@@ -134,7 +134,7 @@ Status: `[ ] TODO`, `[-] IN PROGRESS`, `[x] DONE`, `[!] BLOCKED`, `[?] NEEDS DEC
 - [-] JAR-004 Observability basis — structured logging/tracing klaar; OpenTelemetry/metrics volgt (JAR-070..075)
 
 ## P1 — identity en sync
-- [ ] JAR-100 User/device model
+- [x] JAR-100 User/device model
 - [ ] JAR-101 Device-bound sessions
 - [ ] JAR-102 Local encrypted cache
 - [ ] JAR-103 Sync protocol

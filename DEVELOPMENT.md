@@ -44,8 +44,16 @@ npm run tauri build -- --bundles app
 ```
 
 Stack: Tauri 2 + Vue 3 + TypeScript, Pinia, Vue Router. The `greet` command
-(`src-tauri/src/lib.rs`) demonstrates the JS<->Rust bridge. iOS is the next
-target (needs full Xcode).
+(`src-tauri/src/lib.rs`) demonstrates the JS<->Rust bridge.
+
+iOS also builds (needs full Xcode + an iOS simulator runtime):
+
+```bash
+npm run tauri ios init                       # once
+npm run tauri ios build -- --target aarch64-sim --ci
+xcrun simctl install booted <path/to/Jarvis.app> && \
+  xcrun simctl launch booted com.hawkeynl.jarvis
+```
 
 ## Checks (identical to CI)
 
@@ -55,14 +63,23 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
 
+Integration tests (`#[sqlx::test]`) need Postgres running and `DATABASE_URL` set
+(they create throwaway databases):
+
+```bash
+docker compose -f deploy/compose/docker-compose.yml up -d --wait
+DATABASE_URL=postgres://jarvis:jarvis_dev_pw@localhost:5432/jarvis cargo test --all
+```
+
 ## Layout
 
 - `services/api` — Axum HTTP API (`jarvis-api`)
 - `crates/config` — typed configuration (`jarvis-config`)
 - `crates/observability` — logging/tracing (`jarvis-observability`)
+- `crates/identity` — user/device model + repository (`jarvis-identity`)
 - `migrations/` — SQLx migrations (Postgres)
 - `deploy/compose/` — local Docker stack
-- `apps/client` — Tauri 2 + Vue 3 client (macOS; iOS planned)
+- `apps/client` — Tauri 2 + Vue 3 client (macOS + iOS)
 
 ## Notes
 

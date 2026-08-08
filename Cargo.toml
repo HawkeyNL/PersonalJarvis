@@ -4,6 +4,7 @@ members = [
     "services/api",
     "crates/config",
     "crates/observability",
+    "crates/identity",
 ]
 # The Tauri client crate builds via its own tooling (npm run tauri ...) and is
 # intentionally excluded so backend CI (clippy -D warnings) stays fast and the
@@ -28,6 +29,8 @@ sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
     "macros",
     "migrate",
+    "uuid",
+    "time",
 ] }
 
 # serde
@@ -40,6 +43,11 @@ dotenvy = "0.15"
 
 # errors
 anyhow = "1"
+thiserror = "1"
+
+# ids and time
+uuid = { version = "1", features = ["v7", "serde"] }
+time = { version = "0.3", features = ["serde"] }
 
 # logging / tracing
 tracing = "0.1"
