@@ -800,13 +800,20 @@ dependencies = [
  "anyhow",
  "axum",
  "dotenvy",
+ "ed25519-dalek",
+ "hex",
  "jarvis-config",
+ "jarvis-identity",
  "jarvis-observability",
+ "rand",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -4,10 +4,10 @@
 Blueprint v2.6
 
 ## Huidige fase
-Fase 1 (identity) gestart. Fase 0 — backend + Tauri/Vue-client op macOS én iOS — is afgerond.
+Fase 1 (identity): datamodel + device-bound auth over HTTP klaar. Fase 0 (backend + client macOS/iOS) afgerond.
 
 ## Eerstvolgende taak
-`JAR-101 — Device-bound sessions` (auth-challenge + sessies) en de identity-API-endpoints.
+Client-login bedraden (device-keypair in OS-keychain, challenge signeren, sessietoken bewaren), daarna richting Fase 2 (read-only finance).
 
 ## Klaar
 - Productvisie
@@ -22,6 +22,7 @@ Fase 1 (identity) gestart. Fase 0 — backend + Tauri/Vue-client op macOS én iO
 - Tauri 2 + Vue 3 client (Pinia + Vue Router) — `Jarvis.app` gebouwd en geverifieerd op macOS én iOS-simulator (iPhone 17, iOS 26.3)
 - JAR-100 user/device model: `users`/`devices`/`device_keys`-schema + `jarvis-identity` repository (create/register/list/revoke), geverifieerd met unit- én Postgres-integratietests
 - Client ↔ backend live: Tauri HTTP-plugin; Home-badge + Status-scherm halen live `/livez`+`/readyz` op — end-to-end geverifieerd op iOS-simulator ("Backend: verbonden")
+- JAR-101 device-bound auth: Ed25519 challenge-response (`/v1/auth/challenge`+`/login`), sessies met gehashte tokens, Bearer-extractor + beschermde `/v1/devices`; HTTP-flow end-to-end getest
 
 ## Blockers/beslissingen
 - Primaire LLM-provider
@@ -38,3 +39,4 @@ Fase 1 (identity) gestart. Fase 0 — backend + Tauri/Vue-client op macOS én iO
 - Tauri 2 + Vue 3 client (`apps/client`, Pinia + Vue Router) gescaffold; macOS `Jarvis.app` gebouwd en geverifieerd. iOS-project gegenereerd; simulator-build (iOS 26.3, iPhone 17) draait en geverifieerd met screenshot. Fase 0 afgerond.
 - JAR-100: identity-datamodel (`users`/`devices`/`device_keys`, migratie 0002) + `jarvis-identity`-crate (repository + tests); CI uitgebreid met Postgres-service voor `#[sqlx::test]`-integratietests. Build/clippy/fmt/test groen.
 - Client↔backend live-koppeling via `@tauri-apps/plugin-http` (`src/api.ts`); Home toont "Backend: verbonden", Status-scherm toont `/livez`+`/readyz`. End-to-end geverifieerd op iOS-simulator tegen draaiende API + Postgres (screenshot).
+- JAR-101: device-bound auth (migratie 0003 sessions/challenges) + Ed25519 challenge-response + sessies; API gerefactord naar lib+bin met `/v1/auth/*` en beschermde `/v1/devices` (Bearer-extractor). HTTP-flow-integratietest groen.

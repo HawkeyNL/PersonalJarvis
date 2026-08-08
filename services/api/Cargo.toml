@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[lib]
+name = "jarvis_api"
+path = "src/lib.rs"
+
 [[bin]]
 name = "jarvis-api"
 path = "src/main.rs"
@@ -14,9 +18,18 @@ tokio.workspace = true
 axum.workspace = true
 tower-http.workspace = true
 sqlx.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 dotenvy.workspace = true
+hex.workspace = true
+uuid.workspace = true
 tracing.workspace = true
 jarvis-config.workspace = true
 jarvis-observability.workspace = true
+jarvis-identity.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+ed25519-dalek.workspace = true
+rand.workspace = true

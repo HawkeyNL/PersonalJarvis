@@ -135,7 +135,7 @@ Status: `[ ] TODO`, `[-] IN PROGRESS`, `[x] DONE`, `[!] BLOCKED`, `[?] NEEDS DEC
 
 ## P1 — identity en sync
 - [x] JAR-100 User/device model
-- [ ] JAR-101 Device-bound sessions
+- [x] JAR-101 Device-bound sessions
 - [ ] JAR-102 Local encrypted cache
 - [ ] JAR-103 Sync protocol
 - [ ] JAR-104 Approval challenge en replay protection

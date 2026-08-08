@@ -22,12 +22,12 @@
 
 ### sessions
 
-- [ ] contract/design
-- [ ] implementation
-- [ ] unit tests
-- [ ] integration/contract tests
+- [x] contract/design
+- [x] implementation
+- [x] unit tests
+- [x] integration/contract tests
 - [ ] observability
-- [ ] documentation
+- [x] documentation
 
 ### approvals
 
