@@ -128,10 +128,10 @@
 Status: `[ ] TODO`, `[-] IN PROGRESS`, `[x] DONE`, `[!] BLOCKED`, `[?] NEEDS DECISION`.
 
 ## P0 — fundament
-- [ ] JAR-001 Monorepo initialiseren
-- [ ] JAR-002 Docker development stack
-- [ ] JAR-003 Typed configuration en environments
-- [ ] JAR-004 Observability basis
+- [x] JAR-001 Monorepo initialiseren
+- [x] JAR-002 Docker development stack
+- [x] JAR-003 Typed configuration en environments
+- [-] JAR-004 Observability basis — structured logging/tracing klaar; OpenTelemetry/metrics volgt (JAR-070..075)
 
 ## P1 — identity en sync
 - [ ] JAR-100 User/device model

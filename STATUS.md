@@ -4,10 +4,10 @@
 Blueprint v2.6
 
 ## Huidige fase
-Documentatie en architectuur. Implementatie is nog niet gestart.
+Fase 0 — fundament. Backend-skelet geïmplementeerd en geverifieerd; Tauri/Vue-client nog te doen.
 
 ## Eerstvolgende taak
-`JAR-001 — Monorepo initialiseren`
+Tauri 2 + Vue 3 client scaffolden (Fase 0 afronden), daarna `JAR-100 — User/device model`.
 
 ## Klaar
 - Productvisie
@@ -18,6 +18,7 @@ Documentatie en architectuur. Implementatie is nog niet gestart.
 - NautilusTrader evaluatie
 - Risk/backtest/securityprincipes
 - Centrale TODO- en stappenstructuur
+- JAR-001/002/003 gebouwd en geverifieerd: Rust workspace, Axum API (/livez, /readyz), typed config, tracing, SQLx-migraties, Docker dev-stack en CI
 
 ## Blockers/beslissingen
 - Primaire LLM-provider
@@ -28,6 +29,6 @@ Documentatie en architectuur. Implementatie is nog niet gestart.
 - Lokale hardware versus cloud-API
 
 ## Laatste update
-3 augustus 2026
+8 augustus 2026
 
-- Agent Observatory ontwerp toegevoegd.
+- JAR-001 geïmplementeerd: Rust workspace, Axum API (/livez, /readyz), typed config, tracing, SQLx-migraties, Docker dev-stack en CI. Build/clippy/fmt/test groen; /readyz getest tegen Postgres 17.

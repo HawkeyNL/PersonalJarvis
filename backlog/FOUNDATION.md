@@ -5,53 +5,53 @@
 ### monorepo
 
 - [ ] contract/design
-- [ ] implementation
+- [x] implementation
 - [ ] unit tests
 - [ ] integration/contract tests
 - [ ] observability
-- [ ] documentation
+- [x] documentation
 
 ### rust-workspace
 
 - [ ] contract/design
-- [ ] implementation
+- [x] implementation
 - [ ] unit tests
 - [ ] integration/contract tests
 - [ ] observability
-- [ ] documentation
+- [x] documentation
 
 ### configuration
 
 - [ ] contract/design
-- [ ] implementation
+- [x] implementation
 - [ ] unit tests
 - [ ] integration/contract tests
 - [ ] observability
-- [ ] documentation
+- [x] documentation
 
 ### logging
 
 - [ ] contract/design
-- [ ] implementation
+- [x] implementation
 - [ ] unit tests
 - [ ] integration/contract tests
 - [ ] observability
-- [ ] documentation
+- [x] documentation
 
 ### ci
 
 - [ ] contract/design
-- [ ] implementation
+- [x] implementation
 - [ ] unit tests
 - [ ] integration/contract tests
 - [ ] observability
-- [ ] documentation
+- [x] documentation
 
 ### docker
 
 - [ ] contract/design
-- [ ] implementation
+- [x] implementation
 - [ ] unit tests
 - [ ] integration/contract tests
 - [ ] observability
-- [ ] documentation
+- [x] documentation

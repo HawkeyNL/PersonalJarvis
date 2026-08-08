@@ -23,10 +23,10 @@ Iedere coding-agent moet na werk taken afvinken, nieuwe taken toevoegen, tests v
 - [x] IBKR-, MT5-, futures- en prop-firmonderzoek
 - [x] NautilusTrader evaluatie toegevoegd
 - [x] Agents, risk, execution en backtesting beschreven
-- [ ] Monorepo aangemaakt
+- [x] Monorepo aangemaakt
 - [ ] Tauri-client gestart
-- [ ] Rust/Axum API gestart
-- [ ] PostgreSQL-migraties
+- [x] Rust/Axum API gestart
+- [x] PostgreSQL-migraties
 - [ ] Auth en sync
 - [ ] Agent runtime
 - [ ] IBKR paper read-only
@@ -43,12 +43,12 @@ Iedere coding-agent moet na werk taken afvinken, nieuwe taken toevoegen, tests v
 ## Bouwfasen
 
 ### Fase 0 — fundament
-- [ ] Rust workspace
+- [x] Rust workspace
 - [ ] Tauri 2 + Vue 3
-- [ ] Axum API
-- [ ] PostgreSQL + SQLx
-- [ ] Docker Compose
-- [ ] CI, logging en config
+- [x] Axum API
+- [x] PostgreSQL + SQLx
+- [x] Docker Compose
+- [x] CI, logging en config
 
 ### Fase 1 — Jarvis-kern
 - [ ] User/device-auth

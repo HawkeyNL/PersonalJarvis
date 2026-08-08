@@ -1,0 +1,30 @@
+# Local development stack for Jarvis.
+# Production topology (reverse proxy, internal networks, broker tunnel) lives in
+# infra/DOCKER_AND_DEPLOYMENT.md — this file is intentionally dev-only.
+#
+#   docker compose -f deploy/compose/docker-compose.yml up -d
+#
+# The API is run on the host during development (`cargo run -p jarvis-api`).
+
+name: jarvis-dev
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-jarvis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jarvis_dev_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-jarvis}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jarvis} -d ${POSTGRES_DB:-jarvis}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:

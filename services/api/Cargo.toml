@@ -1,0 +1,22 @@
+[package]
+name = "jarvis-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "jarvis-api"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+sqlx.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+dotenvy.workspace = true
+tracing.workspace = true
+jarvis-config.workspace = true
+jarvis-observability.workspace = true
