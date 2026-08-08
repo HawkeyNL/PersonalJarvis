@@ -11,6 +11,10 @@ uuid.workspace = true
 time.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
