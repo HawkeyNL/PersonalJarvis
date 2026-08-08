@@ -49,9 +49,9 @@
 
 ### revocation
 
-- [ ] contract/design
-- [ ] implementation
+- [x] contract/design
+- [x] implementation
 - [ ] unit tests
-- [ ] integration/contract tests
+- [x] integration/contract tests
 - [ ] observability
-- [ ] documentation
+- [x] documentation

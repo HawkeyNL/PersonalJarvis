@@ -43,14 +43,51 @@ fn save_store(app: &AppHandle, store: &AuthStore) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| e.to_string())
 }
 
-/// Load the device signing key, generating and persisting one on first use.
-fn signing_key(store: &mut AuthStore) -> Result<SigningKey, String> {
-    if store.private_key.is_none() {
-        let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
-        store.private_key = Some(hex::encode(seed));
+const KEY_SERVICE: &str = "com.hawkeynl.jarvis";
+const KEY_ACCOUNT: &str = "device-private-key";
+
+/// Read the device private key (hex), preferring the OS keychain and falling
+/// back to the app-private file (also used to migrate older installs).
+fn load_private_key(app: &AppHandle) -> Option<String> {
+    if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT) {
+        if let Ok(key) = entry.get_password() {
+            return Some(key);
+        }
     }
-    let seed = hex::decode(store.private_key.as_ref().unwrap()).map_err(|e| e.to_string())?;
+    load_store(app).private_key
+}
+
+/// Persist the device private key, preferring the OS keychain. Falls back to
+/// the app-private file when the keychain is unavailable.
+fn save_private_key(app: &AppHandle, key_hex: &str) -> Result<(), String> {
+    if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT) {
+        if entry.set_password(key_hex).is_ok() {
+            // Now in the keychain: drop any copy left in the file.
+            let mut store = load_store(app);
+            if store.private_key.take().is_some() {
+                let _ = save_store(app, &store);
+            }
+            return Ok(());
+        }
+    }
+    let mut store = load_store(app);
+    store.private_key = Some(key_hex.to_string());
+    save_store(app, &store)
+}
+
+/// Load the device signing key, generating and persisting one on first use.
+fn get_or_create_signing_key(app: &AppHandle) -> Result<SigningKey, String> {
+    let key_hex = match load_private_key(app) {
+        Some(key) => key,
+        None => {
+            let mut seed = [0u8; 32];
+            OsRng.fill_bytes(&mut seed);
+            let key_hex = hex::encode(seed);
+            save_private_key(app, &key_hex)?;
+            key_hex
+        }
+    };
+    let seed = hex::decode(&key_hex).map_err(|e| e.to_string())?;
     let seed: [u8; 32] = seed.try_into().map_err(|_| "invalid stored key".to_string())?;
     Ok(SigningKey::from_bytes(&seed))
 }
@@ -74,18 +111,14 @@ fn device_info() -> serde_json::Value {
 /// Return the device public key (hex), generating a keypair on first call.
 #[tauri::command]
 fn auth_public_key(app: AppHandle) -> Result<String, String> {
-    let mut store = load_store(&app);
-    let key = signing_key(&mut store)?;
-    save_store(&app, &store)?;
+    let key = get_or_create_signing_key(&app)?;
     Ok(hex::encode(key.verifying_key().to_bytes()))
 }
 
 /// Sign a hex-encoded challenge nonce; returns the hex signature.
 #[tauri::command]
 fn auth_sign(app: AppHandle, nonce_hex: String) -> Result<String, String> {
-    let mut store = load_store(&app);
-    let key = signing_key(&mut store)?;
-    save_store(&app, &store)?;
+    let key = get_or_create_signing_key(&app)?;
     let nonce = hex::decode(nonce_hex).map_err(|e| e.to_string())?;
     Ok(hex::encode(key.sign(&nonce).to_bytes()))
 }
@@ -106,7 +139,7 @@ fn auth_session(app: AppHandle) -> serde_json::Value {
     serde_json::json!({
         "device_id": store.device_id,
         "token": store.token,
-        "has_key": store.private_key.is_some(),
+        "has_key": load_private_key(&app).is_some(),
     })
 }
 

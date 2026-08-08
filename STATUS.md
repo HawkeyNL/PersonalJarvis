@@ -4,7 +4,7 @@
 Blueprint v2.6
 
 ## Huidige fase
-Fase 1 (identity): datamodel + device-bound auth over HTTP klaar. Fase 0 (backend + client macOS/iOS) afgerond.
+Fase 1 (identity) afgerond: datamodel, device-bound auth, revocatie en keychain-opslag. Fase 0 (backend + client macOS/iOS) afgerond. Klaar voor Fase 2.
 
 ## Eerstvolgende taak
 Fase 2 — read-only finance (eerste nuttige scherm: watchlist/portfolio). Later: privésleutel naar OS-keychain en enrollment-hardening (JAR-104).
@@ -23,7 +23,8 @@ Fase 2 — read-only finance (eerste nuttige scherm: watchlist/portfolio). Later
 - JAR-100 user/device model: `users`/`devices`/`device_keys`-schema + `jarvis-identity` repository (create/register/list/revoke), geverifieerd met unit- én Postgres-integratietests
 - Client ↔ backend live: Tauri HTTP-plugin; Home-badge + Status-scherm halen live `/livez`+`/readyz` op — end-to-end geverifieerd op iOS-simulator ("Backend: verbonden")
 - JAR-101 device-bound auth: Ed25519 challenge-response (`/v1/auth/challenge`+`/login`), sessies met gehashte tokens, Bearer-extractor + beschermde `/v1/devices`; HTTP-flow end-to-end getest
-- Client-login werkend op iOS + macOS: keypair + signeren in Rust (privésleutel app-privé), dev auto-enroll + login, apparatenlijst via Bearer-token — geverifieerd met screenshot op iOS-simulator
+- Client-login werkend op iOS + macOS: keypair + signeren in Rust, dev auto-enroll + login, apparatenlijst via Bearer-token — geverifieerd met screenshot op iOS-simulator
+- Fase 1-hardening: server-side logout + owner-checked device-revocatie; privésleutel in OS-keychain (`keyring`, Apple-backend) met app-privé fallback — iOS-build met keyring geverifieerd
 
 ## Blockers/beslissingen
 - Primaire LLM-provider
@@ -41,4 +42,5 @@ Fase 2 — read-only finance (eerste nuttige scherm: watchlist/portfolio). Later
 - JAR-100: identity-datamodel (`users`/`devices`/`device_keys`, migratie 0002) + `jarvis-identity`-crate (repository + tests); CI uitgebreid met Postgres-service voor `#[sqlx::test]`-integratietests. Build/clippy/fmt/test groen.
 - Client↔backend live-koppeling via `@tauri-apps/plugin-http` (`src/api.ts`); Home toont "Backend: verbonden", Status-scherm toont `/livez`+`/readyz`. End-to-end geverifieerd op iOS-simulator tegen draaiende API + Postgres (screenshot).
 - JAR-101: device-bound auth (migratie 0003 sessions/challenges) + Ed25519 challenge-response + sessies; API gerefactord naar lib+bin met `/v1/auth/*` en beschermde `/v1/devices` (Bearer-extractor). HTTP-flow-integratietest groen.
-- Client-login bedraad: Rust-commands (device_info/auth_public_key/auth_sign/auth_save/auth_session/auth_logout, privésleutel app-privé), dev-enroll-endpoint, `auth.ts`-flow + Home-UI. Volledige device-bound login end-to-end op iOS-simulator geverifieerd (screenshot: "ingelogd" + apparaat).
+- Client-login bedraad: Rust-commands (device_info/auth_public_key/auth_sign/auth_save/auth_session/auth_logout), dev-enroll-endpoint, `auth.ts`-flow + Home-UI. Volledige device-bound login end-to-end op iOS-simulator geverifieerd (screenshot: "ingelogd" + apparaat).
+- Fase 1 afgerond: revocatie-endpoints (`/v1/auth/logout`, `DELETE /v1/devices/{id}`) + client-logout server-side; privésleutel naar OS-keychain (`keyring`) met fallback. iOS-e2e opnieuw geverifieerd.
