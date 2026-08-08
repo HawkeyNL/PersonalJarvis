@@ -5,6 +5,7 @@ members = [
     "crates/config",
     "crates/observability",
     "crates/identity",
+    "crates/portfolio",
 ]
 # The Tauri client crate builds via its own tooling (npm run tauri ...) and is
 # intentionally excluded so backend CI (clippy -D warnings) stays fast and the
@@ -31,6 +32,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "migrate",
     "uuid",
     "time",
+    "rust_decimal",
 ] }
 
 # serde
@@ -49,6 +51,9 @@ thiserror = "1"
 uuid = { version = "1", features = ["v7", "serde"] }
 time = { version = "0.3", features = ["serde"] }
 
+# decimal money (never floats for money)
+rust_decimal = { version = "1", features = ["serde-str"] }
+
 # crypto (device-bound auth)
 ed25519-dalek = "2"
 rand = "0.8"
@@ -63,3 +68,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"]
 jarvis-config = { path = "crates/config" }
 jarvis-observability = { path = "crates/observability" }
 jarvis-identity = { path = "crates/identity" }
+jarvis-portfolio = { path = "crates/portfolio" }

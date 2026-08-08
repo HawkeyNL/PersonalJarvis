@@ -17,6 +17,8 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use jarvis_identity as identity;
+use jarvis_portfolio as portfolio;
+use rust_decimal::Decimal;
 
 /// Shared, cheaply-cloneable application state.
 #[derive(Clone)]
@@ -37,6 +39,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/logout", post(auth_logout))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{id}", delete(delete_device))
+        .route("/v1/holdings", get(get_holdings).post(add_holding))
+        .route("/v1/holdings/{id}", delete(remove_holding))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -81,6 +85,13 @@ fn internal(_e: identity::IdentityError) -> (StatusCode, Json<Value>) {
 
 fn bad_request(message: &str) -> (StatusCode, Json<Value>) {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": message })))
+}
+
+fn portfolio_err(_e: portfolio::PortfolioError) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "internal error" })),
+    )
 }
 
 /// Authenticated principal, extracted from a `Bearer` session token.
@@ -263,6 +274,99 @@ async fn delete_device(
     }
 }
 
+/// List the authenticated user's holdings with cost basis and allocation.
+async fn get_holdings(
+    authed: Authed,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let holdings = portfolio::list_holdings(&state.db, authed.user.id)
+        .await
+        .map_err(portfolio_err)?;
+    let total: Decimal = holdings.iter().map(|h| h.cost_basis()).sum();
+    let hundred = Decimal::from(100);
+    let items: Vec<Value> = holdings
+        .iter()
+        .map(|h| {
+            let cost = h.cost_basis();
+            let weight = if total.is_zero() {
+                Decimal::ZERO
+            } else {
+                (cost / total) * hundred
+            };
+            json!({
+                "id": h.id,
+                "symbol": h.symbol,
+                "quantity": h.quantity.normalize().to_string(),
+                "avg_cost": h.avg_cost.normalize().to_string(),
+                "currency": h.currency,
+                "cost_basis": cost.normalize().to_string(),
+                "weight_pct": weight.round_dp(1).normalize().to_string(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "holdings": items,
+        "total_cost": total.normalize().to_string(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct AddHoldingReq {
+    symbol: String,
+    quantity: Decimal,
+    avg_cost: Decimal,
+    currency: Option<String>,
+}
+
+/// Add a holding for the authenticated user.
+async fn add_holding(
+    authed: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<AddHoldingReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let symbol = req.symbol.trim().to_uppercase();
+    if symbol.is_empty() {
+        return Err(bad_request("symbol is required"));
+    }
+    if req.quantity <= Decimal::ZERO {
+        return Err(bad_request("quantity must be positive"));
+    }
+    if req.avg_cost < Decimal::ZERO {
+        return Err(bad_request("avg_cost must be non-negative"));
+    }
+    let currency = req.currency.as_deref().unwrap_or("EUR");
+    let holding = portfolio::add_holding(
+        &state.db,
+        authed.user.id,
+        &symbol,
+        req.quantity,
+        req.avg_cost,
+        currency,
+    )
+    .await
+    .map_err(portfolio_err)?;
+    Ok(Json(json!({ "id": holding.id, "symbol": holding.symbol })))
+}
+
+/// Delete one of the authenticated user's holdings.
+async fn remove_holding(
+    authed: Authed,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if portfolio::delete_holding(&state.db, authed.user.id, id)
+        .await
+        .map_err(portfolio_err)?
+    {
+        Ok(Json(json!({ "status": "deleted" })))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "holding not found" })),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +504,46 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         assert_eq!(body["devices"].as_array().unwrap().len(), 1);
+
+        // 4b. add a holding, then list it (both protected)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/holdings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "symbol": "aapl",
+                            "quantity": "10",
+                            "avg_cost": "150.25",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/holdings")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["holdings"].as_array().unwrap().len(), 1);
+        assert_eq!(body["holdings"][0]["symbol"], "AAPL");
+        assert_eq!(body["total_cost"], "1502.5");
 
         // 5. logout revokes the session server-side
         let resp = app

@@ -28,6 +28,8 @@ tracing.workspace = true
 jarvis-config.workspace = true
 jarvis-observability.workspace = true
 jarvis-identity.workspace = true
+jarvis-portfolio.workspace = true
+rust_decimal.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
