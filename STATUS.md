@@ -21,6 +21,7 @@ Fase 1 (identity) gestart. Fase 0 — backend + Tauri/Vue-client op macOS én iO
 - JAR-001/002/003 gebouwd en geverifieerd: Rust workspace, Axum API (/livez, /readyz), typed config, tracing, SQLx-migraties, Docker dev-stack en CI
 - Tauri 2 + Vue 3 client (Pinia + Vue Router) — `Jarvis.app` gebouwd en geverifieerd op macOS én iOS-simulator (iPhone 17, iOS 26.3)
 - JAR-100 user/device model: `users`/`devices`/`device_keys`-schema + `jarvis-identity` repository (create/register/list/revoke), geverifieerd met unit- én Postgres-integratietests
+- Client ↔ backend live: Tauri HTTP-plugin; Home-badge + Status-scherm halen live `/livez`+`/readyz` op — end-to-end geverifieerd op iOS-simulator ("Backend: verbonden")
 
 ## Blockers/beslissingen
 - Primaire LLM-provider
@@ -36,3 +37,4 @@ Fase 1 (identity) gestart. Fase 0 — backend + Tauri/Vue-client op macOS én iO
 - JAR-001 geïmplementeerd: Rust workspace, Axum API (/livez, /readyz), typed config, tracing, SQLx-migraties, Docker dev-stack en CI. Build/clippy/fmt/test groen; /readyz getest tegen Postgres 17.
 - Tauri 2 + Vue 3 client (`apps/client`, Pinia + Vue Router) gescaffold; macOS `Jarvis.app` gebouwd en geverifieerd. iOS-project gegenereerd; simulator-build (iOS 26.3, iPhone 17) draait en geverifieerd met screenshot. Fase 0 afgerond.
 - JAR-100: identity-datamodel (`users`/`devices`/`device_keys`, migratie 0002) + `jarvis-identity`-crate (repository + tests); CI uitgebreid met Postgres-service voor `#[sqlx::test]`-integratietests. Build/clippy/fmt/test groen.
+- Client↔backend live-koppeling via `@tauri-apps/plugin-http` (`src/api.ts`); Home toont "Backend: verbonden", Status-scherm toont `/livez`+`/readyz`. End-to-end geverifieerd op iOS-simulator tegen draaiende API + Postgres (screenshot).

@@ -106,6 +106,19 @@ body {
   line-height: 1.6;
 }
 
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 14px;
+  color: var(--muted);
+  margin: 4px 0 8px;
+}
+
 .greet {
   display: flex;
   gap: 8px;
@@ -177,6 +190,18 @@ code {
 
 .dot-todo {
   background: #7a828d;
+}
+
+.dot-ok {
+  background: #4ade80;
+}
+
+.dot-err {
+  background: #f87171;
+}
+
+.err {
+  color: #f87171;
 }
 
 /* Narrow screens (iOS/iPhone): sidebar becomes a top bar. */
