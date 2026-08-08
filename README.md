@@ -24,7 +24,7 @@ Iedere coding-agent moet na werk taken afvinken, nieuwe taken toevoegen, tests v
 - [x] NautilusTrader evaluatie toegevoegd
 - [x] Agents, risk, execution en backtesting beschreven
 - [x] Monorepo aangemaakt
-- [ ] Tauri-client gestart
+- [x] Tauri-client gestart
 - [x] Rust/Axum API gestart
 - [x] PostgreSQL-migraties
 - [ ] Auth en sync
@@ -44,7 +44,7 @@ Iedere coding-agent moet na werk taken afvinken, nieuwe taken toevoegen, tests v
 
 ### Fase 0 — fundament
 - [x] Rust workspace
-- [ ] Tauri 2 + Vue 3
+- [x] Tauri 2 + Vue 3 (macOS; iOS volgt)
 - [x] Axum API
 - [x] PostgreSQL + SQLx
 - [x] Docker Compose

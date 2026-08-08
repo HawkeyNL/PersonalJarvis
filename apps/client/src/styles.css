@@ -1,0 +1,179 @@
+:root {
+  --bg: #14161a;
+  --panel: #1b1e24;
+  --border: #2a2f37;
+  --text: #e6e8eb;
+  --muted: #9aa2ad;
+  --accent: #4c8dff;
+  --accent-2: #22c8db;
+
+  font-family: Inter, Avenir, system-ui, -apple-system, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  height: 100vh;
+}
+
+.sidebar {
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  font-size: 18px;
+}
+
+.brand-mark {
+  color: var(--accent-2);
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.nav-link {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.nav-link:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+}
+
+.nav-link.router-link-active {
+  background: rgba(76, 141, 255, 0.15);
+  color: var(--text);
+}
+
+.tagline {
+  margin-top: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.content {
+  padding: 32px 40px;
+  overflow-y: auto;
+}
+
+.view {
+  max-width: 720px;
+}
+
+.view h1 {
+  margin: 0 0 12px;
+  font-size: 24px;
+}
+
+.muted {
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.greet {
+  display: flex;
+  gap: 8px;
+  margin: 20px 0 8px;
+}
+
+input {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font: inherit;
+  min-width: 200px;
+}
+
+input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(1.08);
+}
+
+.greet-msg {
+  color: var(--accent-2);
+}
+
+code {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.9em;
+}
+
+.status-list {
+  list-style: none;
+  padding: 0;
+  margin: 20px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.status-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot-todo {
+  background: #7a828d;
+}

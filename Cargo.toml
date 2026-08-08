@@ -5,6 +5,12 @@ members = [
     "crates/config",
     "crates/observability",
 ]
+# The Tauri client crate builds via its own tooling (npm run tauri ...) and is
+# intentionally excluded so backend CI (clippy -D warnings) stays fast and the
+# heavy tauri/wry deps don't enter the workspace graph.
+exclude = [
+    "apps/client/src-tauri",
+]
 
 [workspace.package]
 edition = "2021"
