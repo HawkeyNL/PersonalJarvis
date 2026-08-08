@@ -44,3 +44,32 @@ export async function postAuth(path: string, token: string): Promise<void> {
     throw new Error(`HTTP ${res.status}`);
   }
 }
+
+export async function postJsonAuth<T>(
+  path: string,
+  token: string,
+  body: unknown,
+): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+  return (await res.json()) as T;
+}
+
+export async function deleteAuth(path: string, token: string): Promise<void> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+}

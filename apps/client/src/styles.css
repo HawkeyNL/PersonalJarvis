@@ -204,6 +204,79 @@ code {
   color: #f87171;
 }
 
+.holding-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 16px 0;
+}
+
+.holding-form input {
+  min-width: 110px;
+  flex: 1;
+}
+
+.total {
+  margin-bottom: 14px;
+  color: var(--muted);
+}
+
+.holding-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.holding-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.holding-head .sym {
+  font-weight: 600;
+}
+
+.holding-head .cost {
+  margin-left: auto;
+}
+
+.del {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 2px 9px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.del:hover {
+  color: var(--accent-2);
+  border-color: var(--accent-2);
+}
+
+.bar {
+  height: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 4px;
+  margin-top: 8px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+.weight {
+  font-size: 12px;
+  margin-top: 3px;
+}
+
 /* Narrow screens (iOS/iPhone): sidebar becomes a top bar. */
 @media (max-width: 640px) {
   .app {

@@ -8,10 +8,13 @@ import {
   listDevices,
   type DeviceItem,
 } from "../auth";
+import { listHoldings } from "../portfolio";
 
 const backend = ref<"checking" | "ok" | "fout">("checking");
 const auth = ref<"checking" | "in" | "uit" | "fout">("checking");
 const devices = ref<DeviceItem[]>([]);
+const portfolioTotal = ref("0");
+const portfolioCount = ref(0);
 const error = ref<string | null>(null);
 
 async function refresh() {
@@ -33,6 +36,13 @@ async function refresh() {
     if (session.token) {
       devices.value = await listDevices(session.token);
       auth.value = "in";
+      try {
+        const p = await listHoldings();
+        portfolioTotal.value = p.total_cost;
+        portfolioCount.value = p.holdings.length;
+      } catch {
+        /* portfolio summary is optional on the dashboard */
+      }
     } else {
       auth.value = "uit";
     }
@@ -78,6 +88,11 @@ onMounted(refresh);
     </div>
 
     <div v-if="auth === 'in'" class="devices">
+      <div class="badge">
+        <span class="dot dot-ok"></span>
+        Portfolio: {{ portfolioCount }} posities · kostenbasis {{ portfolioTotal }}
+      </div>
+
       <h2>Vertrouwde apparaten</h2>
       <ul class="status-list">
         <li v-for="d in devices" :key="d.id">
