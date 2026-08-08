@@ -54,6 +54,7 @@ body {
 
 .brand-mark {
   color: var(--accent-2);
+  flex: none;
 }
 
 .nav {
@@ -176,4 +177,35 @@ code {
 
 .dot-todo {
   background: #7a828d;
+}
+
+/* Narrow screens (iOS/iPhone): sidebar becomes a top bar. */
+@media (max-width: 640px) {
+  .app {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+
+  .sidebar {
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .nav {
+    flex-direction: row;
+    gap: 4px;
+    margin-left: auto;
+  }
+
+  .tagline {
+    display: none;
+  }
+
+  .content {
+    padding: 20px;
+  }
 }
