@@ -351,7 +351,7 @@ Status: `[ ] TODO`, `[-] IN PROGRESS`, `[x] DONE`, `[!] BLOCKED`, `[?] NEEDS DEC
 - [ ] JAR-300 Instrument master
 - [ ] JAR-301 Market data provider
 - [ ] JAR-302 News ingestion
-- [ ] JAR-303 Portfolio domain
+- [x] JAR-303 Portfolio domain (handmatige holdings; live koersen volgen met JAR-301)
 - [ ] JAR-304 Investment Analyst
 - [ ] JAR-305 Deterministic allocator
 

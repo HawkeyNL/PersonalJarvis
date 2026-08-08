@@ -4,10 +4,10 @@
 Blueprint v2.6
 
 ## Huidige fase
-Fase 1 (identity) afgerond: datamodel, device-bound auth, revocatie en keychain-opslag. Fase 0 (backend + client macOS/iOS) afgerond. Klaar voor Fase 2.
+Fase 2 gestart: handmatig portfolio (holdings) werkt op iOS + macOS, achter de device-login. Fase 0 + Fase 1 afgerond.
 
 ## Eerstvolgende taak
-Fase 2 — read-only finance (eerste nuttige scherm: watchlist/portfolio). Later: privésleutel naar OS-keychain en enrollment-hardening (JAR-104).
+B — marktdata-provider kiezen (DEC-002) voor live koersen: actuele waarde + winst/verlies bovenop de handmatige posities.
 
 ## Klaar
 - Productvisie
@@ -25,6 +25,7 @@ Fase 2 — read-only finance (eerste nuttige scherm: watchlist/portfolio). Later
 - JAR-101 device-bound auth: Ed25519 challenge-response (`/v1/auth/challenge`+`/login`), sessies met gehashte tokens, Bearer-extractor + beschermde `/v1/devices`; HTTP-flow end-to-end getest
 - Client-login werkend op iOS + macOS: keypair + signeren in Rust, dev auto-enroll + login, apparatenlijst via Bearer-token — geverifieerd met screenshot op iOS-simulator
 - Fase 1-hardening: server-side logout + owner-checked device-revocatie; privésleutel in OS-keychain (`keyring`, Apple-backend) met app-privé fallback — iOS-build met keyring geverifieerd
+- Fase 2 — portfolio: `holdings`-tabel (Decimal-geld) + `jarvis-portfolio` + beveiligde `/v1/holdings` (GET/POST/DELETE) met kostenbasis/allocatie; client Portfolio-scherm + Home-samenvatting. iOS geverifieerd (dashboard: "3 posities · kostenbasis 7842.75")
 
 ## Blockers/beslissingen
 - Primaire LLM-provider
@@ -44,3 +45,4 @@ Fase 2 — read-only finance (eerste nuttige scherm: watchlist/portfolio). Later
 - JAR-101: device-bound auth (migratie 0003 sessions/challenges) + Ed25519 challenge-response + sessies; API gerefactord naar lib+bin met `/v1/auth/*` en beschermde `/v1/devices` (Bearer-extractor). HTTP-flow-integratietest groen.
 - Client-login bedraad: Rust-commands (device_info/auth_public_key/auth_sign/auth_save/auth_session/auth_logout), dev-enroll-endpoint, `auth.ts`-flow + Home-UI. Volledige device-bound login end-to-end op iOS-simulator geverifieerd (screenshot: "ingelogd" + apparaat).
 - Fase 1 afgerond: revocatie-endpoints (`/v1/auth/logout`, `DELETE /v1/devices/{id}`) + client-logout server-side; privésleutel naar OS-keychain (`keyring`) met fallback. iOS-e2e opnieuw geverifieerd.
+- Fase 2 gestart — portfolio: migratie 0004 (`holdings`, numeric-geld) + crate `jarvis-portfolio` + beveiligde `/v1/holdings`-endpoints (kostenbasis/allocatie); client Portfolio-view + Home-samenvatting. iOS-dashboard geverifieerd met geseede posities (kostenbasis 7842.75, exacte Decimal). Provider-vrij; live koersen = B.
