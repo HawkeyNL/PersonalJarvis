@@ -40,6 +40,7 @@ IBKR live verifiëren zodra de Client Portal Gateway draait + ingelogd (paper ee
 8 augustus 2026
 
 - Jarvis-HUD Home: levend reactor-core-scherm (canvas-particles + draaiende SVG-ringen + radar-sweep) met telemetrie-panelen (systeemstatus, device-mesh, portfolio, IBKR-link, live engine-feed), klok + uptime. Groen als standaard-accent voor de hele client (`styles.css`). Nieuw component `components/ReactorCore.vue`; `Home.vue` herschreven en op echte backend-/login-/portfolio-/IBKR-data aangesloten. `vue-tsc` + `vite build` groen. Respecteert `prefers-reduced-motion`.
+- Navigatie omgebouwd naar een zwevende **Liquid-Glass dock** onderaan (alle schermen; geen zijbalk meer), 5 tabs met iconen (Jarvis/Portfolio/IBKR/System/Settings), Jarvis als hoofdtab. Core toont nu **alleen de naam "Jarvis"** en schaalt mee met het scherm (full-screen HUD). Nieuwe `Settings`-view met werkende **accentkleur-switch** (groen standaard, `theme.ts`, gepersisteerd in localStorage; particles volgen de accentkleur). Nieuw `components/NavIcon.vue`. Glass-design op panelen + dock.
 - README uitgebreid met een "Lokaal opstarten"-quickstart (Postgres → API → client, endpoints, iOS-sim, IBKR, checks).
 
 - JAR-001 geïmplementeerd: Rust workspace, Axum API (/livez, /readyz), typed config, tracing, SQLx-migraties, Docker dev-stack en CI. Build/clippy/fmt/test groen; /readyz getest tegen Postgres 17.

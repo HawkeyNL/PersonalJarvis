@@ -3,6 +3,7 @@ import Home from "../views/Home.vue";
 import Portfolio from "../views/Portfolio.vue";
 import Broker from "../views/Broker.vue";
 import Status from "../views/Status.vue";
+import Settings from "../views/Settings.vue";
 
 export const router = createRouter({
   history: createWebHistory(),
@@ -11,5 +12,6 @@ export const router = createRouter({
     { path: "/portfolio", name: "portfolio", component: Portfolio },
     { path: "/broker", name: "broker", component: Broker },
     { path: "/status", name: "status", component: Status },
+    { path: "/settings", name: "settings", component: Settings },
   ],
 });

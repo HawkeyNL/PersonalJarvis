@@ -44,17 +44,6 @@ function pushFeed(kind: string, msg: string) {
 }
 
 const online = computed(() => backend.value === "ok");
-const coreStatus = computed(() =>
-  backend.value === "ok"
-    ? "CORE ONLINE"
-    : backend.value === "fout"
-      ? "CORE OFFLINE"
-      : "BOOTING",
-);
-const coreValue = computed(() => (auth.value === "in" ? portfolioCount.value : "—"));
-const coreSub = computed(() =>
-  auth.value === "in" ? `basis ${portfolioTotal.value}` : "wacht op login",
-);
 const uptimeStr = computed(() => {
   const h = Math.floor(uptime.value / 3600);
   const m = Math.floor((uptime.value % 3600) / 60);
@@ -214,13 +203,7 @@ onBeforeUnmount(() => {
 
       <!-- CENTER: reactor core -->
       <div class="col col-core">
-        <ReactorCore
-          :value="coreValue"
-          :sub="coreSub"
-          :status="coreStatus"
-          label="NEURAL CORE"
-          :active="online"
-        />
+        <ReactorCore name="Jarvis" :active="online" />
         <div class="meters">
           <div class="meter" v-for="m in meters" :key="m.key">
             <span class="meter-k">{{ m.key }}</span>
@@ -378,15 +361,23 @@ onBeforeUnmount(() => {
 }
 
 .col { display: flex; flex-direction: column; gap: 16px; }
-.col-core { align-items: center; gap: 18px; }
+.col-core {
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  --core-size: clamp(320px, 46vh, 640px);
+}
 
 .panel {
   position: relative;
   width: 100%;
-  background: linear-gradient(180deg, rgba(16, 34, 26, 0.55), rgba(8, 18, 14, 0.55));
+  background: linear-gradient(180deg, rgba(16, 34, 26, 0.5), rgba(8, 18, 14, 0.42));
+  backdrop-filter: blur(12px) saturate(1.25);
+  -webkit-backdrop-filter: blur(12px) saturate(1.25);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 12px 14px 14px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 /* corner brackets */
 .panel::before,
@@ -430,7 +421,7 @@ onBeforeUnmount(() => {
 .big-stat .unit { font-family: var(--mono); font-size: 11px; color: var(--muted); letter-spacing: 0.14em; }
 .sub-stat { font-size: 11px; color: var(--muted); margin-top: 4px; }
 
-.meters { width: min(46vh, 400px); display: flex; flex-direction: column; gap: 7px; }
+.meters { width: var(--core-size, min(46vh, 400px)); display: flex; flex-direction: column; gap: 7px; }
 .meter { display: flex; align-items: center; gap: 10px; }
 .meter-k { font-family: var(--mono); font-size: 10px; color: var(--muted); width: 58px; letter-spacing: 0.12em; }
 .meter-bar { flex: 1; height: 6px; background: rgba(52, 245, 160, 0.08); border-radius: 4px; overflow: hidden; }

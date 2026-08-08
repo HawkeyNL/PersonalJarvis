@@ -1,28 +1,33 @@
 <script setup lang="ts">
-import { useAppStore } from "./stores/app";
+import NavIcon from "./components/NavIcon.vue";
 
-const app = useAppStore();
+const tabs = [
+  { to: "/", label: "Jarvis", icon: "core" as const },
+  { to: "/portfolio", label: "Portfolio", icon: "chart" as const },
+  { to: "/broker", label: "IBKR", icon: "link" as const },
+  { to: "/status", label: "System", icon: "pulse" as const },
+  { to: "/settings", label: "Settings", icon: "gear" as const },
+];
 </script>
 
 <template>
   <div class="app">
-    <aside class="sidebar">
-      <div class="brand">
-        <svg class="brand-mark" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-          <path d="M12 2 22 12 12 22 2 12Z" fill="currentColor" />
-        </svg>
-        <span class="brand-name">{{ app.name }}</span>
-      </div>
-      <nav class="nav">
-        <RouterLink to="/" class="nav-link">Home</RouterLink>
-        <RouterLink to="/portfolio" class="nav-link">Portfolio</RouterLink>
-        <RouterLink to="/broker" class="nav-link">IBKR</RouterLink>
-        <RouterLink to="/status" class="nav-link">Status</RouterLink>
-      </nav>
-      <p class="tagline">{{ app.tagline }}</p>
-    </aside>
     <main class="content">
       <RouterView />
     </main>
+
+    <!-- Floating liquid-glass dock (all screens). Jarvis is the primary tab. -->
+    <nav class="dock">
+      <RouterLink
+        v-for="t in tabs"
+        :key="t.to"
+        :to="t.to"
+        class="tab"
+        :class="{ primary: t.to === '/' }"
+      >
+        <NavIcon :name="t.icon" />
+        <span>{{ t.label }}</span>
+      </RouterLink>
+    </nav>
   </div>
 </template>

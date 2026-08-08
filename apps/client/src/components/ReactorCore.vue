@@ -3,20 +3,15 @@
 // fountain), rotating SVG rings + ticks, and a conic radar sweep. Purely
 // presentational — the readout text is passed in via props.
 import { ref, onMounted, onBeforeUnmount } from "vue";
+import { accentRgb } from "../theme";
 
 withDefaults(
   defineProps<{
-    label?: string;
-    value?: string | number;
-    sub?: string;
-    status?: string;
+    name?: string;
     active?: boolean;
   }>(),
   {
-    label: "NEURAL CORE",
-    value: "",
-    sub: "",
-    status: "ONLINE",
+    name: "Jarvis",
     active: true,
   },
 );
@@ -27,6 +22,9 @@ let ctx: CanvasRenderingContext2D | null = null;
 
 const SIZE = 360; // internal drawing resolution (square user units)
 const N = 150;
+let cr = 96,
+  cg = 255,
+  cb = 184; // particle colour (follows the accent)
 
 type P = { a: number; r: number; life: number; max: number; sp: number; sz: number };
 const parts: P[] = [];
@@ -65,7 +63,7 @@ function drawFrame() {
     const x = cx + Math.cos(p.a) * rr;
     const y = cy + Math.sin(p.a) * rr * 0.55 - t * 34; // slight upward drift
     const alpha = Math.sin(t * Math.PI) * 0.8;
-    c.fillStyle = `rgba(96, 255, 184, ${alpha.toFixed(3)})`;
+    c.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${alpha.toFixed(3)})`;
     c.beginPath();
     c.arc(x, y, p.sz, 0, Math.PI * 2);
     c.fill();
@@ -73,8 +71,8 @@ function drawFrame() {
 
   // soft central bloom
   const g = c.createRadialGradient(cx, cy, 0, cx, cy, 96);
-  g.addColorStop(0, "rgba(56,245,160,0.20)");
-  g.addColorStop(1, "rgba(56,245,160,0)");
+  g.addColorStop(0, `rgba(${cr}, ${cg}, ${cb}, 0.20)`);
+  g.addColorStop(1, `rgba(${cr}, ${cg}, ${cb}, 0)`);
   c.fillStyle = g;
   c.fillRect(0, 0, SIZE, SIZE);
   c.globalCompositeOperation = "source-over";
@@ -90,6 +88,7 @@ onMounted(() => {
   el.height = SIZE * dpr;
   ctx = el.getContext("2d");
   if (ctx) ctx.scale(dpr, dpr);
+  [cr, cg, cb] = accentRgb();
   init();
 
   const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
@@ -130,12 +129,7 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
     </svg>
 
     <div class="core-readout">
-      <div class="core-status">
-        <span class="core-dot"></span>{{ status }}
-      </div>
-      <div class="core-value">{{ value }}</div>
-      <div class="core-label">{{ label }}</div>
-      <div v-if="sub" class="core-sub">{{ sub }}</div>
+      <div class="core-name">{{ name }}</div>
     </div>
   </div>
 </template>
@@ -143,10 +137,10 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
 <style scoped>
 .core {
   position: relative;
-  width: min(46vh, 400px);
+  width: min(var(--core-size, 400px), 90vw);
   aspect-ratio: 1;
   margin: 0 auto;
-  filter: drop-shadow(0 0 24px rgba(52, 245, 160, 0.14));
+  filter: drop-shadow(0 0 28px rgba(52, 245, 160, 0.16));
 }
 
 .core-canvas,
@@ -225,56 +219,20 @@ onBeforeUnmount(() => cancelAnimationFrame(raf));
   pointer-events: none;
 }
 
-.core-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 0.18em;
-  color: var(--accent-2);
-  margin-bottom: 6px;
-}
-
-.core-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 8px var(--accent);
-  animation: blink 2.4s ease-in-out infinite;
-}
-
-.core-value {
-  font-size: 58px;
+.core-name {
+  font-size: clamp(34px, 8vh, 66px);
   font-weight: 700;
   line-height: 1;
+  letter-spacing: 0.14em;
   color: #eafff4;
-  text-shadow: 0 0 18px rgba(52, 245, 160, 0.5);
-  font-variant-numeric: tabular-nums;
-}
-
-.core-label {
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.26em;
-  color: var(--accent);
-  margin-top: 8px;
-}
-
-.core-sub {
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 0.12em;
-  color: var(--muted);
-  margin-top: 4px;
+  text-shadow: 0 0 22px rgba(52, 245, 160, 0.55), 0 0 6px rgba(52, 245, 160, 0.4);
+  text-indent: 0.14em; /* balance the trailing letter-spacing */
 }
 
 .core.idle {
   filter: grayscale(0.5) drop-shadow(0 0 10px rgba(120, 120, 120, 0.1));
-  opacity: 0.75;
+  opacity: 0.8;
 }
-.core.idle .core-dot { background: #f0a848; box-shadow: 0 0 8px #f0a848; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes sweep { to { transform: rotate(360deg); } }
