@@ -147,6 +147,22 @@ pub async fn get_user(pool: &PgPool, id: Uuid) -> Result<Option<User>, IdentityE
     Ok(user)
 }
 
+/// Return the (single) existing user, or create one. Jarvis is single-user, so
+/// device enrollment attaches every device to this account.
+pub async fn first_user_or_create(
+    pool: &PgPool,
+    display_name: &str,
+) -> Result<User, IdentityError> {
+    if let Some(user) =
+        sqlx::query_as::<_, User>("select * from users order by created_at asc limit 1")
+            .fetch_optional(pool)
+            .await?
+    {
+        return Ok(user);
+    }
+    create_user(pool, display_name).await
+}
+
 /// Register a device for a user together with its initial public key.
 /// The device and its key are created atomically.
 pub async fn register_device(

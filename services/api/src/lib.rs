@@ -31,6 +31,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", get(root))
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
+        .route("/v1/auth/enroll", post(auth_enroll))
         .route("/v1/auth/challenge", post(auth_challenge))
         .route("/v1/auth/login", post(auth_login))
         .route("/v1/devices", get(list_devices))
@@ -76,6 +77,10 @@ fn internal(_e: identity::IdentityError) -> (StatusCode, Json<Value>) {
     )
 }
 
+fn bad_request(message: &str) -> (StatusCode, Json<Value>) {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": message })))
+}
+
 /// Authenticated principal, extracted from a `Bearer` session token.
 pub struct Authed {
     pub user: identity::User,
@@ -100,6 +105,51 @@ impl FromRequestParts<AppState> for Authed {
             .map_err(|_| unauthorized())?;
         Ok(Authed { user, device })
     }
+}
+
+#[derive(Deserialize)]
+struct EnrollReq {
+    name: String,
+    platform: String,
+    /// Hex-encoded Ed25519 public key.
+    public_key: String,
+}
+
+/// Dev-only device enrollment: create the single user if needed and register
+/// the calling device with its public key. Disabled in production.
+async fn auth_enroll(
+    State(state): State<AppState>,
+    Json(req): Json<EnrollReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if state.environment == "production" {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "enrollment is disabled in production" })),
+        ));
+    }
+    let platform =
+        identity::Platform::parse(&req.platform).map_err(|_| bad_request("unknown platform"))?;
+    let public_key =
+        hex::decode(&req.public_key).map_err(|_| bad_request("invalid public_key encoding"))?;
+
+    let user = identity::first_user_or_create(&state.db, "Jarvis user")
+        .await
+        .map_err(internal)?;
+    let (device, _key) = identity::register_device(
+        &state.db,
+        user.id,
+        &req.name,
+        platform,
+        "ed25519",
+        &public_key,
+    )
+    .await
+    .map_err(internal)?;
+
+    Ok(Json(json!({
+        "user_id": user.id,
+        "device_id": device.id,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -202,27 +252,41 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn auth_flow_over_http(pool: PgPool) {
-        let user = identity::create_user(&pool, "Gus").await.unwrap();
         let mut seed = [0u8; 32];
         OsRng.fill_bytes(&mut seed);
         let signing = SigningKey::from_bytes(&seed);
-        let (device, _key) = identity::register_device(
-            &pool,
-            user.id,
-            "iPhone",
-            identity::Platform::Ios,
-            "ed25519",
-            &signing.verifying_key().to_bytes(),
-        )
-        .await
-        .unwrap();
+        let public_key = hex::encode(signing.verifying_key().to_bytes());
 
         let app = build_router(AppState {
             db: pool.clone(),
             environment: "test".to_string(),
         });
 
-        // 1. request a challenge
+        // 1. enroll this device (dev endpoint)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/enroll")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "name": "iPhone",
+                            "platform": "ios",
+                            "public_key": public_key,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let enroll = body_json(resp).await;
+        let device_id = enroll["device_id"].as_str().unwrap().to_string();
+
+        // 2. request a challenge
         let resp = app
             .clone()
             .oneshot(
@@ -231,7 +295,7 @@ mod tests {
                     .uri("/v1/auth/challenge")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        serde_json::to_vec(&json!({ "device_id": device.id })).unwrap(),
+                        serde_json::to_vec(&json!({ "device_id": device_id })).unwrap(),
                     ))
                     .unwrap(),
             )
@@ -253,7 +317,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "device_id": device.id,
+                            "device_id": device_id,
                             "challenge_id": challenge_id,
                             "signature": signature,
                         }))
