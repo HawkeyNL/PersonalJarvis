@@ -329,8 +329,15 @@ pub async fn login(
     })
 }
 
-/// Validate a raw session token; returns the authenticated user and device.
-pub async fn authenticate(pool: &PgPool, token: &str) -> Result<(User, Device), IdentityError> {
+/// The authenticated principal behind a valid session token.
+pub struct Authenticated {
+    pub user: User,
+    pub device: Device,
+    pub session_id: Uuid,
+}
+
+/// Validate a raw session token; returns the authenticated principal.
+pub async fn authenticate(pool: &PgPool, token: &str) -> Result<Authenticated, IdentityError> {
     let raw = hex::decode(token).map_err(|_| IdentityError::AuthFailed)?;
     let token_hash = Sha256::digest(&raw).to_vec();
 
@@ -357,7 +364,20 @@ pub async fn authenticate(pool: &PgPool, token: &str) -> Result<(User, Device), 
         .fetch_one(pool)
         .await?;
 
-    Ok((user, device))
+    Ok(Authenticated {
+        user,
+        device,
+        session_id: session.id,
+    })
+}
+
+/// Fetch a device by id.
+pub async fn get_device(pool: &PgPool, id: Uuid) -> Result<Option<Device>, IdentityError> {
+    let device = sqlx::query_as::<_, Device>("select * from devices where id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(device)
 }
 
 /// Revoke a session. Idempotent.
@@ -456,9 +476,9 @@ mod tests {
         let signature = signing.sign(&challenge.nonce).to_bytes();
 
         let result = login(&pool, device.id, challenge.id, &signature).await?;
-        let (u, d) = authenticate(&pool, &result.token).await?;
-        assert_eq!(u.id, user.id);
-        assert_eq!(d.id, device.id);
+        let auth = authenticate(&pool, &result.token).await?;
+        assert_eq!(auth.user.id, user.id);
+        assert_eq!(auth.device.id, device.id);
 
         // A challenge cannot be replayed.
         assert!(login(&pool, device.id, challenge.id, &signature)

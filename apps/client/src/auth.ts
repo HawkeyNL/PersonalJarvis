@@ -4,7 +4,7 @@
 // orchestrates the HTTP flow (enroll -> challenge -> login) and reads back the
 // session state. The private key never enters JS.
 import { invoke } from "@tauri-apps/api/core";
-import { getJsonAuth, postJson } from "./api";
+import { getJsonAuth, postAuth, postJson } from "./api";
 
 export type Session = {
   device_id: string | null;
@@ -57,6 +57,15 @@ export async function login(): Promise<void> {
 }
 
 export async function logout(): Promise<void> {
+  const session = await currentSession();
+  if (session.token) {
+    // Best-effort server-side revocation; clear locally regardless.
+    try {
+      await postAuth("/v1/auth/logout", session.token);
+    } catch {
+      /* ignore */
+    }
+  }
   await invoke("auth_logout");
 }
 

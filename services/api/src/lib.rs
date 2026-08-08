@@ -5,9 +5,9 @@
 //! `Bearer` session token (see [`Authed`]).
 
 use axum::{
-    extract::{FromRequestParts, State},
+    extract::{FromRequestParts, Path, State},
     http::{header::AUTHORIZATION, request::Parts, StatusCode},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -34,7 +34,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/enroll", post(auth_enroll))
         .route("/v1/auth/challenge", post(auth_challenge))
         .route("/v1/auth/login", post(auth_login))
+        .route("/v1/auth/logout", post(auth_logout))
         .route("/v1/devices", get(list_devices))
+        .route("/v1/devices/{id}", delete(delete_device))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -85,6 +87,7 @@ fn bad_request(message: &str) -> (StatusCode, Json<Value>) {
 pub struct Authed {
     pub user: identity::User,
     pub device: identity::Device,
+    pub session_id: Uuid,
 }
 
 impl FromRequestParts<AppState> for Authed {
@@ -100,10 +103,14 @@ impl FromRequestParts<AppState> for Authed {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "))
             .ok_or_else(unauthorized)?;
-        let (user, device) = identity::authenticate(&state.db, token)
+        let auth = identity::authenticate(&state.db, token)
             .await
             .map_err(|_| unauthorized())?;
-        Ok(Authed { user, device })
+        Ok(Authed {
+            user: auth.user,
+            device: auth.device,
+            session_id: auth.session_id,
+        })
     }
 }
 
@@ -220,6 +227,40 @@ async fn list_devices(
         })
         .collect();
     Ok(Json(json!({ "devices": items })))
+}
+
+/// Log out: revoke the current session server-side.
+async fn auth_logout(
+    authed: Authed,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    identity::revoke_session(&state.db, authed.session_id)
+        .await
+        .map_err(internal)?;
+    Ok(Json(json!({ "status": "logged out" })))
+}
+
+/// Revoke one of the authenticated user's devices.
+async fn delete_device(
+    authed: Authed,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match identity::get_device(&state.db, id)
+        .await
+        .map_err(internal)?
+    {
+        Some(device) if device.user_id == authed.user.id => {
+            identity::revoke_device(&state.db, id)
+                .await
+                .map_err(internal)?;
+            Ok(Json(json!({ "status": "revoked" })))
+        }
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "device not found" })),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -359,5 +400,34 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         assert_eq!(body["devices"].as_array().unwrap().len(), 1);
+
+        // 5. logout revokes the session server-side
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/logout")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 6. the revoked token no longer authenticates
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/devices")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

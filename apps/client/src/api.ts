@@ -34,3 +34,13 @@ export async function getJsonAuth<T>(path: string, token: string): Promise<T> {
   }
   return (await res.json()) as T;
 }
+
+export async function postAuth(path: string, token: string): Promise<void> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+}
