@@ -11,6 +11,7 @@ import {
 import { listHoldings } from "../portfolio";
 import { ibkrStatus, type IbkrStatus } from "../ibkr";
 import ReactorCore from "../components/ReactorCore.vue";
+import AssistantChat from "../components/AssistantChat.vue";
 
 type State = "checking" | "ok" | "fout";
 
@@ -145,7 +146,27 @@ onBeforeUnmount(() => {
 <template>
   <section class="hud">
     <div class="hud-grid">
-      <!-- LEFT: system telemetry -->
+      <!-- LEFT: conversation with Jarvis -->
+      <div class="col col-chat">
+        <AssistantChat />
+      </div>
+
+      <!-- CENTER: reactor core -->
+      <div class="col col-core">
+        <ReactorCore name="Jarvis" :active="online" />
+        <div class="meters">
+          <div class="meter" v-for="m in meters" :key="m.key">
+            <span class="meter-k">{{ m.key }}</span>
+            <span class="meter-bar"><i :style="{ width: m.pct + '%' }"></i></span>
+          </div>
+        </div>
+        <div class="core-actions">
+          <button v-if="auth === 'in'" class="ghost" @click="doLogout">Uitloggen</button>
+          <button v-else-if="auth === 'uit'" @click="boot">Inloggen</button>
+        </div>
+      </div>
+
+      <!-- RIGHT: telemetry -->
       <div class="col">
         <div class="panel">
           <div class="panel-head">SYSTEM STATUS <span class="hint">live</span></div>
@@ -168,36 +189,6 @@ onBeforeUnmount(() => {
           </ul>
         </div>
 
-        <div class="panel">
-          <div class="panel-head">DEVICE MESH <span class="hint">{{ devices.length }}</span></div>
-          <ul class="tel" v-if="devices.length">
-            <li v-for="d in devices" :key="d.id">
-              <span class="dot dot-ok"></span>
-              <span class="k">{{ d.name }}</span>
-              <span class="v mono">{{ d.platform }}</span>
-            </li>
-          </ul>
-          <p v-else class="empty">geen apparaten gekoppeld</p>
-        </div>
-      </div>
-
-      <!-- CENTER: reactor core -->
-      <div class="col col-core">
-        <ReactorCore name="Jarvis" :active="online" />
-        <div class="meters">
-          <div class="meter" v-for="m in meters" :key="m.key">
-            <span class="meter-k">{{ m.key }}</span>
-            <span class="meter-bar"><i :style="{ width: m.pct + '%' }"></i></span>
-          </div>
-        </div>
-        <div class="core-actions">
-          <button v-if="auth === 'in'" class="ghost" @click="doLogout">Uitloggen</button>
-          <button v-else-if="auth === 'uit'" @click="boot">Inloggen</button>
-        </div>
-      </div>
-
-      <!-- RIGHT: portfolio, broker, feed -->
-      <div class="col">
         <div class="panel">
           <div class="panel-head">PORTFOLIO <span class="hint">basis</span></div>
           <div class="big-stat">
@@ -334,11 +325,13 @@ onBeforeUnmount(() => {
 
 .hud-grid {
   display: grid;
-  grid-template-columns: minmax(200px, 1fr) minmax(320px, 1.4fr) minmax(220px, 1fr);
+  grid-template-columns: minmax(300px, 1.1fr) minmax(320px, 1.3fr) minmax(240px, 1fr);
   gap: 18px;
   min-height: calc(100vh - 150px);
   align-items: stretch;
 }
+
+.col-chat { min-height: 360px; }
 
 .col { display: flex; flex-direction: column; gap: 16px; }
 .col-core {

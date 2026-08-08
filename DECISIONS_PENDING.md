@@ -8,3 +8,4 @@
 - DEC-006 Riskdefault: voorstel 0,5%, normale bovengrens 1%
 - DEC-007 Bestaande pc, nieuwe GPU of vooral API's
 - DEC-008 Eigen VPS of dedicated backend-VPS
+- DEC-009 STT-provider (spraak-naar-tekst): cloud versus lokaal/on-device (TTS = Fish Audio)
