@@ -33,6 +33,10 @@ pub struct AppConfig {
     /// Deployment environment name (e.g. `development`, `production`).
     #[serde(default = "default_environment")]
     pub environment: String,
+
+    /// Base URL of the IBKR Client Portal Gateway (read-only proxy target).
+    #[serde(default = "default_ibkr_gateway_url")]
+    pub ibkr_gateway_url: String,
 }
 
 fn default_bind_addr() -> String {
@@ -41,6 +45,10 @@ fn default_bind_addr() -> String {
 
 fn default_environment() -> String {
     "development".to_string()
+}
+
+fn default_ibkr_gateway_url() -> String {
+    "https://localhost:5000/v1/api".to_string()
 }
 
 impl AppConfig {
@@ -62,6 +70,7 @@ impl fmt::Debug for AppConfig {
             .field("database_url", &"<redacted>")
             .field("log_json", &self.log_json)
             .field("environment", &self.environment)
+            .field("ibkr_gateway_url", &self.ibkr_gateway_url)
             .finish()
     }
 }
@@ -77,6 +86,7 @@ mod tests {
             database_url: "postgres://user:supersecret@localhost/jarvis".to_string(),
             log_json: false,
             environment: "test".to_string(),
+            ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
         };
 
         let rendered = format!("{cfg:?}");

@@ -7,7 +7,7 @@ Blueprint v2.6
 Fase 2 gestart: handmatig portfolio (holdings) werkt op iOS + macOS, achter de device-login. Fase 0 + Fase 1 afgerond.
 
 ## Eerstvolgende taak
-B — marktdata-provider kiezen (DEC-002) voor live koersen: actuele waarde + winst/verlies bovenop de handmatige posities.
+IBKR live verifiëren zodra de Client Portal Gateway draait + ingelogd (paper eerst); daarna B — marktdata-provider (DEC-002) voor live koersen.
 
 ## Klaar
 - Productvisie
@@ -26,6 +26,7 @@ B — marktdata-provider kiezen (DEC-002) voor live koersen: actuele waarde + wi
 - Client-login werkend op iOS + macOS: keypair + signeren in Rust, dev auto-enroll + login, apparatenlijst via Bearer-token — geverifieerd met screenshot op iOS-simulator
 - Fase 1-hardening: server-side logout + owner-checked device-revocatie; privésleutel in OS-keychain (`keyring`, Apple-backend) met app-privé fallback — iOS-build met keyring geverifieerd
 - Fase 2 — portfolio: `holdings`-tabel (Decimal-geld) + `jarvis-portfolio` + beveiligde `/v1/holdings` (GET/POST/DELETE) met kostenbasis/allocatie; client Portfolio-scherm + Home-samenvatting. iOS geverifieerd (dashboard: "3 posities · kostenbasis 7842.75")
+- IBKR read-only adapter (DEC-003 → ADR-013: Client Portal Web API): crate `jarvis-ibkr` (auth-status/accounts/positions + contracttests), beveiligde `/v1/broker/ibkr/status`+`/positions`, client IBKR-scherm. Live nog te testen met draaiende gateway.
 
 ## Blockers/beslissingen
 - Primaire LLM-provider
@@ -46,3 +47,4 @@ B — marktdata-provider kiezen (DEC-002) voor live koersen: actuele waarde + wi
 - Client-login bedraad: Rust-commands (device_info/auth_public_key/auth_sign/auth_save/auth_session/auth_logout), dev-enroll-endpoint, `auth.ts`-flow + Home-UI. Volledige device-bound login end-to-end op iOS-simulator geverifieerd (screenshot: "ingelogd" + apparaat).
 - Fase 1 afgerond: revocatie-endpoints (`/v1/auth/logout`, `DELETE /v1/devices/{id}`) + client-logout server-side; privésleutel naar OS-keychain (`keyring`) met fallback. iOS-e2e opnieuw geverifieerd.
 - Fase 2 gestart — portfolio: migratie 0004 (`holdings`, numeric-geld) + crate `jarvis-portfolio` + beveiligde `/v1/holdings`-endpoints (kostenbasis/allocatie); client Portfolio-view + Home-samenvatting. iOS-dashboard geverifieerd met geseede posities (kostenbasis 7842.75, exacte Decimal). Provider-vrij; live koersen = B.
+- IBKR read-only: DEC-003 gekozen (ADR-013, Client Portal Web API). Crate `jarvis-ibkr` (reqwest-client + getypeerde auth-status/accounts/positions + contracttests), config `JARVIS_IBKR_GATEWAY_URL`, beveiligde `/v1/broker/ibkr/status`+`/positions`, client IBKR-scherm. Build/clippy/tests groen. Live verificatie vereist draaiende Client Portal Gateway + interactieve SSO/2FA-login (door gebruiker).

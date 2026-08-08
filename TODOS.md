@@ -356,7 +356,7 @@ Status: `[ ] TODO`, `[-] IN PROGRESS`, `[x] DONE`, `[!] BLOCKED`, `[?] NEEDS DEC
 - [ ] JAR-305 Deterministic allocator
 
 ## P4 — IBKR
-- [ ] JAR-400 API access spike
+- [x] JAR-400 API access spike (route: Client Portal Web API — ADR-013; read-only adapter `jarvis-ibkr` gebouwd)
 - [ ] JAR-401 Paper connection
 - [ ] JAR-402 Accounts/cash/positions
 - [ ] JAR-403 Orders/executions read-only

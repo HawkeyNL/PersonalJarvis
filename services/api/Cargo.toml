@@ -29,6 +29,7 @@ jarvis-config.workspace = true
 jarvis-observability.workspace = true
 jarvis-identity.workspace = true
 jarvis-portfolio.workspace = true
+jarvis-ibkr.workspace = true
 rust_decimal.workspace = true
 
 [dev-dependencies]

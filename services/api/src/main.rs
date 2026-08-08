@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         db,
         environment: config.environment.clone(),
+        ibkr_gateway_url: config.ibkr_gateway_url.clone(),
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

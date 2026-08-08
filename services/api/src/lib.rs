@@ -4,8 +4,10 @@
 //! (`/v1/auth/challenge`, `/v1/auth/login`). Protected endpoints require a
 //! `Bearer` session token (see [`Authed`]).
 
+use std::collections::HashMap;
+
 use axum::{
-    extract::{FromRequestParts, Path, State},
+    extract::{FromRequestParts, Path, Query, State},
     http::{header::AUTHORIZATION, request::Parts, StatusCode},
     routing::{delete, get, post},
     Json, Router,
@@ -16,6 +18,7 @@ use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
+use jarvis_ibkr as ibkr;
 use jarvis_identity as identity;
 use jarvis_portfolio as portfolio;
 use rust_decimal::Decimal;
@@ -25,6 +28,7 @@ use rust_decimal::Decimal;
 pub struct AppState {
     pub db: PgPool,
     pub environment: String,
+    pub ibkr_gateway_url: String,
 }
 
 /// Build the application router.
@@ -41,6 +45,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/devices/{id}", delete(delete_device))
         .route("/v1/holdings", get(get_holdings).post(add_holding))
         .route("/v1/holdings/{id}", delete(remove_holding))
+        .route("/v1/broker/ibkr/status", get(ibkr_status))
+        .route("/v1/broker/ibkr/positions", get(ibkr_positions))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -367,6 +373,64 @@ async fn remove_holding(
     }
 }
 
+fn ibkr_down() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "IBKR gateway not connected",
+            "hint": "start de Client Portal Gateway en log in (paper of live)",
+        })),
+    )
+}
+
+/// IBKR gateway reachability + auth status (read-only).
+async fn ibkr_status(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
+    let client = match ibkr::IbkrClient::new(&state.ibkr_gateway_url) {
+        Ok(c) => c,
+        Err(_) => return Json(json!({ "reachable": false, "authenticated": false })),
+    };
+    match client.auth_status().await {
+        Ok(s) => Json(json!({
+            "reachable": true,
+            "authenticated": s.authenticated,
+            "connected": s.connected,
+        })),
+        Err(_) => Json(json!({
+            "reachable": false,
+            "authenticated": false,
+            "hint": "start de IBKR Client Portal Gateway en log in",
+        })),
+    }
+}
+
+/// IBKR positions for an account (read-only). `?account=` selects the account;
+/// otherwise the first account in the session is used.
+async fn ibkr_positions(
+    _authed: Authed,
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let client = ibkr::IbkrClient::new(&state.ibkr_gateway_url).map_err(|_| ibkr_down())?;
+    let status = client.auth_status().await.map_err(|_| ibkr_down())?;
+    if !status.authenticated {
+        return Err(ibkr_down());
+    }
+    let account = match params.get("account") {
+        Some(a) => a.clone(),
+        None => client
+            .accounts()
+            .await
+            .map_err(|_| ibkr_down())?
+            .into_iter()
+            .next()
+            .map(|a| a.account_id)
+            .ok_or_else(ibkr_down)?,
+    };
+    let positions = client.positions(&account).await.map_err(|_| ibkr_down())?;
+    let positions = serde_json::to_value(&positions).unwrap_or_else(|_| json!([]));
+    Ok(Json(json!({ "account": account, "positions": positions })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +469,7 @@ mod tests {
         let app = build_router(AppState {
             db: pool.clone(),
             environment: "test".to_string(),
+            ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
         });
 
         // 1. enroll this device (dev endpoint)

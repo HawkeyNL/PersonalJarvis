@@ -16,6 +16,7 @@ const app = useAppStore();
       <nav class="nav">
         <RouterLink to="/" class="nav-link">Home</RouterLink>
         <RouterLink to="/portfolio" class="nav-link">Portfolio</RouterLink>
+        <RouterLink to="/broker" class="nav-link">IBKR</RouterLink>
         <RouterLink to="/status" class="nav-link">Status</RouterLink>
       </nav>
       <p class="tagline">{{ app.tagline }}</p>
