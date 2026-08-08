@@ -4,10 +4,10 @@
 Blueprint v2.6
 
 ## Huidige fase
-Fase 0 — fundament. Backend én Tauri/Vue-client (macOS) gebouwd en geverifieerd.
+Fase 0 afgerond: backend + Tauri/Vue-client op macOS én iOS-simulator gebouwd en geverifieerd.
 
 ## Eerstvolgende taak
-iOS-target voor de Tauri-client (vereist volledige Xcode), daarna `JAR-100 — User/device model`.
+Fase 1 — `JAR-100 — User/device model` (identity + sync).
 
 ## Klaar
 - Productvisie
@@ -19,7 +19,7 @@ iOS-target voor de Tauri-client (vereist volledige Xcode), daarna `JAR-100 — U
 - Risk/backtest/securityprincipes
 - Centrale TODO- en stappenstructuur
 - JAR-001/002/003 gebouwd en geverifieerd: Rust workspace, Axum API (/livez, /readyz), typed config, tracing, SQLx-migraties, Docker dev-stack en CI
-- Tauri 2 + Vue 3 client (Pinia + Vue Router) — macOS-app `Jarvis.app` gebouwd en geverifieerd
+- Tauri 2 + Vue 3 client (Pinia + Vue Router) — `Jarvis.app` gebouwd en geverifieerd op macOS én iOS-simulator (iPhone 17, iOS 26.3)
 
 ## Blockers/beslissingen
 - Primaire LLM-provider
@@ -33,4 +33,4 @@ iOS-target voor de Tauri-client (vereist volledige Xcode), daarna `JAR-100 — U
 8 augustus 2026
 
 - JAR-001 geïmplementeerd: Rust workspace, Axum API (/livez, /readyz), typed config, tracing, SQLx-migraties, Docker dev-stack en CI. Build/clippy/fmt/test groen; /readyz getest tegen Postgres 17.
-- Tauri 2 + Vue 3 client (`apps/client`, Pinia + Vue Router) gescaffold; macOS `Jarvis.app` gebouwd en geverifieerd. iOS volgt.
+- Tauri 2 + Vue 3 client (`apps/client`, Pinia + Vue Router) gescaffold; macOS `Jarvis.app` gebouwd en geverifieerd. iOS-project gegenereerd; simulator-build (iOS 26.3, iPhone 17) draait en geverifieerd met screenshot. Fase 0 afgerond.

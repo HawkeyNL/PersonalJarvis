@@ -44,7 +44,7 @@ Iedere coding-agent moet na werk taken afvinken, nieuwe taken toevoegen, tests v
 
 ### Fase 0 — fundament
 - [x] Rust workspace
-- [x] Tauri 2 + Vue 3 (macOS; iOS volgt)
+- [x] Tauri 2 + Vue 3 (macOS + iOS)
 - [x] Axum API
 - [x] PostgreSQL + SQLx
 - [x] Docker Compose
