@@ -4,6 +4,88 @@
 
 Deze repository is het centrale besturingsdocument voor mensen en coding-agents.
 
+## Lokaal opstarten
+
+Snelstart om de volledige keten (Postgres → API → client) op je Mac te draaien.
+Uitgebreide uitleg staat in [`DEVELOPMENT.md`](DEVELOPMENT.md).
+
+### Benodigdheden
+
+- **Rust** (stable, via [rustup](https://rustup.rs)) — versie gepind in `rust-toolchain.toml`
+- **Node 24** via [nvm](https://github.com/nvm-sh/nvm) — gepind in `.nvmrc`
+- **Docker Desktop** — voor de lokale Postgres
+- **Xcode 26** (volledig, niet alleen CommandLineTools) — alleen nodig voor de macOS/iOS-client
+
+### 1. Backend (API + database)
+
+```bash
+# a. Start Postgres (wacht tot 'healthy')
+docker compose -f deploy/compose/docker-compose.yml up -d --wait
+
+# b. Kopieer de voorbeeld-config (pas aan indien nodig)
+cp .env.example .env
+
+# c. Start de API — draait de migraties automatisch bij het opstarten
+cargo run -p jarvis-api
+```
+
+De API luistert op **`http://localhost:8080`** (`JARVIS_BIND_ADDR` in `.env`).
+Snel testen: `curl http://localhost:8080/livez` en `curl http://localhost:8080/readyz`.
+
+Belangrijkste endpoints:
+
+| Methode | Pad | Doel |
+|---------|-----|------|
+| GET | `/livez` · `/readyz` | liveness / readiness (pingt Postgres) |
+| POST | `/v1/auth/enroll` · `/challenge` · `/login` · `/logout` | device-bound auth (Ed25519) |
+| GET/DELETE | `/v1/devices` · `/v1/devices/{id}` | apparatenbeheer (Bearer-token) |
+| GET/POST/DELETE | `/v1/holdings` · `/v1/holdings/{id}` | portfolio (Decimal-geld) |
+| GET | `/v1/broker/ibkr/status` · `/positions` | IBKR read-only (via gateway) |
+
+### 2. Client (macOS)
+
+In een **tweede terminal**, met de API draaiend:
+
+```bash
+cd apps/client
+nvm use            # Node 24 (zie .nvmrc)
+npm install        # eenmalig
+npm run tauri dev  # hot-reload dev-venster
+```
+
+Native `.app` bouwen: `npm run tauri build -- --bundles app`
+→ `apps/client/src-tauri/target/release/bundle/macos/Jarvis.app`.
+
+### 3. Client (iOS-simulator, optioneel)
+
+```bash
+cd apps/client
+npm run tauri ios init                          # eenmalig
+npm run tauri ios build -- --target aarch64-sim --ci
+xcrun simctl install booted <pad/naar/Jarvis.app>
+xcrun simctl launch booted com.hawkeynl.jarvis
+```
+
+### 4. IBKR live koppelen (optioneel, read-only)
+
+De backend proxeert alleen; het inloggen (SSO + 2FA) gebeurt in de **IBKR Client
+Portal Gateway** die jij lokaal draait. Zet daarna `JARVIS_IBKR_GATEWAY_URL` in
+`.env` (default `https://localhost:5000/v1/api`) en herstart de API. **Paper eerst.**
+
+### Checks (zoals in CI)
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
+```
+
+Integratietests (`#[sqlx::test]`) hebben een draaiende Postgres + `DATABASE_URL` nodig:
+
+```bash
+DATABASE_URL=postgres://jarvis:jarvis_dev_pw@localhost:5432/jarvis cargo test --all
+```
+
 ## Voortgang bijhouden
 
 - `README.md`: globale fasen en afvinkbare roadmap.

@@ -1,11 +1,12 @@
 :root {
-  --bg: #14161a;
-  --panel: #1b1e24;
-  --border: #2a2f37;
-  --text: #e6e8eb;
-  --muted: #9aa2ad;
-  --accent: #4c8dff;
-  --accent-2: #22c8db;
+  --bg: #050a08;
+  --panel: #0a1410;
+  --border: #17402e;
+  --text: #dff3e8;
+  --muted: #7d9a8e;
+  --accent: #34f5a0;
+  --accent-2: #7dffc0;
+  --mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
 
   font-family: Inter, Avenir, system-ui, -apple-system, sans-serif;
   color: var(--text);
@@ -77,7 +78,7 @@ body {
 }
 
 .nav-link.router-link-active {
-  background: rgba(76, 141, 255, 0.15);
+  background: rgba(52, 245, 160, 0.14);
   color: var(--text);
 }
 
@@ -142,11 +143,12 @@ input:focus {
 
 button {
   background: var(--accent);
-  color: #fff;
+  color: #04140c;
   border: none;
   border-radius: 8px;
   padding: 8px 14px;
   font: inherit;
+  font-weight: 600;
   cursor: pointer;
 }
 
