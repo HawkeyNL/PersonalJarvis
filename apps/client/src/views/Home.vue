@@ -22,7 +22,6 @@ const portfolioCount = ref(0);
 const ibkr = ref<IbkrStatus | null>(null);
 const error = ref<string | null>(null);
 
-const clock = ref("--:--:--");
 const uptime = ref(0);
 const feed = ref<{ id: number; t: string; kind: string; msg: string }[]>([]);
 let feedId = 0;
@@ -131,10 +130,8 @@ async function doLogout() {
 
 onMounted(() => {
   clockTimer = window.setInterval(() => {
-    clock.value = fmtClock(new Date());
     uptime.value += 1;
   }, 1000);
-  clock.value = fmtClock(new Date());
   pollTimer = window.setInterval(pollBackend, 5000);
   boot();
 });
@@ -147,23 +144,6 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="hud">
-    <header class="hud-top">
-      <div class="hud-brand">
-        <span class="pulse" :class="{ off: !online }"></span>
-        <span class="wordmark">JARVIS</span>
-        <small>MK I</small>
-      </div>
-      <div class="hud-modes">
-        <span class="chip chip-on">SYSTEM</span>
-        <RouterLink to="/portfolio" class="chip">TRADING</RouterLink>
-      </div>
-      <div class="hud-engine">
-        <span class="dot" :class="online ? 'dot-ok' : backend === 'fout' ? 'dot-err' : 'dot-todo'"></span>
-        ENGINE {{ online ? "ONLINE" : backend === "fout" ? "OFFLINE" : "…" }}
-        <b class="clock">{{ clock }}</b>
-      </div>
-    </header>
-
     <div class="hud-grid">
       <!-- LEFT: system telemetry -->
       <div class="col">
@@ -356,8 +336,8 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: minmax(200px, 1fr) minmax(320px, 1.4fr) minmax(220px, 1fr);
   gap: 18px;
-  margin-top: 20px;
-  align-items: start;
+  min-height: calc(100vh - 150px);
+  align-items: stretch;
 }
 
 .col { display: flex; flex-direction: column; gap: 16px; }
