@@ -363,6 +363,18 @@ onMounted(refreshRoute);
   height: 17px;
 }
 
+/* Touch devices have no hover: keep the input visible and drop the peek hint. */
+@media (hover: none) {
+  .peek {
+    display: none;
+  }
+  .dock {
+    transform: none;
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .dots span,
   .dock,
