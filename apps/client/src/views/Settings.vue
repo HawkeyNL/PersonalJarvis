@@ -16,6 +16,13 @@ import {
   enroll,
   verify,
 } from "../voiceServer";
+import {
+  wakeEnabled,
+  wakeStatus,
+  wakeError,
+  wakeReady,
+  setWakeEnabled,
+} from "../voicewake";
 
 const accent = ref<Accent>(currentAccent());
 const session = ref<Session | null>(null);
@@ -151,6 +158,26 @@ onMounted(async () => {
 
       <p v-if="lastVerify && lastVerify.enrolled && lastVerify.transcript" class="small muted">
         Gehoord: "{{ lastVerify.transcript }}"
+      </p>
+
+      <label class="toggle" :class="{ off: !wakeReady }" style="margin-top: 14px">
+        <span class="tl">
+          <span class="tt">Luister naar "Hey Jarvis"</span>
+          <span class="td">
+            Werkt op elk toestel (in de app zelf). Alleen jouw stem wekt Jarvis.
+            Tot de auto-detectie er is: ⌘⇧J als test-trigger.
+          </span>
+        </span>
+        <input
+          type="checkbox"
+          :checked="wakeEnabled"
+          :disabled="!wakeReady"
+          @change="setWakeEnabled(($event.target as HTMLInputElement).checked)"
+        />
+        <span class="sw"></span>
+      </label>
+      <p class="small" :class="wakeError ? 'errc' : 'muted'">
+        {{ wakeError || "status: " + wakeStatus }}
       </p>
 
       <p class="muted small">
