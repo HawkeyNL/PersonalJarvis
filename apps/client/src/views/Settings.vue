@@ -4,9 +4,27 @@ import { API_BASE } from "../api";
 import { ACCENTS, PRESETS, currentAccent, applyAccent, type Accent } from "../theme";
 import { currentSession, logout, type Session } from "../auth";
 import { lockEnabled, isDesktop, setLockEnabled, initLock } from "../lock";
+import {
+  accessKey,
+  wakeEnabled,
+  enrolled,
+  enrolling,
+  enrollPct,
+  wakeStatus,
+  wakeError,
+  wakeReady,
+  setAccessKey,
+  enrollVoice,
+  setWakeEnabled,
+} from "../voicewake";
 
 const accent = ref<Accent>(currentAccent());
 const session = ref<Session | null>(null);
+const keyInput = ref(accessKey.value);
+
+function saveKey() {
+  setAccessKey(keyInput.value.trim());
+}
 
 const labels: Record<Accent, string> = {
   green: "Jarvis-groen",
@@ -99,6 +117,52 @@ onMounted(async () => {
     </div>
 
     <div class="panel glass">
+      <div class="panel-head">STEM-ACTIVATIE <span class="hint">"Hey Jarvis"</span></div>
+      <label class="field">
+        <span class="fl">Picovoice AccessKey</span>
+        <input
+          class="txt"
+          type="password"
+          v-model="keyInput"
+          placeholder="plak je gratis AccessKey"
+          @change="saveKey"
+        />
+      </label>
+      <p class="muted small">
+        Gratis persoonlijke sleutel via console.picovoice.ai — blijft lokaal op dit toestel.
+      </p>
+
+      <div class="enroll">
+        <button class="ghost" :disabled="!accessKey.trim() || enrolling" @click="enrollVoice">
+          {{ enrolled ? "Stem opnieuw opnemen" : "Neem je stem op" }}
+        </button>
+        <span v-if="enrolling" class="mono small">opnemen… {{ enrollPct }}%</span>
+        <span v-else-if="enrolled" class="mono small okc">stemprofiel ✓</span>
+      </div>
+      <p v-if="enrolling" class="muted small">Praat rustig door tot 100% (een paar zinnen).</p>
+
+      <label class="toggle" :class="{ off: !wakeReady }" style="margin-top: 6px">
+        <span class="tl">
+          <span class="tt">Luister naar "Hey Jarvis"</span>
+          <span class="td">
+            Alleen jouw stem activeert Jarvis. Vergrendeld start het Touch ID —
+            biometrie blijft het slot.
+          </span>
+        </span>
+        <input
+          type="checkbox"
+          :checked="wakeEnabled"
+          :disabled="!wakeReady"
+          @change="setWakeEnabled(($event.target as HTMLInputElement).checked)"
+        />
+        <span class="sw"></span>
+      </label>
+      <p class="small" :class="wakeError ? 'errc' : 'muted'">
+        {{ wakeError || "status: " + wakeStatus }}
+      </p>
+    </div>
+
+    <div class="panel glass">
       <div class="panel-head">SYSTEEM <span class="hint">info</span></div>
       <ul class="kv">
         <li><span class="k">Backend</span><span class="v mono">{{ API_BASE }}</span></li>
@@ -179,4 +243,16 @@ onMounted(async () => {
 .toggle input:checked ~ .sw { background: rgba(52, 245, 160, 0.25); border-color: var(--accent); }
 .toggle input:checked ~ .sw::after { transform: translateX(19px); background: var(--accent); }
 .toggle input:disabled ~ .sw { opacity: 0.5; }
+
+.field { display: flex; flex-direction: column; gap: 6px; }
+.fl { font-size: 13px; color: var(--muted); }
+.txt {
+  background: rgba(0, 0, 0, 0.25); border: 1px solid var(--border); color: var(--text);
+  border-radius: 10px; padding: 9px 12px; font: inherit; font-size: 13px;
+}
+.txt:focus { outline: none; border-color: var(--accent); }
+.enroll { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+.enroll .ghost { margin-top: 0; }
+.okc { color: var(--accent); }
+.errc { color: #f87171; }
 </style>

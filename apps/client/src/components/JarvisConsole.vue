@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, watch, onMounted } from "vue";
 import NavIcon from "./NavIcon.vue";
 import { messages, send, thinking } from "../assistant";
 import { useMic } from "../useMic";
+import { wakePulse } from "../voicewake";
 import {
   voiceEnabled,
   headset,
@@ -15,15 +16,27 @@ import {
 const text = ref("");
 const hovered = ref(false);
 const focused = ref(false);
+const woke = ref(false);
 const policy = computed(() => canSpeak());
 
 const mic = useMic((said) => send(said));
 
 // The input dock lifts into view on hover / focus / typing / while listening,
-// and tucks away again when you leave the bottom-left zone.
+// and after a "Hey Jarvis" wake; it tucks away again when you leave.
 const revealed = computed(
-  () => hovered.value || focused.value || !!text.value || mic.listening.value,
+  () => hovered.value || focused.value || woke.value || !!text.value || mic.listening.value,
 );
+
+// A verified "Hey Jarvis" reveals the console and starts listening.
+let wokeTimer: number | undefined;
+watch(wakePulse, () => {
+  woke.value = true;
+  clearTimeout(wokeTimer);
+  wokeTimer = window.setTimeout(() => {
+    woke.value = false;
+  }, 8000);
+  if (!mic.listening.value) mic.toggle();
+});
 
 // Only the last few turns float over the backdrop; older ones fade out.
 const recent = computed(() => messages.value.slice(-5));

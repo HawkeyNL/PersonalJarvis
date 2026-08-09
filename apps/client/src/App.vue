@@ -6,6 +6,7 @@ import AppLock from "./components/AppLock.vue";
 import UnlockApprovals from "./components/UnlockApprovals.vue";
 import { locked, initLock, noteActivity } from "./lock";
 import { startApprovalPolling, stopApprovalPolling } from "./unlockApprovals";
+import { maybeStartWake, stopWake } from "./voicewake";
 
 const route = useRoute();
 const mode = computed<"system" | "trading">(() =>
@@ -43,12 +44,14 @@ onMounted(() => {
   timer = window.setInterval(tick, 1000);
   initLock();
   startApprovalPolling(); // this device can approve other devices' unlocks
+  maybeStartWake(); // resume "Hey Jarvis" if it was enabled
   window.addEventListener("pointerdown", noteActivity, { passive: true });
   window.addEventListener("keydown", noteActivity);
 });
 onBeforeUnmount(() => {
   clearInterval(timer);
   stopApprovalPolling();
+  stopWake();
   window.removeEventListener("pointerdown", noteActivity);
   window.removeEventListener("keydown", noteActivity);
 });

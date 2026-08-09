@@ -89,6 +89,21 @@ backend-`.env` — nooit in de client.
 Zonder sleutel én zonder Ollama toont de chat een nette "brein niet
 bereikbaar"-melding.
 
+### 6. "Hey Jarvis" aanzetten (optioneel)
+
+Handsfree activeren met **"Hey Jarvis"**, en alleen jouw stem (on-device via
+Picovoice — geen audio verlaat je toestel; zie `decisions/ADR-024`).
+
+```bash
+cd apps/client
+npm run fetch-models   # haalt de Porcupine/Eagle-modellen (niet in git)
+```
+
+Daarna in de app onder **Settings → Stem-activatie**: plak een gratis
+[Picovoice AccessKey](https://console.picovoice.ai), neem je stem op, en zet de
+toggle aan. Stem is een *gemaks*-laag: vergrendeld start "Hey Jarvis" alleen de
+Touch ID-prompt — de biometrie blijft het slot.
+
 ### Checks (zoals in CI)
 
 ```bash

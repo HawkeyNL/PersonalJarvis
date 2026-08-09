@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Picovoice wake-word / speaker models — fetched via `npm run fetch-models`
+public/models
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
