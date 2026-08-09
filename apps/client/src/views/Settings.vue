@@ -5,26 +5,20 @@ import { ACCENTS, PRESETS, currentAccent, applyAccent, type Accent } from "../th
 import { currentSession, logout, type Session } from "../auth";
 import { lockEnabled, isDesktop, setLockEnabled, initLock } from "../lock";
 import {
-  accessKey,
-  wakeEnabled,
+  voiceSupported,
   enrolled,
-  enrolling,
-  enrollPct,
-  wakeStatus,
-  wakeError,
-  wakeReady,
-  setAccessKey,
-  enrollVoice,
-  setWakeEnabled,
-} from "../voicewake";
+  engine,
+  busy,
+  voiceStatus,
+  voiceError,
+  lastVerify,
+  refreshVoiceStatus,
+  enroll,
+  verify,
+} from "../voiceServer";
 
 const accent = ref<Accent>(currentAccent());
 const session = ref<Session | null>(null);
-const keyInput = ref(accessKey.value);
-
-function saveKey() {
-  setAccessKey(keyInput.value.trim());
-}
 
 const labels: Record<Accent, string> = {
   green: "Jarvis-groen",
@@ -46,6 +40,7 @@ async function doLogout() {
 onMounted(async () => {
   session.value = await currentSession();
   await initLock(); // resolves isDesktop for the lock toggle
+  await refreshVoiceStatus();
 });
 </script>
 
@@ -117,48 +112,50 @@ onMounted(async () => {
     </div>
 
     <div class="panel glass">
-      <div class="panel-head">STEM-ACTIVATIE <span class="hint">"Hey Jarvis"</span></div>
-      <label class="field">
-        <span class="fl">Picovoice AccessKey</span>
-        <input
-          class="txt"
-          type="password"
-          v-model="keyInput"
-          placeholder="plak je gratis AccessKey"
-          @change="saveKey"
-        />
-      </label>
-      <p class="muted small">
-        Gratis persoonlijke sleutel via console.picovoice.ai — blijft lokaal op dit toestel.
-      </p>
+      <div class="panel-head">STEM <span class="hint">server-side · centraal</span></div>
+      <ul class="kv">
+        <li>
+          <span class="k">Stemprofiel</span>
+          <span class="v">
+            <span class="dot" :class="enrolled ? 'dot-ok' : 'dot-todo'"></span>
+            {{ enrolled ? "ingeschreven" : "nog niet" }}
+          </span>
+        </li>
+        <li v-if="engine">
+          <span class="k">Engine</span>
+          <span class="v mono">{{ engine }}</span>
+        </li>
+      </ul>
 
       <div class="enroll">
-        <button class="ghost" :disabled="!accessKey.trim() || enrolling" @click="enrollVoice">
+        <button class="ghost" :disabled="!voiceSupported || busy" @click="enroll()">
           {{ enrolled ? "Stem opnieuw opnemen" : "Neem je stem op" }}
         </button>
-        <span v-if="enrolling" class="mono small">opnemen… {{ enrollPct }}%</span>
-        <span v-else-if="enrolled" class="mono small okc">stemprofiel ✓</span>
+        <button
+          v-if="enrolled"
+          class="ghost"
+          :disabled="!voiceSupported || busy"
+          @click="verify()"
+        >
+          Test verificatie
+        </button>
       </div>
-      <p v-if="enrolling" class="muted small">Praat rustig door tot 100% (een paar zinnen).</p>
 
-      <label class="toggle" :class="{ off: !wakeReady }" style="margin-top: 6px">
-        <span class="tl">
-          <span class="tt">Luister naar "Hey Jarvis"</span>
-          <span class="td">
-            Alleen jouw stem activeert Jarvis. Vergrendeld start het Touch ID —
-            biometrie blijft het slot.
-          </span>
-        </span>
-        <input
-          type="checkbox"
-          :checked="wakeEnabled"
-          :disabled="!wakeReady"
-          @change="setWakeEnabled(($event.target as HTMLInputElement).checked)"
-        />
-        <span class="sw"></span>
-      </label>
-      <p class="small" :class="wakeError ? 'errc' : 'muted'">
-        {{ wakeError || "status: " + wakeStatus }}
+      <p v-if="!voiceSupported" class="small errc">
+        Microfoon niet beschikbaar op dit toestel.
+      </p>
+      <p v-else-if="voiceStatus" class="small" :class="busy ? 'muted' : 'okc'">
+        {{ voiceStatus }}
+      </p>
+      <p v-if="voiceError" class="small errc">{{ voiceError }}</p>
+
+      <p v-if="lastVerify && lastVerify.enrolled && lastVerify.transcript" class="small muted">
+        Gehoord: "{{ lastVerify.transcript }}"
+      </p>
+
+      <p class="muted small">
+        Je stem staat centraal op je eigen server en geldt op al je toestellen.
+        Stem is gemak — Touch ID / je telefoon blijft het slot.
       </p>
     </div>
 
@@ -244,14 +241,7 @@ onMounted(async () => {
 .toggle input:checked ~ .sw::after { transform: translateX(19px); background: var(--accent); }
 .toggle input:disabled ~ .sw { opacity: 0.5; }
 
-.field { display: flex; flex-direction: column; gap: 6px; }
-.fl { font-size: 13px; color: var(--muted); }
-.txt {
-  background: rgba(0, 0, 0, 0.25); border: 1px solid var(--border); color: var(--text);
-  border-radius: 10px; padding: 9px 12px; font: inherit; font-size: 13px;
-}
-.txt:focus { outline: none; border-color: var(--accent); }
-.enroll { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+.enroll { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
 .enroll .ghost { margin-top: 0; }
 .okc { color: var(--accent); }
 .errc { color: #f87171; }

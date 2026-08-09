@@ -51,6 +51,10 @@ hoogstens de console of start de biometrie.
   (Whisper voor STT, een speaker-embedding-net) is een afgebakende vervolgstap
   achter dezelfde trait — te valideren op de machine van de gebruiker met echte
   audio.
-- Nog te doen: client-audio-opname + upload (push-to-talk) + enroll-UI; echt
-  STT/embedding-model; lokaal wake-word; drempel tunen; audio-resampling naar
-  16 kHz; profiel eventueel versleuteld opslaan.
+- **Client-slice klaar** (`voiceCapture.ts` + `voiceServer.ts`): WebAudio-opname
+  → resample naar 16 kHz mono i16 → upload naar `/enroll` en `/verify`. Settings
+  heeft een STEM-panel (inschrijven + "test verificatie" met transcript + score).
+  Werkt mechanisch tegen de stub end-to-end.
+- Nog te doen: echt STT/embedding-model; console-STT (mic → server-transcript)
+  zodra het echte model er is; lokaal wake-word; drempel tunen; profiel
+  eventueel versleuteld opslaan.
