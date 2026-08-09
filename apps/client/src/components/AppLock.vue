@@ -10,9 +10,12 @@ import {
   cancelPhoneApproval,
 } from "../lock";
 
-// Offer Touch ID immediately; the user can also fall back to phone approval.
-onMounted(() => {
-  biometricUnlock();
+// Offer Touch ID immediately. If it fails or the machine has no biometric
+// hardware (e.g. a Mac without Touch ID), fall straight through to the phone
+// route rather than the desktop password.
+onMounted(async () => {
+  const ok = await biometricUnlock();
+  if (!ok) requestPhoneApproval();
 });
 </script>
 

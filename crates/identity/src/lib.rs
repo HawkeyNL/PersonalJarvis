@@ -567,6 +567,32 @@ pub async fn approve_unlock_request(
     Ok(())
 }
 
+/// Deny a pending unlock request. No signature required — the denying device is
+/// already authenticated, and a denial only ever cancels an unlock. Only affects
+/// a pending request the denier did not create.
+pub async fn deny_unlock_request(
+    pool: &PgPool,
+    id: Uuid,
+    user_id: Uuid,
+    denier_device_id: Uuid,
+) -> Result<(), IdentityError> {
+    let res = sqlx::query(
+        "update unlock_requests set status = 'denied', approved_by_device_id = $3, \
+         resolved_at = now() \
+         where id = $1 and user_id = $2 and status = 'pending' \
+           and requesting_device_id <> $3",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(denier_device_id)
+    .execute(pool)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(IdentityError::AuthFailed);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,6 +735,43 @@ mod tests {
         assert!(pending_unlock_requests(&pool, user.id, phone.id)
             .await?
             .is_empty());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unlock_deny_flow(pool: PgPool) -> Result<(), IdentityError> {
+        let user = create_user(&pool, "Gus").await?;
+        let (desktop, _) = register_device(
+            &pool,
+            user.id,
+            "MacBook",
+            Platform::Macos,
+            "ed25519",
+            &new_keypair().verifying_key().to_bytes(),
+        )
+        .await?;
+        let (phone, _) = register_device(
+            &pool,
+            user.id,
+            "iPhone",
+            Platform::Ios,
+            "ed25519",
+            &new_keypair().verifying_key().to_bytes(),
+        )
+        .await?;
+        let (req_id, _nonce) = create_unlock_request(&pool, user.id, desktop.id).await?;
+
+        // A device can't deny its own request.
+        assert!(deny_unlock_request(&pool, req_id, user.id, desktop.id)
+            .await
+            .is_err());
+
+        // The phone denies it; the desktop sees 'denied'.
+        deny_unlock_request(&pool, req_id, user.id, phone.id).await?;
+        assert_eq!(
+            unlock_request_status(&pool, req_id, user.id).await?.as_deref(),
+            Some("denied"),
+        );
         Ok(())
     }
 

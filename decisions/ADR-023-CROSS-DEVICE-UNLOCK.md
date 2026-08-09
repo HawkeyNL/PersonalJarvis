@@ -39,6 +39,13 @@ Eigenschappen:
 - Verzoeken verlopen na 2 minuten; de handtekening bewijst bezit van de
   device-sleutel — er gaat **nooit een wachtwoord over de lijn**.
 - Auto-relock na 5 min inactiviteit (reset op interactie).
+- De telefoon kan een verzoek ook expliciet **weigeren** (`denied`, geen
+  handtekening nodig); de desktop toont dat direct.
+- **Near-push via long-polling**: de status- en pending-endpoints accepteren
+  `?wait=<secs>` (server houdt de request ~20 s open en antwoordt zodra de
+  status wijzigt), dus goedkeuring voelt onmiddellijk zonder strak poll-interval.
+- Faalt de desktop-biometrie of ontbreekt de hardware (Mac zonder Touch ID),
+  dan start de telefoon-route **automatisch**.
 
 Endpoints (allemaal Bearer-beveiligd): `POST /v1/auth/unlock/request`,
 `GET /v1/auth/unlock/pending`, `GET /v1/auth/unlock/{id}`,
@@ -49,9 +56,10 @@ Endpoints (allemaal Bearer-beveiligd): `POST /v1/auth/unlock/request`,
 - **Desktop-wachtwoord als fallback** (`deviceOwnerAuthentication`): simpelst,
   maar precies wat de gebruiker niet wil; de telefoon-route is prettiger en
   hergebruikt de bestaande device-trust.
-- **Push-notificatie i.p.v. polling**: mooier, maar vereist een push-kanaal
-  (APNs/websockets). Polling (2–4 s) is nu eenvoudig en voldoende; push is een
-  latere optimalisatie.
+- **Push-notificatie i.p.v. polling**: mooier voor achtergrond-wakeup, maar
+  vereist een push-kanaal (APNs/websockets). We doen nu **long-polling**
+  (`?wait=`), wat voorgrond-latency al wegneemt; échte push blijft een latere
+  optimalisatie voor wanneer de app op de achtergrond staat.
 - **Nieuw sleutelpaar / apart approval-secret**: overbodig — de device-sleutels
   uit de login bewijzen apparaatbezit al.
 - **Altijd vergrendelen**: verworpen als default — opt-in via Settings, zodat
@@ -65,5 +73,5 @@ Endpoints (allemaal Bearer-beveiligd): `POST /v1/auth/unlock/request`,
   (order-approval): hetzelfde patroon (verzoek → biometrie → getekende
   goedkeuring) is straks herbruikbaar.
 - iOS heeft `NSFaceIDUsageDescription` nodig (toegevoegd aan de Info.plist).
-- Nog te doen: push i.p.v. polling; expliciet weigeren (`denied`) vanaf de
-  telefoon; meerdere gelijktijdige verzoeken netjes tonen.
+- Nog te doen: échte push (APNs) voor achtergrond-wakeup i.p.v. long-polling;
+  meerdere gelijktijdige verzoeken netjes tonen/afhandelen.

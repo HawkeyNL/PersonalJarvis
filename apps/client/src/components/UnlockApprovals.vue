@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import NavIcon from "./NavIcon.vue";
-import { pending, approve, approving, approvalError } from "../unlockApprovals";
+import { pending, approve, deny, approving, approvalError } from "../unlockApprovals";
 </script>
 
 <template>
@@ -14,9 +14,12 @@ import { pending, approve, approving, approvalError } from "../unlockApprovals";
             <span class="plat">{{ r.platform }}</span>
             wil ontgrendelen
           </div>
-          <button class="approve" :disabled="approving === r.id" @click="approve(r)">
-            {{ approving === r.id ? "Verifiëren…" : "Goedkeuren" }}
-          </button>
+          <div class="actions">
+            <button class="deny" :disabled="approving === r.id" @click="deny(r)">Weiger</button>
+            <button class="approve" :disabled="approving === r.id" @click="approve(r)">
+              {{ approving === r.id ? "Verifiëren…" : "Goedkeuren" }}
+            </button>
+          </div>
         </div>
         <p v-if="approvalError" class="err">{{ approvalError }}</p>
         <p class="hint">Bevestig met Face ID / Touch ID op dit toestel.</p>
@@ -78,12 +81,14 @@ import { pending, approve, approving, approvalError } from "../unlockApprovals";
   color: var(--muted);
   margin: 0 4px;
 }
-.approve {
+.actions {
   margin-left: auto;
   flex: none;
-  background: linear-gradient(180deg, var(--accent), var(--accent-2));
-  color: #04140c;
-  border: none;
+  display: flex;
+  gap: 8px;
+}
+.approve,
+.deny {
   border-radius: 11px;
   padding: 9px 16px;
   font: inherit;
@@ -91,7 +96,23 @@ import { pending, approve, approving, approvalError } from "../unlockApprovals";
   font-weight: 700;
   cursor: pointer;
 }
-.approve:disabled {
+.approve {
+  background: linear-gradient(180deg, var(--accent), var(--accent-2));
+  color: #04140c;
+  border: none;
+}
+.deny {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-weight: 500;
+}
+.deny:hover:not(:disabled) {
+  border-color: #f87171;
+  color: #f87171;
+}
+.approve:disabled,
+.deny:disabled {
   opacity: 0.6;
   cursor: default;
 }

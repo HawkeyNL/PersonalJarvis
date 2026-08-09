@@ -51,6 +51,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/unlock/pending", get(unlock_pending))
         .route("/v1/auth/unlock/{id}", get(unlock_status))
         .route("/v1/auth/unlock/{id}/approve", post(unlock_approve))
+        .route("/v1/auth/unlock/{id}/deny", post(unlock_deny))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{id}", delete(delete_device))
         .route("/v1/holdings", get(get_holdings).post(add_holding))
@@ -284,33 +285,73 @@ async fn unlock_request(
     })))
 }
 
+/// Longest a `?wait=` long-poll will hold a request open (seconds).
+const UNLOCK_WAIT_CAP_SECS: u64 = 25;
+
+/// Parse and clamp the `?wait=` long-poll seconds from query params.
+fn wait_secs(params: &HashMap<String, String>) -> u64 {
+    params
+        .get("wait")
+        .and_then(|w| w.parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(UNLOCK_WAIT_CAP_SECS)
+}
+
 /// Poll the status of an unlock request: `pending` | `approved` | `denied` | `expired`.
+///
+/// With `?wait=<secs>` the request long-polls: it returns as soon as the status
+/// leaves `pending` (near-instant approval), or after the timeout still pending.
 async fn unlock_status(
     authed: Authed,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match identity::unlock_request_status(&state.db, id, authed.user.id)
-        .await
-        .map_err(internal)?
-    {
-        Some(status) => Ok(Json(json!({ "status": status }))),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "unlock request not found" })),
-        )),
+    let mut ticks = wait_secs(&params) * 2; // 500ms per tick
+    loop {
+        match identity::unlock_request_status(&state.db, id, authed.user.id)
+            .await
+            .map_err(internal)?
+        {
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "unlock request not found" })),
+                ))
+            }
+            Some(status) if status != "pending" => {
+                return Ok(Json(json!({ "status": status })))
+            }
+            Some(status) => {
+                if ticks == 0 {
+                    return Ok(Json(json!({ "status": status })));
+                }
+                ticks -= 1;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
     }
 }
 
-/// Unlock requests this device can approve (same user, not itself).
+/// Unlock requests this device can approve (same user, not itself). With
+/// `?wait=<secs>` it long-polls: returns as soon as a request appears.
 async fn unlock_pending(
     authed: Authed,
     State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let requests =
-        identity::pending_unlock_requests(&state.db, authed.user.id, authed.device.id)
-            .await
-            .map_err(internal)?;
+    let mut ticks = wait_secs(&params) * 2;
+    let requests = loop {
+        let requests =
+            identity::pending_unlock_requests(&state.db, authed.user.id, authed.device.id)
+                .await
+                .map_err(internal)?;
+        if !requests.is_empty() || ticks == 0 {
+            break requests;
+        }
+        ticks -= 1;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
     let items: Vec<Value> = requests
         .iter()
         .map(|r| {
@@ -345,6 +386,18 @@ async fn unlock_approve(
         .await
         .map_err(|_| unauthorized())?;
     Ok(Json(json!({ "status": "approved" })))
+}
+
+/// Deny (cancel) a pending unlock request from this device.
+async fn unlock_deny(
+    authed: Authed,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    identity::deny_unlock_request(&state.db, id, authed.user.id, authed.device.id)
+        .await
+        .map_err(|_| unauthorized())?;
+    Ok(Json(json!({ "status": "denied" })))
 }
 
 /// Revoke one of the authenticated user's devices.

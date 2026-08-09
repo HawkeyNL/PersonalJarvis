@@ -28,7 +28,9 @@ export const lockEnabled = ref(localStorage.getItem(LKEY) === "true");
 // Auto re-lock after this much inactivity (ms). 0 disables it.
 const INACTIVITY_MS = 5 * 60 * 1000;
 let idleTimer: number | undefined;
-let pollTimer: number | undefined;
+let pollActive = false;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Decide whether this platform locks in-app (desktop yes, phone no). */
 export async function initLock(): Promise<void> {
@@ -77,7 +79,7 @@ export async function biometricUnlock(): Promise<boolean> {
   }
 }
 
-/** Ask a trusted phone to approve the unlock; poll until it signs (or expires). */
+/** Ask a trusted phone to approve the unlock; long-poll until it resolves. */
 export async function requestPhoneApproval(): Promise<void> {
   phoneError.value = null;
   const session = await currentSession();
@@ -93,29 +95,43 @@ export async function requestPhoneApproval(): Promise<void> {
       {},
     );
     phoneWaiting.value = true;
+    pollActive = true;
     const deadline = Date.now() + 2 * 60 * 1000;
-    clearInterval(pollTimer);
-    pollTimer = window.setInterval(async () => {
-      if (Date.now() > deadline) {
-        stopPhonePoll();
-        phoneError.value = "verzoek verlopen — probeer opnieuw";
-        return;
-      }
+    // Long-poll: the server holds each request ~20s and returns the instant the
+    // phone acts, so approval feels immediate without a tight polling loop.
+    while (pollActive && Date.now() < deadline) {
       try {
         const { status } = await getJsonAuth<{ status: string }>(
-          `/v1/auth/unlock/${request_id}`,
+          `/v1/auth/unlock/${request_id}?wait=20`,
           token,
         );
-        if (status === "approved") unlockApp();
-        else if (status === "expired" || status === "denied") {
+        if (!pollActive) return; // cancelled while the request was open
+        if (status === "approved") {
+          unlockApp();
+          return;
+        }
+        if (status === "denied") {
+          stopPhonePoll();
+          phoneError.value = "geweigerd op je telefoon";
+          return;
+        }
+        if (status === "expired") {
           stopPhonePoll();
           phoneError.value = "verzoek verlopen — probeer opnieuw";
+          return;
         }
+        // still pending → loop immediately (the server already waited)
       } catch {
-        /* transient network error — keep polling until the deadline */
+        if (!pollActive) return;
+        await sleep(1500); // transient network error — back off, then retry
       }
-    }, 2000);
+    }
+    if (pollActive) {
+      stopPhonePoll();
+      phoneError.value = "verzoek verlopen — probeer opnieuw";
+    }
   } catch (e) {
+    stopPhonePoll();
     phoneError.value = e instanceof Error ? e.message : String(e);
   }
 }
@@ -126,8 +142,7 @@ export function cancelPhoneApproval(): void {
 }
 
 function stopPhonePoll(): void {
-  clearInterval(pollTimer);
-  pollTimer = undefined;
+  pollActive = false;
   phoneWaiting.value = false;
 }
 
