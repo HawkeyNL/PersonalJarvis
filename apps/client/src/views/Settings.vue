@@ -2,7 +2,7 @@
 import { ref, onMounted } from "vue";
 import { API_BASE } from "../api";
 import { ACCENTS, PRESETS, currentAccent, applyAccent, type Accent } from "../theme";
-import { currentSession, logout, type Session } from "../auth";
+import { currentSession, deregisterDevice, type Session } from "../auth";
 import { lockEnabled, isDesktop, setLockEnabled, initLock } from "../lock";
 import {
   voiceSupported,
@@ -39,9 +39,18 @@ function pick(a: Accent) {
   applyAccent(a);
 }
 
-async function doLogout() {
-  await logout();
-  session.value = await currentSession();
+const confirmUnlink = ref(false);
+const unlinking = ref(false);
+
+async function doUnlink() {
+  unlinking.value = true;
+  try {
+    await deregisterDevice();
+    session.value = await currentSession();
+  } finally {
+    unlinking.value = false;
+    confirmUnlink.value = false;
+  }
 }
 
 onMounted(async () => {
@@ -92,7 +101,13 @@ onMounted(async () => {
           <span class="v">{{ session?.has_key ? "in keychain" : "geen" }}</span>
         </li>
       </ul>
-      <button v-if="session?.token" class="ghost" @click="doLogout">Uitloggen</button>
+      <button
+        v-if="session?.token"
+        class="ghost danger"
+        @click="confirmUnlink = true"
+      >
+        Dit apparaat loskoppelen
+      </button>
     </div>
 
     <div class="panel glass">
@@ -194,6 +209,28 @@ onMounted(async () => {
         <li><span class="k">Broker</span><span class="v">IBKR read-only</span></li>
       </ul>
     </div>
+
+    <!-- Destructive-action confirmation. -->
+    <Transition name="modal">
+      <div v-if="confirmUnlink" class="modal-overlay" @click.self="confirmUnlink = false">
+        <div class="modal glass" role="dialog" aria-modal="true" aria-labelledby="unlink-title">
+          <h2 id="unlink-title">Dit apparaat loskoppelen?</h2>
+          <p>
+            Dit trekt dit toestel serverside in en wist de device-sleutel hier.
+            Je moet dit apparaat daarna opnieuw koppelen (enrollen) om weer in te
+            loggen. Je gegevens op de server blijven bestaan.
+          </p>
+          <div class="modal-actions">
+            <button class="ghost" :disabled="unlinking" @click="confirmUnlink = false">
+              Annuleren
+            </button>
+            <button class="ghost danger" :disabled="unlinking" @click="doUnlink">
+              {{ unlinking ? "Loskoppelen…" : "Loskoppelen" }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
   </section>
 </template>
 
@@ -246,6 +283,31 @@ onMounted(async () => {
   color: var(--muted); font-family: var(--mono); font-size: 12px;
 }
 .ghost:hover { color: var(--accent-2); border-color: var(--accent-2); filter: none; }
+.ghost.danger { color: #f87171; border-color: rgba(248, 113, 113, 0.4); }
+.ghost.danger:hover { color: #fca5a5; border-color: #f87171; }
+.ghost:disabled { opacity: 0.5; cursor: default; }
+
+/* Destructive confirmation modal. */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+}
+.modal {
+  width: min(420px, 100%);
+  border: 1px solid var(--border); border-radius: 14px; padding: 20px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.6);
+}
+.modal h2 { margin: 0 0 10px; font-size: 16px; }
+.modal p { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+.modal-actions .ghost { margin-top: 0; }
+
+.modal-enter-active, .modal-leave-active { transition: opacity 0.2s ease; }
+.modal-enter-from, .modal-leave-to { opacity: 0; }
+.modal-enter-active .modal, .modal-leave-active .modal { transition: transform 0.2s ease; }
+.modal-enter-from .modal, .modal-leave-to .modal { transform: translateY(8px) scale(0.98); }
 
 .toggle { display: flex; align-items: center; gap: 14px; cursor: pointer; }
 .toggle.off { cursor: default; }

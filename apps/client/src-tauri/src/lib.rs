@@ -151,6 +151,17 @@ fn auth_logout(app: AppHandle) -> Result<(), String> {
     save_store(&app, &store)
 }
 
+/// Fully deregister this device locally: wipe the device key (keychain + file),
+/// the device id, and the session token. The next `login()` enrolls a fresh
+/// device. Pair with a server-side `DELETE /v1/devices/{id}`.
+#[tauri::command]
+fn auth_reset(app: AppHandle) -> Result<(), String> {
+    if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT) {
+        let _ = entry.delete_credential(); // ignore "not found"
+    }
+    save_store(&app, &AuthStore::default())
+}
+
 /// Prompt the OS for local verification (Touch ID / Face ID).
 ///
 /// `allow_password` controls the device-password fallback. The desktop passes
@@ -214,6 +225,7 @@ pub fn run() {
             auth_save,
             auth_session,
             auth_logout,
+            auth_reset,
             biometric_unlock,
         ])
         .run(tauri::generate_context!())

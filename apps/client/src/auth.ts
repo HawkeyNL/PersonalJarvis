@@ -4,7 +4,7 @@
 // orchestrates the HTTP flow (enroll -> challenge -> login) and reads back the
 // session state. The private key never enters JS.
 import { invoke } from "@tauri-apps/api/core";
-import { getJsonAuth, postAuth, postJson } from "./api";
+import { deleteAuth, getJsonAuth, postAuth, postJson } from "./api";
 
 export type Session = {
   device_id: string | null;
@@ -74,6 +74,21 @@ export async function logout(): Promise<void> {
     }
   }
   await invoke("auth_logout");
+}
+
+/** Fully unlink this device: revoke it server-side (invalidating its sessions)
+ *  and wipe the local key/id/token. Destructive — the next login() enrolls a
+ *  brand-new device. Best-effort on the server call; always clears locally. */
+export async function deregisterDevice(): Promise<void> {
+  const session = await currentSession();
+  if (session.token && session.device_id) {
+    try {
+      await deleteAuth(`/v1/devices/${session.device_id}`, session.token);
+    } catch {
+      /* revoke best-effort; still wipe locally so this device is detached */
+    }
+  }
+  await invoke("auth_reset");
 }
 
 export async function listDevices(token: string): Promise<DeviceItem[]> {
