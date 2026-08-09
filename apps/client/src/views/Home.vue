@@ -67,11 +67,15 @@ const ibkrLabel = computed(() => {
   return "gateway offline";
 });
 
+let authTrying = false;
+
 async function pollBackend() {
   try {
     await getJson("/readyz");
     if (backend.value !== "ok") pushFeed("ok", "LINK backend /readyz → 200 OK");
     backend.value = "ok";
+    // Retry login if we're not authenticated yet (e.g. the backend started later).
+    if (auth.value !== "in") await refreshAuthData();
   } catch {
     if (backend.value !== "fout") pushFeed("err", "LINK backend onbereikbaar");
     backend.value = "fout";
@@ -79,7 +83,10 @@ async function pollBackend() {
 }
 
 async function refreshAuthData() {
+  if (authTrying) return;
+  authTrying = true;
   try {
+    error.value = null;
     let session = await currentSession();
     if (!session.token) {
       await login();
@@ -110,16 +117,17 @@ async function refreshAuthData() {
       auth.value = "uit";
     }
   } catch (e) {
+    if (auth.value !== "fout") pushFeed("err", "AUTH mislukt");
     auth.value = "fout";
     error.value = String(e);
-    pushFeed("err", "AUTH mislukt");
+  } finally {
+    authTrying = false;
   }
 }
 
 async function boot() {
   pushFeed("info", "JARVIS neural core online");
-  await pollBackend();
-  await refreshAuthData();
+  await pollBackend(); // pollBackend triggers login once the backend is reachable
 }
 
 async function doLogout() {
@@ -162,7 +170,9 @@ onBeforeUnmount(() => {
         </div>
         <div class="core-actions">
           <button v-if="auth === 'in'" class="ghost" @click="doLogout">Uitloggen</button>
-          <button v-else-if="auth === 'uit'" @click="boot">Inloggen</button>
+          <button v-else-if="auth === 'uit' || auth === 'fout'" @click="refreshAuthData">
+            {{ auth === "fout" ? "Opnieuw proberen" : "Inloggen" }}
+          </button>
         </div>
       </div>
 
@@ -230,7 +240,6 @@ onBeforeUnmount(() => {
 <style scoped>
 .hud {
   position: relative;
-  min-height: calc(100vh - 64px);
 }
 
 /* faint grid + scanlines behind everything */
@@ -327,7 +336,9 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: minmax(300px, 1.1fr) minmax(320px, 1.3fr) minmax(240px, 1fr);
   gap: 18px;
-  min-height: calc(100vh - 150px);
+  /* fill the space between top bar and dock without forcing overflow */
+  min-height: calc(100vh - 190px);
+  min-height: calc(100dvh - 190px);
   align-items: stretch;
 }
 
