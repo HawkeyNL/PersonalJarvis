@@ -15,6 +15,8 @@ const WAKE_KEY = "jarvis.wake.enabled";
 
 export const wakeEnabled = ref(localStorage.getItem(WAKE_KEY) === "1");
 export const wakeRunning = ref(false);
+/** True when the always-on ONNX detector is actively listening. */
+export const wakeListening = ref(false);
 export const wakeStatus = ref("uit");
 export const wakeError = ref<string | null>(null);
 export const lastScore = ref(0);
@@ -28,6 +30,9 @@ export const wakeReady = computed(() => true);
 let verifying = false;
 let keyHandler: ((e: KeyboardEvent) => void) | null = null;
 let unlistenNative: (() => void) | null = null;
+// The always-on openWakeWord detector (loaded lazily; may be absent if the
+// model assets aren't installed — then only the hotkey path is active).
+let detector: { stop: () => Promise<void> } | null = null;
 
 // Temporary manual trigger until the always-on detector lands: ⌘/Ctrl+⇧+J in the
 // webview simulates "Hey Jarvis" and runs the exact same path a real detection
@@ -85,7 +90,28 @@ export async function startWake(): Promise<void> {
 
   await refreshVoiceStatus();
   wakeRunning.value = true;
-  wakeStatus.value = "gereed — zeg ‘Hey Jarvis’ (⌘⇧J tot auto-detectie)";
+
+  // Try the always-on ONNX detector. Absent model assets → hotkey-only.
+  try {
+    const { WakeDetector } = await import("./wakeDetector");
+    const d = new WakeDetector({
+      onWake: () => void triggerWake(),
+      onScore: (s) => {
+        lastScore.value = s;
+      },
+    });
+    await d.start();
+    detector = d;
+    wakeListening.value = true;
+    wakeStatus.value = "luistert naar ‘Hey Jarvis’ 🎙️";
+  } catch (e) {
+    detector = null;
+    wakeListening.value = false;
+    wakeStatus.value =
+      "gereed — ⌘⇧J werkt; auto-detectie: draai scripts/setup-wakeword.sh";
+    // Not fatal: the hotkey + native-event paths remain active.
+    console.warn("[wake] onnx detector unavailable:", e);
+  }
 }
 
 export async function stopWake(): Promise<void> {
@@ -97,6 +123,11 @@ export async function stopWake(): Promise<void> {
     unlistenNative();
     unlistenNative = null;
   }
+  if (detector) {
+    await detector.stop();
+    detector = null;
+  }
+  wakeListening.value = false;
   wakeRunning.value = false;
   wakeStatus.value = "uit";
 }

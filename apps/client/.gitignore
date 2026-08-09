@@ -12,7 +12,7 @@ dist
 dist-ssr
 *.local
 
-# Picovoice wake-word / speaker models — fetched via `npm run fetch-models`
+# Wake-word models — fetched via `npm run setup-wakeword` (ADR-026)
 public/models
 
 # Editor directories and files

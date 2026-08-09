@@ -51,10 +51,15 @@ exact hetzelfde pad, zodat reveal → verify → luisteren nu al werkt en getest
 ## Gevolgen
 
 - Controller + speaker-gate + aan/uit staan (cross-device by construction, want
-  in de gedeelde webview). Handmatige trigger werkt nu end-to-end tegen de
+  in de gedeelde webview). Handmatige trigger werkt end-to-end tegen de
   spraak-stub.
-- Nog te doen: de openWakeWord-`hey_jarvis`-detector via onnxruntime-web
-  inpluggen (model-assets bundelen, audio-framing, CSP) — te valideren met echte
-  audio op de machine van de gebruiker; dan is "Hey Jarvis" volledig hands-free
-  op elk toestel. Drempel/false-accept tunen. Eventueel native `ort` voor
-  achtergrond-luisteren.
+- **Detector gebouwd** (`wakeDetector.ts`): openWakeWord-pipeline via
+  onnxruntime-web (CPU-wasm, single-thread) — 16 kHz mic → melspec → embedding →
+  `hey_jarvis` → score. Lui geladen bij inschakelen; ontbreken de modellen, dan
+  valt de controller terug op de hotkey. ORT-wasm wordt door Vite gebundeld;
+  `npm run setup-wakeword` haalt de 3 ONNX-modellen (v0.5.1) naar `public/models`.
+- **Nog te valideren op device** (jouw Mac, echte audio): framing-details en de
+  detectiedrempel (`WakeDetector.threshold`, default 0.5) — `onScore` logt elke
+  stap zodat we live kunnen tunen. Daarna: eventueel een Web Worker voor de
+  inferentie (UI niet blokkeren), false-accept-tuning, en optioneel native `ort`
+  voor achtergrond-luisteren op iOS.
