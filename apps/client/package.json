@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "bash scripts/setup-wakeword.sh || true",
     "dev": "vite",
+    "prebuild": "bash scripts/setup-wakeword.sh || true",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "setup-wakeword": "bash scripts/setup-wakeword.sh",
