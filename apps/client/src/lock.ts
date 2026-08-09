@@ -30,8 +30,10 @@ export const lockEnabled = ref(localStorage.getItem(LKEY) === "true");
 // dev code-save never re-prompts for Touch ID, while a fresh launch still locks.
 const SESSION_UNLOCKED = "jarvis.unlocked";
 
-// Auto re-lock after this much inactivity (ms). 0 disables it.
-const INACTIVITY_MS = 5 * 60 * 1000;
+// Auto re-lock after this much inactivity (ms). 0 disables it — the app then
+// only locks on a fresh launch, so you authenticate once per session, not
+// repeatedly. (A configurable timeout can come back later if wanted.)
+const INACTIVITY_MS = 0;
 let idleTimer: number | undefined;
 let pollActive = false;
 

@@ -7,17 +7,14 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri",
-    "fetch-models": "mkdir -p public/models && curl -sL -o public/models/porcupine_params.pv https://raw.githubusercontent.com/Picovoice/porcupine/master/lib/common/porcupine_params.pv && curl -sL -o public/models/eagle_params.pv https://raw.githubusercontent.com/Picovoice/eagle/main/lib/common/eagle_params.pv"
+    "tauri": "tauri"
   },
   "dependencies": {
-    "@picovoice/eagle-web": "^3.0.1",
-    "@picovoice/porcupine-web": "^4.0.1",
-    "@picovoice/web-voice-processor": "^4.0.10",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-http": "^2.5.9",
     "@tauri-apps/plugin-opener": "^2",
     "pinia": "^2.2.0",
+    "vosk-browser": "^0.0.8",
     "vue": "^3.5.13",
     "vue-router": "^4.4.0"
   },
