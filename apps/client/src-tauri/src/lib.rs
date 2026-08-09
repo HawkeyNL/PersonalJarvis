@@ -151,6 +151,55 @@ fn auth_logout(app: AppHandle) -> Result<(), String> {
     save_store(&app, &store)
 }
 
+/// Prompt the OS for local biometric verification (Touch ID / Face ID).
+///
+/// Deliberately biometrics-only (no device-password fallback): if biometrics
+/// fail or are unavailable, the app falls back to phone approval instead of the
+/// desktop password. Returns `Ok(())` only on a successful verification; any
+/// failure, cancellation, or lack of hardware is an `Err`.
+#[tauri::command]
+fn biometric_unlock(reason: String) -> Result<(), String> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use robius_authentication::{
+        AndroidText, BiometricStrength, Context, PolicyBuilder, Text, WindowsText,
+    };
+
+    let policy = PolicyBuilder::new()
+        .biometrics(Some(BiometricStrength::Strong))
+        .password(false)
+        .companion(false)
+        .build()
+        .ok_or_else(|| "biometrics not supported".to_string())?;
+
+    let text = Text {
+        android: AndroidText {
+            title: "Jarvis",
+            subtitle: None,
+            description: None,
+        },
+        apple: reason.as_str(),
+        windows: WindowsText::new("Jarvis", &reason)
+            .ok_or_else(|| "invalid prompt text".to_string())?,
+    };
+
+    // `authenticate` is callback-based (synchronous on Apple, async elsewhere);
+    // bridge it to a blocking result so the command returns the verdict.
+    let (tx, rx) = mpsc::channel();
+    Context::new(())
+        .authenticate(text, &policy, move |res| {
+            let _ = tx.send(res.is_ok());
+        })
+        .map_err(|e| format!("{e:?}"))?;
+
+    match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("authentication failed".into()),
+        Err(_) => Err("authentication timed out".into()),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -163,6 +212,7 @@ pub fn run() {
             auth_save,
             auth_session,
             auth_logout,
+            biometric_unlock,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
