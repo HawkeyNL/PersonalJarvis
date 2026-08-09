@@ -1,0 +1,374 @@
+<script setup lang="ts">
+import { ref, computed, onMounted } from "vue";
+import NavIcon from "./NavIcon.vue";
+import { messages, send, thinking } from "../assistant";
+import { useMic } from "../useMic";
+import {
+  voiceEnabled,
+  headset,
+  setVoiceEnabled,
+  setHeadset,
+  canSpeak,
+  refreshRoute,
+} from "../voice";
+
+const text = ref("");
+const hovered = ref(false);
+const focused = ref(false);
+const policy = computed(() => canSpeak());
+
+const mic = useMic((said) => send(said));
+
+// The input dock lifts into view on hover / focus / typing / while listening,
+// and tucks away again when you leave the bottom-left zone.
+const revealed = computed(
+  () => hovered.value || focused.value || !!text.value || mic.listening.value,
+);
+
+// Only the last few turns float over the backdrop; older ones fade out.
+const recent = computed(() => messages.value.slice(-5));
+
+function onSend() {
+  if (!text.value.trim()) return;
+  send(text.value);
+  text.value = "";
+}
+
+// Uplight the mic with your voice while listening.
+const micStyle = computed(() =>
+  mic.listening.value
+    ? {
+        borderColor: "var(--accent)",
+        boxShadow: `0 0 ${(8 + mic.level.value * 26).toFixed(0)}px rgba(52,245,160,${(0.3 + mic.level.value * 0.55).toFixed(2)})`,
+      }
+    : {},
+);
+
+function toggleVoice() {
+  setVoiceEnabled(!voiceEnabled.value);
+}
+async function toggleHeadset() {
+  setHeadset(!headset.value);
+  await refreshRoute();
+}
+
+onMounted(refreshRoute);
+</script>
+
+<template>
+  <div class="console">
+    <!-- Conversation, floating over the living backdrop. -->
+    <div class="transcript" :class="{ dim: revealed }">
+      <TransitionGroup name="line">
+        <p v-for="m in recent" :key="m.id" class="line" :class="m.role">
+          <span class="who">{{ m.role === "jarvis" ? "JARVIS" : "JIJ" }}</span>
+          <span class="txt">{{ m.text }}</span>
+          <span v-if="m.role === 'jarvis' && m.spoken" class="spoke">🔊</span>
+        </p>
+      </TransitionGroup>
+      <p v-if="thinking" class="line jarvis thinking" key="thinking">
+        <span class="who">JARVIS</span>
+        <span class="dots"><span></span><span></span><span></span></span>
+      </p>
+    </div>
+
+    <!-- Bottom-left hover zone reveals the input. -->
+    <div
+      class="zone"
+      @mouseenter="hovered = true"
+      @mouseleave="hovered = false"
+    >
+      <div class="peek" :class="{ hide: revealed }">
+        <NavIcon name="core" /> praat met Jarvis
+      </div>
+
+      <div class="dock" :class="{ show: revealed }">
+        <div class="policy" :class="policy.allowed ? 'ok' : 'off'">
+          <span class="pdot" :class="policy.allowed ? 'on' : ''"></span>
+          {{ policy.allowed ? "Jarvis kan praten" : "Jarvis is stil" }} · {{ policy.reason }}
+        </div>
+        <form class="row" @submit.prevent="onSend">
+          <button
+            type="button"
+            class="ic mic"
+            :class="{ live: mic.listening.value }"
+            :style="micStyle"
+            :disabled="!mic.available"
+            :title="mic.available ? (mic.listening.value ? 'Luistert… (stopt na 5s stilte)' : 'Spreken') : 'Spraakinvoer niet beschikbaar'"
+            @click="mic.toggle"
+          >
+            <NavIcon name="mic" />
+          </button>
+          <input
+            v-model="text"
+            placeholder="Typ of spreek tegen Jarvis…"
+            aria-label="bericht"
+            @focus="focused = true"
+            @blur="focused = false"
+          />
+          <button
+            type="button"
+            class="ic"
+            :class="{ on: voiceEnabled }"
+            :title="voiceEnabled ? 'Spraak uit' : 'Spraak aan'"
+            @click="toggleVoice"
+          >
+            <NavIcon :name="voiceEnabled ? 'sound-on' : 'sound-off'" />
+          </button>
+          <button
+            type="button"
+            class="ic"
+            :class="{ on: headset }"
+            title="Oortje in/uit"
+            @click="toggleHeadset"
+          >
+            <NavIcon name="headset" />
+          </button>
+          <button type="submit" class="ic send" aria-label="verstuur"><NavIcon name="send" /></button>
+        </form>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.console {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none; /* let the backdrop breathe; children re-enable */
+}
+
+/* Transcript floats bottom-left, above the input zone. */
+.transcript {
+  position: absolute;
+  left: clamp(20px, 5vw, 64px);
+  bottom: 132px;
+  width: min(46ch, 60vw);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: opacity 0.4s ease;
+  /* older lines fade toward the top */
+  mask-image: linear-gradient(180deg, transparent, #000 30%);
+  -webkit-mask-image: linear-gradient(180deg, transparent, #000 30%);
+}
+.transcript.dim {
+  opacity: 0.55;
+}
+
+.line {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  text-shadow: 0 1px 12px rgba(0, 0, 0, 0.7);
+}
+.line .who {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.18em;
+  margin-right: 8px;
+  vertical-align: 1px;
+}
+.line.jarvis .who {
+  color: var(--accent);
+}
+.line.user .who {
+  color: var(--muted);
+}
+.line.user .txt {
+  color: var(--muted);
+}
+.spoke {
+  margin-left: 6px;
+  opacity: 0.8;
+}
+
+.dots {
+  display: inline-flex;
+  gap: 4px;
+}
+.dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.4;
+  animation: cdot 1.1s infinite ease-in-out;
+}
+.dots span:nth-child(2) {
+  animation-delay: 0.18s;
+}
+.dots span:nth-child(3) {
+  animation-delay: 0.36s;
+}
+@keyframes cdot {
+  0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-2px); }
+}
+
+/* Enter/leave animation for transcript lines. */
+.line-enter-active {
+  transition: opacity 0.45s ease, transform 0.45s ease;
+}
+.line-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+/* Bottom-left hover zone. */
+.zone {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: min(560px, 82vw);
+  height: 168px;
+  pointer-events: auto;
+  padding: 0 clamp(20px, 5vw, 64px) clamp(20px, 4vh, 40px);
+  display: flex;
+  align-items: flex-end;
+}
+
+.peek {
+  position: absolute;
+  left: clamp(20px, 5vw, 64px);
+  bottom: clamp(20px, 4vh, 40px);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  opacity: 0.7;
+  transition: opacity 0.25s ease;
+}
+.peek :deep(svg) {
+  width: 15px;
+  height: 15px;
+}
+.peek.hide {
+  opacity: 0;
+}
+
+.dock {
+  width: 100%;
+  transform: translateY(18px);
+  opacity: 0;
+  pointer-events: none;
+  transition: transform 0.3s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.28s ease;
+}
+.dock.show {
+  transform: translateY(0);
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.policy {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 9px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(6, 14, 10, 0.55);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+}
+.policy.ok {
+  color: var(--accent);
+}
+.pdot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.pdot.on {
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px;
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.03));
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+.row input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  padding: 6px 4px;
+}
+.row input:focus {
+  outline: none;
+}
+.row input::placeholder {
+  color: var(--muted);
+}
+
+.ic {
+  flex: none;
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.ic:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.ic:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.ic.on {
+  color: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 8px rgba(52, 245, 160, 0.35);
+}
+.ic.mic.live {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.ic.send {
+  background: var(--accent);
+  color: #04140c;
+  border: none;
+}
+.ic :deep(svg) {
+  width: 17px;
+  height: 17px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dots span,
+  .dock,
+  .line-enter-active {
+    animation: none;
+    transition: none;
+  }
+}
+</style>

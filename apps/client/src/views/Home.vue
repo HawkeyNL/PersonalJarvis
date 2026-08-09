@@ -1,84 +1,27 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from "vue";
 import { getJson, ApiError } from "../api";
-import {
-  currentSession,
-  login,
-  logout,
-  clearSession,
-  listDevices,
-  type DeviceItem,
-} from "../auth";
-import { listHoldings } from "../portfolio";
-import { ibkrStatus, type IbkrStatus } from "../ibkr";
+import { currentSession, login, clearSession, listDevices } from "../auth";
 import ReactorCore from "../components/ReactorCore.vue";
-import AssistantChat from "../components/AssistantChat.vue";
+import JarvisConsole from "../components/JarvisConsole.vue";
 
-type State = "checking" | "ok" | "fout";
-
-const backend = ref<State>("checking");
+// The homepage is pure Jarvis: a living backdrop + a hover-reveal console.
+// Backend health and device-bound login run silently in the background so the
+// chat always has a valid session; there is no telemetry UI here anymore
+// (System/Trading tabs own that).
+const backend = ref<"checking" | "ok" | "fout">("checking");
 const auth = ref<"checking" | "in" | "uit" | "fout">("checking");
-const devices = ref<DeviceItem[]>([]);
-const portfolioTotal = ref("0");
-const portfolioCount = ref(0);
-const ibkr = ref<IbkrStatus | null>(null);
-const error = ref<string | null>(null);
-
-const uptime = ref(0);
-const feed = ref<{ id: number; t: string; kind: string; msg: string }[]>([]);
-let feedId = 0;
-
-let clockTimer: number | undefined;
-let pollTimer: number | undefined;
-
-function pad(n: number): string {
-  return String(n).padStart(2, "0");
-}
-
-function fmtClock(d: Date): string {
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-}
-
-function pushFeed(kind: string, msg: string) {
-  feed.value.unshift({ id: feedId++, t: fmtClock(new Date()), kind, msg });
-  if (feed.value.length > 8) feed.value.pop();
-}
-
 const online = computed(() => backend.value === "ok");
-const uptimeStr = computed(() => {
-  const h = Math.floor(uptime.value / 3600);
-  const m = Math.floor((uptime.value % 3600) / 60);
-  const s = uptime.value % 60;
-  return `${pad(h)}:${pad(m)}:${pad(s)}`;
-});
 
-// Meter widths reflect real-ish state (0-100).
-const meters = computed(() => [
-  { key: "LINK", pct: backend.value === "ok" ? 96 : 8 },
-  { key: "AUTH", pct: auth.value === "in" ? 100 : 12 },
-  { key: "MESH", pct: Math.min(100, 20 + devices.value.length * 26) },
-  { key: "BROKER", pct: ibkr.value?.authenticated ? 100 : ibkr.value?.reachable ? 45 : 6 },
-]);
-
-const ibkrLabel = computed(() => {
-  const s = ibkr.value;
-  if (!s) return "controleren…";
-  if (s.authenticated) return "verbonden (ingelogd)";
-  if (s.reachable) return "gateway bereikbaar · niet ingelogd";
-  return "gateway offline";
-});
-
+let pollTimer: number | undefined;
 let authTrying = false;
 
 async function pollBackend() {
   try {
     await getJson("/readyz");
-    if (backend.value !== "ok") pushFeed("ok", "LINK backend /readyz → 200 OK");
     backend.value = "ok";
-    // Retry login if we're not authenticated yet (e.g. the backend started later).
-    if (auth.value !== "in") await refreshAuthData();
+    if (auth.value !== "in") await refreshAuth(); // retry login once the backend is up
   } catch {
-    if (backend.value !== "fout") pushFeed("err", "LINK backend onbereikbaar");
     backend.value = "fout";
   }
 }
@@ -89,391 +32,89 @@ async function ensureSession(): Promise<string | null> {
   if (!session.token) {
     await login();
     session = await currentSession();
-    if (session.token) pushFeed("ok", "AUTH device-bound sessie geactiveerd");
   }
   return session.token;
 }
 
-async function refreshAuthData() {
+async function refreshAuth() {
   if (authTrying) return;
   authTrying = true;
   try {
-    error.value = null;
     let token = await ensureSession();
     if (!token) {
       auth.value = "uit";
       return;
     }
-
-    // Listing devices also validates the token. A stale token (the backend
-    // restarted and forgot the session) 401s — drop it and log in fresh once,
-    // instead of looping on a dead token every poll.
+    // Listing devices validates the token; a stale one (backend restarted) 401s
+    // — drop it and log in fresh once, instead of looping on a dead token.
     try {
-      devices.value = await listDevices(token);
+      await listDevices(token);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
-        pushFeed("warn", "AUTH sessie verlopen — opnieuw inloggen");
         await clearSession();
         token = await ensureSession();
         if (!token) {
           auth.value = "uit";
           return;
         }
-        devices.value = await listDevices(token);
+        await listDevices(token);
       } else {
         throw e;
       }
     }
     auth.value = "in";
-
-    try {
-      const p = await listHoldings();
-      portfolioTotal.value = p.total_cost;
-      portfolioCount.value = p.holdings.length;
-      pushFeed("info", `PORTFOLIO ${p.holdings.length} posities · basis ${p.total_cost}`);
-    } catch {
-      /* portfolio summary is optional */
-    }
-    try {
-      ibkr.value = await ibkrStatus();
-      pushFeed(
-        ibkr.value.reachable ? "info" : "warn",
-        `IBKR ${ibkr.value.authenticated ? "ingelogd" : ibkr.value.reachable ? "gateway bereikbaar" : "offline"}`,
-      );
-    } catch {
-      /* ibkr optional */
-    }
-  } catch (e) {
-    if (auth.value !== "fout") pushFeed("err", "AUTH mislukt");
+  } catch {
     auth.value = "fout";
-    error.value = String(e);
   } finally {
     authTrying = false;
   }
 }
 
-async function boot() {
-  pushFeed("info", "JARVIS neural core online");
-  await pollBackend(); // pollBackend triggers login once the backend is reachable
-}
-
-async function doLogout() {
-  await logout();
-  devices.value = [];
-  auth.value = "uit";
-  pushFeed("warn", "AUTH sessie beëindigd");
-}
-
 onMounted(() => {
-  clockTimer = window.setInterval(() => {
-    uptime.value += 1;
-  }, 1000);
+  pollBackend();
   pollTimer = window.setInterval(pollBackend, 5000);
-  boot();
 });
-
-onBeforeUnmount(() => {
-  clearInterval(clockTimer);
-  clearInterval(pollTimer);
-});
+onBeforeUnmount(() => clearInterval(pollTimer));
 </script>
 
 <template>
-  <section class="hud">
-    <div class="hud-grid">
-      <!-- LEFT: conversation with Jarvis -->
-      <div class="col col-chat">
-        <AssistantChat />
-      </div>
-
-      <!-- CENTER: reactor core -->
-      <div class="col col-core">
-        <ReactorCore name="Jarvis" :active="online" />
-        <div class="meters">
-          <div class="meter" v-for="m in meters" :key="m.key">
-            <span class="meter-k">{{ m.key }}</span>
-            <span class="meter-bar"><i :style="{ width: m.pct + '%' }"></i></span>
-          </div>
-        </div>
-        <div class="core-actions">
-          <button v-if="auth === 'in'" class="ghost" @click="doLogout">Uitloggen</button>
-          <button v-else-if="auth === 'uit' || auth === 'fout'" @click="refreshAuthData">
-            {{ auth === "fout" ? "Opnieuw proberen" : "Inloggen" }}
-          </button>
-        </div>
-      </div>
-
-      <!-- RIGHT: telemetry -->
-      <div class="col">
-        <div class="panel">
-          <div class="panel-head">SYSTEM STATUS <span class="hint">live</span></div>
-          <ul class="tel">
-            <li>
-              <span class="dot" :class="online ? 'dot-ok' : backend === 'fout' ? 'dot-err' : 'dot-todo'"></span>
-              <span class="k">BACKEND</span>
-              <span class="v">{{ online ? "verbonden" : backend === "fout" ? "onbereikbaar" : "controleren…" }}</span>
-            </li>
-            <li>
-              <span class="dot" :class="auth === 'in' ? 'dot-ok' : auth === 'fout' ? 'dot-err' : 'dot-todo'"></span>
-              <span class="k">LOGIN</span>
-              <span class="v">{{ auth === "in" ? "device-bound" : auth === "fout" ? "mislukt" : auth === "uit" ? "uitgelogd" : "bezig…" }}</span>
-            </li>
-            <li>
-              <span class="dot dot-ok"></span>
-              <span class="k">UPTIME</span>
-              <span class="v mono">{{ uptimeStr }}</span>
-            </li>
-          </ul>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head">PORTFOLIO <span class="hint">basis</span></div>
-          <div class="big-stat">
-            <span class="num">{{ portfolioCount }}</span>
-            <span class="unit">posities</span>
-          </div>
-          <div class="sub-stat mono">kostenbasis {{ portfolioTotal }}</div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head">
-            IBKR LINK
-            <span class="hint" :class="ibkr?.authenticated ? 'ok' : 'warn'">read-only</span>
-          </div>
-          <div class="tel">
-            <div class="li">
-              <span class="dot" :class="ibkr?.authenticated ? 'dot-ok' : ibkr?.reachable ? 'dot-todo' : 'dot-err'"></span>
-              <span class="v">{{ ibkrLabel }}</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="panel feed-panel">
-          <div class="panel-head">LIVE ENGINE FEED <span class="hint">live</span></div>
-          <ul class="feed">
-            <li v-for="f in feed" :key="f.id" :class="'f-' + f.kind">
-              <span class="ft">{{ f.t }}</span>
-              <span class="fm">{{ f.msg }}</span>
-            </li>
-          </ul>
-        </div>
-      </div>
+  <section class="jarvis-home">
+    <!-- Full-bleed living backdrop. -->
+    <div class="backdrop">
+      <ReactorCore name="Jarvis" :active="online" />
     </div>
-
-    <p v-if="error" class="hud-err">Laatste fout: {{ error }}</p>
+    <!-- Floating conversation + hover-reveal input. -->
+    <JarvisConsole />
   </section>
 </template>
 
 <style scoped>
-.hud {
+.jarvis-home {
   position: relative;
-  display: flex;
-  flex-direction: column;
-  min-height: 100%; /* fill the content pane so the grid can flex to fit */
+  height: 100%;
+  min-height: 100%;
 }
 
-/* faint grid + scanlines behind everything */
-.hud::before {
-  content: "";
+/* The core sits fixed behind everything (under the translucent top bar/dock),
+   so the whole screen reads as one living surface. */
+.backdrop {
   position: fixed;
   inset: 0;
   z-index: 0;
-  pointer-events: none;
-  background-image:
-    linear-gradient(rgba(52, 245, 160, 0.04) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(52, 245, 160, 0.04) 1px, transparent 1px);
-  background-size: 44px 44px;
-  mask-image: radial-gradient(ellipse at 60% 40%, #000 30%, transparent 80%);
-  -webkit-mask-image: radial-gradient(ellipse at 60% 40%, #000 30%, transparent 80%);
-}
-
-.hud > * { position: relative; z-index: 1; }
-
-.hud-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding-bottom: 16px;
-  border-bottom: 1px solid var(--border);
-  flex-wrap: wrap;
-}
-
-.hud-brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.wordmark {
-  font-weight: 700;
-  letter-spacing: 0.42em;
-  font-size: 18px;
-  color: #eafff4;
-  text-shadow: 0 0 14px rgba(52, 245, 160, 0.35);
-}
-
-.hud-brand small {
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--muted);
-  letter-spacing: 0.2em;
-}
-
-.pulse {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 0 0 rgba(52, 245, 160, 0.6);
-  animation: ping 2s ease-out infinite;
-}
-.pulse.off { background: #f0a848; animation: none; }
-
-.hud-modes { display: flex; gap: 8px; }
-
-.chip {
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.16em;
-  padding: 5px 12px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--muted);
-  text-decoration: none;
-  cursor: pointer;
-}
-.chip:hover { color: var(--text); border-color: var(--accent); }
-.chip-on {
-  color: #04140c;
-  background: var(--accent);
-  border-color: var(--accent);
-  box-shadow: 0 0 14px rgba(52, 245, 160, 0.35);
-}
-
-.hud-engine {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.14em;
-  color: var(--muted);
-}
-.clock { color: var(--accent-2); margin-left: 6px; }
-
-.hud-grid {
   display: grid;
-  grid-template-columns: minmax(300px, 1.1fr) minmax(320px, 1.3fr) minmax(240px, 1fr);
-  gap: 18px;
-  /* take the space left under the header without forcing viewport overflow */
-  flex: 1;
-  min-height: 0;
-  align-items: stretch;
+  place-items: center;
+  --core-size: min(90vh, 900px);
+  pointer-events: none;
 }
-
-.col-chat { min-height: 360px; }
-
-.col { display: flex; flex-direction: column; gap: 16px; }
-.col-core {
-  align-items: center;
-  justify-content: center;
-  gap: 22px;
-  --core-size: clamp(320px, 46vh, 640px);
-}
-
-.panel {
-  position: relative;
-  width: 100%;
-  background: linear-gradient(180deg, rgba(16, 34, 26, 0.5), rgba(8, 18, 14, 0.42));
-  backdrop-filter: blur(12px) saturate(1.25);
-  -webkit-backdrop-filter: blur(12px) saturate(1.25);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 12px 14px 14px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
-}
-/* corner brackets */
-.panel::before,
-.panel::after {
+.backdrop::before {
   content: "";
   position: absolute;
-  width: 12px;
-  height: 12px;
-  border: 1px solid var(--accent);
-  opacity: 0.7;
-}
-.panel::before { top: -1px; left: -1px; border-right: 0; border-bottom: 0; }
-.panel::after { bottom: -1px; right: -1px; border-left: 0; border-top: 0; }
-
-.panel-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.18em;
-  color: var(--accent);
-  margin-bottom: 10px;
-}
-.hint { font-size: 9px; color: var(--muted); letter-spacing: 0.1em; }
-.hint.ok { color: var(--accent); }
-.hint.warn { color: #f0a848; }
-
-.tel { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
-.tel li, .tel .li { display: flex; align-items: center; gap: 9px; }
-.tel .k { font-size: 12px; color: var(--muted); letter-spacing: 0.06em; }
-.tel .v { margin-left: auto; font-size: 12px; color: var(--text); }
-.mono { font-family: var(--mono); }
-.empty { font-size: 12px; color: var(--muted); margin: 2px 0 0; }
-
-.big-stat { display: flex; align-items: baseline; gap: 8px; }
-.big-stat .num {
-  font-size: 40px; font-weight: 700; color: #eafff4;
-  text-shadow: 0 0 14px rgba(52, 245, 160, 0.35); font-variant-numeric: tabular-nums;
-}
-.big-stat .unit { font-family: var(--mono); font-size: 11px; color: var(--muted); letter-spacing: 0.14em; }
-.sub-stat { font-size: 11px; color: var(--muted); margin-top: 4px; }
-
-.meters { width: var(--core-size, min(46vh, 400px)); display: flex; flex-direction: column; gap: 7px; }
-.meter { display: flex; align-items: center; gap: 10px; }
-.meter-k { font-family: var(--mono); font-size: 10px; color: var(--muted); width: 58px; letter-spacing: 0.12em; }
-.meter-bar { flex: 1; height: 6px; background: rgba(52, 245, 160, 0.08); border-radius: 4px; overflow: hidden; }
-.meter-bar i {
-  display: block; height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--accent-2));
-  box-shadow: 0 0 10px rgba(52, 245, 160, 0.5);
-  transition: width 0.6s ease;
-}
-
-.core-actions { min-height: 20px; }
-button {
-  font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em;
-}
-.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
-.ghost:hover { color: var(--accent-2); border-color: var(--accent-2); filter: none; }
-
-.feed-panel { flex: 1; }
-.feed { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
-.feed li { display: flex; gap: 8px; font-family: var(--mono); font-size: 11px; line-height: 1.35; }
-.feed .ft { color: var(--muted); flex: none; }
-.feed .fm { color: var(--text); }
-.f-ok .fm { color: var(--accent); }
-.f-info .fm { color: var(--accent-2); }
-.f-warn .fm { color: #f0a848; }
-.f-err .fm { color: #f87171; }
-
-.hud-err { margin-top: 16px; color: #f87171; font-size: 12px; }
-
-@media (max-width: 980px) {
-  .hud-grid { grid-template-columns: 1fr; }
-  .col-core { order: -1; }
-  .meters, .core { width: min(70vw, 360px); }
-}
-
-@keyframes ping {
-  0% { box-shadow: 0 0 0 0 rgba(52, 245, 160, 0.5); }
-  70% { box-shadow: 0 0 0 10px rgba(52, 245, 160, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(52, 245, 160, 0); }
+  inset: 0;
+  background:
+    radial-gradient(ellipse at 50% 44%, rgba(52, 245, 160, 0.1), transparent 60%),
+    linear-gradient(rgba(52, 245, 160, 0.028) 1px, transparent 1px) 0 0 / 46px 46px,
+    linear-gradient(90deg, rgba(52, 245, 160, 0.028) 1px, transparent 1px) 0 0 / 46px 46px;
+  mask-image: radial-gradient(ellipse at 55% 45%, #000 25%, transparent 82%);
+  -webkit-mask-image: radial-gradient(ellipse at 55% 45%, #000 25%, transparent 82%);
 }
 </style>
