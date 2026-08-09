@@ -5,10 +5,21 @@ import { fetch } from "@tauri-apps/plugin-http";
 
 export const API_BASE = "http://localhost:8080";
 
+/** An HTTP error carrying the status code, so callers can react to e.g. 401. */
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    path: string,
+  ) {
+    super(`HTTP ${status} (${path})`);
+    this.name = "ApiError";
+  }
+}
+
 export async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, { method: "GET" });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+    throw new ApiError(res.status, path);
   }
   return (await res.json()) as T;
 }
@@ -20,7 +31,7 @@ export async function postJson<T>(path: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+    throw new ApiError(res.status, path);
   }
   return (await res.json()) as T;
 }
@@ -30,7 +41,7 @@ export async function getJsonAuth<T>(path: string, token: string): Promise<T> {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+    throw new ApiError(res.status, path);
   }
   return (await res.json()) as T;
 }
@@ -41,7 +52,7 @@ export async function postAuth(path: string, token: string): Promise<void> {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+    throw new ApiError(res.status, path);
   }
 }
 
@@ -59,7 +70,7 @@ export async function postJsonAuth<T>(
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+    throw new ApiError(res.status, path);
   }
   return (await res.json()) as T;
 }
@@ -70,6 +81,6 @@ export async function deleteAuth(path: string, token: string): Promise<void> {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+    throw new ApiError(res.status, path);
   }
 }

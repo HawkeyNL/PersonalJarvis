@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from "vue";
-import { getJson } from "../api";
+import { getJson, ApiError } from "../api";
 import {
   currentSession,
   login,
   logout,
+  clearSession,
   listDevices,
   type DeviceItem,
 } from "../auth";
@@ -82,39 +83,65 @@ async function pollBackend() {
   }
 }
 
+// Return a usable session token, logging in (enroll if needed) when absent.
+async function ensureSession(): Promise<string | null> {
+  let session = await currentSession();
+  if (!session.token) {
+    await login();
+    session = await currentSession();
+    if (session.token) pushFeed("ok", "AUTH device-bound sessie geactiveerd");
+  }
+  return session.token;
+}
+
 async function refreshAuthData() {
   if (authTrying) return;
   authTrying = true;
   try {
     error.value = null;
-    let session = await currentSession();
-    if (!session.token) {
-      await login();
-      session = await currentSession();
-      if (session.token) pushFeed("ok", "AUTH device-bound sessie geactiveerd");
-    }
-    if (session.token) {
-      devices.value = await listDevices(session.token);
-      auth.value = "in";
-      try {
-        const p = await listHoldings();
-        portfolioTotal.value = p.total_cost;
-        portfolioCount.value = p.holdings.length;
-        pushFeed("info", `PORTFOLIO ${p.holdings.length} posities · basis ${p.total_cost}`);
-      } catch {
-        /* portfolio summary is optional */
-      }
-      try {
-        ibkr.value = await ibkrStatus();
-        pushFeed(
-          ibkr.value.reachable ? "info" : "warn",
-          `IBKR ${ibkr.value.authenticated ? "ingelogd" : ibkr.value.reachable ? "gateway bereikbaar" : "offline"}`,
-        );
-      } catch {
-        /* ibkr optional */
-      }
-    } else {
+    let token = await ensureSession();
+    if (!token) {
       auth.value = "uit";
+      return;
+    }
+
+    // Listing devices also validates the token. A stale token (the backend
+    // restarted and forgot the session) 401s — drop it and log in fresh once,
+    // instead of looping on a dead token every poll.
+    try {
+      devices.value = await listDevices(token);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        pushFeed("warn", "AUTH sessie verlopen — opnieuw inloggen");
+        await clearSession();
+        token = await ensureSession();
+        if (!token) {
+          auth.value = "uit";
+          return;
+        }
+        devices.value = await listDevices(token);
+      } else {
+        throw e;
+      }
+    }
+    auth.value = "in";
+
+    try {
+      const p = await listHoldings();
+      portfolioTotal.value = p.total_cost;
+      portfolioCount.value = p.holdings.length;
+      pushFeed("info", `PORTFOLIO ${p.holdings.length} posities · basis ${p.total_cost}`);
+    } catch {
+      /* portfolio summary is optional */
+    }
+    try {
+      ibkr.value = await ibkrStatus();
+      pushFeed(
+        ibkr.value.reachable ? "info" : "warn",
+        `IBKR ${ibkr.value.authenticated ? "ingelogd" : ibkr.value.reachable ? "gateway bereikbaar" : "offline"}`,
+      );
+    } catch {
+      /* ibkr optional */
     }
   } catch (e) {
     if (auth.value !== "fout") pushFeed("err", "AUTH mislukt");
@@ -240,6 +267,9 @@ onBeforeUnmount(() => {
 <style scoped>
 .hud {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 100%; /* fill the content pane so the grid can flex to fit */
 }
 
 /* faint grid + scanlines behind everything */
@@ -336,9 +366,9 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: minmax(300px, 1.1fr) minmax(320px, 1.3fr) minmax(240px, 1fr);
   gap: 18px;
-  /* fill the space between top bar and dock without forcing overflow */
-  min-height: calc(100vh - 190px);
-  min-height: calc(100dvh - 190px);
+  /* take the space left under the header without forcing viewport overflow */
+  flex: 1;
+  min-height: 0;
   align-items: stretch;
 }
 

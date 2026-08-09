@@ -32,10 +32,28 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "migrations did not run (is postgres up?)"),
     }
 
+    // Wire up the brain (DEC-001). The API key never leaves the backend.
+    let llm = jarvis_llm::build_provider(jarvis_llm::ProviderConfig {
+        provider: config.llm_provider.clone(),
+        api_key: {
+            let key = config.llm_api_key.trim();
+            (!key.is_empty()).then(|| key.to_string())
+        },
+        anthropic_base_url: config.llm_anthropic_base_url.clone(),
+        model_default: config.llm_model.clone(),
+        model_hard: config.llm_model_hard.clone(),
+        model_cheap: config.llm_model_cheap.clone(),
+        ollama_url: config.llm_ollama_url.clone(),
+        ollama_model: config.llm_ollama_model.clone(),
+    });
+    tracing::info!(brain = %llm.label(), "llm brain configured");
+
     let state = AppState {
         db,
         environment: config.environment.clone(),
         ibkr_gateway_url: config.ibkr_gateway_url.clone(),
+        llm,
+        llm_max_tokens: config.llm_max_tokens,
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

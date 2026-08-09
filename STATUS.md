@@ -7,7 +7,7 @@ Blueprint v2.6
 Fase 2 gestart: handmatig portfolio (holdings) werkt op iOS + macOS, achter de device-login. Fase 0 + Fase 1 afgerond.
 
 ## Eerstvolgende taak
-IBKR live verifiëren zodra de Client Portal Gateway draait + ingelogd (paper eerst); daarna B — marktdata-provider (DEC-002) voor live koersen.
+Live test van het Jarvis-brein: `JARVIS_LLM_API_KEY` (Anthropic) in de backend-`.env` zetten en het gesprek end-to-end verifiëren. Daarna IBKR live verifiëren zodra de Client Portal Gateway draait + ingelogd (paper eerst); vervolgens B — marktdata-provider (DEC-002) voor live koersen.
 
 ## Klaar
 - Productvisie
@@ -27,9 +27,9 @@ IBKR live verifiëren zodra de Client Portal Gateway draait + ingelogd (paper ee
 - Fase 1-hardening: server-side logout + owner-checked device-revocatie; privésleutel in OS-keychain (`keyring`, Apple-backend) met app-privé fallback — iOS-build met keyring geverifieerd
 - Fase 2 — portfolio: `holdings`-tabel (Decimal-geld) + `jarvis-portfolio` + beveiligde `/v1/holdings` (GET/POST/DELETE) met kostenbasis/allocatie; client Portfolio-scherm + Home-samenvatting. iOS geverifieerd (dashboard: "3 posities · kostenbasis 7842.75")
 - IBKR read-only adapter (DEC-003 → ADR-013: Client Portal Web API): crate `jarvis-ibkr` (auth-status/accounts/positions + contracttests), beveiligde `/v1/broker/ibkr/status`+`/positions`, client IBKR-scherm. Live nog te testen met draaiende gateway.
+- LLM-integratie (DEC-001 → ADR-022: Anthropic/Claude): crate `jarvis-llm` (`LlmProvider`-trait, Anthropic + Ollama-fallback, tiers Sonnet/Opus/Haiku), beveiligde `/v1/assistant/chat` met Nederlandse persona, client-chat op het echte brein. Sleutel alleen in backend-`.env`. Live test vereist `JARVIS_LLM_API_KEY`.
 
 ## Blockers/beslissingen
-- Primaire LLM-provider
 - Eerste marktdata-provider
 - Praktische IBKR API-route
 - Prop-firmkeuze
@@ -37,8 +37,9 @@ IBKR live verifiëren zodra de Client Portal Gateway draait + ingelogd (paper ee
 - Lokale hardware versus cloud-API
 
 ## Laatste update
-8 augustus 2026
+9 augustus 2026
 
+- **Jarvis-brein bedraad (DEC-001 = Claude, ADR-022)**: nieuwe crate `crates/llm` met een provider-abstractie (`LlmProvider`-trait, `Arc<dyn>` in `AppState`). Providers: `AnthropicProvider` (raw HTTP → `POST /v1/messages`, tiers `claude-sonnet-5`/`claude-opus-5`/`claude-haiku-4-5`), `OllamaProvider` (lokale fallback `llama3.2`), `FallbackProvider` (valt terug bij transport-/API-fout, **niet** bij een echte `refusal`), plus `Unconfigured` + `Echo`-stub voor tests. Beveiligd (Bearer) endpoint `POST /v1/assistant/chat`: persona/system-prompt (`JARVIS_SYSTEM`, NL) wordt server-side toegevoegd, client stuurt alleen de beurten. Config `JARVIS_LLM_*` (sleutel geredigeerd in `Debug`, alleen backend). Client `assistant.ts` roept nu het echte endpoint aan met een "denkt na"-indicator; TTS spreekt alleen als de policy het toelaat. `cargo build`/`clippy -D warnings`/`test` (6 llm + config + API-integratie incl. chat-echo) en client `npm run build` groen. Nog te doen: SSE-streaming; live test met echte sleutel.
 - Jarvis-HUD Home: levend reactor-core-scherm (canvas-particles + draaiende SVG-ringen + radar-sweep) met telemetrie-panelen (systeemstatus, device-mesh, portfolio, IBKR-link, live engine-feed), klok + uptime. Groen als standaard-accent voor de hele client (`styles.css`). Nieuw component `components/ReactorCore.vue`; `Home.vue` herschreven en op echte backend-/login-/portfolio-/IBKR-data aangesloten. `vue-tsc` + `vite build` groen. Respecteert `prefers-reduced-motion`.
 - Navigatie omgebouwd naar een zwevende **Liquid-Glass dock** onderaan (alle schermen; geen zijbalk meer), 5 tabs met iconen (Jarvis/Portfolio/IBKR/System/Settings), Jarvis als hoofdtab. Core toont nu **alleen de naam "Jarvis"** en schaalt mee met het scherm (full-screen HUD). Nieuwe `Settings`-view met werkende **accentkleur-switch** (groen standaard, `theme.ts`, gepersisteerd in localStorage; particles volgen de accentkleur). Nieuw `components/NavIcon.vue`. Glass-design op panelen + dock.
 - Navigatie herzien naar **twee lagen**: bovenaan een globale modus-schakelaar **SYSTEM / TRADING** (groene chip actief) + klok; onderaan een Liquid-Glass **sub-tab-dock** die meebeweegt met de modus (SYSTEM → Jarvis/System/Settings, TRADING → Portfolio/IBKR). Content van niet-HUD-views gecentreerd (`margin: 0 auto`).

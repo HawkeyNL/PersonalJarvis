@@ -41,6 +41,7 @@ Belangrijkste endpoints:
 | GET/DELETE | `/v1/devices` · `/v1/devices/{id}` | apparatenbeheer (Bearer-token) |
 | GET/POST/DELETE | `/v1/holdings` · `/v1/holdings/{id}` | portfolio (Decimal-geld) |
 | GET | `/v1/broker/ibkr/status` · `/positions` | IBKR read-only (via gateway) |
+| POST | `/v1/assistant/chat` | Jarvis-brein (Claude, Bearer-token) |
 
 ### 2. Client (macOS)
 
@@ -71,6 +72,22 @@ xcrun simctl launch booted com.hawkeynl.jarvis
 De backend proxeert alleen; het inloggen (SSO + 2FA) gebeurt in de **IBKR Client
 Portal Gateway** die jij lokaal draait. Zet daarna `JARVIS_IBKR_GATEWAY_URL` in
 `.env` (default `https://localhost:5000/v1/api`) en herstart de API. **Paper eerst.**
+
+### 5. Jarvis-brein aanzetten (Claude of lokaal)
+
+Het gesprek op de SYSTEM → Jarvis-view praat met een echt LLM via de backend
+(DEC-001 = Claude, zie `decisions/ADR-022`). De API-sleutel leeft **alleen** in de
+backend-`.env` — nooit in de client.
+
+- **Claude (aanbevolen):** zet `JARVIS_LLM_API_KEY=<jouw Anthropic-sleutel>` in
+  `.env` en herstart de API. Modellen per tier staan in `.env.example`
+  (`claude-sonnet-5` standaard, `claude-opus-5` zwaar, `claude-haiku-4-5` snel).
+- **Lokaal (gratis, offline):** draai [Ollama](https://ollama.com) (`ollama serve`
+  + `ollama pull llama3.2`) en zet `JARVIS_LLM_PROVIDER=ollama`. Met **beide**
+  gezet valt de backend automatisch terug op Ollama als Claude niet bereikbaar is.
+
+Zonder sleutel én zonder Ollama toont de chat een nette "brein niet
+bereikbaar"-melding.
 
 ### Checks (zoals in CI)
 
@@ -136,8 +153,8 @@ Iedere coding-agent moet na werk taken afvinken, nieuwe taken toevoegen, tests v
 - [ ] User/device-auth
 - [ ] Centrale sync
 - [ ] Lokale encrypted cache
-- [ ] Cloudmodeladapter
-- [ ] Ollama fallback
+- [x] Cloudmodeladapter (Claude via `crates/llm`, DEC-001/ADR-022)
+- [x] Ollama fallback
 - [ ] Agent orchestration
 - [ ] Tool registry
 - [ ] Cost tracking

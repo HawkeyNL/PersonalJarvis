@@ -31,18 +31,22 @@ body {
 }
 
 .app {
-  min-height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden; /* the shell is fixed; only .content scrolls */
 }
 
 .content {
+  flex: 1;
+  min-height: 0; /* allow this pane to scroll instead of stretching the shell */
+  overflow-y: auto;
   padding: 22px 32px calc(96px + env(safe-area-inset-bottom));
-  min-height: 100vh;
 }
 
 /* Global top bar — primary mode switch (SYSTEM / TRADING). */
 .topbar {
-  position: sticky;
-  top: 0;
+  flex: none; /* fixed header of the shell; .content scrolls beneath it */
   z-index: 40;
   display: flex;
   align-items: center;

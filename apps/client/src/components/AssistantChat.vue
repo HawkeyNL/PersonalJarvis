@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from "vue";
 import NavIcon from "./NavIcon.vue";
-import { messages, send } from "../assistant";
+import { messages, send, thinking } from "../assistant";
 import {
   voiceEnabled,
   headset,
@@ -156,7 +156,7 @@ async function toggleHeadset() {
 }
 
 watch(
-  () => messages.value.length,
+  () => [messages.value.length, thinking.value],
   async () => {
     await nextTick();
     if (listEl.value) listEl.value.scrollTop = listEl.value.scrollHeight;
@@ -203,7 +203,10 @@ onBeforeUnmount(stopMic);
           <span v-if="m.role === 'jarvis' && m.spoken" class="spoke">🔊</span>{{ m.ts }}
         </div>
       </div>
-      <p v-if="!messages.length" class="ch-empty">Zeg of typ iets tegen Jarvis…</p>
+      <p v-if="!messages.length && !thinking" class="ch-empty">Zeg of typ iets tegen Jarvis…</p>
+      <div v-if="thinking" class="msg jarvis">
+        <div class="bubble typing"><span></span><span></span><span></span></div>
+      </div>
     </div>
 
     <form class="ch-input" @submit.prevent="onSend">
@@ -286,6 +289,16 @@ onBeforeUnmount(stopMic);
 }
 .meta { font-family: var(--mono); font-size: 9px; color: var(--muted); letter-spacing: 0.06em; }
 .spoke { margin-right: 4px; }
+
+.bubble.typing { display: inline-flex; gap: 4px; align-items: center; }
+.bubble.typing span {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); opacity: 0.4; animation: typing-dot 1.1s infinite ease-in-out;
+}
+.bubble.typing span:nth-child(2) { animation-delay: 0.18s; }
+.bubble.typing span:nth-child(3) { animation-delay: 0.36s; }
+@keyframes typing-dot { 0%, 60%, 100% { opacity: 0.3; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
+@media (prefers-reduced-motion: reduce) { .bubble.typing span { animation: none; opacity: 0.6; } }
 
 .ch-input {
   display: flex; align-items: center; gap: 7px; padding: 10px 11px;

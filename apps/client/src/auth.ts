@@ -56,6 +56,13 @@ export async function login(): Promise<void> {
   await invoke("auth_save", { deviceId, token: result.token });
 }
 
+/** Drop the locally stored session token (keeps the enrolled device + key), so
+ *  the next `login()` mints a fresh session. Used to recover from a stale token
+ *  (e.g. the backend restarted and forgot the session) instead of looping on 401. */
+export async function clearSession(): Promise<void> {
+  await invoke("auth_logout");
+}
+
 export async function logout(): Promise<void> {
   const session = await currentSession();
   if (session.token) {

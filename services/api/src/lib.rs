@@ -5,6 +5,7 @@
 //! `Bearer` session token (see [`Authed`]).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::{
     extract::{FromRequestParts, Path, Query, State},
@@ -20,6 +21,7 @@ use uuid::Uuid;
 
 use jarvis_ibkr as ibkr;
 use jarvis_identity as identity;
+use jarvis_llm as llm;
 use jarvis_portfolio as portfolio;
 use rust_decimal::Decimal;
 
@@ -29,6 +31,10 @@ pub struct AppState {
     pub db: PgPool,
     pub environment: String,
     pub ibkr_gateway_url: String,
+    /// The brain (DEC-001) — provider-abstracted, swappable at runtime.
+    pub llm: Arc<dyn llm::LlmProvider>,
+    /// Max output tokens per assistant reply.
+    pub llm_max_tokens: u32,
 }
 
 /// Build the application router.
@@ -47,6 +53,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/holdings/{id}", delete(remove_holding))
         .route("/v1/broker/ibkr/status", get(ibkr_status))
         .route("/v1/broker/ibkr/positions", get(ibkr_positions))
+        .route("/v1/assistant/chat", post(assistant_chat))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -431,6 +438,88 @@ async fn ibkr_positions(
     Ok(Json(json!({ "account": account, "positions": positions })))
 }
 
+/// Jarvis' persona, prepended server-side. Kept plain (no shouty emphasis):
+/// modern Claude models follow the system prompt closely.
+const JARVIS_SYSTEM: &str = "Je bent Jarvis, de persoonlijke AI-assistent op het HUD-dashboard van de gebruiker. \
+Antwoord in het Nederlands, kort en duidelijk, in een rustige en behulpzame toon. \
+Je helpt met het systeem, de portfolio en trading-inzichten. \
+Zeg het eerlijk wanneer je iets niet zeker weet in plaats van te gokken. \
+Voer nooit trades of onomkeerbare acties uit — die vereisen altijd een expliciete bevestiging van de gebruiker.";
+
+#[derive(Deserialize)]
+struct ChatTurn {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct ChatReq {
+    messages: Vec<ChatTurn>,
+    /// Optional tier hint: `default` | `hard` | `cheap`.
+    #[serde(default)]
+    tier: Option<String>,
+    /// Optional system-prompt override (defaults to the Jarvis persona).
+    #[serde(default)]
+    system: Option<String>,
+}
+
+/// Chat with the brain (protected). The client sends the conversation so far;
+/// the persona is prepended server-side. Never exposes the API key.
+async fn assistant_chat(
+    _authed: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<ChatReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let messages: Vec<llm::ChatMessage> = req
+        .messages
+        .iter()
+        .filter_map(|t| {
+            let content = t.content.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(match t.role.as_str() {
+                "assistant" | "jarvis" => llm::ChatMessage::assistant(content),
+                _ => llm::ChatMessage::user(content),
+            })
+        })
+        .collect();
+    if messages.is_empty() {
+        return Err(bad_request("messages is required"));
+    }
+
+    let chat = llm::ChatRequest {
+        system: Some(req.system.unwrap_or_else(|| JARVIS_SYSTEM.to_string())),
+        tier: req.tier.as_deref().map(llm::Tier::parse).unwrap_or_default(),
+        messages,
+        max_tokens: state.llm_max_tokens,
+    };
+
+    match state.llm.chat(&chat).await {
+        Ok(reply) => Ok(Json(json!({
+            "reply": reply.text,
+            "model": reply.model,
+            "stop_reason": reply.stop_reason,
+        }))),
+        Err(llm::LlmError::Refused) => Ok(Json(json!({
+            "reply": "Sorry, daar kan ik niet op antwoorden.",
+            "model": Value::Null,
+            "stop_reason": "refusal",
+        }))),
+        Err(e) => {
+            // Details stay in logs; the client gets an opaque, actionable hint.
+            tracing::warn!(error = %e, "assistant chat failed");
+            Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": "brain unavailable",
+                    "hint": "controleer JARVIS_LLM_API_KEY of start Ollama lokaal",
+                })),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +559,8 @@ mod tests {
             db: pool.clone(),
             environment: "test".to_string(),
             ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
+            llm: jarvis_llm::stub(),
+            llm_max_tokens: 256,
         });
 
         // 1. enroll this device (dev endpoint)
@@ -609,6 +700,49 @@ mod tests {
         assert_eq!(body["holdings"].as_array().unwrap().len(), 1);
         assert_eq!(body["holdings"][0]["symbol"], "AAPL");
         assert_eq!(body["total_cost"], "1502.5");
+
+        // 4c. assistant chat replies via the stub brain (protected)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assistant/chat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "messages": [{ "role": "user", "content": "hoi Jarvis" }],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["reply"], "echo: hoi Jarvis");
+
+        // 4d. the chat endpoint is protected (no token -> 401)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assistant/chat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "messages": [{ "role": "user", "content": "hoi" }],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         // 5. logout revokes the session server-side
         let resp = app
