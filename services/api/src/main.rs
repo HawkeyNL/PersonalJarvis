@@ -48,12 +48,21 @@ async fn main() -> anyhow::Result<()> {
     });
     tracing::info!(brain = %llm.label(), "llm brain configured");
 
+    // Server-side speech (STT + speaker verification). Stub until a real model
+    // is plugged in behind the SpeechEngine trait.
+    let speech = jarvis_speech::build_engine(&jarvis_speech::EngineConfig {
+        provider: config.speech_provider.clone(),
+    });
+    tracing::info!(speech = %speech.label(), "speech engine configured");
+
     let state = AppState {
         db,
         environment: config.environment.clone(),
         ibkr_gateway_url: config.ibkr_gateway_url.clone(),
         llm,
         llm_max_tokens: config.llm_max_tokens,
+        speech,
+        speech_verify_threshold: config.speech_verify_threshold,
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

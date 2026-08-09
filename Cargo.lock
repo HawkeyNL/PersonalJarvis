@@ -987,6 +987,7 @@ dependencies = [
  "jarvis-llm",
  "jarvis-observability",
  "jarvis-portfolio",
+ "jarvis-speech",
  "rand 0.8.7",
  "rust_decimal",
  "serde",
@@ -1066,6 +1067,16 @@ dependencies = [
  "time",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "jarvis-speech"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

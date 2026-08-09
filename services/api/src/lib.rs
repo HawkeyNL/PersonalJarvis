@@ -23,6 +23,7 @@ use jarvis_ibkr as ibkr;
 use jarvis_identity as identity;
 use jarvis_llm as llm;
 use jarvis_portfolio as portfolio;
+use jarvis_speech as speech;
 use rust_decimal::Decimal;
 
 /// Shared, cheaply-cloneable application state.
@@ -35,6 +36,10 @@ pub struct AppState {
     pub llm: Arc<dyn llm::LlmProvider>,
     /// Max output tokens per assistant reply.
     pub llm_max_tokens: u32,
+    /// Server-side speech engine (STT + speaker verification).
+    pub speech: Arc<dyn speech::SpeechEngine>,
+    /// Cosine threshold to accept a voice as the enrolled speaker.
+    pub speech_verify_threshold: f32,
 }
 
 /// Build the application router.
@@ -59,6 +64,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/broker/ibkr/status", get(ibkr_status))
         .route("/v1/broker/ibkr/positions", get(ibkr_positions))
         .route("/v1/assistant/chat", post(assistant_chat))
+        .route("/v1/voice/status", get(voice_status))
+        .route("/v1/voice/enroll", post(voice_enroll))
+        .route("/v1/voice/verify", post(voice_verify))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -669,6 +677,133 @@ async fn assistant_chat(
     }
 }
 
+// ---- Voice: server-side speaker verification + STT --------------------------
+
+fn db_err(_e: sqlx::Error) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "internal error" })),
+    )
+}
+
+fn speech_err(e: speech::SpeechError) -> (StatusCode, Json<Value>) {
+    match e {
+        speech::SpeechError::TooShort => bad_request("audio was empty or too short"),
+        speech::SpeechError::NotConfigured(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "speech engine not configured" })),
+        ),
+        speech::SpeechError::Failed(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "speech engine failed" })),
+        ),
+    }
+}
+
+fn encode_embedding(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct AudioReq {
+    sample_rate: u32,
+    /// 16-bit mono PCM samples.
+    pcm: Vec<i16>,
+}
+
+fn to_audio(req: AudioReq) -> Result<speech::Audio, (StatusCode, Json<Value>)> {
+    if req.pcm.is_empty() {
+        return Err(bad_request("audio is required"));
+    }
+    Ok(speech::Audio::new(req.pcm, req.sample_rate))
+}
+
+/// Whether the authenticated user has enrolled a voice profile.
+async fn voice_status(
+    authed: Authed,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let exists: Option<i32> =
+        sqlx::query_scalar("select 1 from voice_profiles where user_id = $1")
+            .bind(authed.user.id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(db_err)?;
+    Ok(Json(json!({
+        "enrolled": exists.is_some(),
+        "engine": state.speech.label(),
+    })))
+}
+
+/// Enroll (or re-enroll) the user's voice: embed the audio and store it centrally.
+async fn voice_enroll(
+    authed: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<AudioReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let audio = to_audio(req)?;
+    let embedding = state.speech.embed(&audio).await.map_err(speech_err)?;
+    let bytes = encode_embedding(&embedding);
+    sqlx::query(
+        "insert into voice_profiles (user_id, embedding, dims, engine, updated_at) \
+         values ($1, $2, $3, $4, now()) \
+         on conflict (user_id) do update set \
+           embedding = $2, dims = $3, engine = $4, updated_at = now()",
+    )
+    .bind(authed.user.id)
+    .bind(&bytes)
+    .bind(embedding.len() as i32)
+    .bind(state.speech.label())
+    .execute(&state.db)
+    .await
+    .map_err(db_err)?;
+    Ok(Json(json!({ "status": "enrolled", "dims": embedding.len() })))
+}
+
+/// Verify a voice against the enrolled profile and transcribe it.
+async fn voice_verify(
+    authed: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<AudioReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let audio = to_audio(req)?;
+    let embedding = state.speech.embed(&audio).await.map_err(speech_err)?;
+    let transcript = state.speech.transcribe(&audio).await.unwrap_or_default();
+
+    let stored: Option<Vec<u8>> =
+        sqlx::query_scalar("select embedding from voice_profiles where user_id = $1")
+            .bind(authed.user.id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(db_err)?;
+
+    match stored {
+        None => Ok(Json(json!({
+            "enrolled": false,
+            "is_you": false,
+            "score": 0.0,
+            "transcript": transcript,
+        }))),
+        Some(bytes) => {
+            let profile = decode_embedding(&bytes);
+            let score = speech::cosine(&profile, &embedding);
+            Ok(Json(json!({
+                "enrolled": true,
+                "is_you": score >= state.speech_verify_threshold,
+                "score": score,
+                "transcript": transcript,
+            })))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,6 +845,8 @@ mod tests {
             ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
             llm: jarvis_llm::stub(),
             llm_max_tokens: 256,
+            speech: jarvis_speech::stub(),
+            speech_verify_threshold: 0.5,
         });
 
         // 1. enroll this device (dev endpoint)
@@ -892,6 +1029,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 4e. voice: not enrolled → enroll → verify the same audio as "you"
+        let pcm: Vec<i16> = (0..2000).map(|i| ((i * 7) % 5000) as i16).collect();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/voice/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["enrolled"], false);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/voice/enroll")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "sample_rate": 16000, "pcm": pcm })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["status"], "enrolled");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/voice/verify")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "sample_rate": 16000, "pcm": pcm })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["enrolled"], true);
+        assert_eq!(body["is_you"], true); // identical audio → perfect self-match
 
         // 5. logout revokes the session server-side
         let resp = app

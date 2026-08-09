@@ -74,6 +74,16 @@ pub struct AppConfig {
     /// Ollama model name (fallback brain).
     #[serde(default = "default_ollama_model")]
     pub llm_ollama_model: String,
+
+    /// Speech engine (STT + speaker verification): `stub` (default) until a real
+    /// model is plugged in.
+    #[serde(default = "default_speech_provider")]
+    pub speech_provider: String,
+
+    /// Cosine-similarity threshold above which a voice is accepted as the
+    /// enrolled speaker. Model-dependent; tune per engine.
+    #[serde(default = "default_speech_verify_threshold")]
+    pub speech_verify_threshold: f32,
 }
 
 fn default_bind_addr() -> String {
@@ -122,6 +132,14 @@ fn default_ollama_model() -> String {
     "llama3.2".to_string()
 }
 
+fn default_speech_provider() -> String {
+    "stub".to_string()
+}
+
+fn default_speech_verify_threshold() -> f32 {
+    0.5
+}
+
 impl AppConfig {
     /// Load configuration from `jarvis.toml` (optional) and `JARVIS_` env vars.
     ///
@@ -158,6 +176,8 @@ impl fmt::Debug for AppConfig {
             .field("llm_max_tokens", &self.llm_max_tokens)
             .field("llm_ollama_url", &self.llm_ollama_url)
             .field("llm_ollama_model", &self.llm_ollama_model)
+            .field("speech_provider", &self.speech_provider)
+            .field("speech_verify_threshold", &self.speech_verify_threshold)
             .finish()
     }
 }
@@ -183,6 +203,8 @@ mod tests {
             llm_max_tokens: 1024,
             llm_ollama_url: "http://localhost:11434".to_string(),
             llm_ollama_model: "llama3.2".to_string(),
+            speech_provider: "stub".to_string(),
+            speech_verify_threshold: 0.5,
         };
 
         let rendered = format!("{cfg:?}");
