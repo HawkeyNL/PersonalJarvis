@@ -409,6 +409,164 @@ fn verify_signature(
         .map_err(|_| IdentityError::AuthFailed)
 }
 
+// ---- Cross-device unlock approval ------------------------------------------
+
+/// How long an unlock request stays actionable.
+const UNLOCK_TTL_MINUTES: i64 = 2;
+
+/// A pending unlock request, as presented to an approving device.
+#[derive(Debug)]
+pub struct UnlockRequest {
+    pub id: Uuid,
+    pub requesting_device_id: Uuid,
+    pub requesting_device_name: String,
+    pub requesting_device_platform: String,
+    /// Nonce the approving device must sign to approve.
+    pub nonce: Vec<u8>,
+    pub created_at: OffsetDateTime,
+}
+
+/// Create an unlock request for `requesting_device_id`. Returns the request id
+/// and the nonce a trusted device must sign to approve it.
+pub async fn create_unlock_request(
+    pool: &PgPool,
+    user_id: Uuid,
+    requesting_device_id: Uuid,
+) -> Result<(Uuid, Vec<u8>), IdentityError> {
+    let mut nonce = vec![0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    let id = Uuid::now_v7();
+    let expires_at = OffsetDateTime::now_utc() + Duration::minutes(UNLOCK_TTL_MINUTES);
+
+    sqlx::query(
+        "insert into unlock_requests (id, user_id, requesting_device_id, nonce, expires_at) \
+         values ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(requesting_device_id)
+    .bind(&nonce)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+
+    Ok((id, nonce))
+}
+
+/// The status of an unlock request for the requesting user to poll. Returns
+/// `None` if it does not exist or belongs to another user. A pending-but-expired
+/// request reads as `"expired"`.
+pub async fn unlock_request_status(
+    pool: &PgPool,
+    id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<String>, IdentityError> {
+    let row: Option<(String, OffsetDateTime)> = sqlx::query_as(
+        "select status, expires_at from unlock_requests where id = $1 and user_id = $2",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(status, expires_at)| {
+        if status == "pending" && expires_at < OffsetDateTime::now_utc() {
+            "expired".to_string()
+        } else {
+            status
+        }
+    }))
+}
+
+/// Pending unlock requests the approving device may act on: same user, not the
+/// requester itself, still pending and unexpired.
+pub async fn pending_unlock_requests(
+    pool: &PgPool,
+    user_id: Uuid,
+    approver_device_id: Uuid,
+) -> Result<Vec<UnlockRequest>, IdentityError> {
+    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, Vec<u8>, OffsetDateTime)>(
+        "select r.id, r.requesting_device_id, d.name, d.platform, r.nonce, r.created_at \
+         from unlock_requests r \
+         join devices d on d.id = r.requesting_device_id \
+         where r.user_id = $1 and r.requesting_device_id <> $2 \
+           and r.status = 'pending' and r.expires_at > now() \
+         order by r.created_at desc",
+    )
+    .bind(user_id)
+    .bind(approver_device_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, rid, name, platform, nonce, created_at)| UnlockRequest {
+                id,
+                requesting_device_id: rid,
+                requesting_device_name: name,
+                requesting_device_platform: platform,
+                nonce,
+                created_at,
+            },
+        )
+        .collect())
+}
+
+/// Approve an unlock request by verifying the approving device's signature over
+/// the request nonce. The approver must be an active device of the same user and
+/// must not be the requester. The request must still be pending and unexpired.
+pub async fn approve_unlock_request(
+    pool: &PgPool,
+    id: Uuid,
+    user_id: Uuid,
+    approver_device_id: Uuid,
+    signature: &[u8],
+) -> Result<(), IdentityError> {
+    let mut tx = pool.begin().await?;
+
+    let row: Option<(Uuid, Vec<u8>, String, OffsetDateTime)> = sqlx::query_as(
+        "select requesting_device_id, nonce, status, expires_at from unlock_requests \
+         where id = $1 and user_id = $2 for update",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let (requesting_device_id, nonce, status, expires_at) = row.ok_or(IdentityError::AuthFailed)?;
+    if status != "pending" || expires_at < OffsetDateTime::now_utc() {
+        return Err(IdentityError::AuthFailed);
+    }
+    if requesting_device_id == approver_device_id {
+        return Err(IdentityError::AuthFailed); // a device cannot approve its own unlock
+    }
+
+    // Verify against the approver's most recent active public key.
+    let public_key: Option<Vec<u8>> = sqlx::query_scalar(
+        "select public_key from device_keys \
+         where device_id = $1 and revoked_at is null \
+         order by created_at desc limit 1",
+    )
+    .bind(approver_device_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let public_key = public_key.ok_or(IdentityError::AuthFailed)?;
+    verify_signature(&public_key, &nonce, signature)?;
+
+    sqlx::query(
+        "update unlock_requests set status = 'approved', approved_by_device_id = $2, \
+         resolved_at = now() where id = $1",
+    )
+    .bind(id)
+    .bind(approver_device_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +647,68 @@ mod tests {
         revoke_session(&pool, result.session.id).await?;
         assert!(authenticate(&pool, &result.token).await.is_err());
 
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unlock_request_approve_flow(pool: PgPool) -> Result<(), IdentityError> {
+        let user = create_user(&pool, "Gus").await?;
+        let desktop_key = new_keypair();
+        let (desktop, _) = register_device(
+            &pool,
+            user.id,
+            "MacBook",
+            Platform::Macos,
+            "ed25519",
+            &desktop_key.verifying_key().to_bytes(),
+        )
+        .await?;
+        let phone_key = new_keypair();
+        let (phone, _) = register_device(
+            &pool,
+            user.id,
+            "iPhone",
+            Platform::Ios,
+            "ed25519",
+            &phone_key.verifying_key().to_bytes(),
+        )
+        .await?;
+
+        // The desktop asks to be unlocked.
+        let (req_id, nonce) = create_unlock_request(&pool, user.id, desktop.id).await?;
+        assert_eq!(
+            unlock_request_status(&pool, req_id, user.id).await?.as_deref(),
+            Some("pending"),
+        );
+
+        // The phone sees the pending request; the desktop does not see its own.
+        let pending = pending_unlock_requests(&pool, user.id, phone.id).await?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, req_id);
+        assert!(pending_unlock_requests(&pool, user.id, desktop.id)
+            .await?
+            .is_empty());
+
+        // A device cannot approve its own unlock (even with a valid signature).
+        let self_sig = desktop_key.sign(&nonce).to_bytes();
+        assert!(
+            approve_unlock_request(&pool, req_id, user.id, desktop.id, &self_sig)
+                .await
+                .is_err()
+        );
+
+        // The phone signs the nonce and approves.
+        let sig = phone_key.sign(&nonce).to_bytes();
+        approve_unlock_request(&pool, req_id, user.id, phone.id, &sig).await?;
+        assert_eq!(
+            unlock_request_status(&pool, req_id, user.id).await?.as_deref(),
+            Some("approved"),
+        );
+
+        // Approved requests drop out of the pending list.
+        assert!(pending_unlock_requests(&pool, user.id, phone.id)
+            .await?
+            .is_empty());
         Ok(())
     }
 

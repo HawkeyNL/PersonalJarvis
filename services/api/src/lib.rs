@@ -47,6 +47,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/challenge", post(auth_challenge))
         .route("/v1/auth/login", post(auth_login))
         .route("/v1/auth/logout", post(auth_logout))
+        .route("/v1/auth/unlock/request", post(unlock_request))
+        .route("/v1/auth/unlock/pending", get(unlock_pending))
+        .route("/v1/auth/unlock/{id}", get(unlock_status))
+        .route("/v1/auth/unlock/{id}/approve", post(unlock_approve))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{id}", delete(delete_device))
         .route("/v1/holdings", get(get_holdings).post(add_holding))
@@ -262,6 +266,85 @@ async fn auth_logout(
         .await
         .map_err(internal)?;
     Ok(Json(json!({ "status": "logged out" })))
+}
+
+/// Ask a trusted device to approve unlocking this (requesting) device.
+/// Returns the request id and the nonce an approver must sign.
+async fn unlock_request(
+    authed: Authed,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let (id, nonce) =
+        identity::create_unlock_request(&state.db, authed.user.id, authed.device.id)
+            .await
+            .map_err(internal)?;
+    Ok(Json(json!({
+        "request_id": id,
+        "nonce": hex::encode(nonce),
+    })))
+}
+
+/// Poll the status of an unlock request: `pending` | `approved` | `denied` | `expired`.
+async fn unlock_status(
+    authed: Authed,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match identity::unlock_request_status(&state.db, id, authed.user.id)
+        .await
+        .map_err(internal)?
+    {
+        Some(status) => Ok(Json(json!({ "status": status }))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unlock request not found" })),
+        )),
+    }
+}
+
+/// Unlock requests this device can approve (same user, not itself).
+async fn unlock_pending(
+    authed: Authed,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let requests =
+        identity::pending_unlock_requests(&state.db, authed.user.id, authed.device.id)
+            .await
+            .map_err(internal)?;
+    let items: Vec<Value> = requests
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "device_name": r.requesting_device_name,
+                "platform": r.requesting_device_platform,
+                "nonce": hex::encode(&r.nonce),
+                "created_at": r.created_at.unix_timestamp(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "requests": items })))
+}
+
+#[derive(Deserialize)]
+struct ApproveReq {
+    /// Hex-encoded Ed25519 signature over the request nonce.
+    signature: String,
+}
+
+/// Approve an unlock request by signing its nonce with this device's key.
+async fn unlock_approve(
+    authed: Authed,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ApproveReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let signature =
+        hex::decode(&req.signature).map_err(|_| bad_request("invalid signature encoding"))?;
+    identity::approve_unlock_request(&state.db, id, authed.user.id, authed.device.id, &signature)
+        .await
+        .map_err(|_| unauthorized())?;
+    Ok(Json(json!({ "status": "approved" })))
 }
 
 /// Revoke one of the authenticated user's devices.

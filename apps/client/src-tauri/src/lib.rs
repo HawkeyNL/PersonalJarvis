@@ -151,14 +151,16 @@ fn auth_logout(app: AppHandle) -> Result<(), String> {
     save_store(&app, &store)
 }
 
-/// Prompt the OS for local biometric verification (Touch ID / Face ID).
+/// Prompt the OS for local verification (Touch ID / Face ID).
 ///
-/// Deliberately biometrics-only (no device-password fallback): if biometrics
-/// fail or are unavailable, the app falls back to phone approval instead of the
-/// desktop password. Returns `Ok(())` only on a successful verification; any
-/// failure, cancellation, or lack of hardware is an `Err`.
+/// `allow_password` controls the device-password fallback. The desktop passes
+/// `false` (biometrics-only): if biometrics fail, the app falls back to phone
+/// approval rather than the desktop password. The phone passes `true`, so its
+/// own biometrics fall back to the phone's passcode — the always-with-you route.
+/// Returns `Ok(())` only on a successful verification; any failure,
+/// cancellation, or lack of hardware is an `Err`.
 #[tauri::command]
-fn biometric_unlock(reason: String) -> Result<(), String> {
+fn biometric_unlock(reason: String, allow_password: bool) -> Result<(), String> {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -168,7 +170,7 @@ fn biometric_unlock(reason: String) -> Result<(), String> {
 
     let policy = PolicyBuilder::new()
         .biometrics(Some(BiometricStrength::Strong))
-        .password(false)
+        .password(allow_password)
         .companion(false)
         .build()
         .ok_or_else(|| "biometrics not supported".to_string())?;

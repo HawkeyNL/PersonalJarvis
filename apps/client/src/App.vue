@@ -2,6 +2,10 @@
 import { ref, computed, onMounted, onBeforeUnmount } from "vue";
 import { useRoute } from "vue-router";
 import NavIcon from "./components/NavIcon.vue";
+import AppLock from "./components/AppLock.vue";
+import UnlockApprovals from "./components/UnlockApprovals.vue";
+import { locked, initLock, noteActivity } from "./lock";
+import { startApprovalPolling, stopApprovalPolling } from "./unlockApprovals";
 
 const route = useRoute();
 const mode = computed<"system" | "trading">(() =>
@@ -37,8 +41,17 @@ function tick() {
 onMounted(() => {
   tick();
   timer = window.setInterval(tick, 1000);
+  initLock();
+  startApprovalPolling(); // this device can approve other devices' unlocks
+  window.addEventListener("pointerdown", noteActivity, { passive: true });
+  window.addEventListener("keydown", noteActivity);
 });
-onBeforeUnmount(() => clearInterval(timer));
+onBeforeUnmount(() => {
+  clearInterval(timer);
+  stopApprovalPolling();
+  window.removeEventListener("pointerdown", noteActivity);
+  window.removeEventListener("keydown", noteActivity);
+});
 </script>
 
 <template>
@@ -69,5 +82,10 @@ onBeforeUnmount(() => clearInterval(timer));
         <span>{{ t.label }}</span>
       </RouterLink>
     </nav>
+
+    <!-- Incoming unlock approvals for other devices (phone side). -->
+    <UnlockApprovals />
+    <!-- Full-screen biometric gate on desktop when the lock is enabled. -->
+    <AppLock v-if="locked" />
   </div>
 </template>

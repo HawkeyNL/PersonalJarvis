@@ -3,6 +3,7 @@ import { ref, onMounted } from "vue";
 import { API_BASE } from "../api";
 import { ACCENTS, PRESETS, currentAccent, applyAccent, type Accent } from "../theme";
 import { currentSession, logout, type Session } from "../auth";
+import { lockEnabled, isDesktop, setLockEnabled, initLock } from "../lock";
 
 const accent = ref<Accent>(currentAccent());
 const session = ref<Session | null>(null);
@@ -26,6 +27,7 @@ async function doLogout() {
 
 onMounted(async () => {
   session.value = await currentSession();
+  await initLock(); // resolves isDesktop for the lock toggle
 });
 </script>
 
@@ -71,6 +73,29 @@ onMounted(async () => {
         </li>
       </ul>
       <button v-if="session?.token" class="ghost" @click="doLogout">Uitloggen</button>
+    </div>
+
+    <div class="panel glass">
+      <div class="panel-head">BEVEILIGING <span class="hint">app-vergrendeling</span></div>
+      <label class="toggle" :class="{ off: !isDesktop }">
+        <span class="tl">
+          <span class="tt">Vergrendel bij openen</span>
+          <span class="td">
+            Touch ID / Face ID bij het openen. Faalt de biometrie, dan keur je
+            goed via je telefoon.
+          </span>
+        </span>
+        <input
+          type="checkbox"
+          :checked="lockEnabled"
+          :disabled="!isDesktop"
+          @change="setLockEnabled(($event.target as HTMLInputElement).checked)"
+        />
+        <span class="sw"></span>
+      </label>
+      <p v-if="!isDesktop" class="muted small">
+        Dit toestel keurt ontgrendelingen goed voor je desktop — geen eigen slot nodig.
+      </p>
     </div>
 
     <div class="panel glass">
@@ -133,4 +158,25 @@ onMounted(async () => {
   color: var(--muted); font-family: var(--mono); font-size: 12px;
 }
 .ghost:hover { color: var(--accent-2); border-color: var(--accent-2); filter: none; }
+
+.toggle { display: flex; align-items: center; gap: 14px; cursor: pointer; }
+.toggle.off { cursor: default; }
+.toggle .tl { display: flex; flex-direction: column; gap: 3px; }
+.tt { font-size: 14px; }
+.td { font-size: 12px; color: var(--muted); line-height: 1.4; max-width: 42ch; }
+.toggle input { position: absolute; opacity: 0; pointer-events: none; }
+.sw {
+  margin-left: auto; flex: none; position: relative;
+  width: 46px; height: 27px; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border);
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+.sw::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 21px; height: 21px; border-radius: 50%;
+  background: var(--muted); transition: transform 0.2s ease, background 0.2s ease;
+}
+.toggle input:checked ~ .sw { background: rgba(52, 245, 160, 0.25); border-color: var(--accent); }
+.toggle input:checked ~ .sw::after { transform: translateX(19px); background: var(--accent); }
+.toggle input:disabled ~ .sw { opacity: 0.5; }
 </style>

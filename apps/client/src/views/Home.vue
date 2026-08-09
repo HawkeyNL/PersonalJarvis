@@ -103,7 +103,7 @@ onBeforeUnmount(() => clearInterval(pollTimer));
   z-index: 0;
   display: grid;
   place-items: center;
-  --core-size: min(90vh, 900px);
+  --core-size: min(80vh, 780px);
   pointer-events: none;
 }
 .backdrop::before {
