@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::types::{truncate, ChatReply, ChatRequest, LlmError, Role};
+use crate::types::{truncate, ChatReply, ChatRequest, LlmError, Role, Usage};
 use crate::LlmProvider;
 
 pub struct OllamaProvider {
@@ -87,6 +87,11 @@ impl LlmProvider for OllamaProvider {
         if text.is_empty() {
             return Err(LlmError::Empty);
         }
+        let usage = Usage {
+            input_tokens: v.get("prompt_eval_count").and_then(Value::as_u64).unwrap_or(0) as u32,
+            output_tokens: v.get("eval_count").and_then(Value::as_u64).unwrap_or(0) as u32,
+            ..Default::default()
+        };
         Ok(ChatReply {
             text,
             model: self.model.clone(),
@@ -94,6 +99,7 @@ impl LlmProvider for OllamaProvider {
                 .get("done_reason")
                 .and_then(Value::as_str)
                 .map(String::from),
+            usage: Some(usage),
         })
     }
 }

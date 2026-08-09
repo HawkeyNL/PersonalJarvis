@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::types::{truncate, ChatReply, ChatRequest, LlmError, Role, Tier};
+use crate::types::{truncate, ChatReply, ChatRequest, LlmError, Role, Tier, Usage};
 use crate::LlmProvider;
 
 /// Anthropic Messages API version (sent as `anthropic-version`).
@@ -88,7 +88,13 @@ impl LlmProvider for AnthropicProvider {
             "messages": messages,
         });
         if let Some(system) = &req.system {
-            body["system"] = json!(system);
+            // Cache the (stable) system prompt so repeat calls bill it at the
+            // cheap cache-read rate instead of re-processing it every turn.
+            body["system"] = json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": { "type": "ephemeral" },
+            }]);
         }
 
         let resp = self
@@ -124,10 +130,20 @@ impl LlmProvider for AnthropicProvider {
         if text.is_empty() {
             return Err(LlmError::Empty);
         }
+        let usage = v.get("usage").map(|u| {
+            let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0) as u32;
+            Usage {
+                input_tokens: n("input_tokens"),
+                output_tokens: n("output_tokens"),
+                cache_read_tokens: n("cache_read_input_tokens"),
+                cache_write_tokens: n("cache_creation_input_tokens"),
+            }
+        });
         Ok(ChatReply {
             text,
             model,
             stop_reason,
+            usage,
         })
     }
 }

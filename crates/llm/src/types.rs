@@ -65,6 +65,17 @@ pub struct ChatRequest {
     pub max_tokens: u32,
 }
 
+/// Token usage for a reply, when the provider reports it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Usage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    /// Tokens served from the prompt cache (cheap).
+    pub cache_read_tokens: u32,
+    /// Tokens written into the prompt cache.
+    pub cache_write_tokens: u32,
+}
+
 /// A brain reply.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatReply {
@@ -74,6 +85,8 @@ pub struct ChatReply {
     pub model: String,
     /// Provider stop reason, when reported.
     pub stop_reason: Option<String>,
+    /// Token usage, when the provider reports it.
+    pub usage: Option<Usage>,
 }
 
 /// Errors from the brain.

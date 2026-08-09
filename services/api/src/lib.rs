@@ -632,11 +632,24 @@ async fn assistant_chat(
     };
 
     match state.llm.chat(&chat).await {
-        Ok(reply) => Ok(Json(json!({
-            "reply": reply.text,
-            "model": reply.model,
-            "stop_reason": reply.stop_reason,
-        }))),
+        Ok(reply) => {
+            if let Some(u) = &reply.usage {
+                // Foundation for cost tracking (Fase 1). Cache reads are cheap.
+                tracing::info!(
+                    model = %reply.model,
+                    input = u.input_tokens,
+                    output = u.output_tokens,
+                    cache_read = u.cache_read_tokens,
+                    cache_write = u.cache_write_tokens,
+                    "assistant chat usage",
+                );
+            }
+            Ok(Json(json!({
+                "reply": reply.text,
+                "model": reply.model,
+                "stop_reason": reply.stop_reason,
+            })))
+        }
         Err(llm::LlmError::Refused) => Ok(Json(json!({
             "reply": "Sorry, daar kan ik niet op antwoorden.",
             "model": Value::Null,

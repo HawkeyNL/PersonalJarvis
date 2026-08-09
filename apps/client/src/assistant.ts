@@ -38,10 +38,14 @@ interface ChatReply {
 
 // Ask the backend brain, sending the conversation so far. The persona/system
 // prompt is prepended server-side, so we only send the raw turns.
+// Only send the most recent turns so a long chat can't grow the request (and
+// token cost) without bound. The system prompt is added server-side.
+const MAX_TURNS = 20;
+
 async function ask(): Promise<ChatReply> {
   const session = await currentSession();
   if (!session.token) throw new Error("niet ingelogd");
-  const history = messages.value.map((m) => ({
+  const history = messages.value.slice(-MAX_TURNS).map((m) => ({
     role: m.role === "jarvis" ? "assistant" : "user",
     content: m.text,
   }));

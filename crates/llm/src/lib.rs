@@ -17,7 +17,7 @@ use async_trait::async_trait;
 pub use anthropic::AnthropicProvider;
 pub use fallback::FallbackProvider;
 pub use ollama::OllamaProvider;
-pub use types::{ChatMessage, ChatReply, ChatRequest, LlmError, Role, Tier};
+pub use types::{ChatMessage, ChatReply, ChatRequest, LlmError, Role, Tier, Usage};
 
 /// A swappable brain: given a conversation, produce a reply.
 #[async_trait]
@@ -116,6 +116,7 @@ impl LlmProvider for Echo {
             text: format!("echo: {last}"),
             model: "stub".into(),
             stop_reason: Some("end_turn".into()),
+            usage: None,
         })
     }
 }
