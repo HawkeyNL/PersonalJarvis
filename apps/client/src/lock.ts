@@ -25,6 +25,11 @@ export const phoneError = ref<string | null>(null);
 const LKEY = "jarvis.lock.enabled";
 export const lockEnabled = ref(localStorage.getItem(LKEY) === "true");
 
+// Once unlocked, stay unlocked for the rest of this window session. sessionStorage
+// survives hot-reloads and page reloads but clears when the app is closed, so a
+// dev code-save never re-prompts for Touch ID, while a fresh launch still locks.
+const SESSION_UNLOCKED = "jarvis.unlocked";
+
 // Auto re-lock after this much inactivity (ms). 0 disables it.
 const INACTIVITY_MS = 5 * 60 * 1000;
 let idleTimer: number | undefined;
@@ -40,7 +45,8 @@ export async function initLock(): Promise<void> {
   } catch {
     isDesktop.value = false;
   }
-  locked.value = isDesktop.value && lockEnabled.value;
+  const alreadyUnlocked = sessionStorage.getItem(SESSION_UNLOCKED) === "1";
+  locked.value = isDesktop.value && lockEnabled.value && !alreadyUnlocked;
 }
 
 export function setLockEnabled(v: boolean): void {
@@ -55,11 +61,15 @@ export function unlockApp(): void {
   locked.value = false;
   lockError.value = null;
   phoneError.value = null;
+  sessionStorage.setItem(SESSION_UNLOCKED, "1"); // survive reloads this session
   armIdle();
 }
 
 export function lockApp(): void {
-  if (isDesktop.value && lockEnabled.value) locked.value = true;
+  if (isDesktop.value && lockEnabled.value) {
+    sessionStorage.removeItem(SESSION_UNLOCKED);
+    locked.value = true;
+  }
 }
 
 /** Local biometric unlock (Touch ID / Face ID), biometrics-only. */
