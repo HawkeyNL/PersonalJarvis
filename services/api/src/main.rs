@@ -48,10 +48,12 @@ async fn main() -> anyhow::Result<()> {
     });
     tracing::info!(brain = %llm.label(), "llm brain configured");
 
-    // Server-side speech (STT + speaker verification). Stub until a real model
-    // is plugged in behind the SpeechEngine trait.
+    // Server-side speech (STT + speaker verification). `stub` by default; set
+    // provider to `whisper` (with --features speech-whisper) for real STT.
     let speech = jarvis_speech::build_engine(&jarvis_speech::EngineConfig {
         provider: config.speech_provider.clone(),
+        whisper_model: config.speech_whisper_model.clone(),
+        whisper_language: config.speech_whisper_language.clone(),
     });
     tracing::info!(speech = %speech.label(), "speech engine configured");
 

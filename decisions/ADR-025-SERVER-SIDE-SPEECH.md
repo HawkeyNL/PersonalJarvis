@@ -55,6 +55,12 @@ hoogstens de console of start de biometrie.
   → resample naar 16 kHz mono i16 → upload naar `/enroll` en `/verify`. Settings
   heeft een STEM-panel (inschrijven + "test verificatie" met transcript + score).
   Werkt mechanisch tegen de stub end-to-end.
-- Nog te doen: echt STT/embedding-model; console-STT (mic → server-transcript)
-  zodra het echte model er is; lokaal wake-word; drempel tunen; profiel
-  eventueel versleuteld opslaan.
+- **Echt STT — stage 1 (whisper.cpp)**: `WhisperEngine` achter de trait via
+  `whisper-rs`, feature-gated (`--features speech-whisper`, vereist cmake) zodat
+  de default-build/CI de stub houden. Provider `whisper` + `JARVIS_SPEECH_WHISPER_*`;
+  model via `scripts/fetch-whisper-model.sh`. `transcribe` draait op een
+  blocking-thread; misconfig degradeert netjes naar de stub. `embed` is nog de
+  placeholder-energie-fingerprint.
+- Nog te doen: **stage 2 — echt speaker-embedding** (`embed`, bv. een
+  ECAPA/wespeaker-ONNX via `ort`) zodat "is het jij" echt wordt; console-STT
+  (mic → server-transcript); drempel tunen; profiel eventueel versleuteld opslaan.

@@ -14,6 +14,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+#[cfg(feature = "whisper")]
+mod whisper_engine;
+
 /// 16-bit mono PCM audio at a known sample rate.
 #[derive(Debug, Clone)]
 pub struct Audio {
@@ -103,7 +106,7 @@ impl SpeechEngine for StubEngine {
     }
 }
 
-fn stub_embedding(audio: &Audio) -> Vec<f32> {
+pub(crate) fn stub_embedding(audio: &Audio) -> Vec<f32> {
     // RMS energy over STUB_DIM equal chunks, then L2-normalized.
     let mut v = vec![0.0f32; STUB_DIM];
     let n = audio.pcm.len();
@@ -133,21 +136,49 @@ fn stub_embedding(audio: &Audio) -> Vec<f32> {
 }
 
 /// How to build the engine.
+#[derive(Debug, Clone, Default)]
 pub struct EngineConfig {
     pub provider: String,
+    /// Path to the Whisper GGML model (for `provider = "whisper"`).
+    pub whisper_model: Option<String>,
+    /// Whisper decode language (`nl`, `auto`, …).
+    pub whisper_language: String,
 }
 
-/// Build a speech engine from config. Only `stub` exists today; real engines
-/// (Whisper, speaker-embedding nets) slot in here behind the same trait.
+/// Build a speech engine from config. `stub` is always available; `whisper`
+/// requires the `whisper` feature (and a model), else it degrades to the stub.
 pub fn build_engine(cfg: &EngineConfig) -> Arc<dyn SpeechEngine> {
     match cfg.provider.as_str() {
         "stub" => Arc::new(StubEngine),
-        // Real providers (e.g. "whisper") slot in here.
+        "whisper" => build_whisper(cfg),
         other => {
             tracing::warn!(provider = other, "unknown speech provider; using stub");
             Arc::new(StubEngine)
         }
     }
+}
+
+#[cfg(feature = "whisper")]
+fn build_whisper(cfg: &EngineConfig) -> Arc<dyn SpeechEngine> {
+    match whisper_engine::WhisperEngine::load(cfg) {
+        Ok(engine) => {
+            tracing::info!(engine = engine.label(), "whisper STT loaded");
+            Arc::new(engine)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "whisper unavailable; falling back to stub");
+            Arc::new(StubEngine)
+        }
+    }
+}
+
+#[cfg(not(feature = "whisper"))]
+fn build_whisper(_cfg: &EngineConfig) -> Arc<dyn SpeechEngine> {
+    tracing::warn!(
+        "speech provider 'whisper' requested but the crate was built without the \
+         'whisper' feature; using stub. Rebuild the api with --features speech-whisper."
+    );
+    Arc::new(StubEngine)
 }
 
 /// The deterministic stub, as a trait object.
@@ -203,6 +234,7 @@ mod tests {
     fn build_defaults_to_stub() {
         let e = build_engine(&EngineConfig {
             provider: "stub".into(),
+            ..Default::default()
         });
         assert_eq!(e.label(), "stub");
     }

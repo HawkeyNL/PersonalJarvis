@@ -8,7 +8,7 @@ Fase 2 gestart: handmatig portfolio (holdings) werkt op iOS + macOS, achter de d
 
 ## Eerstvolgende taak
 1. **Stem/wake live valideren op macOS**: `tauri dev` herstarten (mic-fix), in Settings de stem inschrijven en verify testen; daarna `npm run setup-wakeword` en de wake-drempel (`WakeDetector.threshold`) tunen met echte audio (`onScore` logt elke stap).
-2. **Echt spraakmodel** achter de `SpeechEngine`-trait (Whisper STT + speaker-embedding-net) zodat verify/transcribe echt worden — de stub eruit. Daarna wake-inferentie eventueel naar een Web Worker (UI niet blokkeren).
+2. **Echt spraakmodel valideren**: STT stage 1 (whisper.cpp) is gebouwd — `brew install cmake`, `bash scripts/fetch-whisper-model.sh` (base of small voor beter NL), `.env` op `JARVIS_SPEECH_PROVIDER=whisper`, backend draaien met `--features speech-whisper` en transcriptie testen. Daarna **stage 2 — echt speaker-embedding** (`embed` via ECAPA/wespeaker-ONNX + `ort`) zodat "is het jij" echt wordt. Daarna wake-inferentie eventueel naar een Web Worker.
 
 Parallel blijft staan: live test Jarvis-brein (`JARVIS_LLM_API_KEY` in backend-`.env`, gesprek end-to-end), IBKR live zodra de Client Portal Gateway draait + ingelogd (paper eerst), en B — marktdata-provider (DEC-002) voor live koersen.
 
@@ -40,6 +40,10 @@ Parallel blijft staan: live test Jarvis-brein (`JARVIS_LLM_API_KEY` in backend-`
 - Lokale hardware versus cloud-API
 
 ## Laatste update
+10 augustus 2026
+
+- **Echt spraakmodel — STT stage 1 (whisper.cpp, ADR-025)**: `WhisperEngine` achter de `SpeechEngine`-trait via `whisper-rs`, **feature-gated** (`jarvis-speech/whisper` → api `--features speech-whisper`, vereist cmake) zodat de default-build/CI de deterministische stub houden (config 2 + speech 4 + api 3 tests groen, clippy schoon). Provider `whisper` + nieuwe config `JARVIS_SPEECH_WHISPER_MODEL`/`_LANGUAGE`; model via `scripts/fetch-whisper-model.sh` (HuggingFace ggerganov/whisper.cpp, gitignore `/models/`). `transcribe` draait op een blocking-thread; misconfig degradeert netjes naar de stub. `embed` (speaker) blijft de placeholder tot **stage 2** (ECAPA/wespeaker-ONNX via `ort`). Whisper-variant compileert lokaal op de Mac (`brew install cmake`).
+
 9 augustus 2026
 
 - **Apparaat loskoppelen + bevestigingsmodal**: de account-knop "Uitloggen" (die alleen het token wiste terwijl de sleutel bleef → stille her-login, weinig waarde) vervangen door een destructieve **"Dit apparaat loskoppelen"**: serverside intrekken (`DELETE /v1/devices/{id}` → device `revoked`, sleutels/sessies vervallen) én lokaal alles wissen via nieuw `auth_reset`-commando (sleutel uit keychain + bestand, id, token). Achter een **bevestigingsmodal** zodat een misklik het toestel niet loskoppelt. Client + Rust groen.

@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = []
+# Real STT (whisper.cpp). Requires cmake + a C++ toolchain. Run the backend with
+# `cargo run -p jarvis-api --features speech-whisper` and set JARVIS_SPEECH_*.
+speech-whisper = ["jarvis-speech/whisper"]
+
 [lib]
 name = "jarvis_api"
 path = "src/lib.rs"

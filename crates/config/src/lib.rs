@@ -84,6 +84,15 @@ pub struct AppConfig {
     /// enrolled speaker. Model-dependent; tune per engine.
     #[serde(default = "default_speech_verify_threshold")]
     pub speech_verify_threshold: f32,
+
+    /// Path to the Whisper GGML model (e.g. `models/ggml-base.bin`), used when
+    /// `speech_provider = "whisper"`. Fetch via `scripts/fetch-whisper-model.sh`.
+    #[serde(default)]
+    pub speech_whisper_model: Option<String>,
+
+    /// Whisper decode language: an ISO code like `nl`, or `auto` to detect.
+    #[serde(default = "default_speech_whisper_language")]
+    pub speech_whisper_language: String,
 }
 
 fn default_bind_addr() -> String {
@@ -140,6 +149,10 @@ fn default_speech_verify_threshold() -> f32 {
     0.5
 }
 
+fn default_speech_whisper_language() -> String {
+    "auto".to_string()
+}
+
 impl AppConfig {
     /// Load configuration from `jarvis.toml` (optional) and `JARVIS_` env vars.
     ///
@@ -178,6 +191,8 @@ impl fmt::Debug for AppConfig {
             .field("llm_ollama_model", &self.llm_ollama_model)
             .field("speech_provider", &self.speech_provider)
             .field("speech_verify_threshold", &self.speech_verify_threshold)
+            .field("speech_whisper_model", &self.speech_whisper_model)
+            .field("speech_whisper_language", &self.speech_whisper_language)
             .finish()
     }
 }
@@ -205,6 +220,8 @@ mod tests {
             llm_ollama_model: "llama3.2".to_string(),
             speech_provider: "stub".to_string(),
             speech_verify_threshold: 0.5,
+            speech_whisper_model: None,
+            speech_whisper_language: "auto".to_string(),
         };
 
         let rendered = format!("{cfg:?}");

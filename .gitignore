@@ -19,6 +19,9 @@ apps/**/src-tauri/target/
 # SQLx offline data (regenerated)
 /.sqlx
 
+# Speech models (fetched via scripts/fetch-whisper-model.sh)
+/models/
+
 # OS / editor
 .DS_Store
 .idea/
