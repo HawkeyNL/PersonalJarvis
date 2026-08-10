@@ -14,6 +14,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+mod speaker;
+pub(crate) use speaker::speaker_embedding;
+
 #[cfg(feature = "whisper")]
 mod whisper_engine;
 
@@ -76,19 +79,16 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
-/// Dimensionality of the stub embedding.
-const STUB_DIM: usize = 32;
-
-/// A deterministic, network-free engine for tests and wiring. `embed` is a
-/// coarse energy fingerprint: the same audio yields the same vector (cosine 1.0)
-/// and different audio yields a different one — enough to exercise enroll/verify
-/// end-to-end. `transcribe` returns empty (there is no real model here).
+/// Engine with a real speaker embedding but no STT: `embed` is the MFCC-based
+/// [`speaker_embedding`] (deterministic — same audio → cosine 1.0), so speaker
+/// verification works out of the box; `transcribe` returns empty until a real
+/// STT model (whisper) is enabled. This is the default provider.
 pub struct StubEngine;
 
 #[async_trait]
 impl SpeechEngine for StubEngine {
     fn label(&self) -> &str {
-        "stub"
+        "baseline"
     }
 
     async fn transcribe(&self, audio: &Audio) -> Result<String, SpeechError> {
@@ -99,40 +99,12 @@ impl SpeechEngine for StubEngine {
     }
 
     async fn embed(&self, audio: &Audio) -> Result<Vec<f32>, SpeechError> {
-        if audio.is_empty() {
+        let v = speaker_embedding(audio);
+        if v.is_empty() {
             return Err(SpeechError::TooShort);
         }
-        Ok(stub_embedding(audio))
+        Ok(v)
     }
-}
-
-pub(crate) fn stub_embedding(audio: &Audio) -> Vec<f32> {
-    // RMS energy over STUB_DIM equal chunks, then L2-normalized.
-    let mut v = vec![0.0f32; STUB_DIM];
-    let n = audio.pcm.len();
-    for (i, bucket) in v.iter_mut().enumerate() {
-        let start = i * n / STUB_DIM;
-        let end = ((i + 1) * n / STUB_DIM).max(start + 1).min(n);
-        let mut sum = 0.0f64;
-        let mut count = 0u64;
-        for &s in &audio.pcm[start..end.min(n)] {
-            let x = s as f64 / 32768.0;
-            sum += x * x;
-            count += 1;
-        }
-        *bucket = if count > 0 {
-            (sum / count as f64).sqrt() as f32
-        } else {
-            0.0
-        };
-    }
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for x in &mut v {
-            *x /= norm;
-        }
-    }
-    v
 }
 
 /// How to build the engine.
@@ -205,14 +177,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stub_embed_is_deterministic_and_discriminative() {
+    async fn baseline_embed_is_deterministic_and_discriminative() {
         let e = StubEngine;
         let a = tone(16000, 7);
         let b = tone(16000, 31);
         let ea1 = e.embed(&a).await.unwrap();
         let ea2 = e.embed(&a).await.unwrap();
         let eb = e.embed(&b).await.unwrap();
-        assert_eq!(ea1.len(), STUB_DIM);
+        assert!(!ea1.is_empty());
         // Same audio → identical embedding (perfect match).
         assert!((cosine(&ea1, &ea2) - 1.0).abs() < 1e-6);
         // Different audio → lower similarity than a self-match.
@@ -231,11 +203,11 @@ mod tests {
     }
 
     #[test]
-    fn build_defaults_to_stub() {
+    fn build_defaults_to_baseline() {
         let e = build_engine(&EngineConfig {
             provider: "stub".into(),
             ..Default::default()
         });
-        assert_eq!(e.label(), "stub");
+        assert_eq!(e.label(), "baseline");
     }
 }

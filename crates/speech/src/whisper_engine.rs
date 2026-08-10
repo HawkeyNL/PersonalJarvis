@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-use crate::{stub_embedding, Audio, EngineConfig, SpeechEngine, SpeechError};
+use crate::{speaker_embedding, Audio, EngineConfig, SpeechEngine, SpeechError};
 
 /// Whisper STT engine. The loaded model is read-only and shared across calls;
 /// each transcription gets its own decode state and runs on a blocking thread.
@@ -65,12 +65,13 @@ impl SpeechEngine for WhisperEngine {
     }
 
     async fn embed(&self, audio: &Audio) -> Result<Vec<f32>, SpeechError> {
-        // Placeholder speaker embedding (energy fingerprint). Real speaker model
-        // is stage 2 (ADR-025); kept so enroll/verify stays functional meanwhile.
-        if audio.is_empty() {
+        // Real MFCC speaker embedding (shared, pure Rust). A neural ECAPA/
+        // wespeaker ONNX model is a future accuracy upgrade behind this method.
+        let v = speaker_embedding(audio);
+        if v.is_empty() {
             return Err(SpeechError::TooShort);
         }
-        Ok(stub_embedding(audio))
+        Ok(v)
     }
 }
 

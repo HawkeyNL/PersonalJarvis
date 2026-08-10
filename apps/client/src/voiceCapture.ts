@@ -4,6 +4,8 @@
 // Uses WebAudio (works in WKWebView). We capture at the device sample rate via a
 // ScriptProcessor and resample to 16 kHz — what the speech models expect.
 
+import { micConstraints } from "./micDevices";
+
 const TARGET_RATE = 16000;
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -47,7 +49,7 @@ function resampleTo16k(input: Float32Array, inRate: number): Int16Array {
 /** Record for `ms` milliseconds and return 16 kHz mono PCM. */
 export async function recordPcm(ms: number): Promise<Pcm> {
   if (!captureSupported) throw new Error("microfoon niet beschikbaar");
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const stream = await navigator.mediaDevices.getUserMedia(micConstraints());
   const ctx = new AC();
   const source = ctx.createMediaStreamSource(stream);
   const bufferSize = 4096;

@@ -23,6 +23,12 @@ import {
   wakeReady,
   setWakeEnabled,
 } from "../voicewake";
+import { mics, selectedMic, setMic, listMics } from "../micDevices";
+
+async function onEnroll() {
+  await enroll();
+  await listMics(); // labels become available once mic permission is granted
+}
 
 const accent = ref<Accent>(currentAccent());
 const session = ref<Session | null>(null);
@@ -57,6 +63,7 @@ onMounted(async () => {
   session.value = await currentSession();
   await initLock(); // resolves isDesktop for the lock toggle
   await refreshVoiceStatus();
+  await listMics();
 });
 </script>
 
@@ -149,8 +156,20 @@ onMounted(async () => {
         </li>
       </ul>
 
+      <label class="miclabel">
+        <span class="fl">Microfoon</span>
+        <select
+          class="micsel"
+          :value="selectedMic"
+          @change="setMic(($event.target as HTMLSelectElement).value)"
+        >
+          <option value="">Systeemstandaard</option>
+          <option v-for="m in mics" :key="m.deviceId" :value="m.deviceId">{{ m.label }}</option>
+        </select>
+      </label>
+
       <div class="enroll">
-        <button class="ghost" :disabled="!voiceSupported || busy" @click="enroll()">
+        <button class="ghost" :disabled="!voiceSupported || busy" @click="onEnroll">
           {{ enrolled ? "Stem opnieuw opnemen" : "Neem je stem op" }}
         </button>
         <button
@@ -331,6 +350,13 @@ onMounted(async () => {
 .toggle input:disabled ~ .sw { opacity: 0.5; }
 
 .enroll { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+.miclabel { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.fl { font-size: 13px; color: var(--muted); }
+.micsel {
+  background: rgba(0, 0, 0, 0.25); border: 1px solid var(--border); color: var(--text);
+  border-radius: 10px; padding: 8px 10px; font: inherit; font-size: 13px;
+}
+.micsel:focus { outline: none; border-color: var(--accent); }
 .enroll .ghost { margin-top: 0; }
 .okc { color: var(--accent); }
 .errc { color: #f87171; }

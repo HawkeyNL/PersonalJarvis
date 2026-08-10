@@ -13,6 +13,8 @@
 // NOTE: the framing constants match openWakeWord; the exact threshold and any
 // edge behaviour still want validation with real audio on-device (see ADR-026).
 
+import { micConstraints } from "./micDevices";
+
 const SAMPLE_RATE = 16000;
 const STEP_SAMPLES = 1280; // 80 ms of new audio per step
 const MEL_CONTEXT = 480; // extra lookback so melspec yields exactly 8 frames
@@ -79,7 +81,7 @@ export class WakeDetector {
     if (this.node) return;
     if (!this.wwSess) await this.load();
 
-    this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    this.stream = await navigator.mediaDevices.getUserMedia(micConstraints());
     // Ask for a 16 kHz context so no resampling is needed. Fall back if the
     // platform refuses the rate.
     try {

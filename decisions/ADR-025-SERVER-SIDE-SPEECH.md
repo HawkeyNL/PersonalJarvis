@@ -61,6 +61,13 @@ hoogstens de console of start de biometrie.
   model via `scripts/fetch-whisper-model.sh`. `transcribe` draait op een
   blocking-thread; misconfig degradeert netjes naar de stub. `embed` is nog de
   placeholder-energie-fingerprint.
-- Nog te doen: **stage 2 — echt speaker-embedding** (`embed`, bv. een
-  ECAPA/wespeaker-ONNX via `ort`) zodat "is het jij" echt wordt; console-STT
-  (mic → server-transcript); drempel tunen; profiel eventueel versleuteld opslaan.
+- **Echt speaker-embedding — stage 2 (MFCC, pure Rust)**: `embed` gebruikt nu een
+  echte stem-timbre-embedding (`speaker.rs`: per-frame MFCC's → mean+std, c0
+  weggelaten, L2-genormaliseerd), gedeeld door de default- en whisper-engine.
+  Geen model/download/native-dep — puur Rust met `rustfft`, hier compileerbaar +
+  unit-getest (deterministisch én onderscheidt verschillende stemprofielen). De
+  default-engine heet nu `baseline` (echte speaker-verify, nog geen STT). Client:
+  **microfoon-keuze** in Settings (`micDevices.ts`).
+- Nog te doen: eventueel een **neuraal speaker-model** (ECAPA/wespeaker-ONNX via
+  `ort`) als accuraatheids-upgrade achter dezelfde `embed`; console-STT (mic →
+  server-transcript); drempel tunen; profiel eventueel versleuteld opslaan.
