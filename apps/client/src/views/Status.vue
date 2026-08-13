@@ -63,10 +63,18 @@ interface HostInfo {
   mem_total_gb: number;
   gpu: string;
 }
+interface ModelEntry {
+  id: string;
+  backend: string;
+  class: "light" | "mid" | "heavy" | "reasoning";
+  cost: "local" | "cheap" | "mid" | "pricey";
+  available: boolean;
+}
 interface Registry {
   host: HostInfo;
   software: SoftwareItem[];
   brains: Brain[];
+  models: ModelEntry[];
   active_brain: string;
 }
 
@@ -205,6 +213,22 @@ onMounted(() => {
           </span>
         </div>
 
+        <!-- Model catalog (ADR-028): what Jarvis can pick from, by class. -->
+        <div v-if="reg.models && reg.models.length" class="models">
+          <div class="k">modellen · goedkoopste geschikte per taak</div>
+          <ul>
+            <li
+              v-for="m in reg.models"
+              :key="m.backend + '/' + m.id"
+              :class="{ off: !m.available }"
+            >
+              <span class="mclass" :class="'mc-' + m.class">{{ m.class }}</span>
+              <span class="mid">{{ m.id }}</span>
+              <span class="mcost">{{ m.cost }}</span>
+            </li>
+          </ul>
+        </div>
+
         <button :disabled="regBusy" @click="loadRegistry(true)">
           {{ regBusy ? "verversen…" : "Ververs resources" }}
         </button>
@@ -287,6 +311,74 @@ onMounted(() => {
   border: 1px solid var(--border);
   border-radius: 999px;
   padding: 2px 7px;
+}
+.models {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  margin-bottom: 14px;
+}
+.models .k {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.models ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.models li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.models li.off {
+  opacity: 0.4;
+}
+.models li.off .mid {
+  text-decoration: line-through;
+}
+.mclass {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  min-width: 62px;
+  text-align: center;
+}
+.mc-light {
+  color: #60a5fa;
+  border-color: rgba(96, 165, 250, 0.5);
+}
+.mc-mid {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.mc-heavy {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.5);
+}
+.mc-reasoning {
+  color: #c084fc;
+  border-color: rgba(192, 132, 252, 0.5);
+}
+.mid {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.mcost {
+  font-size: 9.5px;
+  color: var(--muted);
+  letter-spacing: 0.05em;
 }
 .brains {
   list-style: none;

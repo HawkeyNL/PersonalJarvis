@@ -17,8 +17,51 @@ pub struct Registry {
     pub host: HostInfo,
     pub software: Vec<SoftwareItem>,
     pub brains: Vec<Brain>,
+    /// The models Jarvis can pick from (catalog — ADR-028). Curated cloud models
+    /// per keyed provider + the local Ollama models actually installed.
+    pub models: Vec<ModelEntry>,
     /// Label of the brain currently wired as the router's primary chain.
     pub active_brain: String,
+}
+
+/// What a model is good for — drives "cheapest sufficient" model choice (ADR-028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelClass {
+    /// Small/fast — the default for most tasks.
+    Light,
+    /// Balanced general work.
+    Mid,
+    /// Strong — for hard tasks and planning.
+    Heavy,
+    /// Explicit reasoning models (o-series, deepseek-reasoner).
+    Reasoning,
+}
+
+/// A rough cost band for a model (exact prices live in `jarvis-usage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelCost {
+    /// Runs locally, no marginal cost.
+    Local,
+    /// Cheap per-token (e.g. DeepSeek, mini/haiku tiers).
+    Cheap,
+    /// Mid per-token.
+    Mid,
+    /// Expensive per-token (top models).
+    Pricey,
+}
+
+/// One model in the catalog.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelEntry {
+    pub id: String,
+    /// Which backend serves it (`anthropic-api`, `openai-api`, `deepseek-api`,
+    /// `ollama`).
+    pub backend: String,
+    pub class: ModelClass,
+    pub cost: ModelCost,
+    pub available: bool,
 }
 
 /// The machine Jarvis runs on.
@@ -70,13 +113,19 @@ pub struct CollectInput {
     pub claude_cli_bin: String,
     pub has_api_key: bool,
     pub anthropic_model: String,
+    pub anthropic_model_hard: String,
+    pub anthropic_model_cheap: String,
     pub ollama_model: String,
-    /// OpenAI: whether a key is set + the default model (for the brain label).
+    /// OpenAI: whether a key is set + its per-tier models (for the catalog).
     pub has_openai_key: bool,
     pub openai_model: String,
-    /// DeepSeek: whether a key is set + the default model.
+    pub openai_model_hard: String,
+    pub openai_model_cheap: String,
+    /// DeepSeek: whether a key is set + its per-tier models.
     pub has_deepseek_key: bool,
     pub deepseek_model: String,
+    pub deepseek_model_hard: String,
+    pub deepseek_model_cheap: String,
     pub speech_provider: String,
     pub whisper_model: Option<String>,
     /// The built router's label (e.g. `claude-cli:…→anthropic:…`).
@@ -129,13 +178,94 @@ pub async fn collect(input: &CollectInput) -> Registry {
     ];
 
     let brains = derive_brains(input, claude_ver.is_some(), &ollama_models);
+    let models = derive_models(input, &ollama_models);
 
     Registry {
         host,
         software,
         brains,
+        models,
         active_brain: input.active_brain.clone(),
     }
+}
+
+/// Build the model catalog (pure — testable): curated cloud models per keyed
+/// provider (class by tier role, cost by band) + the local Ollama models that
+/// are actually installed. Deduplicated per backend (a provider often reuses the
+/// same model across tiers). See ADR-028.
+fn derive_models(input: &CollectInput, ollama_models: &[String]) -> Vec<ModelEntry> {
+    let mut out = Vec::new();
+
+    // Class from a model's tier role, sharpened to Reasoning by name.
+    let class_of = |name: &str, role_default: ModelClass| {
+        let n = name.to_ascii_lowercase();
+        if n.contains("reason") || n.contains("-o1") || n.contains("-o3") || n.contains("o4-mini") {
+            ModelClass::Reasoning
+        } else {
+            role_default
+        }
+    };
+
+    // Add the cheap/default/hard trio for one keyed cloud provider.
+    let mut add_cloud =
+        |backend: &str, available: bool, cheap: &str, default: &str, hard: &str, cheap_cost: ModelCost| {
+            let trio = [
+                (cheap, ModelClass::Light, cheap_cost),
+                (default, ModelClass::Mid, ModelCost::Mid),
+                (hard, ModelClass::Heavy, ModelCost::Pricey),
+            ];
+            for (id, role_class, cost) in trio {
+                if id.is_empty() || out.iter().any(|m: &ModelEntry| m.id == id && m.backend == backend) {
+                    continue; // skip blanks + duplicates (e.g. default == hard)
+                }
+                out.push(ModelEntry {
+                    id: id.to_string(),
+                    backend: backend.to_string(),
+                    class: class_of(id, role_class),
+                    // DeepSeek is cheap across the board; others keep the band.
+                    cost: if backend == "deepseek-api" { ModelCost::Cheap } else { cost },
+                    available,
+                });
+            }
+        };
+
+    add_cloud(
+        "anthropic-api",
+        input.has_api_key,
+        &input.anthropic_model_cheap,
+        &input.anthropic_model,
+        &input.anthropic_model_hard,
+        ModelCost::Cheap,
+    );
+    add_cloud(
+        "openai-api",
+        input.has_openai_key,
+        &input.openai_model_cheap,
+        &input.openai_model,
+        &input.openai_model_hard,
+        ModelCost::Cheap,
+    );
+    add_cloud(
+        "deepseek-api",
+        input.has_deepseek_key,
+        &input.deepseek_model_cheap,
+        &input.deepseek_model,
+        &input.deepseek_model_hard,
+        ModelCost::Cheap,
+    );
+
+    // Local Ollama models actually installed — all free; treat as light by default.
+    for id in ollama_models {
+        out.push(ModelEntry {
+            id: id.clone(),
+            backend: "ollama".into(),
+            class: ModelClass::Light,
+            cost: ModelCost::Local,
+            available: true,
+        });
+    }
+
+    out
 }
 
 /// Build the brain list (pure — testable) from config + probe results.
@@ -273,11 +403,17 @@ mod tests {
             claude_cli_bin: "claude".into(),
             has_api_key: true,
             anthropic_model: "claude-sonnet-5".into(),
+            anthropic_model_hard: "claude-opus-5".into(),
+            anthropic_model_cheap: "claude-haiku-4-5".into(),
             ollama_model: "llama3.2".into(),
             has_openai_key: true,
             openai_model: "gpt-4o".into(),
+            openai_model_hard: "gpt-4o".into(),
+            openai_model_cheap: "gpt-4o-mini".into(),
             has_deepseek_key: true,
             deepseek_model: "deepseek-chat".into(),
+            deepseek_model_hard: "deepseek-reasoner".into(),
+            deepseek_model_cheap: "deepseek-chat".into(),
             speech_provider: "whisper".into(),
             whisper_model: Some("models/ggml-base.bin".into()),
             active_brain: "claude-cli:…→anthropic:…".into(),
@@ -321,6 +457,36 @@ mod tests {
         assert!(!brain(&brains, "openai-api").available); // no openai key
         assert!(!brain(&brains, "deepseek-api").available); // no deepseek key
         assert!(!brain(&brains, "ollama").available); // no ollama models
+    }
+
+    #[test]
+    fn model_catalog_classes_and_dedups() {
+        let models = derive_models(&input(), &["llama3.2:latest".to_string()]);
+        let get = |id: &str| models.iter().find(|m| m.id == id).expect("model present");
+        // Class by tier role, sharpened for reasoners.
+        assert_eq!(get("claude-haiku-4-5").class, ModelClass::Light);
+        assert_eq!(get("claude-opus-5").class, ModelClass::Heavy);
+        assert_eq!(get("deepseek-reasoner").class, ModelClass::Reasoning);
+        // DeepSeek is cheap across the board; Ollama is local.
+        assert_eq!(get("deepseek-chat").cost, ModelCost::Cheap);
+        assert_eq!(get("llama3.2:latest").cost, ModelCost::Local);
+        // gpt-4o is default==hard for this config → appears once.
+        assert_eq!(models.iter().filter(|m| m.id == "gpt-4o").count(), 1);
+    }
+
+    #[test]
+    fn model_catalog_marks_unkeyed_providers_unavailable() {
+        let mut i = input();
+        i.has_openai_key = false;
+        let models = derive_models(&i, &[]);
+        // Known models stay visible ("ecosystem"), just flagged unavailable.
+        let openai: Vec<_> = models.iter().filter(|m| m.backend == "openai-api").collect();
+        assert!(!openai.is_empty());
+        assert!(openai.iter().all(|m| !m.available));
+        assert!(models
+            .iter()
+            .filter(|m| m.backend == "anthropic-api")
+            .all(|m| m.available));
     }
 
     #[tokio::test]
