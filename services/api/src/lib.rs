@@ -99,6 +99,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/system/registry/refresh", post(system_registry_refresh))
         .route("/v1/system/usage", get(system_usage))
         .route("/v1/agent/action", post(agent_action))
+        .route("/v1/agent/pending", get(agent_pending))
+        .route("/v1/agent/pending/{id}/approve", post(agent_pending_approve))
+        .route("/v1/agent/pending/{id}/deny", post(agent_pending_deny))
         .route("/v1/agent/audit", get(agent_audit_log))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
@@ -795,13 +798,47 @@ async fn agent_action(
     let risk = agent::classify(&action);
     let detail = serde_json::to_string(&action).ok();
 
-    // 4a runs only read-only (Auto) actions. Mutations arrive in 4b behind the gate.
-    if risk != agent::RiskClass::Auto {
-        record_agent_audit(&state, authed.device.id, &at, detail, risk, "denied", Some("requires approval (4b)")).await;
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "needs approval", "hint": "mutaties komen in 4b" })),
-        ));
+    // Mutating actions (4b) need a device-signed approval: validate + preview,
+    // store a pending action, and return its nonce for the owner to sign.
+    if agent::is_mutating(&action) {
+        let preview = match agent::preview(&sandbox, &action).await {
+            Ok(p) => p,
+            Err(e) => {
+                // A protected/escaping target is refused now — no pending created.
+                record_agent_audit(&state, authed.device.id, &at, detail, risk, "denied", Some(&e.to_string())).await;
+                return Err((StatusCode::FORBIDDEN, Json(json!({ "error": e.to_string() }))));
+            }
+        };
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let id = Uuid::now_v7();
+        let action_json = serde_json::to_string(&action).unwrap_or_default();
+        let res = sqlx::query(
+            "INSERT INTO agent_pending_actions \
+             (id, user_id, requesting_device_id, action_type, action, preview, nonce, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now() + interval '5 minutes')",
+        )
+        .bind(id)
+        .bind(authed.user.id)
+        .bind(authed.device.id)
+        .bind(&at)
+        .bind(&action_json)
+        .bind(&preview)
+        .bind(&nonce[..])
+        .execute(&state.db)
+        .await;
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "failed to create pending action");
+            return Err(db_err(e));
+        }
+        record_agent_audit(&state, authed.device.id, &at, detail, risk, "pending", None).await;
+        return Ok(Json(json!({
+            "needs_approval": true,
+            "pending_id": id,
+            "nonce": hex::encode(nonce),
+            "action": at,
+            "preview": preview,
+        })));
     }
 
     match agent::execute(&sandbox, &action).await {
@@ -828,6 +865,118 @@ async fn agent_action(
             Err((code, Json(json!({ "error": e.to_string() }))))
         }
     }
+}
+
+/// Mutating actions awaiting the owner's device-signed approval (ADR-029 4b).
+async fn agent_pending(authed: Authed, State(state): State<AppState>) -> Json<Value> {
+    let rows: Vec<(Uuid, String, String, String, String)> = sqlx::query_as(
+        "SELECT id, action_type, preview, encode(nonce, 'hex'), \
+         to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') \
+         FROM agent_pending_actions \
+         WHERE user_id = $1 AND status = 'pending' AND expires_at > now() \
+         ORDER BY created_at DESC",
+    )
+    .bind(authed.user.id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let entries: Vec<Value> = rows
+        .into_iter()
+        .map(|(id, at, preview, nonce, created)| {
+            json!({ "pending_id": id, "action": at, "preview": preview, "nonce": nonce, "created_at": created })
+        })
+        .collect();
+    Json(json!({ "pending": entries }))
+}
+
+/// Approve a pending mutation by signing its nonce with a trusted device, then
+/// execute it once (ADR-029 4b). The signature proves owner presence (the device
+/// key is biometric-gated); the stored action is what runs — the LLM can propose,
+/// only a signed human can commit.
+async fn agent_pending_approve(
+    authed: Authed,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ApproveReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let signature =
+        hex::decode(&req.signature).map_err(|_| bad_request("invalid signature encoding"))?;
+    let Some(sandbox) = state.agent_sandbox.clone() else {
+        return Err((StatusCode::FORBIDDEN, Json(json!({ "error": "no workspace" }))));
+    };
+
+    // Fetch the pending action (must be this user's, still pending + unexpired).
+    let row: Option<(Vec<u8>, String, String)> = sqlx::query_as(
+        "SELECT nonce, action, action_type FROM agent_pending_actions \
+         WHERE id = $1 AND user_id = $2 AND status = 'pending' AND expires_at > now()",
+    )
+    .bind(id)
+    .bind(authed.user.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(db_err)?;
+    let (nonce, action_json, at) = row.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(json!({ "error": "no such pending action" })))
+    })?;
+
+    // Verify the owner's device signature over the nonce.
+    identity::verify_device_signature(&state.db, authed.user.id, authed.device.id, &nonce, &signature)
+        .await
+        .map_err(|_| unauthorized())?;
+
+    // Consume it atomically — mark executed so it can never run twice (replay).
+    let claimed = sqlx::query(
+        "UPDATE agent_pending_actions SET status = 'executed', \
+         approved_by_device_id = $2, resolved_at = now() \
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(id)
+    .bind(authed.device.id)
+    .execute(&state.db)
+    .await
+    .map_err(db_err)?;
+    if claimed.rows_affected() == 0 {
+        return Err((StatusCode::CONFLICT, Json(json!({ "error": "already resolved" }))));
+    }
+
+    let action: agent::Action = serde_json::from_str(&action_json).map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "corrupt pending action" })))
+    })?;
+
+    match agent::execute(&sandbox, &action).await {
+        Ok(outcome) => {
+            let note = outcome.truncated.then_some("output truncated");
+            record_agent_audit(&state, authed.device.id, &at, Some(action_json), agent::RiskClass::NeedsApproval, "ok", note).await;
+            Ok(Json(json!({ "action": at, "output": outcome.output, "truncated": outcome.truncated })))
+        }
+        Err(e) => {
+            record_agent_audit(&state, authed.device.id, &at, Some(action_json), agent::RiskClass::NeedsApproval, "error", Some(&e.to_string())).await;
+            Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))))
+        }
+    }
+}
+
+/// Deny a pending mutation (no signature needed — the denier is authenticated and
+/// a denial only cancels).
+async fn agent_pending_deny(
+    authed: Authed,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let res = sqlx::query(
+        "UPDATE agent_pending_actions SET status = 'denied', resolved_at = now() \
+         WHERE id = $1 AND user_id = $2 AND status = 'pending'",
+    )
+    .bind(id)
+    .bind(authed.user.id)
+    .execute(&state.db)
+    .await
+    .map_err(db_err)?;
+    if res.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "no such pending action" }))));
+    }
+    record_agent_audit(&state, authed.device.id, "pending", None, agent::RiskClass::NeedsApproval, "denied", Some("denied by owner")).await;
+    Ok(Json(json!({ "status": "denied" })))
 }
 
 /// Write one append-only audit row. Auditing must never break the action path,
@@ -1500,5 +1649,207 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Enroll a device and log it in, returning `(device_id, session token)`.
+    async fn enroll_and_login(app: &axum::Router, signing: &SigningKey) -> (String, String) {
+        let public_key = hex::encode(signing.verifying_key().to_bytes());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/enroll")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "name": "iPhone",
+                            "platform": "ios",
+                            "public_key": public_key,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let device_id = body_json(resp).await["device_id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/challenge")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "device_id": device_id })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ch = body_json(resp).await;
+        let challenge_id = ch["challenge_id"].as_str().unwrap().to_string();
+        let nonce = hex::decode(ch["nonce"].as_str().unwrap()).unwrap();
+        let signature = hex::encode(signing.sign(&nonce).to_bytes());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "device_id": device_id,
+                            "challenge_id": challenge_id,
+                            "signature": signature,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let token = body_json(resp).await["token"].as_str().unwrap().to_string();
+        (device_id, token)
+    }
+
+    async fn agent_enabled_state(pool: PgPool, sandbox: agent::Sandbox) -> AppState {
+        AppState {
+            db: pool,
+            environment: "test".to_string(),
+            ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
+            llm: jarvis_llm::stub(),
+            llm_max_tokens: 256,
+            jarvis_system: std::sync::Arc::from(JARVIS_SYSTEM_FALLBACK),
+            speech: jarvis_speech::stub(),
+            speech_verify_threshold: 0.5,
+            registry: std::sync::Arc::new(std::sync::RwLock::new(
+                jarvis_registry::collect(&jarvis_registry::CollectInput::default()).await,
+            )),
+            registry_input: std::sync::Arc::new(jarvis_registry::CollectInput::default()),
+            budget_cents: 5000,
+            spent_cents: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            eur_per_usd: 0.92,
+            agent_enabled: true,
+            agent_sandbox: Some(std::sync::Arc::new(sandbox)),
+        }
+    }
+
+    /// A mutating action must not run until the owner signs its nonce on a
+    /// trusted device; a signed approval executes it exactly once (ADR-029 4b).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn agent_mutating_needs_signed_approval(pool: PgPool) {
+        // A unique sandbox root so parallel test runs never collide.
+        let mut suffix = [0u8; 8];
+        OsRng.fill_bytes(&mut suffix);
+        let root = std::env::temp_dir().join(format!("jarvis_agent_{}", hex::encode(suffix)));
+        std::fs::create_dir_all(&root).unwrap();
+        let sandbox = agent::Sandbox::new(&root).unwrap();
+
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let signing = SigningKey::from_bytes(&seed);
+
+        let app = build_router(agent_enabled_state(pool.clone(), sandbox).await);
+        let (_device_id, token) = enroll_and_login(&app, &signing).await;
+
+        // 1. A write is not executed inline — it returns a pending action + nonce.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/agent/action")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "type": "write_file",
+                            "path": "note.txt",
+                            "content": "hallo van jarvis",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["needs_approval"], true);
+        let pending_id = body["pending_id"].as_str().unwrap().to_string();
+        let nonce = hex::decode(body["nonce"].as_str().unwrap()).unwrap();
+        // The file must NOT exist yet — nothing ran.
+        assert!(!root.join("note.txt").exists());
+
+        // 2. Signing the nonce approves exactly this action; it executes once.
+        let signature = hex::encode(signing.sign(&nonce).to_bytes());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/agent/pending/{pending_id}/approve"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "signature": signature })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "hallo van jarvis"
+        );
+
+        // 3. Replay: the same signed approval cannot execute twice.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/agent/pending/{pending_id}/approve"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "signature": signature })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // 4. The Core is never writable — refused before any pending is created.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/agent/action")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "type": "write_file",
+                            "path": "core/Jarvis.md",
+                            "content": "hack",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

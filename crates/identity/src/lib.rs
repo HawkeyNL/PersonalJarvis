@@ -389,6 +389,31 @@ pub async fn revoke_session(pool: &PgPool, session_id: Uuid) -> Result<(), Ident
     Ok(())
 }
 
+/// Verify that `signature` over `message` was made by an active key of `device_id`
+/// (belonging to `user_id`). Used to gate agentic mutations on a device-signed
+/// approval (ADR-029) — the same crypto that backs device unlock.
+pub async fn verify_device_signature(
+    pool: &PgPool,
+    user_id: Uuid,
+    device_id: Uuid,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), IdentityError> {
+    let public_key: Option<Vec<u8>> = sqlx::query_scalar(
+        "select k.public_key from device_keys k \
+         join devices d on d.id = k.device_id \
+         where k.device_id = $1 and d.user_id = $2 \
+           and k.revoked_at is null and d.status = 'active' \
+         order by k.created_at desc limit 1",
+    )
+    .bind(device_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    let public_key = public_key.ok_or(IdentityError::AuthFailed)?;
+    verify_signature(&public_key, message, signature)
+}
+
 /// Verify an Ed25519 signature over `message` using a raw 32-byte public key.
 fn verify_signature(
     public_key: &[u8],

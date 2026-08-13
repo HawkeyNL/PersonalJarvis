@@ -43,6 +43,7 @@ jarvis-usage.workspace = true
 jarvis-orchestrator.workspace = true
 jarvis-agent.workspace = true
 rust_decimal.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

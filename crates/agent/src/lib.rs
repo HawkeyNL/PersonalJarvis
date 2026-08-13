@@ -36,6 +36,11 @@ pub enum Action {
     Grep { pattern: String, path: String },
     /// A read-only git query in the workspace.
     Git { sub: GitRead },
+    /// Write (create/overwrite) a text file in the sandbox. **Mutating** —
+    /// NeedsApproval. Never allowed into the Core, `.git`, or secrets.
+    WriteFile { path: String, content: String },
+    /// Stage all changes and commit them. **Mutating** — NeedsApproval.
+    GitCommit { message: String },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -56,10 +61,19 @@ pub enum RiskClass {
     Denied,
 }
 
-/// Classify an action. Every representable 4a action is read-only ⇒ `Auto`;
-/// path-level denials (escape/secret) happen at execution, not here.
-pub fn classify(_action: &Action) -> RiskClass {
-    RiskClass::Auto
+/// Classify an action (ADR-029 laag 2). Read-only ⇒ `Auto`; mutating ⇒
+/// `NeedsApproval` (4b, behind a device-signed approval). Path-level denials
+/// (escape/secret/Core) are enforced separately at resolution.
+pub fn classify(action: &Action) -> RiskClass {
+    match action {
+        Action::WriteFile { .. } | Action::GitCommit { .. } => RiskClass::NeedsApproval,
+        _ => RiskClass::Auto,
+    }
+}
+
+/// Whether an action mutates state (⇒ needs approval + a preview).
+pub fn is_mutating(action: &Action) -> bool {
+    classify(action) == RiskClass::NeedsApproval
 }
 
 /// Stable audit label for an action.
@@ -73,6 +87,8 @@ pub fn action_type(a: &Action) -> &'static str {
             GitRead::Diff => "git_diff",
             GitRead::Log => "git_log",
         },
+        Action::WriteFile { .. } => "write_file",
+        Action::GitCommit { .. } => "git_commit",
     }
 }
 
@@ -130,6 +146,47 @@ impl Sandbox {
         }
         Ok(canon)
     }
+
+    /// Resolve a path to **write** to: the file need not exist yet, but its parent
+    /// must exist inside the sandbox, and the target may never be the Core, a
+    /// secret, or inside `.git`. This is the hard guarantee that Jarvis can't
+    /// rewrite its own rules (ADR-029 / Jarvis.md §30).
+    fn resolve_write(&self, rel: &str) -> Result<PathBuf, AgentError> {
+        if Path::new(rel).is_absolute() {
+            return Err(AgentError::OutsideSandbox);
+        }
+        let joined = self.root.join(rel);
+        // Lexical guard first: deny Core/.git/secret targets even when the parent
+        // dir doesn't exist yet, so the denial is clear and can't be raced.
+        if self.is_protected(&joined) || is_secret(&joined) {
+            return Err(AgentError::Denied(
+                "protected path (Core / .git / secret) — owner-only".into(),
+            ));
+        }
+        let parent = joined.parent().ok_or(AgentError::OutsideSandbox)?;
+        let parent_canon = parent
+            .canonicalize()
+            .map_err(|_| AgentError::NotFound)?;
+        if !parent_canon.starts_with(&self.root) {
+            return Err(AgentError::OutsideSandbox);
+        }
+        let name = joined.file_name().ok_or(AgentError::OutsideSandbox)?;
+        let target = parent_canon.join(name);
+        // Canonical guard: catches `..`/symlink escapes into the Core or secrets.
+        if is_secret(&target) || self.is_protected(&target) {
+            return Err(AgentError::Denied(
+                "protected path (Core / .git / secret) — owner-only".into(),
+            ));
+        }
+        Ok(target)
+    }
+
+    /// The Core and version-control internals are never agent-writable. `core/**`
+    /// is Jarvis' constitution (Jarvis.md §30); `.git/**` is not for direct writes.
+    fn is_protected(&self, path: &Path) -> bool {
+        path.starts_with(self.root.join("core"))
+            || path.components().any(|c| c.as_os_str() == ".git")
+    }
 }
 
 /// Secret paths are off-limits even to read, even inside the sandbox (ADR-029).
@@ -163,6 +220,8 @@ pub async fn execute(sandbox: &Sandbox, action: &Action) -> Result<Outcome, Agen
         Action::ReadFile { path } => read_file(sandbox, path)?,
         Action::Grep { pattern, path } => grep(sandbox, pattern, path).await?,
         Action::Git { sub } => git(sandbox, *sub).await?,
+        Action::WriteFile { path, content } => write_file(sandbox, path, content)?,
+        Action::GitCommit { message } => git_commit(sandbox, message).await?,
     };
     let (output, truncated) = cap(raw);
     Ok(Outcome {
@@ -170,6 +229,49 @@ pub async fn execute(sandbox: &Sandbox, action: &Action) -> Result<Outcome, Agen
         output,
         truncated,
     })
+}
+
+/// A human-readable preview of what a mutating action would do — shown to the
+/// owner before they sign the approval. Also re-validates the target path, so a
+/// protected/escaping write is refused at request time, before any pending
+/// action exists.
+pub async fn preview(sandbox: &Sandbox, action: &Action) -> Result<String, AgentError> {
+    match action {
+        Action::WriteFile { path, content } => {
+            let target = sandbox.resolve_write(path)?; // enforces Core/secret denial
+            let verb = if target.exists() { "OVERSCHRIJFT" } else { "nieuw bestand" };
+            let head: String = content.chars().take(2000).collect();
+            Ok(format!(
+                "WriteFile {path} ({verb}, {} bytes)\n--- inhoud ---\n{head}",
+                content.len()
+            ))
+        }
+        Action::GitCommit { message } => {
+            let status = git(sandbox, GitRead::Status).await?;
+            Ok(format!(
+                "GitCommit \"{message}\"\n--- staat (git status) ---\n{}",
+                if status.trim().is_empty() {
+                    "(niets te committen)".into()
+                } else {
+                    status
+                }
+            ))
+        }
+        // Read-only actions don't need a preview; describe them plainly.
+        other => Ok(format!("{} (alleen-lezen)", action_type(other))),
+    }
+}
+
+fn write_file(sandbox: &Sandbox, path: &str, content: &str) -> Result<String, AgentError> {
+    let target = sandbox.resolve_write(path)?;
+    std::fs::write(&target, content).map_err(|e| AgentError::Exec(e.to_string()))?;
+    Ok(format!("geschreven: {path} ({} bytes)", content.len()))
+}
+
+async fn git_commit(sandbox: &Sandbox, message: &str) -> Result<String, AgentError> {
+    run_cmd(sandbox.root(), "git", &["add", "-A"]).await?;
+    let out = run_cmd(sandbox.root(), "git", &["commit", "-m", message]).await?;
+    Ok(out)
 }
 
 fn list_dir(sandbox: &Sandbox, path: &str) -> Result<String, AgentError> {
@@ -319,9 +421,50 @@ mod tests {
     }
 
     #[test]
-    fn everything_representable_is_auto() {
+    fn read_only_is_auto_mutating_needs_approval() {
         assert_eq!(classify(&Action::ListDir { path: ".".into() }), RiskClass::Auto);
         assert_eq!(action_type(&Action::Git { sub: GitRead::Status }), "git_status");
+        assert_eq!(
+            classify(&Action::WriteFile { path: "a.txt".into(), content: "x".into() }),
+            RiskClass::NeedsApproval
+        );
+        assert!(is_mutating(&Action::GitCommit { message: "m".into() }));
+    }
+
+    #[tokio::test]
+    async fn writes_a_file_but_never_the_core_or_secrets() {
+        let (sb, dir) = temp_sandbox("write");
+        std::fs::create_dir_all(dir.join("core")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+
+        // Happy path: write into the sandbox.
+        let ok = execute(&sb, &Action::WriteFile { path: "note.txt".into(), content: "hoi".into() }).await;
+        assert!(ok.is_ok());
+        assert_eq!(std::fs::read_to_string(dir.join("note.txt")).unwrap(), "hoi");
+
+        // The Core is never writable — not even with a valid path.
+        let core = execute(&sb, &Action::WriteFile { path: "core/Jarvis.md".into(), content: "hack".into() }).await;
+        assert!(matches!(core, Err(AgentError::Denied(_))), "core write must be denied");
+
+        // .git internals, secrets, and escapes are denied too.
+        assert!(matches!(sb.resolve_write("core/anything.md"), Err(AgentError::Denied(_))));
+        assert!(matches!(sb.resolve_write(".git/config"), Err(AgentError::Denied(_))));
+        assert!(matches!(sb.resolve_write(".env"), Err(AgentError::Denied(_))));
+        assert!(matches!(sb.resolve_write("/etc/passwd"), Err(AgentError::OutsideSandbox)));
+
+        // And the Core stays untouched on disk.
+        assert!(!dir.join("core/Jarvis.md").exists());
+    }
+
+    #[tokio::test]
+    async fn preview_of_a_write_shows_the_content_and_denies_the_core() {
+        let (sb, _dir) = temp_sandbox("preview");
+        let p = preview(&sb, &Action::WriteFile { path: "x.txt".into(), content: "inhoud".into() })
+            .await
+            .unwrap();
+        assert!(p.contains("inhoud"));
+        let denied = preview(&sb, &Action::WriteFile { path: "core/x.md".into(), content: "y".into() }).await;
+        assert!(matches!(denied, Err(AgentError::Denied(_))));
     }
 
     #[test]

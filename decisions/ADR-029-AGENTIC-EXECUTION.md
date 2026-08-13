@@ -1,6 +1,6 @@
 # ADR-029 — Agentische uitvoering (Jarvis krijgt handen), veilig achter policy + goedkeuring
 
-- Status: **geaccepteerd — fase 4a gebouwd** (read-only, kill switch default uit) — 13 augustus 2026
+- Status: **geaccepteerd — fase 4a + 4b gebouwd** (read-only autonoom; mutaties achter device-getekende goedkeuring; kill switch default uit) — 13 augustus 2026
 - Bouwt op ADR-027 (kosten-router + registry + budget), ADR-028 (model-per-taak +
   plan→execute), de bestaande unlock/approval-flow (device-gebonden, cryptografisch),
   en `core/Jarvis.md` §11 (Risk-Based Autonomy), §12 (Financial Safety), §13
@@ -79,8 +79,20 @@ zijn **tijdgebonden** en **actie-specifiek** (geen blanco cheque).
   append-only `agent_audit`-log (migratie 0008), leesbaar via
   `GET /v1/agent/audit`. cargo/tests bewust nog níet (die compileren + draaien
   code). agent 6 tests, api-kill-switch-test, clippy schoon.
-- **4b — Mutaties achter goedkeuring**: bestand schrijven / `git commit` via de
-  approval-gate. Preview (dry-run/diff) vóór goedkeuring; voorkeur voor omkeerbaar (§28).
+- **4b — Mutaties achter goedkeuring ✅ gebouwd**: `write_file` / `git_commit`
+  worden **NeedsApproval** (`classify`), nooit inline uitgevoerd. `POST /v1/agent/action`
+  op een mutatie doet eerst een **preview** (`agent::preview` — dry-run/diff-achtig,
+  hervalideert het pad), weigert direct als het pad de Core/secret/sandbox schendt
+  (403, geen pending), en slaat anders een **pending action** op met een verse 32-byte
+  nonce (tabel `agent_pending_actions`, migratie 0009, TTL 5 min). De eigenaar tekent
+  die nonce op een vertrouwd toestel en `POST /v1/agent/pending/{id}/approve`
+  ({signature}) **verifieert de device-handtekening** (`identity::verify_device_signature`,
+  Ed25519, biometrie-gated device-key), consumeert de actie **atomisch**
+  (`status pending→executed`, replay-veilig) en voert 'm **precies één keer** uit;
+  `.../deny` annuleert. Elke uitkomst → `agent_audit`. `GET /v1/agent/pending` lijst
+  het openstaande werk. De Core-bescherming geldt óók hier: nooit goedkeurbaar. api 6
+  tests (nieuwe end-to-end approval-flow incl. replay-weigering + Core-weigering),
+  agent 8, clippy schoon.
 - **4c — Claude Code aansturen**: een plan→execute-stap (ADR-028) mag een headless
   CC-run zijn, in de sandbox, achter goedkeuring — Jarvis als orchestrator, CC als
   uitvoerder.
