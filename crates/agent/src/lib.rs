@@ -1,17 +1,22 @@
-//! Agentic execution — phase 4a: read-only, policy-gated, sandboxed (ADR-029).
+//! Agentic execution — policy-gated, sandboxed hands for Jarvis (ADR-029).
 //!
-//! Jarvis' first "hands", deliberately minimal and safe:
 //! - **Typed allowlist, no free shell.** Only the [`Action`] variants exist; a
 //!   request that doesn't map to one can't be represented, let alone run.
-//! - **Read-only only.** List/read/grep/git-status — nothing mutates. cargo/tests
-//!   (which compile + run code) are intentionally NOT here yet.
+//! - **Risk-classed.** Read-only actions are `Auto`; mutating ones
+//!   (`write_file`, `git_commit`, `claude_code`) are `NeedsApproval` and only run
+//!   after a device-signed approval (4b), verified in the API.
 //! - **Sandboxed.** Every path is resolved inside a single workspace root; no
 //!   escape (`..`/symlinks), no secrets (`.env`, keys, `.ssh`) — even to read.
 //! - **Off by default + audited.** The kill switch (`JARVIS_AGENT_ENABLED`) and
 //!   the audit log live in the API; this crate is the pure policy + executor.
 //!
-//! The Core (`core/**`, policy, secrets) is never even representable here — there
-//! is no write action at all in 4a, and secret paths are denied on read.
+//! Fase 4c adds a confined **Claude Code executor**: Jarvis may drive headless
+//! `claude` to edit files, but only within the sandbox and behind deny-rules that
+//! block the Core, `.git`, secrets, the shell and network. It is a *second*
+//! deliberate opt-in ([`Sandbox::with_claude_code`]) on top of the kill switch.
+//!
+//! The Core (`core/**`, policy, secrets) is never agent-writable — not via a
+//! `write_file`, not via Claude Code, not even with a signed approval.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,6 +27,10 @@ use tokio::process::Command;
 const MAX_OUTPUT: usize = 64 * 1024;
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const EXEC_TIMEOUT: Duration = Duration::from_secs(20);
+/// Claude Code runs a whole agentic loop, so it gets a much longer leash than a
+/// single read/write. There is no `--max-turns` flag; the process timeout is the
+/// hard bound on how long (and how much) a single approved run may take.
+const CLAUDE_CODE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A read-only action Jarvis may perform. This enum *is* the allowlist: anything
 /// not expressible here cannot be requested (4a has no mutating variants).
@@ -41,6 +50,11 @@ pub enum Action {
     WriteFile { path: String, content: String },
     /// Stage all changes and commit them. **Mutating** — NeedsApproval.
     GitCommit { message: String },
+    /// Drive headless Claude Code as a confined code-executor in the sandbox
+    /// (ADR-029 fase 4c). **Mutating** — NeedsApproval; runs only when the CC
+    /// executor is deliberately enabled, with deny-rules that block the Core,
+    /// `.git`, secrets, the shell (`Bash`) and network tools.
+    ClaudeCode { prompt: String },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -66,7 +80,9 @@ pub enum RiskClass {
 /// (escape/secret/Core) are enforced separately at resolution.
 pub fn classify(action: &Action) -> RiskClass {
     match action {
-        Action::WriteFile { .. } | Action::GitCommit { .. } => RiskClass::NeedsApproval,
+        Action::WriteFile { .. } | Action::GitCommit { .. } | Action::ClaudeCode { .. } => {
+            RiskClass::NeedsApproval
+        }
         _ => RiskClass::Auto,
     }
 }
@@ -89,6 +105,7 @@ pub fn action_type(a: &Action) -> &'static str {
         },
         Action::WriteFile { .. } => "write_file",
         Action::GitCommit { .. } => "git_commit",
+        Action::ClaudeCode { .. } => "claude_code",
     }
 }
 
@@ -108,9 +125,20 @@ pub enum AgentError {
     Timeout,
 }
 
+/// Config for the confined Claude Code executor (ADR-029 fase 4c). Present only
+/// when the owner deliberately enables it; absent ⇒ `claude_code` is refused.
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeCfg {
+    /// The `claude` binary to drive.
+    pub bin: String,
+    /// Model id; empty ⇒ let `claude` choose its own default.
+    pub model: String,
+}
+
 /// A confined workspace: all file access resolves inside `root` (canonicalized).
 pub struct Sandbox {
     root: PathBuf,
+    claude_code: Option<ClaudeCodeCfg>,
 }
 
 impl Sandbox {
@@ -120,7 +148,17 @@ impl Sandbox {
             .as_ref()
             .canonicalize()
             .map_err(|_| AgentError::NoWorkspace)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            claude_code: None,
+        })
+    }
+
+    /// Opt this sandbox into the Claude Code executor (4c). Without this, a
+    /// `claude_code` action is denied even when the agent is enabled.
+    pub fn with_claude_code(mut self, cfg: ClaudeCodeCfg) -> Self {
+        self.claude_code = Some(cfg);
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -222,6 +260,7 @@ pub async fn execute(sandbox: &Sandbox, action: &Action) -> Result<Outcome, Agen
         Action::Git { sub } => git(sandbox, *sub).await?,
         Action::WriteFile { path, content } => write_file(sandbox, path, content)?,
         Action::GitCommit { message } => git_commit(sandbox, message).await?,
+        Action::ClaudeCode { prompt } => claude_code(sandbox, prompt).await?,
     };
     let (output, truncated) = cap(raw);
     Ok(Outcome {
@@ -257,6 +296,32 @@ pub async fn preview(sandbox: &Sandbox, action: &Action) -> Result<String, Agent
                 }
             ))
         }
+        Action::ClaudeCode { prompt } => {
+            // No cheap dry-run for an autonomous agent — the preview states the
+            // exact prompt and the confinement, so the owner signs with eyes open.
+            let cfg = sandbox
+                .claude_code
+                .as_ref()
+                .ok_or_else(|| AgentError::Denied(CLAUDE_CODE_DISABLED.into()))?;
+            let model = if cfg.model.trim().is_empty() {
+                "(claude default)"
+            } else {
+                &cfg.model
+            };
+            Ok(format!(
+                "ClaudeCode — headless code-executor\n\
+                 --- opdracht ---\n{prompt}\n\
+                 --- inperking ---\n\
+                 workspace : {}\n\
+                 model     : {model}\n\
+                 permission: acceptEdits (deny-regels blijven gelden)\n\
+                 geweigerd : Core (core/**), .git, secrets (.env/*.pem/*.key/.ssh), Bash, WebFetch, WebSearch, Agent\n\
+                 timeout   : {}s, geen netwerk, geen shell\n\
+                 LET OP: Claude Code bewerkt zelfstandig bestanden — controleer de git-diff na afloop.",
+                sandbox.root().display(),
+                CLAUDE_CODE_TIMEOUT.as_secs(),
+            ))
+        }
         // Read-only actions don't need a preview; describe them plainly.
         other => Ok(format!("{} (alleen-lezen)", action_type(other))),
     }
@@ -272,6 +337,149 @@ async fn git_commit(sandbox: &Sandbox, message: &str) -> Result<String, AgentErr
     run_cmd(sandbox.root(), "git", &["add", "-A"]).await?;
     let out = run_cmd(sandbox.root(), "git", &["commit", "-m", message]).await?;
     Ok(out)
+}
+
+const CLAUDE_CODE_DISABLED: &str =
+    "claude-code executor uit — zet JARVIS_AGENT_CLAUDE_CODE_ENABLED=true";
+
+/// Deny-rules for the Claude Code executor. These are enforced in *every*
+/// permission mode (even `bypassPermissions`), so they — not the tool flags —
+/// are the guaranteed confinement: the Core, git internals, secrets, the shell
+/// (`Bash`) and the network (`WebFetch`/`WebSearch`) are blocked outright.
+fn claude_code_settings() -> &'static str {
+    concat!(
+        r#"{"permissions":{"deny":["#,
+        r#""Read(./core/**)","Edit(./core/**)","Write(./core/**)","#,
+        r#""Read(./.git/**)","Edit(./.git/**)","Write(./.git/**)","#,
+        r#""Read(**/.env)","Read(**/.env.*)","Edit(**/.env)","Edit(**/.env.*)","Write(**/.env)","Write(**/.env.*)","#,
+        r#""Read(**/*.pem)","Read(**/*.key)","Edit(**/*.pem)","Edit(**/*.key)","Write(**/*.pem)","Write(**/*.key)","#,
+        r#""Read(**/.ssh/**)","Edit(**/.ssh/**)","Write(**/.ssh/**)","#,
+        r#""Bash","WebFetch","WebSearch","Agent""#,
+        r#"]}}"#
+    )
+}
+
+/// Drive headless Claude Code as a confined code-executor (ADR-029 fase 4c). Runs
+/// only when the CC executor is enabled; confined to the sandbox by `current_dir`
+/// + deny-rules; bounded by a hard process timeout (there is no `--max-turns`).
+async fn claude_code(sandbox: &Sandbox, prompt: &str) -> Result<String, AgentError> {
+    let cfg = sandbox
+        .claude_code
+        .as_ref()
+        .ok_or_else(|| AgentError::Denied(CLAUDE_CODE_DISABLED.into()))?;
+
+    let mut cmd = Command::new(&cfg.bin);
+    cmd.arg("-p")
+        .arg(prompt)
+        .arg("--output-format")
+        .arg("json")
+        .arg("--permission-mode")
+        .arg("acceptEdits")
+        .arg("--settings")
+        .arg(claude_code_settings());
+    if !cfg.model.trim().is_empty() {
+        cmd.arg("--model").arg(&cfg.model);
+    }
+    // The workspace is the write boundary; deny-rules do the rest. No API key is
+    // injected — `claude` uses the owner's subscription (no metered spend).
+    cmd.current_dir(sandbox.root()).kill_on_drop(true);
+
+    let out = tokio::time::timeout(CLAUDE_CODE_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| AgentError::Timeout)?
+        .map_err(|e| AgentError::Exec(format!("claude '{}': {e}", cfg.bin)))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let code = out.status.code().unwrap_or(-1);
+        return Err(AgentError::Exec(format!(
+            "claude exit {code}: {}",
+            stderr.trim()
+        )));
+    }
+
+    let result = parse_claude_code_output(&String::from_utf8_lossy(&out.stdout))?;
+
+    // Defense in depth: show the owner exactly what changed, and shout if a
+    // protected path was somehow touched (the deny-rules should have blocked it).
+    let porcelain = git(sandbox, GitRead::Status).await.unwrap_or_default();
+    let is_repo = !porcelain.trim_start().starts_with("fatal");
+    let breaches = if is_repo {
+        protected_breaches(sandbox, &changed_paths(&porcelain))
+    } else {
+        Vec::new()
+    };
+    let changed = if !is_repo {
+        "(geen git-repo — controleer wijzigingen handmatig)".to_string()
+    } else if porcelain.trim().is_empty() {
+        "(geen wijzigingen gedetecteerd)".to_string()
+    } else {
+        porcelain.trim().to_string()
+    };
+
+    let mut report =
+        format!("{result}\n\n--- gewijzigde bestanden (git status) ---\n{changed}");
+    if !breaches.is_empty() {
+        report.push_str(&format!(
+            "\n\n⚠️ SCHENDING: beschermde paden geraakt: {} — controleer direct.",
+            breaches.join(", ")
+        ));
+    }
+    Ok(report)
+}
+
+/// Parse `claude -p --output-format json`. An `is_error` result becomes an
+/// `Exec` error; otherwise return the assistant's final text.
+fn parse_claude_code_output(stdout: &str) -> Result<String, AgentError> {
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| AgentError::Exec(format!("onparseerbare claude-output: {e}")))?;
+    if v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false) {
+        let msg = v
+            .get("result")
+            .and_then(|r| r.as_str())
+            .or_else(|| v.get("subtype").and_then(|s| s.as_str()))
+            .unwrap_or("claude meldde een fout");
+        return Err(AgentError::Exec(format!("claude: {msg}")));
+    }
+    let result = match v.get("result") {
+        Some(serde_json::Value::String(s)) => s.trim().to_string(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+    Ok(if result.is_empty() {
+        "(claude gaf geen tekst terug)".to_string()
+    } else {
+        result
+    })
+}
+
+/// Paths from `git status --short` porcelain (rename → the new path).
+fn changed_paths(porcelain: &str) -> Vec<String> {
+    porcelain
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_end();
+            if line.len() < 4 {
+                return None;
+            }
+            let rest = line[3..].trim();
+            let path = rest.rsplit(" -> ").next().unwrap_or(rest);
+            Some(path.trim_matches('"').to_string())
+        })
+        .collect()
+}
+
+/// Any changed path that is protected (Core / `.git` / secret) — should always be
+/// empty, but if not, the deny-rules failed and the owner must know immediately.
+fn protected_breaches(sandbox: &Sandbox, paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|p| {
+            let joined = sandbox.root().join(p);
+            sandbox.is_protected(&joined) || is_secret(&joined)
+        })
+        .cloned()
+        .collect()
 }
 
 fn list_dir(sandbox: &Sandbox, path: &str) -> Result<String, AgentError> {
@@ -472,5 +680,85 @@ mod tests {
         let (s, truncated) = cap("x".repeat(MAX_OUTPUT + 100));
         assert!(truncated);
         assert_eq!(s.len(), MAX_OUTPUT);
+    }
+
+    // ---- 4c: Claude Code executor -----------------------------------------
+
+    #[test]
+    fn claude_code_is_mutating_and_labeled() {
+        let a = Action::ClaudeCode { prompt: "fix the bug".into() };
+        assert_eq!(classify(&a), RiskClass::NeedsApproval);
+        assert!(is_mutating(&a));
+        assert_eq!(action_type(&a), "claude_code");
+    }
+
+    #[tokio::test]
+    async fn claude_code_denied_when_executor_disabled() {
+        // A sandbox *without* `with_claude_code` must refuse the action before
+        // ever spawning a process — the second opt-in is required.
+        let (sb, _dir) = temp_sandbox("cc_disabled");
+        let err = execute(&sb, &Action::ClaudeCode { prompt: "do it".into() }).await;
+        assert!(matches!(err, Err(AgentError::Denied(_))));
+    }
+
+    #[tokio::test]
+    async fn preview_claude_code_shows_prompt_and_confinement() {
+        let (dir, _p) = temp_sandbox("cc_preview");
+        let sb = dir.with_claude_code(ClaudeCodeCfg {
+            bin: "claude".into(),
+            model: String::new(),
+        });
+        let p = preview(&sb, &Action::ClaudeCode { prompt: "refactor module X".into() })
+            .await
+            .unwrap();
+        assert!(p.contains("refactor module X"));
+        assert!(p.contains("geweigerd"));
+        assert!(p.contains("Core"));
+        assert!(p.contains("Bash"));
+
+        // Disabled executor ⇒ even the preview is denied (nothing to sign).
+        let (bare, _d) = temp_sandbox("cc_preview_off");
+        let denied = preview(&bare, &Action::ClaudeCode { prompt: "x".into() }).await;
+        assert!(matches!(denied, Err(AgentError::Denied(_))));
+    }
+
+    #[test]
+    fn claude_code_settings_are_valid_json_and_deny_the_core_and_shell() {
+        let v: serde_json::Value = serde_json::from_str(claude_code_settings()).unwrap();
+        let deny = v["permissions"]["deny"].as_array().unwrap();
+        let rules: Vec<&str> = deny.iter().filter_map(|r| r.as_str()).collect();
+        assert!(rules.iter().any(|r| r.contains("core/")));
+        assert!(rules.contains(&"Bash"));
+        assert!(rules.contains(&"WebFetch"));
+        assert!(rules.iter().any(|r| r.contains(".env")));
+    }
+
+    #[test]
+    fn parses_claude_code_success_and_error() {
+        let ok = parse_claude_code_output(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"klaar: 2 bestanden bewerkt"}"#,
+        )
+        .unwrap();
+        assert_eq!(ok, "klaar: 2 bestanden bewerkt");
+
+        let err = parse_claude_code_output(
+            r#"{"is_error":true,"subtype":"error_max_turns","result":"limiet bereikt"}"#,
+        );
+        assert!(matches!(err, Err(AgentError::Exec(m)) if m.contains("limiet bereikt")));
+    }
+
+    #[test]
+    fn changed_paths_and_protected_breaches() {
+        let (sb, _dir) = temp_sandbox("cc_breach");
+        let porcelain = " M src/main.rs\n?? note.txt\nR  old.rs -> core/hack.rs\n M .env\n";
+        let paths = changed_paths(porcelain);
+        assert!(paths.contains(&"src/main.rs".to_string()));
+        assert!(paths.contains(&"core/hack.rs".to_string())); // rename target
+        assert!(paths.contains(&".env".to_string()));
+
+        let breaches = protected_breaches(&sb, &paths);
+        assert!(breaches.contains(&"core/hack.rs".to_string()));
+        assert!(breaches.contains(&".env".to_string()));
+        assert!(!breaches.contains(&"src/main.rs".to_string()));
     }
 }

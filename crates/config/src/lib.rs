@@ -147,6 +147,20 @@ pub struct AppConfig {
     /// All file access is confined to this directory.
     #[serde(default)]
     pub agent_workspace_root: String,
+
+    /// Second, deliberate opt-in for the Claude Code executor (ADR-029 fase 4c):
+    /// letting Jarvis drive headless `claude` to *edit* files. Default **false** —
+    /// even with the agent enabled, this stays off until switched on on purpose.
+    #[serde(default)]
+    pub agent_claude_code_enabled: bool,
+
+    /// The `claude` binary used as the confined code-executor (4c).
+    #[serde(default = "default_claude_code_bin")]
+    pub agent_claude_code_bin: String,
+
+    /// Model for the Claude Code executor. Empty ⇒ let `claude` pick its default.
+    #[serde(default)]
+    pub agent_claude_code_model: String,
 }
 
 fn default_bind_addr() -> String {
@@ -201,6 +215,10 @@ fn default_claude_cli_bin() -> String {
 
 fn default_llm_persona_path() -> String {
     "core/Jarvis.md".to_string()
+}
+
+fn default_claude_code_bin() -> String {
+    "claude".to_string()
 }
 
 fn default_openai_base_url() -> String {
@@ -308,6 +326,9 @@ impl fmt::Debug for AppConfig {
             .field("speech_whisper_language", &self.speech_whisper_language)
             .field("agent_enabled", &self.agent_enabled)
             .field("agent_workspace_root", &self.agent_workspace_root)
+            .field("agent_claude_code_enabled", &self.agent_claude_code_enabled)
+            .field("agent_claude_code_bin", &self.agent_claude_code_bin)
+            .field("agent_claude_code_model", &self.agent_claude_code_model)
             .finish()
     }
 }
@@ -353,6 +374,9 @@ mod tests {
             speech_whisper_language: "auto".to_string(),
             agent_enabled: false,
             agent_workspace_root: String::new(),
+            agent_claude_code_enabled: false,
+            agent_claude_code_bin: "claude".to_string(),
+            agent_claude_code_model: String::new(),
         };
 
         let rendered = format!("{cfg:?}");

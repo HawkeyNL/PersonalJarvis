@@ -166,8 +166,20 @@ async fn main() -> anyhow::Result<()> {
             None
         } else {
             match jarvis_agent::Sandbox::new(root) {
-                Ok(sb) => {
-                    tracing::info!(root = %sb.root().display(), enabled = config.agent_enabled, "agent sandbox ready");
+                Ok(mut sb) => {
+                    // Second, deliberate opt-in: the Claude Code executor (4c).
+                    if config.agent_claude_code_enabled {
+                        sb = sb.with_claude_code(jarvis_agent::ClaudeCodeCfg {
+                            bin: config.agent_claude_code_bin.clone(),
+                            model: config.agent_claude_code_model.clone(),
+                        });
+                    }
+                    tracing::info!(
+                        root = %sb.root().display(),
+                        enabled = config.agent_enabled,
+                        claude_code = config.agent_claude_code_enabled,
+                        "agent sandbox ready"
+                    );
                     Some(Arc::new(sb))
                 }
                 Err(e) => {
@@ -178,7 +190,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     if config.agent_enabled && agent_sandbox.is_some() {
-        tracing::warn!("AGENTIC EXECUTION IS ENABLED (read-only, ADR-029 4a)");
+        tracing::warn!("AGENTIC EXECUTION IS ENABLED (mutaties achter getekende goedkeuring, ADR-029 4a/4b)");
+        if config.agent_claude_code_enabled {
+            tracing::warn!("CLAUDE CODE EXECUTOR IS ENABLED (4c) — Jarvis mag bestanden bewerken via headless claude, achter goedkeuring");
+        }
     }
 
     let state = AppState {
