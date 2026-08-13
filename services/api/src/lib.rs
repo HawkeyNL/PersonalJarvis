@@ -26,8 +26,10 @@ use jarvis_portfolio as portfolio;
 use jarvis_registry as registry;
 use jarvis_speech as speech;
 use rust_decimal::Decimal;
+use jarvis_usage as usage;
 // std (not tokio) RwLock: the router's `Availability` reads it synchronously,
 // and the registry is small with brief, await-free critical sections.
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 /// Shared, cheaply-cloneable application state.
@@ -51,6 +53,13 @@ pub struct AppState {
     pub registry: Arc<RwLock<registry::Registry>>,
     /// Inputs to re-collect the registry on refresh.
     pub registry_input: Arc<registry::CollectInput>,
+    /// Hard monthly spend cap in EUR-cents across metered API backends (ADR-027).
+    pub budget_cents: u64,
+    /// Metered spend so far this month, in EUR-cents. Mirrors the DB (refreshed
+    /// after each call) so the router's sync budget gate can read it cheaply.
+    pub spent_cents: Arc<AtomicU64>,
+    /// EUR per 1 USD, to price provider (USD) usage into the EUR budget.
+    pub eur_per_usd: f64,
 }
 
 /// Build the application router.
@@ -80,6 +89,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/voice/verify", post(voice_verify))
         .route("/v1/system/registry", get(system_registry))
         .route("/v1/system/registry/refresh", post(system_registry_refresh))
+        .route("/v1/system/usage", get(system_usage))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -669,17 +679,7 @@ async fn assistant_chat(
 
     match state.llm.chat(&chat).await {
         Ok(reply) => {
-            if let Some(u) = &reply.usage {
-                // Foundation for cost tracking (Fase 1). Cache reads are cheap.
-                tracing::info!(
-                    model = %reply.model,
-                    input = u.input_tokens,
-                    output = u.output_tokens,
-                    cache_read = u.cache_read_tokens,
-                    cache_write = u.cache_write_tokens,
-                    "assistant chat usage",
-                );
-            }
+            record_usage(&state, &reply).await;
             Ok(Json(json!({
                 "reply": reply.text,
                 "model": reply.model,
@@ -832,6 +832,67 @@ async fn voice_verify(
     }
 }
 
+/// Record a reply's cost and refresh the monthly spend counter (ADR-027). Free
+/// backends (plan/Ollama) cost nothing and are skipped. Billing must never break
+/// a chat, so DB errors are logged, not surfaced.
+async fn record_usage(state: &AppState, reply: &llm::ChatReply) {
+    let (Some(u), Some(backend)) = (&reply.usage, reply.backend.as_deref()) else {
+        return;
+    };
+    let cost = usage::cost_eur(
+        backend,
+        &reply.model,
+        u.input_tokens,
+        u.output_tokens,
+        u.cache_read_tokens,
+        state.eur_per_usd,
+    );
+    tracing::info!(
+        %backend, model = %reply.model, input = u.input_tokens, output = u.output_tokens,
+        cache_read = u.cache_read_tokens, cost_eur = cost, "assistant chat usage",
+    );
+    if !usage::is_metered(backend) {
+        return; // plan/local: nothing to bill or count
+    }
+    let entry = usage::UsageEntry {
+        backend: backend.to_string(),
+        model: reply.model.clone(),
+        input_tokens: u.input_tokens as i32,
+        output_tokens: u.output_tokens as i32,
+        cache_read_tokens: u.cache_read_tokens as i32,
+        cache_write_tokens: u.cache_write_tokens as i32,
+        cost_eur: cost,
+    };
+    if let Err(e) = usage::record(&state.db, &entry).await {
+        tracing::warn!(error = %e, "failed to record llm usage");
+    }
+    // Re-read the month total so the gate stays correct across a month rollover.
+    match usage::month_total_eur(&state.db).await {
+        Ok(total) => state
+            .spent_cents
+            .store((total * 100.0).round() as u64, Ordering::Relaxed),
+        Err(e) => tracing::warn!(error = %e, "failed to refresh monthly spend"),
+    }
+}
+
+/// This month's LLM spend vs. the budget, with a per-backend breakdown (ADR-027).
+async fn system_usage(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
+    let spent_eur = state.spent_cents.load(Ordering::Relaxed) as f64 / 100.0;
+    let budget_eur = state.budget_cents as f64 / 100.0;
+    let breakdown = usage::month_breakdown(&state.db).await.unwrap_or_default();
+    let by_backend: Vec<Value> = breakdown
+        .into_iter()
+        .map(|(backend, eur)| json!({ "backend": backend, "spent_eur": eur }))
+        .collect();
+    Json(json!({
+        "budget_eur": budget_eur,
+        "spent_eur": spent_eur,
+        "remaining_eur": (budget_eur - spent_eur).max(0.0),
+        "over_budget": spent_eur >= budget_eur,
+        "by_backend": by_backend,
+    }))
+}
+
 /// Jarvis' resource/agent registry — available brains + cost + the host it runs
 /// on (ADR-027 stage 3). Cached from startup; POST `/refresh` re-probes.
 async fn system_registry(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
@@ -851,15 +912,27 @@ async fn system_registry_refresh(_authed: Authed, State(state): State<AppState>)
     Json(serde_json::to_value(&fresh).unwrap_or_else(|_| json!({})))
 }
 
-/// Live brain availability from the resource registry — the bridge that lets the
-/// router (`jarvis-llm`) route on what's actually up (ADR-027). A backend is
-/// available iff the registry has a matching brain marked available; a poisoned
-/// lock degrades to "try it" so a bug here never bricks the brain.
-pub struct RegistryAvailability(pub Arc<RwLock<registry::Registry>>);
+/// Live brain availability for the router (`jarvis-llm`) — the bridge that makes
+/// it route on what's actually up *and* affordable (ADR-027). A backend is
+/// available iff the registry marks it available AND, for metered API backends,
+/// this month's spend is still under the budget. A poisoned lock degrades to
+/// "try it" so a bug here never bricks the brain.
+pub struct BrainAvailability {
+    pub registry: Arc<RwLock<registry::Registry>>,
+    pub spent_cents: Arc<AtomicU64>,
+    pub budget_cents: u64,
+}
 
-impl llm::Availability for RegistryAvailability {
+impl llm::Availability for BrainAvailability {
     fn is_available(&self, backend_id: &str) -> bool {
-        self.0
+        // Metered backends are cut off once the monthly budget is reached, so
+        // the router falls back to the free plan/Ollama.
+        if usage::is_metered(backend_id)
+            && self.spent_cents.load(Ordering::Relaxed) >= self.budget_cents
+        {
+            return false;
+        }
+        self.registry
             .read()
             .map(|reg| {
                 reg.brains
@@ -935,6 +1008,9 @@ mod tests {
                 jarvis_registry::collect(&jarvis_registry::CollectInput::default()).await,
             )),
             registry_input: std::sync::Arc::new(jarvis_registry::CollectInput::default()),
+            budget_cents: 5000,
+            spent_cents: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            eur_per_usd: 0.92,
         });
 
         // 1. enroll this device (dev endpoint)

@@ -1,6 +1,6 @@
 # ADR-027 — Kosten-bewuste brein-router (plan vóór API vóór lokaal)
 
-- Status: geaccepteerd (stages 1 + 3 + router-koppeling gebouwd) — 13 augustus 2026
+- Status: geaccepteerd (stages 1 + 2 + 3 + router-koppeling + multi-provider gebouwd) — 13 augustus 2026
 - Bouwt op ADR-022 (Claude als brein, provider-abstractie) en de bestaande
   `LlmProvider`-trait + `FallbackProvider`
 
@@ -38,8 +38,19 @@ latere stage bovenop deze basis.
 
 ## Vervolg (nog te bouwen)
 
-- **Stage 2 — usage/threshold-routing**: eigen token/verzoek-teller per backend,
-  waarschuwen + vervroegd omschakelen rond een drempel; kosten/limieten in beeld.
+- **Stage 2 — usage/budget-routing ✅ gebouwd**: crate `jarvis-usage` schat de
+  kosten per call (prijs-per-model × tokens, USD→EUR) en logt élke *metered* call
+  in Postgres (`llm_usage`, migratie 0007). Alleen de betaalde API's tellen; het
+  plan (claude-cli) en Ollama zijn gratis. Een **harde maand-cap** (default
+  `JARVIS_LLM_MONTHLY_BUDGET_EUR=50`) wordt afgedwongen door `BrainAvailability`:
+  zodra de maand-som ≥ budget, markeert de availability-brug de metered breinen
+  als "niet beschikbaar" → de router valt terug op plan/Ollama. De teller is een
+  `AtomicU64` (cent) die de DB spiegelt: geseed bij startup, herladen na elke call
+  (dekt de maandwissel, want de som filtert op `date_trunc('month', now())`).
+  Endpoint `GET /v1/system/usage` (budget/verbruik/rest + per-backend); client
+  toont een budgetbalk in Status. **Multi-provider**: naast Anthropic nu ook
+  OpenAI + DeepSeek (OpenAI-compatibele adapter), elk met eigen key in de backend.
+  Nog open: een proactieve waarschuwing rond ~80–90% en per-provider sub-budgetten.
 - **Stage 3 — resource-/agent-registry ("instant memory") ✅ gebouwd**: crate
   `jarvis-registry` detecteert de **host** (CPU/RAM/GPU via `sysinfo`, arch, OS) en
   probeert de **breinen/tools** (claude CLI, Ollama + lokale modellen, cmake,

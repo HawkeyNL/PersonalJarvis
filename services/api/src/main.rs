@@ -5,9 +5,10 @@
 
 use std::time::Duration;
 
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
-use jarvis_api::{build_router, AppState, RegistryAvailability};
+use jarvis_api::{build_router, AppState, BrainAvailability};
 use jarvis_config::AppConfig;
 use sqlx::postgres::PgPoolOptions;
 
@@ -106,9 +107,25 @@ async fn main() -> anyhow::Result<()> {
             model_cheap: config.llm_deepseek_model_cheap.clone(),
         },
     };
+    // Cost guardrail (ADR-027): a hard monthly EUR cap on metered API backends.
+    // Seed the in-memory spend counter from this month's DB total so the gate is
+    // correct across restarts; the router refuses paid calls once it's reached.
+    let budget_cents = (config.llm_monthly_budget_eur * 100.0).round().max(0.0) as u64;
+    let spent_eur = jarvis_usage::month_total_eur(&db).await.unwrap_or(0.0);
+    let spent_cents = Arc::new(AtomicU64::new((spent_eur * 100.0).round().max(0.0) as u64));
+    tracing::info!(
+        budget_eur = config.llm_monthly_budget_eur,
+        spent_eur,
+        "llm monthly budget"
+    );
+
     let llm = match config.llm_provider.to_ascii_lowercase().as_str() {
         "router" | "auto" => {
-            let availability = Arc::new(RegistryAvailability(registry.clone()));
+            let availability = Arc::new(BrainAvailability {
+                registry: registry.clone(),
+                spent_cents: spent_cents.clone(),
+                budget_cents,
+            });
             jarvis_llm::build_router(provider_cfg, availability)
         }
         _ => jarvis_llm::build_provider(provider_cfg),
@@ -143,6 +160,9 @@ async fn main() -> anyhow::Result<()> {
         speech_verify_threshold: config.speech_verify_threshold,
         registry,
         registry_input: Arc::new(registry_input),
+        budget_cents,
+        spent_cents,
+        eur_per_usd: config.llm_eur_per_usd,
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

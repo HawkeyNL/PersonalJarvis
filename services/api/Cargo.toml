@@ -39,6 +39,7 @@ jarvis-ibkr.workspace = true
 jarvis-llm.workspace = true
 jarvis-speech.workspace = true
 jarvis-registry.workspace = true
+jarvis-usage.workspace = true
 rust_decimal.workspace = true
 
 [dev-dependencies]

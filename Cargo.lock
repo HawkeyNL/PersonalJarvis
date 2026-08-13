@@ -1084,6 +1084,7 @@ dependencies = [
  "jarvis-portfolio",
  "jarvis-registry",
  "jarvis-speech",
+ "jarvis-usage",
  "rand 0.8.7",
  "rust_decimal",
  "serde",
@@ -1185,6 +1186,15 @@ dependencies = [
  "tokio",
  "tracing",
  "whisper-rs",
+]
+
+[[package]]
+name = "jarvis-usage"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sqlx",
+ "tracing",
 ]
 
 [[package]]

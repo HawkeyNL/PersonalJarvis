@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, computed, onMounted } from "vue";
 import { API_BASE, getJson, getJsonAuth, postJsonAuth } from "../api";
 import { currentSession } from "../auth";
 
@@ -70,9 +70,27 @@ interface Registry {
   active_brain: string;
 }
 
+interface Usage {
+  budget_eur: number;
+  spent_eur: number;
+  remaining_eur: number;
+  over_budget: boolean;
+  by_backend: { backend: string; spent_eur: number }[];
+}
+
 const reg = ref<Registry | null>(null);
+const usage = ref<Usage | null>(null);
 const regError = ref<string | null>(null);
 const regBusy = ref(false);
+
+function eur(n: number): string {
+  return "€" + n.toFixed(2);
+}
+const budgetPct = computed(() => {
+  const u = usage.value;
+  if (!u || u.budget_eur <= 0) return 0;
+  return Math.min(100, Math.round((u.spent_eur / u.budget_eur) * 100));
+});
 const costLabel: Record<Brain["cost"], string> = {
   plan: "plan",
   metered: "per-token",
@@ -91,6 +109,7 @@ async function loadRegistry(refresh = false) {
     reg.value = refresh
       ? await postJsonAuth<Registry>("/v1/system/registry/refresh", s.token, {})
       : await getJsonAuth<Registry>("/v1/system/registry", s.token);
+    usage.value = await getJsonAuth<Usage>("/v1/system/usage", s.token);
   } catch (e) {
     regError.value = String(e);
   } finally {
@@ -135,6 +154,29 @@ onMounted(() => {
       <p v-if="regError" class="muted err">{{ regError }}</p>
       <template v-else-if="reg">
         <p class="active">actief brein: <code>{{ reg.active_brain }}</code></p>
+
+        <!-- Monthly spend vs the hard budget (ADR-027). -->
+        <div v-if="usage" class="budget">
+          <div class="brow">
+            <span class="k">maandbudget</span>
+            <span :class="{ over: usage.over_budget }">
+              {{ eur(usage.spent_eur) }} / {{ eur(usage.budget_eur) }}
+              <span v-if="usage.over_budget" class="capped">· plafond bereikt</span>
+            </span>
+          </div>
+          <div class="bar">
+            <div
+              class="fill"
+              :class="{ over: usage.over_budget }"
+              :style="{ width: budgetPct + '%' }"
+            ></div>
+          </div>
+          <div v-if="usage.by_backend.length" class="bk">
+            <span v-for="b in usage.by_backend" :key="b.backend" class="bkchip">
+              {{ b.backend }} {{ eur(b.spent_eur) }}
+            </span>
+          </div>
+        </div>
         <ul class="brains">
           <li v-for="b in reg.brains" :key="b.id">
             <span class="dot" :class="b.available ? 'dot-ok' : 'dot-err'"></span>
@@ -200,6 +242,51 @@ onMounted(() => {
 .active {
   margin: 0 0 12px;
   font-size: 13px;
+}
+.budget {
+  margin: 0 0 14px;
+  font-size: 12px;
+}
+.brow {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 5px;
+}
+.brow .over {
+  color: #f87171;
+}
+.capped {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+.bar {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+.bar .fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+.bar .fill.over {
+  background: #f87171;
+}
+.bk {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.bkchip {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 7px;
 }
 .brains {
   list-style: none;
