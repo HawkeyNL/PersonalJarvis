@@ -2,6 +2,7 @@
 import { ref, computed, watch, onMounted } from "vue";
 import NavIcon from "./NavIcon.vue";
 import { messages, send, thinking } from "../assistant";
+import { renderMarkdown, handleMarkdownClick } from "../markdown";
 import { useMic } from "../useMic";
 import { wakePulse } from "../voicewake";
 import {
@@ -73,11 +74,18 @@ onMounted(refreshRoute);
     <!-- Conversation, floating over the living backdrop. -->
     <div class="transcript" :class="{ dim: revealed }">
       <TransitionGroup name="line">
-        <p v-for="m in recent" :key="m.id" class="line" :class="m.role">
+        <div v-for="m in recent" :key="m.id" class="line" :class="m.role">
           <span class="who">{{ m.role === "jarvis" ? "JARVIS" : "JIJ" }}</span>
-          <span class="txt">{{ m.text }}</span>
+          <!-- Jarvis speaks Markdown; the user's own text stays literal. -->
+          <span
+            v-if="m.role === 'jarvis'"
+            class="txt md"
+            @click="handleMarkdownClick"
+            v-html="renderMarkdown(m.text)"
+          ></span>
+          <span v-else class="txt">{{ m.text }}</span>
           <span v-if="m.role === 'jarvis' && m.spoken" class="spoke">🔊</span>
-        </p>
+        </div>
       </TransitionGroup>
       <p v-if="thinking" class="line jarvis thinking" key="thinking">
         <span class="who">JARVIS</span>
@@ -196,6 +204,96 @@ onMounted(refreshRoute);
 .spoke {
   margin-left: 6px;
   opacity: 0.8;
+}
+
+/* Rendered Markdown from Jarvis. The transcript is click-through (the backdrop
+   breathes underneath), so only the interactive bits (links, images) re-enable
+   pointer events. A single-paragraph reply sits inline right after the label; a
+   richer reply (lists, code) flows as blocks below it. */
+.md {
+  display: inline;
+}
+.md > :first-child {
+  margin-top: 0;
+}
+.md > p:first-child {
+  display: inline; /* keep short replies on the label's line */
+}
+.md p {
+  margin: 0 0 6px;
+}
+.md > :last-child,
+.md p:last-child {
+  margin-bottom: 0;
+}
+.md strong {
+  color: var(--text);
+  font-weight: 700;
+}
+.md em {
+  font-style: italic;
+}
+.md a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  pointer-events: auto; /* clickable even though the transcript is click-through */
+}
+.md code {
+  font-family: var(--mono);
+  font-size: 0.88em;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.1);
+}
+.md pre {
+  margin: 6px 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid var(--border);
+  overflow-x: auto;
+}
+.md pre code {
+  padding: 0;
+  background: none;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.md ul,
+.md ol {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+.md li {
+  margin: 2px 0;
+}
+.md blockquote {
+  margin: 6px 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--accent);
+  color: var(--muted);
+}
+.md img {
+  display: block;
+  max-width: 100%;
+  max-height: 240px;
+  margin: 6px 0;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  pointer-events: auto;
+}
+.md h1,
+.md h2,
+.md h3 {
+  margin: 8px 0 4px;
+  font-size: 15px;
+  font-weight: 700;
+}
+.md :is(p, li, h1, h2, h3) {
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .dots {
