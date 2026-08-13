@@ -178,7 +178,7 @@ pub async fn collect(input: &CollectInput) -> Registry {
     ];
 
     let brains = derive_brains(input, claude_ver.is_some(), &ollama_models);
-    let models = derive_models(input, &ollama_models);
+    let models = derive_models(input, claude_ver.is_some(), &ollama_models);
 
     Registry {
         host,
@@ -193,7 +193,7 @@ pub async fn collect(input: &CollectInput) -> Registry {
 /// provider (class by tier role, cost by band) + the local Ollama models that
 /// are actually installed. Deduplicated per backend (a provider often reuses the
 /// same model across tiers). See ADR-028.
-fn derive_models(input: &CollectInput, ollama_models: &[String]) -> Vec<ModelEntry> {
+fn derive_models(input: &CollectInput, claude_present: bool, ollama_models: &[String]) -> Vec<ModelEntry> {
     let mut out = Vec::new();
 
     // Class from a model's tier role, sharpened to Reasoning by name.
@@ -222,13 +222,27 @@ fn derive_models(input: &CollectInput, ollama_models: &[String]) -> Vec<ModelEnt
                     id: id.to_string(),
                     backend: backend.to_string(),
                     class: class_of(id, role_class),
-                    // DeepSeek is cheap across the board; others keep the band.
-                    cost: if backend == "deepseek-api" { ModelCost::Cheap } else { cost },
+                    // The plan route is free; DeepSeek is cheap across the board;
+                    // others keep the tier band.
+                    cost: match backend {
+                        "claude-cli" => ModelCost::Local,
+                        "deepseek-api" => ModelCost::Cheap,
+                        _ => cost,
+                    },
                     available,
                 });
             }
         };
 
+    // The Claude plan via the CLI runs the same Claude models, but free.
+    add_cloud(
+        "claude-cli",
+        claude_present,
+        &input.anthropic_model_cheap,
+        &input.anthropic_model,
+        &input.anthropic_model_hard,
+        ModelCost::Local,
+    );
     add_cloud(
         "anthropic-api",
         input.has_api_key,
@@ -461,7 +475,7 @@ mod tests {
 
     #[test]
     fn model_catalog_classes_and_dedups() {
-        let models = derive_models(&input(), &["llama3.2:latest".to_string()]);
+        let models = derive_models(&input(), true, &["llama3.2:latest".to_string()]);
         let get = |id: &str| models.iter().find(|m| m.id == id).expect("model present");
         // Class by tier role, sharpened for reasoners.
         assert_eq!(get("claude-haiku-4-5").class, ModelClass::Light);
@@ -478,7 +492,7 @@ mod tests {
     fn model_catalog_marks_unkeyed_providers_unavailable() {
         let mut i = input();
         i.has_openai_key = false;
-        let models = derive_models(&i, &[]);
+        let models = derive_models(&i, true, &[]);
         // Known models stay visible ("ecosystem"), just flagged unavailable.
         let openai: Vec<_> = models.iter().filter(|m| m.backend == "openai-api").collect();
         assert!(!openai.is_empty());

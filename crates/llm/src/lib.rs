@@ -22,7 +22,7 @@ pub use claude_cli::ClaudeCliProvider;
 pub use fallback::FallbackProvider;
 pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
-pub use router::{always_available, Availability, RouterProvider};
+pub use router::{always_available, Availability, CatalogModel, ModelClass, RouterProvider};
 pub use types::{ChatMessage, ChatReply, ChatRequest, LlmError, Role, Tier, Usage};
 
 /// A swappable brain: given a conversation, produce a reply.
@@ -149,7 +149,7 @@ pub fn build_provider(cfg: ProviderConfig) -> Arc<dyn LlmProvider> {
     let anthropic = build_anthropic(&cfg);
 
     match cfg.provider.to_ascii_lowercase().as_str() {
-        "router" | "auto" => build_router(cfg, always_available()),
+        "router" | "auto" => build_router(cfg, always_available(), Vec::new()),
         "claude-cli" => {
             let cli = build_claude_cli(&cfg);
             match anthropic.or(ollama) {
@@ -189,13 +189,17 @@ fn single_or_fallback(
     }
 }
 
-/// Build the registry-aware [`RouterProvider`] over every buildable backend, in
-/// a fixed id order (`ollama`, `claude-cli`, `anthropic-api`). The router itself
-/// decides per request which to try, consulting `availability` (backed by the
-/// resource registry) and a per-tier cost/quality policy — cheap tasks local,
-/// real work on the plan, the API as the vangnet, the hardest on strong brains
-/// only. Falls back to [`Unconfigured`] if nothing is buildable.
-pub fn build_router(cfg: ProviderConfig, availability: Arc<dyn Availability>) -> Arc<dyn LlmProvider> {
+/// Build the registry-aware [`RouterProvider`] over every buildable backend. The
+/// router decides per request which backend to try (consulting `availability` +
+/// a per-tier cost/quality policy) *and*, from `catalog`, which model — cheapest
+/// sufficient, low models by default (ADR-028 fase 2). An empty catalog ⇒ each
+/// provider uses its own tier model. Falls back to [`Unconfigured`] if nothing
+/// is buildable.
+pub fn build_router(
+    cfg: ProviderConfig,
+    availability: Arc<dyn Availability>,
+    catalog: Vec<router::CatalogModel>,
+) -> Arc<dyn LlmProvider> {
     let mut candidates = Vec::new();
     if let Some(ollama) = build_ollama(&cfg) {
         candidates.push(router::Candidate {
@@ -228,7 +232,7 @@ pub fn build_router(cfg: ProviderConfig, availability: Arc<dyn Availability>) ->
     if candidates.is_empty() {
         return Arc::new(Unconfigured);
     }
-    Arc::new(RouterProvider::new(candidates, availability))
+    Arc::new(RouterProvider::new(candidates, availability, catalog))
 }
 
 /// A brain that always errors — when nothing is configured.
@@ -297,6 +301,7 @@ mod tests {
                 messages: vec![ChatMessage::user("hoi Jarvis")],
                 tier: Tier::Default,
                 max_tokens: 64,
+                model: None,
             })
             .await
             .unwrap();

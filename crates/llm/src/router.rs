@@ -31,6 +31,24 @@ pub fn always_available() -> Arc<dyn Availability> {
     Arc::new(AlwaysAvailable)
 }
 
+/// What a model is good for — mirrors `jarvis_registry::ModelClass` so the router
+/// can pick per task without depending on the registry crate (ADR-028 fase 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelClass {
+    Light,
+    Mid,
+    Heavy,
+    Reasoning,
+}
+
+/// One model the router may pick, mapped from the registry catalog (available only).
+#[derive(Debug, Clone)]
+pub struct CatalogModel {
+    pub backend: String,
+    pub id: String,
+    pub class: ModelClass,
+}
+
 /// A backend the router can route to.
 pub(crate) struct Candidate {
     pub(crate) id: String,
@@ -40,18 +58,53 @@ pub(crate) struct Candidate {
 pub struct RouterProvider {
     candidates: Vec<Candidate>,
     availability: Arc<dyn Availability>,
+    /// Available models per backend, cheapest-first within a class (ADR-028).
+    catalog: Vec<CatalogModel>,
     label: String,
 }
 
 impl RouterProvider {
-    pub(crate) fn new(candidates: Vec<Candidate>, availability: Arc<dyn Availability>) -> Self {
+    pub(crate) fn new(
+        candidates: Vec<Candidate>,
+        availability: Arc<dyn Availability>,
+        catalog: Vec<CatalogModel>,
+    ) -> Self {
         let ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
         let label = format!("router[{}]", ids.join(","));
         Self {
             candidates,
             availability,
+            catalog,
             label,
         }
+    }
+
+    /// Model classes acceptable for a tier, best-preferred first — "low models
+    /// almost always" (ADR-028): everyday work stays light, only Hard reaches for
+    /// the strong brains, with a sensible escalation fallback.
+    fn target_classes(tier: Tier) -> &'static [ModelClass] {
+        match tier {
+            Tier::Cheap => &[ModelClass::Light],
+            Tier::Default => &[ModelClass::Light, ModelClass::Mid],
+            Tier::Hard => &[ModelClass::Heavy, ModelClass::Reasoning, ModelClass::Mid],
+        }
+    }
+
+    /// Pick the best model for `backend` at `tier` from the catalog: the first
+    /// catalog entry (catalog is cheapest-first within a class) whose class is
+    /// the most-preferred available for this tier. `None` ⇒ let the provider use
+    /// its own tier model.
+    fn model_for(&self, backend: &str, tier: Tier) -> Option<String> {
+        for want in Self::target_classes(tier) {
+            if let Some(m) = self
+                .catalog
+                .iter()
+                .find(|m| m.backend == backend && m.class == *want)
+            {
+                return Some(m.id.clone());
+            }
+        }
+        None
     }
 
     /// Preference order of backend ids for a tier. Cheap → cheapest first (free
@@ -113,7 +166,22 @@ impl LlmProvider for RouterProvider {
         }
         let mut last = None;
         for candidate in plan {
-            match candidate.provider.chat(req).await {
+            // Pick the cheapest sufficient model for this backend + tier; if the
+            // request already names a model, respect it. Fall back to the
+            // provider's own tier model when the catalog has nothing.
+            let chosen = req
+                .model
+                .clone()
+                .or_else(|| self.model_for(&candidate.id, req.tier));
+            let attempt = if chosen == req.model {
+                req.clone()
+            } else {
+                ChatRequest {
+                    model: chosen,
+                    ..req.clone()
+                }
+            };
+            match candidate.provider.chat(&attempt).await {
                 Ok(reply) => return Ok(reply),
                 Err(LlmError::Refused) => return Err(LlmError::Refused),
                 Err(e) => {
@@ -184,21 +252,84 @@ mod tests {
         plan.iter().map(|c| c.id.clone()).collect()
     }
 
+    fn catalog() -> Vec<CatalogModel> {
+        let m = |backend: &str, id: &str, class| CatalogModel {
+            backend: backend.into(),
+            id: id.into(),
+            class,
+        };
+        vec![
+            m("ollama", "llama3.2", ModelClass::Light),
+            m("claude-cli", "claude-haiku-4-5", ModelClass::Light),
+            m("claude-cli", "claude-opus-5", ModelClass::Heavy),
+            m("anthropic-api", "claude-sonnet-5", ModelClass::Mid),
+        ]
+    }
+
+    #[test]
+    fn picks_low_models_by_default_and_strong_for_hard() {
+        let r = RouterProvider::new(all(), always_available(), catalog());
+        // Default → light on the plan (cheap sufficient, free).
+        assert_eq!(r.model_for("claude-cli", Tier::Default).as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(r.model_for("claude-cli", Tier::Cheap).as_deref(), Some("claude-haiku-4-5"));
+        // Hard → the heavy model.
+        assert_eq!(r.model_for("claude-cli", Tier::Hard).as_deref(), Some("claude-opus-5"));
+        // No light for anthropic-api → Default escalates to its Mid model.
+        assert_eq!(r.model_for("anthropic-api", Tier::Default).as_deref(), Some("claude-sonnet-5"));
+        // Ollama has only a light model → nothing for a Hard task (uses default).
+        assert_eq!(r.model_for("ollama", Tier::Hard), None);
+    }
+
+    #[tokio::test]
+    async fn router_sends_the_chosen_model_to_the_backend() {
+        // A provider that echoes back whichever model it was handed.
+        struct EchoModel;
+        #[async_trait]
+        impl LlmProvider for EchoModel {
+            fn label(&self) -> &str {
+                "claude-cli"
+            }
+            async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
+                Ok(ChatReply {
+                    text: String::new(),
+                    model: req.model.clone().unwrap_or_else(|| "DEFAULT".into()),
+                    backend: Some("claude-cli".into()),
+                    stop_reason: None,
+                    usage: None,
+                })
+            }
+        }
+        let cands = vec![Candidate {
+            id: "claude-cli".into(),
+            provider: Arc::new(EchoModel),
+        }];
+        let r = RouterProvider::new(cands, always_available(), catalog());
+        let ask = |tier| ChatRequest {
+            system: None,
+            messages: vec![ChatMessage::user("hi")],
+            tier,
+            max_tokens: 16,
+            model: None,
+        };
+        assert_eq!(r.chat(&ask(Tier::Default)).await.unwrap().model, "claude-haiku-4-5");
+        assert_eq!(r.chat(&ask(Tier::Hard)).await.unwrap().model, "claude-opus-5");
+    }
+
     #[test]
     fn cheap_prefers_local_then_plan_then_api() {
-        let r = RouterProvider::new(all(), always_available());
+        let r = RouterProvider::new(all(), always_available(), vec![]);
         assert_eq!(ids(r.plan(Tier::Cheap)), ["ollama", "claude-cli", "anthropic-api"]);
     }
 
     #[test]
     fn default_prefers_plan_then_api_then_local() {
-        let r = RouterProvider::new(all(), always_available());
+        let r = RouterProvider::new(all(), always_available(), vec![]);
         assert_eq!(ids(r.plan(Tier::Default)), ["claude-cli", "anthropic-api", "ollama"]);
     }
 
     #[test]
     fn hard_is_strong_only() {
-        let r = RouterProvider::new(all(), always_available());
+        let r = RouterProvider::new(all(), always_available(), vec![]);
         assert_eq!(ids(r.plan(Tier::Hard)), ["claude-cli", "anthropic-api"]);
     }
 
@@ -211,7 +342,7 @@ mod tests {
             cand("openai-api", true),
             cand("anthropic-api", true),
         ];
-        let r = RouterProvider::new(fleet, always_available());
+        let r = RouterProvider::new(fleet, always_available(), vec![]);
         // Cheap: free first, then the cheapest metered.
         assert_eq!(
             ids(r.plan(Tier::Cheap)),
@@ -231,7 +362,7 @@ mod tests {
 
     #[test]
     fn availability_filters_but_keeps_a_safety_net() {
-        let r = RouterProvider::new(all(), Arc::new(Only("anthropic-api")));
+        let r = RouterProvider::new(all(), Arc::new(Only("anthropic-api")), vec![]);
         assert_eq!(ids(r.plan(Tier::Default)), ["anthropic-api"]);
 
         // If the registry claims nothing is up, still try (ordered) rather than fail.
@@ -241,7 +372,7 @@ mod tests {
                 false
             }
         }
-        let r2 = RouterProvider::new(all(), Arc::new(None_));
+        let r2 = RouterProvider::new(all(), Arc::new(None_), vec![]);
         assert_eq!(ids(r2.plan(Tier::Default)), ["claude-cli", "anthropic-api", "ollama"]);
     }
 
@@ -253,13 +384,14 @@ mod tests {
             cand("claude-cli", false),
             cand("anthropic-api", true),
         ];
-        let r = RouterProvider::new(cands, always_available());
+        let r = RouterProvider::new(cands, always_available(), vec![]);
         let reply = r
             .chat(&ChatRequest {
                 system: None,
                 messages: vec![ChatMessage::user("hi")],
                 tier: Tier::Default,
                 max_tokens: 16,
+                model: None,
             })
             .await
             .unwrap();

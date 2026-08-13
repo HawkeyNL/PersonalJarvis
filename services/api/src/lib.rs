@@ -675,6 +675,8 @@ async fn assistant_chat(
         tier: req.tier.as_deref().map(llm::Tier::parse).unwrap_or_default(),
         messages,
         max_tokens: state.llm_max_tokens,
+        // The router picks the concrete model per backend (ADR-028 fase 2).
+        model: None,
     };
 
     match state.llm.chat(&chat).await {
@@ -921,6 +923,28 @@ pub struct BrainAvailability {
     pub registry: Arc<RwLock<registry::Registry>>,
     pub spent_cents: Arc<AtomicU64>,
     pub budget_cents: u64,
+}
+
+/// Map the registry's model catalog (available models only) into the router's
+/// catalog so it can pick the cheapest sufficient model per task (ADR-028 fase 2).
+pub fn router_catalog(reg: &Arc<RwLock<registry::Registry>>) -> Vec<llm::CatalogModel> {
+    let Ok(reg) = reg.read() else {
+        return Vec::new();
+    };
+    reg.models
+        .iter()
+        .filter(|m| m.available)
+        .map(|m| llm::CatalogModel {
+            backend: m.backend.clone(),
+            id: m.id.clone(),
+            class: match m.class {
+                registry::ModelClass::Light => llm::ModelClass::Light,
+                registry::ModelClass::Mid => llm::ModelClass::Mid,
+                registry::ModelClass::Heavy => llm::ModelClass::Heavy,
+                registry::ModelClass::Reasoning => llm::ModelClass::Reasoning,
+            },
+        })
+        .collect()
 }
 
 impl llm::Availability for BrainAvailability {

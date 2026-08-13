@@ -74,7 +74,10 @@ impl LlmProvider for OpenAiCompatProvider {
     }
 
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
-        let model = self.model_for(req.tier).to_string();
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| self.model_for(req.tier).to_string());
 
         // OpenAI-style messages: the system prompt is the first `system` turn.
         let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);

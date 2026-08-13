@@ -63,6 +63,9 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub tier: Tier,
     pub max_tokens: u32,
+    /// Explicit model override chosen by the router (ADR-028 fase 2). `None` ⇒
+    /// the provider picks its own model for `tier`.
+    pub model: Option<String>,
 }
 
 /// Token usage for a reply, when the provider reports it.

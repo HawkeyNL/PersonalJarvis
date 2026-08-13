@@ -41,6 +41,8 @@ impl LlmProvider for OllamaProvider {
     }
 
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
+        // The router may pick a specific local model; else use the configured one.
+        let model = req.model.clone().unwrap_or_else(|| self.model.clone());
         // Ollama takes the system prompt inline as a leading message.
         let mut msgs: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
         if let Some(system) = &req.system {
@@ -54,7 +56,7 @@ impl LlmProvider for OllamaProvider {
         }
 
         let body = json!({
-            "model": self.model,
+            "model": model,
             "messages": msgs,
             "stream": false,
             "options": { "num_predict": req.max_tokens },
@@ -94,7 +96,7 @@ impl LlmProvider for OllamaProvider {
         };
         Ok(ChatReply {
             text,
-            model: self.model.clone(),
+            model,
             backend: Some("ollama".into()),
             stop_reason: v
                 .get("done_reason")

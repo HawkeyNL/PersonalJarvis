@@ -1,6 +1,6 @@
 # ADR-028 — Model-per-taak routing + plan→execute (goedkoopste geschikte intelligentie)
 
-- Status: geaccepteerd (fase 1 gebouwd) — 13 augustus 2026
+- Status: geaccepteerd (fases 1 + 2 gebouwd) — 13 augustus 2026
 - Bouwt op ADR-027 (kosten-bewuste brein-router + registry + budget) en op
   `core/Jarvis.md` §6 (Orchestrator First), §7 (Agent Specialization),
   §9 (Cheapest Sufficient Intelligence)
@@ -42,13 +42,27 @@ beschikbaar backend een lijst `ModelEntry { id, backend, class, cost, available 
 Zichtbaar via `GET /v1/system/registry` (`models`) en in Status. Dit is de
 kennisbasis; routing gebruikt 'm in fase 2.
 
-### Fase 2 — Capability-routing (nog te bouwen)
+### Fase 2 — Capability-routing ✅ gebouwd
 
-De router kiest per **taak-klasse** het **goedkoopste model dat volstaat** uit de
-catalogus (i.p.v. het vaste tier-model), begrensd door beschikbaarheid + budget
-(ADR-027). Default-beleid: *licht tenzij nodig* — gewone chat → `light`; alleen
-expliciet zware taken → `heavy`/`reasoning`. Taak-klasse komt eerst uit een
-expliciete hint (client/agent), later uit een goedkope classifier.
+De router kiest nu **per backend het goedkoopste model dat volstaat** uit de
+catalogus i.p.v. het vaste tier-model. `ChatRequest` draagt een `model`-override
+die de router per poging invult; de adapters (Anthropic/OpenAI/DeepSeek/Ollama/
+claude-cli) respecteren 'm en vallen anders terug op hun eigen tier-model.
+
+- **"Licht tenzij nodig"** via `target_classes(tier)`: `Cheap → [light]`,
+  `Default → [light, mid]` (gewone chat blijft licht!), `Hard → [heavy,
+  reasoning, mid]`. De router pakt de best-preferred klasse die de backend heeft.
+- De **plan-route** (`claude-cli`) staat óók in de catalogus (dezelfde Claude-
+  modellen, `cost: local` want gratis), dus een lichte taak draait op **Haiku via
+  je abonnement** i.p.v. de betaalde API.
+- De keuze blijft begrensd door de bestaande backend-policy + `BrainAvailability`
+  (beschikbaarheid + budget, ADR-027) en de reactieve fallback.
+- `jarvis-llm` blijft los van `jarvis-registry`: eigen `ModelClass`/`CatalogModel`,
+  de api mapt de registry-catalogus naar de router via `router_catalog()`
+  (snapshot bij startup; ververst bij herstart).
+
+Nog open: de **taak-klasse** komt nu uit de tier-hint van de client; een goedkope
+**classifier** (bepaalt zelf licht/zwaar) is de volgende verfijning.
 
 ### Fase 3 — Plan→execute-orchestrator (nog te bouwen)
 

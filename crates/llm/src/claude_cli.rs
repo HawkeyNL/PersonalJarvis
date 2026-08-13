@@ -62,7 +62,10 @@ impl LlmProvider for ClaudeCliProvider {
 
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
         let prompt = build_prompt(&req.messages);
-        let model = self.model_for(req.tier).to_string();
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| self.model_for(req.tier).to_string());
 
         let mut cmd = Command::new(&self.bin);
         cmd.arg("-p")

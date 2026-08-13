@@ -132,7 +132,10 @@ async fn main() -> anyhow::Result<()> {
                 spent_cents: spent_cents.clone(),
                 budget_cents,
             });
-            jarvis_llm::build_router(provider_cfg, availability)
+            // The router picks the cheapest sufficient model from the catalog
+            // of *available* models (ADR-028 fase 2).
+            let catalog = jarvis_api::router_catalog(&registry);
+            jarvis_llm::build_router(provider_cfg, availability, catalog)
         }
         _ => jarvis_llm::build_provider(provider_cfg),
     };
