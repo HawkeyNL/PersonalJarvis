@@ -26,14 +26,22 @@ const text = ref("");
 const hovered = ref(false);
 const focused = ref(false);
 const woke = ref(false);
+const chatHover = ref(false);
 const policy = computed(() => canSpeak());
 
 const mic = useMic((said) => send(said));
 
-// The input dock lifts into view on hover / focus / typing / while listening,
-// and after a "Hey Jarvis" wake; it tucks away again when you leave.
+// "Chat active" = the input dock lifts in and the memory tabs appear: on hover
+// (the input zone or the chat stack), focus, typing, while listening, and after
+// a "Hey Jarvis" wake. Everything tucks away again when you leave.
 const revealed = computed(
-  () => hovered.value || focused.value || woke.value || !!text.value || mic.listening.value,
+  () =>
+    hovered.value ||
+    focused.value ||
+    woke.value ||
+    chatHover.value ||
+    !!text.value ||
+    mic.listening.value,
 );
 
 // A verified "Hey Jarvis" reveals the console and starts listening.
@@ -107,11 +115,16 @@ onMounted(async () => {
 
 <template>
   <div class="console">
-    <div class="stack">
+    <div
+      class="stack"
+      @mouseenter="chatHover = true"
+      @mouseleave="chatHover = false"
+    >
       <!-- Conversation tabs = your memory: browse chats, delete, start a new one
-           (ADR-030). The strip never grows wider than the chat window. -->
-      <div class="tabs">
-        <button class="tab new" title="Nieuw gesprek" @click="newChat">+ nieuw</button>
+           (ADR-030). Hidden until the chat is active; never wider than the chat. -->
+      <Transition name="tabsfade">
+        <div v-show="revealed" class="tabs">
+          <button class="tab new" title="Nieuw gesprek" @click="newChat">+ nieuw</button>
         <button
           v-for="c in conversations"
           :key="c.id"
@@ -120,16 +133,17 @@ onMounted(async () => {
           :title="c.title"
           @click="switchTo(c.id)"
         >
-          <span class="tab-title">{{ c.title }}</span>
-          <span
-            v-if="c.id === currentId"
-            class="tab-x"
-            title="Gesprek verwijderen"
-            @click.stop="removeChat(c.id)"
-            >×</span
-          >
-        </button>
-      </div>
+            <span class="tab-title">{{ c.title }}</span>
+            <span
+              v-if="c.id === currentId"
+              class="tab-x"
+              title="Gesprek verwijderen"
+              @click.stop="removeChat(c.id)"
+              >×</span
+            >
+          </button>
+        </div>
+      </Transition>
 
       <!-- The whole current conversation, scrollable, pinned to the latest turn. -->
       <div ref="transcriptEl" class="transcript" :class="{ dim: revealed }">
@@ -221,7 +235,9 @@ onMounted(async () => {
   pointer-events: none; /* let the backdrop breathe; children re-enable */
 }
 
-/* Tabs + transcript stack, floating bottom-left above the input zone. */
+/* Tabs + transcript stack, floating bottom-left above the input zone. The whole
+   stack is one hover region so the memory tabs reveal (and stay put while you
+   move onto them) whenever the chat is active. */
 .stack {
   position: absolute;
   left: clamp(20px, 5vw, 64px);
@@ -230,7 +246,18 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  pointer-events: none; /* only the tabs re-enable clicks */
+  pointer-events: auto;
+}
+
+/* Tabs fade/slide in when the chat becomes active; gone (and space-free) otherwise. */
+.tabsfade-enter-active,
+.tabsfade-leave-active {
+  transition: opacity 0.25s ease, transform 0.25s ease;
+}
+.tabsfade-enter-from,
+.tabsfade-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
 }
 
 /* Conversation tabs — never wider than the chat window; scroll within it. */
