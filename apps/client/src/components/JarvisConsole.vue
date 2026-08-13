@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from "vue";
+import { ref, computed, watch, onMounted, nextTick } from "vue";
 import NavIcon from "./NavIcon.vue";
 import {
   messages,
@@ -47,8 +47,18 @@ watch(wakePulse, () => {
   if (!mic.listening.value) mic.toggle();
 });
 
-// Only the last few turns float over the backdrop; older ones fade out.
-const recent = computed(() => messages.value.slice(-5));
+// The transcript is a scroll region: the whole current conversation is there,
+// pinned to the latest turn but scrollable up through the history.
+const transcriptEl = ref<HTMLElement | null>(null);
+function scrollToBottom() {
+  const el = transcriptEl.value;
+  if (el) el.scrollTop = el.scrollHeight;
+}
+// Follow new turns (and the thinking indicator) to the bottom.
+watch(
+  () => [messages.value.length, thinking.value],
+  () => nextTick(scrollToBottom),
+);
 
 function onSend() {
   if (!text.value.trim()) return;
@@ -90,14 +100,18 @@ async function removeChat(id: string) {
 onMounted(async () => {
   refreshRoute();
   await initChat();
+  await nextTick();
+  scrollToBottom();
 });
 </script>
 
 <template>
   <div class="console">
     <div class="stack">
-      <!-- Conversation tabs: Jarvis groups chats by topic (ADR-030). -->
-      <div class="tabs" v-if="conversations.length">
+      <!-- Conversation tabs = your memory: browse chats, delete, start a new one
+           (ADR-030). The strip never grows wider than the chat window. -->
+      <div class="tabs">
+        <button class="tab new" title="Nieuw gesprek" @click="newChat">+ nieuw</button>
         <button
           v-for="c in conversations"
           :key="c.id"
@@ -115,13 +129,12 @@ onMounted(async () => {
             >×</span
           >
         </button>
-        <button class="tab new" title="Nieuw gesprek" @click="newChat">+</button>
       </div>
 
-      <!-- Conversation, floating over the living backdrop. -->
-      <div class="transcript" :class="{ dim: revealed }">
+      <!-- The whole current conversation, scrollable, pinned to the latest turn. -->
+      <div ref="transcriptEl" class="transcript" :class="{ dim: revealed }">
         <TransitionGroup name="line">
-        <div v-for="m in recent" :key="m.id" class="line" :class="m.role">
+        <div v-for="m in messages" :key="m.id" class="line" :class="m.role">
           <span class="who">{{ m.role === "jarvis" ? "JARVIS" : "JIJ" }}</span>
           <!-- Jarvis speaks Markdown; the user's own text stays literal. -->
           <span
@@ -220,10 +233,11 @@ onMounted(async () => {
   pointer-events: none; /* only the tabs re-enable clicks */
 }
 
-/* Conversation tabs — Jarvis groups chats by topic. */
+/* Conversation tabs — never wider than the chat window; scroll within it. */
 .tabs {
   display: flex;
   gap: 6px;
+  max-width: 100%;
   overflow-x: auto;
   pointer-events: auto;
   padding-bottom: 2px;
@@ -272,22 +286,38 @@ onMounted(async () => {
   color: #ff6b6b;
 }
 .tab.new {
-  font-size: 15px;
-  padding: 4px 11px;
+  position: sticky;
+  left: 0;
+  font-weight: 600;
   color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(52, 245, 160, 0.12);
 }
 
 .transcript {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  max-height: min(50vh, 460px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  pointer-events: auto; /* scrollable through the whole conversation */
   transition: opacity 0.4s ease;
-  /* older lines fade toward the top */
-  mask-image: linear-gradient(180deg, transparent, #000 30%);
-  -webkit-mask-image: linear-gradient(180deg, transparent, #000 30%);
+  /* a soft fade at the very top hints there's more above */
+  mask-image: linear-gradient(180deg, transparent 0, #000 26px);
+  -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 26px);
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.transcript::-webkit-scrollbar {
+  width: 6px;
+}
+.transcript::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
 }
 .transcript.dim {
-  opacity: 0.55;
+  opacity: 0.7;
 }
 
 .line {
