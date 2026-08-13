@@ -1,6 +1,6 @@
 # ADR-029 — Agentische uitvoering (Jarvis krijgt handen), veilig achter policy + goedkeuring
 
-- Status: **geaccepteerd — fase 4a + 4b + 4c gebouwd** (read-only autonoom; mutaties achter device-getekende goedkeuring; Claude Code als confined uitvoerder; kill switch default uit) — 13 augustus 2026
+- Status: **geaccepteerd — fase 4a + 4b + 4c + 4d gebouwd** (read-only autonoom; mutaties achter device-getekende goedkeuring; Claude Code als confined uitvoerder; zelfontwikkeling als adviseur; kill switch default uit) — 13 augustus 2026
 - Bouwt op ADR-027 (kosten-router + registry + budget), ADR-028 (model-per-taak +
   plan→execute), de bestaande unlock/approval-flow (device-gebonden, cryptografisch),
   en `core/Jarvis.md` §11 (Risk-Based Autonomy), §12 (Financial Safety), §13
@@ -108,9 +108,18 @@ zijn **tijdgebonden** en **actie-specifiek** (geen blanco cheque).
   **breach-scan** (defense-in-depth: schreeuwt als een beschermd pad tóch geraakt is).
   Loopt via de bestaande 4b-goedkeuringsmachinerie — geen nieuwe endpoints. agent 14
   tests (+6), config 2, clippy schoon.
-- **4d — Zelfontwikkeling**: nieuwe modellen/keys/tools detecteren (registry) →
-  Jarvis **stelt voor**, activeert nooit autonoom iets betaalds (§12). Budget uit
-  ADR-027 blijft de rem.
+- **4d — Zelfontwikkeling ✅ gebouwd**: crate `jarvis-selfdev` — een **adviseur**,
+  geen uitvoerder. Endpoint `POST /v1/system/self-improve` (beveiligd, **op verzoek**;
+  geen achtergrond-loop) laat Jarvis zijn **eigen ecosysteem** lezen (registry: host,
+  breinen, model-catalogus, budget, agent-capabilities) en **concrete voorstellen**
+  doen (sterk/plan-tier, JSON: `{summary, proposals[{title, category, rationale, cost,
+  requires_approval, steps}]}`). Harde grenzen conform het beleid: **advisory only**
+  (bewerkt niets, draait niets — uitvoeren gaat via de 4b/4c-goedkeuringsgate); **niets
+  betaalds auto-activeren** (`requires_approval` + kosten benoemd, §12); en de **Core +
+  Jarvis.md** worden nooit door de agent aangeraakt (voorstellen daarover = owner-only,
+  handmatig). Robuust: geen bruikbare JSON → de ruwe tekst wordt de samenvatting, chat/
+  advies breekt niet. Client: knop "Vraag om verbetervoorstellen" in Status. selfdev 4
+  tests, api 8 (+1), clippy schoon, client groen.
 - **MCP (los spoor)**: Jarvis-eigen tools als MCP-server (read-only portfolio/
   geheugen) die Claude Code mag gebruiken; en Jarvis als MCP-host.
 

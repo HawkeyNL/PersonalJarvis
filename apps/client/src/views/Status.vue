@@ -125,6 +125,41 @@ async function loadRegistry(refresh = false) {
   }
 }
 
+// Self-development (ADR-029 fase 4d): Jarvis proposes improvements to itself.
+interface Proposal {
+  title: string;
+  category: string;
+  rationale: string;
+  cost: string;
+  requires_approval: boolean;
+  steps: string[];
+}
+interface SelfDev {
+  summary: string;
+  proposals: Proposal[];
+  note: string;
+}
+const advice = ref<SelfDev | null>(null);
+const adviceBusy = ref(false);
+const adviceError = ref<string | null>(null);
+
+async function askSelfImprove() {
+  adviceBusy.value = true;
+  adviceError.value = null;
+  try {
+    const s = await currentSession();
+    if (!s.token) {
+      adviceError.value = "niet ingelogd";
+      return;
+    }
+    advice.value = await postJsonAuth<SelfDev>("/v1/system/self-improve", s.token, {});
+  } catch (e) {
+    adviceError.value = String(e);
+  } finally {
+    adviceBusy.value = false;
+  }
+}
+
 onMounted(() => {
   check();
   loadRegistry();
@@ -232,6 +267,43 @@ onMounted(() => {
         <button :disabled="regBusy" @click="loadRegistry(true)">
           {{ regBusy ? "verversen…" : "Ververs resources" }}
         </button>
+      </template>
+    </div>
+
+    <!-- Self-development (ADR-029 4d): Jarvis proposes improvements to itself. -->
+    <div class="panel">
+      <div class="phead">
+        ZELFVERBETERING <span class="hint">Jarvis stelt voor · jij keurt goed</span>
+      </div>
+      <p class="muted small">
+        Jarvis bekijkt zijn eigen ecosysteem en doet voorstellen. Hij voert niets
+        zelf uit — de Core en <code>Jarvis.md</code> blijven handmatig, alleen door jou.
+      </p>
+      <button :disabled="adviceBusy" @click="askSelfImprove">
+        {{ adviceBusy ? "Jarvis denkt na…" : "Vraag om verbetervoorstellen" }}
+      </button>
+      <p v-if="adviceError" class="muted err">{{ adviceError }}</p>
+      <template v-if="advice">
+        <p class="active">{{ advice.summary }}</p>
+        <ul class="props">
+          <li v-for="(p, i) in advice.proposals" :key="i">
+            <div class="prow">
+              <span class="mclass mc-mid">{{ p.category }}</span>
+              <span class="ptitle">{{ p.title }}</span>
+              <span
+                class="cost"
+                :class="p.requires_approval ? 'cost-metered' : 'cost-local'"
+              >
+                {{ p.requires_approval ? "goedkeuring" : "vrij" }} · {{ p.cost }}
+              </span>
+            </div>
+            <p v-if="p.rationale" class="muted small note">{{ p.rationale }}</p>
+            <ol v-if="p.steps.length" class="steps">
+              <li v-for="(st, j) in p.steps" :key="j">{{ st }}</li>
+            </ol>
+          </li>
+        </ul>
+        <p class="muted small note">{{ advice.note }}</p>
       </template>
     </div>
   </section>
@@ -463,5 +535,36 @@ onMounted(() => {
 }
 .err {
   color: #f87171;
+}
+.props {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.props > li {
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+}
+.prow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ptitle {
+  font-size: 13px;
+  font-weight: 600;
+}
+.steps {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.steps li {
+  margin: 2px 0;
 }
 </style>

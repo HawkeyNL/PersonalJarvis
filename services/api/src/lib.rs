@@ -26,6 +26,7 @@ use jarvis_llm as llm;
 use jarvis_orchestrator as orchestrator;
 use jarvis_portfolio as portfolio;
 use jarvis_registry as registry;
+use jarvis_selfdev as selfdev;
 use jarvis_speech as speech;
 use rust_decimal::Decimal;
 use jarvis_usage as usage;
@@ -103,6 +104,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/system/registry", get(system_registry))
         .route("/v1/system/registry/refresh", post(system_registry_refresh))
         .route("/v1/system/usage", get(system_usage))
+        .route("/v1/system/self-improve", post(system_self_improve))
         .route("/v1/agent/action", post(agent_action))
         .route("/v1/agent/pending", get(agent_pending))
         .route("/v1/agent/pending/{id}/approve", post(agent_pending_approve))
@@ -1507,6 +1509,143 @@ async fn system_registry_refresh(_authed: Authed, State(state): State<AppState>)
     Json(serde_json::to_value(&fresh).unwrap_or_else(|_| json!({})))
 }
 
+#[derive(Deserialize)]
+struct SelfImproveReq {
+    /// Optional area to focus the advice on (e.g. "goedkopere modellen").
+    #[serde(default)]
+    focus: Option<String>,
+}
+
+/// Jarvis proposes improvements to ITSELF (ADR-029 fase 4d) — **advisory only**.
+/// It reads its own ecosystem (registry + budget + agent capabilities) and returns
+/// concrete proposals; it never acts. Carrying one out goes through the approval
+/// gate (4b/4c); the Core and `Jarvis.md` stay owner-only, manual. On request only.
+async fn system_self_improve(
+    _authed: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<SelfImproveReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let ecosystem = match state.registry.read() {
+        Ok(reg) => render_ecosystem(&reg, state.agent_enabled, state.agent_sandbox.is_some()),
+        Err(_) => "(ecosysteem tijdelijk niet leesbaar)".to_string(),
+    };
+    let spent_eur = state.spent_cents.load(Ordering::Relaxed) as f64 / 100.0;
+    let budget_eur = state.budget_cents as f64 / 100.0;
+    match selfdev::propose(
+        &state.llm,
+        &state.jarvis_system,
+        &ecosystem,
+        budget_eur,
+        spent_eur,
+        req.focus.as_deref(),
+    )
+    .await
+    {
+        Ok(report) => {
+            for reply in &report.calls {
+                record_usage(&state, reply).await;
+            }
+            let proposals: Vec<Value> = report
+                .proposals
+                .iter()
+                .map(|p| {
+                    json!({
+                        "title": p.title,
+                        "category": p.category,
+                        "rationale": p.rationale,
+                        "cost": p.cost,
+                        "requires_approval": p.requires_approval,
+                        "steps": p.steps,
+                    })
+                })
+                .collect();
+            Ok(Json(json!({
+                "summary": report.summary,
+                "proposals": proposals,
+                "note": "Jarvis stelt alleen voor — uitvoeren gaat via jouw goedkeuring (4b/4c); \
+                         de Core en Jarvis.md blijven handmatig, alleen door jou.",
+            })))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "self-improve failed");
+            Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": "brain unavailable",
+                    "hint": "controleer je brein-config (router/keys/Ollama)",
+                })),
+            ))
+        }
+    }
+}
+
+/// Render the registry into a compact text snapshot for the self-dev advisor.
+fn render_ecosystem(reg: &registry::Registry, agent_enabled: bool, has_workspace: bool) -> String {
+    let h = &reg.host;
+    let mut s = format!(
+        "Host: {} {}, {} ({} cores), {:.1} GB RAM, GPU: {}\nActief brein: {}\n",
+        h.os, h.arch, h.cpu, h.cpu_cores, h.mem_total_gb, h.gpu, reg.active_brain
+    );
+    s.push_str("\nBreinen:\n");
+    for b in &reg.brains {
+        s.push_str(&format!(
+            "- {} [{}] beschikbaar: {} — {}\n",
+            b.label,
+            enum_str(&b.cost),
+            yesno(b.available),
+            b.note
+        ));
+    }
+    s.push_str("\nModel-catalogus:\n");
+    for m in &reg.models {
+        s.push_str(&format!(
+            "- {} ({}, {}, {}) beschikbaar: {}\n",
+            m.id,
+            m.backend,
+            enum_str(&m.class),
+            enum_str(&m.cost),
+            yesno(m.available)
+        ));
+    }
+    s.push_str("\nTools op de host:\n");
+    for t in &reg.software {
+        let v = t
+            .version
+            .as_deref()
+            .map(|v| format!(" ({v})"))
+            .unwrap_or_default();
+        s.push_str(&format!(
+            "- {}: {}{}\n",
+            t.name,
+            if t.present { "aanwezig" } else { "afwezig" },
+            v
+        ));
+    }
+    s.push_str(&format!(
+        "\nAgent-capabilities: agent {}, werkmap {}\n",
+        if agent_enabled { "AAN" } else { "uit" },
+        if has_workspace { "geconfigureerd" } else { "geen" }
+    ));
+    s
+}
+
+/// Serialize a small lowercase-tagged enum (ModelClass/ModelCost/CostTier) to its
+/// string form for display.
+fn enum_str<T: serde::Serialize>(t: &T) -> String {
+    serde_json::to_value(t)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn yesno(b: bool) -> &'static str {
+    if b {
+        "ja"
+    } else {
+        "nee"
+    }
+}
+
 /// Live brain availability for the router (`jarvis-llm`) — the bridge that makes
 /// it route on what's actually up *and* affordable (ADR-027). A backend is
 /// available iff the registry marks it available AND, for metered API backends,
@@ -2265,5 +2404,54 @@ mod tests {
             .unwrap();
         let body = body_json(resp).await;
         assert_eq!(body["conversations"].as_array().unwrap().len(), 0);
+    }
+
+    /// Self-development is advisory + owner-only: it needs auth and returns a
+    /// proposal shape without ever acting (ADR-029 fase 4d).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn self_improve_is_advisory_and_protected(pool: PgPool) {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let signing = SigningKey::from_bytes(&seed);
+        let app = build_router(stub_state(pool.clone()).await);
+        let (_device_id, token) = enroll_and_login(&app, &signing).await;
+
+        // Unauthenticated → 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/system/self-improve")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Authenticated → 200 advisory shape (stub brain → no JSON → summary +
+        // empty proposals + the owner-only note).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/system/self-improve")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "focus": "goedkopere modellen" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body["summary"].is_string());
+        assert!(body["proposals"].is_array());
+        assert!(body["note"].as_str().unwrap().contains("goedkeuring"));
     }
 }

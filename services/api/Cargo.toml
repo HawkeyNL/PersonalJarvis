@@ -42,6 +42,7 @@ jarvis-registry.workspace = true
 jarvis-usage.workspace = true
 jarvis-orchestrator.workspace = true
 jarvis-agent.workspace = true
+jarvis-selfdev.workspace = true
 rust_decimal.workspace = true
 rand.workspace = true
 
