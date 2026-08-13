@@ -158,6 +158,29 @@ async fn main() -> anyhow::Result<()> {
         reg.active_brain = active_brain;
     }
 
+    // Agentic execution (ADR-029 4a) — off by default. Build the sandbox only
+    // when a workspace root is configured and valid; otherwise actions are refused.
+    let agent_sandbox = {
+        let root = config.agent_workspace_root.trim();
+        if root.is_empty() {
+            None
+        } else {
+            match jarvis_agent::Sandbox::new(root) {
+                Ok(sb) => {
+                    tracing::info!(root = %sb.root().display(), enabled = config.agent_enabled, "agent sandbox ready");
+                    Some(Arc::new(sb))
+                }
+                Err(e) => {
+                    tracing::warn!(root, error = %e, "invalid agent workspace root; agent disabled");
+                    None
+                }
+            }
+        }
+    };
+    if config.agent_enabled && agent_sandbox.is_some() {
+        tracing::warn!("AGENTIC EXECUTION IS ENABLED (read-only, ADR-029 4a)");
+    }
+
     let state = AppState {
         db,
         environment: config.environment.clone(),
@@ -172,6 +195,8 @@ async fn main() -> anyhow::Result<()> {
         budget_cents,
         spent_cents,
         eur_per_usd: config.llm_eur_per_usd,
+        agent_enabled: config.agent_enabled,
+        agent_sandbox,
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use jarvis_ibkr as ibkr;
 use jarvis_identity as identity;
+use jarvis_agent as agent;
 use jarvis_llm as llm;
 use jarvis_orchestrator as orchestrator;
 use jarvis_portfolio as portfolio;
@@ -61,6 +62,11 @@ pub struct AppState {
     pub spent_cents: Arc<AtomicU64>,
     /// EUR per 1 USD, to price provider (USD) usage into the EUR budget.
     pub eur_per_usd: f64,
+    /// Agentic execution kill switch (ADR-029) — Jarvis has no hands unless true.
+    pub agent_enabled: bool,
+    /// The sandbox Jarvis' read-only actions are confined to. `None` ⇒ no
+    /// workspace configured (actions refused even when enabled).
+    pub agent_sandbox: Option<Arc<agent::Sandbox>>,
 }
 
 /// Build the application router.
@@ -92,6 +98,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/system/registry", get(system_registry))
         .route("/v1/system/registry/refresh", post(system_registry_refresh))
         .route("/v1/system/usage", get(system_usage))
+        .route("/v1/agent/action", post(agent_action))
+        .route("/v1/agent/audit", get(agent_audit_log))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -761,6 +769,120 @@ async fn assistant_orchestrate(
     }
 }
 
+// ---- Agentic execution: read-only, policy-gated, sandboxed (ADR-029 4a) -----
+
+/// Run a single read-only agent action (ADR-029 phase 4a). Gated by the kill
+/// switch + a configured sandbox; only `Auto` (read-only) actions run; every
+/// attempt — ok, denied, or error — is written to the append-only audit log.
+async fn agent_action(
+    authed: Authed,
+    State(state): State<AppState>,
+    Json(action): Json<agent::Action>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.agent_enabled {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "agent disabled", "hint": "zet JARVIS_AGENT_ENABLED=true" })),
+        ));
+    }
+    let Some(sandbox) = state.agent_sandbox.clone() else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "no workspace", "hint": "zet JARVIS_AGENT_WORKSPACE_ROOT" })),
+        ));
+    };
+    let at = agent::action_type(&action).to_string();
+    let risk = agent::classify(&action);
+    let detail = serde_json::to_string(&action).ok();
+
+    // 4a runs only read-only (Auto) actions. Mutations arrive in 4b behind the gate.
+    if risk != agent::RiskClass::Auto {
+        record_agent_audit(&state, authed.device.id, &at, detail, risk, "denied", Some("requires approval (4b)")).await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "needs approval", "hint": "mutaties komen in 4b" })),
+        ));
+    }
+
+    match agent::execute(&sandbox, &action).await {
+        Ok(outcome) => {
+            let note = outcome.truncated.then_some("output truncated");
+            record_agent_audit(&state, authed.device.id, &at, detail, risk, "ok", note).await;
+            Ok(Json(json!({
+                "action": at,
+                "output": outcome.output,
+                "truncated": outcome.truncated,
+            })))
+        }
+        Err(e) => {
+            let denied = matches!(
+                e,
+                agent::AgentError::Denied(_) | agent::AgentError::OutsideSandbox
+            );
+            let (label, code) = if denied {
+                ("denied", StatusCode::FORBIDDEN)
+            } else {
+                ("error", StatusCode::BAD_REQUEST)
+            };
+            record_agent_audit(&state, authed.device.id, &at, detail, risk, label, Some(&e.to_string())).await;
+            Err((code, Json(json!({ "error": e.to_string() }))))
+        }
+    }
+}
+
+/// Write one append-only audit row. Auditing must never break the action path,
+/// so a DB failure is logged, not surfaced.
+#[allow(clippy::too_many_arguments)]
+async fn record_agent_audit(
+    state: &AppState,
+    device_id: Uuid,
+    action_type: &str,
+    detail: Option<String>,
+    risk: agent::RiskClass,
+    outcome: &str,
+    note: Option<&str>,
+) {
+    let risk_str = match risk {
+        agent::RiskClass::Auto => "auto",
+        agent::RiskClass::NeedsApproval => "needs_approval",
+        agent::RiskClass::Denied => "denied",
+    };
+    let res = sqlx::query(
+        "INSERT INTO agent_audit (device_id, action_type, detail, risk_class, outcome, note) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(device_id)
+    .bind(action_type)
+    .bind(detail)
+    .bind(risk_str)
+    .bind(outcome)
+    .bind(note)
+    .execute(&state.db)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!(error = %e, "failed to write agent audit");
+    }
+}
+
+/// The recent agent audit trail (ADR-029) — what Jarvis' hands have done.
+async fn agent_audit_log(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
+    let rows: Vec<(String, String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT action_type, risk_class, outcome, note, \
+         to_char(ts, 'YYYY-MM-DD HH24:MI:SS') \
+         FROM agent_audit ORDER BY ts DESC LIMIT 50",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let entries: Vec<Value> = rows
+        .into_iter()
+        .map(|(action, risk, outcome, note, ts)| {
+            json!({ "action": action, "risk": risk, "outcome": outcome, "note": note, "ts": ts })
+        })
+        .collect();
+    Json(json!({ "enabled": state.agent_enabled, "entries": entries }))
+}
+
 // ---- Voice: server-side speaker verification + STT --------------------------
 
 fn db_err(_e: sqlx::Error) -> (StatusCode, Json<Value>) {
@@ -1089,6 +1211,8 @@ mod tests {
             budget_cents: 5000,
             spent_cents: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eur_per_usd: 0.92,
+            agent_enabled: false,
+            agent_sandbox: None,
         });
 
         // 1. enroll this device (dev endpoint)
@@ -1271,6 +1395,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 4d-bis. agent is off by default → even an authenticated read-only
+        // action is refused (kill switch, ADR-029).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/agent/action")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "type": "list_dir", "path": "." })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "agent disabled");
 
         // 4e. voice: not enrolled → enroll → verify the same audio as "you"
         let pcm: Vec<i16> = (0..2000).map(|i| ((i * 7) % 5000) as i16).collect();

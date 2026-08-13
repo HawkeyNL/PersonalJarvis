@@ -1,6 +1,6 @@
 # ADR-029 — Agentische uitvoering (Jarvis krijgt handen), veilig achter policy + goedkeuring
 
-- Status: **VOORGESTELD** (ontwerp — nog niets gebouwd, wacht op akkoord eigenaar) — 13 augustus 2026
+- Status: **geaccepteerd — fase 4a gebouwd** (read-only, kill switch default uit) — 13 augustus 2026
 - Bouwt op ADR-027 (kosten-router + registry + budget), ADR-028 (model-per-taak +
   plan→execute), de bestaande unlock/approval-flow (device-gebonden, cryptografisch),
   en `core/Jarvis.md` §11 (Risk-Based Autonomy), §12 (Financial Safety), §13
@@ -69,8 +69,16 @@ zijn **tijdgebonden** en **actie-specifiek** (geen blanco cheque).
 
 ## Fasering (elk zelfstandig, na akkoord)
 
-- **4a — Read-only shell**: alleen Auto-acties binnen de sandbox + audit. Geen
-  mutaties. Bewijst de policy-engine + audit end-to-end, met nul mutatierisico.
+- **4a — Read-only shell ✅ gebouwd**: crate `jarvis-agent` (getypeerde `Action`-
+  allowlist: `list_dir`/`read_file`/`grep`/`git status|diff|log`; geen vrije shell,
+  geen mutaties), een `Sandbox` die elk pad canonicaliseert + insluit (geen
+  `..`/symlink-escape) en secrets (`.env`, keys, `.ssh`) hard weigert — óók bij
+  lezen. Endpoint `POST /v1/agent/action` achter de kill switch
+  (`JARVIS_AGENT_ENABLED`, default **false**) + een geconfigureerde
+  `JARVIS_AGENT_WORKSPACE_ROOT`; élke poging (ok/denied/error) gaat naar het
+  append-only `agent_audit`-log (migratie 0008), leesbaar via
+  `GET /v1/agent/audit`. cargo/tests bewust nog níet (die compileren + draaien
+  code). agent 6 tests, api-kill-switch-test, clippy schoon.
 - **4b — Mutaties achter goedkeuring**: bestand schrijven / `git commit` via de
   approval-gate. Preview (dry-run/diff) vóór goedkeuring; voorkeur voor omkeerbaar (§28).
 - **4c — Claude Code aansturen**: een plan→execute-stap (ADR-028) mag een headless

@@ -137,6 +137,16 @@ pub struct AppConfig {
     /// Whisper decode language: an ISO code like `nl`, or `auto` to detect.
     #[serde(default = "default_speech_whisper_language")]
     pub speech_whisper_language: String,
+
+    /// Agentic execution kill switch (ADR-029). Default **false** — Jarvis has no
+    /// hands until the owner deliberately enables it.
+    #[serde(default)]
+    pub agent_enabled: bool,
+
+    /// Sandbox root for agentic actions. Empty ⇒ no workspace (actions refused).
+    /// All file access is confined to this directory.
+    #[serde(default)]
+    pub agent_workspace_root: String,
 }
 
 fn default_bind_addr() -> String {
@@ -296,6 +306,8 @@ impl fmt::Debug for AppConfig {
             .field("speech_verify_threshold", &self.speech_verify_threshold)
             .field("speech_whisper_model", &self.speech_whisper_model)
             .field("speech_whisper_language", &self.speech_whisper_language)
+            .field("agent_enabled", &self.agent_enabled)
+            .field("agent_workspace_root", &self.agent_workspace_root)
             .finish()
     }
 }
@@ -339,6 +351,8 @@ mod tests {
             speech_verify_threshold: 0.5,
             speech_whisper_model: None,
             speech_whisper_language: "auto".to_string(),
+            agent_enabled: false,
+            agent_workspace_root: String::new(),
         };
 
         let rendered = format!("{cfg:?}");
