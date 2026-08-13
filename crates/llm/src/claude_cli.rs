@@ -6,6 +6,11 @@
 //! `LlmError`, so a [`FallbackProvider`](crate::FallbackProvider) falls through
 //! to the API: "API als vangnet als de CLI vol is." A genuine answer is returned
 //! as-is; no tools run (the neutral working dir keeps Claude Code out of the repo).
+//!
+//! The persona is passed with `--system-prompt` (which **replaces** Claude Code's
+//! default system prompt), not `--append-system-prompt` (which keeps it). This is
+//! deliberate: as a pure brain, the model must *be* Jarvis — with `--append-` the
+//! built-in "you are Claude Code" identity leaks through on "who are you?".
 
 use std::time::Duration;
 
@@ -74,8 +79,10 @@ impl LlmProvider for ClaudeCliProvider {
             .arg("json")
             .arg("--model")
             .arg(&model);
+        // Replace (not append) the system prompt so the model *is* Jarvis, not
+        // Claude Code — otherwise the CLI's built-in identity answers "wie ben jij?".
         if let Some(system) = req.system.as_deref().filter(|s| !s.trim().is_empty()) {
-            cmd.arg("--append-system-prompt").arg(system);
+            cmd.arg("--system-prompt").arg(system);
         }
         // Run somewhere neutral so headless Claude Code can't wander the repo.
         cmd.current_dir(std::env::temp_dir());
