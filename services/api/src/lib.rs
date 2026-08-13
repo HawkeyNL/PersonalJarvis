@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use axum::{
     extract::{FromRequestParts, Path, Query, State},
-    http::{header::AUTHORIZATION, request::Parts, StatusCode},
+    http::{header::AUTHORIZATION, request::Parts, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -110,6 +111,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/agent/pending/{id}/approve", post(agent_pending_approve))
         .route("/v1/agent/pending/{id}/deny", post(agent_pending_deny))
         .route("/v1/agent/audit", get(agent_audit_log))
+        .route("/mcp", post(mcp_endpoint))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -1302,6 +1304,234 @@ async fn agent_audit_log(_authed: Authed, State(state): State<AppState>) -> Json
     Json(json!({ "enabled": state.agent_enabled, "entries": entries }))
 }
 
+// ---- MCP: Jarvis' read-only tools over Streamable HTTP (ADR-031) ------------
+//
+// A minimal, defensive MCP server so Claude Code (and the owner's own Claude
+// tooling) can *read* Jarvis' portfolio, status and memory. Every call is
+// owner-scoped (the `Authed` extractor requires a valid session token) and
+// read-only — no secrets, no Core, no mutations, no trading.
+//
+// The protocol shape has churned across MCP versions, so this is deliberately
+// lenient: it answers both the classic `initialize` and the newer
+// `server/discover` handshake, echoes the client's requested protocol version,
+// and returns union results that satisfy either. The stable core — `tools/call`
+// → `{content:[{type:"text"}], isError}` — is identical everywhere.
+
+async fn mcp_endpoint(
+    authed: Authed,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    // DNS-rebinding guard: reject a browser Origin that isn't local. Non-browser
+    // clients (Claude Code) send no Origin and are allowed.
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if !is_local_origin(origin) {
+            return (StatusCode::FORBIDDEN, "bad origin").into_response();
+        }
+    }
+
+    let id = body.get("id").cloned();
+    // Notifications carry no id and expect no response body.
+    if id.is_none() {
+        return StatusCode::ACCEPTED.into_response();
+    }
+    let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+
+    let outcome: Result<Value, (i64, String)> = match method {
+        "initialize" | "server/discover" => Ok(mcp_handshake(&body)),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "resultType": "complete", "tools": mcp_tools() })),
+        "tools/call" => {
+            let name = body
+                .pointer("/params/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let args = body
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match mcp_call(&state, &authed, name, &args).await {
+                Ok(text) => Ok(json!({
+                    "resultType": "complete",
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": false,
+                })),
+                Err(ToolErr::Unknown) => Err((-32601, format!("onbekende tool: {name}"))),
+                Err(ToolErr::Failed(msg)) => Ok(json!({
+                    "resultType": "complete",
+                    "content": [{ "type": "text", "text": msg }],
+                    "isError": true,
+                })),
+            }
+        }
+        other => Err((-32601, format!("methode niet gevonden: {other}"))),
+    };
+
+    let payload = match outcome {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Err((code, message)) => {
+            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+        }
+    };
+    Json(payload).into_response()
+}
+
+/// A union handshake result that satisfies both `initialize` (classic) and
+/// `server/discover`, echoing the client's requested protocol version.
+fn mcp_handshake(body: &Value) -> Value {
+    let requested = body
+        .pointer("/params/protocolVersion")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            body.get("params")
+                .and_then(|p| p.get("_meta"))
+                .and_then(|m| m.get("io.modelcontextprotocol/protocolVersion"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("2025-06-18");
+    let info = json!({ "name": "jarvis", "version": env!("CARGO_PKG_VERSION") });
+    json!({
+        "resultType": "complete",
+        "protocolVersion": requested,
+        "supportedVersions": [requested],
+        "capabilities": { "tools": {} },
+        "serverInfo": info,
+        "_meta": { "io.modelcontextprotocol/serverInfo": info },
+        "instructions": "Read-only tools van Jarvis: portfolio, status en geheugen.",
+    })
+}
+
+/// The read-only tool catalog. Definitions are static; execution is owner-scoped.
+fn mcp_tools() -> Value {
+    json!([
+        {
+            "name": "portfolio_summary",
+            "description": "Jarvis' portfolio: posities, kostenbasis en allocatie (alleen-lezen).",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "jarvis_status",
+            "description": "Jarvis' ecosysteem: host, breinen, model-catalogus en maandbudget (alleen-lezen).",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "recent_conversations",
+            "description": "Recente gesprekstitels — Jarvis' geheugen, nieuwste eerst (alleen-lezen).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "limit": { "type": "integer", "description": "max aantal (1-50)" } },
+                "additionalProperties": false
+            }
+        }
+    ])
+}
+
+enum ToolErr {
+    Unknown,
+    Failed(String),
+}
+
+/// Dispatch a read-only tool call, owner-scoped. Never mutates or exposes secrets.
+async fn mcp_call(
+    state: &AppState,
+    authed: &Authed,
+    name: &str,
+    args: &Value,
+) -> Result<String, ToolErr> {
+    match name {
+        "portfolio_summary" => mcp_portfolio(state, authed).await,
+        "jarvis_status" => Ok(mcp_status(state)),
+        "recent_conversations" => mcp_recent_conversations(state, authed, args).await,
+        _ => Err(ToolErr::Unknown),
+    }
+}
+
+async fn mcp_portfolio(state: &AppState, authed: &Authed) -> Result<String, ToolErr> {
+    let holdings = portfolio::list_holdings(&state.db, authed.user.id)
+        .await
+        .map_err(|e| ToolErr::Failed(format!("portfolio niet leesbaar: {e}")))?;
+    if holdings.is_empty() {
+        return Ok("Geen posities in het portfolio.".to_string());
+    }
+    let total: Decimal = holdings.iter().map(|h| h.cost_basis()).sum();
+    let hundred = Decimal::from(100);
+    let mut s = format!(
+        "Portfolio — {} posities, totale kostenbasis {}:\n",
+        holdings.len(),
+        total.normalize()
+    );
+    for h in &holdings {
+        let cost = h.cost_basis();
+        let weight = if total.is_zero() {
+            Decimal::ZERO
+        } else {
+            (cost / total * hundred).round_dp(1)
+        };
+        s.push_str(&format!(
+            "- {}: {} @ {} {} = {} ({}%)\n",
+            h.symbol,
+            h.quantity.normalize(),
+            h.avg_cost.normalize(),
+            h.currency,
+            cost.normalize(),
+            weight.normalize()
+        ));
+    }
+    Ok(s)
+}
+
+fn mcp_status(state: &AppState) -> String {
+    let eco = match state.registry.read() {
+        Ok(reg) => render_ecosystem(&reg, state.agent_enabled, state.agent_sandbox.is_some()),
+        Err(_) => "(ecosysteem tijdelijk niet leesbaar)".to_string(),
+    };
+    let spent = state.spent_cents.load(Ordering::Relaxed) as f64 / 100.0;
+    let budget = state.budget_cents as f64 / 100.0;
+    format!(
+        "{eco}\nBudget: €{spent:.2} van €{budget:.2} gebruikt deze maand (€{:.2} over).",
+        (budget - spent).max(0.0)
+    )
+}
+
+async fn mcp_recent_conversations(
+    state: &AppState,
+    authed: &Authed,
+    args: &Value,
+) -> Result<String, ToolErr> {
+    let limit = args
+        .get("limit")
+        .and_then(|l| l.as_i64())
+        .unwrap_or(10)
+        .clamp(1, 50);
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT title, to_char(updated_at, 'YYYY-MM-DD HH24:MI') \
+         FROM conversations WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2",
+    )
+    .bind(authed.user.id)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| ToolErr::Failed(format!("gesprekken niet leesbaar: {e}")))?;
+    if rows.is_empty() {
+        return Ok("Nog geen gesprekken.".to_string());
+    }
+    let mut s = String::from("Recente gesprekken:\n");
+    for (title, updated) in rows {
+        s.push_str(&format!("- {title} ({updated})\n"));
+    }
+    Ok(s)
+}
+
+/// Only local origins are allowed (DNS-rebinding protection); a client that sends
+/// no Origin header (Claude Code) is allowed by the caller before this is reached.
+fn is_local_origin(origin: &str) -> bool {
+    origin.starts_with("http://localhost")
+        || origin.starts_with("http://127.0.0.1")
+        || origin.starts_with("https://localhost")
+        || origin == "null"
+}
+
 // ---- Voice: server-side speaker verification + STT --------------------------
 
 fn db_err(_e: sqlx::Error) -> (StatusCode, Json<Value>) {
@@ -2453,5 +2683,115 @@ mod tests {
         assert!(body["summary"].is_string());
         assert!(body["proposals"].is_array());
         assert!(body["note"].as_str().unwrap().contains("goedkeuring"));
+    }
+
+    /// The MCP server is authenticated, read-only, and speaks the minimal
+    /// JSON-RPC contract (ADR-031).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn mcp_exposes_read_only_tools(pool: PgPool) {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let signing = SigningKey::from_bytes(&seed);
+        let app = build_router(stub_state(pool.clone()).await);
+        let (_device_id, token) = enroll_and_login(&app, &signing).await;
+
+        let rpc = |body: Value, token: Option<String>, app: axum::Router| async move {
+            let mut b = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(t) = token {
+                b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+            }
+            app.oneshot(b.body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap())
+                .await
+                .unwrap()
+        };
+
+        // Unauthenticated → 401.
+        let resp = rpc(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            None,
+            app.clone(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // initialize → capabilities + serverInfo, echoing the protocol version.
+        let resp = rpc(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } }),
+            Some(token.clone()),
+            app.clone(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
+        assert!(body["result"]["capabilities"]["tools"].is_object());
+        assert_eq!(body["result"]["serverInfo"]["name"], "jarvis");
+
+        // tools/list → the read-only catalog.
+        let resp = rpc(
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+            Some(token.clone()),
+            app.clone(),
+        )
+        .await;
+        let body = body_json(resp).await;
+        let names: Vec<&str> = body["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"portfolio_summary"));
+        assert!(names.contains(&"jarvis_status"));
+        assert!(names.contains(&"recent_conversations"));
+
+        // tools/call jarvis_status → text content, not an error.
+        let resp = rpc(
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": { "name": "jarvis_status", "arguments": {} } }),
+            Some(token.clone()),
+            app.clone(),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["isError"], false);
+        assert!(body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Budget"));
+
+        // Unknown tool → JSON-RPC method error, never a crash.
+        let resp = rpc(
+            json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": { "name": "drop_everything", "arguments": {} } }),
+            Some(token.clone()),
+            app.clone(),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32601);
+
+        // A non-local browser Origin is refused (DNS-rebinding guard).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header("origin", "https://evil.example")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" }))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }
