@@ -9,6 +9,7 @@ mod anthropic;
 mod claude_cli;
 mod fallback;
 mod ollama;
+mod router;
 mod types;
 
 use std::sync::Arc;
@@ -19,6 +20,7 @@ pub use anthropic::AnthropicProvider;
 pub use claude_cli::ClaudeCliProvider;
 pub use fallback::FallbackProvider;
 pub use ollama::OllamaProvider;
+pub use router::{always_available, Availability, RouterProvider};
 pub use types::{ChatMessage, ChatReply, ChatRequest, LlmError, Role, Tier, Usage};
 
 /// A swappable brain: given a conversation, produce a reply.
@@ -47,24 +49,17 @@ pub struct ProviderConfig {
     pub claude_cli_bin: String,
 }
 
-/// Wire up the brain from config, cheapest-capable-first (ADR-027):
-///
-/// - `provider = "claude-cli"` ⇒ your Claude *plan* via the `claude` CLI, with
-///   the Anthropic API (else Ollama) as the fallback when the plan is full.
-/// - `provider = "anthropic"` + key ⇒ Anthropic, Ollama as local fallback.
-/// - `provider = "ollama"`, or nothing else buildable ⇒ Ollama only.
-/// - Nothing buildable ⇒ an [`Unconfigured`] brain that returns a clear error.
-///
-/// Fallback is reactive: try the primary, fall through on any error except a
-/// genuine refusal. (Proactive %-of-plan routing is a later stage.)
-pub fn build_provider(cfg: ProviderConfig) -> Arc<dyn LlmProvider> {
-    let ollama: Option<Arc<dyn LlmProvider>> = OllamaProvider::new(&cfg.ollama_url, &cfg.ollama_model)
+/// Build the local Ollama brain, if the client constructs (no network yet).
+fn build_ollama(cfg: &ProviderConfig) -> Option<Arc<dyn LlmProvider>> {
+    OllamaProvider::new(&cfg.ollama_url, &cfg.ollama_model)
         .ok()
-        .map(|p| Arc::new(p) as Arc<dyn LlmProvider>);
+        .map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
+}
 
-    // Anthropic is buildable whenever a key is present — as a primary or a fallback.
-    let anthropic: Option<Arc<dyn LlmProvider>> = cfg
-        .api_key
+/// Build the Anthropic API brain whenever a key is present — as a primary or a
+/// fallback. Keys stay backend-only (ADR-022).
+fn build_anthropic(cfg: &ProviderConfig) -> Option<Arc<dyn LlmProvider>> {
+    cfg.api_key
         .as_deref()
         .filter(|k| !k.trim().is_empty())
         .and_then(|key| {
@@ -77,16 +72,44 @@ pub fn build_provider(cfg: ProviderConfig) -> Arc<dyn LlmProvider> {
             )
             .ok()
         })
-        .map(|p| Arc::new(p) as Arc<dyn LlmProvider>);
+        .map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
+}
+
+/// Build the Claude *plan* brain via the local `claude` CLI (always constructs;
+/// a missing/logged-out CLI surfaces as an error at call time).
+fn build_claude_cli(cfg: &ProviderConfig) -> Arc<dyn LlmProvider> {
+    Arc::new(ClaudeCliProvider::new(
+        &cfg.claude_cli_bin,
+        &cfg.model_default,
+        &cfg.model_hard,
+        &cfg.model_cheap,
+    ))
+}
+
+/// Wire up the brain from config, cheapest-capable-first (ADR-027):
+///
+/// - `provider = "router"` / `"auto"` ⇒ the registry-aware [`RouterProvider`]
+///   (see [`build_router`]); the smart mode that picks per task.
+/// - `provider = "claude-cli"` ⇒ your Claude *plan* via the `claude` CLI, with
+///   the Anthropic API (else Ollama) as the fallback when the plan is full.
+/// - `provider = "anthropic"` + key ⇒ Anthropic, Ollama as local fallback.
+/// - `provider = "ollama"`, or nothing else buildable ⇒ Ollama only.
+/// - Nothing buildable ⇒ an [`Unconfigured`] brain that returns a clear error.
+///
+/// Fallback is reactive: try the primary, fall through on any error except a
+/// genuine refusal. (Proactive %-of-plan routing is a later stage.)
+///
+/// For `router`/`auto`, callers should use [`build_router`] directly so they can
+/// pass a live [`Availability`] source; this function falls back to
+/// [`always_available`] so it stays a pure `ProviderConfig -> brain` map.
+pub fn build_provider(cfg: ProviderConfig) -> Arc<dyn LlmProvider> {
+    let ollama = build_ollama(&cfg);
+    let anthropic = build_anthropic(&cfg);
 
     match cfg.provider.to_ascii_lowercase().as_str() {
+        "router" | "auto" => build_router(cfg, always_available()),
         "claude-cli" => {
-            let cli: Arc<dyn LlmProvider> = Arc::new(ClaudeCliProvider::new(
-                &cfg.claude_cli_bin,
-                &cfg.model_default,
-                &cfg.model_hard,
-                &cfg.model_cheap,
-            ));
+            let cli = build_claude_cli(&cfg);
             match anthropic.or(ollama) {
                 Some(fallback) => Arc::new(FallbackProvider::new(cli, fallback)),
                 None => cli,
@@ -101,6 +124,36 @@ pub fn build_provider(cfg: ProviderConfig) -> Arc<dyn LlmProvider> {
             (None, None) => Arc::new(Unconfigured),
         },
     }
+}
+
+/// Build the registry-aware [`RouterProvider`] over every buildable backend, in
+/// a fixed id order (`ollama`, `claude-cli`, `anthropic-api`). The router itself
+/// decides per request which to try, consulting `availability` (backed by the
+/// resource registry) and a per-tier cost/quality policy — cheap tasks local,
+/// real work on the plan, the API as the vangnet, the hardest on strong brains
+/// only. Falls back to [`Unconfigured`] if nothing is buildable.
+pub fn build_router(cfg: ProviderConfig, availability: Arc<dyn Availability>) -> Arc<dyn LlmProvider> {
+    let mut candidates = Vec::new();
+    if let Some(ollama) = build_ollama(&cfg) {
+        candidates.push(router::Candidate {
+            id: "ollama".into(),
+            provider: ollama,
+        });
+    }
+    candidates.push(router::Candidate {
+        id: "claude-cli".into(),
+        provider: build_claude_cli(&cfg),
+    });
+    if let Some(anthropic) = build_anthropic(&cfg) {
+        candidates.push(router::Candidate {
+            id: "anthropic-api".into(),
+            provider: anthropic,
+        });
+    }
+    if candidates.is_empty() {
+        return Arc::new(Unconfigured);
+    }
+    Arc::new(RouterProvider::new(candidates, availability))
 }
 
 /// A brain that always errors — when nothing is configured.
@@ -208,5 +261,22 @@ mod tests {
         });
         // CLI primary, API as the fallback ("vangnet als de CLI vol is").
         assert_eq!(brain.label(), "claude-cli:claude-sonnet-5→anthropic:claude-sonnet-5");
+    }
+
+    #[test]
+    fn router_mode_wires_every_backend() {
+        let brain = build_provider(ProviderConfig {
+            provider: "router".into(),
+            api_key: Some("sk-ant-test".into()),
+            anthropic_base_url: "https://api.anthropic.com".into(),
+            model_default: "claude-sonnet-5".into(),
+            model_hard: "claude-opus-5".into(),
+            model_cheap: "claude-haiku-4-5".into(),
+            ollama_url: "http://127.0.0.1:11434".into(),
+            ollama_model: "llama3.2".into(),
+            claude_cli_bin: "claude".into(),
+        });
+        // Registry-aware router over local + plan + API, in fixed id order.
+        assert_eq!(brain.label(), "router[ollama,claude-cli,anthropic-api]");
     }
 }

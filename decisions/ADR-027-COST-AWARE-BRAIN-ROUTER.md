@@ -1,6 +1,6 @@
 # ADR-027 — Kosten-bewuste brein-router (plan vóór API vóór lokaal)
 
-- Status: geaccepteerd (stage 1 gebouwd) — 13 augustus 2026
+- Status: geaccepteerd (stages 1 + 3 + router-koppeling gebouwd) — 13 augustus 2026
 - Bouwt op ADR-022 (Claude als brein, provider-abstractie) en de bestaande
   `LlmProvider`-trait + `FallbackProvider`
 
@@ -46,9 +46,25 @@ latere stage bovenop deze basis.
   whisper-model), met per brein een **kostentier** (plan/metered/local) +
   beschikbaarheid. Verzameld bij startup, endpoints `GET /v1/system/registry` +
   `POST /v1/system/registry/refresh`; client toont het in Status ("AI-RESOURCES").
-  **Nog te doen**: de router deze registry live laten raadplegen zodat hij per
-  taak dynamisch kiest op **capability × kosten × beschikbaarheid** (nu nog een
-  vaste keten uit config).
+- **Router ↔ registry-koppeling ✅ gebouwd**: `JARVIS_LLM_PROVIDER=router`
+  (of `auto`) bouwt een `RouterProvider` (`crates/llm/src/router.rs`) die **per
+  verzoek** kiest op **capability × kosten × beschikbaarheid** i.p.v. een vaste
+  keten. Per tier een **logische voorkeursvolgorde**:
+  - `Cheap` → `ollama` → `claude-cli` → `anthropic-api` (goedkoopste eerst;
+    simpel werk mag lokaal/gratis).
+  - `Default` → `claude-cli` → `anthropic-api` → `ollama` (plan eerst voor
+    kwaliteit, lokaal alleen als laatste redmiddel).
+  - `Hard` → alleen sterke breinen (`claude-cli` → `anthropic-api`).
+
+  De router filtert die volgorde op **live beschikbaarheid** uit de registry via
+  de trait `jarvis_llm::Availability`, in de api geïmplementeerd door
+  `RegistryAvailability` (leest `registry.brains[].available`, achter een
+  `std::sync::RwLock` zodat de check synchroon is). **Vangnet**: zegt de registry
+  dat *niets* beschikbaar is, dan probeert de router de volledige geordende lijst
+  alsnog — een verkeerde registry mag het brein nooit lamleggen. Binnen de
+  gekozen lijst blijft het **reactief**: probeer op volgorde, val bij elke fout
+  (behalve een echte refusal) door naar de volgende. `jarvis-llm` hangt níet af
+  van `jarvis-registry` (geen cyclus) — alleen de api overbrugt de twee.
 - **Stage 4 — MCP-laag**: MCP is de **tool/context-laag**, geen facturatieroute.
   Jarvis als MCP-host (tools consumeren) én Jarvis-eigen tools (portfolio, IBKR,
   geheugen) als MCP-server die Claude Code kan gebruiken. Agentische shell/taken
@@ -57,8 +73,10 @@ latere stage bovenop deze basis.
 
 ## Gevolgen
 
-- Directe besparing mogelijk: zet `JARVIS_LLM_PROVIDER=claude-cli` en het gesprek
-  loopt op je abonnement, met de API als automatisch vangnet.
+- Directe besparing mogelijk: zet `JARVIS_LLM_PROVIDER=router` (aanbevolen) en
+  Jarvis verdeelt het werk zelf — gratis lokaal waar het kan, je abonnement voor
+  echt werk, de API als vangnet. `claude-cli` blijft beschikbaar als vaste keten
+  (alleen plan + vangnet, zonder de per-taak-routing).
 - Vereist een ingelogde `claude` CLI op de machine waar de backend draait.
   Headless `-p` is een officiële feature; voor persoonlijk gebruik prima (geen
   publieke multi-user API-backend). Subprocess = iets meer latency dan HTTP.

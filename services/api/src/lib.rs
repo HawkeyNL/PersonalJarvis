@@ -26,7 +26,9 @@ use jarvis_portfolio as portfolio;
 use jarvis_registry as registry;
 use jarvis_speech as speech;
 use rust_decimal::Decimal;
-use tokio::sync::RwLock;
+// std (not tokio) RwLock: the router's `Availability` reads it synchronously,
+// and the registry is small with brief, await-free critical sections.
+use std::sync::RwLock;
 
 /// Shared, cheaply-cloneable application state.
 #[derive(Clone)]
@@ -815,14 +817,39 @@ async fn voice_verify(
 /// Jarvis' resource/agent registry — available brains + cost + the host it runs
 /// on (ADR-027 stage 3). Cached from startup; POST `/refresh` re-probes.
 async fn system_registry(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
-    let reg = state.registry.read().await;
-    Json(serde_json::to_value(&*reg).unwrap_or_else(|_| json!({})))
+    let value = state
+        .registry
+        .read()
+        .map(|reg| serde_json::to_value(&*reg).unwrap_or_else(|_| json!({})))
+        .unwrap_or_else(|_| json!({}));
+    Json(value)
 }
 
 async fn system_registry_refresh(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
     let fresh = registry::collect(&state.registry_input).await;
-    *state.registry.write().await = fresh.clone();
+    if let Ok(mut reg) = state.registry.write() {
+        *reg = fresh.clone();
+    }
     Json(serde_json::to_value(&fresh).unwrap_or_else(|_| json!({})))
+}
+
+/// Live brain availability from the resource registry — the bridge that lets the
+/// router (`jarvis-llm`) route on what's actually up (ADR-027). A backend is
+/// available iff the registry has a matching brain marked available; a poisoned
+/// lock degrades to "try it" so a bug here never bricks the brain.
+pub struct RegistryAvailability(pub Arc<RwLock<registry::Registry>>);
+
+impl llm::Availability for RegistryAvailability {
+    fn is_available(&self, backend_id: &str) -> bool {
+        self.0
+            .read()
+            .map(|reg| {
+                reg.brains
+                    .iter()
+                    .any(|b| b.id == backend_id && b.available)
+            })
+            .unwrap_or(true)
+    }
 }
 
 #[cfg(test)]
@@ -868,7 +895,7 @@ mod tests {
             llm_max_tokens: 256,
             speech: jarvis_speech::stub(),
             speech_verify_threshold: 0.5,
-            registry: std::sync::Arc::new(tokio::sync::RwLock::new(
+            registry: std::sync::Arc::new(std::sync::RwLock::new(
                 jarvis_registry::collect(&jarvis_registry::CollectInput::default()).await,
             )),
             registry_input: std::sync::Arc::new(jarvis_registry::CollectInput::default()),

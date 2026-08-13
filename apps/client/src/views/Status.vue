@@ -130,7 +130,7 @@ onMounted(() => {
     <!-- AI-resources: brains Jarvis can route to, and the host it runs on. -->
     <div class="panel" v-if="reg || regError">
       <div class="phead">
-        AI-RESOURCES <span class="hint">instant memory · kies goedkoopste-geschikte</span>
+        AI-RESOURCES <span class="hint">instant memory · router kiest per taak</span>
       </div>
       <p v-if="regError" class="muted err">{{ regError }}</p>
       <template v-else-if="reg">
