@@ -38,6 +38,7 @@ jarvis-portfolio.workspace = true
 jarvis-ibkr.workspace = true
 jarvis-llm.workspace = true
 jarvis-speech.workspace = true
+jarvis-registry.workspace = true
 rust_decimal.workspace = true
 
 [dev-dependencies]

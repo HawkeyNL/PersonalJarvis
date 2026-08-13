@@ -23,8 +23,10 @@ use jarvis_ibkr as ibkr;
 use jarvis_identity as identity;
 use jarvis_llm as llm;
 use jarvis_portfolio as portfolio;
+use jarvis_registry as registry;
 use jarvis_speech as speech;
 use rust_decimal::Decimal;
+use tokio::sync::RwLock;
 
 /// Shared, cheaply-cloneable application state.
 #[derive(Clone)]
@@ -40,6 +42,10 @@ pub struct AppState {
     pub speech: Arc<dyn speech::SpeechEngine>,
     /// Cosine threshold to accept a voice as the enrolled speaker.
     pub speech_verify_threshold: f32,
+    /// Resource/agent registry — Jarvis' "instant memory" (ADR-027 stage 3).
+    pub registry: Arc<RwLock<registry::Registry>>,
+    /// Inputs to re-collect the registry on refresh.
+    pub registry_input: Arc<registry::CollectInput>,
 }
 
 /// Build the application router.
@@ -67,6 +73,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/voice/status", get(voice_status))
         .route("/v1/voice/enroll", post(voice_enroll))
         .route("/v1/voice/verify", post(voice_verify))
+        .route("/v1/system/registry", get(system_registry))
+        .route("/v1/system/registry/refresh", post(system_registry_refresh))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -804,6 +812,19 @@ async fn voice_verify(
     }
 }
 
+/// Jarvis' resource/agent registry — available brains + cost + the host it runs
+/// on (ADR-027 stage 3). Cached from startup; POST `/refresh` re-probes.
+async fn system_registry(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
+    let reg = state.registry.read().await;
+    Json(serde_json::to_value(&*reg).unwrap_or_else(|_| json!({})))
+}
+
+async fn system_registry_refresh(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
+    let fresh = registry::collect(&state.registry_input).await;
+    *state.registry.write().await = fresh.clone();
+    Json(serde_json::to_value(&fresh).unwrap_or_else(|_| json!({})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,6 +868,10 @@ mod tests {
             llm_max_tokens: 256,
             speech: jarvis_speech::stub(),
             speech_verify_threshold: 0.5,
+            registry: std::sync::Arc::new(tokio::sync::RwLock::new(
+                jarvis_registry::collect(&jarvis_registry::CollectInput::default()).await,
+            )),
+            registry_input: std::sync::Arc::new(jarvis_registry::CollectInput::default()),
         });
 
         // 1. enroll this device (dev endpoint)

@@ -40,11 +40,15 @@ latere stage bovenop deze basis.
 
 - **Stage 2 — usage/threshold-routing**: eigen token/verzoek-teller per backend,
   waarschuwen + vervroegd omschakelen rond een drempel; kosten/limieten in beeld.
-- **Stage 3 — resource-/agent-registry ("instant memory")**: Jarvis kent de
-  beschikbare breinen/agents (CLI, API, Ollama-modellen, MCP-servers), hun
-  status/kosten, én de host (CPU/RAM/GPU, Apple Silicon; geïnstalleerde software)
-  — zodat hij weet wat lokaal kan draaien en waar het voordeligst is. Router
-  kiest per taak op **capability × kosten × beschikbaarheid**.
+- **Stage 3 — resource-/agent-registry ("instant memory") ✅ gebouwd**: crate
+  `jarvis-registry` detecteert de **host** (CPU/RAM/GPU via `sysinfo`, arch, OS) en
+  probeert de **breinen/tools** (claude CLI, Ollama + lokale modellen, cmake,
+  whisper-model), met per brein een **kostentier** (plan/metered/local) +
+  beschikbaarheid. Verzameld bij startup, endpoints `GET /v1/system/registry` +
+  `POST /v1/system/registry/refresh`; client toont het in Status ("AI-RESOURCES").
+  **Nog te doen**: de router deze registry live laten raadplegen zodat hij per
+  taak dynamisch kiest op **capability × kosten × beschikbaarheid** (nu nog een
+  vaste keten uit config).
 - **Stage 4 — MCP-laag**: MCP is de **tool/context-laag**, geen facturatieroute.
   Jarvis als MCP-host (tools consumeren) én Jarvis-eigen tools (portfolio, IBKR,
   geheugen) als MCP-server die Claude Code kan gebruiken. Agentische shell/taken

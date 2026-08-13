@@ -58,6 +58,24 @@ async fn main() -> anyhow::Result<()> {
     });
     tracing::info!(speech = %speech.label(), "speech engine configured");
 
+    // Resource/agent registry — Jarvis' "instant memory" of brains + host (ADR-027).
+    let registry_input = jarvis_registry::CollectInput {
+        llm_provider: config.llm_provider.clone(),
+        claude_cli_bin: config.llm_claude_cli_bin.clone(),
+        has_api_key: !config.llm_api_key.trim().is_empty(),
+        anthropic_model: config.llm_model.clone(),
+        ollama_model: config.llm_ollama_model.clone(),
+        speech_provider: config.speech_provider.clone(),
+        whisper_model: config.speech_whisper_model.clone(),
+        active_brain: llm.label().to_string(),
+    };
+    let registry = jarvis_registry::collect(&registry_input).await;
+    tracing::info!(
+        cpu_cores = registry.host.cpu_cores,
+        brains = registry.brains.len(),
+        "resource registry collected"
+    );
+
     let state = AppState {
         db,
         environment: config.environment.clone(),
@@ -66,6 +84,8 @@ async fn main() -> anyhow::Result<()> {
         llm_max_tokens: config.llm_max_tokens,
         speech,
         speech_verify_threshold: config.speech_verify_threshold,
+        registry: std::sync::Arc::new(tokio::sync::RwLock::new(registry)),
+        registry_input: std::sync::Arc::new(registry_input),
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

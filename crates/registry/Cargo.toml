@@ -1,0 +1,15 @@
+[package]
+name = "jarvis-registry"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing.workspace = true
+sysinfo = "0.32"
+
+[dev-dependencies]
+tokio.workspace = true

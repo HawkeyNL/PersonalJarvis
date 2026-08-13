@@ -9,6 +9,7 @@ members = [
     "crates/ibkr",
     "crates/llm",
     "crates/speech",
+    "crates/registry",
 ]
 # The Tauri client crate builds via its own tooling (npm run tauri ...) and is
 # intentionally excluded so backend CI (clippy -D warnings) stays fast and the
@@ -75,3 +76,4 @@ jarvis-portfolio = { path = "crates/portfolio" }
 jarvis-ibkr = { path = "crates/ibkr" }
 jarvis-llm = { path = "crates/llm" }
 jarvis-speech = { path = "crates/speech" }
+jarvis-registry = { path = "crates/registry" }
