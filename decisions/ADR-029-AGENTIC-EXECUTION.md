@@ -89,13 +89,33 @@ zijn **tijdgebonden** en **actie-specifiek** (geen blanco cheque).
 - Geen autonome onomkeerbare acties. Geen netwerk buiten expliciet toegestane hosts.
 - De executor is single-user (de eigenaar), geen publieke multi-user route.
 
-## Open beleidskeuzes (→ eigenaar beslist vóór 4a)
+## Vastgestelde beleidskeuzes (eigenaar, 13 augustus 2026)
 
-1. **Autonomie van read-only acties**: volledig autonoom + auditen, of tóch elke
-   keer even melden/vragen?
-2. **Sandbox-scope**: welke map is de `workspace-root`?
-3. **Goedkeuringsvenster**: per losse actie tekenen, of een kort sessie-venster
-   (bv. "10 min mutaties toegestaan") na één goedkeuring?
+1. **Read-only acties**: **autonoom + alles auditen**. Jarvis draait veilige
+   read-only commando's (ls, git status/diff, cargo test/check, grep) zelf binnen
+   de sandbox; elke actie in het audit-log.
+2. **Mutaties**: **per actie tekenen** — elke schrijf-/commit-actie apart
+   goedgekeurd via de device-signed gate; een goedkeuring geldt voor precies die
+   ene actie, niet herbruikbaar.
+3. **Zelf-verbetering (sandbox = de PersonalJarvis-codebase zelf)**:
+   - **alleen op verzoek** van de eigenaar — Jarvis begint hier nooit uit zichzelf;
+   - hij **stelt eerst een plan op** (de plan→execute-orchestrator, ADR-028 fase 3),
+     toont dat, en voert het pas uit **na goedkeuring per stap**;
+   - hij mag aan de **codebase** werken (crates, services, apps, niet-Core docs),
+     maar niet aan de Core.
+
+### Onaantastbaar — nooit via Jarvis, ook niet met goedkeuring
+
+- **`core/Jarvis.md`**: Jarvis wijzigt zijn eigen grondwet **nooit**. Punt.
+- **De sloten zelf**: policy, permissions, de allowlist, de veiligheidsconfig en
+  secrets (`.env`, keychain). Als de agent zijn eigen hek (met één getekende
+  goedkeuring) kon verzetten, ondermijnt dat de hele gate (§31 — Policy Is Not
+  replaceable, §16 — prompt-injectie is onvertrouwd). Deze blijven **puur
+  handmatig door de eigenaar**, buiten elke agentische route om.
+
+Dit is strenger dan "de Core niet zonder toestemming": de Core-sloten zijn niet
+eens goedkeurbaar. Zo blijft "alleen de eigenaar verandert de Core" een garantie,
+niet een gunst — en kan Jarvis tóch aan de rest van zichzelf werken.
 
 ## Gevolgen
 
