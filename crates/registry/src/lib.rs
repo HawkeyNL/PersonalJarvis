@@ -71,6 +71,12 @@ pub struct CollectInput {
     pub has_api_key: bool,
     pub anthropic_model: String,
     pub ollama_model: String,
+    /// OpenAI: whether a key is set + the default model (for the brain label).
+    pub has_openai_key: bool,
+    pub openai_model: String,
+    /// DeepSeek: whether a key is set + the default model.
+    pub has_deepseek_key: bool,
+    pub deepseek_model: String,
     pub speech_provider: String,
     pub whisper_model: Option<String>,
     /// The built router's label (e.g. `claude-cli:…→anthropic:…`).
@@ -154,6 +160,28 @@ fn derive_brains(input: &CollectInput, claude_present: bool, ollama_models: &[St
             available: input.has_api_key,
             note: if input.has_api_key {
                 "per-token (vangnet)".into()
+            } else {
+                "geen API-key gezet".into()
+            },
+        },
+        Brain {
+            id: "openai-api".into(),
+            label: format!("OpenAI API · {}", input.openai_model),
+            cost: CostTier::Metered,
+            available: input.has_openai_key,
+            note: if input.has_openai_key {
+                "per-token".into()
+            } else {
+                "geen API-key gezet".into()
+            },
+        },
+        Brain {
+            id: "deepseek-api".into(),
+            label: format!("DeepSeek API · {}", input.deepseek_model),
+            cost: CostTier::Metered,
+            available: input.has_deepseek_key,
+            note: if input.has_deepseek_key {
+                "per-token (goedkoop)".into()
             } else {
                 "geen API-key gezet".into()
             },
@@ -246,10 +274,18 @@ mod tests {
             has_api_key: true,
             anthropic_model: "claude-sonnet-5".into(),
             ollama_model: "llama3.2".into(),
+            has_openai_key: true,
+            openai_model: "gpt-4o".into(),
+            has_deepseek_key: true,
+            deepseek_model: "deepseek-chat".into(),
             speech_provider: "whisper".into(),
             whisper_model: Some("models/ggml-base.bin".into()),
             active_brain: "claude-cli:…→anthropic:…".into(),
         }
+    }
+
+    fn brain<'a>(brains: &'a [Brain], id: &str) -> &'a Brain {
+        brains.iter().find(|b| b.id == id).expect("brain present")
     }
 
     #[test]
@@ -261,25 +297,30 @@ mod tests {
     #[test]
     fn brains_reflect_availability_and_cost() {
         let brains = derive_brains(&input(), true, &["llama3.2:latest".to_string()]);
-        let cli = &brains[0];
-        assert_eq!(cli.id, "claude-cli");
+        let cli = brain(&brains, "claude-cli");
         assert_eq!(cli.cost, CostTier::Plan);
         assert!(cli.available);
-        assert_eq!(brains[1].cost, CostTier::Metered);
-        assert!(brains[1].available); // has_api_key
-        assert_eq!(brains[2].cost, CostTier::Local);
-        assert!(brains[2].available); // one ollama model present
+        assert_eq!(brain(&brains, "anthropic-api").cost, CostTier::Metered);
+        assert!(brain(&brains, "anthropic-api").available); // has_api_key
+        assert!(brain(&brains, "openai-api").available); // has_openai_key
+        assert!(brain(&brains, "deepseek-api").available); // has_deepseek_key
+        assert_eq!(brain(&brains, "ollama").cost, CostTier::Local);
+        assert!(brain(&brains, "ollama").available); // one ollama model present
     }
 
     #[test]
     fn missing_tools_are_unavailable() {
         let mut i = input();
         i.has_api_key = false;
+        i.has_openai_key = false;
+        i.has_deepseek_key = false;
         let brains = derive_brains(&i, false, &[]);
-        assert!(!brains[0].available); // no claude binary
-        assert!(brains[0].note.contains("niet gevonden"));
-        assert!(!brains[1].available); // no api key
-        assert!(!brains[2].available); // no ollama models
+        assert!(!brain(&brains, "claude-cli").available); // no claude binary
+        assert!(brain(&brains, "claude-cli").note.contains("niet gevonden"));
+        assert!(!brain(&brains, "anthropic-api").available); // no api key
+        assert!(!brain(&brains, "openai-api").available); // no openai key
+        assert!(!brain(&brains, "deepseek-api").available); // no deepseek key
+        assert!(!brain(&brains, "ollama").available); // no ollama models
     }
 
     #[tokio::test]
@@ -288,7 +329,7 @@ mod tests {
         let mut i = input();
         i.claude_cli_bin = "definitely-not-a-real-binary-xyz".into();
         let reg = collect(&i).await;
-        assert_eq!(reg.brains.len(), 3);
+        assert_eq!(reg.brains.len(), 5);
         assert!(reg.host.cpu_cores >= 1);
         assert!(!reg.host.os.is_empty());
     }

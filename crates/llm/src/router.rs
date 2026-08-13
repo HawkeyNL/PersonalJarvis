@@ -54,14 +54,27 @@ impl RouterProvider {
         }
     }
 
-    /// Preference order of backend ids for a tier. Cheap → cheapest first
-    /// (trivial tasks are fine locally); Default → the plan first for quality,
-    /// local only as a last resort; Hard → strong brains only.
+    /// Preference order of backend ids for a tier. Cheap → cheapest first (free
+    /// local/plan, then the cheapest metered); Default → the plan first for
+    /// quality, strong APIs as the vangnet, cheap/local last; Hard → strong
+    /// brains only. Ids not built (no key) are simply skipped.
     fn policy(tier: Tier) -> &'static [&'static str] {
         match tier {
-            Tier::Cheap => &["ollama", "claude-cli", "anthropic-api"],
-            Tier::Default => &["claude-cli", "anthropic-api", "ollama"],
-            Tier::Hard => &["claude-cli", "anthropic-api"],
+            Tier::Cheap => &[
+                "ollama",
+                "claude-cli",
+                "deepseek-api",
+                "openai-api",
+                "anthropic-api",
+            ],
+            Tier::Default => &[
+                "claude-cli",
+                "anthropic-api",
+                "openai-api",
+                "deepseek-api",
+                "ollama",
+            ],
+            Tier::Hard => &["claude-cli", "anthropic-api", "openai-api"],
         }
     }
 
@@ -132,6 +145,7 @@ mod tests {
                 Ok(ChatReply {
                     text: self.label.clone(),
                     model: self.label.clone(),
+                    backend: Some(self.label.clone()),
                     stop_reason: None,
                     usage: None,
                 })
@@ -186,6 +200,33 @@ mod tests {
     fn hard_is_strong_only() {
         let r = RouterProvider::new(all(), always_available());
         assert_eq!(ids(r.plan(Tier::Hard)), ["claude-cli", "anthropic-api"]);
+    }
+
+    #[test]
+    fn full_fleet_orders_by_cost_and_quality_per_tier() {
+        let fleet = vec![
+            cand("ollama", true),
+            cand("claude-cli", true),
+            cand("deepseek-api", true),
+            cand("openai-api", true),
+            cand("anthropic-api", true),
+        ];
+        let r = RouterProvider::new(fleet, always_available());
+        // Cheap: free first, then the cheapest metered.
+        assert_eq!(
+            ids(r.plan(Tier::Cheap)),
+            ["ollama", "claude-cli", "deepseek-api", "openai-api", "anthropic-api"]
+        );
+        // Default: plan first, strong APIs, then cheap/local last.
+        assert_eq!(
+            ids(r.plan(Tier::Default)),
+            ["claude-cli", "anthropic-api", "openai-api", "deepseek-api", "ollama"]
+        );
+        // Hard: strong brains only (no deepseek/ollama).
+        assert_eq!(
+            ids(r.plan(Tier::Hard)),
+            ["claude-cli", "anthropic-api", "openai-api"]
+        );
     }
 
     #[test]

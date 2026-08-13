@@ -11,6 +11,13 @@ use jarvis_api::{build_router, AppState, RegistryAvailability};
 use jarvis_config::AppConfig;
 use sqlx::postgres::PgPoolOptions;
 
+/// `Some(trimmed)` for a non-empty secret, `None` otherwise — so an unset key
+/// disables its backend instead of building a provider that always 401s.
+fn non_empty(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load `.env` for local development if present (ignored in production).
@@ -52,6 +59,10 @@ async fn main() -> anyhow::Result<()> {
         has_api_key: !config.llm_api_key.trim().is_empty(),
         anthropic_model: config.llm_model.clone(),
         ollama_model: config.llm_ollama_model.clone(),
+        has_openai_key: !config.llm_openai_api_key.trim().is_empty(),
+        openai_model: config.llm_openai_model.clone(),
+        has_deepseek_key: !config.llm_deepseek_api_key.trim().is_empty(),
+        deepseek_model: config.llm_deepseek_model.clone(),
         speech_provider: config.speech_provider.clone(),
         whisper_model: config.speech_whisper_model.clone(),
         active_brain: String::new(),
@@ -80,6 +91,20 @@ async fn main() -> anyhow::Result<()> {
         ollama_url: config.llm_ollama_url.clone(),
         ollama_model: config.llm_ollama_model.clone(),
         claude_cli_bin: config.llm_claude_cli_bin.clone(),
+        openai: jarvis_llm::OpenAiBackend {
+            api_key: non_empty(&config.llm_openai_api_key),
+            base_url: config.llm_openai_base_url.clone(),
+            model_default: config.llm_openai_model.clone(),
+            model_hard: config.llm_openai_model_hard.clone(),
+            model_cheap: config.llm_openai_model_cheap.clone(),
+        },
+        deepseek: jarvis_llm::OpenAiBackend {
+            api_key: non_empty(&config.llm_deepseek_api_key),
+            base_url: config.llm_deepseek_base_url.clone(),
+            model_default: config.llm_deepseek_model.clone(),
+            model_hard: config.llm_deepseek_model_hard.clone(),
+            model_cheap: config.llm_deepseek_model_cheap.clone(),
+        },
     };
     let llm = match config.llm_provider.to_ascii_lowercase().as_str() {
         "router" | "auto" => {
@@ -89,6 +114,16 @@ async fn main() -> anyhow::Result<()> {
         _ => jarvis_llm::build_provider(provider_cfg),
     };
     tracing::info!(brain = %llm.label(), "llm brain configured");
+
+    // Load Jarvis' identity (core/Jarvis.md) as the system prompt — the single
+    // source of truth for "what Jarvis is". Falls back to a built-in persona if
+    // the file is absent, so the brain always has an identity.
+    let (jarvis_system, persona_loaded) = jarvis_api::load_persona(&config.llm_persona_path);
+    if persona_loaded {
+        tracing::info!(path = %config.llm_persona_path, chars = jarvis_system.len(), "Jarvis persona loaded");
+    } else {
+        tracing::warn!(path = %config.llm_persona_path, "no persona file; using built-in fallback persona");
+    }
 
     // Record the resolved brain for display (Status "AI-RESOURCES") and refresh.
     let active_brain = llm.label().to_string();
@@ -103,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         ibkr_gateway_url: config.ibkr_gateway_url.clone(),
         llm,
         llm_max_tokens: config.llm_max_tokens,
+        jarvis_system,
         speech,
         speech_verify_threshold: config.speech_verify_threshold,
         registry,

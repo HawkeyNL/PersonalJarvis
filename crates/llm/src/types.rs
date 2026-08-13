@@ -83,6 +83,11 @@ pub struct ChatReply {
     pub text: String,
     /// The concrete model that produced it.
     pub model: String,
+    /// Which backend produced it (`anthropic-api`, `openai-api`, `deepseek-api`,
+    /// `claude-cli`, `ollama`). Drives cost attribution — plan/local are free,
+    /// only the metered API backends count against the monthly budget.
+    #[serde(default)]
+    pub backend: Option<String>,
     /// Provider stop reason, when reported.
     pub stop_reason: Option<String>,
     /// Token usage, when the provider reports it.

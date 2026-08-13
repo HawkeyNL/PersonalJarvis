@@ -175,6 +175,7 @@ fn parse_cli_output(stdout: &str, model: &str) -> Result<ChatReply, LlmError> {
     Ok(ChatReply {
         text,
         model: model.to_string(),
+        backend: Some("claude-cli".into()),
         stop_reason: Some("end_turn".into()),
         usage: parsed.usage.map(|u| Usage {
             input_tokens: u.input_tokens,

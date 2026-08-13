@@ -9,6 +9,7 @@ mod anthropic;
 mod claude_cli;
 mod fallback;
 mod ollama;
+mod openai_compat;
 mod router;
 mod types;
 
@@ -20,6 +21,7 @@ pub use anthropic::AnthropicProvider;
 pub use claude_cli::ClaudeCliProvider;
 pub use fallback::FallbackProvider;
 pub use ollama::OllamaProvider;
+pub use openai_compat::OpenAiCompatProvider;
 pub use router::{always_available, Availability, RouterProvider};
 pub use types::{ChatMessage, ChatReply, ChatRequest, LlmError, Role, Tier, Usage};
 
@@ -32,10 +34,22 @@ pub trait LlmProvider: Send + Sync {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError>;
 }
 
-/// Inputs for [`build_provider`] — flat so the API service can map from its
-/// `AppConfig` without this crate depending on the config crate.
+/// One OpenAI-compatible backend's settings (OpenAI or DeepSeek). Key is
+/// `None`/empty ⇒ that backend is disabled.
+#[derive(Default, Clone)]
+pub struct OpenAiBackend {
+    pub api_key: Option<String>,
+    pub base_url: String,
+    pub model_default: String,
+    pub model_hard: String,
+    pub model_cheap: String,
+}
+
+/// Inputs for [`build_provider`]/[`build_router`] — flat so the API service can
+/// map from its `AppConfig` without this crate depending on the config crate.
 pub struct ProviderConfig {
-    /// `anthropic` (default), `claude-cli` (your Claude plan) or `ollama`.
+    /// `router`/`auto` (smart), `anthropic`, `claude-cli`, `openai`, `deepseek`
+    /// or `ollama`.
     pub provider: String,
     /// Anthropic API key; `None`/empty ⇒ Anthropic disabled (used as fallback).
     pub api_key: Option<String>,
@@ -47,6 +61,10 @@ pub struct ProviderConfig {
     pub ollama_model: String,
     /// Path/name of the `claude` CLI (for `provider = "claude-cli"`).
     pub claude_cli_bin: String,
+    /// OpenAI backend (key + base URL + per-tier models).
+    pub openai: OpenAiBackend,
+    /// DeepSeek backend (OpenAI-compatible; key + base URL + per-tier models).
+    pub deepseek: OpenAiBackend,
 }
 
 /// Build the local Ollama brain, if the client constructs (no network yet).
@@ -86,6 +104,30 @@ fn build_claude_cli(cfg: &ProviderConfig) -> Arc<dyn LlmProvider> {
     ))
 }
 
+/// Build an OpenAI-compatible brain (OpenAI or DeepSeek) if a key is present.
+fn build_openai_compat(
+    provider: &str,
+    backend_id: &str,
+    b: &OpenAiBackend,
+) -> Option<Arc<dyn LlmProvider>> {
+    b.api_key
+        .as_deref()
+        .filter(|k| !k.trim().is_empty())
+        .and_then(|key| {
+            OpenAiCompatProvider::new(
+                provider,
+                backend_id,
+                key,
+                &b.base_url,
+                &b.model_default,
+                &b.model_hard,
+                &b.model_cheap,
+            )
+            .ok()
+        })
+        .map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
+}
+
 /// Wire up the brain from config, cheapest-capable-first (ADR-027):
 ///
 /// - `provider = "router"` / `"auto"` ⇒ the registry-aware [`RouterProvider`]
@@ -115,6 +157,14 @@ pub fn build_provider(cfg: ProviderConfig) -> Arc<dyn LlmProvider> {
                 None => cli,
             }
         }
+        "openai" => single_or_fallback(
+            build_openai_compat("openai", "openai-api", &cfg.openai),
+            ollama,
+        ),
+        "deepseek" => single_or_fallback(
+            build_openai_compat("deepseek", "deepseek-api", &cfg.deepseek),
+            ollama,
+        ),
         "ollama" => ollama.unwrap_or_else(|| Arc::new(Unconfigured)),
         // Default: Anthropic API primary, Ollama fallback.
         _ => match (anthropic, ollama) {
@@ -123,6 +173,19 @@ pub fn build_provider(cfg: ProviderConfig) -> Arc<dyn LlmProvider> {
             (None, Some(fallback)) => fallback,
             (None, None) => Arc::new(Unconfigured),
         },
+    }
+}
+
+/// A `primary` with a `fallback` behind it — or whichever exists, or Unconfigured.
+fn single_or_fallback(
+    primary: Option<Arc<dyn LlmProvider>>,
+    fallback: Option<Arc<dyn LlmProvider>>,
+) -> Arc<dyn LlmProvider> {
+    match (primary, fallback) {
+        (Some(p), Some(f)) => Arc::new(FallbackProvider::new(p, f)),
+        (Some(p), None) => p,
+        (None, Some(f)) => f,
+        (None, None) => Arc::new(Unconfigured),
     }
 }
 
@@ -144,6 +207,18 @@ pub fn build_router(cfg: ProviderConfig, availability: Arc<dyn Availability>) ->
         id: "claude-cli".into(),
         provider: build_claude_cli(&cfg),
     });
+    if let Some(deepseek) = build_openai_compat("deepseek", "deepseek-api", &cfg.deepseek) {
+        candidates.push(router::Candidate {
+            id: "deepseek-api".into(),
+            provider: deepseek,
+        });
+    }
+    if let Some(openai) = build_openai_compat("openai", "openai-api", &cfg.openai) {
+        candidates.push(router::Candidate {
+            id: "openai-api".into(),
+            provider: openai,
+        });
+    }
     if let Some(anthropic) = build_anthropic(&cfg) {
         candidates.push(router::Candidate {
             id: "anthropic-api".into(),
@@ -190,6 +265,7 @@ impl LlmProvider for Echo {
         Ok(ChatReply {
             text: format!("echo: {last}"),
             model: "stub".into(),
+            backend: Some("stub".into()),
             stop_reason: Some("end_turn".into()),
             usage: None,
         })
@@ -241,6 +317,8 @@ mod tests {
             ollama_url: "http://127.0.0.1:11434".into(),
             ollama_model: "llama3.2".into(),
             claude_cli_bin: "claude".into(),
+            openai: OpenAiBackend::default(),
+            deepseek: OpenAiBackend::default(),
         });
         // With no API key, this resolves to the Ollama-only brain.
         assert_eq!(brain.label(), "ollama:llama3.2");
@@ -258,6 +336,8 @@ mod tests {
             ollama_url: "http://127.0.0.1:11434".into(),
             ollama_model: "llama3.2".into(),
             claude_cli_bin: "claude".into(),
+            openai: OpenAiBackend::default(),
+            deepseek: OpenAiBackend::default(),
         });
         // CLI primary, API as the fallback ("vangnet als de CLI vol is").
         assert_eq!(brain.label(), "claude-cli:claude-sonnet-5→anthropic:claude-sonnet-5");
@@ -275,6 +355,8 @@ mod tests {
             ollama_url: "http://127.0.0.1:11434".into(),
             ollama_model: "llama3.2".into(),
             claude_cli_bin: "claude".into(),
+            openai: OpenAiBackend::default(),
+            deepseek: OpenAiBackend::default(),
         });
         // Registry-aware router over local + plan + API, in fixed id order.
         assert_eq!(brain.label(), "router[ollama,claude-cli,anthropic-api]");

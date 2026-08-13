@@ -40,6 +40,9 @@ pub struct AppState {
     pub llm: Arc<dyn llm::LlmProvider>,
     /// Max output tokens per assistant reply.
     pub llm_max_tokens: u32,
+    /// Jarvis' identity/persona (from `core/Jarvis.md`), prepended as the system
+    /// prompt on every chat. The single source of truth for "what Jarvis is".
+    pub jarvis_system: Arc<str>,
     /// Server-side speech engine (STT + speaker verification).
     pub speech: Arc<dyn speech::SpeechEngine>,
     /// Cosine threshold to accept a voice as the enrolled speaker.
@@ -592,13 +595,25 @@ async fn ibkr_positions(
     Ok(Json(json!({ "account": account, "positions": positions })))
 }
 
-/// Jarvis' persona, prepended server-side. Kept plain (no shouty emphasis):
-/// modern Claude models follow the system prompt closely.
-const JARVIS_SYSTEM: &str = "Je bent Jarvis, de persoonlijke AI-assistent op het HUD-dashboard van de gebruiker. \
+/// Fallback persona when `core/Jarvis.md` is absent (keeps dev/CI green without
+/// the file). The real identity lives in `core/Jarvis.md`, loaded at startup
+/// into [`AppState::jarvis_system`]. Kept plain: modern Claude models follow the
+/// system prompt closely.
+pub const JARVIS_SYSTEM_FALLBACK: &str = "Je bent Jarvis, de persoonlijke AI-assistent op het HUD-dashboard van de gebruiker. \
 Antwoord in het Nederlands, kort en duidelijk, in een rustige en behulpzame toon. \
 Je helpt met het systeem, de portfolio en trading-inzichten. \
 Zeg het eerlijk wanneer je iets niet zeker weet in plaats van te gokken. \
 Voer nooit trades of onomkeerbare acties uit — die vereisen altijd een expliciete bevestiging van de gebruiker.";
+
+/// Load Jarvis' persona from `path` (typically `core/Jarvis.md`). A missing,
+/// unreadable, or empty file falls back to [`JARVIS_SYSTEM_FALLBACK`] so the
+/// brain always has an identity. Returns the text and whether the file loaded.
+pub fn load_persona(path: &str) -> (Arc<str>, bool) {
+    match std::fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => (Arc::from(text.trim()), true),
+        _ => (Arc::from(JARVIS_SYSTEM_FALLBACK), false),
+    }
+}
 
 #[derive(Deserialize)]
 struct ChatTurn {
@@ -643,7 +658,10 @@ async fn assistant_chat(
     }
 
     let chat = llm::ChatRequest {
-        system: Some(req.system.unwrap_or_else(|| JARVIS_SYSTEM.to_string())),
+        system: Some(
+            req.system
+                .unwrap_or_else(|| state.jarvis_system.to_string()),
+        ),
         tier: req.tier.as_deref().map(llm::Tier::parse).unwrap_or_default(),
         messages,
         max_tokens: state.llm_max_tokens,
@@ -873,6 +891,23 @@ mod tests {
         assert_eq!(body["service"], "jarvis-api");
     }
 
+    #[test]
+    fn persona_falls_back_when_file_is_absent() {
+        let (text, loaded) = load_persona("does/not/exist/Jarvis.md");
+        assert!(!loaded);
+        assert_eq!(&*text, JARVIS_SYSTEM_FALLBACK);
+    }
+
+    #[test]
+    fn persona_loads_from_file_when_present() {
+        let path = std::env::temp_dir().join("jarvis_persona_test.md");
+        std::fs::write(&path, "  Je bent Jarvis, de kern.  \n").unwrap();
+        let (text, loaded) = load_persona(path.to_str().unwrap());
+        assert!(loaded);
+        assert_eq!(&*text, "Je bent Jarvis, de kern.");
+        let _ = std::fs::remove_file(&path);
+    }
+
     async fn body_json(resp: axum::response::Response) -> Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -893,6 +928,7 @@ mod tests {
             ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
             llm: jarvis_llm::stub(),
             llm_max_tokens: 256,
+            jarvis_system: std::sync::Arc::from(JARVIS_SYSTEM_FALLBACK),
             speech: jarvis_speech::stub(),
             speech_verify_threshold: 0.5,
             registry: std::sync::Arc::new(std::sync::RwLock::new(

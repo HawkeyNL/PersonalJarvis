@@ -80,6 +80,45 @@ pub struct AppConfig {
     #[serde(default = "default_claude_cli_bin")]
     pub llm_claude_cli_bin: String,
 
+    /// Path to Jarvis' canonical identity/persona doc (`core/Jarvis.md`), loaded
+    /// at startup as the system prompt. Missing/empty ⇒ a built-in fallback
+    /// persona is used. This is the single source of truth for "what Jarvis is".
+    #[serde(default = "default_llm_persona_path")]
+    pub llm_persona_path: String,
+
+    /// OpenAI API key. Secret — redacted in `Debug`. Empty ⇒ OpenAI disabled.
+    #[serde(default)]
+    pub llm_openai_api_key: String,
+    #[serde(default = "default_openai_base_url")]
+    pub llm_openai_base_url: String,
+    #[serde(default = "default_openai_model")]
+    pub llm_openai_model: String,
+    #[serde(default = "default_openai_model")]
+    pub llm_openai_model_hard: String,
+    #[serde(default = "default_openai_model_cheap")]
+    pub llm_openai_model_cheap: String,
+
+    /// DeepSeek API key (OpenAI-compatible). Secret. Empty ⇒ DeepSeek disabled.
+    #[serde(default)]
+    pub llm_deepseek_api_key: String,
+    #[serde(default = "default_deepseek_base_url")]
+    pub llm_deepseek_base_url: String,
+    #[serde(default = "default_deepseek_model")]
+    pub llm_deepseek_model: String,
+    #[serde(default = "default_deepseek_model_hard")]
+    pub llm_deepseek_model_hard: String,
+    #[serde(default = "default_deepseek_model")]
+    pub llm_deepseek_model_cheap: String,
+
+    /// Hard monthly spend cap (EUR) across all metered API backends. Once
+    /// reached, the router refuses paid calls and falls back to the plan/Ollama.
+    #[serde(default = "default_llm_monthly_budget_eur")]
+    pub llm_monthly_budget_eur: f64,
+
+    /// EUR per 1 USD, to convert provider (USD) pricing into the EUR budget.
+    #[serde(default = "default_eur_per_usd")]
+    pub llm_eur_per_usd: f64,
+
     /// Speech engine (STT + speaker verification): `stub` (default) until a real
     /// model is plugged in.
     #[serde(default = "default_speech_provider")]
@@ -150,6 +189,51 @@ fn default_claude_cli_bin() -> String {
     "claude".to_string()
 }
 
+fn default_llm_persona_path() -> String {
+    "core/Jarvis.md".to_string()
+}
+
+fn default_openai_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
+fn default_openai_model() -> String {
+    "gpt-4o".to_string()
+}
+
+fn default_openai_model_cheap() -> String {
+    "gpt-4o-mini".to_string()
+}
+
+fn default_deepseek_base_url() -> String {
+    "https://api.deepseek.com/v1".to_string()
+}
+
+fn default_deepseek_model() -> String {
+    "deepseek-chat".to_string()
+}
+
+fn default_deepseek_model_hard() -> String {
+    "deepseek-reasoner".to_string()
+}
+
+fn default_llm_monthly_budget_eur() -> f64 {
+    50.0
+}
+
+fn default_eur_per_usd() -> f64 {
+    0.92
+}
+
+/// `<none>` for an empty secret, `<redacted>` otherwise — never the value.
+fn redact(secret: &str) -> &'static str {
+    if secret.trim().is_empty() {
+        "<none>"
+    } else {
+        "<redacted>"
+    }
+}
+
 fn default_speech_provider() -> String {
     "stub".to_string()
 }
@@ -199,6 +283,15 @@ impl fmt::Debug for AppConfig {
             .field("llm_ollama_url", &self.llm_ollama_url)
             .field("llm_ollama_model", &self.llm_ollama_model)
             .field("llm_claude_cli_bin", &self.llm_claude_cli_bin)
+            .field("llm_persona_path", &self.llm_persona_path)
+            .field("llm_openai_api_key", &redact(&self.llm_openai_api_key))
+            .field("llm_openai_base_url", &self.llm_openai_base_url)
+            .field("llm_openai_model", &self.llm_openai_model)
+            .field("llm_deepseek_api_key", &redact(&self.llm_deepseek_api_key))
+            .field("llm_deepseek_base_url", &self.llm_deepseek_base_url)
+            .field("llm_deepseek_model", &self.llm_deepseek_model)
+            .field("llm_monthly_budget_eur", &self.llm_monthly_budget_eur)
+            .field("llm_eur_per_usd", &self.llm_eur_per_usd)
             .field("speech_provider", &self.speech_provider)
             .field("speech_verify_threshold", &self.speech_verify_threshold)
             .field("speech_whisper_model", &self.speech_whisper_model)
@@ -229,6 +322,19 @@ mod tests {
             llm_ollama_url: "http://localhost:11434".to_string(),
             llm_ollama_model: "llama3.2".to_string(),
             llm_claude_cli_bin: "claude".to_string(),
+            llm_persona_path: "core/Jarvis.md".to_string(),
+            llm_openai_api_key: "sk-openai-supersecret".to_string(),
+            llm_openai_base_url: "https://api.openai.com/v1".to_string(),
+            llm_openai_model: "gpt-4o".to_string(),
+            llm_openai_model_hard: "gpt-4o".to_string(),
+            llm_openai_model_cheap: "gpt-4o-mini".to_string(),
+            llm_deepseek_api_key: "sk-deepseek-supersecret".to_string(),
+            llm_deepseek_base_url: "https://api.deepseek.com/v1".to_string(),
+            llm_deepseek_model: "deepseek-chat".to_string(),
+            llm_deepseek_model_hard: "deepseek-reasoner".to_string(),
+            llm_deepseek_model_cheap: "deepseek-chat".to_string(),
+            llm_monthly_budget_eur: 50.0,
+            llm_eur_per_usd: 0.92,
             speech_provider: "stub".to_string(),
             speech_verify_threshold: 0.5,
             speech_whisper_model: None,

@@ -95,6 +95,7 @@ impl LlmProvider for OllamaProvider {
         Ok(ChatReply {
             text,
             model: self.model.clone(),
+            backend: Some("ollama".into()),
             stop_reason: v
                 .get("done_reason")
                 .and_then(Value::as_str)

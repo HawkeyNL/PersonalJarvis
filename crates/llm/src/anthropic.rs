@@ -142,6 +142,7 @@ impl LlmProvider for AnthropicProvider {
         Ok(ChatReply {
             text,
             model,
+            backend: Some("anthropic-api".into()),
             stop_reason,
             usage,
         })
