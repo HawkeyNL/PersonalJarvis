@@ -1,11 +1,22 @@
 // Conversation state with Jarvis. The brain is the backend `/v1/assistant/chat`
 // endpoint (DEC-001 = Claude, provider-abstracted with an Ollama fallback). The
-// API key lives only in the backend — never here. The chat, voice-output policy
-// and TTS are handled client-side.
+// API key lives only in the backend — never here.
+//
+// Chats are persisted server-side and grouped into conversations ("tabs",
+// ADR-030): every turn is stored, and when you switch topic Jarvis splits the
+// thread into a new conversation. This module owns the *current* conversation's
+// messages; the tab list lives in `conversations.ts`.
 import { ref } from "vue";
 import { speak } from "./voice";
 import { currentSession } from "./auth";
-import { postJsonAuth } from "./api";
+import { postJsonAuth, getJsonAuth } from "./api";
+import {
+  currentId,
+  setCurrent,
+  savedCurrentId,
+  loadConversations,
+  conversations,
+} from "./conversations";
 
 export type Role = "user" | "jarvis";
 export interface Msg {
@@ -34,10 +45,11 @@ interface ChatReply {
   reply: string;
   model: string | null;
   stop_reason: string | null;
+  conversation_id?: string;
+  conversation_title?: string;
+  new_topic?: boolean;
 }
 
-// Ask the backend brain, sending the conversation so far. The persona/system
-// prompt is prepended server-side, so we only send the raw turns.
 // Only send the most recent turns so a long chat can't grow the request (and
 // token cost) without bound. The system prompt is added server-side.
 const MAX_TURNS = 20;
@@ -51,7 +63,48 @@ async function ask(): Promise<ChatReply> {
   }));
   return await postJsonAuth<ChatReply>("/v1/assistant/chat", session.token, {
     messages: history,
+    conversation_id: currentId.value,
   });
+}
+
+/** Load a conversation's history into the view and make it the current tab. */
+export async function openConversation(id: string): Promise<void> {
+  setCurrent(id);
+  const session = await currentSession();
+  if (!session.token) return;
+  const res = await getJsonAuth<{
+    id: string;
+    title: string;
+    messages: { role: string; content: string; model: string | null; at: string }[];
+  }>(`/v1/conversations/${id}`, session.token);
+  messages.value = res.messages.map((m) => ({
+    id: idc++,
+    role: m.role === "assistant" ? "jarvis" : "user",
+    text: m.content,
+    ts: m.at?.slice(11) || stamp(), // "YYYY-MM-DD HH:MM" → "HH:MM"
+    spoken: false,
+  }));
+}
+
+/** Start a fresh conversation: the next message opens a new tab server-side. */
+export function startNewConversation(): void {
+  setCurrent(null);
+  messages.value = [];
+}
+
+/** On launch, restore the tab list and reopen the last (or most recent) chat,
+ *  so the conversation is right there after an app restart. */
+export async function initChat(): Promise<void> {
+  try {
+    await loadConversations();
+    const saved = savedCurrentId();
+    const exists = saved && conversations.value.some((c) => c.id === saved);
+    const target = exists ? saved! : (conversations.value[0]?.id ?? null);
+    if (target) await openConversation(target);
+    else startNewConversation();
+  } catch {
+    // Offline or not logged in yet — leave the chat empty; it'll load later.
+  }
 }
 
 /** Send a user message; Jarvis replies (and speaks if the policy allows). */
@@ -60,10 +113,24 @@ export async function send(input: string): Promise<void> {
   if (!t) return;
   push("user", t);
   thinking.value = true;
+  const hadHistory = messages.value.length > 1;
   try {
     const res = await ask();
     const spoken = speak(res.reply); // speaks only when canSpeak() allows
-    push("jarvis", res.reply, spoken);
+
+    // The server may have placed this turn in a different conversation: the very
+    // first message (no tab yet) or a mid-chat topic split. Follow it.
+    const moved = !!res.conversation_id && res.conversation_id !== currentId.value;
+    if (moved) setCurrent(res.conversation_id!);
+
+    if (res.new_topic && moved && hadHistory) {
+      // A topic split: reload the new thread so the tab shows only its own turns.
+      await openConversation(res.conversation_id!);
+    } else {
+      push("jarvis", res.reply, spoken);
+    }
+    // Refresh the tab list (new tab / updated title + order).
+    void loadConversations();
   } catch (e) {
     const detail = e instanceof Error ? e.message : "onbekende fout";
     push(

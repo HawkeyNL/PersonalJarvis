@@ -1,7 +1,15 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from "vue";
 import NavIcon from "./NavIcon.vue";
-import { messages, send, thinking } from "../assistant";
+import {
+  messages,
+  send,
+  thinking,
+  openConversation,
+  startNewConversation,
+  initChat,
+} from "../assistant";
+import { conversations, currentId, deleteConversation } from "../conversations";
 import { renderMarkdown, handleMarkdownClick } from "../markdown";
 import { useMic } from "../useMic";
 import { wakePulse } from "../voicewake";
@@ -66,14 +74,53 @@ async function toggleHeadset() {
   await refreshRoute();
 }
 
-onMounted(refreshRoute);
+// Conversation tabs (ADR-030).
+function switchTo(id: string) {
+  if (id !== currentId.value) void openConversation(id);
+}
+function newChat() {
+  startNewConversation();
+}
+async function removeChat(id: string) {
+  const next = await deleteConversation(id);
+  if (next) await openConversation(next);
+  else startNewConversation();
+}
+
+onMounted(async () => {
+  refreshRoute();
+  await initChat();
+});
 </script>
 
 <template>
   <div class="console">
-    <!-- Conversation, floating over the living backdrop. -->
-    <div class="transcript" :class="{ dim: revealed }">
-      <TransitionGroup name="line">
+    <div class="stack">
+      <!-- Conversation tabs: Jarvis groups chats by topic (ADR-030). -->
+      <div class="tabs" v-if="conversations.length">
+        <button
+          v-for="c in conversations"
+          :key="c.id"
+          class="tab"
+          :class="{ active: c.id === currentId }"
+          :title="c.title"
+          @click="switchTo(c.id)"
+        >
+          <span class="tab-title">{{ c.title }}</span>
+          <span
+            v-if="c.id === currentId"
+            class="tab-x"
+            title="Gesprek verwijderen"
+            @click.stop="removeChat(c.id)"
+            >×</span
+          >
+        </button>
+        <button class="tab new" title="Nieuw gesprek" @click="newChat">+</button>
+      </div>
+
+      <!-- Conversation, floating over the living backdrop. -->
+      <div class="transcript" :class="{ dim: revealed }">
+        <TransitionGroup name="line">
         <div v-for="m in recent" :key="m.id" class="line" :class="m.role">
           <span class="who">{{ m.role === "jarvis" ? "JARVIS" : "JIJ" }}</span>
           <!-- Jarvis speaks Markdown; the user's own text stays literal. -->
@@ -87,10 +134,11 @@ onMounted(refreshRoute);
           <span v-if="m.role === 'jarvis' && m.spoken" class="spoke">🔊</span>
         </div>
       </TransitionGroup>
-      <p v-if="thinking" class="line jarvis thinking" key="thinking">
-        <span class="who">JARVIS</span>
-        <span class="dots"><span></span><span></span><span></span></span>
-      </p>
+        <p v-if="thinking" class="line jarvis thinking" key="thinking">
+          <span class="who">JARVIS</span>
+          <span class="dots"><span></span><span></span><span></span></span>
+        </p>
+      </div>
     </div>
 
     <!-- Bottom-left hover zone reveals the input. -->
@@ -160,12 +208,76 @@ onMounted(refreshRoute);
   pointer-events: none; /* let the backdrop breathe; children re-enable */
 }
 
-/* Transcript floats bottom-left, above the input zone. */
-.transcript {
+/* Tabs + transcript stack, floating bottom-left above the input zone. */
+.stack {
   position: absolute;
   left: clamp(20px, 5vw, 64px);
   bottom: 132px;
   width: min(46ch, 60vw);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none; /* only the tabs re-enable clicks */
+}
+
+/* Conversation tabs — Jarvis groups chats by topic. */
+.tabs {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  pointer-events: auto;
+  padding-bottom: 2px;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar {
+  display: none;
+}
+.tab {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 22ch;
+  padding: 4px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  background: rgba(6, 14, 10, 0.55);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.tab:hover {
+  border-color: var(--accent);
+}
+.tab.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 10px rgba(52, 245, 160, 0.25);
+}
+.tab-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tab-x {
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.7;
+}
+.tab-x:hover {
+  opacity: 1;
+  color: #ff6b6b;
+}
+.tab.new {
+  font-size: 15px;
+  padding: 4px 11px;
+  color: var(--accent);
+}
+
+.transcript {
   display: flex;
   flex-direction: column;
   gap: 10px;
