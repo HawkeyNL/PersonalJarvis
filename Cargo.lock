@@ -1081,6 +1081,7 @@ dependencies = [
  "jarvis-identity",
  "jarvis-llm",
  "jarvis-observability",
+ "jarvis-orchestrator",
  "jarvis-portfolio",
  "jarvis-registry",
  "jarvis-speech",
@@ -1151,6 +1152,18 @@ version = "0.1.0"
 dependencies = [
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "jarvis-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "jarvis-llm",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 # ADR-028 — Model-per-taak routing + plan→execute (goedkoopste geschikte intelligentie)
 
-- Status: geaccepteerd (fases 1 + 2 gebouwd) — 13 augustus 2026
+- Status: geaccepteerd (fases 1 + 2 + 3 gebouwd) — 13 augustus 2026
 - Bouwt op ADR-027 (kosten-bewuste brein-router + registry + budget) en op
   `core/Jarvis.md` §6 (Orchestrator First), §7 (Agent Specialization),
   §9 (Cheapest Sufficient Intelligence)
@@ -64,13 +64,26 @@ claude-cli) respecteren 'm en vallen anders terug op hun eigen tier-model.
 Nog open: de **taak-klasse** komt nu uit de tier-hint van de client; een goedkope
 **classifier** (bepaalt zelf licht/zwaar) is de volgende verfijning.
 
-### Fase 3 — Plan→execute-orchestrator (nog te bouwen)
+### Fase 3 — Plan→execute-orchestrator ✅ gebouwd
 
-Een orchestratiestap (§6) voor zware taken: een **plan-model** (`heavy`/
-`reasoning`, bv. Opus) maakt een plan/architectuur; de **uitvoering** van de
-deelstappen gaat naar goedkope `light`/`mid`-modellen, met een verificatie-stap
-(§10) die het resultaat tegen het plan + `core/Jarvis.md` toetst. Dit is de brug
-naar de Engineering Orchestrator (JAR-060) en de agentische laag (ADR-027 stage 4).
+Crate `jarvis-orchestrator`: `plan_and_execute(llm, task, persona)` doet §6
+"Orchestrator First" in drie fasen, elk via de kosten-router:
+- **Plan** — tier `Hard` (router → `heavy`, bv. Opus op het plan): verdeel de taak
+  in 2–6 stappen (JSON `{"steps":[…]}`, robuust geparsed met fallback op
+  genummerde regels; max 6 stappen).
+- **Execute** — tier `Cheap` per stap (goedkoop/lokaal `light`), met de taak, het
+  plan en eerdere resultaten als context.
+- **Synthesize + toets** — tier `Default`: voegt de deelresultaten samen tot één
+  antwoord en meldt eerlijk wat ontbreekt (§10).
+
+Endpoint `POST /v1/assistant/orchestrate` (`{task}` → `{plan, steps, answer}`),
+beveiligd; elke onderliggende call wordt tegen het budget geboekt (ADR-027).
+
+**Veiligheidsgrens (bewust):** dit is **pure LLM-orchestratie — geen tools,
+shell, of bestandsacties**. Écht uitvoeren (commando's draaien, code naar disk)
+is de **agentische laag** (ADR-027 stage 4) achter een allowlist + expliciete
+goedkeuring; biometrie blijft het slot. Fase 3 levert het denk-/plan-werk, niet
+de handen.
 
 ### Fase 4 — Zelfontwikkeling (later)
 

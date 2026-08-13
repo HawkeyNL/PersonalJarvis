@@ -22,6 +22,7 @@ use uuid::Uuid;
 use jarvis_ibkr as ibkr;
 use jarvis_identity as identity;
 use jarvis_llm as llm;
+use jarvis_orchestrator as orchestrator;
 use jarvis_portfolio as portfolio;
 use jarvis_registry as registry;
 use jarvis_speech as speech;
@@ -84,6 +85,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/broker/ibkr/status", get(ibkr_status))
         .route("/v1/broker/ibkr/positions", get(ibkr_positions))
         .route("/v1/assistant/chat", post(assistant_chat))
+        .route("/v1/assistant/orchestrate", post(assistant_orchestrate))
         .route("/v1/voice/status", get(voice_status))
         .route("/v1/voice/enroll", post(voice_enroll))
         .route("/v1/voice/verify", post(voice_verify))
@@ -701,6 +703,58 @@ async fn assistant_chat(
                 Json(json!({
                     "error": "brain unavailable",
                     "hint": "controleer JARVIS_LLM_API_KEY of start Ollama lokaal",
+                })),
+            ))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OrchestrateReq {
+    /// The task to plan and carry out.
+    task: String,
+}
+
+/// Plan→execute a task (ADR-028 fase 3): a strong model plans, cheap models run
+/// the steps, a synthesis composes + checks. Pure reasoning — no tools/actions.
+/// Every underlying call is billed against the budget (ADR-027).
+async fn assistant_orchestrate(
+    _authed: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<OrchestrateReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let task = req.task.trim();
+    if task.is_empty() {
+        return Err(bad_request("task is required"));
+    }
+    match orchestrator::plan_and_execute(&state.llm, task, &state.jarvis_system).await {
+        Ok(run) => {
+            for reply in &run.calls {
+                record_usage(&state, reply).await;
+            }
+            let steps: Vec<Value> = run
+                .steps
+                .iter()
+                .map(|s| json!({ "step": s.step, "output": s.output, "model": s.model }))
+                .collect();
+            Ok(Json(json!({
+                "plan": run.plan,
+                "steps": steps,
+                "answer": run.answer,
+            })))
+        }
+        Err(llm::LlmError::Refused) => Ok(Json(json!({
+            "answer": "Sorry, daar kan ik niet op antwoorden.",
+            "plan": Value::Array(vec![]),
+            "steps": Value::Array(vec![]),
+        }))),
+        Err(e) => {
+            tracing::warn!(error = %e, "orchestration failed");
+            Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": "brain unavailable",
+                    "hint": "controleer je brein-config (router/keys/Ollama)",
                 })),
             ))
         }
