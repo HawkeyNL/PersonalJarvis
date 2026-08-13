@@ -6,6 +6,7 @@
 //! the webview, or logs.
 
 mod anthropic;
+mod claude_cli;
 mod fallback;
 mod ollama;
 mod types;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 pub use anthropic::AnthropicProvider;
+pub use claude_cli::ClaudeCliProvider;
 pub use fallback::FallbackProvider;
 pub use ollama::OllamaProvider;
 pub use types::{ChatMessage, ChatReply, ChatRequest, LlmError, Role, Tier, Usage};
@@ -31,9 +33,9 @@ pub trait LlmProvider: Send + Sync {
 /// Inputs for [`build_provider`] — flat so the API service can map from its
 /// `AppConfig` without this crate depending on the config crate.
 pub struct ProviderConfig {
-    /// `anthropic` (default) or `ollama`.
+    /// `anthropic` (default), `claude-cli` (your Claude plan) or `ollama`.
     pub provider: String,
-    /// Anthropic API key; `None`/empty ⇒ Anthropic disabled (Ollama only).
+    /// Anthropic API key; `None`/empty ⇒ Anthropic disabled (used as fallback).
     pub api_key: Option<String>,
     pub anthropic_base_url: String,
     pub model_default: String,
@@ -41,43 +43,63 @@ pub struct ProviderConfig {
     pub model_cheap: String,
     pub ollama_url: String,
     pub ollama_model: String,
+    /// Path/name of the `claude` CLI (for `provider = "claude-cli"`).
+    pub claude_cli_bin: String,
 }
 
-/// Wire up the brain from config.
+/// Wire up the brain from config, cheapest-capable-first (ADR-027):
 ///
-/// - `provider = "anthropic"` + key present ⇒ Anthropic with a local Ollama
-///   fallback (falls back on transport/API errors, not on refusals).
-/// - `provider = "ollama"`, or no Anthropic key ⇒ Ollama only.
-/// - Neither buildable ⇒ an [`Unconfigured`] brain that returns a clear error.
+/// - `provider = "claude-cli"` ⇒ your Claude *plan* via the `claude` CLI, with
+///   the Anthropic API (else Ollama) as the fallback when the plan is full.
+/// - `provider = "anthropic"` + key ⇒ Anthropic, Ollama as local fallback.
+/// - `provider = "ollama"`, or nothing else buildable ⇒ Ollama only.
+/// - Nothing buildable ⇒ an [`Unconfigured`] brain that returns a clear error.
+///
+/// Fallback is reactive: try the primary, fall through on any error except a
+/// genuine refusal. (Proactive %-of-plan routing is a later stage.)
 pub fn build_provider(cfg: ProviderConfig) -> Arc<dyn LlmProvider> {
     let ollama: Option<Arc<dyn LlmProvider>> = OllamaProvider::new(&cfg.ollama_url, &cfg.ollama_model)
         .ok()
         .map(|p| Arc::new(p) as Arc<dyn LlmProvider>);
 
-    let anthropic: Option<Arc<dyn LlmProvider>> = if cfg.provider.eq_ignore_ascii_case("anthropic") {
-        cfg.api_key
-            .as_deref()
-            .filter(|k| !k.trim().is_empty())
-            .and_then(|key| {
-                AnthropicProvider::new(
-                    key,
-                    &cfg.anthropic_base_url,
-                    &cfg.model_default,
-                    &cfg.model_hard,
-                    &cfg.model_cheap,
-                )
-                .ok()
-            })
-            .map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
-    } else {
-        None
-    };
+    // Anthropic is buildable whenever a key is present — as a primary or a fallback.
+    let anthropic: Option<Arc<dyn LlmProvider>> = cfg
+        .api_key
+        .as_deref()
+        .filter(|k| !k.trim().is_empty())
+        .and_then(|key| {
+            AnthropicProvider::new(
+                key,
+                &cfg.anthropic_base_url,
+                &cfg.model_default,
+                &cfg.model_hard,
+                &cfg.model_cheap,
+            )
+            .ok()
+        })
+        .map(|p| Arc::new(p) as Arc<dyn LlmProvider>);
 
-    match (anthropic, ollama) {
-        (Some(primary), Some(fallback)) => Arc::new(FallbackProvider::new(primary, fallback)),
-        (Some(primary), None) => primary,
-        (None, Some(fallback)) => fallback,
-        (None, None) => Arc::new(Unconfigured),
+    match cfg.provider.to_ascii_lowercase().as_str() {
+        "claude-cli" => {
+            let cli: Arc<dyn LlmProvider> = Arc::new(ClaudeCliProvider::new(
+                &cfg.claude_cli_bin,
+                &cfg.model_default,
+                &cfg.model_hard,
+                &cfg.model_cheap,
+            ));
+            match anthropic.or(ollama) {
+                Some(fallback) => Arc::new(FallbackProvider::new(cli, fallback)),
+                None => cli,
+            }
+        }
+        "ollama" => ollama.unwrap_or_else(|| Arc::new(Unconfigured)),
+        // Default: Anthropic API primary, Ollama fallback.
+        _ => match (anthropic, ollama) {
+            (Some(primary), Some(fallback)) => Arc::new(FallbackProvider::new(primary, fallback)),
+            (Some(primary), None) => primary,
+            (None, Some(fallback)) => fallback,
+            (None, None) => Arc::new(Unconfigured),
+        },
     }
 }
 
@@ -165,8 +187,26 @@ mod tests {
             // (reqwest client builds regardless); this only checks wiring.
             ollama_url: "http://127.0.0.1:11434".into(),
             ollama_model: "llama3.2".into(),
+            claude_cli_bin: "claude".into(),
         });
         // With no API key, this resolves to the Ollama-only brain.
         assert_eq!(brain.label(), "ollama:llama3.2");
+    }
+
+    #[test]
+    fn claude_cli_falls_back_to_api_when_keyed() {
+        let brain = build_provider(ProviderConfig {
+            provider: "claude-cli".into(),
+            api_key: Some("sk-ant-test".into()),
+            anthropic_base_url: "https://api.anthropic.com".into(),
+            model_default: "claude-sonnet-5".into(),
+            model_hard: "claude-opus-5".into(),
+            model_cheap: "claude-haiku-4-5".into(),
+            ollama_url: "http://127.0.0.1:11434".into(),
+            ollama_model: "llama3.2".into(),
+            claude_cli_bin: "claude".into(),
+        });
+        // CLI primary, API as the fallback ("vangnet als de CLI vol is").
+        assert_eq!(brain.label(), "claude-cli:claude-sonnet-5→anthropic:claude-sonnet-5");
     }
 }

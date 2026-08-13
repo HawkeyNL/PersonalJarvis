@@ -40,6 +40,10 @@ Parallel blijft staan: live test Jarvis-brein (`JARVIS_LLM_API_KEY` in backend-`
 - Lokale hardware versus cloud-API
 
 ## Laatste update
+13 augustus 2026
+
+- **Kosten-bewuste brein-router — stage 1 (ADR-027)**: nieuwe `ClaudeCliProvider` draait Jarvis' brein op je **Claude-abonnement** via de lokale `claude` CLI headless (`claude -p --output-format json --model … --append-system-prompt …`, neutrale werkmap, geen tools) i.p.v. de betaalde API. `JARVIS_LLM_PROVIDER=claude-cli` → CLI primair met de **API als reactief vangnet** (elke CLI-fout, incl. plan/rate-limit → `FallbackProvider` schakelt door). Router in `build_provider` kiest nu goedkoopste-geschikte-eerst; config `JARVIS_LLM_CLAUDE_CLI_BIN`. llm 11 tests (incl. output-parsing + routing), config 2, api 3, clippy schoon. Proactieve "tot 98%"-drempel, resource/agent-registry en MCP-tool-laag = stages 2–4 in de ADR.
+
 10 augustus 2026
 
 - **Echt speaker-model — stage 2 (MFCC, pure Rust, ADR-025)**: `embed` is nu een echte stem-timbre-embedding (`crates/speech/src/speaker.rs`: per-frame MFCC's via `rustfft` → mean+std, c0 weggelaten, L2-genormaliseerd) i.p.v. de energie-stub — gedeeld door de default- én whisper-engine. Geen model/download/native-dep; hier compileerbaar + unit-getest (deterministisch én onderscheidt verschillende stemprofielen). Default-engine heet nu `baseline` (echte speaker-verify, nog geen STT). Client: **microfoon-keuze** in Settings (`micDevices.ts` → voiceCapture + wakeDetector). Speech 7 tests, api 3, clippy schoon; client build groen. Neuraal ECAPA/wespeaker-ONNX blijft een optionele accuraatheids-upgrade achter dezelfde `embed`.

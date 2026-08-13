@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         model_cheap: config.llm_model_cheap.clone(),
         ollama_url: config.llm_ollama_url.clone(),
         ollama_model: config.llm_ollama_model.clone(),
+        claude_cli_bin: config.llm_claude_cli_bin.clone(),
     });
     tracing::info!(brain = %llm.label(), "llm brain configured");
 

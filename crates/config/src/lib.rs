@@ -75,6 +75,11 @@ pub struct AppConfig {
     #[serde(default = "default_ollama_model")]
     pub llm_ollama_model: String,
 
+    /// Path/name of the `claude` CLI, used when `llm_provider = "claude-cli"`
+    /// (runs the brain on your Claude subscription; see decisions/ADR-027).
+    #[serde(default = "default_claude_cli_bin")]
+    pub llm_claude_cli_bin: String,
+
     /// Speech engine (STT + speaker verification): `stub` (default) until a real
     /// model is plugged in.
     #[serde(default = "default_speech_provider")]
@@ -141,6 +146,10 @@ fn default_ollama_model() -> String {
     "llama3.2".to_string()
 }
 
+fn default_claude_cli_bin() -> String {
+    "claude".to_string()
+}
+
 fn default_speech_provider() -> String {
     "stub".to_string()
 }
@@ -189,6 +198,7 @@ impl fmt::Debug for AppConfig {
             .field("llm_max_tokens", &self.llm_max_tokens)
             .field("llm_ollama_url", &self.llm_ollama_url)
             .field("llm_ollama_model", &self.llm_ollama_model)
+            .field("llm_claude_cli_bin", &self.llm_claude_cli_bin)
             .field("speech_provider", &self.speech_provider)
             .field("speech_verify_threshold", &self.speech_verify_threshold)
             .field("speech_whisper_model", &self.speech_whisper_model)
@@ -218,6 +228,7 @@ mod tests {
             llm_max_tokens: 1024,
             llm_ollama_url: "http://localhost:11434".to_string(),
             llm_ollama_model: "llama3.2".to_string(),
+            llm_claude_cli_bin: "claude".to_string(),
             speech_provider: "stub".to_string(),
             speech_verify_threshold: 0.5,
             speech_whisper_model: None,
