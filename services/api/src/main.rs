@@ -37,9 +37,14 @@ async fn main() -> anyhow::Result<()> {
         .acquire_timeout(Duration::from_secs(5))
         .connect_lazy(&config.database_url)?;
 
-    match sqlx::migrate!("../../migrations").run(&db).await {
-        Ok(()) => tracing::info!("database migrations up to date"),
-        Err(e) => tracing::warn!(error = %e, "migrations did not run (is postgres up?)"),
+    if let Err(error) = sqlx::migrate!("../../migrations").run(&db).await {
+        if config.environment == "production" {
+            tracing::error!(%error, "database migrations failed; refusing to start in production");
+            return Err(error.into());
+        }
+        tracing::warn!(%error, "database migrations did not run; continuing outside production");
+    } else {
+        tracing::info!("database migrations up to date");
     }
 
     // Server-side speech (STT + speaker verification). `stub` by default; set
