@@ -146,11 +146,22 @@ const adviceCancelled = ref(false);
 // Held while a request is in flight so the user can abort it — aborting also
 // stops the server-side LLM call, so a cancel doesn't keep burning tokens.
 const adviceCtrl = ref<AbortController | null>(null);
+// Live elapsed seconds so the status shows real progress, not just a spinner.
+const adviceElapsed = ref(0);
+let adviceTimer: number | undefined;
+const elapsedLabel = computed(() => {
+  const m = Math.floor(adviceElapsed.value / 60);
+  const s = adviceElapsed.value % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+});
 
 async function askSelfImprove() {
   adviceBusy.value = true;
   adviceError.value = null;
   adviceCancelled.value = false;
+  adviceElapsed.value = 0;
+  clearInterval(adviceTimer);
+  adviceTimer = window.setInterval(() => (adviceElapsed.value += 1), 1000);
   const ctrl = new AbortController();
   adviceCtrl.value = ctrl;
   try {
@@ -175,6 +186,7 @@ async function askSelfImprove() {
   } finally {
     adviceBusy.value = false;
     adviceCtrl.value = null;
+    clearInterval(adviceTimer);
   }
 }
 
@@ -309,9 +321,14 @@ onMounted(() => {
           <span class="thinking">
             Jarvis denkt na<span class="dots"><span></span><span></span><span></span></span>
           </span>
+          <span class="sd-elapsed">{{ elapsedLabel }}</span>
           <button class="ghost" @click="cancelSelfImprove">Annuleren</button>
         </template>
       </div>
+      <p v-if="adviceBusy" class="muted small sd-status">
+        raadpleegt <code>{{ reg?.active_brain || "brein" }}</code> · leest het
+        ecosysteem en stelt verbetervoorstellen op
+      </p>
       <p v-if="adviceCancelled" class="muted small">Geannuleerd.</p>
       <p v-if="adviceError" class="muted err">{{ adviceError }}</p>
       <template v-if="advice">
@@ -605,6 +622,15 @@ onMounted(() => {
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+}
+.sd-elapsed {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.sd-status {
+  margin: 8px 0 0;
 }
 .thinking {
   display: inline-flex;
