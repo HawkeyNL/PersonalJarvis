@@ -13,3 +13,37 @@ pub fn bounded_text(value: &str, max_len: usize) -> bool {
 pub fn is_hex_of_len(value: &str, len: usize) -> bool {
     value.len() == len && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_text_rejects_empty_and_oversized() {
+        assert!(bounded_text("iPhone", MAX_DEVICE_NAME_LEN));
+        assert!(bounded_text(&"x".repeat(MAX_DEVICE_NAME_LEN), MAX_DEVICE_NAME_LEN));
+        assert!(!bounded_text("", MAX_DEVICE_NAME_LEN));
+        assert!(!bounded_text("   ", MAX_DEVICE_NAME_LEN)); // whitespace-only
+        assert!(!bounded_text(
+            &"x".repeat(MAX_DEVICE_NAME_LEN + 1),
+            MAX_DEVICE_NAME_LEN
+        ));
+    }
+
+    #[test]
+    fn is_hex_of_len_requires_exact_length_and_hex() {
+        assert!(is_hex_of_len(
+            &"a".repeat(ED25519_PUBLIC_KEY_HEX_LEN),
+            ED25519_PUBLIC_KEY_HEX_LEN
+        ));
+        assert!(is_hex_of_len(
+            &"0".repeat(ED25519_SIGNATURE_HEX_LEN),
+            ED25519_SIGNATURE_HEX_LEN
+        ));
+        assert!(!is_hex_of_len("abcd", ED25519_PUBLIC_KEY_HEX_LEN)); // too short
+        assert!(!is_hex_of_len(
+            &"z".repeat(ED25519_PUBLIC_KEY_HEX_LEN),
+            ED25519_PUBLIC_KEY_HEX_LEN
+        )); // non-hex chars
+    }
+}

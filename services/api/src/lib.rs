@@ -36,6 +36,8 @@ use jarvis_usage as usage;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
+mod validation;
+
 /// Shared, cheaply-cloneable application state.
 #[derive(Clone)]
 pub struct AppState {
@@ -216,6 +218,17 @@ async fn auth_enroll(
             Json(json!({ "error": "enrollment is disabled in production" })),
         ));
     }
+    // Bound the free-text fields and pin the key to an exact-length hex string
+    // before it ever reaches the DB or crypto layer (fail closed on junk input).
+    if !validation::bounded_text(&req.name, validation::MAX_DEVICE_NAME_LEN) {
+        return Err(bad_request("invalid device name"));
+    }
+    if !validation::bounded_text(&req.platform, validation::MAX_PLATFORM_LEN) {
+        return Err(bad_request("invalid platform"));
+    }
+    if !validation::is_hex_of_len(&req.public_key, validation::ED25519_PUBLIC_KEY_HEX_LEN) {
+        return Err(bad_request("invalid public_key"));
+    }
     let platform =
         identity::Platform::parse(&req.platform).map_err(|_| bad_request("unknown platform"))?;
     let public_key =
@@ -273,6 +286,9 @@ async fn auth_login(
     State(state): State<AppState>,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !validation::is_hex_of_len(&req.signature, validation::ED25519_SIGNATURE_HEX_LEN) {
+        return Err(bad_request("invalid signature"));
+    }
     let signature = hex::decode(&req.signature).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -433,6 +449,9 @@ async fn unlock_approve(
     Path(id): Path<Uuid>,
     Json(req): Json<ApproveReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !validation::is_hex_of_len(&req.signature, validation::ED25519_SIGNATURE_HEX_LEN) {
+        return Err(bad_request("invalid signature"));
+    }
     let signature =
         hex::decode(&req.signature).map_err(|_| bad_request("invalid signature encoding"))?;
     identity::approve_unlock_request(&state.db, id, authed.user.id, authed.device.id, &signature)
@@ -1171,6 +1190,9 @@ async fn agent_pending_approve(
     Path(id): Path<Uuid>,
     Json(req): Json<ApproveReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !validation::is_hex_of_len(&req.signature, validation::ED25519_SIGNATURE_HEX_LEN) {
+        return Err(bad_request("invalid signature"));
+    }
     let signature =
         hex::decode(&req.signature).map_err(|_| bad_request("invalid signature encoding"))?;
     let Some(sandbox) = state.agent_sandbox.clone() else {
@@ -2396,6 +2418,60 @@ mod tests {
             agent_enabled: false,
             agent_sandbox: None,
         }
+    }
+
+    async fn enroll_status(app: &axum::Router, body: Value) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/enroll")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Malformed enrollment input is rejected (400) before any device is created:
+    /// bounded name/platform and an exact-length hex public key.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn enroll_rejects_malformed_input(pool: PgPool) {
+        let app = build_router(stub_state(pool).await);
+
+        // A well-formed request is accepted (64-hex key = 32 bytes).
+        let ok = enroll_status(
+            &app,
+            json!({ "name": "iPhone", "platform": "ios", "public_key": "aa".repeat(32) }),
+        )
+        .await;
+        assert_eq!(ok, StatusCode::OK);
+
+        // Oversized device name.
+        let long = enroll_status(
+            &app,
+            json!({ "name": "x".repeat(200), "platform": "ios", "public_key": "aa".repeat(32) }),
+        )
+        .await;
+        assert_eq!(long, StatusCode::BAD_REQUEST);
+
+        // Wrong-length public key (not 64 hex chars).
+        let short_key = enroll_status(
+            &app,
+            json!({ "name": "iPhone", "platform": "ios", "public_key": "abcd" }),
+        )
+        .await;
+        assert_eq!(short_key, StatusCode::BAD_REQUEST);
+
+        // Non-hex public key of the right length.
+        let non_hex = enroll_status(
+            &app,
+            json!({ "name": "iPhone", "platform": "ios", "public_key": "z".repeat(64) }),
+        )
+        .await;
+        assert_eq!(non_hex, StatusCode::BAD_REQUEST);
     }
 
     /// A mutating action must not run until the owner signs its nonce on a
