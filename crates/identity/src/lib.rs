@@ -701,6 +701,39 @@ mod tests {
         Ok(())
     }
 
+    /// An expired challenge is rejected even with a valid signature.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn login_rejects_expired_challenge(pool: PgPool) -> Result<(), IdentityError> {
+        let user = create_user(&pool, "Gus").await?;
+        let signing = new_keypair();
+        let (device, _k) = register_device(
+            &pool,
+            user.id,
+            "iPhone",
+            Platform::Ios,
+            "ed25519",
+            &signing.verifying_key().to_bytes(),
+        )
+        .await?;
+
+        let challenge = create_challenge(&pool, device.id).await?;
+        let signature = signing.sign(&challenge.nonce).to_bytes();
+
+        // Force the challenge into the past so only expiry — not the signature —
+        // can cause the failure.
+        sqlx::query(
+            "update auth_challenges set expires_at = now() - interval '1 minute' where id = $1",
+        )
+        .bind(challenge.id)
+        .execute(&pool)
+        .await?;
+
+        assert!(login(&pool, device.id, challenge.id, &signature)
+            .await
+            .is_err());
+        Ok(())
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn unlock_request_approve_flow(pool: PgPool) -> Result<(), IdentityError> {
         let user = create_user(&pool, "Gus").await?;
