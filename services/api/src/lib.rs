@@ -119,6 +119,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/agent/pending/{id}/approve", post(agent_pending_approve))
         .route("/v1/agent/pending/{id}/deny", post(agent_pending_deny))
         .route("/v1/agent/audit", get(agent_audit_log))
+        .route("/v1/system/audit", get(security_audit_log))
         .route("/mcp", post(mcp_endpoint))
         // Per-IP rate limiting on auth-sensitive endpoints (enroll/challenge/login).
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit_mw))
@@ -335,6 +336,7 @@ async fn auth_enroll(
     .await
     .map_err(internal)?;
 
+    record_security_event(&state, Some(device.id), "auth.enroll", "ok", None).await;
     Ok(Json(json!({
         "user_id": user.id,
         "device_id": device.id,
@@ -382,9 +384,15 @@ async fn auth_login(
             Json(json!({ "error": "invalid signature encoding" })),
         )
     })?;
-    let result = identity::login(&state.db, req.device_id, req.challenge_id, &signature)
-        .await
-        .map_err(|_| unauthorized())?;
+    let result = match identity::login(&state.db, req.device_id, req.challenge_id, &signature).await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            record_security_event(&state, Some(req.device_id), "auth.login", "fail", None).await;
+            return Err(unauthorized());
+        }
+    };
+    record_security_event(&state, Some(req.device_id), "auth.login", "ok", None).await;
     Ok(Json(json!({
         "token": result.token,
         "expires_at": result.session.expires_at.unix_timestamp(),
@@ -422,6 +430,7 @@ async fn auth_logout(
     identity::revoke_session(&state.db, authed.session_id)
         .await
         .map_err(internal)?;
+    record_security_event(&state, Some(authed.device.id), "auth.logout", "ok", None).await;
     Ok(Json(json!({ "status": "logged out" })))
 }
 
@@ -544,6 +553,7 @@ async fn unlock_approve(
     identity::approve_unlock_request(&state.db, id, authed.user.id, authed.device.id, &signature)
         .await
         .map_err(|_| unauthorized())?;
+    record_security_event(&state, Some(authed.device.id), "unlock.approve", "ok", None).await;
     Ok(Json(json!({ "status": "approved" })))
 }
 
@@ -556,6 +566,7 @@ async fn unlock_deny(
     identity::deny_unlock_request(&state.db, id, authed.user.id, authed.device.id)
         .await
         .map_err(|_| unauthorized())?;
+    record_security_event(&state, Some(authed.device.id), "unlock.deny", "ok", None).await;
     Ok(Json(json!({ "status": "denied" })))
 }
 
@@ -573,6 +584,14 @@ async fn delete_device(
             identity::revoke_device(&state.db, id)
                 .await
                 .map_err(internal)?;
+            record_security_event(
+                &state,
+                Some(authed.device.id),
+                "device.revoke",
+                "ok",
+                Some(&id.to_string()),
+            )
+            .await;
             Ok(Json(json!({ "status": "revoked" })))
         }
         _ => Err((
@@ -1413,6 +1432,57 @@ async fn record_agent_audit(
     if let Err(e) = res {
         tracing::warn!(error = %e, "failed to write agent audit");
     }
+}
+
+/// Append a security/auth event to the audit trail (Priority 6). Best-effort:
+/// a write failure is logged but never blocks the request, and no secrets are
+/// ever stored — only the actor device, the event, the outcome, and a short note.
+async fn record_security_event(
+    state: &AppState,
+    device_id: Option<Uuid>,
+    event: &str,
+    outcome: &str,
+    detail: Option<&str>,
+) {
+    let res = sqlx::query(
+        "INSERT INTO security_audit (device_id, event, outcome, detail) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(device_id)
+    .bind(event)
+    .bind(outcome)
+    .bind(detail)
+    .execute(&state.db)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!(error = %e, event, "failed to write security audit");
+    }
+}
+
+/// The recent security/auth audit trail (Priority 6) — logins, enrolment,
+/// logout, and device/unlock changes. Owner-only; never contains secrets.
+async fn security_audit_log(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
+    type AuditRow = (Option<Uuid>, String, String, Option<String>, String);
+    let rows: Vec<AuditRow> = sqlx::query_as(
+        "SELECT device_id, event, outcome, detail, \
+         to_char(ts, 'YYYY-MM-DD HH24:MI:SS') \
+         FROM security_audit ORDER BY ts DESC LIMIT 100",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let entries: Vec<Value> = rows
+        .into_iter()
+        .map(|(device_id, event, outcome, detail, ts)| {
+            json!({
+                "device_id": device_id,
+                "event": event,
+                "outcome": outcome,
+                "detail": detail,
+                "ts": ts,
+            })
+        })
+        .collect();
+    Json(json!({ "entries": entries }))
 }
 
 /// The recent agent audit trail (ADR-029) — what Jarvis' hands have done.
@@ -2732,6 +2802,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Enrolment and login are recorded in the security audit trail, readable by
+    /// the owner at /v1/system/audit.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn security_audit_records_auth_events(pool: PgPool) {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let signing = SigningKey::from_bytes(&seed);
+        let app = build_router(stub_state(pool).await);
+        let (_device_id, token) = enroll_and_login(&app, &signing).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/system/audit")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let events: Vec<String> = body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["event"].as_str().unwrap().to_string())
+            .collect();
+        assert!(events.contains(&"auth.enroll".to_string()));
+        assert!(events.contains(&"auth.login".to_string()));
     }
 
     /// A mutating action must not run until the owner signs its nonce on a
