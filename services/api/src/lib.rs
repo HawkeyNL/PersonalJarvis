@@ -38,10 +38,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 mod audit;
+mod error;
 mod rate_limit;
 mod validation;
 
 use audit::{agent_audit_log, record_agent_audit, record_security_event, security_audit_log};
+use error::{bad_request, db_err, internal, portfolio_err, speech_err, unauthorized};
 pub use rate_limit::{AuthLimits, RateLimiter};
 
 /// Shared, cheaply-cloneable application state.
@@ -261,32 +263,6 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
             )
         }
     }
-}
-
-fn unauthorized() -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": "unauthorized" })),
-    )
-}
-
-fn internal(_e: identity::IdentityError) -> (StatusCode, Json<Value>) {
-    // Errors are deliberately opaque to clients; details go to logs/traces.
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": "internal error" })),
-    )
-}
-
-fn bad_request(message: &str) -> (StatusCode, Json<Value>) {
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": message })))
-}
-
-fn portfolio_err(_e: portfolio::PortfolioError) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": "internal error" })),
-    )
 }
 
 /// Authenticated principal, extracted from a `Bearer` session token.
@@ -1663,27 +1639,6 @@ fn is_local_origin(origin: &str) -> bool {
 }
 
 // ---- Voice: server-side speaker verification + STT --------------------------
-
-fn db_err(_e: sqlx::Error) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": "internal error" })),
-    )
-}
-
-fn speech_err(e: speech::SpeechError) -> (StatusCode, Json<Value>) {
-    match e {
-        speech::SpeechError::TooShort => bad_request("audio was empty or too short"),
-        speech::SpeechError::NotConfigured(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "speech engine not configured" })),
-        ),
-        speech::SpeechError::Failed(_) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": "speech engine failed" })),
-        ),
-    }
-}
 
 fn encode_embedding(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
