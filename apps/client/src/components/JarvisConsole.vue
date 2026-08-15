@@ -62,9 +62,10 @@ function scrollToBottom() {
   const el = transcriptEl.value;
   if (el) el.scrollTop = el.scrollHeight;
 }
-// Follow new turns (and the thinking indicator) to the bottom.
+// Follow new turns (and the thinking indicator) to the bottom — and pin to the
+// latest turn the moment the transcript rises into view.
 watch(
-  () => [messages.value.length, thinking.value],
+  () => [messages.value.length, thinking.value, revealed.value],
   () => nextTick(scrollToBottom),
 );
 
@@ -145,12 +146,16 @@ onMounted(async () => {
         </div>
       </Transition>
 
-      <!-- The whole current conversation, scrollable, pinned to the latest turn. -->
-      <div
-        ref="transcriptEl"
-        class="transcript"
-        :class="{ dim: revealed, scrim: messages.length > 0 }"
-      >
+      <!-- The whole current conversation: hidden by default, it rises into view
+           only while the chat is active (hovering the bottom-left zone or the
+           chat itself), then tucks away again. -->
+      <Transition name="rise">
+        <div
+          v-show="revealed"
+          ref="transcriptEl"
+          class="transcript"
+          :class="{ scrim: messages.length > 0 }"
+        >
         <TransitionGroup name="line">
         <div v-for="m in messages" :key="m.id" class="line" :class="m.role">
           <span class="who">{{ m.role === "jarvis" ? "JARVIS" : "JIJ" }}</span>
@@ -169,7 +174,8 @@ onMounted(async () => {
           <span class="who">JARVIS</span>
           <span class="dots"><span></span><span></span><span></span></span>
         </p>
-      </div>
+        </div>
+      </Transition>
     </div>
 
     <!-- Bottom-left hover zone reveals the input. -->
@@ -333,7 +339,6 @@ onMounted(async () => {
   overflow-y: auto;
   overscroll-behavior: contain;
   pointer-events: auto; /* scrollable through the whole conversation */
-  transition: opacity 0.4s ease;
   /* a soft fade at the very top hints there's more above */
   mask-image: linear-gradient(180deg, transparent 0, #000 26px);
   -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 26px);
@@ -347,8 +352,15 @@ onMounted(async () => {
   background: var(--border);
   border-radius: 3px;
 }
-.transcript.dim {
-  opacity: 0.7;
+/* Hidden by default; rises up (fade + slide) when the chat becomes active. */
+.rise-enter-active,
+.rise-leave-active {
+  transition: opacity 0.3s ease, transform 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.rise-enter-from,
+.rise-leave-to {
+  opacity: 0;
+  transform: translateY(14px);
 }
 /* When a conversation is on screen, a soft dark scrim sits behind the transcript
    so the text stays legible over the living HUD "brain". Feathered (radial fade
