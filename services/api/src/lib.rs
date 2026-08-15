@@ -134,10 +134,14 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
             StatusCode::OK,
             Json(json!({ "status": "ready", "environment": state.environment })),
         ),
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "degraded", "error": e.to_string() })),
-        ),
+        Err(e) => {
+            // Log the detail; never leak internal DB errors in the response body.
+            tracing::warn!(error = %e, "readiness check failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "status": "degraded" })),
+            )
+        }
     }
 }
 
@@ -549,6 +553,9 @@ async fn add_holding(
     if symbol.is_empty() {
         return Err(bad_request("symbol is required"));
     }
+    if symbol.len() > validation::MAX_SYMBOL_LEN {
+        return Err(bad_request("symbol too long"));
+    }
     if req.quantity <= Decimal::ZERO {
         return Err(bad_request("quantity must be positive"));
     }
@@ -556,6 +563,9 @@ async fn add_holding(
         return Err(bad_request("avg_cost must be non-negative"));
     }
     let currency = req.currency.as_deref().unwrap_or("EUR");
+    if !validation::bounded_text(currency, validation::MAX_CURRENCY_LEN) {
+        return Err(bad_request("invalid currency"));
+    }
     let holding = portfolio::add_holding(
         &state.db,
         authed.user.id,
@@ -1028,6 +1038,9 @@ async fn assistant_orchestrate(
     let task = req.task.trim();
     if task.is_empty() {
         return Err(bad_request("task is required"));
+    }
+    if task.len() > validation::MAX_TASK_LEN {
+        return Err(bad_request("task too long"));
     }
     match orchestrator::plan_and_execute(&state.llm, task, &state.jarvis_system).await {
         Ok(run) => {
@@ -1777,6 +1790,11 @@ async fn system_self_improve(
     State(state): State<AppState>,
     Json(req): Json<SelfImproveReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(focus) = req.focus.as_deref() {
+        if focus.len() > validation::MAX_FOCUS_LEN {
+            return Err(bad_request("focus too long"));
+        }
+    }
     let ecosystem = match state.registry.read() {
         Ok(reg) => render_ecosystem(&reg, state.agent_enabled, state.agent_sandbox.is_some()),
         Err(_) => "(ecosysteem tijdelijk niet leesbaar)".to_string(),
@@ -2472,6 +2490,48 @@ mod tests {
         )
         .await;
         assert_eq!(non_hex, StatusCode::BAD_REQUEST);
+    }
+
+    /// A failed readiness check reports "degraded" without leaking the internal
+    /// database error into the response body (detail belongs in the logs).
+    #[tokio::test]
+    async fn readyz_does_not_leak_db_errors() {
+        // A lazy pool pointed at a dead port: the SELECT 1 fails at call time.
+        // A short acquire timeout keeps the test fast (no 30s default retry loop).
+        let dead = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://127.0.0.1:1/none")
+            .unwrap();
+        let (status, Json(body)) = readyz(State(stub_state(dead).await)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "degraded");
+        assert!(body.get("error").is_none(), "must not leak DB error detail");
+    }
+
+    /// Oversized free-text focus is rejected (400) before any LLM call.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn self_improve_rejects_oversized_focus(pool: PgPool) {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let signing = SigningKey::from_bytes(&seed);
+        let app = build_router(stub_state(pool).await);
+        let (_device_id, token) = enroll_and_login(&app, &signing).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/system/self-improve")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "focus": "x".repeat(600) })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// A mutating action must not run until the owner signs its nonce on a

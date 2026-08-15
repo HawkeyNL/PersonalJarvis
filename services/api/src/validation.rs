@@ -5,6 +5,13 @@ pub const MAX_PLATFORM_LEN: usize = 32;
 pub const ED25519_PUBLIC_KEY_HEX_LEN: usize = 64;
 pub const ED25519_SIGNATURE_HEX_LEN: usize = 128;
 
+// Generous upper bounds on free-text inputs so a single request cannot ship an
+// unbounded string into the DB or an LLM prompt. Sized well above real use.
+pub const MAX_SYMBOL_LEN: usize = 32;
+pub const MAX_CURRENCY_LEN: usize = 8;
+pub const MAX_FOCUS_LEN: usize = 500;
+pub const MAX_TASK_LEN: usize = 8_000;
+
 pub fn bounded_text(value: &str, max_len: usize) -> bool {
     let trimmed = value.trim();
     !trimmed.is_empty() && trimmed.len() <= max_len
