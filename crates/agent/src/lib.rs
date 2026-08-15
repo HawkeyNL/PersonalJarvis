@@ -75,15 +75,43 @@ pub enum RiskClass {
     Denied,
 }
 
-/// Classify an action (ADR-029 laag 2). Read-only ⇒ `Auto`; mutating ⇒
-/// `NeedsApproval` (4b, behind a device-signed approval). Path-level denials
-/// (escape/secret/Core) are enforced separately at resolution.
-pub fn classify(action: &Action) -> RiskClass {
+/// Map an action to its policy capability + risk class (review P2). This is the
+/// single place that says *what kind of thing* an action is; the approval
+/// decision itself comes from [`jarvis_policy::decide`].
+fn action_capability(action: &Action) -> (jarvis_policy::Capability, jarvis_policy::RiskClass) {
+    use jarvis_policy::{Capability, RiskClass as PRisk};
     match action {
-        Action::WriteFile { .. } | Action::GitCommit { .. } | Action::ClaudeCode { .. } => {
-            RiskClass::NeedsApproval
+        Action::WriteFile { .. } | Action::GitCommit { .. } => {
+            (Capability::ManageFiles, PRisk::Mutating)
         }
-        _ => RiskClass::Auto,
+        Action::ClaudeCode { .. } => (Capability::ExecuteCode, PRisk::Mutating),
+        Action::ListDir { .. }
+        | Action::ReadFile { .. }
+        | Action::Grep { .. }
+        | Action::Git { .. } => (Capability::ReadData, PRisk::ReadOnly),
+    }
+}
+
+/// Classify an action (ADR-029 laag 2). The auto-vs-approval decision is owned by
+/// `jarvis-policy` (review P2 — one authoritative policy path); this function is
+/// the adapter that maps a [`jarvis_policy::PolicyDecision`] onto the agent's
+/// [`RiskClass`]. Path-level denials (escape/secret/Core) are enforced separately
+/// at resolution, since they are workspace-specific rather than capability-class.
+pub fn classify(action: &Action) -> RiskClass {
+    let (capability, risk) = action_capability(action);
+    // An unapproved, non-reversible request from a trusted device: policy decides
+    // whether it may run automatically or must be signed off.
+    let decision = jarvis_policy::decide(&jarvis_policy::PolicyContext {
+        capability,
+        risk,
+        trusted_device: true,
+        approved: false,
+        reversible: false,
+    });
+    match decision {
+        jarvis_policy::PolicyDecision::Allow => RiskClass::Auto,
+        jarvis_policy::PolicyDecision::RequireApproval => RiskClass::NeedsApproval,
+        jarvis_policy::PolicyDecision::Deny => RiskClass::Denied,
     }
 }
 
@@ -637,6 +665,35 @@ mod tests {
             RiskClass::NeedsApproval
         );
         assert!(is_mutating(&Action::GitCommit { message: "m".into() }));
+    }
+
+    /// The auto-vs-approval decision comes from `jarvis-policy` (review P2): every
+    /// mutating capability resolves to `RequireApproval`, reads to `Allow`, and
+    /// the agent's `RiskClass` adapter must agree with a direct policy call.
+    #[test]
+    fn classify_is_consistent_with_jarvis_policy() {
+        use jarvis_policy::{decide, Capability, PolicyContext, PolicyDecision, RiskClass as PRisk};
+        let ctx = |cap, risk| PolicyContext {
+            capability: cap,
+            risk,
+            trusted_device: true,
+            approved: false,
+            reversible: false,
+        };
+        // Reads → Allow → Auto.
+        assert_eq!(decide(&ctx(Capability::ReadData, PRisk::ReadOnly)), PolicyDecision::Allow);
+        assert_eq!(classify(&Action::ReadFile { path: "a".into() }), RiskClass::Auto);
+        // Code execution → RequireApproval → NeedsApproval.
+        assert_eq!(
+            decide(&ctx(Capability::ExecuteCode, PRisk::Mutating)),
+            PolicyDecision::RequireApproval
+        );
+        assert_eq!(classify(&Action::ClaudeCode { prompt: "x".into() }), RiskClass::NeedsApproval);
+        // File writes → RequireApproval → NeedsApproval.
+        assert_eq!(
+            decide(&ctx(Capability::ManageFiles, PRisk::Mutating)),
+            PolicyDecision::RequireApproval
+        );
     }
 
     #[tokio::test]
