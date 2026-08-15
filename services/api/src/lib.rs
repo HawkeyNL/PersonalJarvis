@@ -79,6 +79,9 @@ pub struct AppState {
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
     /// Tunable thresholds for the auth rate limiter (from `JARVIS_AUTH_*`).
     pub auth_limits: rate_limit::AuthLimits,
+    /// Number of trusted proxy hops in front of the API (0 ⇒ never trust
+    /// `X-Forwarded-For`; use the socket peer). See [`client_ip`].
+    pub trusted_proxy_hops: u32,
 }
 
 /// Build the application router.
@@ -129,14 +132,44 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
-/// Best-effort client IP for rate-limit keys. Uses the connection peer address
-/// (injected by `into_make_service_with_connect_info`); falls back to a constant
-/// when absent (e.g. in-process test requests), which simply shares one bucket.
-fn client_ip(req: &Request) -> String {
+/// The connection peer address (injected by `into_make_service_with_connect_info`);
+/// falls back to a constant when absent (e.g. in-process test requests).
+fn peer_ip(req: &Request) -> String {
     req.extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip().to_string())
         .unwrap_or_else(|| "local".to_string())
+}
+
+/// The client IP used to key rate limiting, login lockout and audit attribution.
+///
+/// Trust model (Priority 3): a client-supplied `X-Forwarded-For` is **never**
+/// trusted by default (`trusted_hops == 0`) — the socket peer address is used, so
+/// a forged header cannot bypass IP limits. Only when the operator declares that
+/// the API sits behind exactly `trusted_hops` trusted proxies (and is reachable
+/// *only* through them) do we read the client from `X-Forwarded-For`, taking the
+/// entry the innermost trusted proxy appended (`len - trusted_hops`) and ignoring
+/// the spoofable prefix. A malformed/short header falls back to the peer address.
+fn client_ip(req: &Request, trusted_hops: u32) -> String {
+    if trusted_hops == 0 {
+        return peer_ip(req);
+    }
+    let hops = trusted_hops as usize;
+    if let Some(xff) = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+    {
+        let ips: Vec<&str> = xff
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ips.len() >= hops {
+            return ips[ips.len() - hops].to_string();
+        }
+    }
+    peer_ip(req)
 }
 
 /// The shared 429 response for any auth throttle.
@@ -160,7 +193,7 @@ async fn rate_limit_mw(State(state): State<AppState>, req: Request, next: Next) 
     let window = std::time::Duration::from_secs(60);
     let lock_window = std::time::Duration::from_secs(limits.login_lock_secs);
     let path = req.uri().path().to_string();
-    let ip = client_ip(&req);
+    let ip = client_ip(&req, state.trusted_proxy_hops);
 
     // Flat per-endpoint rate limit.
     let flat = match path.as_str() {
@@ -2155,6 +2188,46 @@ mod tests {
     }
 
     #[test]
+    fn client_ip_ignores_forwarded_header_without_trusted_proxy() {
+        let req = Request::builder()
+            .header("x-forwarded-for", "6.6.6.6")
+            .body(Body::empty())
+            .unwrap();
+        // hops=0 → never trust the header; no ConnectInfo peer → "local".
+        assert_eq!(client_ip(&req, 0), "local");
+    }
+
+    #[test]
+    fn client_ip_trusts_only_the_innermost_proxy_hop() {
+        // The client spoofs "9.9.9.9"; the single trusted proxy appended the peer.
+        let req = Request::builder()
+            .header("x-forwarded-for", "9.9.9.9, 203.0.113.7")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(client_ip(&req, 1), "203.0.113.7");
+    }
+
+    #[test]
+    fn client_ip_skips_trusted_hops_from_the_right() {
+        let req = Request::builder()
+            .header("x-forwarded-for", "9.9.9.9, 203.0.113.7, 10.0.0.9")
+            .body(Body::empty())
+            .unwrap();
+        // 2 trusted hops → the client sits at len-2, spoofable prefix ignored.
+        assert_eq!(client_ip(&req, 2), "203.0.113.7");
+    }
+
+    #[test]
+    fn client_ip_falls_back_when_header_too_short() {
+        let req = Request::builder()
+            .header("x-forwarded-for", "9.9.9.9")
+            .body(Body::empty())
+            .unwrap();
+        // hops=2 but only one entry → fall back to the peer ("local").
+        assert_eq!(client_ip(&req, 2), "local");
+    }
+
+    #[test]
     fn persona_falls_back_when_file_is_absent() {
         let (text, loaded) = load_persona("does/not/exist/Jarvis.md");
         assert!(!loaded);
@@ -2205,6 +2278,7 @@ mod tests {
             agent_sandbox: None,
             rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::new()),
             auth_limits: crate::rate_limit::AuthLimits::default(),
+            trusted_proxy_hops: 0,
         });
 
         // 1. enroll this device (dev endpoint)
@@ -2581,6 +2655,7 @@ mod tests {
             agent_sandbox: Some(std::sync::Arc::new(sandbox)),
             rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::new()),
             auth_limits: crate::rate_limit::AuthLimits::default(),
+            trusted_proxy_hops: 0,
         }
     }
 
@@ -2605,6 +2680,7 @@ mod tests {
             agent_sandbox: None,
             rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::new()),
             auth_limits: crate::rate_limit::AuthLimits::default(),
+            trusted_proxy_hops: 0,
         }
     }
 

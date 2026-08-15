@@ -178,6 +178,12 @@ pub struct AppConfig {
     /// Lockout window (seconds) for repeated failed logins.
     #[serde(default = "default_auth_login_lock_secs")]
     pub auth_login_lock_secs: u64,
+
+    /// Trusted proxy hops in front of the API. 0 (default) ⇒ never trust
+    /// `X-Forwarded-For`; use the socket peer address for rate-limit/audit keys.
+    /// Set to N only when the API is reachable *only* through N trusted proxies.
+    #[serde(default)]
+    pub trusted_proxy_hops: u32,
 }
 
 fn default_bind_addr() -> String {
@@ -419,6 +425,7 @@ mod tests {
             auth_rate_login_per_min: 20,
             auth_login_max_failures: 5,
             auth_login_lock_secs: 300,
+            trusted_proxy_hops: 0,
         };
 
         let rendered = format!("{cfg:?}");

@@ -225,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
             login_max_failures: config.auth_login_max_failures,
             login_lock_secs: config.auth_login_lock_secs,
         },
+        trusted_proxy_hops: config.trusted_proxy_hops,
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
