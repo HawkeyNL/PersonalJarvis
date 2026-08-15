@@ -789,6 +789,18 @@ async fn assistant_chat(
     State(state): State<AppState>,
     Json(req): Json<ChatReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Generous bounds so a single request cannot ship an unbounded transcript or
+    // a giant paste into the LLM (real conversations stay well under these).
+    if req.messages.len() > validation::MAX_CHAT_TURNS {
+        return Err(bad_request("too many messages"));
+    }
+    if req
+        .messages
+        .iter()
+        .any(|t| t.content.len() > validation::MAX_CHAT_CONTENT_LEN)
+    {
+        return Err(bad_request("message too long"));
+    }
     let history: Vec<llm::ChatMessage> = req
         .messages
         .iter()
@@ -2691,6 +2703,35 @@ mod tests {
         assert_eq!(statuses[4], StatusCode::UNAUTHORIZED);
         assert_eq!(statuses[5], StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(statuses[6], StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// An oversized chat message is rejected (400) before any LLM call.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn chat_rejects_oversized_message(pool: PgPool) {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let signing = SigningKey::from_bytes(&seed);
+        let app = build_router(stub_state(pool).await);
+        let (_device_id, token) = enroll_and_login(&app, &signing).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assistant/chat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "messages": [{ "role": "user", "content": "x".repeat(25_000) }]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// A mutating action must not run until the owner signs its nonce on a

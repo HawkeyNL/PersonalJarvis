@@ -11,6 +11,10 @@ pub const MAX_SYMBOL_LEN: usize = 32;
 pub const MAX_CURRENCY_LEN: usize = 8;
 pub const MAX_FOCUS_LEN: usize = 500;
 pub const MAX_TASK_LEN: usize = 8_000;
+// Chat is the primary feature, so these are deliberately generous: they cap
+// abuse (and runaway token spend) without touching real conversations.
+pub const MAX_CHAT_TURNS: usize = 500;
+pub const MAX_CHAT_CONTENT_LEN: usize = 24_000;
 
 pub fn bounded_text(value: &str, max_len: usize) -> bool {
     let trimmed = value.trim();
