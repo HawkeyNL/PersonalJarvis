@@ -207,7 +207,7 @@ Iedere coding-agent moet na werk taken afvinken, nieuwe taken toevoegen, tests v
 ### Fase 1A — Home Node en Device Mesh
 
 - [ ] headless mini-pc kiezen en installeren
-- [ ] Ubuntu Server + SSH
+- [ ] Ubuntu Desktop LTS + SSH
 - [ ] private VPN/tunnel
 - [ ] trusted-device enrollment
 - [ ] health/presence
