@@ -14,13 +14,10 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
-use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 
-use jarvis_agent as agent;
 use jarvis_llm as llm;
 use jarvis_registry as registry;
-use jarvis_speech as speech;
 use jarvis_usage as usage;
 // std (not tokio) RwLock: the router's `Availability` reads it synchronously,
 // and the registry is small with brief, await-free critical sections.
@@ -34,9 +31,11 @@ mod mcp;
 mod metering;
 mod rate_limit;
 mod routes;
+mod state;
 mod validation;
 
 pub use extract::Authed;
+pub use state::AppState;
 
 use audit::{agent_audit_log, security_audit_log};
 use mcp::mcp_endpoint;
@@ -57,48 +56,6 @@ use routes::system::{
 };
 use routes::voice::{voice_enroll, voice_status, voice_verify};
 pub use rate_limit::{AuthLimits, RateLimiter};
-
-/// Shared, cheaply-cloneable application state.
-#[derive(Clone)]
-pub struct AppState {
-    pub db: PgPool,
-    pub environment: String,
-    pub ibkr_gateway_url: String,
-    /// The brain (DEC-001) — provider-abstracted, swappable at runtime.
-    pub llm: Arc<dyn llm::LlmProvider>,
-    /// Max output tokens per assistant reply.
-    pub llm_max_tokens: u32,
-    /// Jarvis' identity/persona (from `core/Jarvis.md`), prepended as the system
-    /// prompt on every chat. The single source of truth for "what Jarvis is".
-    pub jarvis_system: Arc<str>,
-    /// Server-side speech engine (STT + speaker verification).
-    pub speech: Arc<dyn speech::SpeechEngine>,
-    /// Cosine threshold to accept a voice as the enrolled speaker.
-    pub speech_verify_threshold: f32,
-    /// Resource/agent registry — Jarvis' "instant memory" (ADR-027 stage 3).
-    pub registry: Arc<RwLock<registry::Registry>>,
-    /// Inputs to re-collect the registry on refresh.
-    pub registry_input: Arc<registry::CollectInput>,
-    /// Hard monthly spend cap in EUR-cents across metered API backends (ADR-027).
-    pub budget_cents: u64,
-    /// Metered spend so far this month, in EUR-cents. Mirrors the DB (refreshed
-    /// after each call) so the router's sync budget gate can read it cheaply.
-    pub spent_cents: Arc<AtomicU64>,
-    /// EUR per 1 USD, to price provider (USD) usage into the EUR budget.
-    pub eur_per_usd: f64,
-    /// Agentic execution kill switch (ADR-029) — Jarvis has no hands unless true.
-    pub agent_enabled: bool,
-    /// The sandbox Jarvis' read-only actions are confined to. `None` ⇒ no
-    /// workspace configured (actions refused even when enabled).
-    pub agent_sandbox: Option<Arc<agent::Sandbox>>,
-    /// Per-IP rate limiter for auth-sensitive endpoints (enroll/challenge/login).
-    pub rate_limiter: Arc<rate_limit::RateLimiter>,
-    /// Tunable thresholds for the auth rate limiter (from `JARVIS_AUTH_*`).
-    pub auth_limits: rate_limit::AuthLimits,
-    /// Number of trusted proxy hops in front of the API (0 ⇒ never trust
-    /// `X-Forwarded-For`; use the socket peer). See [`client_ip`].
-    pub trusted_proxy_hops: u32,
-}
 
 /// Build the application router.
 pub fn build_router(state: AppState) -> Router {
@@ -254,7 +211,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::{header, Request};
     use ed25519_dalek::{Signer, SigningKey};
+    use jarvis_agent as agent;
     use rand::{rngs::OsRng, RngCore};
+    use sqlx::PgPool;
     use tower::ServiceExt;
     use uuid::Uuid;
 
