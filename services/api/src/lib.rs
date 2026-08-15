@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{FromRequestParts, State},
-    http::{header::AUTHORIZATION, request::Parts, StatusCode},
+    extract::State,
+    http::StatusCode,
     middleware,
     routing::{delete, get, post},
     Json, Router,
@@ -16,9 +16,7 @@ use axum::{
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
-use uuid::Uuid;
 
-use jarvis_identity as identity;
 use jarvis_agent as agent;
 use jarvis_llm as llm;
 use jarvis_registry as registry;
@@ -31,14 +29,16 @@ use std::sync::RwLock;
 
 mod audit;
 mod error;
+mod extract;
 mod mcp;
 mod metering;
 mod rate_limit;
 mod routes;
 mod validation;
 
+pub use extract::Authed;
+
 use audit::{agent_audit_log, security_audit_log};
-use error::unauthorized;
 use mcp::mcp_endpoint;
 use rate_limit::rate_limit_mw;
 use routes::agent::{agent_action, agent_pending, agent_pending_approve, agent_pending_deny};
@@ -175,37 +175,6 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     }
 }
 
-/// Authenticated principal, extracted from a `Bearer` session token.
-pub struct Authed {
-    pub user: identity::User,
-    pub device: identity::Device,
-    pub session_id: Uuid,
-}
-
-impl FromRequestParts<AppState> for Authed {
-    type Rejection = (StatusCode, Json<Value>);
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let token = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .ok_or_else(unauthorized)?;
-        let auth = identity::authenticate(&state.db, token)
-            .await
-            .map_err(|_| unauthorized())?;
-        Ok(Authed {
-            user: auth.user,
-            device: auth.device,
-            session_id: auth.session_id,
-        })
-    }
-}
-
 /// Fallback persona when `core/Jarvis.md` is absent (keeps dev/CI green without
 /// the file). The real identity lives in `core/Jarvis.md`, loaded at startup
 /// into [`AppState::jarvis_system`]. Kept plain: modern Claude models follow the
@@ -287,6 +256,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rand::{rngs::OsRng, RngCore};
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn livez_reports_alive() {
