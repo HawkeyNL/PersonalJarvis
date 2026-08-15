@@ -21,7 +21,6 @@ use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use jarvis_ibkr as ibkr;
 use jarvis_identity as identity;
 use jarvis_agent as agent;
 use jarvis_llm as llm;
@@ -40,10 +39,13 @@ use std::sync::RwLock;
 mod audit;
 mod error;
 mod rate_limit;
+mod routes;
 mod validation;
 
 use audit::{agent_audit_log, record_agent_audit, record_security_event, security_audit_log};
-use error::{bad_request, db_err, internal, portfolio_err, speech_err, unauthorized};
+use error::{bad_request, db_err, internal, speech_err, unauthorized};
+use routes::broker::{ibkr_positions, ibkr_status};
+use routes::portfolio::{add_holding, get_holdings, remove_holding};
 pub use rate_limit::{AuthLimits, RateLimiter};
 
 /// Shared, cheaply-cloneable application state.
@@ -609,163 +611,6 @@ async fn delete_device(
             Json(json!({ "error": "device not found" })),
         )),
     }
-}
-
-/// List the authenticated user's holdings with cost basis and allocation.
-async fn get_holdings(
-    authed: Authed,
-    State(state): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let holdings = portfolio::list_holdings(&state.db, authed.user.id)
-        .await
-        .map_err(portfolio_err)?;
-    let total: Decimal = holdings.iter().map(|h| h.cost_basis()).sum();
-    let hundred = Decimal::from(100);
-    let items: Vec<Value> = holdings
-        .iter()
-        .map(|h| {
-            let cost = h.cost_basis();
-            let weight = if total.is_zero() {
-                Decimal::ZERO
-            } else {
-                (cost / total) * hundred
-            };
-            json!({
-                "id": h.id,
-                "symbol": h.symbol,
-                "quantity": h.quantity.normalize().to_string(),
-                "avg_cost": h.avg_cost.normalize().to_string(),
-                "currency": h.currency,
-                "cost_basis": cost.normalize().to_string(),
-                "weight_pct": weight.round_dp(1).normalize().to_string(),
-            })
-        })
-        .collect();
-    Ok(Json(json!({
-        "holdings": items,
-        "total_cost": total.normalize().to_string(),
-    })))
-}
-
-#[derive(Deserialize)]
-struct AddHoldingReq {
-    symbol: String,
-    quantity: Decimal,
-    avg_cost: Decimal,
-    currency: Option<String>,
-}
-
-/// Add a holding for the authenticated user.
-async fn add_holding(
-    authed: Authed,
-    State(state): State<AppState>,
-    Json(req): Json<AddHoldingReq>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let symbol = req.symbol.trim().to_uppercase();
-    if symbol.is_empty() {
-        return Err(bad_request("symbol is required"));
-    }
-    if symbol.len() > validation::MAX_SYMBOL_LEN {
-        return Err(bad_request("symbol too long"));
-    }
-    if req.quantity <= Decimal::ZERO {
-        return Err(bad_request("quantity must be positive"));
-    }
-    if req.avg_cost < Decimal::ZERO {
-        return Err(bad_request("avg_cost must be non-negative"));
-    }
-    let currency = req.currency.as_deref().unwrap_or("EUR");
-    if !validation::bounded_text(currency, validation::MAX_CURRENCY_LEN) {
-        return Err(bad_request("invalid currency"));
-    }
-    let holding = portfolio::add_holding(
-        &state.db,
-        authed.user.id,
-        &symbol,
-        req.quantity,
-        req.avg_cost,
-        currency,
-    )
-    .await
-    .map_err(portfolio_err)?;
-    Ok(Json(json!({ "id": holding.id, "symbol": holding.symbol })))
-}
-
-/// Delete one of the authenticated user's holdings.
-async fn remove_holding(
-    authed: Authed,
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if portfolio::delete_holding(&state.db, authed.user.id, id)
-        .await
-        .map_err(portfolio_err)?
-    {
-        Ok(Json(json!({ "status": "deleted" })))
-    } else {
-        Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "holding not found" })),
-        ))
-    }
-}
-
-fn ibkr_down() -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "error": "IBKR gateway not connected",
-            "hint": "start de Client Portal Gateway en log in (paper of live)",
-        })),
-    )
-}
-
-/// IBKR gateway reachability + auth status (read-only).
-async fn ibkr_status(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
-    let client = match ibkr::IbkrClient::new(&state.ibkr_gateway_url) {
-        Ok(c) => c,
-        Err(_) => return Json(json!({ "reachable": false, "authenticated": false })),
-    };
-    match client.auth_status().await {
-        Ok(s) => Json(json!({
-            "reachable": true,
-            "authenticated": s.authenticated,
-            "connected": s.connected,
-        })),
-        Err(_) => Json(json!({
-            "reachable": false,
-            "authenticated": false,
-            "hint": "start de IBKR Client Portal Gateway en log in",
-        })),
-    }
-}
-
-/// IBKR positions for an account (read-only). `?account=` selects the account;
-/// otherwise the first account in the session is used.
-async fn ibkr_positions(
-    _authed: Authed,
-    State(state): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let client = ibkr::IbkrClient::new(&state.ibkr_gateway_url).map_err(|_| ibkr_down())?;
-    let status = client.auth_status().await.map_err(|_| ibkr_down())?;
-    if !status.authenticated {
-        return Err(ibkr_down());
-    }
-    let account = match params.get("account") {
-        Some(a) => a.clone(),
-        None => client
-            .accounts()
-            .await
-            .map_err(|_| ibkr_down())?
-            .into_iter()
-            .next()
-            .map(|a| a.account_id)
-            .ok_or_else(ibkr_down)?,
-    };
-    let positions = client.positions(&account).await.map_err(|_| ibkr_down())?;
-    let positions = serde_json::to_value(&positions).unwrap_or_else(|_| json!([]));
-    Ok(Json(json!({ "account": account, "positions": positions })))
 }
 
 /// Fallback persona when `core/Jarvis.md` is absent (keeps dev/CI green without
