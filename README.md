@@ -43,6 +43,35 @@ Belangrijkste endpoints:
 | GET | `/v1/broker/ibkr/status` · `/positions` | IBKR read-only (via gateway) |
 | POST | `/v1/assistant/chat` | Jarvis-brein (Claude, Bearer-token) |
 
+#### API-codestructuur (`services/api`)
+
+De API is opgesplitst in samenhangende modules; `lib.rs` is nog slechts de
+compositieroot (router-bedrading + health-probes). Handlers zijn per concern
+gegroepeerd, elk met zijn eigen request-DTO's:
+
+| Module | Verantwoordelijkheid |
+|--------|----------------------|
+| `lib.rs` | `build_router`, health-probes, persona-loader, router-infra |
+| `state.rs` | `AppState` — gedeelde, goedkoop-kloonbare dependency-bundle |
+| `extract.rs` | `Authed` — de Bearer-token auth-poort (elke beschermde handler) |
+| `error.rs` | opake HTTP-error/response-helpers (details alleen in logs) |
+| `rate_limit.rs` | per-IP rate-limiting + login-lockout + `X-Forwarded-For` trust-model |
+| `metering.rs` | LLM-kosten/budget bijhouden (ADR-027) |
+| `audit.rs` | append-only security- en agent-audit-trail |
+| `validation.rs` | invoer-bounds (lengtes, hex-vormen) |
+| `mcp.rs` | read-only MCP-server voor Claude-tooling (ADR-031) |
+| `routes/auth.rs` | enroll/challenge/login/logout, apparaten, unlock-flow |
+| `routes/chat.rs` | chat + gesprekken + orchestrate (ADR-028/030) |
+| `routes/agent.rs` | agentische uitvoering + device-getekende goedkeuring (ADR-029) |
+| `routes/system.rs` | usage/registry/self-improve (advisory-only) |
+| `routes/portfolio.rs` | holdings (cost-basis + allocatie) |
+| `routes/broker.rs` | IBKR read-only (status/positions) |
+| `routes/voice.rs` | STT + speaker-verificatie (gemaks-signaal, nooit het slot) |
+
+Unit-tests van privé-interne functies staan in de modules zelf; de HTTP-round-trip
+integratietests staan in `services/api/tests/api.rs` en spreken de crate alleen via
+haar publieke API aan.
+
 ### 2. Client (macOS)
 
 In een **tweede terminal**, met de API draaiend:
