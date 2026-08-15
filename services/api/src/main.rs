@@ -218,6 +218,13 @@ async fn main() -> anyhow::Result<()> {
         agent_enabled: config.agent_enabled,
         agent_sandbox,
         rate_limiter: std::sync::Arc::new(jarvis_api::RateLimiter::new()),
+        auth_limits: jarvis_api::AuthLimits {
+            enroll_per_min: config.auth_rate_enroll_per_min,
+            challenge_per_min: config.auth_rate_challenge_per_min,
+            login_per_min: config.auth_rate_login_per_min,
+            login_max_failures: config.auth_login_max_failures,
+            login_lock_secs: config.auth_login_lock_secs,
+        },
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

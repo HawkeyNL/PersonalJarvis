@@ -11,6 +11,28 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Tunable limits for the auth endpoints (configurable via `JARVIS_AUTH_*`).
+#[derive(Clone, Copy, Debug)]
+pub struct AuthLimits {
+    pub enroll_per_min: u32,
+    pub challenge_per_min: u32,
+    pub login_per_min: u32,
+    pub login_max_failures: u32,
+    pub login_lock_secs: u64,
+}
+
+impl Default for AuthLimits {
+    fn default() -> Self {
+        Self {
+            enroll_per_min: 10,
+            challenge_per_min: 30,
+            login_per_min: 20,
+            login_max_failures: 5,
+            login_lock_secs: 300,
+        }
+    }
+}
+
 /// Fixed-window request counter keyed by an arbitrary string (e.g. `"path:ip"`).
 #[derive(Default)]
 pub struct RateLimiter {

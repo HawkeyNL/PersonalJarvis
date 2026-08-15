@@ -161,6 +161,23 @@ pub struct AppConfig {
     /// Model for the Claude Code executor. Empty ⇒ let `claude` pick its default.
     #[serde(default)]
     pub agent_claude_code_model: String,
+
+    // --- Auth rate limiting (security hardening, Priority 2). Per client IP. ---
+    /// Max device enrolments per minute.
+    #[serde(default = "default_auth_rate_enroll")]
+    pub auth_rate_enroll_per_min: u32,
+    /// Max login challenges per minute.
+    #[serde(default = "default_auth_rate_challenge")]
+    pub auth_rate_challenge_per_min: u32,
+    /// Max login attempts per minute.
+    #[serde(default = "default_auth_rate_login")]
+    pub auth_rate_login_per_min: u32,
+    /// Failed logins that trip the lockout within the lockout window.
+    #[serde(default = "default_auth_login_max_failures")]
+    pub auth_login_max_failures: u32,
+    /// Lockout window (seconds) for repeated failed logins.
+    #[serde(default = "default_auth_login_lock_secs")]
+    pub auth_login_lock_secs: u64,
 }
 
 fn default_bind_addr() -> String {
@@ -215,6 +232,26 @@ fn default_claude_cli_bin() -> String {
 
 fn default_llm_persona_path() -> String {
     "core/Jarvis.md".to_string()
+}
+
+fn default_auth_rate_enroll() -> u32 {
+    10
+}
+
+fn default_auth_rate_challenge() -> u32 {
+    30
+}
+
+fn default_auth_rate_login() -> u32 {
+    20
+}
+
+fn default_auth_login_max_failures() -> u32 {
+    5
+}
+
+fn default_auth_login_lock_secs() -> u64 {
+    300
 }
 
 fn default_claude_code_bin() -> String {
@@ -377,6 +414,11 @@ mod tests {
             agent_claude_code_enabled: false,
             agent_claude_code_bin: "claude".to_string(),
             agent_claude_code_model: String::new(),
+            auth_rate_enroll_per_min: 10,
+            auth_rate_challenge_per_min: 30,
+            auth_rate_login_per_min: 20,
+            auth_login_max_failures: 5,
+            auth_login_lock_secs: 300,
         };
 
         let rendered = format!("{cfg:?}");

@@ -40,7 +40,7 @@ use std::sync::RwLock;
 mod rate_limit;
 mod validation;
 
-pub use rate_limit::RateLimiter;
+pub use rate_limit::{AuthLimits, RateLimiter};
 
 /// Shared, cheaply-cloneable application state.
 #[derive(Clone)]
@@ -77,6 +77,8 @@ pub struct AppState {
     pub agent_sandbox: Option<Arc<agent::Sandbox>>,
     /// Per-IP rate limiter for auth-sensitive endpoints (enroll/challenge/login).
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
+    /// Tunable thresholds for the auth rate limiter (from `JARVIS_AUTH_*`).
+    pub auth_limits: rate_limit::AuthLimits,
 }
 
 /// Build the application router.
@@ -127,11 +129,6 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
-/// After this many failed logins from one IP within the lockout window, further
-/// attempts are refused (429) until the window rolls off.
-const MAX_LOGIN_FAILURES: u32 = 5;
-const LOGIN_LOCK_WINDOW_SECS: u64 = 300;
-
 /// Best-effort client IP for rate-limit keys. Uses the connection peer address
 /// (injected by `into_make_service_with_connect_info`); falls back to a constant
 /// when absent (e.g. in-process test requests), which simply shares one bucket.
@@ -159,16 +156,17 @@ fn too_many_requests() -> Response {
 /// signatures lock the IP without penalising a successful login. Runs before the
 /// handler (and before body parsing). Over any limit ⇒ `429`.
 async fn rate_limit_mw(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let limits = state.auth_limits;
     let window = std::time::Duration::from_secs(60);
-    let lock_window = std::time::Duration::from_secs(LOGIN_LOCK_WINDOW_SECS);
+    let lock_window = std::time::Duration::from_secs(limits.login_lock_secs);
     let path = req.uri().path().to_string();
     let ip = client_ip(&req);
 
     // Flat per-endpoint rate limit.
     let flat = match path.as_str() {
-        "/v1/auth/enroll" => Some(10u32),
-        "/v1/auth/challenge" => Some(30),
-        "/v1/auth/login" => Some(20),
+        "/v1/auth/enroll" => Some(limits.enroll_per_min),
+        "/v1/auth/challenge" => Some(limits.challenge_per_min),
+        "/v1/auth/login" => Some(limits.login_per_min),
         _ => None,
     };
     if let Some(max) = flat {
@@ -182,7 +180,8 @@ async fn rate_limit_mw(State(state): State<AppState>, req: Request, next: Next) 
     let is_login = path == "/v1/auth/login";
     let fail_key = format!("loginfail:{ip}");
     if is_login
-        && state.rate_limiter.failures_in_window(&fail_key, lock_window) >= MAX_LOGIN_FAILURES
+        && state.rate_limiter.failures_in_window(&fail_key, lock_window)
+            >= limits.login_max_failures
     {
         tracing::warn!(%ip, "login locked out after repeated failures");
         return too_many_requests();
@@ -2205,6 +2204,7 @@ mod tests {
             agent_enabled: false,
             agent_sandbox: None,
             rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::new()),
+            auth_limits: crate::rate_limit::AuthLimits::default(),
         });
 
         // 1. enroll this device (dev endpoint)
@@ -2580,6 +2580,7 @@ mod tests {
             agent_enabled: true,
             agent_sandbox: Some(std::sync::Arc::new(sandbox)),
             rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::new()),
+            auth_limits: crate::rate_limit::AuthLimits::default(),
         }
     }
 
@@ -2603,6 +2604,7 @@ mod tests {
             agent_enabled: false,
             agent_sandbox: None,
             rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::new()),
+            auth_limits: crate::rate_limit::AuthLimits::default(),
         }
     }
 
