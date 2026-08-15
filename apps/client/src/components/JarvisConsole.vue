@@ -146,7 +146,11 @@ onMounted(async () => {
       </Transition>
 
       <!-- The whole current conversation, scrollable, pinned to the latest turn. -->
-      <div ref="transcriptEl" class="transcript" :class="{ dim: revealed }">
+      <div
+        ref="transcriptEl"
+        class="transcript"
+        :class="{ dim: revealed, scrim: messages.length > 0 }"
+      >
         <TransitionGroup name="line">
         <div v-for="m in messages" :key="m.id" class="line" :class="m.role">
           <span class="who">{{ m.role === "jarvis" ? "JARVIS" : "JIJ" }}</span>
@@ -346,13 +350,31 @@ onMounted(async () => {
 .transcript.dim {
   opacity: 0.7;
 }
+/* When a conversation is on screen, a soft dark scrim sits behind the transcript
+   so the text stays legible over the living HUD "brain". Feathered (radial fade
+   plus the existing top scroll-mask) and lightly blurred, so it reads as a
+   shadow/haze rather than a hard card. */
+.transcript.scrim {
+  padding: 12px 16px 10px;
+  border-radius: 16px;
+  background: radial-gradient(
+    130% 100% at 22% 40%,
+    rgba(2, 10, 7, 0.72) 0%,
+    rgba(2, 10, 7, 0.55) 46%,
+    rgba(2, 10, 7, 0.18) 82%,
+    rgba(2, 10, 7, 0) 100%
+  );
+  backdrop-filter: blur(6px) saturate(115%);
+  -webkit-backdrop-filter: blur(6px) saturate(115%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
 
 .line {
   margin: 0;
   font-size: 14px;
   line-height: 1.5;
   color: var(--text);
-  text-shadow: 0 1px 12px rgba(0, 0, 0, 0.7);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 0 16px rgba(0, 0, 0, 0.6);
 }
 .line .who {
   font-family: var(--mono);
