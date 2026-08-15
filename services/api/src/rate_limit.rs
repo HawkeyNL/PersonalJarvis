@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 pub struct RateLimiter {
     hits: Mutex<HashMap<String, (Instant, u32)>>,
+    /// Consecutive *failed* attempts per key, for failure-based lockout — kept
+    /// separate from `hits` so a successful call can clear a caller's penalty.
+    failures: Mutex<HashMap<String, (Instant, u32)>>,
 }
 
 impl RateLimiter {
@@ -39,6 +42,36 @@ impl RateLimiter {
         }
         entry.1 += 1;
         entry.1 <= max
+    }
+
+    /// Record one failed attempt for `key` within `window`; return the running
+    /// failure count. Used for failure-based lockout (e.g. bad login signatures).
+    pub fn note_failure(&self, key: &str, window: Duration) -> u32 {
+        let now = Instant::now();
+        let mut map = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = map.entry(key.to_string()).or_insert((now, 0));
+        if now.duration_since(entry.0) >= window {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        entry.1
+    }
+
+    /// How many failures `key` has accrued in the current `window` (0 if none or
+    /// the window has elapsed).
+    pub fn failures_in_window(&self, key: &str, window: Duration) -> u32 {
+        let now = Instant::now();
+        let map = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(key) {
+            Some((start, n)) if now.duration_since(*start) < window => *n,
+            _ => 0,
+        }
+    }
+
+    /// Clear a caller's failure penalty (e.g. after a successful login).
+    pub fn clear_failures(&self, key: &str) {
+        let mut map = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(key);
     }
 }
 
@@ -66,5 +99,17 @@ mod tests {
         assert!(!rl.check("k", 1, w)); // 2nd within the window is blocked
         std::thread::sleep(Duration::from_millis(55));
         assert!(rl.check("k", 1, w)); // window elapsed → allowed again
+    }
+
+    #[test]
+    fn failures_accumulate_and_clear() {
+        let rl = RateLimiter::new();
+        let w = Duration::from_secs(60);
+        assert_eq!(rl.failures_in_window("ip", w), 0);
+        assert_eq!(rl.note_failure("ip", w), 1);
+        assert_eq!(rl.note_failure("ip", w), 2);
+        assert_eq!(rl.failures_in_window("ip", w), 2);
+        rl.clear_failures("ip"); // a success wipes the penalty
+        assert_eq!(rl.failures_in_window("ip", w), 0);
     }
 }

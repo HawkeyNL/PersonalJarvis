@@ -126,6 +126,11 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
+/// After this many failed logins from one IP within the lockout window, further
+/// attempts are refused (429) until the window rolls off.
+const MAX_LOGIN_FAILURES: u32 = 5;
+const LOGIN_LOCK_WINDOW_SECS: u64 = 300;
+
 /// Best-effort client IP for rate-limit keys. Uses the connection peer address
 /// (injected by `into_make_service_with_connect_info`); falls back to a constant
 /// when absent (e.g. in-process test requests), which simply shares one bucket.
@@ -136,31 +141,64 @@ fn client_ip(req: &Request) -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
-/// Rate-limit the auth endpoints per client IP. Runs before the handler (and
-/// before body parsing), so it throttles brute-force attempts regardless of
-/// whether they would ultimately succeed. Over the limit ⇒ `429`.
+/// The shared 429 response for any auth throttle.
+fn too_many_requests() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "error": "rate limited",
+            "hint": "te veel pogingen; probeer het straks opnieuw",
+        })),
+    )
+        .into_response()
+}
+
+/// Rate limiting for auth endpoints. A flat per-endpoint limit throttles all
+/// traffic; login additionally has a failure-based lockout so repeated *bad*
+/// signatures lock the IP without penalising a successful login. Runs before the
+/// handler (and before body parsing). Over any limit ⇒ `429`.
 async fn rate_limit_mw(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let window = std::time::Duration::from_secs(60);
-    let limit = match req.uri().path() {
+    let lock_window = std::time::Duration::from_secs(LOGIN_LOCK_WINDOW_SECS);
+    let path = req.uri().path().to_string();
+    let ip = client_ip(&req);
+
+    // Flat per-endpoint rate limit.
+    let flat = match path.as_str() {
         "/v1/auth/enroll" => Some(10u32),
         "/v1/auth/challenge" => Some(30),
         "/v1/auth/login" => Some(20),
         _ => None,
     };
-    if let Some(max) = limit {
-        let key = format!("{}:{}", req.uri().path(), client_ip(&req));
-        if !state.rate_limiter.check(&key, max, window) {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({
-                    "error": "rate limited",
-                    "hint": "te veel pogingen; probeer het straks opnieuw",
-                })),
-            )
-                .into_response();
+    if let Some(max) = flat {
+        if !state.rate_limiter.check(&format!("{path}:{ip}"), max, window) {
+            tracing::warn!(%ip, %path, "auth rate limit hit");
+            return too_many_requests();
         }
     }
-    next.run(req).await
+
+    // Login-specific failure lockout — repeated bad signatures lock the IP.
+    let is_login = path == "/v1/auth/login";
+    let fail_key = format!("loginfail:{ip}");
+    if is_login
+        && state.rate_limiter.failures_in_window(&fail_key, lock_window) >= MAX_LOGIN_FAILURES
+    {
+        tracing::warn!(%ip, "login locked out after repeated failures");
+        return too_many_requests();
+    }
+
+    let resp = next.run(req).await;
+
+    // Count genuine auth failures (401); a success wipes the penalty.
+    if is_login {
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            let n = state.rate_limiter.note_failure(&fail_key, lock_window);
+            tracing::warn!(%ip, failures = n, "failed login attempt");
+        } else if resp.status().is_success() {
+            state.rate_limiter.clear_failures(&fail_key);
+        }
+    }
+    resp
 }
 
 async fn root() -> Json<Value> {
@@ -2618,6 +2656,41 @@ mod tests {
         assert_eq!(statuses[9], StatusCode::OK);
         assert_eq!(statuses[10], StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(statuses[11], StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// Repeated *failed* logins from one IP lock it out (429) after the failure
+    /// threshold, even while below the flat per-minute limit.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn repeated_failed_logins_lock_out(pool: PgPool) {
+        let app = build_router(stub_state(pool).await);
+        let mut statuses = Vec::new();
+        for _ in 0..7 {
+            // Valid-format but wrong signature over random ids → the handler
+            // returns 401, which the middleware counts as a failed login.
+            let body = json!({
+                "device_id": Uuid::now_v7(),
+                "challenge_id": Uuid::now_v7(),
+                "signature": "ab".repeat(64), // 128 hex chars
+            });
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/auth/login")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            statuses.push(resp.status());
+        }
+        // First 5 are genuine 401s; after 5 failures the IP is locked (429).
+        assert_eq!(statuses[0], StatusCode::UNAUTHORIZED);
+        assert_eq!(statuses[4], StatusCode::UNAUTHORIZED);
+        assert_eq!(statuses[5], StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses[6], StatusCode::TOO_MANY_REQUESTS);
     }
 
     /// A mutating action must not run until the owner signs its nonce on a
