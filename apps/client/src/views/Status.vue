@@ -142,22 +142,44 @@ interface SelfDev {
 const advice = ref<SelfDev | null>(null);
 const adviceBusy = ref(false);
 const adviceError = ref<string | null>(null);
+const adviceCancelled = ref(false);
+// Held while a request is in flight so the user can abort it — aborting also
+// stops the server-side LLM call, so a cancel doesn't keep burning tokens.
+const adviceCtrl = ref<AbortController | null>(null);
 
 async function askSelfImprove() {
   adviceBusy.value = true;
   adviceError.value = null;
+  adviceCancelled.value = false;
+  const ctrl = new AbortController();
+  adviceCtrl.value = ctrl;
   try {
     const s = await currentSession();
     if (!s.token) {
       adviceError.value = "niet ingelogd";
       return;
     }
-    advice.value = await postJsonAuth<SelfDev>("/v1/system/self-improve", s.token, {});
+    advice.value = await postJsonAuth<SelfDev>(
+      "/v1/system/self-improve",
+      s.token,
+      {},
+      ctrl.signal,
+    );
   } catch (e) {
-    adviceError.value = String(e);
+    // An abort is a deliberate cancel, not an error.
+    if (ctrl.signal.aborted) {
+      adviceCancelled.value = true;
+    } else {
+      adviceError.value = String(e);
+    }
   } finally {
     adviceBusy.value = false;
+    adviceCtrl.value = null;
   }
+}
+
+function cancelSelfImprove() {
+  adviceCtrl.value?.abort();
 }
 
 onMounted(() => {
@@ -279,9 +301,18 @@ onMounted(() => {
         Jarvis bekijkt zijn eigen ecosysteem en doet voorstellen. Hij voert niets
         zelf uit — de Core en <code>Jarvis.md</code> blijven handmatig, alleen door jou.
       </p>
-      <button :disabled="adviceBusy" @click="askSelfImprove">
-        {{ adviceBusy ? "Jarvis denkt na…" : "Vraag om verbetervoorstellen" }}
-      </button>
+      <div class="sd-actions">
+        <button v-if="!adviceBusy" @click="askSelfImprove">
+          Vraag om verbetervoorstellen
+        </button>
+        <template v-else>
+          <span class="thinking">
+            Jarvis denkt na<span class="dots"><span></span><span></span><span></span></span>
+          </span>
+          <button class="ghost" @click="cancelSelfImprove">Annuleren</button>
+        </template>
+      </div>
+      <p v-if="adviceCancelled" class="muted small">Geannuleerd.</p>
       <p v-if="adviceError" class="muted err">{{ adviceError }}</p>
       <template v-if="advice">
         <p class="active">{{ advice.summary }}</p>
@@ -566,5 +597,58 @@ onMounted(() => {
 }
 .steps li {
   margin: 2px 0;
+}
+
+/* Self-development action row: a live "thinking" indicator + a cancel button. */
+.sd-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.thinking {
+  display: inline-flex;
+  align-items: center;
+  font-size: 13px;
+  color: var(--accent);
+}
+.thinking .dots {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: 8px;
+}
+.thinking .dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.4;
+  animation: sdpulse 1.1s infinite ease-in-out;
+}
+.thinking .dots span:nth-child(2) {
+  animation-delay: 0.18s;
+}
+.thinking .dots span:nth-child(3) {
+  animation-delay: 0.36s;
+}
+@keyframes sdpulse {
+  0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-2px); }
+}
+button.ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-weight: 500;
+}
+button.ghost:hover {
+  filter: none;
+  border-color: #f87171;
+  color: #f87171;
+}
+@media (prefers-reduced-motion: reduce) {
+  .thinking .dots span {
+    animation: none;
+  }
 }
 </style>

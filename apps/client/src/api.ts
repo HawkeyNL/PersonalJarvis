@@ -60,6 +60,7 @@ export async function postJsonAuth<T>(
   path: string,
   token: string,
   body: unknown,
+  signal?: AbortSignal,
 ): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
@@ -68,6 +69,7 @@ export async function postJsonAuth<T>(
       Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(body),
+    signal,
   });
   if (!res.ok) {
     throw new ApiError(res.status, path);
