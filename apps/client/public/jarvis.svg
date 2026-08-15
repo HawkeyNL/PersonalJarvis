@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024"><defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#06271f"/><stop offset="1" stop-color="#01110e"/></linearGradient>
+  <radialGradient id="core"><stop stop-color="#d9fff0"/><stop offset=".24" stop-color="#52f7ba"/><stop offset=".64" stop-color="#0eb57a"/><stop offset="1" stop-color="#087254"/></radialGradient>
+  <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#b8ffe2"/><stop offset=".4" stop-color="#35e79d"/><stop offset="1" stop-color="#087657"/></linearGradient>
+  <filter id="glow" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="15" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  <filter id="soft" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="26"/></filter>
+</defs><g>
+ <circle cx="512" cy="512" r="277" fill="none" stroke="#17d994" stroke-opacity=".18" stroke-width="28" filter="url(#soft)"/>
+ <circle cx="512" cy="512" r="243" fill="none" stroke="url(#ring)" stroke-width="18" stroke-linecap="round" stroke-dasharray="1040 490" transform="rotate(-35 512 512)"/>
+ <circle cx="512" cy="512" r="194" fill="none" stroke="#48f1b1" stroke-opacity=".38" stroke-width="6" stroke-dasharray="7 31"/>
+ <circle cx="512" cy="512" r="113" fill="#0bb87b" fill-opacity=".24" filter="url(#soft)"/>
+ <circle cx="512" cy="512" r="101" fill="url(#core)" filter="url(#glow)"/>
+ <circle cx="512" cy="512" r="51" fill="#b9ffe4" fill-opacity=".68"/>
+ <circle cx="512" cy="512" r="28" fill="#effff8"/>
+ <g fill="#75ffc9" filter="url(#glow)"><circle cx="276" cy="380" r="13"/><circle cx="361" cy="251" r="9"/><circle cx="590" cy="224" r="11"/><circle cx="728" cy="358" r="14"/><circle cx="743" cy="543" r="9"/><circle cx="618" cy="683" r="12"/><circle cx="392" cy="674" r="10"/><circle cx="276" cy="555" r="8"/></g>
+</g></svg>
