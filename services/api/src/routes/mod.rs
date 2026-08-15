@@ -6,6 +6,7 @@
 pub(crate) mod agent;
 pub(crate) mod auth;
 pub(crate) mod broker;
+pub(crate) mod chat;
 pub(crate) mod portfolio;
 pub(crate) mod system;
 pub(crate) mod voice;

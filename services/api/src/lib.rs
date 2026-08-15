@@ -7,14 +7,13 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{ConnectInfo, FromRequestParts, Path, Request, State},
+    extract::{ConnectInfo, FromRequestParts, Request, State},
     http::{header::AUTHORIZATION, request::Parts, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
@@ -23,7 +22,6 @@ use uuid::Uuid;
 use jarvis_identity as identity;
 use jarvis_agent as agent;
 use jarvis_llm as llm;
-use jarvis_orchestrator as orchestrator;
 use jarvis_registry as registry;
 use jarvis_speech as speech;
 use jarvis_usage as usage;
@@ -41,15 +39,18 @@ mod routes;
 mod validation;
 
 use audit::{agent_audit_log, security_audit_log};
-use error::{bad_request, db_err, unauthorized};
+use error::unauthorized;
 use mcp::mcp_endpoint;
-use metering::record_usage;
 use routes::agent::{agent_action, agent_pending, agent_pending_approve, agent_pending_deny};
 use routes::auth::{
     auth_challenge, auth_enroll, auth_login, auth_logout, delete_device, list_devices,
     unlock_approve, unlock_deny, unlock_pending, unlock_request, unlock_status,
 };
 use routes::broker::{ibkr_positions, ibkr_status};
+use routes::chat::{
+    assistant_chat, assistant_orchestrate, delete_conversation, get_conversation,
+    list_conversations,
+};
 use routes::portfolio::{add_holding, get_holdings, remove_holding};
 use routes::system::{
     system_registry, system_registry_refresh, system_self_improve, system_usage,
@@ -324,418 +325,6 @@ pub fn load_persona(path: &str) -> (Arc<str>, bool) {
     match std::fs::read_to_string(path) {
         Ok(text) if !text.trim().is_empty() => (Arc::from(text.trim()), true),
         _ => (Arc::from(JARVIS_SYSTEM_FALLBACK), false),
-    }
-}
-
-#[derive(Deserialize)]
-struct ChatTurn {
-    role: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ChatReq {
-    messages: Vec<ChatTurn>,
-    /// Optional tier hint: `default` | `hard` | `cheap`.
-    #[serde(default)]
-    tier: Option<String>,
-    /// Optional system-prompt override (defaults to the Jarvis persona).
-    #[serde(default)]
-    system: Option<String>,
-    /// The conversation this turn belongs to (ADR-030). Absent ⇒ start a fresh
-    /// one; present ⇒ append, unless the topic shifted (then Jarvis splits it off
-    /// into a new conversation and returns the new id).
-    #[serde(default)]
-    conversation_id: Option<Uuid>,
-}
-
-/// Chat with the brain (protected). Persists the turn under a conversation and
-/// auto-splits a new topic into its own conversation (ADR-030). The persona is
-/// prepended server-side; the API key is never exposed.
-async fn assistant_chat(
-    authed: Authed,
-    State(state): State<AppState>,
-    Json(req): Json<ChatReq>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Generous bounds so a single request cannot ship an unbounded transcript or
-    // a giant paste into the LLM (real conversations stay well under these).
-    if req.messages.len() > validation::MAX_CHAT_TURNS {
-        return Err(bad_request("too many messages"));
-    }
-    if req
-        .messages
-        .iter()
-        .any(|t| t.content.len() > validation::MAX_CHAT_CONTENT_LEN)
-    {
-        return Err(bad_request("message too long"));
-    }
-    let history: Vec<llm::ChatMessage> = req
-        .messages
-        .iter()
-        .filter_map(|t| {
-            let content = t.content.trim();
-            if content.is_empty() {
-                return None;
-            }
-            Some(match t.role.as_str() {
-                "assistant" | "jarvis" => llm::ChatMessage::assistant(content),
-                _ => llm::ChatMessage::user(content),
-            })
-        })
-        .collect();
-    if history.is_empty() {
-        return Err(bad_request("messages is required"));
-    }
-    // The last user turn is the new message to store and (maybe) reclassify.
-    let new_msg = req
-        .messages
-        .iter()
-        .rev()
-        .find(|t| !matches!(t.role.as_str(), "assistant" | "jarvis"))
-        .map(|t| t.content.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| bad_request("a user message is required"))?;
-
-    // Which conversation does this belong to? Append to the current one unless
-    // the topic shifted; with no valid current one, start fresh.
-    let existing = match req.conversation_id {
-        Some(cid) => conversation_title(&state.db, cid, authed.user.id)
-            .await
-            .map(|t| (cid, t)),
-        None => None,
-    };
-    let (conv_id, conv_title, new_topic) = match existing {
-        Some((cid, title)) => {
-            let (same, proposed) = classify_topic(&state, Some(&title), &new_msg).await;
-            if same {
-                (cid, title, false)
-            } else {
-                let id = create_conversation(&state.db, authed.user.id, &proposed)
-                    .await
-                    .map_err(db_err)?;
-                (id, proposed, true)
-            }
-        }
-        None => {
-            let (_same, proposed) = classify_topic(&state, None, &new_msg).await;
-            let id = create_conversation(&state.db, authed.user.id, &proposed)
-                .await
-                .map_err(db_err)?;
-            (id, proposed, true)
-        }
-    };
-
-    // Save what the owner said up front, so it survives even a brain outage.
-    append_message(&state.db, conv_id, authed.user.id, "user", &new_msg, None).await;
-
-    // A fresh topic starts with a clean slate; a continuation keeps its context.
-    let messages = if new_topic {
-        vec![llm::ChatMessage::user(&new_msg)]
-    } else {
-        history
-    };
-    let chat = llm::ChatRequest {
-        system: Some(req.system.unwrap_or_else(|| state.jarvis_system.to_string())),
-        tier: req.tier.as_deref().map(llm::Tier::parse).unwrap_or_default(),
-        messages,
-        max_tokens: state.llm_max_tokens,
-        // The router picks the concrete model per backend (ADR-028 fase 2).
-        model: None,
-    };
-
-    match state.llm.chat(&chat).await {
-        Ok(reply) => {
-            record_usage(&state, &reply).await;
-            append_message(
-                &state.db,
-                conv_id,
-                authed.user.id,
-                "assistant",
-                &reply.text,
-                Some(reply.model.as_str()),
-            )
-            .await;
-            Ok(Json(json!({
-                "reply": reply.text,
-                "model": reply.model,
-                "stop_reason": reply.stop_reason,
-                "conversation_id": conv_id,
-                "conversation_title": conv_title,
-                "new_topic": new_topic,
-            })))
-        }
-        Err(llm::LlmError::Refused) => {
-            let text = "Sorry, daar kan ik niet op antwoorden.";
-            append_message(&state.db, conv_id, authed.user.id, "assistant", text, None).await;
-            Ok(Json(json!({
-                "reply": text,
-                "model": Value::Null,
-                "stop_reason": "refusal",
-                "conversation_id": conv_id,
-                "conversation_title": conv_title,
-                "new_topic": new_topic,
-            })))
-        }
-        Err(e) => {
-            // Details stay in logs; the client gets an opaque, actionable hint.
-            // The user's message is already saved under `conv_id`.
-            tracing::warn!(error = %e, "assistant chat failed");
-            Err((
-                StatusCode::BAD_GATEWAY,
-                Json(json!({
-                    "error": "brain unavailable",
-                    "hint": "controleer JARVIS_LLM_API_KEY of start Ollama lokaal",
-                    "conversation_id": conv_id,
-                })),
-            ))
-        }
-    }
-}
-
-/// Ask a cheap model whether `new_msg` continues the current topic, and get a
-/// short title for the (new) topic. Best-effort: any failure keeps the current
-/// conversation (or, with none, derives a title) so chat never breaks (ADR-030).
-async fn classify_topic(
-    state: &AppState,
-    current_title: Option<&str>,
-    new_msg: &str,
-) -> (bool, String) {
-    let snippet: String = new_msg.chars().take(600).collect();
-    let system = "Je bepaalt of een nieuw bericht bij het lopende gespreksonderwerp \
-         hoort of een nieuw onderwerp begint. Antwoord UITSLUITEND met JSON: \
-         {\"same_topic\": true of false, \"title\": \"korte titel, max 5 woorden\"}. \
-         Is er geen lopend onderwerp, dan is same_topic altijd false.";
-    let user = format!(
-        "Lopend onderwerp: \"{}\"\nNieuw bericht: \"{}\"",
-        current_title.unwrap_or("(geen)"),
-        snippet
-    );
-    let req = llm::ChatRequest {
-        system: Some(system.to_string()),
-        tier: llm::Tier::Cheap,
-        messages: vec![llm::ChatMessage::user(&user)],
-        max_tokens: 60,
-        model: None,
-    };
-    match state.llm.chat(&req).await {
-        Ok(reply) => {
-            record_usage(state, &reply).await;
-            parse_topic(&reply.text)
-                .unwrap_or_else(|| (current_title.is_some(), derive_title(new_msg)))
-        }
-        // Brain down for the classifier: don't fragment — keep the current
-        // conversation if there is one, else start one with a derived title.
-        Err(_) => (current_title.is_some(), derive_title(new_msg)),
-    }
-}
-
-/// Extract `{same_topic, title}` from a model reply (tolerant of prose around
-/// the JSON). Returns None if no usable object is found.
-fn parse_topic(text: &str) -> Option<(bool, String)> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    let v: Value = serde_json::from_str(text.get(start..=end)?).ok()?;
-    let same = v.get("same_topic").and_then(|b| b.as_bool()).unwrap_or(false);
-    let title = v
-        .get("title")
-        .and_then(|t| t.as_str())
-        .map(clean_title)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Nieuw gesprek".to_string());
-    Some((same, title))
-}
-
-/// A short, single-line title derived from the first user message.
-fn derive_title(msg: &str) -> String {
-    let t = clean_title(msg);
-    if t.is_empty() {
-        "Nieuw gesprek".to_string()
-    } else {
-        t
-    }
-}
-
-/// Normalize a title: single line, trimmed, capped at ~48 chars.
-fn clean_title(s: &str) -> String {
-    let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let capped: String = one_line.chars().take(48).collect();
-    capped.trim().to_string()
-}
-
-/// A conversation's title, if it belongs to this user.
-async fn conversation_title(pool: &PgPool, id: Uuid, user_id: Uuid) -> Option<String> {
-    sqlx::query_scalar("SELECT title FROM conversations WHERE id = $1 AND user_id = $2")
-        .bind(id)
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-}
-
-/// Create a new conversation and return its id (ADR-030).
-async fn create_conversation(
-    pool: &PgPool,
-    user_id: Uuid,
-    title: &str,
-) -> Result<Uuid, sqlx::Error> {
-    let id = Uuid::now_v7();
-    sqlx::query("INSERT INTO conversations (id, user_id, title) VALUES ($1, $2, $3)")
-        .bind(id)
-        .bind(user_id)
-        .bind(title)
-        .execute(pool)
-        .await?;
-    Ok(id)
-}
-
-/// Append a message and bump the conversation's `updated_at`. Best-effort:
-/// persistence must never break the reply, so a failure is logged, not surfaced.
-async fn append_message(
-    pool: &PgPool,
-    conv_id: Uuid,
-    user_id: Uuid,
-    role: &str,
-    content: &str,
-    model: Option<&str>,
-) {
-    let res = sqlx::query(
-        "INSERT INTO chat_messages (id, conversation_id, user_id, role, content, model) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(Uuid::now_v7())
-    .bind(conv_id)
-    .bind(user_id)
-    .bind(role)
-    .bind(content)
-    .bind(model)
-    .execute(pool)
-    .await;
-    if let Err(e) = res {
-        tracing::warn!(error = %e, "failed to persist chat message");
-        return;
-    }
-    let _ = sqlx::query("UPDATE conversations SET updated_at = now() WHERE id = $1")
-        .bind(conv_id)
-        .execute(pool)
-        .await;
-}
-
-/// List the owner's conversations, newest-active first (ADR-030).
-async fn list_conversations(authed: Authed, State(state): State<AppState>) -> Json<Value> {
-    let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT id, title, to_char(updated_at, 'YYYY-MM-DD HH24:MI') \
-         FROM conversations WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 100",
-    )
-    .bind(authed.user.id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let items: Vec<Value> = rows
-        .into_iter()
-        .map(|(id, title, updated)| json!({ "id": id, "title": title, "updated_at": updated }))
-        .collect();
-    Json(json!({ "conversations": items }))
-}
-
-/// A single conversation's messages, in order (ADR-030).
-async fn get_conversation(
-    authed: Authed,
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let title = conversation_title(&state.db, id, authed.user.id)
-        .await
-        .ok_or_else(|| {
-            (StatusCode::NOT_FOUND, Json(json!({ "error": "no such conversation" })))
-        })?;
-    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT role, content, model, to_char(created_at, 'YYYY-MM-DD HH24:MI') \
-         FROM chat_messages WHERE conversation_id = $1 ORDER BY created_at ASC",
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(db_err)?;
-    let messages: Vec<Value> = rows
-        .into_iter()
-        .map(|(role, content, model, at)| {
-            json!({ "role": role, "content": content, "model": model, "at": at })
-        })
-        .collect();
-    Ok(Json(json!({ "id": id, "title": title, "messages": messages })))
-}
-
-/// Delete a conversation and its messages (ON DELETE CASCADE) — owner-only.
-async fn delete_conversation(
-    authed: Authed,
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let res = sqlx::query("DELETE FROM conversations WHERE id = $1 AND user_id = $2")
-        .bind(id)
-        .bind(authed.user.id)
-        .execute(&state.db)
-        .await
-        .map_err(db_err)?;
-    if res.rows_affected() == 0 {
-        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "no such conversation" }))));
-    }
-    Ok(Json(json!({ "status": "deleted" })))
-}
-
-#[derive(Deserialize)]
-struct OrchestrateReq {
-    /// The task to plan and carry out.
-    task: String,
-}
-
-/// Plan→execute a task (ADR-028 fase 3): a strong model plans, cheap models run
-/// the steps, a synthesis composes + checks. Pure reasoning — no tools/actions.
-/// Every underlying call is billed against the budget (ADR-027).
-async fn assistant_orchestrate(
-    _authed: Authed,
-    State(state): State<AppState>,
-    Json(req): Json<OrchestrateReq>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let task = req.task.trim();
-    if task.is_empty() {
-        return Err(bad_request("task is required"));
-    }
-    if task.len() > validation::MAX_TASK_LEN {
-        return Err(bad_request("task too long"));
-    }
-    match orchestrator::plan_and_execute(&state.llm, task, &state.jarvis_system).await {
-        Ok(run) => {
-            for reply in &run.calls {
-                record_usage(&state, reply).await;
-            }
-            let steps: Vec<Value> = run
-                .steps
-                .iter()
-                .map(|s| json!({ "step": s.step, "output": s.output, "model": s.model }))
-                .collect();
-            Ok(Json(json!({
-                "plan": run.plan,
-                "steps": steps,
-                "answer": run.answer,
-            })))
-        }
-        Err(llm::LlmError::Refused) => Ok(Json(json!({
-            "answer": "Sorry, daar kan ik niet op antwoorden.",
-            "plan": Value::Array(vec![]),
-            "steps": Value::Array(vec![]),
-        }))),
-        Err(e) => {
-            tracing::warn!(error = %e, "orchestration failed");
-            Err((
-                StatusCode::BAD_GATEWAY,
-                Json(json!({
-                    "error": "brain unavailable",
-                    "hint": "controleer je brein-config (router/keys/Ollama)",
-                })),
-            ))
-        }
     }
 }
 
