@@ -217,11 +217,18 @@ async fn main() -> anyhow::Result<()> {
         eur_per_usd: config.llm_eur_per_usd,
         agent_enabled: config.agent_enabled,
         agent_sandbox,
+        rate_limiter: std::sync::Arc::new(jarvis_api::RateLimiter::new()),
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "jarvis-api listening");
-    axum::serve(listener, build_router(state)).await?;
+    // `into_make_service_with_connect_info` exposes the peer address so the
+    // rate limiter can key per client IP.
+    axum::serve(
+        listener,
+        build_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

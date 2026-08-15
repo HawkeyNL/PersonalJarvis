@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::{FromRequestParts, Path, Query, State},
+    extract::{ConnectInfo, FromRequestParts, Path, Query, Request, State},
     http::{header::AUTHORIZATION, request::Parts, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -36,7 +37,10 @@ use jarvis_usage as usage;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
+mod rate_limit;
 mod validation;
+
+pub use rate_limit::RateLimiter;
 
 /// Shared, cheaply-cloneable application state.
 #[derive(Clone)]
@@ -71,6 +75,8 @@ pub struct AppState {
     /// The sandbox Jarvis' read-only actions are confined to. `None` ⇒ no
     /// workspace configured (actions refused even when enabled).
     pub agent_sandbox: Option<Arc<agent::Sandbox>>,
+    /// Per-IP rate limiter for auth-sensitive endpoints (enroll/challenge/login).
+    pub rate_limiter: Arc<rate_limit::RateLimiter>,
 }
 
 /// Build the application router.
@@ -114,8 +120,47 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/agent/pending/{id}/deny", post(agent_pending_deny))
         .route("/v1/agent/audit", get(agent_audit_log))
         .route("/mcp", post(mcp_endpoint))
+        // Per-IP rate limiting on auth-sensitive endpoints (enroll/challenge/login).
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_mw))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
+}
+
+/// Best-effort client IP for rate-limit keys. Uses the connection peer address
+/// (injected by `into_make_service_with_connect_info`); falls back to a constant
+/// when absent (e.g. in-process test requests), which simply shares one bucket.
+fn client_ip(req: &Request) -> String {
+    req.extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().to_string())
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// Rate-limit the auth endpoints per client IP. Runs before the handler (and
+/// before body parsing), so it throttles brute-force attempts regardless of
+/// whether they would ultimately succeed. Over the limit ⇒ `429`.
+async fn rate_limit_mw(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let window = std::time::Duration::from_secs(60);
+    let limit = match req.uri().path() {
+        "/v1/auth/enroll" => Some(10u32),
+        "/v1/auth/challenge" => Some(30),
+        "/v1/auth/login" => Some(20),
+        _ => None,
+    };
+    if let Some(max) = limit {
+        let key = format!("{}:{}", req.uri().path(), client_ip(&req));
+        if !state.rate_limiter.check(&key, max, window) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "rate limited",
+                    "hint": "te veel pogingen; probeer het straks opnieuw",
+                })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 async fn root() -> Json<Value> {
@@ -2039,6 +2084,7 @@ mod tests {
             eur_per_usd: 0.92,
             agent_enabled: false,
             agent_sandbox: None,
+            rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::new()),
         });
 
         // 1. enroll this device (dev endpoint)
@@ -2413,6 +2459,7 @@ mod tests {
             eur_per_usd: 0.92,
             agent_enabled: true,
             agent_sandbox: Some(std::sync::Arc::new(sandbox)),
+            rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::new()),
         }
     }
 
@@ -2435,6 +2482,7 @@ mod tests {
             eur_per_usd: 0.92,
             agent_enabled: false,
             agent_sandbox: None,
+            rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::new()),
         }
     }
 
@@ -2532,6 +2580,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Auth endpoints are rate limited per client IP: once the per-window budget
+    /// is spent, further attempts get 429 (before reaching the handler). In-process
+    /// test requests carry no peer address, so they all share one "local" bucket.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn enroll_is_rate_limited(pool: PgPool) {
+        let app = build_router(stub_state(pool).await);
+        let mut statuses = Vec::new();
+        for _ in 0..12 {
+            let mut key = [0u8; 32];
+            OsRng.fill_bytes(&mut key);
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/auth/enroll")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "name": "iPhone",
+                                "platform": "ios",
+                                "public_key": hex::encode(key),
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            statuses.push(resp.status());
+        }
+        // First 10 within the window are allowed; the 11th trips the limit.
+        assert_eq!(statuses[0], StatusCode::OK);
+        assert_eq!(statuses[9], StatusCode::OK);
+        assert_eq!(statuses[10], StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses[11], StatusCode::TOO_MANY_REQUESTS);
     }
 
     /// A mutating action must not run until the owner signs its nonce on a
