@@ -1180,6 +1180,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "jarvis-portfolio"
 version = "0.1.0"
 dependencies = [
