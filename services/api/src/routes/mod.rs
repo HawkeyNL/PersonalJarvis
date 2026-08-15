@@ -6,3 +6,4 @@
 pub(crate) mod auth;
 pub(crate) mod broker;
 pub(crate) mod portfolio;
+pub(crate) mod voice;

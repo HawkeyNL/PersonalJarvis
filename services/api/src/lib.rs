@@ -42,13 +42,14 @@ mod routes;
 mod validation;
 
 use audit::{agent_audit_log, record_agent_audit, security_audit_log};
-use error::{bad_request, db_err, speech_err, unauthorized};
+use error::{bad_request, db_err, unauthorized};
 use routes::auth::{
     auth_challenge, auth_enroll, auth_login, auth_logout, delete_device, list_devices,
     unlock_approve, unlock_deny, unlock_pending, unlock_request, unlock_status, ApproveReq,
 };
 use routes::broker::{ibkr_positions, ibkr_status};
 use routes::portfolio::{add_holding, get_holdings, remove_holding};
+use routes::voice::{voice_enroll, voice_status, voice_verify};
 pub use rate_limit::{AuthLimits, RateLimiter};
 
 /// Shared, cheaply-cloneable application state.
@@ -1169,112 +1170,6 @@ fn is_local_origin(origin: &str) -> bool {
         || origin.starts_with("http://127.0.0.1")
         || origin.starts_with("https://localhost")
         || origin == "null"
-}
-
-// ---- Voice: server-side speaker verification + STT --------------------------
-
-fn encode_embedding(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|f| f.to_le_bytes()).collect()
-}
-
-fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-#[derive(Deserialize)]
-struct AudioReq {
-    sample_rate: u32,
-    /// 16-bit mono PCM samples.
-    pcm: Vec<i16>,
-}
-
-fn to_audio(req: AudioReq) -> Result<speech::Audio, (StatusCode, Json<Value>)> {
-    if req.pcm.is_empty() {
-        return Err(bad_request("audio is required"));
-    }
-    Ok(speech::Audio::new(req.pcm, req.sample_rate))
-}
-
-/// Whether the authenticated user has enrolled a voice profile.
-async fn voice_status(
-    authed: Authed,
-    State(state): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let exists: Option<i32> =
-        sqlx::query_scalar("select 1 from voice_profiles where user_id = $1")
-            .bind(authed.user.id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(db_err)?;
-    Ok(Json(json!({
-        "enrolled": exists.is_some(),
-        "engine": state.speech.label(),
-    })))
-}
-
-/// Enroll (or re-enroll) the user's voice: embed the audio and store it centrally.
-async fn voice_enroll(
-    authed: Authed,
-    State(state): State<AppState>,
-    Json(req): Json<AudioReq>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let audio = to_audio(req)?;
-    let embedding = state.speech.embed(&audio).await.map_err(speech_err)?;
-    let bytes = encode_embedding(&embedding);
-    sqlx::query(
-        "insert into voice_profiles (user_id, embedding, dims, engine, updated_at) \
-         values ($1, $2, $3, $4, now()) \
-         on conflict (user_id) do update set \
-           embedding = $2, dims = $3, engine = $4, updated_at = now()",
-    )
-    .bind(authed.user.id)
-    .bind(&bytes)
-    .bind(embedding.len() as i32)
-    .bind(state.speech.label())
-    .execute(&state.db)
-    .await
-    .map_err(db_err)?;
-    Ok(Json(json!({ "status": "enrolled", "dims": embedding.len() })))
-}
-
-/// Verify a voice against the enrolled profile and transcribe it.
-async fn voice_verify(
-    authed: Authed,
-    State(state): State<AppState>,
-    Json(req): Json<AudioReq>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let audio = to_audio(req)?;
-    let embedding = state.speech.embed(&audio).await.map_err(speech_err)?;
-    let transcript = state.speech.transcribe(&audio).await.unwrap_or_default();
-
-    let stored: Option<Vec<u8>> =
-        sqlx::query_scalar("select embedding from voice_profiles where user_id = $1")
-            .bind(authed.user.id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(db_err)?;
-
-    match stored {
-        None => Ok(Json(json!({
-            "enrolled": false,
-            "is_you": false,
-            "score": 0.0,
-            "transcript": transcript,
-        }))),
-        Some(bytes) => {
-            let profile = decode_embedding(&bytes);
-            let score = speech::cosine(&profile, &embedding);
-            Ok(Json(json!({
-                "enrolled": true,
-                "is_you": score >= state.speech_verify_threshold,
-                "score": score,
-                "transcript": transcript,
-            })))
-        }
-    }
 }
 
 /// Record a reply's cost and refresh the monthly spend counter (ADR-027). Free
