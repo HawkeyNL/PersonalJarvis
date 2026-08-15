@@ -24,7 +24,8 @@ use serde_json::{json, Value};
 
 use jarvis_portfolio as portfolio;
 
-use crate::{render_ecosystem, AppState, Authed};
+use crate::routes::system::render_ecosystem;
+use crate::{AppState, Authed};
 
 pub(crate) async fn mcp_endpoint(
     authed: Authed,
