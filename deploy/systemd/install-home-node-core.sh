@@ -65,6 +65,16 @@ repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 install -o root -g root -m 0644 \
     "$repo_dir/deploy/systemd/jarvis-core.service" \
     /etc/systemd/system/jarvis-core.service
+install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
+install -o root -g root -m 0755 \
+    "$repo_dir/deploy/systemd/update-core-release.sh" \
+    /usr/local/libexec/jarvis/update-core-release
+install -o root -g root -m 0644 \
+    "$repo_dir/deploy/systemd/jarvis-updater.service" \
+    /etc/systemd/system/jarvis-updater.service
+install -o root -g root -m 0644 \
+    "$repo_dir/deploy/systemd/jarvis-updater.timer" \
+    /etc/systemd/system/jarvis-updater.timer
 
 # A release is immutable: the unprivileged service cannot modify its binary or
 # Core persona even if an application-level control were bypassed.
@@ -74,6 +84,8 @@ ln -sfn "$release_dir" /opt/jarvis/current
 
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/jarvis-core.service
+systemd-analyze verify /etc/systemd/system/jarvis-updater.service
+systemd-analyze verify /etc/systemd/system/jarvis-updater.timer
 systemctl enable --now jarvis-core
 
 curl --fail --silent --show-error http://127.0.0.1:8080/livez >/dev/null

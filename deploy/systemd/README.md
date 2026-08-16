@@ -34,6 +34,9 @@ Before installing Jarvis:
   host firewall with default-deny inbound rules.
 - Install Docker Engine with the Compose plugin for PostgreSQL. Keep its management
   socket local; do not add the `jarvis` account to the `docker` group.
+- Install `curl` and `jq`; the updater uses them to fetch and validate release
+  metadata and assets. Ubuntu's standard `tar`, `sha256sum` and `flock` tools are
+  also required.
 - Create a separate PostgreSQL 17 instance with durable storage and backups. It
   must be reachable only from the Home Node (for example, published on
   `127.0.0.1` only). Do **not** use `deploy/compose/docker-compose.yml` as a
@@ -129,7 +132,8 @@ sudo systemctl enable --now jarvis-core
 Alternatively, after you have created the environment file and staged the
 release, run the guarded installer. It validates the release layout, refuses a
 non-production environment or initially enabled agents, protects the release
-files, verifies the unit, and checks both health endpoints:
+files, installs the Core and updater unit files (but does not enable automatic
+updates), verifies the units, and checks both health endpoints:
 
 ```bash
 sudo bash deploy/systemd/install-home-node-core.sh /opt/jarvis/releases/<commit>
@@ -160,7 +164,94 @@ Confirm externally only through the authorised private-network path. Do not solv
 connectivity failures by binding `0.0.0.0`, disabling the firewall, or trusting
 forwarding headers.
 
-## 6. Upgrade and rollback
+## 6. Automatic, tag-based Core updates
+
+Pushing a stable semantic-version tag such as `v0.1.0` starts the `Release Jarvis
+Core` GitHub workflow. It runs the full format, Clippy, test and dependency-audit gate again,
+then publishes an Ubuntu x86_64 release archive containing only `jarvis-api`,
+`core/Jarvis.md`, a tag/revision manifest and a SHA-256 checksum. The workflow
+has no SSH key, Home Node token or production secret, and never connects to the
+Home Node.
+
+The Home Node pulls the latest stable GitHub release over outbound HTTPS every
+five minutes. It uses a lock, downloads into a root-only staging directory,
+checks the checksum and archive layout, atomically switches `/opt/jarvis/current`,
+restarts only `jarvis-core`, then requires `/readyz` to succeed. A failed
+readiness check immediately restores the preceding binary release. It never
+builds from source, executes release-provided scripts, prunes older releases, or
+touches the database schema.
+
+If you chose the manual Core-unit installation above rather than the guarded
+installer, install the updater files before enabling its timer:
+
+```bash
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
+sudo install -o root -g root -m 0755 deploy/systemd/update-core-release.sh /usr/local/libexec/jarvis/update-core-release
+sudo install -o root -g root -m 0644 deploy/systemd/jarvis-updater.service /etc/systemd/system/
+sudo install -o root -g root -m 0644 deploy/systemd/jarvis-updater.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemd-analyze verify /etc/systemd/system/jarvis-updater.service
+```
+
+Create the updater configuration after the initial Core installation:
+
+```bash
+sudoedit /etc/jarvis/updater.env
+sudo chown root:root /etc/jarvis/updater.env
+sudo chmod 0600 /etc/jarvis/updater.env
+```
+
+For this repository's public releases, the file contains only:
+
+```dotenv
+JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis
+```
+
+For a future private repository, do not place a token in this file. Create a
+root-only curl netrc instead and add its path to `updater.env`:
+
+```bash
+sudoedit /etc/jarvis/github-release.netrc
+sudo chown root:root /etc/jarvis/github-release.netrc
+sudo chmod 0600 /etc/jarvis/github-release.netrc
+```
+
+```netrc
+machine api.github.com login token password <fine-grained-read-only-token>
+machine github.com login token password <fine-grained-read-only-token>
+```
+
+```dotenv
+JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis
+JARVIS_GITHUB_CURL_NETRC=/etc/jarvis/github-release.netrc
+```
+
+The token, if ever needed, must be fine-grained, read-only and limited to this
+repository. Do not reuse a personal administration token. Enable and inspect the
+timer only after the configuration has been reviewed:
+
+```bash
+sudo systemctl enable --now jarvis-updater.timer
+sudo systemctl list-timers jarvis-updater.timer
+sudo systemctl start jarvis-updater.service
+sudo journalctl -u jarvis-updater -n 100 --no-pager
+```
+
+The checksum protects against corrupted transfer, while the GitHub repository,
+tag protection, required reviews and the release workflow remain the trust root.
+Before enabling automatic production updates, protect the `v*` tag namespace and
+require the normal CI checks and trusted maintainers in GitHub. This updater does
+refuse automatic version downgrades and does not make database migrations
+reversible: review schema compatibility and restore plans separately before
+publishing a release tag.
+
+To disable automatic updates without affecting Core:
+
+```bash
+sudo systemctl disable --now jarvis-updater.timer
+```
+
+## 7. Manual upgrade and rollback
 
 For every update, repeat the CI gate, stage a new immutable release, and retain
 the previous release directory. Then switch the symlink and restart only Core:
@@ -175,7 +266,7 @@ If readiness fails, switch `/opt/jarvis/current` back to the previous release an
 restart Core. Investigate the journal and database migration state before retrying;
 never roll back database schema blindly.
 
-## 7. Operational checks to schedule
+## 8. Operational checks to schedule
 
 - Check `systemctl status jarvis-core`, `readyz`, disk capacity, temperature, and
   PostgreSQL health after reboots and updates.
