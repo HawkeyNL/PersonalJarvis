@@ -14,6 +14,11 @@ Run these directly on Ubuntu:
 - hardware/OS monitoring
 - Claude Code and Codex CLI for controlled engineering tasks
 
+The first Core unit is versioned at
+[`deploy/systemd/jarvis-core.service`](../deploy/systemd/jarvis-core.service).
+Its installation, secret-file, readiness, and proxy-trust requirements are in
+[`deploy/systemd/README.md`](../deploy/systemd/README.md).
+
 Jarvis Core should remain available when an individual Docker service fails. It is the orchestrator, not another application container.
 
 ## Docker responsibilities
