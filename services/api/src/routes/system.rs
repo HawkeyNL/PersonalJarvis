@@ -184,7 +184,11 @@ pub(crate) fn render_ecosystem(
     s.push_str(&format!(
         "\nAgent-capabilities: agent {}, werkmap {}\n",
         if agent_enabled { "AAN" } else { "uit" },
-        if has_workspace { "geconfigureerd" } else { "geen" }
+        if has_workspace {
+            "geconfigureerd"
+        } else {
+            "geen"
+        }
     ));
     s
 }

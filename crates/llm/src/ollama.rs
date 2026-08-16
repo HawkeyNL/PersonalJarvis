@@ -90,7 +90,10 @@ impl LlmProvider for OllamaProvider {
             return Err(LlmError::Empty);
         }
         let usage = Usage {
-            input_tokens: v.get("prompt_eval_count").and_then(Value::as_u64).unwrap_or(0) as u32,
+            input_tokens: v
+                .get("prompt_eval_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
             output_tokens: v.get("eval_count").and_then(Value::as_u64).unwrap_or(0) as u32,
             ..Default::default()
         };

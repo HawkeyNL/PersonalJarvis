@@ -270,12 +270,24 @@ mod tests {
     fn picks_low_models_by_default_and_strong_for_hard() {
         let r = RouterProvider::new(all(), always_available(), catalog());
         // Default → light on the plan (cheap sufficient, free).
-        assert_eq!(r.model_for("claude-cli", Tier::Default).as_deref(), Some("claude-haiku-4-5"));
-        assert_eq!(r.model_for("claude-cli", Tier::Cheap).as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(
+            r.model_for("claude-cli", Tier::Default).as_deref(),
+            Some("claude-haiku-4-5")
+        );
+        assert_eq!(
+            r.model_for("claude-cli", Tier::Cheap).as_deref(),
+            Some("claude-haiku-4-5")
+        );
         // Hard → the heavy model.
-        assert_eq!(r.model_for("claude-cli", Tier::Hard).as_deref(), Some("claude-opus-5"));
+        assert_eq!(
+            r.model_for("claude-cli", Tier::Hard).as_deref(),
+            Some("claude-opus-5")
+        );
         // No light for anthropic-api → Default escalates to its Mid model.
-        assert_eq!(r.model_for("anthropic-api", Tier::Default).as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(
+            r.model_for("anthropic-api", Tier::Default).as_deref(),
+            Some("claude-sonnet-5")
+        );
         // Ollama has only a light model → nothing for a Hard task (uses default).
         assert_eq!(r.model_for("ollama", Tier::Hard), None);
     }
@@ -311,20 +323,32 @@ mod tests {
             max_tokens: 16,
             model: None,
         };
-        assert_eq!(r.chat(&ask(Tier::Default)).await.unwrap().model, "claude-haiku-4-5");
-        assert_eq!(r.chat(&ask(Tier::Hard)).await.unwrap().model, "claude-opus-5");
+        assert_eq!(
+            r.chat(&ask(Tier::Default)).await.unwrap().model,
+            "claude-haiku-4-5"
+        );
+        assert_eq!(
+            r.chat(&ask(Tier::Hard)).await.unwrap().model,
+            "claude-opus-5"
+        );
     }
 
     #[test]
     fn cheap_prefers_local_then_plan_then_api() {
         let r = RouterProvider::new(all(), always_available(), vec![]);
-        assert_eq!(ids(r.plan(Tier::Cheap)), ["ollama", "claude-cli", "anthropic-api"]);
+        assert_eq!(
+            ids(r.plan(Tier::Cheap)),
+            ["ollama", "claude-cli", "anthropic-api"]
+        );
     }
 
     #[test]
     fn default_prefers_plan_then_api_then_local() {
         let r = RouterProvider::new(all(), always_available(), vec![]);
-        assert_eq!(ids(r.plan(Tier::Default)), ["claude-cli", "anthropic-api", "ollama"]);
+        assert_eq!(
+            ids(r.plan(Tier::Default)),
+            ["claude-cli", "anthropic-api", "ollama"]
+        );
     }
 
     #[test]
@@ -346,12 +370,24 @@ mod tests {
         // Cheap: free first, then the cheapest metered.
         assert_eq!(
             ids(r.plan(Tier::Cheap)),
-            ["ollama", "claude-cli", "deepseek-api", "openai-api", "anthropic-api"]
+            [
+                "ollama",
+                "claude-cli",
+                "deepseek-api",
+                "openai-api",
+                "anthropic-api"
+            ]
         );
         // Default: plan first, strong APIs, then cheap/local last.
         assert_eq!(
             ids(r.plan(Tier::Default)),
-            ["claude-cli", "anthropic-api", "openai-api", "deepseek-api", "ollama"]
+            [
+                "claude-cli",
+                "anthropic-api",
+                "openai-api",
+                "deepseek-api",
+                "ollama"
+            ]
         );
         // Hard: strong brains only (no deepseek/ollama).
         assert_eq!(
@@ -373,7 +409,10 @@ mod tests {
             }
         }
         let r2 = RouterProvider::new(all(), Arc::new(None_), vec![]);
-        assert_eq!(ids(r2.plan(Tier::Default)), ["claude-cli", "anthropic-api", "ollama"]);
+        assert_eq!(
+            ids(r2.plan(Tier::Default)),
+            ["claude-cli", "anthropic-api", "ollama"]
+        );
     }
 
     #[tokio::test]

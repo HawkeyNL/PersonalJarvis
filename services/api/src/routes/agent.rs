@@ -45,17 +45,31 @@ pub(crate) async fn agent_action(
     };
     let at = agent::action_type(&action).to_string();
     let risk = agent::classify(&action);
-    let detail = serde_json::to_string(&action).ok();
+    // Prompts and write content can contain sensitive material. The audit trail
+    // records the capability, risk and outcome, never unredacted action payloads.
+    let detail = None;
 
     // Mutating actions (4b) need a device-signed approval: validate + preview,
     // store a pending action, and return its nonce for the owner to sign.
     if agent::is_mutating(&action) {
         let preview = match agent::preview(&sandbox, &action).await {
             Ok(p) => p,
-            Err(e) => {
+            Err(_e) => {
                 // A protected/escaping target is refused now — no pending created.
-                record_agent_audit(&state, authed.device.id, &at, detail, risk, "denied", Some(&e.to_string())).await;
-                return Err((StatusCode::FORBIDDEN, Json(json!({ "error": e.to_string() }))));
+                record_agent_audit(
+                    &state,
+                    authed.device.id,
+                    &at,
+                    detail,
+                    risk,
+                    "denied",
+                    Some("action refused"),
+                )
+                .await;
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "agent action refused" })),
+                ));
             }
         };
         let mut nonce = [0u8; 32];
@@ -110,8 +124,17 @@ pub(crate) async fn agent_action(
             } else {
                 ("error", StatusCode::BAD_REQUEST)
             };
-            record_agent_audit(&state, authed.device.id, &at, detail, risk, label, Some(&e.to_string())).await;
-            Err((code, Json(json!({ "error": e.to_string() }))))
+            record_agent_audit(
+                &state,
+                authed.device.id,
+                &at,
+                detail,
+                risk,
+                label,
+                Some("action failed"),
+            )
+            .await;
+            Err((code, Json(json!({ "error": "agent action failed" }))))
         }
     }
 }
@@ -154,7 +177,10 @@ pub(crate) async fn agent_pending_approve(
     let signature =
         hex::decode(&req.signature).map_err(|_| bad_request("invalid signature encoding"))?;
     let Some(sandbox) = state.agent_sandbox.clone() else {
-        return Err((StatusCode::FORBIDDEN, Json(json!({ "error": "no workspace" }))));
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "no workspace" })),
+        ));
     };
 
     // Fetch the pending action (must be this user's, still pending + unexpired).
@@ -168,13 +194,22 @@ pub(crate) async fn agent_pending_approve(
     .await
     .map_err(db_err)?;
     let (nonce, action_json, at) = row.ok_or_else(|| {
-        (StatusCode::NOT_FOUND, Json(json!({ "error": "no such pending action" })))
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such pending action" })),
+        )
     })?;
 
     // Verify the owner's device signature over the nonce.
-    identity::verify_device_signature(&state.db, authed.user.id, authed.device.id, &nonce, &signature)
-        .await
-        .map_err(|_| unauthorized())?;
+    identity::verify_device_signature(
+        &state.db,
+        authed.user.id,
+        authed.device.id,
+        &nonce,
+        &signature,
+    )
+    .await
+    .map_err(|_| unauthorized())?;
 
     // Consume it atomically — mark executed so it can never run twice (replay).
     let claimed = sqlx::query(
@@ -188,22 +223,51 @@ pub(crate) async fn agent_pending_approve(
     .await
     .map_err(db_err)?;
     if claimed.rows_affected() == 0 {
-        return Err((StatusCode::CONFLICT, Json(json!({ "error": "already resolved" }))));
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "already resolved" })),
+        ));
     }
 
     let action: agent::Action = serde_json::from_str(&action_json).map_err(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "corrupt pending action" })))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "corrupt pending action" })),
+        )
     })?;
 
     match agent::execute(&sandbox, &action).await {
         Ok(outcome) => {
             let note = outcome.truncated.then_some("output truncated");
-            record_agent_audit(&state, authed.device.id, &at, Some(action_json), agent::RiskClass::NeedsApproval, "ok", note).await;
-            Ok(Json(json!({ "action": at, "output": outcome.output, "truncated": outcome.truncated })))
+            record_agent_audit(
+                &state,
+                authed.device.id,
+                &at,
+                None,
+                agent::RiskClass::NeedsApproval,
+                "ok",
+                note,
+            )
+            .await;
+            Ok(Json(
+                json!({ "action": at, "output": outcome.output, "truncated": outcome.truncated }),
+            ))
         }
-        Err(e) => {
-            record_agent_audit(&state, authed.device.id, &at, Some(action_json), agent::RiskClass::NeedsApproval, "error", Some(&e.to_string())).await;
-            Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))))
+        Err(_e) => {
+            record_agent_audit(
+                &state,
+                authed.device.id,
+                &at,
+                None,
+                agent::RiskClass::NeedsApproval,
+                "error",
+                Some("action failed"),
+            )
+            .await;
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "agent action failed" })),
+            ))
         }
     }
 }
@@ -225,8 +289,20 @@ pub(crate) async fn agent_pending_deny(
     .await
     .map_err(db_err)?;
     if res.rows_affected() == 0 {
-        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "no such pending action" }))));
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such pending action" })),
+        ));
     }
-    record_agent_audit(&state, authed.device.id, "pending", None, agent::RiskClass::NeedsApproval, "denied", Some("denied by owner")).await;
+    record_agent_audit(
+        &state,
+        authed.device.id,
+        "pending",
+        None,
+        agent::RiskClass::NeedsApproval,
+        "denied",
+        Some("denied by owner"),
+    )
+    .await;
     Ok(Json(json!({ "status": "denied" })))
 }

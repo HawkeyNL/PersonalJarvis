@@ -4,6 +4,7 @@
 //! auth rate limiter. It is cheaply cloneable (everything shared is behind `Arc`)
 //! so Axum can hand a clone to each request.
 
+use std::net::IpAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
@@ -53,7 +54,9 @@ pub struct AppState {
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
     /// Tunable thresholds for the auth rate limiter (from `JARVIS_AUTH_*`).
     pub auth_limits: rate_limit::AuthLimits,
-    /// Number of trusted proxy hops in front of the API (0 ⇒ never trust
-    /// `X-Forwarded-For`; use the socket peer). See `rate_limit::client_ip`.
+    /// Number of trusted proxy hops in front of the API. Forwarding headers are
+    /// only considered when the direct peer is in `trusted_proxy_ips`.
     pub trusted_proxy_hops: u32,
+    /// Direct peer IPs of the proxies allowed to supply forwarding headers.
+    pub trusted_proxy_ips: Arc<Vec<IpAddr>>,
 }

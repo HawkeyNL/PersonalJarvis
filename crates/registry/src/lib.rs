@@ -161,7 +161,8 @@ pub async fn collect(input: &CollectInput) -> Registry {
             name: "ollama".into(),
             present: ollama_ver.is_some(),
             version: ollama_ver,
-            detail: (!ollama_models.is_empty()).then(|| format!("{} lokaal model(len)", ollama_models.len())),
+            detail: (!ollama_models.is_empty())
+                .then(|| format!("{} lokaal model(len)", ollama_models.len())),
         },
         SoftwareItem {
             name: "cmake".into(),
@@ -193,7 +194,11 @@ pub async fn collect(input: &CollectInput) -> Registry {
 /// provider (class by tier role, cost by band) + the local Ollama models that
 /// are actually installed. Deduplicated per backend (a provider often reuses the
 /// same model across tiers). See ADR-028.
-fn derive_models(input: &CollectInput, claude_present: bool, ollama_models: &[String]) -> Vec<ModelEntry> {
+fn derive_models(
+    input: &CollectInput,
+    claude_present: bool,
+    ollama_models: &[String],
+) -> Vec<ModelEntry> {
     let mut out = Vec::new();
 
     // Class from a model's tier role, sharpened to Reasoning by name.
@@ -207,32 +212,40 @@ fn derive_models(input: &CollectInput, claude_present: bool, ollama_models: &[St
     };
 
     // Add the cheap/default/hard trio for one keyed cloud provider.
-    let mut add_cloud =
-        |backend: &str, available: bool, cheap: &str, default: &str, hard: &str, cheap_cost: ModelCost| {
-            let trio = [
-                (cheap, ModelClass::Light, cheap_cost),
-                (default, ModelClass::Mid, ModelCost::Mid),
-                (hard, ModelClass::Heavy, ModelCost::Pricey),
-            ];
-            for (id, role_class, cost) in trio {
-                if id.is_empty() || out.iter().any(|m: &ModelEntry| m.id == id && m.backend == backend) {
-                    continue; // skip blanks + duplicates (e.g. default == hard)
-                }
-                out.push(ModelEntry {
-                    id: id.to_string(),
-                    backend: backend.to_string(),
-                    class: class_of(id, role_class),
-                    // The plan route is free; DeepSeek is cheap across the board;
-                    // others keep the tier band.
-                    cost: match backend {
-                        "claude-cli" => ModelCost::Local,
-                        "deepseek-api" => ModelCost::Cheap,
-                        _ => cost,
-                    },
-                    available,
-                });
+    let mut add_cloud = |backend: &str,
+                         available: bool,
+                         cheap: &str,
+                         default: &str,
+                         hard: &str,
+                         cheap_cost: ModelCost| {
+        let trio = [
+            (cheap, ModelClass::Light, cheap_cost),
+            (default, ModelClass::Mid, ModelCost::Mid),
+            (hard, ModelClass::Heavy, ModelCost::Pricey),
+        ];
+        for (id, role_class, cost) in trio {
+            if id.is_empty()
+                || out
+                    .iter()
+                    .any(|m: &ModelEntry| m.id == id && m.backend == backend)
+            {
+                continue; // skip blanks + duplicates (e.g. default == hard)
             }
-        };
+            out.push(ModelEntry {
+                id: id.to_string(),
+                backend: backend.to_string(),
+                class: class_of(id, role_class),
+                // The plan route is free; DeepSeek is cheap across the board;
+                // others keep the tier band.
+                cost: match backend {
+                    "claude-cli" => ModelCost::Local,
+                    "deepseek-api" => ModelCost::Cheap,
+                    _ => cost,
+                },
+                available,
+            });
+        }
+    };
 
     // The Claude plan via the CLI runs the same Claude models, but free.
     add_cloud(
@@ -283,7 +296,11 @@ fn derive_models(input: &CollectInput, claude_present: bool, ollama_models: &[St
 }
 
 /// Build the brain list (pure — testable) from config + probe results.
-fn derive_brains(input: &CollectInput, claude_present: bool, ollama_models: &[String]) -> Vec<Brain> {
+fn derive_brains(
+    input: &CollectInput,
+    claude_present: bool,
+    ollama_models: &[String],
+) -> Vec<Brain> {
     let ollama_available = !ollama_models.is_empty();
     vec![
         Brain {
@@ -389,9 +406,7 @@ async fn probe_version(bin: &str, arg: &str) -> Option<String> {
 
 async fn probe_ollama_models() -> Vec<String> {
     match Command::new("ollama").arg("list").output().await {
-        Ok(out) if out.status.success() => {
-            parse_ollama_list(&String::from_utf8_lossy(&out.stdout))
-        }
+        Ok(out) if out.status.success() => parse_ollama_list(&String::from_utf8_lossy(&out.stdout)),
         _ => Vec::new(),
     }
 }
@@ -441,7 +456,10 @@ mod tests {
     #[test]
     fn parses_ollama_list() {
         let out = "NAME            ID          SIZE    MODIFIED\nllama3.2:latest a1b2  2.0 GB  2 days ago\nqwen2.5:7b   c3d4  4.7 GB  1 week ago\n";
-        assert_eq!(parse_ollama_list(out), vec!["llama3.2:latest", "qwen2.5:7b"]);
+        assert_eq!(
+            parse_ollama_list(out),
+            vec!["llama3.2:latest", "qwen2.5:7b"]
+        );
     }
 
     #[test]
@@ -494,7 +512,10 @@ mod tests {
         i.has_openai_key = false;
         let models = derive_models(&i, true, &[]);
         // Known models stay visible ("ecosystem"), just flagged unavailable.
-        let openai: Vec<_> = models.iter().filter(|m| m.backend == "openai-api").collect();
+        let openai: Vec<_> = models
+            .iter()
+            .filter(|m| m.backend == "openai-api")
+            .collect();
         assert!(!openai.is_empty());
         assert!(openai.iter().all(|m| !m.available));
         assert!(models

@@ -37,7 +37,9 @@ impl AnthropicProvider {
     ) -> Result<Self, LlmError> {
         let api_key = api_key.into();
         if api_key.trim().is_empty() {
-            return Err(LlmError::NotConfigured("JARVIS_LLM_API_KEY is empty".into()));
+            return Err(LlmError::NotConfigured(
+                "JARVIS_LLM_API_KEY is empty".into(),
+            ));
         }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))

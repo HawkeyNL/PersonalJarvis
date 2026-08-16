@@ -345,7 +345,10 @@ mod tests {
             deepseek: OpenAiBackend::default(),
         });
         // CLI primary, API as the fallback ("vangnet als de CLI vol is").
-        assert_eq!(brain.label(), "claude-cli:claude-sonnet-5→anthropic:claude-sonnet-5");
+        assert_eq!(
+            brain.label(),
+            "claude-cli:claude-sonnet-5→anthropic:claude-sonnet-5"
+        );
     }
 
     #[test]

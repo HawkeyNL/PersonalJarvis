@@ -8,7 +8,7 @@
 // from `load()` for ergonomics; boxing it would break `?` in anyhow callers.
 #![allow(clippy::result_large_err)]
 
-use std::fmt;
+use std::{fmt, net::IpAddr};
 
 use figment::{
     providers::{Env, Format, Toml},
@@ -181,9 +181,15 @@ pub struct AppConfig {
 
     /// Trusted proxy hops in front of the API. 0 (default) ⇒ never trust
     /// `X-Forwarded-For`; use the socket peer address for rate-limit/audit keys.
-    /// Set to N only when the API is reachable *only* through N trusted proxies.
+    /// Set to N only together with `trusted_proxy_ips` when the API is reachable
+    /// *only* through N trusted proxies.
     #[serde(default)]
     pub trusted_proxy_hops: u32,
+
+    /// Comma-separated direct peer IP addresses for the proxies allowed to set
+    /// forwarding headers. Empty (the default) means no proxy is trusted.
+    #[serde(default)]
+    pub trusted_proxy_ips: String,
 }
 
 fn default_bind_addr() -> String {
@@ -327,6 +333,27 @@ impl AppConfig {
             .merge(Env::prefixed("JARVIS_"))
             .extract()
     }
+
+    /// Parse the direct proxy peers allowed to supply forwarding headers.
+    /// Configuration is deliberately strict: enabling proxy hops without an
+    /// explicit peer allowlist fails startup rather than trusting arbitrary
+    /// network clients.
+    pub fn trusted_proxy_ips(&self) -> Result<Vec<IpAddr>, String> {
+        let peers = self
+            .trusted_proxy_ips
+            .split(',')
+            .map(str::trim)
+            .filter(|peer| !peer.is_empty())
+            .map(|peer| {
+                peer.parse()
+                    .map_err(|_| format!("invalid trusted proxy IP: {peer}"))
+            })
+            .collect::<Result<Vec<IpAddr>, _>>()?;
+        if self.trusted_proxy_hops > 0 && peers.is_empty() {
+            return Err("JARVIS_TRUSTED_PROXY_HOPS requires JARVIS_TRUSTED_PROXY_IPS".to_string());
+        }
+        Ok(peers)
+    }
 }
 
 impl fmt::Debug for AppConfig {
@@ -372,6 +399,8 @@ impl fmt::Debug for AppConfig {
             .field("agent_claude_code_enabled", &self.agent_claude_code_enabled)
             .field("agent_claude_code_bin", &self.agent_claude_code_bin)
             .field("agent_claude_code_model", &self.agent_claude_code_model)
+            .field("trusted_proxy_hops", &self.trusted_proxy_hops)
+            .field("trusted_proxy_ips", &self.trusted_proxy_ips)
             .finish()
     }
 }
@@ -426,6 +455,7 @@ mod tests {
             auth_login_max_failures: 5,
             auth_login_lock_secs: 300,
             trusted_proxy_hops: 0,
+            trusted_proxy_ips: String::new(),
         };
 
         let rendered = format!("{cfg:?}");
@@ -453,6 +483,21 @@ mod tests {
             assert_eq!(cfg.database_url, "postgres://localhost/x");
             assert!(cfg.log_json);
             assert_eq!(cfg.environment, "development"); // default
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn proxy_hops_require_an_explicit_peer_allowlist() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("JARVIS_DATABASE_URL", "postgres://localhost/x");
+            jail.set_env("JARVIS_TRUSTED_PROXY_HOPS", "1");
+            let cfg = AppConfig::load()?;
+            assert!(cfg.trusted_proxy_ips().is_err());
+
+            jail.set_env("JARVIS_TRUSTED_PROXY_IPS", "127.0.0.1,::1");
+            let cfg = AppConfig::load()?;
+            assert_eq!(cfg.trusted_proxy_ips()?.len(), 2);
             Ok(())
         });
     }

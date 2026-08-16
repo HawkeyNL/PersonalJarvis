@@ -69,7 +69,10 @@ pub(crate) async fn record_security_event(
 
 /// The recent security/auth audit trail (Priority 6) — logins, enrolment,
 /// logout, and device/unlock changes. Owner-only; never contains secrets.
-pub(crate) async fn security_audit_log(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
+pub(crate) async fn security_audit_log(
+    _authed: Authed,
+    State(state): State<AppState>,
+) -> Json<Value> {
     type AuditRow = (Option<Uuid>, String, String, Option<String>, String);
     let rows: Vec<AuditRow> = sqlx::query_as(
         "SELECT device_id, event, outcome, detail, \

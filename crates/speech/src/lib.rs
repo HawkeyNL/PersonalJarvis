@@ -163,7 +163,9 @@ mod tests {
     use super::*;
 
     fn tone(len: usize, step: i16) -> Audio {
-        let pcm: Vec<i16> = (0..len).map(|i| ((i as i16).wrapping_mul(step)) % 8000).collect();
+        let pcm: Vec<i16> = (0..len)
+            .map(|i| ((i as i16).wrapping_mul(step)) % 8000)
+            .collect();
         Audio::new(pcm, 16000)
     }
 

@@ -51,6 +51,7 @@ async fn auth_flow_over_http(pool: PgPool) {
         rate_limiter: std::sync::Arc::new(jarvis_api::RateLimiter::new()),
         auth_limits: jarvis_api::AuthLimits::default(),
         trusted_proxy_hops: 0,
+        trusted_proxy_ips: std::sync::Arc::new(Vec::new()),
     });
 
     // 1. enroll this device (dev endpoint)
@@ -362,7 +363,10 @@ async fn enroll_and_login(app: &axum::Router, signing: &SigningKey) -> (String, 
         )
         .await
         .unwrap();
-    let device_id = body_json(resp).await["device_id"].as_str().unwrap().to_string();
+    let device_id = body_json(resp).await["device_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let resp = app
         .clone()
@@ -428,6 +432,7 @@ async fn agent_enabled_state(pool: PgPool, sandbox: agent::Sandbox) -> AppState 
         rate_limiter: std::sync::Arc::new(jarvis_api::RateLimiter::new()),
         auth_limits: jarvis_api::AuthLimits::default(),
         trusted_proxy_hops: 0,
+        trusted_proxy_ips: std::sync::Arc::new(Vec::new()),
     }
 }
 
@@ -453,6 +458,7 @@ async fn stub_state(pool: PgPool) -> AppState {
         rate_limiter: std::sync::Arc::new(jarvis_api::RateLimiter::new()),
         auth_limits: jarvis_api::AuthLimits::default(),
         trusted_proxy_hops: 0,
+        trusted_proxy_ips: std::sync::Arc::new(Vec::new()),
     }
 }
 
@@ -689,7 +695,7 @@ async fn agent_mutating_needs_signed_approval(pool: PgPool) {
     let signing = SigningKey::from_bytes(&seed);
 
     let app = build_router(agent_enabled_state(pool.clone(), sandbox).await);
-    let (_device_id, token) = enroll_and_login(&app, &signing).await;
+    let (device_id, token) = enroll_and_login(&app, &signing).await;
 
     // 1. A write is not executed inline — it returns a pending action + nonce.
     let resp = app
@@ -784,6 +790,17 @@ async fn agent_mutating_needs_signed_approval(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
+    let audit_details: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT detail FROM agent_audit WHERE device_id = $1 ORDER BY ts")
+            .bind(device_id.parse::<Uuid>().unwrap())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        audit_details.iter().all(Option::is_none),
+        "agent audit must not store action payloads"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -825,7 +842,10 @@ async fn chat_is_persisted_and_grouped(pool: PgPool) {
     assert_eq!(body["new_topic"], true);
     assert_eq!(body["reply"], "echo: hoe werkt rust ownership?");
     let conv_id = body["conversation_id"].as_str().unwrap().to_string();
-    assert!(body["conversation_title"].as_str().unwrap().contains("rust"));
+    assert!(body["conversation_title"]
+        .as_str()
+        .unwrap()
+        .contains("rust"));
 
     // 2. Follow-up carrying the conversation id → appended to the same thread.
     let resp = chat(
@@ -978,9 +998,12 @@ async fn mcp_exposes_read_only_tools(pool: PgPool) {
         if let Some(t) = token {
             b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
         }
-        app.oneshot(b.body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap())
-            .await
-            .unwrap()
+        app.oneshot(
+            b.body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
     };
 
     // Unauthenticated → 401.
@@ -1060,8 +1083,10 @@ async fn mcp_exposes_read_only_tools(pool: PgPool) {
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header("origin", "https://evil.example")
                 .body(Body::from(
-                    serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" }))
-                        .unwrap(),
+                    serde_json::to_vec(
+                        &json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" }),
+                    )
+                    .unwrap(),
                 ))
                 .unwrap(),
         )
