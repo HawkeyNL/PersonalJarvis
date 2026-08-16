@@ -176,10 +176,9 @@ pub(crate) async fn unlock_request(
     authed: Authed,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let (id, nonce) =
-        identity::create_unlock_request(&state.db, authed.user.id, authed.device.id)
-            .await
-            .map_err(internal)?;
+    let (id, nonce) = identity::create_unlock_request(&state.db, authed.user.id, authed.device.id)
+        .await
+        .map_err(internal)?;
     Ok(Json(json!({
         "request_id": id,
         "nonce": hex::encode(nonce),
@@ -220,9 +219,7 @@ pub(crate) async fn unlock_status(
                     Json(json!({ "error": "unlock request not found" })),
                 ))
             }
-            Some(status) if status != "pending" => {
-                return Ok(Json(json!({ "status": status })))
-            }
+            Some(status) if status != "pending" => return Ok(Json(json!({ "status": status }))),
             Some(status) => {
                 if ticks == 0 {
                     return Ok(Json(json!({ "status": status })));

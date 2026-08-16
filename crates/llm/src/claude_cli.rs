@@ -162,7 +162,10 @@ struct CliUsage {
 fn parse_cli_output(stdout: &str, model: &str) -> Result<ChatReply, LlmError> {
     let parsed: CliResult = serde_json::from_str(stdout.trim()).map_err(|e| LlmError::Api {
         status: 502,
-        body: format!("unparseable claude CLI output: {e}: {}", truncate(stdout, 200)),
+        body: format!(
+            "unparseable claude CLI output: {e}: {}",
+            truncate(stdout, 200)
+        ),
     })?;
 
     if parsed.is_error {
@@ -240,6 +243,9 @@ mod tests {
 
     #[test]
     fn single_turn_prompt_passes_through() {
-        assert_eq!(build_prompt(&[ChatMessage::user("alleen dit")]), "alleen dit");
+        assert_eq!(
+            build_prompt(&[ChatMessage::user("alleen dit")]),
+            "alleen dit"
+        );
     }
 }

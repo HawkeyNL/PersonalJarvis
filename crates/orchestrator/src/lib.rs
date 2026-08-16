@@ -79,7 +79,14 @@ pub async fn plan_and_execute(
     }
 
     // 3. SYNTHESIZE + check — the balanced tier.
-    let synth_reply = chat_once(llm, Tier::Default, SYNTH_SYS, &synth_context(task, &steps), persona).await?;
+    let synth_reply = chat_once(
+        llm,
+        Tier::Default,
+        SYNTH_SYS,
+        &synth_context(task, &steps),
+        persona,
+    )
+    .await?;
     let answer = synth_reply.text.clone();
     calls.push(synth_reply);
 
@@ -192,7 +199,10 @@ mod tests {
     #[test]
     fn extract_steps_falls_back_to_numbered_lines() {
         let t = "Plan:\n1. Verzamel data\n2) Analyseer\n- Rapporteer\nklaar";
-        assert_eq!(extract_steps(t), ["Verzamel data", "Analyseer", "Rapporteer"]);
+        assert_eq!(
+            extract_steps(t),
+            ["Verzamel data", "Analyseer", "Rapporteer"]
+        );
     }
 
     #[test]
@@ -232,7 +242,9 @@ mod tests {
         let llm: Arc<dyn LlmProvider> = Arc::new(Scripted {
             seen: Mutex::new(Vec::new()),
         });
-        let r = plan_and_execute(&llm, "bouw iets", "Je bent Jarvis.").await.unwrap();
+        let r = plan_and_execute(&llm, "bouw iets", "Je bent Jarvis.")
+            .await
+            .unwrap();
         assert_eq!(r.plan, ["a", "b"]);
         assert_eq!(r.steps.len(), 2);
         assert!(r.steps.iter().all(|s| s.model == "haiku")); // cheap executes

@@ -130,8 +130,15 @@ pub(crate) async fn assistant_chat(
         history
     };
     let chat = llm::ChatRequest {
-        system: Some(req.system.unwrap_or_else(|| state.jarvis_system.to_string())),
-        tier: req.tier.as_deref().map(llm::Tier::parse).unwrap_or_default(),
+        system: Some(
+            req.system
+                .unwrap_or_else(|| state.jarvis_system.to_string()),
+        ),
+        tier: req
+            .tier
+            .as_deref()
+            .map(llm::Tier::parse)
+            .unwrap_or_default(),
         messages,
         max_tokens: state.llm_max_tokens,
         // The router picks the concrete model per backend (ADR-028 fase 2).
@@ -230,7 +237,10 @@ fn parse_topic(text: &str) -> Option<(bool, String)> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
     let v: Value = serde_json::from_str(text.get(start..=end)?).ok()?;
-    let same = v.get("same_topic").and_then(|b| b.as_bool()).unwrap_or(false);
+    let same = v
+        .get("same_topic")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
     let title = v
         .get("title")
         .and_then(|t| t.as_str())
@@ -317,7 +327,10 @@ async fn append_message(
 }
 
 /// List the owner's conversations, newest-active first (ADR-030).
-pub(crate) async fn list_conversations(authed: Authed, State(state): State<AppState>) -> Json<Value> {
+pub(crate) async fn list_conversations(
+    authed: Authed,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
         "SELECT id, title, to_char(updated_at, 'YYYY-MM-DD HH24:MI') \
          FROM conversations WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 100",
@@ -342,7 +355,10 @@ pub(crate) async fn get_conversation(
     let title = conversation_title(&state.db, id, authed.user.id)
         .await
         .ok_or_else(|| {
-            (StatusCode::NOT_FOUND, Json(json!({ "error": "no such conversation" })))
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "no such conversation" })),
+            )
         })?;
     let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
         "SELECT role, content, model, to_char(created_at, 'YYYY-MM-DD HH24:MI') \
@@ -358,7 +374,9 @@ pub(crate) async fn get_conversation(
             json!({ "role": role, "content": content, "model": model, "at": at })
         })
         .collect();
-    Ok(Json(json!({ "id": id, "title": title, "messages": messages })))
+    Ok(Json(
+        json!({ "id": id, "title": title, "messages": messages }),
+    ))
 }
 
 /// Delete a conversation and its messages (ON DELETE CASCADE) — owner-only.
@@ -374,7 +392,10 @@ pub(crate) async fn delete_conversation(
         .await
         .map_err(db_err)?;
     if res.rows_affected() == 0 {
-        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "no such conversation" }))));
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such conversation" })),
+        ));
     }
     Ok(Json(json!({ "status": "deleted" })))
 }

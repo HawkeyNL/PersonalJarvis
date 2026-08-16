@@ -8,6 +8,7 @@
 //! horizontally-scaled instances — deliberately avoided for now.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -112,25 +113,25 @@ impl RateLimiter {
 
 /// The connection peer address (injected by `into_make_service_with_connect_info`);
 /// falls back to a constant when absent (e.g. in-process test requests).
-fn peer_ip(req: &Request) -> String {
+fn peer_ip(req: &Request) -> Option<IpAddr> {
     req.extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip().to_string())
-        .unwrap_or_else(|| "local".to_string())
+        .map(|ci| ci.0.ip())
 }
 
 /// The client IP used to key rate limiting, login lockout and audit attribution.
 ///
 /// Trust model (Priority 3): a client-supplied `X-Forwarded-For` is **never**
-/// trusted by default (`trusted_hops == 0`) — the socket peer address is used, so
-/// a forged header cannot bypass IP limits. Only when the operator declares that
-/// the API sits behind exactly `trusted_hops` trusted proxies (and is reachable
-/// *only* through them) do we read the client from `X-Forwarded-For`, taking the
-/// entry the innermost trusted proxy appended (`len - trusted_hops`) and ignoring
-/// the spoofable prefix. A malformed/short header falls back to the peer address.
-pub(crate) fn client_ip(req: &Request, trusted_hops: u32) -> String {
-    if trusted_hops == 0 {
-        return peer_ip(req);
+/// trusted by default. We use a forwarding header only when the connection peer
+/// is explicitly allowlisted as a trusted proxy and the operator configured the
+/// exact proxy-hop count. The proxy must overwrite incoming forwarding headers;
+/// otherwise no application can distinguish a client-supplied value. A malformed
+/// or short header falls back to the direct peer address.
+pub(crate) fn client_ip(req: &Request, trusted_hops: u32, trusted_peers: &[IpAddr]) -> String {
+    let peer = peer_ip(req);
+    let peer_is_trusted = peer.is_some_and(|ip| trusted_peers.contains(&ip));
+    if trusted_hops == 0 || !peer_is_trusted {
+        return peer.map_or_else(|| "local".to_string(), |ip| ip.to_string());
     }
     let hops = trusted_hops as usize;
     if let Some(xff) = req
@@ -138,16 +139,18 @@ pub(crate) fn client_ip(req: &Request, trusted_hops: u32) -> String {
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
     {
-        let ips: Vec<&str> = xff
+        let ips: Option<Vec<IpAddr>> = xff
             .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .collect();
-        if ips.len() >= hops {
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .ok();
+        if let Some(ips) = ips.filter(|ips| ips.len() >= hops) {
             return ips[ips.len() - hops].to_string();
         }
     }
-    peer_ip(req)
+    peer.map_or_else(|| "local".to_string(), |ip| ip.to_string())
 }
 
 /// The shared 429 response for any auth throttle.
@@ -175,7 +178,11 @@ pub(crate) async fn rate_limit_mw(
     let window = std::time::Duration::from_secs(60);
     let lock_window = std::time::Duration::from_secs(limits.login_lock_secs);
     let path = req.uri().path().to_string();
-    let ip = client_ip(&req, state.trusted_proxy_hops);
+    let ip = client_ip(
+        &req,
+        state.trusted_proxy_hops,
+        state.trusted_proxy_ips.as_slice(),
+    );
 
     // Flat per-endpoint rate limit.
     let flat = match path.as_str() {
@@ -185,7 +192,10 @@ pub(crate) async fn rate_limit_mw(
         _ => None,
     };
     if let Some(max) = flat {
-        if !state.rate_limiter.check(&format!("{path}:{ip}"), max, window) {
+        if !state
+            .rate_limiter
+            .check(&format!("{path}:{ip}"), max, window)
+        {
             tracing::warn!(%ip, %path, "auth rate limit hit");
             return too_many_requests();
         }
@@ -195,7 +205,9 @@ pub(crate) async fn rate_limit_mw(
     let is_login = path == "/v1/auth/login";
     let fail_key = format!("loginfail:{ip}");
     if is_login
-        && state.rate_limiter.failures_in_window(&fail_key, lock_window)
+        && state
+            .rate_limiter
+            .failures_in_window(&fail_key, lock_window)
             >= limits.login_max_failures
     {
         tracing::warn!(%ip, "login locked out after repeated failures");
@@ -228,27 +240,34 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         // hops=0 → never trust the header; no ConnectInfo peer → "local".
-        assert_eq!(client_ip(&req, 0), "local");
+        assert_eq!(client_ip(&req, 0, &[]), "local");
     }
 
     #[test]
-    fn client_ip_trusts_only_the_innermost_proxy_hop() {
-        // The client spoofs "9.9.9.9"; the single trusted proxy appended the peer.
-        let req = Request::builder()
+    fn client_ip_ignores_header_from_an_untrusted_peer() {
+        let mut req = Request::builder()
             .header("x-forwarded-for", "9.9.9.9, 203.0.113.7")
             .body(Body::empty())
             .unwrap();
-        assert_eq!(client_ip(&req, 1), "203.0.113.7");
+        req.extensions_mut().insert(ConnectInfo(
+            "198.51.100.8:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let trusted: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(client_ip(&req, 1, &[trusted]), "198.51.100.8");
     }
 
     #[test]
-    fn client_ip_skips_trusted_hops_from_the_right() {
-        let req = Request::builder()
+    fn client_ip_trusts_only_an_allowlisted_proxy_peer() {
+        let mut req = Request::builder()
             .header("x-forwarded-for", "9.9.9.9, 203.0.113.7, 10.0.0.9")
             .body(Body::empty())
             .unwrap();
-        // 2 trusted hops → the client sits at len-2, spoofable prefix ignored.
-        assert_eq!(client_ip(&req, 2), "203.0.113.7");
+        req.extensions_mut().insert(ConnectInfo(
+            "10.0.0.9:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let trusted: IpAddr = "10.0.0.9".parse().unwrap();
+        // 2 trusted hops → use the entry before the trusted proxy chain.
+        assert_eq!(client_ip(&req, 2, &[trusted]), "203.0.113.7");
     }
 
     #[test]
@@ -258,7 +277,20 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         // hops=2 but only one entry → fall back to the peer ("local").
-        assert_eq!(client_ip(&req, 2), "local");
+        assert_eq!(client_ip(&req, 2, &[]), "local");
+    }
+
+    #[test]
+    fn client_ip_falls_back_when_header_is_malformed() {
+        let mut req = Request::builder()
+            .header("x-forwarded-for", "not-an-ip")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(
+            "10.0.0.9:443".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let trusted: IpAddr = "10.0.0.9".parse().unwrap();
+        assert_eq!(client_ip(&req, 1, &[trusted]), "10.0.0.9");
     }
 
     #[test]
@@ -269,7 +301,7 @@ mod tests {
         assert!(rl.check("k", 3, w));
         assert!(rl.check("k", 3, w));
         assert!(!rl.check("k", 3, w)); // 4th over the limit of 3
-        // A different key has its own independent budget.
+                                       // A different key has its own independent budget.
         assert!(rl.check("other", 3, w));
     }
 

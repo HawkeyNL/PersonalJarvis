@@ -32,7 +32,10 @@ mod tests {
     #[test]
     fn bounded_text_rejects_empty_and_oversized() {
         assert!(bounded_text("iPhone", MAX_DEVICE_NAME_LEN));
-        assert!(bounded_text(&"x".repeat(MAX_DEVICE_NAME_LEN), MAX_DEVICE_NAME_LEN));
+        assert!(bounded_text(
+            &"x".repeat(MAX_DEVICE_NAME_LEN),
+            MAX_DEVICE_NAME_LEN
+        ));
         assert!(!bounded_text("", MAX_DEVICE_NAME_LEN));
         assert!(!bounded_text("   ", MAX_DEVICE_NAME_LEN)); // whitespace-only
         assert!(!bounded_text(

@@ -230,9 +230,7 @@ impl Sandbox {
             ));
         }
         let parent = joined.parent().ok_or(AgentError::OutsideSandbox)?;
-        let parent_canon = parent
-            .canonicalize()
-            .map_err(|_| AgentError::NotFound)?;
+        let parent_canon = parent.canonicalize().map_err(|_| AgentError::NotFound)?;
         if !parent_canon.starts_with(&self.root) {
             return Err(AgentError::OutsideSandbox);
         }
@@ -257,10 +255,7 @@ impl Sandbox {
 
 /// Secret paths are off-limits even to read, even inside the sandbox (ADR-029).
 fn is_secret(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     name == ".env"
         || name.starts_with(".env.")
         || name.ends_with(".pem")
@@ -306,7 +301,11 @@ pub async fn preview(sandbox: &Sandbox, action: &Action) -> Result<String, Agent
     match action {
         Action::WriteFile { path, content } => {
             let target = sandbox.resolve_write(path)?; // enforces Core/secret denial
-            let verb = if target.exists() { "OVERSCHRIJFT" } else { "nieuw bestand" };
+            let verb = if target.exists() {
+                "OVERSCHRIJFT"
+            } else {
+                "nieuw bestand"
+            };
             let head: String = content.chars().take(2000).collect();
             Ok(format!(
                 "WriteFile {path} ({verb}, {} bytes)\n--- inhoud ---\n{head}",
@@ -445,8 +444,7 @@ async fn claude_code(sandbox: &Sandbox, prompt: &str) -> Result<String, AgentErr
         porcelain.trim().to_string()
     };
 
-    let mut report =
-        format!("{result}\n\n--- gewijzigde bestanden (git status) ---\n{changed}");
+    let mut report = format!("{result}\n\n--- gewijzigde bestanden (git status) ---\n{changed}");
     if !breaches.is_empty() {
         report.push_str(&format!(
             "\n\n⚠️ SCHENDING: beschermde paden geraakt: {} — controleer direct.",
@@ -551,13 +549,7 @@ async fn grep(sandbox: &Sandbox, pattern: &str, path: &str) -> Result<String, Ag
     run_cmd(
         sandbox.root(),
         "grep",
-        &[
-            "-rnI",
-            "-e",
-            pattern,
-            "--",
-            &target.to_string_lossy(),
-        ],
+        &["-rnI", "-e", pattern, "--", &target.to_string_lossy()],
     )
     .await
 }
@@ -617,7 +609,10 @@ mod tests {
     #[test]
     fn rejects_absolute_and_escape() {
         let (sb, _dir) = temp_sandbox("escape");
-        assert!(matches!(sb.resolve("/etc/passwd"), Err(AgentError::OutsideSandbox)));
+        assert!(matches!(
+            sb.resolve("/etc/passwd"),
+            Err(AgentError::OutsideSandbox)
+        ));
         // ".." exists (the parent) but is outside the root.
         assert!(matches!(sb.resolve(".."), Err(AgentError::OutsideSandbox)));
     }
@@ -636,9 +631,14 @@ mod tests {
     async fn reads_a_file_and_lists_a_dir() {
         let (sb, dir) = temp_sandbox("read");
         std::fs::write(dir.join("hello.txt"), "hoi Jarvis").unwrap();
-        let out = execute(&sb, &Action::ReadFile { path: "hello.txt".into() })
-            .await
-            .unwrap();
+        let out = execute(
+            &sb,
+            &Action::ReadFile {
+                path: "hello.txt".into(),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(out.output, "hoi Jarvis");
         assert!(!out.truncated);
 
@@ -652,19 +652,38 @@ mod tests {
     async fn reading_a_secret_is_denied_end_to_end() {
         let (sb, dir) = temp_sandbox("read_secret");
         std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
-        let err = execute(&sb, &Action::ReadFile { path: ".env".into() }).await;
+        let err = execute(
+            &sb,
+            &Action::ReadFile {
+                path: ".env".into(),
+            },
+        )
+        .await;
         assert!(matches!(err, Err(AgentError::Denied(_))));
     }
 
     #[test]
     fn read_only_is_auto_mutating_needs_approval() {
-        assert_eq!(classify(&Action::ListDir { path: ".".into() }), RiskClass::Auto);
-        assert_eq!(action_type(&Action::Git { sub: GitRead::Status }), "git_status");
         assert_eq!(
-            classify(&Action::WriteFile { path: "a.txt".into(), content: "x".into() }),
+            classify(&Action::ListDir { path: ".".into() }),
+            RiskClass::Auto
+        );
+        assert_eq!(
+            action_type(&Action::Git {
+                sub: GitRead::Status
+            }),
+            "git_status"
+        );
+        assert_eq!(
+            classify(&Action::WriteFile {
+                path: "a.txt".into(),
+                content: "x".into()
+            }),
             RiskClass::NeedsApproval
         );
-        assert!(is_mutating(&Action::GitCommit { message: "m".into() }));
+        assert!(is_mutating(&Action::GitCommit {
+            message: "m".into()
+        }));
     }
 
     /// The auto-vs-approval decision comes from `jarvis-policy` (review P2): every
@@ -672,7 +691,9 @@ mod tests {
     /// the agent's `RiskClass` adapter must agree with a direct policy call.
     #[test]
     fn classify_is_consistent_with_jarvis_policy() {
-        use jarvis_policy::{decide, Capability, PolicyContext, PolicyDecision, RiskClass as PRisk};
+        use jarvis_policy::{
+            decide, Capability, PolicyContext, PolicyDecision, RiskClass as PRisk,
+        };
         let ctx = |cap, risk| PolicyContext {
             capability: cap,
             risk,
@@ -681,14 +702,23 @@ mod tests {
             reversible: false,
         };
         // Reads → Allow → Auto.
-        assert_eq!(decide(&ctx(Capability::ReadData, PRisk::ReadOnly)), PolicyDecision::Allow);
-        assert_eq!(classify(&Action::ReadFile { path: "a".into() }), RiskClass::Auto);
+        assert_eq!(
+            decide(&ctx(Capability::ReadData, PRisk::ReadOnly)),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            classify(&Action::ReadFile { path: "a".into() }),
+            RiskClass::Auto
+        );
         // Code execution → RequireApproval → NeedsApproval.
         assert_eq!(
             decide(&ctx(Capability::ExecuteCode, PRisk::Mutating)),
             PolicyDecision::RequireApproval
         );
-        assert_eq!(classify(&Action::ClaudeCode { prompt: "x".into() }), RiskClass::NeedsApproval);
+        assert_eq!(
+            classify(&Action::ClaudeCode { prompt: "x".into() }),
+            RiskClass::NeedsApproval
+        );
         // File writes → RequireApproval → NeedsApproval.
         assert_eq!(
             decide(&ctx(Capability::ManageFiles, PRisk::Mutating)),
@@ -703,19 +733,51 @@ mod tests {
         std::fs::create_dir_all(dir.join(".git")).unwrap();
 
         // Happy path: write into the sandbox.
-        let ok = execute(&sb, &Action::WriteFile { path: "note.txt".into(), content: "hoi".into() }).await;
+        let ok = execute(
+            &sb,
+            &Action::WriteFile {
+                path: "note.txt".into(),
+                content: "hoi".into(),
+            },
+        )
+        .await;
         assert!(ok.is_ok());
-        assert_eq!(std::fs::read_to_string(dir.join("note.txt")).unwrap(), "hoi");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("note.txt")).unwrap(),
+            "hoi"
+        );
 
         // The Core is never writable — not even with a valid path.
-        let core = execute(&sb, &Action::WriteFile { path: "core/Jarvis.md".into(), content: "hack".into() }).await;
-        assert!(matches!(core, Err(AgentError::Denied(_))), "core write must be denied");
+        let core = execute(
+            &sb,
+            &Action::WriteFile {
+                path: "core/Jarvis.md".into(),
+                content: "hack".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(core, Err(AgentError::Denied(_))),
+            "core write must be denied"
+        );
 
         // .git internals, secrets, and escapes are denied too.
-        assert!(matches!(sb.resolve_write("core/anything.md"), Err(AgentError::Denied(_))));
-        assert!(matches!(sb.resolve_write(".git/config"), Err(AgentError::Denied(_))));
-        assert!(matches!(sb.resolve_write(".env"), Err(AgentError::Denied(_))));
-        assert!(matches!(sb.resolve_write("/etc/passwd"), Err(AgentError::OutsideSandbox)));
+        assert!(matches!(
+            sb.resolve_write("core/anything.md"),
+            Err(AgentError::Denied(_))
+        ));
+        assert!(matches!(
+            sb.resolve_write(".git/config"),
+            Err(AgentError::Denied(_))
+        ));
+        assert!(matches!(
+            sb.resolve_write(".env"),
+            Err(AgentError::Denied(_))
+        ));
+        assert!(matches!(
+            sb.resolve_write("/etc/passwd"),
+            Err(AgentError::OutsideSandbox)
+        ));
 
         // And the Core stays untouched on disk.
         assert!(!dir.join("core/Jarvis.md").exists());
@@ -724,11 +786,24 @@ mod tests {
     #[tokio::test]
     async fn preview_of_a_write_shows_the_content_and_denies_the_core() {
         let (sb, _dir) = temp_sandbox("preview");
-        let p = preview(&sb, &Action::WriteFile { path: "x.txt".into(), content: "inhoud".into() })
-            .await
-            .unwrap();
+        let p = preview(
+            &sb,
+            &Action::WriteFile {
+                path: "x.txt".into(),
+                content: "inhoud".into(),
+            },
+        )
+        .await
+        .unwrap();
         assert!(p.contains("inhoud"));
-        let denied = preview(&sb, &Action::WriteFile { path: "core/x.md".into(), content: "y".into() }).await;
+        let denied = preview(
+            &sb,
+            &Action::WriteFile {
+                path: "core/x.md".into(),
+                content: "y".into(),
+            },
+        )
+        .await;
         assert!(matches!(denied, Err(AgentError::Denied(_))));
     }
 
@@ -743,7 +818,9 @@ mod tests {
 
     #[test]
     fn claude_code_is_mutating_and_labeled() {
-        let a = Action::ClaudeCode { prompt: "fix the bug".into() };
+        let a = Action::ClaudeCode {
+            prompt: "fix the bug".into(),
+        };
         assert_eq!(classify(&a), RiskClass::NeedsApproval);
         assert!(is_mutating(&a));
         assert_eq!(action_type(&a), "claude_code");
@@ -754,7 +831,13 @@ mod tests {
         // A sandbox *without* `with_claude_code` must refuse the action before
         // ever spawning a process — the second opt-in is required.
         let (sb, _dir) = temp_sandbox("cc_disabled");
-        let err = execute(&sb, &Action::ClaudeCode { prompt: "do it".into() }).await;
+        let err = execute(
+            &sb,
+            &Action::ClaudeCode {
+                prompt: "do it".into(),
+            },
+        )
+        .await;
         assert!(matches!(err, Err(AgentError::Denied(_))));
     }
 
@@ -765,9 +848,14 @@ mod tests {
             bin: "claude".into(),
             model: String::new(),
         });
-        let p = preview(&sb, &Action::ClaudeCode { prompt: "refactor module X".into() })
-            .await
-            .unwrap();
+        let p = preview(
+            &sb,
+            &Action::ClaudeCode {
+                prompt: "refactor module X".into(),
+            },
+        )
+        .await
+        .unwrap();
         assert!(p.contains("refactor module X"));
         assert!(p.contains("geweigerd"));
         assert!(p.contains("Core"));

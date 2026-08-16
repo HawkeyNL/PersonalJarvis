@@ -1,0 +1,123 @@
+name: Release Jarvis Core
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# The workflow may only create a release for the tag that triggered it. It has
+# no deployment credentials and never contacts the Home Node.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Verify and publish Linux release
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # A tag is a release request, not a bypass of the normal quality gate.
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --all
+
+      - name: Home Node updater safety fixtures
+        run: sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-update-core-release.sh
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Check dependency-exception expiry
+        run: test "$(date -u +%F)" \< "2026-10-01"
+
+      - name: Dependency vulnerability audit
+        run: cargo audit
+
+      - name: Build release artifact
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REVISION: ${{ github.sha }}
+          SOURCE_DATE_EPOCH: "0"
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "release tag must use stable vMAJOR.MINOR.PATCH form" >&2
+            exit 1
+          }
+
+          cargo build --locked --release -p jarvis-api
+
+          staging=$(mktemp -d)
+          trap 'rm -rf "$staging"' EXIT
+          release_dir="$staging/jarvis-core-$RELEASE_TAG"
+          mkdir -p "$release_dir/core"
+          install -m 0755 target/release/jarvis-api "$release_dir/jarvis-api"
+          install -m 0644 core/Jarvis.md "$release_dir/core/Jarvis.md"
+
+          # Core applies SQLx migrations during startup. A binary rollback cannot
+          # undo a database migration, so the Home Node updater only auto-installs
+          # releases with the same migration set as its active baseline.
+          migration_manifest="$staging/migrations.sha256"
+          while IFS= read -r migration; do
+            sha256sum "migrations/$migration"
+          done < <(find migrations -type f -name '*.sql' -printf '%P\n' | LC_ALL=C sort) \
+            > "$migration_manifest"
+          migrations_sha256=$(sha256sum "$migration_manifest" | awk '{print $1}')
+
+          jq -n \
+            --arg tag "$RELEASE_TAG" \
+            --arg revision "$RELEASE_REVISION" \
+            --arg migrations_sha256 "$migrations_sha256" \
+            '{tag: $tag, revision: $revision, migrations_sha256: $migrations_sha256}' \
+            > "$release_dir/release.json"
+
+          mkdir -p dist
+          artifact="jarvis-core-$RELEASE_TAG-linux-x86_64.tar.gz"
+          tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 \
+            --numeric-owner -C "$staging" -czf "dist/$artifact" "jarvis-core-$RELEASE_TAG"
+          (
+            cd dist
+            sha256sum "$artifact" > "$artifact.sha256"
+          )
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            "dist/jarvis-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
+            "dist/jarvis-core-$RELEASE_TAG-linux-x86_64.tar.gz.sha256" \
+            --title "Jarvis Core $RELEASE_TAG" \
+            --generate-notes

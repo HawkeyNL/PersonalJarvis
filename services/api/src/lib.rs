@@ -40,6 +40,7 @@ pub use state::AppState;
 use audit::{agent_audit_log, security_audit_log};
 use mcp::mcp_endpoint;
 use rate_limit::rate_limit_mw;
+pub use rate_limit::{AuthLimits, RateLimiter};
 use routes::agent::{agent_action, agent_pending, agent_pending_approve, agent_pending_deny};
 use routes::auth::{
     auth_challenge, auth_enroll, auth_login, auth_logout, delete_device, list_devices,
@@ -51,11 +52,8 @@ use routes::chat::{
     list_conversations,
 };
 use routes::portfolio::{add_holding, get_holdings, remove_holding};
-use routes::system::{
-    system_registry, system_registry_refresh, system_self_improve, system_usage,
-};
+use routes::system::{system_registry, system_registry_refresh, system_self_improve, system_usage};
 use routes::voice::{voice_enroll, voice_status, voice_verify};
-pub use rate_limit::{AuthLimits, RateLimiter};
 
 /// Build the application router.
 pub fn build_router(state: AppState) -> Router {
@@ -94,7 +92,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/system/self-improve", post(system_self_improve))
         .route("/v1/agent/action", post(agent_action))
         .route("/v1/agent/pending", get(agent_pending))
-        .route("/v1/agent/pending/{id}/approve", post(agent_pending_approve))
+        .route(
+            "/v1/agent/pending/{id}/approve",
+            post(agent_pending_approve),
+        )
         .route("/v1/agent/pending/{id}/deny", post(agent_pending_deny))
         .route("/v1/agent/audit", get(agent_audit_log))
         .route("/v1/system/audit", get(security_audit_log))
@@ -196,11 +197,7 @@ impl llm::Availability for BrainAvailability {
         }
         self.registry
             .read()
-            .map(|reg| {
-                reg.brains
-                    .iter()
-                    .any(|b| b.id == backend_id && b.available)
-            })
+            .map(|reg| reg.brains.iter().any(|b| b.id == backend_id && b.available))
             .unwrap_or(true)
     }
 }
@@ -261,6 +258,7 @@ mod tests {
             rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::new()),
             auth_limits: crate::rate_limit::AuthLimits::default(),
             trusted_proxy_hops: 0,
+            trusted_proxy_ips: Arc::new(Vec::new()),
         }
     }
 

@@ -42,12 +42,11 @@ pub(crate) async fn voice_status(
     authed: Authed,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let exists: Option<i32> =
-        sqlx::query_scalar("select 1 from voice_profiles where user_id = $1")
-            .bind(authed.user.id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(db_err)?;
+    let exists: Option<i32> = sqlx::query_scalar("select 1 from voice_profiles where user_id = $1")
+        .bind(authed.user.id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(db_err)?;
     Ok(Json(json!({
         "enrolled": exists.is_some(),
         "engine": state.speech.label(),
@@ -76,7 +75,9 @@ pub(crate) async fn voice_enroll(
     .execute(&state.db)
     .await
     .map_err(db_err)?;
-    Ok(Json(json!({ "status": "enrolled", "dims": embedding.len() })))
+    Ok(Json(
+        json!({ "status": "enrolled", "dims": embedding.len() }),
+    ))
 }
 
 /// Verify a voice against the enrolled profile and transcribe it.

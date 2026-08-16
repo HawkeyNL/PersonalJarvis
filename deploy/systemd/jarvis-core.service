@@ -1,0 +1,35 @@
+[Unit]
+Description=Jarvis Core API
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=exec
+User=jarvis
+Group=jarvis
+WorkingDirectory=/opt/jarvis/current
+EnvironmentFile=/etc/jarvis/core.env
+ExecStart=/opt/jarvis/current/jarvis-api
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+UMask=0077
+
+# Core owns no host files at runtime: durable application state is PostgreSQL.
+# Keep the release read-only and make host compromise harder without granting
+# arbitrary sudo or Docker access to the process.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ReadWritePaths=/var/lib/jarvis
+
+[Install]
+WantedBy=multi-user.target

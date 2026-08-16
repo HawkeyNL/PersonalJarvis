@@ -761,7 +761,9 @@ mod tests {
         // The desktop asks to be unlocked.
         let (req_id, nonce) = create_unlock_request(&pool, user.id, desktop.id).await?;
         assert_eq!(
-            unlock_request_status(&pool, req_id, user.id).await?.as_deref(),
+            unlock_request_status(&pool, req_id, user.id)
+                .await?
+                .as_deref(),
             Some("pending"),
         );
 
@@ -785,7 +787,9 @@ mod tests {
         let sig = phone_key.sign(&nonce).to_bytes();
         approve_unlock_request(&pool, req_id, user.id, phone.id, &sig).await?;
         assert_eq!(
-            unlock_request_status(&pool, req_id, user.id).await?.as_deref(),
+            unlock_request_status(&pool, req_id, user.id)
+                .await?
+                .as_deref(),
             Some("approved"),
         );
 
@@ -827,7 +831,9 @@ mod tests {
         // The phone denies it; the desktop sees 'denied'.
         deny_unlock_request(&pool, req_id, user.id, phone.id).await?;
         assert_eq!(
-            unlock_request_status(&pool, req_id, user.id).await?.as_deref(),
+            unlock_request_status(&pool, req_id, user.id)
+                .await?
+                .as_deref(),
             Some("denied"),
         );
         Ok(())

@@ -147,7 +147,10 @@ mod tests {
 
     #[test]
     fn plan_and_local_are_free() {
-        assert_eq!(cost_eur("claude-cli", "claude-opus-5", 1000, 1000, 0, 0.92), 0.0);
+        assert_eq!(
+            cost_eur("claude-cli", "claude-opus-5", 1000, 1000, 0, 0.92),
+            0.0
+        );
         assert_eq!(cost_eur("ollama", "llama3.2", 5000, 5000, 0, 0.92), 0.0);
         assert!(!is_metered("claude-cli"));
         assert!(!is_metered("ollama"));
@@ -159,7 +162,14 @@ mod tests {
         assert!(is_metered("openai-api"));
         assert!(is_metered("deepseek-api"));
         // 1M in + 1M out on sonnet = (3 + 15) USD × 0.92 ≈ 16.56 EUR.
-        let c = cost_eur("anthropic-api", "claude-sonnet-5", 1_000_000, 1_000_000, 0, 0.92);
+        let c = cost_eur(
+            "anthropic-api",
+            "claude-sonnet-5",
+            1_000_000,
+            1_000_000,
+            0,
+            0.92,
+        );
         assert!((c - 16.56).abs() < 1e-6, "got {c}");
     }
 

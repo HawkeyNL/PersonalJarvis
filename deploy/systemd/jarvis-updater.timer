@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for a new Jarvis Core release every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+RandomizedDelaySec=60s
+Persistent=true
+Unit=jarvis-updater.service
+
+[Install]
+WantedBy=timers.target

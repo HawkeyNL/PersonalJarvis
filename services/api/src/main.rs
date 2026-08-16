@@ -195,11 +195,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     if config.agent_enabled && agent_sandbox.is_some() {
-        tracing::warn!("AGENTIC EXECUTION IS ENABLED (mutaties achter getekende goedkeuring, ADR-029 4a/4b)");
+        tracing::warn!(
+            "AGENTIC EXECUTION IS ENABLED (mutaties achter getekende goedkeuring, ADR-029 4a/4b)"
+        );
         if config.agent_claude_code_enabled {
             tracing::warn!("CLAUDE CODE EXECUTOR IS ENABLED (4c) — Jarvis mag bestanden bewerken via headless claude, achter goedkeuring");
         }
     }
+
+    let trusted_proxy_ips = config.trusted_proxy_ips().map_err(anyhow::Error::msg)?;
 
     let state = AppState {
         db,
@@ -226,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
             login_lock_secs: config.auth_login_lock_secs,
         },
         trusted_proxy_hops: config.trusted_proxy_hops,
+        trusted_proxy_ips: Arc::new(trusted_proxy_ips),
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

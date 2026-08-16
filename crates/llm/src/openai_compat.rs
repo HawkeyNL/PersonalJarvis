@@ -40,7 +40,9 @@ impl OpenAiCompatProvider {
     ) -> Result<Self, LlmError> {
         let api_key = api_key.into();
         if api_key.trim().is_empty() {
-            return Err(LlmError::NotConfigured(format!("{provider} API key is empty")));
+            return Err(LlmError::NotConfigured(format!(
+                "{provider} API key is empty"
+            )));
         }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
