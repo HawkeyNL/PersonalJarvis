@@ -17,14 +17,17 @@ Build only a reviewed commit and run these from its repository checkout:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-DATABASE_URL=postgres://... cargo test --all
+# Test-only database. Do not point #[sqlx::test] at the production database.
+docker compose -f deploy/compose/docker-compose.yml up -d --wait
+DATABASE_URL=postgres://jarvis:jarvis_dev_pw@localhost:5432/jarvis cargo test --all
 cargo audit
 ```
 
-At the time this guide was added, `cargo audit` reports findings for `rkyv` and
-`rsa`. Resolve them or record an explicit, time-bounded security exception before
-the first production deployment. Do not treat a passing build/test as a substitute
-for this gate.
+`cargo audit` must pass. The repository currently carries one narrow, expiring
+exception for an uncompiled optional `rust_decimal` → `rkyv` feature; CI rejects
+it automatically on 2026-10-01. Do not add new ignores or extend that exception
+without a separate security review. A passing build/test is not a substitute for
+this gate.
 
 ## 1. Prepare the host
 
@@ -52,24 +55,54 @@ sudo install -d -o jarvis -g jarvis -m 0750 /var/lib/jarvis
 sudo install -d -o root -g root -m 0755 /opt/jarvis/releases /etc/jarvis
 ```
 
-## 2. Build and stage an immutable release
+## 2. Stage an immutable, tagged release
 
-Build in a clean checkout of the reviewed commit. Prefer a trusted build machine
-or CI artifact; never let the running Jarvis process update itself.
+For a node that will receive automatic updates, bootstrap from the verified
+GitHub release archive, not a locally built directory. The archive includes the
+binary, `core/Jarvis.md`, an immutable tag/revision/migration manifest and its
+published SHA-256 checksum. It is produced only after the release workflow's
+format, Clippy, test and audit gates pass.
+
+After the reviewed changes are on `main`, create and push the first stable tag
+from a trusted developer workstation:
 
 ```bash
-git rev-parse HEAD
-cargo build --release -p jarvis-api
+git switch main
+git pull --ff-only origin main
+git tag -a v0.1.0 -m "Jarvis Core v0.1.0"
+git push origin v0.1.0
 ```
 
-Copy the release to a versioned directory. Substitute `<commit>` with the exact
-reviewed commit ID. The release must contain both the binary and `core/Jarvis.md`:
+Wait for **Release Jarvis Core** to succeed in GitHub Actions. Then, on the
+Home Node, download and verify that exact release. Replace `v0.1.0` only with a
+stable tag that completed its release workflow:
 
 ```bash
-sudo install -d -o root -g root -m 0755 /opt/jarvis/releases/<commit>/core
-sudo install -o root -g root -m 0755 target/release/jarvis-api /opt/jarvis/releases/<commit>/jarvis-api
-sudo install -o root -g root -m 0644 core/Jarvis.md /opt/jarvis/releases/<commit>/core/Jarvis.md
-sudo ln -sfn /opt/jarvis/releases/<commit> /opt/jarvis/current
+tag=v0.1.0
+archive="jarvis-core-${tag}-linux-x86_64.tar.gz"
+base_url="https://github.com/HawkeyNL/PersonalJarvis/releases/download/${tag}"
+
+cd /var/tmp
+curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+  -O "${base_url}/${archive}"
+curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+  -O "${base_url}/${archive}.sha256"
+sha256sum --strict --check "${archive}.sha256"
+
+sudo install -d -o root -g root -m 0755 /opt/jarvis/releases
+sudo tar -xzf "$archive" --no-same-owner --no-same-permissions -C /opt/jarvis/releases
+sudo mv "/opt/jarvis/releases/jarvis-core-${tag}" "/opt/jarvis/releases/${tag}"
+sudo chown -R root:root "/opt/jarvis/releases/${tag}"
+sudo chmod -R go-w "/opt/jarvis/releases/${tag}"
+```
+
+Validate the extracted manifest before setting it active:
+
+```bash
+sudo jq -e --arg tag "$tag" \
+  '.tag == $tag and (.revision | test("^[0-9a-f]{40}$")) and (.migrations_sha256 | test("^[0-9a-f]{64}$"))' \
+  "/opt/jarvis/releases/${tag}/release.json"
+sudo ln -sfn "/opt/jarvis/releases/${tag}" /opt/jarvis/current
 ```
 
 Verify that the service account cannot alter release contents:
@@ -169,7 +202,8 @@ forwarding headers.
 Pushing a stable semantic-version tag such as `v0.1.0` starts the `Release Jarvis
 Core` GitHub workflow. It runs the full format, Clippy, test and dependency-audit gate again,
 then publishes an Ubuntu x86_64 release archive containing only `jarvis-api`,
-`core/Jarvis.md`, a tag/revision manifest and a SHA-256 checksum. The workflow
+`core/Jarvis.md`, a tag/revision manifest with a database-migration fingerprint,
+and a SHA-256 checksum. The workflow
 has no SSH key, Home Node token or production secret, and never connects to the
 Home Node.
 
@@ -180,6 +214,18 @@ restarts only `jarvis-core`, then requires `/readyz` to succeed. A failed
 readiness check immediately restores the preceding binary release. It never
 builds from source, executes release-provided scripts, prunes older releases, or
 touches the database schema.
+
+Core runs SQLx migrations during startup. A binary rollback cannot reverse a
+schema migration, so the timer accepts an update **only when its migration
+fingerprint matches the active tagged release**. A release that adds, removes or
+changes a migration is deliberately refused by the updater. Take a tested backup
+and deploy such a release manually, including its database recovery procedure.
+
+The initial Home Node release must therefore be a verified archive produced by
+this tag workflow, not an arbitrary `cargo build` directory. Extract it into
+`/opt/jarvis/releases`, verify the published checksum first, and install it with
+the guarded installer. That gives the active baseline its tag, revision and
+migration fingerprint before the timer is enabled.
 
 If you chose the manual Core-unit installation above rather than the guarded
 installer, install the updater files before enabling its timer:

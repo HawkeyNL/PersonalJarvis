@@ -52,6 +52,9 @@ jobs:
       - name: Tests
         run: cargo test --all
 
+      - name: Home Node updater safety fixtures
+        run: sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-update-core-release.sh
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
@@ -81,10 +84,23 @@ jobs:
           mkdir -p "$release_dir/core"
           install -m 0755 target/release/jarvis-api "$release_dir/jarvis-api"
           install -m 0644 core/Jarvis.md "$release_dir/core/Jarvis.md"
+
+          # Core applies SQLx migrations during startup. A binary rollback cannot
+          # undo a database migration, so the Home Node updater only auto-installs
+          # releases with the same migration set as its active baseline.
+          migration_manifest="$staging/migrations.sha256"
+          while IFS= read -r migration; do
+            sha256sum "migrations/$migration"
+          done < <(find migrations -type f -name '*.sql' -printf '%P\n' | LC_ALL=C sort) \
+            > "$migration_manifest"
+          migrations_sha256=$(sha256sum "$migration_manifest" | awk '{print $1}')
+
           jq -n \
             --arg tag "$RELEASE_TAG" \
             --arg revision "$RELEASE_REVISION" \
-            '{tag: $tag, revision: $revision}' > "$release_dir/release.json"
+            --arg migrations_sha256 "$migrations_sha256" \
+            '{tag: $tag, revision: $revision, migrations_sha256: $migrations_sha256}' \
+            > "$release_dir/release.json"
 
           mkdir -p dist
           artifact="jarvis-core-$RELEASE_TAG-linux-x86_64.tar.gz"

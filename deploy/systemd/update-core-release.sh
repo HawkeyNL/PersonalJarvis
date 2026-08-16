@@ -33,6 +33,10 @@ version_is_newer() {
         ((10#$candidate_major == 10#$installed_major && 10#$candidate_minor == 10#$installed_minor && 10#$candidate_patch > 10#$installed_patch))
 }
 
+migration_fingerprint() {
+    jq -er '.migrations_sha256 | strings | select(test("^[0-9a-f]{64}$"))' "$1"
+}
+
 cleanup() {
     [[ -n ${staging_dir:-} && -d ${staging_dir:-} ]] || return 0
     case "$staging_dir" in
@@ -72,21 +76,28 @@ curl "${curl_args[@]}" \
     "$api_url/repos/$repository/releases/latest" > "$metadata"
 
 tag=$(jq -er '.tag_name | strings' "$metadata") || fail "release has no tag"
-draft=$(jq -er '.draft | booleans' "$metadata") || fail "release draft state is invalid"
-prerelease=$(jq -er '.prerelease | booleans' "$metadata") || fail "release prerelease state is invalid"
+draft=$(jq -r '.draft' "$metadata") || fail "release draft state is invalid"
+prerelease=$(jq -r '.prerelease' "$metadata") || fail "release prerelease state is invalid"
+[[ $draft == true || $draft == false ]] || fail "release draft state is invalid"
+[[ $prerelease == true || $prerelease == false ]] || fail "release prerelease state is invalid"
 [[ $draft == false && $prerelease == false ]] || fail "latest release is not a stable release"
 [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "release tag must use stable vMAJOR.MINOR.PATCH form"
 
 current_target=$(readlink -f -- "$current_link")
 [[ $current_target == "$releases_dir"/* ]] || fail "current release is outside the release directory"
+current_tag=
+current_migrations_sha256=
 if [[ -f $current_target/release.json && ! -L $current_target/release.json ]]; then
     current_tag=$(jq -er '.tag | strings' "$current_target/release.json" 2>/dev/null || true)
+    [[ $current_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
+        fail "installed release manifest has an unsafe tag"
+    current_migrations_sha256=$(migration_fingerprint "$current_target/release.json" 2>/dev/null || true)
     if [[ $current_tag == "$tag" ]]; then
+        [[ -n $current_migrations_sha256 ]] || \
+            fail "active release lacks a migration fingerprint; stage a tagged baseline manually before enabling automatic updates"
         echo "jarvis updater: $tag is already active"
         exit 0
     fi
-    [[ $current_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
-        fail "installed release manifest has an unsafe tag"
     version_is_newer "$tag" "$current_tag" || {
         echo "jarvis updater: refusing automatic downgrade from $current_tag to $tag"
         exit 0
@@ -140,6 +151,16 @@ release_dir="$staging_dir/$expected_top"
     fail "release manifest tag does not match"
 jq -er '.revision | strings | test("^[0-9a-f]{40}$")' "$release_dir/release.json" >/dev/null || \
     fail "release manifest revision is invalid"
+candidate_migrations_sha256=$(migration_fingerprint "$release_dir/release.json") || \
+    fail "release manifest migration fingerprint is invalid"
+
+# The binary starts migrations itself. A failed readiness check can roll the
+# binary back, but it cannot safely reverse a schema change. Require an
+# explicitly staged, tagged baseline and refuse schema changes from the timer.
+[[ -n $current_migrations_sha256 ]] || \
+    fail "active release lacks a migration fingerprint; stage a tagged baseline manually before enabling automatic updates"
+[[ $current_migrations_sha256 == "$candidate_migrations_sha256" ]] || \
+    fail "release changes the database migration set; automatic update refused, deploy manually with backup and recovery verification"
 
 chown -R root:root "$release_dir"
 chmod -R go-w "$release_dir"

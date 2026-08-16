@@ -47,6 +47,9 @@ jobs:
       - name: Tests
         run: cargo test --all
 
+      - name: Home Node updater safety fixtures
+        run: sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-update-core-release.sh
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
