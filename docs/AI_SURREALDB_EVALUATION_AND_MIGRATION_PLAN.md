@@ -10,6 +10,96 @@ Read `AGENTS.md`, `core/Jarvis.md`, all persistence-related ADRs, migrations, SQ
 
 ---
 
+## 0. Current implementation inventory and preliminary decision (verified 2026-08-17)
+
+### What is actually deployed in the codebase
+
+Jarvis currently has one persistence implementation: PostgreSQL through SQLx.
+There is no SurrealDB dependency, no pgvector migration yet, no graph/memory
+store, and no domain persistence abstraction. The API composition root holds one
+`PgPool`, and SQLx migrations run during Core startup. A migration failure stops
+Core from starting, which is the required fail-closed baseline.
+
+The repository contains eleven ordered PostgreSQL migrations:
+
+| Domain | Current tables / invariant | Why it is migration-sensitive |
+| --- | --- | --- |
+| Identity | `users`, `devices`, `device_keys` | Device public keys, revocation and uniqueness are authentication roots. |
+| Authentication | `auth_challenges`, `sessions`, `unlock_requests` | Login locks a challenge with `FOR UPDATE`, consumes it and creates a token-hash session in one SQL transaction. |
+| Portfolio | `holdings` | Quantity and cost use `NUMERIC(20,8)`, never floating point. |
+| Voice | `voice_profiles` | Stores a fixed-dimension biometric embedding as bytes. |
+| Cost control | `llm_usage` | Timestamp-indexed monthly model-cost accounting feeds budget enforcement. |
+| Agent security | `agent_audit`, `agent_pending_actions` | Signed approvals use a conditional `pending -> executed` update so a nonce/action cannot be claimed twice. |
+| Conversation | `conversations`, `chat_messages` | User ownership, ordering and cascade semantics are explicit. |
+| Security audit | `security_audit` | Authentication and device lifecycle events must remain available without secrets. |
+
+`crates/identity`, `crates/portfolio`, `crates/usage`, and API route modules
+currently depend directly on `PgPool`/SQLx query types. A SurrealDB swap would
+therefore be a domain and test migration, not a configuration change. Before a
+POC can touch a production-like domain, introduce narrowly scoped stores with
+parity tests; do not create a single generic persistence facade.
+
+### Security and operational findings
+
+1. PostgreSQL is presently the authoritative durable store for all
+   authentication, approval, audit and portfolio state. No other datastore may
+   become a co-equal source of truth during this evaluation.
+2. The approval flow deliberately claims the pending row before performing the
+   side effect. This means a retry cannot replay an approved action, even if the
+   executor later fails. Any candidate implementation must prove the same
+   compare-and-set behaviour under concurrent approval requests.
+3. The audit tables are application-append-only today: ordinary Jarvis code has
+   no update/delete route, but the database role/DDL does not yet enforce
+   immutability. A SurrealDB evaluation must not call this a stronger guarantee.
+   Database-level append-only protection and a restore test are baseline work
+   for either datastore.
+4. `deploy/compose/docker-compose.yml` is explicitly a development-only
+   PostgreSQL stack. A production PostgreSQL backup/restore runbook and tested
+   recovery exercise are still required regardless of the SurrealDB decision.
+5. The existing tag updater verifies release assets and rolls the binary back on
+   failed readiness, but it does **not** currently compare a schema fingerprint
+   or undo database migrations. Because Core runs SQLx migrations at startup, a
+   schema-changing release needs an explicit backup/compatibility/rollback plan
+   before automatic deployment. This is an existing gap, not a SurrealDB
+   capability.
+
+### Preliminary recommendation: defer replacement; evaluate memory separately
+
+Do **not** replace PostgreSQL for identity, approvals, audit, portfolio or
+trading state. The existing SQL transaction/constraint model is already part of
+the security boundary and has integration coverage. SurrealDB's graph, vector,
+full-text and live-query capabilities are promising for a future *non-critical*
+memory/research domain, but their benefit has not yet been measured on the UM890.
+
+The next database task is therefore a disposable, isolated POC for synthetic
+memory/research data only. It must use a pinned SurrealDB version, no production
+credentials or data, localhost/private Docker networking, reproducible fixtures,
+and a documented destroy/recreate procedure. It must not be added to the
+production compose stack or wired into Jarvis Core until the benchmark and
+recovery gate below have been reviewed.
+
+### Current evidence to validate in the POC
+
+- SurrealDB documents schemafull tables, typed fields and unique indexes, but
+  permissions must be deliberately defined; field permissions otherwise default
+  to `FULL`. Model all security/financial candidate tables schemafully and with
+  explicit deny-by-default access rules.
+- SurrealDB documents manual multi-statement transactions and a Rust SDK with
+  async, typed operations and live queries. Prove the exact concurrent
+  compare-and-set/replay-denial semantics rather than inferring them from ACID
+  claims.
+- HNSW/DISKANN and filtered KNN are useful candidates for memory retrieval, but
+  index selection and predicate pushdown must be verified with `EXPLAIN` on the
+  actual filtered Jarvis query shape. HNSW cache sizing is a Home Node resource
+  decision, not a default to accept blindly.
+- Self-hosted recovery is based on scheduled logical `surreal export` and
+  `surreal import`; it needs a measured restore-time and integrity test before
+  it can meet Jarvis recovery requirements.
+
+Primary references: [schemafull tables and permissions](https://surrealdb.com/docs/learn/schema-management/tables-and-fields/tables), [transactions](https://surrealdb.com/docs/learn/querying/concepts-and-guides/transactions), [Rust SDK](https://surrealdb.com/docs/reference/rust), [filtered vector search](https://surrealdb.com/docs/learn/data-models/vector-search/similarity-search), and [self-hosted backups](https://surrealdb.com/docs/manage/self-hosted/backups-and-recovery).
+
+---
+
 ## 1. Why SurrealDB is being considered
 
 Jarvis is evolving beyond a conventional CRUD application. Its long-term data model includes:
@@ -439,7 +529,12 @@ Do not expose SurrealDB management/query endpoints to the public internet.
 
 This is critical because Jarvis Core now has tag-based automatic release/update/rollback behavior.
 
-The existing updater deliberately refuses automatic binary updates when SQL migration fingerprints change because binary rollback cannot safely reverse database migrations.
+The current updater does **not** yet compare a migration fingerprint. Core runs
+SQLx migrations on startup and fails closed when they cannot apply, but a binary
+rollback cannot safely reverse an already-applied database migration. Treat
+schema compatibility/backup/rollback as a current baseline gap that must be
+closed before automatic schema-changing releases, for PostgreSQL and for any
+future SurrealDB use.
 
 A SurrealDB migration system must preserve or improve this safety property.
 
