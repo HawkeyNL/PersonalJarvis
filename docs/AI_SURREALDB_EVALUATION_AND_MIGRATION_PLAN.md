@@ -1,5 +1,10 @@
 # SurrealDB Evaluation & Migration Plan — AI Engineering Brief
 
+> **Superseded decision:** ADR-034 (2026-08-17) accepteert de directe
+> pre-productie-migratie naar SurrealDB. Deze analyse blijft als risicoregister
+> en uitvoeringscontext behouden; de eerdere aanbeveling om alleen te evalueren
+> geldt niet meer.
+
 ## Purpose
 
 Evaluate whether PersonalJarvis should replace PostgreSQL + pgvector with SurrealDB 3.x as its primary datastore.
