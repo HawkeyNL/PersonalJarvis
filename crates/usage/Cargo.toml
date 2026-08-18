@@ -8,4 +8,7 @@ publish = false
 [dependencies]
 serde = { workspace = true }
 sqlx = { workspace = true }
+jarvis-store.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 tracing = { workspace = true }

@@ -11,6 +11,8 @@
 use serde::Serialize;
 use sqlx::PgPool;
 
+pub mod surreal;
+
 /// The metered backends — the only ones that spend money.
 pub const METERED_BACKENDS: [&str; 3] = ["anthropic-api", "openai-api", "deepseek-api"];
 

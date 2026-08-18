@@ -11,11 +11,19 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+/// SurrealDB repository under parity construction. Exact amounts remain
+/// decimal strings in the datastore; no floating-point portfolio values.
+pub mod surreal;
+
 /// Errors returned by the portfolio repository.
 #[derive(Debug, thiserror::Error)]
 pub enum PortfolioError {
     #[error("database error")]
     Database(#[from] sqlx::Error),
+    #[error("database error")]
+    DatabaseSurreal,
+    #[error("invalid stored decimal")]
+    InvalidDecimal,
 }
 
 /// A single manually-entered holding.

@@ -2287,9 +2287,12 @@ dependencies = [
 name = "jarvis-portfolio"
 version = "0.1.0"
 dependencies = [
+ "jarvis-store",
  "rust_decimal",
  "serde",
+ "serde_json",
  "sqlx",
+ "surrealdb",
  "thiserror 1.0.69",
  "time",
  "tokio",
@@ -2343,9 +2346,12 @@ dependencies = [
 name = "jarvis-usage"
 version = "0.1.0"
 dependencies = [
+ "jarvis-store",
  "serde",
+ "serde_json",
  "sqlx",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
