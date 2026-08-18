@@ -25,15 +25,14 @@ Jarvis Core should remain available when an individual Docker service fails. It 
 
 Use Docker for stateful/supporting workloads and isolated workers:
 
-- PostgreSQL
-- pgvector (with PostgreSQL)
+- SurrealDB 2.6
 - Redis when measured need exists
 - Prometheus/Grafana
 - research workers
 - backtesting workers
 - other isolated application services
 
-PostgreSQL is the durable source of truth. Redis is for ephemeral state, caching, coordination, and realtime fan-out; it must not become the canonical memory store.
+SurrealDB is the durable source of truth. Redis is for ephemeral state, caching, coordination, and realtime fan-out; it must not become the canonical memory store.
 
 ## Network model
 
@@ -61,10 +60,10 @@ Only the interfaces that are explicitly required should be reachable. Database p
 
 | Service | Runtime | Restart policy | Data |
 |---|---|---|---|
-| Jarvis Core | systemd | automatic | PostgreSQL/files |
-| PostgreSQL | Docker | unless-stopped | Docker volume |
+| Jarvis Core | systemd | automatic | SurrealDB/files |
+| SurrealDB | Docker | unless-stopped | Docker volume |
 | Redis | Docker | unless-stopped | ephemeral/persistent only when justified |
-| Workers | Docker | task-specific | temporary + durable results in PostgreSQL |
+| Workers | Docker | task-specific | temporary + durable results in SurrealDB |
 | Monitoring | Docker | unless-stopped | metrics volumes |
 | Claude Code | host task runner | task-scoped | isolated worktree |
 | Codex | host task runner | task-scoped | isolated worktree |
@@ -86,7 +85,7 @@ Jarvis should request privileged operations from a narrow updater/guardian capab
 
 ## Backups
 
-Back up PostgreSQL independently from Docker container lifecycle. Keep at least one recent local backup and one separate backup target. Never rely on a container volume alone as the backup strategy.
+Back up SurrealDB independently from Docker container lifecycle. Keep at least one recent local backup and one separate backup target. Never rely on a container volume alone as the backup strategy.
 
 ## Future local AI
 

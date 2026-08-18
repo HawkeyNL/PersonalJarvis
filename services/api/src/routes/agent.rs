@@ -10,18 +10,57 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use jarvis_agent as agent;
 use jarvis_identity as identity;
 
 use crate::audit::record_agent_audit;
-use crate::error::{bad_request, db_err, unauthorized};
+use crate::error::{bad_request, unauthorized};
 use crate::validation;
 use crate::{AppState, Authed};
 
 use super::auth::ApproveReq;
+
+#[derive(Serialize)]
+struct PendingCreate {
+    id: String,
+    user_id: String,
+    requesting_device_id: String,
+    action_type: String,
+    action: String,
+    preview: String,
+    #[serde(with = "serde_bytes")]
+    nonce: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct PendingListRow {
+    #[serde(with = "uuid::serde::hyphenated")]
+    id: Uuid,
+    action_type: String,
+    preview: String,
+    #[serde(with = "serde_bytes")]
+    nonce: Vec<u8>,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+}
+
+#[derive(Deserialize)]
+struct PendingApprovalRow {
+    #[serde(with = "serde_bytes")]
+    nonce: Vec<u8>,
+    action: String,
+    action_type: String,
+}
+
+#[derive(Deserialize)]
+struct Claimed {
+    id: String,
+}
 
 /// Run a single read-only agent action (ADR-029 phase 4a). Gated by the kill
 /// switch + a configured sandbox; only `Auto` (read-only) actions run; every
@@ -76,23 +115,31 @@ pub(crate) async fn agent_action(
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
         let id = Uuid::now_v7();
         let action_json = serde_json::to_string(&action).unwrap_or_default();
-        let res = sqlx::query(
-            "INSERT INTO agent_pending_actions \
-             (id, user_id, requesting_device_id, action_type, action, preview, nonce, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, now() + interval '5 minutes')",
-        )
-        .bind(id)
-        .bind(authed.user.id)
-        .bind(authed.device.id)
-        .bind(&at)
-        .bind(&action_json)
-        .bind(&preview)
-        .bind(&nonce[..])
-        .execute(&state.db)
-        .await;
+        let res = state
+            .db
+            .query(
+                "CREATE agent_pending_actions SET id = $id, user_id = $user_id, \
+             requesting_device_id = $requesting_device_id, action_type = $action_type, \
+             action = $action, preview = $preview, nonce = <bytes>$nonce, status = 'pending', \
+             created_at = time::now(), expires_at = time::now() + 5m, resolved_at = NONE, \
+             approved_by_device_id = NONE RETURN NONE",
+            )
+            .bind(PendingCreate {
+                id: id.to_string(),
+                user_id: authed.user.id.to_string(),
+                requesting_device_id: authed.device.id.to_string(),
+                action_type: at.clone(),
+                action: action_json,
+                preview: preview.clone(),
+                nonce: nonce.to_vec(),
+            })
+            .await;
         if let Err(e) = res {
             tracing::warn!(error = %e, "failed to create pending action");
-            return Err(db_err(e));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            ));
         }
         record_agent_audit(&state, authed.device.id, &at, detail, risk, "pending", None).await;
         return Ok(Json(json!({
@@ -141,21 +188,27 @@ pub(crate) async fn agent_action(
 
 /// Mutating actions awaiting the owner's device-signed approval (ADR-029 4b).
 pub(crate) async fn agent_pending(authed: Authed, State(state): State<AppState>) -> Json<Value> {
-    let rows: Vec<(Uuid, String, String, String, String)> = sqlx::query_as(
-        "SELECT id, action_type, preview, encode(nonce, 'hex'), \
-         to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') \
-         FROM agent_pending_actions \
-         WHERE user_id = $1 AND status = 'pending' AND expires_at > now() \
-         ORDER BY created_at DESC",
-    )
-    .bind(authed.user.id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    let rows: Vec<PendingListRow> = match state
+        .db
+        .query(
+            "SELECT record::id(id) AS id, action_type, preview, nonce, created_at \
+         FROM agent_pending_actions WHERE user_id = $user_id AND status = 'pending' \
+         AND expires_at > time::now() ORDER BY created_at DESC",
+        )
+        .bind(json!({"user_id": authed.user.id.to_string()}))
+        .await
+    {
+        Ok(mut response) => response.take(0).unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(%error, "failed to list pending actions");
+            Vec::new()
+        }
+    };
     let entries: Vec<Value> = rows
         .into_iter()
-        .map(|(id, at, preview, nonce, created)| {
-            json!({ "pending_id": id, "action": at, "preview": preview, "nonce": nonce, "created_at": created })
+        .map(|row| {
+            json!({ "pending_id": row.id, "action": row.action_type, "preview": row.preview,
+                "nonce": hex::encode(row.nonce), "created_at": row.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() })
         })
         .collect();
     Json(json!({ "pending": entries }))
@@ -184,16 +237,17 @@ pub(crate) async fn agent_pending_approve(
     };
 
     // Fetch the pending action (must be this user's, still pending + unexpired).
-    let row: Option<(Vec<u8>, String, String)> = sqlx::query_as(
-        "SELECT nonce, action, action_type FROM agent_pending_actions \
-         WHERE id = $1 AND user_id = $2 AND status = 'pending' AND expires_at > now()",
-    )
-    .bind(id)
-    .bind(authed.user.id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(db_err)?;
-    let (nonce, action_json, at) = row.ok_or_else(|| {
+    let row: Option<PendingApprovalRow> = state.db.query(
+        "SELECT nonce, action, action_type FROM agent_pending_actions WHERE record::id(id) = $id \
+         AND user_id = $user_id AND status = 'pending' AND expires_at > time::now() LIMIT 1",
+    ).bind(json!({"id": id.to_string(), "user_id": authed.user.id.to_string()})).await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"internal error"}))))?
+        .take(0).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"internal error"}))))?;
+    let PendingApprovalRow {
+        nonce,
+        action: action_json,
+        action_type: at,
+    } = row.ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such pending action" })),
@@ -212,17 +266,19 @@ pub(crate) async fn agent_pending_approve(
     .map_err(|_| unauthorized())?;
 
     // Consume it atomically — mark executed so it can never run twice (replay).
-    let claimed = sqlx::query(
-        "UPDATE agent_pending_actions SET status = 'executed', \
-         approved_by_device_id = $2, resolved_at = now() \
-         WHERE id = $1 AND status = 'pending'",
-    )
-    .bind(id)
-    .bind(authed.device.id)
-    .execute(&state.db)
-    .await
-    .map_err(db_err)?;
-    if claimed.rows_affected() == 0 {
+    let mut claimed_response = state.db.query(
+        "UPDATE agent_pending_actions SET status = 'executed', approved_by_device_id = $device_id, \
+         resolved_at = time::now() WHERE record::id(id) = $id AND user_id = $user_id \
+         AND status = 'pending' AND expires_at > time::now() RETURN record::id(id) AS id",
+    ).bind(json!({"id": id.to_string(), "user_id": authed.user.id.to_string(), "device_id": authed.device.id.to_string()})).await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"internal error"}))))?;
+    let claimed: Option<Claimed> = claimed_response.take(0).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"internal error"})),
+        )
+    })?;
+    if claimed.map(|row| row.id) != Some(id.to_string()) {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({ "error": "already resolved" })),
@@ -279,16 +335,28 @@ pub(crate) async fn agent_pending_deny(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let res = sqlx::query(
-        "UPDATE agent_pending_actions SET status = 'denied', resolved_at = now() \
-         WHERE id = $1 AND user_id = $2 AND status = 'pending'",
-    )
-    .bind(id)
-    .bind(authed.user.id)
-    .execute(&state.db)
-    .await
-    .map_err(db_err)?;
-    if res.rows_affected() == 0 {
+    let mut response = state
+        .db
+        .query(
+            "UPDATE agent_pending_actions SET status = 'denied', resolved_at = time::now() \
+         WHERE record::id(id) = $id AND user_id = $user_id AND status = 'pending' \
+         AND expires_at > time::now() RETURN record::id(id) AS id",
+        )
+        .bind(json!({"id": id.to_string(), "user_id": authed.user.id.to_string()}))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"internal error"})),
+            )
+        })?;
+    let denied: Option<Claimed> = response.take(0).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"internal error"})),
+        )
+    })?;
+    if denied.map(|row| row.id) != Some(id.to_string()) {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such pending action" })),

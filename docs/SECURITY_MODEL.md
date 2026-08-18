@@ -1,5 +1,8 @@
 # Jarvis Security & Capability Model
 
+> **Datastorenoot (ADR-034):** Home Node-persistentie gebruikt private
+> SurrealDB 2.6. PostgreSQL/pgvector-verwijzingen hieronder zijn historisch.
+
 This document defines the security boundary for the future Jarvis Core, Home Node, agents, tools, and trading integrations.
 
 ## Principles

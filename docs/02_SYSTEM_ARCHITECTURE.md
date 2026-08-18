@@ -1,5 +1,8 @@
 # Systeemarchitectuur
 
+> **Datastorenoot (ADR-034):** SurrealDB 2.6, niet PostgreSQL/pgvector, is de
+> actuele Core-datastore. Oudere persistentiediscussie hieronder is historisch.
+
 ## Overzicht
 
 ```text

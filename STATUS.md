@@ -85,7 +85,7 @@ Parallel blijft staan: live test Jarvis-brein (`JARVIS_LLM_API_KEY` in backend-`
 
 - JAR-001 geïmplementeerd: Rust workspace, Axum API (/livez, /readyz), typed config, tracing, SQLx-migraties, Docker dev-stack en CI. Build/clippy/fmt/test groen; /readyz getest tegen Postgres 17.
 - Tauri 2 + Vue 3 client (`apps/client`, Pinia + Vue Router) gescaffold; macOS `Jarvis.app` gebouwd en geverifieerd. iOS-project gegenereerd; simulator-build (iOS 26.3, iPhone 17) draait en geverifieerd met screenshot. Fase 0 afgerond.
-- JAR-100: identity-datamodel (`users`/`devices`/`device_keys`, migratie 0002) + `jarvis-identity`-crate (repository + tests); CI uitgebreid met Postgres-service voor `#[sqlx::test]`-integratietests. Build/clippy/fmt/test groen.
+- JAR-100: identity-datamodel (`users`/`devices`/`device_keys`) + `jarvis-identity`-crate (repository + tests); de actuele SurrealDB-wiretest dekt device-login, getekende unlock en concurrente replaypreventie.
 - Client↔backend live-koppeling via `@tauri-apps/plugin-http` (`src/api.ts`); Home toont "Backend: verbonden", Status-scherm toont `/livez`+`/readyz`. End-to-end geverifieerd op iOS-simulator tegen draaiende API + Postgres (screenshot).
 - JAR-101: device-bound auth (migratie 0003 sessions/challenges) + Ed25519 challenge-response + sessies; API gerefactord naar lib+bin met `/v1/auth/*` en beschermde `/v1/devices` (Bearer-extractor). HTTP-flow-integratietest groen.
 - Client-login bedraad: Rust-commands (device_info/auth_public_key/auth_sign/auth_save/auth_session/auth_logout), dev-enroll-endpoint, `auth.ts`-flow + Home-UI. Volledige device-bound login end-to-end op iOS-simulator geverifieerd (screenshot: "ingelogd" + apparaat).

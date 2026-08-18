@@ -85,21 +85,20 @@ jobs:
           install -m 0755 target/release/jarvis-api "$release_dir/jarvis-api"
           install -m 0644 core/Jarvis.md "$release_dir/core/Jarvis.md"
 
-          # Core applies SQLx migrations during startup. A binary rollback cannot
-          # undo a database migration, so the Home Node updater only auto-installs
-          # releases with the same migration set as its active baseline.
-          migration_manifest="$staging/migrations.sha256"
-          while IFS= read -r migration; do
-            sha256sum "migrations/$migration"
-          done < <(find migrations -type f -name '*.sql' -printf '%P\n' | LC_ALL=C sort) \
-            > "$migration_manifest"
-          migrations_sha256=$(sha256sum "$migration_manifest" | awk '{print $1}')
+          # Schema changes need an explicit, backed-up Home Node deployment;
+          # automatic rollback cannot undo them.
+          schema_manifest="$staging/schema.sha256"
+          while IFS= read -r schema; do
+            sha256sum "schema/surreal/$schema"
+          done < <(find schema/surreal -type f -name '*.surql' -printf '%P\n' | LC_ALL=C sort) \
+            > "$schema_manifest"
+          schema_sha256=$(sha256sum "$schema_manifest" | awk '{print $1}')
 
           jq -n \
             --arg tag "$RELEASE_TAG" \
             --arg revision "$RELEASE_REVISION" \
-            --arg migrations_sha256 "$migrations_sha256" \
-            '{tag: $tag, revision: $revision, migrations_sha256: $migrations_sha256}' \
+            --arg schema_sha256 "$schema_sha256" \
+            '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256}' \
             > "$release_dir/release.json"
 
           mkdir -p dist

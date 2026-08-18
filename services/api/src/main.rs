@@ -1,16 +1,13 @@
 //! Jarvis API / BFF — process entrypoint.
 //!
-//! Loads config, opens the PostgreSQL pool, applies migrations, and serves the
+//! Loads config, opens SurrealDB, applies the versioned baseline, and serves the
 //! router from `jarvis_api::build_router`.
-
-use std::time::Duration;
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
 use jarvis_api::{build_router, AppState, BrainAvailability};
 use jarvis_config::AppConfig;
-use sqlx::postgres::PgPoolOptions;
 
 /// `Some(trimmed)` for a non-empty secret, `None` otherwise — so an unset key
 /// disables its backend instead of building a provider that always 401s.
@@ -27,25 +24,21 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::load()?;
     jarvis_observability::init(config.log_json);
 
-    // `config`'s Debug impl redacts the database_url, so this is safe to log.
+    // `config`'s Debug impl redacts database credentials, so this is safe to log.
     tracing::info!(?config, "starting jarvis-api");
 
-    // Lazy pool: the process starts even if Postgres is not up yet; readiness
-    // is reported separately via `/readyz`.
-    let db = PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect_lazy(&config.database_url)?;
-
-    if let Err(error) = sqlx::migrate!("../../migrations").run(&db).await {
-        if config.environment == "production" {
-            tracing::error!(%error, "database migrations failed; refusing to start in production");
-            return Err(error.into());
-        }
-        tracing::warn!(%error, "database migrations did not run; continuing outside production");
-    } else {
-        tracing::info!("database migrations up to date");
-    }
+    // Core requires an authenticated, private SurrealDB connection. It never
+    // receives a root credential and refuses startup if the schema is unknown.
+    let db = jarvis_store::connect(
+        &config.surreal_endpoint,
+        &config.surreal_namespace,
+        &config.surreal_database,
+        &config.surreal_username,
+        &config.surreal_password,
+    )
+    .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    tracing::info!("SurrealDB schema verified");
 
     // Server-side speech (STT + speaker verification). `stub` by default; set
     // provider to `whisper` (with --features speech-whisper) for real STT.

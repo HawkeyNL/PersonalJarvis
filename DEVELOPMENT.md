@@ -63,12 +63,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
 
-Integration tests (`#[sqlx::test]`) need Postgres running and `DATABASE_URL` set
+SurrealDB wire-protocol tests need a disposable SurrealDB server and explicit test credentials
 (they create throwaway databases):
 
 ```bash
 docker compose -f deploy/compose/docker-compose.yml up -d --wait
-DATABASE_URL=postgres://jarvis:jarvis_dev_pw@localhost:5432/jarvis cargo test --all
+JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=<password> cargo test --all -- --ignored
 ```
 
 ## Layout

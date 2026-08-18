@@ -75,36 +75,36 @@ chmod 0755 "$fake_bin/curl"
 write_release() {
     local root=$1
     local tag=$2
-    local migrations_sha256=$3
+    local schema_sha256=$3
     mkdir -p "$root/jarvis-core-$tag/core"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
     chmod 0755 "$root/jarvis-core-$tag/jarvis-api"
     printf '# test persona\n' > "$root/jarvis-core-$tag/core/Jarvis.md"
     jq -n \
         --arg tag "$tag" \
-        --arg migrations_sha256 "$migrations_sha256" \
-        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", migrations_sha256: $migrations_sha256}' \
+        --arg schema_sha256 "$schema_sha256" \
+        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256}' \
         > "$root/jarvis-core-$tag/release.json"
 }
 
 seed_active_release() {
     local tag=$1
-    local migrations_sha256=$2
+    local schema_sha256=$2
     rm -rf -- /opt/jarvis
     install -d -o root -g root -m 0755 /opt/jarvis/releases
-    write_release /opt/jarvis/releases "$tag" "$migrations_sha256"
+    write_release /opt/jarvis/releases "$tag" "$schema_sha256"
     mv "/opt/jarvis/releases/jarvis-core-$tag" "/opt/jarvis/releases/$tag"
     ln -s "/opt/jarvis/releases/$tag" /opt/jarvis/current
 }
 
 prepare_candidate() {
     local tag=$1
-    local migrations_sha256=$2
+    local schema_sha256=$2
     local asset_root="$fixture_dir/asset"
     local artifact="jarvis-core-$tag-linux-x86_64.tar.gz"
     rm -rf -- "$asset_root"
     mkdir -p "$asset_root"
-    write_release "$asset_root" "$tag" "$migrations_sha256"
+    write_release "$asset_root" "$tag" "$schema_sha256"
     rm -f -- "$fixture_dir"/*.tar.gz "$fixture_dir"/*.tar.gz.sha256
     tar -C "$asset_root" -czf "$fixture_dir/$artifact" "jarvis-core-$tag"
     (

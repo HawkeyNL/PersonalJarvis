@@ -9,7 +9,7 @@
 //! they can drift, so treat the budget as a safety cap, not an exact invoice.
 
 use serde::Serialize;
-use sqlx::PgPool;
+pub mod surreal;
 
 /// The metered backends — the only ones that spend money.
 pub const METERED_BACKENDS: [&str; 3] = ["anthropic-api", "openai-api", "deepseek-api"];
@@ -96,50 +96,9 @@ pub struct UsageEntry {
     pub cost_eur: f64,
 }
 
-/// Persist a call. Failures are the caller's to log — billing must never break a chat.
-pub async fn record(pool: &PgPool, e: &UsageEntry) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO llm_usage \
-         (backend, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_eur) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-    )
-    .bind(&e.backend)
-    .bind(&e.model)
-    .bind(e.input_tokens)
-    .bind(e.output_tokens)
-    .bind(e.cache_read_tokens)
-    .bind(e.cache_write_tokens)
-    .bind(e.cost_eur)
-    .execute(pool)
-    .await
-    .map(|_| ())
-}
-
-/// Total EUR spent so far in the current calendar month (UTC).
-pub async fn month_total_eur(pool: &PgPool) -> Result<f64, sqlx::Error> {
-    let total: Option<f64> = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(cost_eur), 0) FROM llm_usage \
-         WHERE ts >= date_trunc('month', now())",
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok(total.unwrap_or(0.0))
-}
-
-/// Per-backend EUR spent this month, for the UI breakdown.
-pub async fn month_breakdown(pool: &PgPool) -> Result<Vec<(String, f64)>, sqlx::Error> {
-    let rows: Vec<(String, Option<f64>)> = sqlx::query_as(
-        "SELECT backend, SUM(cost_eur) FROM llm_usage \
-         WHERE ts >= date_trunc('month', now()) \
-         GROUP BY backend ORDER BY SUM(cost_eur) DESC",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(b, c)| (b, c.unwrap_or(0.0)))
-        .collect())
-}
+/// SurrealDB persistence functions. Failures remain best-effort at the caller,
+/// so metering cannot break an assistant reply.
+pub use surreal::{month_breakdown, month_total_eur, record};
 
 #[cfg(test)]
 mod tests {
