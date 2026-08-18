@@ -16,7 +16,7 @@ use jarvis_store::Database;
 
 use super::{
     verify_signature, Authenticated, Challenge, Device, DeviceKey, IdentityError, LoginResult,
-    Platform, Session, User,
+    Platform, Session, UnlockRequest, User,
 };
 
 const USER_FIELDS: &str = "record::id(id) AS id, display_name, status, created_at, updated_at";
@@ -99,6 +99,15 @@ struct SessionBindings {
     device_id: String,
     #[serde(with = "serde_bytes")]
     token_hash: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct UnlockCreateBindings {
+    id: String,
+    user_id: String,
+    requesting_device_id: String,
+    #[serde(with = "serde_bytes")]
+    nonce: Vec<u8>,
 }
 
 /// Create the single Jarvis owner.
@@ -408,17 +417,196 @@ pub async fn verify_device_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), IdentityError> {
+    let device = get_device(db, device_id)
+        .await?
+        .ok_or(IdentityError::AuthFailed)?;
+    if device.user_id != user_id || device.status != "active" {
+        return Err(IdentityError::AuthFailed);
+    }
     let key: KeyRow = one(
         db,
-        "SELECT k.public_key, k.created_at FROM device_keys AS k, devices AS d \
-         WHERE k.device_id = $device_id AND record::id(d.id) = $device_id AND d.user_id = $user_id \
-           AND k.revoked_at IS NONE AND d.status = 'active' ORDER BY k.created_at DESC LIMIT 1",
-        json!({ "device_id": device_id.to_string(), "user_id": user_id.to_string() }),
+        "SELECT public_key, created_at FROM device_keys WHERE device_id = $device_id \
+         AND revoked_at IS NONE ORDER BY created_at DESC LIMIT 1",
+        json!({ "device_id": device_id.to_string() }),
     )
     .await?
     .ok_or(IdentityError::AuthFailed)?;
     let _key_created_at = key.created_at;
     verify_signature(&key.public_key, message, signature)
+}
+
+/// Create a short-lived cross-device unlock request.
+pub async fn create_unlock_request(
+    db: &Database,
+    user_id: Uuid,
+    requesting_device_id: Uuid,
+) -> Result<(Uuid, Vec<u8>), IdentityError> {
+    let mut nonce = vec![0_u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let id = Uuid::now_v7();
+    execute(
+        db,
+        "CREATE unlock_requests SET id = $id, user_id = $user_id, requesting_device_id = $requesting_device_id, \
+         nonce = <bytes>$nonce, status = 'pending', approved_by_device_id = NONE, created_at = time::now(), \
+         expires_at = time::now() + 2m, resolved_at = NONE RETURN NONE",
+        UnlockCreateBindings {
+            id: id.to_string(),
+            user_id: user_id.to_string(),
+            requesting_device_id: requesting_device_id.to_string(),
+            nonce: nonce.clone(),
+        },
+    )
+    .await?;
+    Ok((id, nonce))
+}
+
+#[derive(serde::Deserialize)]
+struct UnlockStatusRow {
+    status: String,
+    #[serde(with = "time::serde::rfc3339")]
+    expires_at: OffsetDateTime,
+}
+
+pub async fn unlock_request_status(
+    db: &Database,
+    id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<String>, IdentityError> {
+    let row: Option<UnlockStatusRow> = one(
+        db,
+        "SELECT status, expires_at FROM unlock_requests WHERE record::id(id) = $id AND user_id = $user_id LIMIT 1",
+        serde_json::json!({ "id": id.to_string(), "user_id": user_id.to_string() }),
+    )
+    .await?;
+    Ok(row.map(|row| {
+        if row.status == "pending" && row.expires_at < OffsetDateTime::now_utc() {
+            "expired".to_string()
+        } else {
+            row.status
+        }
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct PendingUnlockRow {
+    #[serde(with = "uuid::serde::hyphenated")]
+    id: Uuid,
+    #[serde(with = "uuid::serde::hyphenated")]
+    requesting_device_id: Uuid,
+    #[serde(with = "serde_bytes")]
+    nonce: Vec<u8>,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+}
+
+pub async fn pending_unlock_requests(
+    db: &Database,
+    user_id: Uuid,
+    approver_device_id: Uuid,
+) -> Result<Vec<UnlockRequest>, IdentityError> {
+    let rows: Vec<PendingUnlockRow> = many(
+        db,
+        "SELECT record::id(id) AS id, requesting_device_id, nonce, created_at \
+         FROM unlock_requests WHERE user_id = $user_id AND requesting_device_id != $approver_device_id \
+           AND status = 'pending' AND expires_at > time::now() ORDER BY created_at DESC",
+        serde_json::json!({
+            "user_id": user_id.to_string(),
+            "approver_device_id": approver_device_id.to_string(),
+        }),
+    )
+    .await?;
+    let mut pending = Vec::with_capacity(rows.len());
+    for row in rows {
+        let device = get_device(db, row.requesting_device_id)
+            .await?
+            .ok_or(IdentityError::AuthFailed)?;
+        if device.user_id != user_id || device.status != "active" {
+            continue;
+        }
+        pending.push(UnlockRequest {
+            id: row.id,
+            requesting_device_id: row.requesting_device_id,
+            requesting_device_name: device.name,
+            requesting_device_platform: device.platform,
+            nonce: row.nonce,
+            created_at: row.created_at,
+        });
+    }
+    Ok(pending)
+}
+
+#[derive(serde::Deserialize)]
+struct UnlockClaim {
+    #[serde(with = "uuid::serde::hyphenated")]
+    requesting_device_id: Uuid,
+    #[serde(with = "serde_bytes")]
+    nonce: Vec<u8>,
+}
+
+pub async fn approve_unlock_request(
+    db: &Database,
+    id: Uuid,
+    user_id: Uuid,
+    approver_device_id: Uuid,
+    signature: &[u8],
+) -> Result<(), IdentityError> {
+    let pending: UnlockClaim = one(
+        db,
+        "SELECT requesting_device_id, nonce FROM unlock_requests WHERE record::id(id) = $id \
+         AND user_id = $user_id AND status = 'pending' AND expires_at > time::now() LIMIT 1",
+        serde_json::json!({ "id": id.to_string(), "user_id": user_id.to_string() }),
+    )
+    .await?
+    .ok_or(IdentityError::AuthFailed)?;
+    if pending.requesting_device_id == approver_device_id {
+        return Err(IdentityError::AuthFailed);
+    }
+    verify_device_signature(db, user_id, approver_device_id, &pending.nonce, signature).await?;
+
+    // Claiming repeats every decision-relevant predicate. A second concurrent
+    // approval cannot overwrite the first device or resolve an expired request.
+    let claimed: Option<ClaimedRecord> = one(
+        db,
+        "UPDATE unlock_requests SET status = 'approved', approved_by_device_id = $approver_device_id, \
+         resolved_at = time::now() WHERE record::id(id) = $id AND user_id = $user_id \
+         AND requesting_device_id != $approver_device_id AND status = 'pending' \
+         AND expires_at > time::now() RETURN record::id(id) AS id",
+        serde_json::json!({
+            "id": id.to_string(),
+            "user_id": user_id.to_string(),
+            "approver_device_id": approver_device_id.to_string(),
+        }),
+    )
+    .await?;
+    if claimed.map(|claim| claim.id) != Some(id.to_string()) {
+        return Err(IdentityError::AuthFailed);
+    }
+    Ok(())
+}
+
+pub async fn deny_unlock_request(
+    db: &Database,
+    id: Uuid,
+    user_id: Uuid,
+    denier_device_id: Uuid,
+) -> Result<(), IdentityError> {
+    let claimed: Option<ClaimedRecord> = one(
+        db,
+        "UPDATE unlock_requests SET status = 'denied', approved_by_device_id = $denier_device_id, \
+         resolved_at = time::now() WHERE record::id(id) = $id AND user_id = $user_id \
+         AND requesting_device_id != $denier_device_id AND status = 'pending' \
+         RETURN record::id(id) AS id",
+        serde_json::json!({
+            "id": id.to_string(),
+            "user_id": user_id.to_string(),
+            "denier_device_id": denier_device_id.to_string(),
+        }),
+    )
+    .await?;
+    if claimed.map(|claim| claim.id) != Some(id.to_string()) {
+        return Err(IdentityError::AuthFailed);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -467,6 +655,44 @@ mod tests {
         assert!(login(&db, device.id, challenge.id, &signature)
             .await
             .is_err());
+
+        let approver_signing = SigningKey::from_bytes(&rand::random());
+        let (approver, _) = register_device(
+            &db,
+            owner.id,
+            "MacBook",
+            Platform::Macos,
+            "ed25519",
+            &approver_signing.verifying_key().to_bytes(),
+        )
+        .await?;
+        let (unlock_id, unlock_nonce) = create_unlock_request(&db, owner.id, device.id).await?;
+        assert_eq!(
+            pending_unlock_requests(&db, owner.id, approver.id)
+                .await?
+                .len(),
+            1
+        );
+        let self_signature = signing.sign(&unlock_nonce).to_bytes();
+        assert!(
+            approve_unlock_request(&db, unlock_id, owner.id, device.id, &self_signature)
+                .await
+                .is_err()
+        );
+        let approval_signature = approver_signing.sign(&unlock_nonce).to_bytes();
+        approve_unlock_request(&db, unlock_id, owner.id, approver.id, &approval_signature).await?;
+        assert_eq!(
+            unlock_request_status(&db, unlock_id, owner.id)
+                .await?
+                .as_deref(),
+            Some("approved")
+        );
+        // The conditional claim also rejects approval replay.
+        assert!(
+            approve_unlock_request(&db, unlock_id, owner.id, approver.id, &approval_signature,)
+                .await
+                .is_err()
+        );
         Ok(())
     }
 }
