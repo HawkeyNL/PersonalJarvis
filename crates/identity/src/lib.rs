@@ -16,11 +16,18 @@ use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
+/// SurrealDB implementation under parity construction. The existing SQLx
+/// repository remains the active implementation until the API, approvals and
+/// audit path can move together without a dual production runtime.
+pub mod surreal;
+
 /// Errors returned by the identity repository.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
     #[error("database error")]
     Database(#[from] sqlx::Error),
+    #[error("database error")]
+    DatabaseSurreal,
     #[error("unknown platform: {0}")]
     UnknownPlatform(String),
     /// Deliberately opaque so callers can't distinguish failure reasons.
@@ -67,49 +74,70 @@ impl Platform {
 /// The account owner. Jarvis is single-user, but the model stays relational.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct User {
+    #[serde(with = "uuid::serde::hyphenated")]
     pub id: Uuid,
     pub display_name: String,
     pub status: String,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
 
 /// A trusted device belonging to a user.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Device {
+    #[serde(with = "uuid::serde::hyphenated")]
     pub id: Uuid,
+    #[serde(with = "uuid::serde::hyphenated")]
     pub user_id: Uuid,
     pub name: String,
     pub platform: String,
     pub status: String,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub last_seen_at: Option<OffsetDateTime>,
 }
 
 /// A device's registered public key. The private key never leaves the device.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct DeviceKey {
+    #[serde(with = "uuid::serde::hyphenated")]
     pub id: Uuid,
+    #[serde(with = "uuid::serde::hyphenated")]
     pub device_id: Uuid,
     pub algorithm: String,
+    #[serde(with = "serde_bytes")]
     pub public_key: Vec<u8>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub revoked_at: Option<OffsetDateTime>,
 }
 
 /// An authenticated session bound to a user and device.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Session {
+    #[serde(with = "uuid::serde::hyphenated")]
     pub id: Uuid,
+    #[serde(with = "uuid::serde::hyphenated")]
     pub user_id: Uuid,
+    #[serde(with = "uuid::serde::hyphenated")]
     pub device_id: Uuid,
     /// SHA-256 of the token. Never serialised out.
     #[serde(skip_serializing)]
+    #[serde(with = "serde_bytes")]
     pub token_hash: Vec<u8>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub last_used_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub revoked_at: Option<OffsetDateTime>,
 }
 

@@ -2229,10 +2229,14 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
+ "jarvis-store",
  "rand 0.8.7",
  "serde",
+ "serde_bytes",
+ "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "surrealdb",
  "thiserror 1.0.69",
  "time",
  "tokio",
@@ -4010,6 +4014,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3753ca04f350fa92d00b6146a3555e63c55388c9ef2e11e09bce2ff1c0b509c6"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
