@@ -1,5 +1,9 @@
 # Docker en deployment
 
+> **Vervangen voor Jarvis Core-persistentie door ADR-034.** Rol de
+> PostgreSQL-voorbeelden hieronder niet uit voor Core; gebruik de private,
+> gepinde SurrealDB 2.6-service en `deploy/systemd/README.md`.
+
 ## Start-Compose
 
 ```yaml

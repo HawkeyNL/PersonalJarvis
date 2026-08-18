@@ -1,5 +1,8 @@
 # Jarvis Home Node — GUI, Remote Access & Computer-Use Plan
 
+> **Datastorenoot (ADR-034):** PostgreSQL/pgvector-verwijzingen hieronder zijn
+> voor Jarvis Core vervangen door private SurrealDB 2.6.
+
 ## Purpose
 
 The UM890 Pro is the intended always-on Jarvis Home Node. It is not a conventional headless API server: it must run Jarvis Core, Docker services, trading applications, GUI automation, backtesting workloads, and remote administration.
