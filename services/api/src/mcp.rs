@@ -21,6 +21,7 @@ use axum::{
 };
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 
 use jarvis_portfolio as portfolio;
 
@@ -214,21 +215,36 @@ async fn mcp_recent_conversations(
         .and_then(|l| l.as_i64())
         .unwrap_or(10)
         .clamp(1, 50);
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT title, to_char(updated_at, 'YYYY-MM-DD HH24:MI') \
-         FROM conversations WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2",
-    )
-    .bind(authed.user.id)
-    .bind(limit)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| ToolErr::Failed(format!("gesprekken niet leesbaar: {e}")))?;
+    #[derive(serde::Deserialize)]
+    struct ConversationRow {
+        title: String,
+        #[serde(with = "time::serde::rfc3339")]
+        updated_at: OffsetDateTime,
+    }
+    let mut response = state
+        .db
+        .query(
+            "SELECT title, updated_at FROM conversations WHERE user_id = $user_id \
+         ORDER BY updated_at DESC LIMIT $limit",
+        )
+        .bind(json!({"user_id": authed.user.id.to_string(), "limit": limit}))
+        .await
+        .map_err(|_| ToolErr::Failed("gesprekken niet leesbaar".to_string()))?;
+    let rows: Vec<ConversationRow> = response
+        .take(0)
+        .map_err(|_| ToolErr::Failed("gesprekken niet leesbaar".to_string()))?;
     if rows.is_empty() {
         return Ok("Nog geen gesprekken.".to_string());
     }
     let mut s = String::from("Recente gesprekken:\n");
-    for (title, updated) in rows {
-        s.push_str(&format!("- {title} ({updated})\n"));
+    for row in rows {
+        s.push_str(&format!(
+            "- {} ({})\n",
+            row.title,
+            row.updated_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default()
+        ));
     }
     Ok(s)
 }

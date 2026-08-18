@@ -650,7 +650,20 @@ mod tests {
         .await?;
         let challenge = create_challenge(&db, device.id).await?;
         let signature = signing.sign(&challenge.nonce).to_bytes();
-        let result = login(&db, device.id, challenge.id, &signature).await?;
+        let first_db = db.clone();
+        let second_db = db.clone();
+        let first_signature = signature;
+        let second_signature = signature;
+        let (first, second) = tokio::join!(
+            login(&first_db, device.id, challenge.id, &first_signature),
+            login(&second_db, device.id, challenge.id, &second_signature),
+        );
+        // The conditional UPDATE is the replay/concurrency boundary: exactly
+        // one request can consume the challenge and obtain a session.
+        let result = match (first, second) {
+            (Ok(result), Err(_)) | (Err(_), Ok(result)) => result,
+            _ => panic!("exactly one concurrent login must succeed"),
+        };
         assert_eq!(authenticate(&db, &result.token).await?.user.id, owner.id);
         assert!(login(&db, device.id, challenge.id, &signature)
             .await

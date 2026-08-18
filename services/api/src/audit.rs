@@ -1,16 +1,17 @@
-//! Audit trails: the agent action log (ADR-029) and the security/auth log
-//! (review P6). Both are append-only and never store secrets; a write failure is
-//! logged, never surfaced, so auditing can never break the request path.
+//! Append-only security and agent audit trails. Audit payloads deliberately omit
+//! secrets, prompts and action content. A write failure is logged but never
+//! changes the authorization or execution outcome.
 
 use axum::{extract::State, Json};
+use serde::Deserialize;
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{AppState, Authed};
 use jarvis_agent as agent;
 
-/// Write one append-only agent audit row. Auditing must never break the action
-/// path, so a DB failure is logged, not surfaced.
+use crate::{AppState, Authed};
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_agent_audit(
     state: &AppState,
@@ -21,31 +22,29 @@ pub(crate) async fn record_agent_audit(
     outcome: &str,
     note: Option<&str>,
 ) {
-    let risk_str = match risk {
+    let risk_class = match risk {
         agent::RiskClass::Auto => "auto",
         agent::RiskClass::NeedsApproval => "needs_approval",
         agent::RiskClass::Denied => "denied",
     };
-    let res = sqlx::query(
-        "INSERT INTO agent_audit (device_id, action_type, detail, risk_class, outcome, note) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(device_id)
-    .bind(action_type)
-    .bind(detail)
-    .bind(risk_str)
-    .bind(outcome)
-    .bind(note)
-    .execute(&state.db)
-    .await;
-    if let Err(e) = res {
-        tracing::warn!(error = %e, "failed to write agent audit");
+    if let Err(error) = state
+        .db
+        .query(
+            "CREATE agent_audit SET id = $id, ts = time::now(), device_id = $device_id, \
+         action_type = $action_type, detail = $detail, risk_class = $risk_class, \
+         outcome = $outcome, note = $note RETURN NONE",
+        )
+        .bind(json!({
+            "id": Uuid::now_v7().to_string(), "device_id": device_id.to_string(),
+            "action_type": action_type, "detail": detail, "risk_class": risk_class,
+            "outcome": outcome, "note": note,
+        }))
+        .await
+    {
+        tracing::warn!(%error, "failed to write agent audit");
     }
 }
 
-/// Append a security/auth event to the audit trail (Priority 6). Best-effort:
-/// a write failure is logged but never blocks the request, and no secrets are
-/// ever stored — only the actor device, the event, the outcome, and a short note.
 pub(crate) async fn record_security_event(
     state: &AppState,
     device_id: Option<Uuid>,
@@ -53,65 +52,66 @@ pub(crate) async fn record_security_event(
     outcome: &str,
     detail: Option<&str>,
 ) {
-    let res = sqlx::query(
-        "INSERT INTO security_audit (device_id, event, outcome, detail) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(device_id)
-    .bind(event)
-    .bind(outcome)
-    .bind(detail)
-    .execute(&state.db)
-    .await;
-    if let Err(e) = res {
-        tracing::warn!(error = %e, event, "failed to write security audit");
+    if let Err(error) = state
+        .db
+        .query(
+            "CREATE security_audit SET id = $id, ts = time::now(), device_id = $device_id, \
+         event = $event, outcome = $outcome, detail = $detail RETURN NONE",
+        )
+        .bind(json!({
+            "id": Uuid::now_v7().to_string(),
+            "device_id": device_id.map(|id| id.to_string()), "event": event,
+            "outcome": outcome, "detail": detail,
+        }))
+        .await
+    {
+        tracing::warn!(%error, event, "failed to write security audit");
     }
 }
 
-/// The recent security/auth audit trail (Priority 6) — logins, enrolment,
-/// logout, and device/unlock changes. Owner-only; never contains secrets.
+#[derive(Deserialize)]
+struct SecurityRow {
+    device_id: Option<String>,
+    event: String,
+    outcome: String,
+    detail: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    ts: OffsetDateTime,
+}
+
 pub(crate) async fn security_audit_log(
     _authed: Authed,
     State(state): State<AppState>,
 ) -> Json<Value> {
-    type AuditRow = (Option<Uuid>, String, String, Option<String>, String);
-    let rows: Vec<AuditRow> = sqlx::query_as(
-        "SELECT device_id, event, outcome, detail, \
-         to_char(ts, 'YYYY-MM-DD HH24:MI:SS') \
-         FROM security_audit ORDER BY ts DESC LIMIT 100",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let entries: Vec<Value> = rows
-        .into_iter()
-        .map(|(device_id, event, outcome, detail, ts)| {
-            json!({
-                "device_id": device_id,
-                "event": event,
-                "outcome": outcome,
-                "detail": detail,
-                "ts": ts,
-            })
-        })
-        .collect();
-    Json(json!({ "entries": entries }))
+    let mut response = match state.db.query(
+        "SELECT device_id, event, outcome, detail, ts FROM security_audit ORDER BY ts DESC LIMIT 100",
+    ).await { Ok(response) => response, Err(error) => { tracing::warn!(%error, "failed to read security audit"); return Json(json!({"entries": []})); } };
+    let rows: Vec<SecurityRow> = response.take(0).unwrap_or_default();
+    Json(json!({"entries": rows.into_iter().map(|row| json!({
+        "device_id": row.device_id, "event": row.event, "outcome": row.outcome,
+        "detail": row.detail, "ts": row.ts.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+    })).collect::<Vec<_>>() }))
 }
 
-/// The recent agent audit trail (ADR-029) — what Jarvis' hands have done.
+#[derive(Deserialize)]
+struct AgentRow {
+    action_type: String,
+    risk_class: String,
+    outcome: String,
+    note: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    ts: OffsetDateTime,
+}
+
 pub(crate) async fn agent_audit_log(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
-    let rows: Vec<(String, String, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT action_type, risk_class, outcome, note, \
-         to_char(ts, 'YYYY-MM-DD HH24:MI:SS') \
-         FROM agent_audit ORDER BY ts DESC LIMIT 50",
+    let mut response = match state.db.query(
+        "SELECT action_type, risk_class, outcome, note, ts FROM agent_audit ORDER BY ts DESC LIMIT 50",
+    ).await { Ok(response) => response, Err(error) => { tracing::warn!(%error, "failed to read agent audit"); return Json(json!({"enabled": state.agent_enabled, "entries": []})); } };
+    let rows: Vec<AgentRow> = response.take(0).unwrap_or_default();
+    Json(
+        json!({"enabled": state.agent_enabled, "entries": rows.into_iter().map(|row| json!({
+        "action": row.action_type, "risk": row.risk_class, "outcome": row.outcome,
+        "note": row.note, "ts": row.ts.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+    })).collect::<Vec<_>>() }),
     )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let entries: Vec<Value> = rows
-        .into_iter()
-        .map(|(action, risk, outcome, note, ts)| {
-            json!({ "action": action, "risk": risk, "outcome": outcome, "note": note, "ts": ts })
-        })
-        .collect();
-    Json(json!({ "enabled": state.agent_enabled, "entries": entries }))
 }

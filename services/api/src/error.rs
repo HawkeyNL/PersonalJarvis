@@ -36,13 +36,6 @@ pub(crate) fn portfolio_err(_e: portfolio::PortfolioError) -> (StatusCode, Json<
     )
 }
 
-pub(crate) fn db_err(_e: sqlx::Error) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": "internal error" })),
-    )
-}
-
 pub(crate) fn speech_err(e: speech::SpeechError) -> (StatusCode, Json<Value>) {
     match e {
         speech::SpeechError::TooShort => bad_request("audio was empty or too short"),

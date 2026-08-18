@@ -54,6 +54,11 @@ grep -qx 'JARVIS_AGENT_CLAUDE_CODE_ENABLED=false' /etc/jarvis/core.env || {
     exit 1
 }
 
+for required in JARVIS_SURREAL_ENDPOINT JARVIS_SURREAL_NAMESPACE JARVIS_SURREAL_DATABASE JARVIS_SURREAL_USERNAME JARVIS_SURREAL_PASSWORD; do
+    value=$(sed -n "s/^${required}=//p" /etc/jarvis/core.env | tail -n 1)
+    [[ -n ${value:-} ]] || { echo "$required must be set" >&2; exit 1; }
+done
+
 hops=$(sed -n 's/^JARVIS_TRUSTED_PROXY_HOPS=//p' /etc/jarvis/core.env | tail -n 1)
 ips=$(sed -n 's/^JARVIS_TRUSTED_PROXY_IPS=//p' /etc/jarvis/core.env | tail -n 1)
 if [[ ${hops:-0} != 0 && -z ${ips:-} ]]; then

@@ -1,5 +1,9 @@
 # SurrealDB Evaluation & Migration Plan — AI Engineering Brief
 
+> **Historisch risicoregister — superseded by ADR-034.** De directe migratie
+> naar SurrealDB 2.6 is geaccepteerd; verwijzingen naar de toenmalige
+> PostgreSQL/SQLx-implementatie beschrijven uitsluitend de beginsituatie.
+
 > **Superseded decision:** ADR-034 (2026-08-17) accepteert de directe
 > pre-productie-migratie naar SurrealDB. Deze analyse blijft als risicoregister
 > en uitvoeringscontext behouden; de eerdere aanbeveling om alleen te evalueren

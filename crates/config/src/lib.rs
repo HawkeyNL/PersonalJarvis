@@ -1,7 +1,7 @@
 //! Typed, environment-driven configuration for Jarvis services.
 //!
 //! Values are loaded from an optional `jarvis.toml` and then overridden by
-//! `JARVIS_`-prefixed environment variables. Secrets (e.g. `database_url`) are
+//! `JARVIS_`-prefixed environment variables. Secrets (e.g. database passwords) are
 //! redacted from the `Debug` output so they never leak into logs.
 
 // `figment::Error` is a large third-party error type that we surface directly
@@ -23,8 +23,17 @@ pub struct AppConfig {
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
 
-    /// PostgreSQL connection string. Secret — redacted in `Debug`.
-    pub database_url: String,
+    /// Private SurrealDB websocket endpoint. Never exposed publicly.
+    pub surreal_endpoint: String,
+    /// SurrealDB namespace and database selected by Core.
+    #[serde(default = "default_surreal_namespace")]
+    pub surreal_namespace: String,
+    #[serde(default = "default_surreal_database")]
+    pub surreal_database: String,
+    /// Database-scoped Core principal. The root account is provisioning-only.
+    pub surreal_username: String,
+    /// Secret — redacted in `Debug`.
+    pub surreal_password: String,
 
     /// Emit logs as JSON (recommended for production).
     #[serde(default)]
@@ -196,6 +205,14 @@ fn default_bind_addr() -> String {
     "0.0.0.0:8080".to_string()
 }
 
+fn default_surreal_namespace() -> String {
+    "jarvis".to_string()
+}
+
+fn default_surreal_database() -> String {
+    "core".to_string()
+}
+
 fn default_environment() -> String {
     "development".to_string()
 }
@@ -360,7 +377,11 @@ impl fmt::Debug for AppConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppConfig")
             .field("bind_addr", &self.bind_addr)
-            .field("database_url", &"<redacted>")
+            .field("surreal_endpoint", &self.surreal_endpoint)
+            .field("surreal_namespace", &self.surreal_namespace)
+            .field("surreal_database", &self.surreal_database)
+            .field("surreal_username", &self.surreal_username)
+            .field("surreal_password", &redact(&self.surreal_password))
             .field("log_json", &self.log_json)
             .field("environment", &self.environment)
             .field("ibkr_gateway_url", &self.ibkr_gateway_url)
@@ -410,10 +431,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn debug_redacts_the_database_url() {
+    fn debug_redacts_the_database_password() {
         let cfg = AppConfig {
             bind_addr: "0.0.0.0:8080".to_string(),
-            database_url: "postgres://user:supersecret@localhost/jarvis".to_string(),
+            surreal_endpoint: "127.0.0.1:8000".to_string(),
+            surreal_namespace: "jarvis".to_string(),
+            surreal_database: "core".to_string(),
+            surreal_username: "core".to_string(),
+            surreal_password: "supersecret".to_string(),
             log_json: false,
             environment: "test".to_string(),
             ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
@@ -474,13 +499,15 @@ mod tests {
     #[test]
     fn env_overrides_are_applied() {
         figment::Jail::expect_with(|jail| {
-            jail.set_env("JARVIS_DATABASE_URL", "postgres://localhost/x");
+            jail.set_env("JARVIS_SURREAL_ENDPOINT", "127.0.0.1:8000");
+            jail.set_env("JARVIS_SURREAL_USERNAME", "core");
+            jail.set_env("JARVIS_SURREAL_PASSWORD", "test-password");
             jail.set_env("JARVIS_BIND_ADDR", "127.0.0.1:9999");
             jail.set_env("JARVIS_LOG_JSON", "true");
 
             let cfg = AppConfig::load()?;
             assert_eq!(cfg.bind_addr, "127.0.0.1:9999");
-            assert_eq!(cfg.database_url, "postgres://localhost/x");
+            assert_eq!(cfg.surreal_endpoint, "127.0.0.1:8000");
             assert!(cfg.log_json);
             assert_eq!(cfg.environment, "development"); // default
             Ok(())
@@ -490,7 +517,9 @@ mod tests {
     #[test]
     fn proxy_hops_require_an_explicit_peer_allowlist() {
         figment::Jail::expect_with(|jail| {
-            jail.set_env("JARVIS_DATABASE_URL", "postgres://localhost/x");
+            jail.set_env("JARVIS_SURREAL_ENDPOINT", "127.0.0.1:8000");
+            jail.set_env("JARVIS_SURREAL_USERNAME", "core");
+            jail.set_env("JARVIS_SURREAL_PASSWORD", "test-password");
             jail.set_env("JARVIS_TRUSTED_PROXY_HOPS", "1");
             let cfg = AppConfig::load()?;
             assert!(cfg.trusted_proxy_ips().is_err());

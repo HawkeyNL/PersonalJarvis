@@ -3,17 +3,20 @@
 - Status: Proposed
 - Date: 2026-08-15
 
+> Datastore details are superseded by ADR-034: SurrealDB 2.6 is the Core
+> datastore. The native-Core/systemd deployment decision remains in force.
+
 ## Context
 
 The PersonalJarvis project is moving toward a dedicated always-on home node (MINISFORUM UM890 Pro) running Ubuntu. The node will host Jarvis Core, databases, workers, trading connectivity and development agents while remaining reachable remotely over a private network.
 
-The repository already uses a modular Rust backend and Docker for PostgreSQL during development. We want the production deployment to preserve that simplicity while avoiding a failure in one container taking the Jarvis orchestrator down with it.
+The repository uses a modular Rust backend and Docker for SurrealDB during development. We want the production deployment to preserve that simplicity while avoiding a failure in one container taking the Jarvis orchestrator down with it.
 
 ## Decision
 
 Jarvis Core remains a native Rust process managed by `systemd` on the Ubuntu host.
 
-Stateful and isolated supporting services run in Docker Compose. Initially these include PostgreSQL (with pgvector when memory features require it), and later Redis/monitoring/workers when justified.
+Stateful and isolated supporting services run in Docker Compose. Initially these include SurrealDB 2.6, and later monitoring/workers when justified.
 
 Conceptually:
 
@@ -27,7 +30,7 @@ Ubuntu host
 |   +-- docker
 |
 +-- Docker
-    +-- PostgreSQL + pgvector
+    +-- SurrealDB 2.6
     +-- Redis (only when needed)
     +-- monitoring
     +-- research/backtest workers
@@ -58,7 +61,7 @@ Container updates follow the same principle: allowlisted services only, with hea
 
 ## Database
 
-PostgreSQL remains the source of truth for durable state. Redis, if introduced, is for ephemeral state, caching, queues or coordination rather than irreplaceable memory.
+SurrealDB remains the source of truth for durable state. Redis, if introduced, is for ephemeral state, caching, queues or coordination rather than irreplaceable memory.
 
 Production database migrations must fail closed: if migrations cannot be applied, Jarvis Core must not start against an unknown schema.
 
@@ -67,7 +70,7 @@ Production database migrations must fail closed: if migrations cannot be applied
 The Home Node should expose machine-readable health and metrics for at least:
 
 - Jarvis Core
-- PostgreSQL
+- SurrealDB
 - Docker services
 - CPU/RAM/disk
 - temperature and throttling

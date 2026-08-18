@@ -11,13 +11,13 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use jarvis_llm as llm;
 use jarvis_orchestrator as orchestrator;
 
-use crate::error::{bad_request, db_err};
+use crate::error::bad_request;
 use crate::metering::record_usage;
 use crate::validation;
 use crate::{AppState, Authed};
@@ -107,7 +107,7 @@ pub(crate) async fn assistant_chat(
             } else {
                 let id = create_conversation(&state.db, authed.user.id, &proposed)
                     .await
-                    .map_err(db_err)?;
+                    .map_err(|_| internal_error())?;
                 (id, proposed, true)
             }
         }
@@ -115,7 +115,7 @@ pub(crate) async fn assistant_chat(
             let (_same, proposed) = classify_topic(&state, None, &new_msg).await;
             let id = create_conversation(&state.db, authed.user.id, &proposed)
                 .await
-                .map_err(db_err)?;
+                .map_err(|_| internal_error())?;
             (id, proposed, true)
         }
     };
@@ -268,62 +268,78 @@ fn clean_title(s: &str) -> String {
 }
 
 /// A conversation's title, if it belongs to this user.
-async fn conversation_title(pool: &PgPool, id: Uuid, user_id: Uuid) -> Option<String> {
-    sqlx::query_scalar("SELECT title FROM conversations WHERE id = $1 AND user_id = $2")
-        .bind(id)
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
+fn internal_error() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "internal error" })),
+    )
+}
+
+#[derive(Deserialize)]
+struct TitleRow {
+    title: String,
+}
+
+async fn conversation_title(
+    db: &jarvis_store::Database,
+    id: Uuid,
+    user_id: Uuid,
+) -> Option<String> {
+    let mut response = db.query(
+        "SELECT title FROM conversations WHERE record::id(id) = $id AND user_id = $user_id LIMIT 1",
+    ).bind(json!({"id": id.to_string(), "user_id": user_id.to_string()})).await.ok()?;
+    response
+        .take::<Option<TitleRow>>(0)
         .ok()
         .flatten()
+        .map(|row| row.title)
 }
 
 /// Create a new conversation and return its id (ADR-030).
 async fn create_conversation(
-    pool: &PgPool,
+    db: &jarvis_store::Database,
     user_id: Uuid,
     title: &str,
-) -> Result<Uuid, sqlx::Error> {
+) -> Result<Uuid, ()> {
     let id = Uuid::now_v7();
-    sqlx::query("INSERT INTO conversations (id, user_id, title) VALUES ($1, $2, $3)")
-        .bind(id)
-        .bind(user_id)
-        .bind(title)
-        .execute(pool)
-        .await?;
+    db.query(
+        "CREATE conversations SET id = $id, user_id = $user_id, title = $title, \
+         created_at = time::now(), updated_at = time::now() RETURN NONE",
+    )
+    .bind(json!({"id": id.to_string(), "user_id": user_id.to_string(), "title": title}))
+    .await
+    .map_err(|_| ())?;
     Ok(id)
 }
 
 /// Append a message and bump the conversation's `updated_at`. Best-effort:
 /// persistence must never break the reply, so a failure is logged, not surfaced.
 async fn append_message(
-    pool: &PgPool,
+    db: &jarvis_store::Database,
     conv_id: Uuid,
     user_id: Uuid,
     role: &str,
     content: &str,
     model: Option<&str>,
 ) {
-    let res = sqlx::query(
-        "INSERT INTO chat_messages (id, conversation_id, user_id, role, content, model) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(Uuid::now_v7())
-    .bind(conv_id)
-    .bind(user_id)
-    .bind(role)
-    .bind(content)
-    .bind(model)
-    .execute(pool)
-    .await;
+    let res = db.query(
+        "BEGIN TRANSACTION; CREATE chat_messages SET id = $id, conversation_id = $conversation_id, \
+         user_id = $user_id, role = $role, content = $content, model = $model, created_at = time::now(); \
+         UPDATE conversations SET updated_at = time::now() WHERE record::id(id) = $conversation_id AND user_id = $user_id; COMMIT TRANSACTION;",
+    ).bind(json!({"id": Uuid::now_v7().to_string(), "conversation_id": conv_id.to_string(),
+        "user_id": user_id.to_string(), "role": role, "content": content, "model": model})).await;
     if let Err(e) = res {
         tracing::warn!(error = %e, "failed to persist chat message");
-        return;
     }
-    let _ = sqlx::query("UPDATE conversations SET updated_at = now() WHERE id = $1")
-        .bind(conv_id)
-        .execute(pool)
-        .await;
+}
+
+#[derive(Deserialize)]
+struct ConversationRow {
+    #[serde(with = "uuid::serde::hyphenated")]
+    id: Uuid,
+    title: String,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
 }
 
 /// List the owner's conversations, newest-active first (ADR-030).
@@ -331,17 +347,13 @@ pub(crate) async fn list_conversations(
     authed: Authed,
     State(state): State<AppState>,
 ) -> Json<Value> {
-    let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT id, title, to_char(updated_at, 'YYYY-MM-DD HH24:MI') \
-         FROM conversations WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 100",
-    )
-    .bind(authed.user.id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    let rows: Vec<ConversationRow> = match state.db.query(
+        "SELECT record::id(id) AS id, title, updated_at FROM conversations WHERE user_id = $user_id \
+         ORDER BY updated_at DESC LIMIT 100",
+    ).bind(json!({"user_id": authed.user.id.to_string()})).await { Ok(mut response) => response.take(0).unwrap_or_default(), Err(error) => { tracing::warn!(%error, "failed to list conversations"); Vec::new() } };
     let items: Vec<Value> = rows
         .into_iter()
-        .map(|(id, title, updated)| json!({ "id": id, "title": title, "updated_at": updated }))
+        .map(|row| json!({ "id": row.id, "title": row.title, "updated_at": row.updated_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() }))
         .collect();
     Json(json!({ "conversations": items }))
 }
@@ -360,18 +372,22 @@ pub(crate) async fn get_conversation(
                 Json(json!({ "error": "no such conversation" })),
             )
         })?;
-    let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT role, content, model, to_char(created_at, 'YYYY-MM-DD HH24:MI') \
-         FROM chat_messages WHERE conversation_id = $1 ORDER BY created_at ASC",
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(db_err)?;
+    #[derive(Deserialize)]
+    struct MessageRow {
+        role: String,
+        content: String,
+        model: Option<String>,
+        #[serde(with = "time::serde::rfc3339")]
+        created_at: OffsetDateTime,
+    }
+    let mut response = state.db.query(
+        "SELECT role, content, model, created_at FROM chat_messages WHERE conversation_id = $id ORDER BY created_at ASC",
+    ).bind(json!({"id": id.to_string()})).await.map_err(|_| internal_error())?;
+    let rows: Vec<MessageRow> = response.take(0).map_err(|_| internal_error())?;
     let messages: Vec<Value> = rows
         .into_iter()
-        .map(|(role, content, model, at)| {
-            json!({ "role": role, "content": content, "model": model, "at": at })
+        .map(|row| {
+            json!({ "role": row.role, "content": row.content, "model": row.model, "at": row.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() })
         })
         .collect();
     Ok(Json(
@@ -385,13 +401,12 @@ pub(crate) async fn delete_conversation(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let res = sqlx::query("DELETE FROM conversations WHERE id = $1 AND user_id = $2")
-        .bind(id)
-        .bind(authed.user.id)
-        .execute(&state.db)
-        .await
-        .map_err(db_err)?;
-    if res.rows_affected() == 0 {
+    let mut response = state.db.query(
+        "BEGIN TRANSACTION; DELETE chat_messages WHERE conversation_id = $id AND user_id = $user_id; \
+         DELETE conversations WHERE record::id(id) = $id AND user_id = $user_id RETURN record::id(id) AS id; COMMIT TRANSACTION;",
+    ).bind(json!({"id": id.to_string(), "user_id": authed.user.id.to_string()})).await.map_err(|_| internal_error())?;
+    let deleted: Option<ConversationRow> = response.take(1).map_err(|_| internal_error())?;
+    if deleted.is_none() {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such conversation" })),

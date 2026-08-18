@@ -8,8 +8,6 @@ use std::net::IpAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
-use sqlx::PgPool;
-
 use jarvis_agent as agent;
 use jarvis_llm as llm;
 use jarvis_registry as registry;
@@ -20,7 +18,7 @@ use crate::rate_limit;
 /// Shared, cheaply-cloneable application state.
 #[derive(Clone)]
 pub struct AppState {
-    pub db: PgPool,
+    pub db: jarvis_store::Database,
     pub environment: String,
     pub ibkr_gateway_url: String,
     /// The brain (DEC-001) — provider-abstracted, swappable at runtime.

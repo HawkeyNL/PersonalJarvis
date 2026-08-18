@@ -6,7 +6,6 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-sqlx.workspace = true
 jarvis-store.workspace = true
 surrealdb.workspace = true
 uuid.workspace = true

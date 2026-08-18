@@ -39,15 +39,6 @@ tower-http = { version = "0.6", features = ["trace", "cors"] }
 # Home Node.  We only enable the websocket client transport: the database stays
 # a separate, private service and is never embedded in the Core process.
 surrealdb = { version = "2.6.5", default-features = false, features = ["protocol-ws", "rustls"] }
-sqlx = { version = "0.9", default-features = false, features = [
-    "runtime-tokio",
-    "postgres",
-    "macros",
-    "migrate",
-    "uuid",
-    "time",
-    "rust_decimal",
-] }
 
 # serde
 serde = { version = "1", features = ["derive"] }

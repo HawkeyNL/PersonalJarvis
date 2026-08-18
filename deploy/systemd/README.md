@@ -1,13 +1,13 @@
 # Jarvis Core on the Ubuntu Home Node
 
 This is the operator runbook for the first Home Node deployment. It runs Jarvis
-Core as a native, unprivileged `systemd` service. PostgreSQL is a separately
+Core as a native, unprivileged `systemd` service. SurrealDB is a separately
 operated Docker service; Core is deliberately not part of the Docker stack and
 does not receive Docker, root, or arbitrary-shell access.
 
 Do these steps from a trusted administrator session on the Ubuntu Desktop LTS
 Home Node. Remote access must already use RivetLink or another verified private
-network; do not expose SSH, the API, PostgreSQL, RDP/VNC, or the Docker socket to
+network; do not expose SSH, the API, SurrealDB, RDP/VNC, or the Docker socket to
 the public internet.
 
 ## 0. Do not deploy before this gate is green
@@ -17,9 +17,9 @@ Build only a reviewed commit and run these from its repository checkout:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-# Test-only database. Do not point #[sqlx::test] at the production database.
+# Test-only database. Do not point wire-protocol tests at the production database.
 docker compose -f deploy/compose/docker-compose.yml up -d --wait
-DATABASE_URL=postgres://jarvis:jarvis_dev_pw@localhost:5432/jarvis cargo test --all
+cargo test --all
 cargo audit
 ```
 
@@ -35,16 +35,19 @@ Before installing Jarvis:
 
 - Install Ubuntu security updates, enable time synchronisation, and configure the
   host firewall with default-deny inbound rules.
-- Install Docker Engine with the Compose plugin for PostgreSQL. Keep its management
+- Install Docker Engine with the Compose plugin for SurrealDB. Keep its management
   socket local; do not add the `jarvis` account to the `docker` group.
 - Install `curl` and `jq`; the updater uses them to fetch and validate release
   metadata and assets. Ubuntu's standard `tar`, `sha256sum` and `flock` tools are
   also required.
-- Create a separate PostgreSQL 17 instance with durable storage and backups. It
+- Create a separate pinned SurrealDB 2.6 instance with durable storage and backups. It
   must be reachable only from the Home Node (for example, published on
   `127.0.0.1` only). Do **not** use `deploy/compose/docker-compose.yml` as a
   production manifest: it is explicitly a development stack.
-- Confirm the database is healthy and create a database/user dedicated to Jarvis.
+- Confirm the database is healthy and create a namespace/database plus a database-scoped `EDITOR` user dedicated to Jarvis. The root account is provisioning-only.
+  Provision it from the isolated database container or a trusted administrator
+  session; then discard the root credential from the Core environment. Core's
+  `/etc/jarvis/core.env` contains only the database-scoped account below.
   Store its strong password only in the root-managed Core environment file below.
 
 Create the service identity and required directories:
@@ -100,7 +103,7 @@ Validate the extracted manifest before setting it active:
 
 ```bash
 sudo jq -e --arg tag "$tag" \
-  '.tag == $tag and (.revision | test("^[0-9a-f]{40}$")) and (.migrations_sha256 | test("^[0-9a-f]{64}$"))' \
+  '.tag == $tag and (.revision | test("^[0-9a-f]{40}$")) and (.schema_sha256 | test("^[0-9a-f]{64}$"))' \
   "/opt/jarvis/releases/${tag}/release.json"
 sudo ln -sfn "/opt/jarvis/releases/${tag}" /opt/jarvis/current
 ```
@@ -129,7 +132,11 @@ the unit, release directory, repository, shell history, or screenshots.
 JARVIS_ENVIRONMENT=production
 JARVIS_LOG_JSON=true
 JARVIS_BIND_ADDR=127.0.0.1:8080
-JARVIS_DATABASE_URL=postgres://<jarvis-user>:<strong-password>@127.0.0.1:5432/<jarvis-db>
+JARVIS_SURREAL_ENDPOINT=127.0.0.1:8000
+JARVIS_SURREAL_NAMESPACE=jarvis
+JARVIS_SURREAL_DATABASE=core
+JARVIS_SURREAL_USERNAME=core
+JARVIS_SURREAL_PASSWORD=<strong-password>
 
 # First deployment: agents and code execution remain off.
 JARVIS_AGENT_ENABLED=false
@@ -172,7 +179,7 @@ updates), verifies the units, and checks both health endpoints:
 sudo bash deploy/systemd/install-home-node-core.sh /opt/jarvis/releases/<commit>
 ```
 
-The installer deliberately does not provision Docker/PostgreSQL, create secrets,
+The installer deliberately does not provision Docker/SurrealDB, create secrets,
 change firewall rules, or roll back database migrations. Those actions require
 separate operator verification.
 
@@ -182,7 +189,7 @@ read ordinary home directories.
 
 ## 5. Verify immediately
 
-Run these on the Home Node. `readyz` validates PostgreSQL connectivity; a failure
+Run these on the Home Node. `readyz` validates SurrealDB connectivity; a failure
 after a migration problem must keep the Core from serving production traffic.
 
 ```bash
@@ -315,8 +322,8 @@ never roll back database schema blindly.
 ## 8. Operational checks to schedule
 
 - Check `systemctl status jarvis-core`, `readyz`, disk capacity, temperature, and
-  PostgreSQL health after reboots and updates.
-- Back up PostgreSQL independently from the container lifecycle and test a restore
+  SurrealDB health after reboots and updates.
+- Back up SurrealDB independently from the container lifecycle and test a restore
   before holding irreplaceable data.
 - Review `journalctl -u jarvis-core` and Jarvis security/agent audit events without
   copying secrets into tickets or chat.

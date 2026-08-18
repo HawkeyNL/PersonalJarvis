@@ -117,7 +117,7 @@ async fn livez() -> Json<Value> {
 
 /// Readiness probe: confirms the database is reachable.
 async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    match sqlx::query("SELECT 1").fetch_one(&state.db).await {
+    match state.db.query("RETURN 1").await {
         Ok(_) => (
             StatusCode::OK,
             Json(json!({ "status": "ready", "environment": state.environment })),
@@ -205,7 +205,6 @@ impl llm::Availability for BrainAvailability {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::PgPool;
 
     #[tokio::test]
     async fn livez_reports_alive() {
@@ -234,47 +233,5 @@ mod tests {
         assert!(loaded);
         assert_eq!(&*text, "Je bent Jarvis, de kern.");
         let _ = std::fs::remove_file(&path);
-    }
-
-    async fn stub_state(pool: PgPool) -> AppState {
-        AppState {
-            db: pool,
-            environment: "test".to_string(),
-            ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
-            llm: jarvis_llm::stub(),
-            llm_max_tokens: 256,
-            jarvis_system: std::sync::Arc::from(JARVIS_SYSTEM_FALLBACK),
-            speech: jarvis_speech::stub(),
-            speech_verify_threshold: 0.5,
-            registry: std::sync::Arc::new(std::sync::RwLock::new(
-                jarvis_registry::collect(&jarvis_registry::CollectInput::default()).await,
-            )),
-            registry_input: std::sync::Arc::new(jarvis_registry::CollectInput::default()),
-            budget_cents: 5000,
-            spent_cents: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            eur_per_usd: 0.92,
-            agent_enabled: false,
-            agent_sandbox: None,
-            rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::new()),
-            auth_limits: crate::rate_limit::AuthLimits::default(),
-            trusted_proxy_hops: 0,
-            trusted_proxy_ips: Arc::new(Vec::new()),
-        }
-    }
-
-    /// A failed readiness check reports "degraded" without leaking the internal
-    /// database error into the response body (detail belongs in the logs).
-    #[tokio::test]
-    async fn readyz_does_not_leak_db_errors() {
-        // A lazy pool pointed at a dead port: the SELECT 1 fails at call time.
-        // A short acquire timeout keeps the test fast (no 30s default retry loop).
-        let dead = sqlx::postgres::PgPoolOptions::new()
-            .acquire_timeout(std::time::Duration::from_millis(200))
-            .connect_lazy("postgres://127.0.0.1:1/none")
-            .unwrap();
-        let (status, Json(body)) = readyz(State(stub_state(dead).await)).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["status"], "degraded");
-        assert!(body.get("error").is_none(), "must not leak DB error detail");
     }
 }

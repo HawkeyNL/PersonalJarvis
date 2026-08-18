@@ -49,14 +49,14 @@ async fn one<T: DeserializeOwned>(
     query: &str,
     bindings: serde_json::Value,
 ) -> Result<Option<T>, PortfolioError> {
-    let mut response = db
-        .query(query)
-        .bind(bindings)
-        .await
-        .map_err(|_| PortfolioError::DatabaseSurreal)?;
-    response
-        .take(0)
-        .map_err(|_| PortfolioError::DatabaseSurreal)
+    let mut response = db.query(query).bind(bindings).await.map_err(|error| {
+        tracing::warn!(%error, "failed to query SurrealDB holding");
+        PortfolioError::DatabaseSurreal
+    })?;
+    response.take(0).map_err(|error| {
+        tracing::warn!(%error, "failed to decode SurrealDB holding");
+        PortfolioError::DatabaseSurreal
+    })
 }
 
 const FIELDS: &str =
@@ -77,18 +77,22 @@ pub async fn add_holding(
     ).bind(json!({
         "id": id.to_string(), "user_id": user_id.to_string(), "symbol": symbol,
         "quantity": quantity.to_string(), "avg_cost": avg_cost.to_string(), "currency": currency,
-    })).await.map_err(|_| PortfolioError::DatabaseSurreal)?;
-    response
-        .check()
-        .map_err(|_| PortfolioError::DatabaseSurreal)?;
+    })).await.map_err(|error| {
+        tracing::warn!(%error, "failed to create SurrealDB holding");
+        PortfolioError::DatabaseSurreal
+    })?;
+    response.check().map_err(|error| {
+        tracing::warn!(%error, "failed to validate SurrealDB holding create");
+        PortfolioError::DatabaseSurreal
+    })?;
     let row: StoredHolding = one(db, &format!("SELECT {FIELDS} FROM holdings WHERE record::id(id) = $id AND user_id = $user_id LIMIT 1"), json!({"id": id.to_string(), "user_id": user_id.to_string()})).await?.ok_or(PortfolioError::DatabaseSurreal)?;
     row.try_into()
 }
 
 pub async fn list_holdings(db: &Database, user_id: Uuid) -> Result<Vec<Holding>, PortfolioError> {
     let mut response = db
-        .query(&format!(
-            "SELECT {FIELDS} FROM holdings WHERE user_id = $user_id ORDER BY symbol ASC"
+        .query(format!(
+            "SELECT {FIELDS} FROM holdings WHERE user_id = $user_id ORDER BY symbol"
         ))
         .bind(json!({"user_id": user_id.to_string()}))
         .await
@@ -104,13 +108,69 @@ pub async fn delete_holding(
     user_id: Uuid,
     id: Uuid,
 ) -> Result<bool, PortfolioError> {
-    #[derive(serde::Deserialize)]
-    struct Deleted {
-        #[serde(with = "uuid::serde::hyphenated")]
-        id: Uuid,
+    let bindings = json!({"id": id.to_string(), "user_id": user_id.to_string()});
+    let exists: Option<StoredHolding> = one(
+        db,
+        &format!("SELECT {FIELDS} FROM holdings WHERE record::id(id) = $id AND user_id = $user_id LIMIT 1"),
+        bindings.clone(),
+    )
+    .await?;
+    if exists.is_none() {
+        return Ok(false);
     }
-    let row: Option<Deleted> = one(db,
-        "DELETE holdings WHERE record::id(id) = $id AND user_id = $user_id RETURN record::id(id) AS id",
-        json!({"id": id.to_string(), "user_id": user_id.to_string()})).await?;
-    Ok(row.map(|deleted| deleted.id) == Some(id))
+    // The owner-scoped condition is repeated in the deletion itself. If a
+    // concurrent delete wins, this remains a safe idempotent success.
+    db.query("DELETE holdings WHERE record::id(id) = $id AND user_id = $user_id RETURN NONE")
+        .bind(bindings)
+        .await
+        .map_err(|_| PortfolioError::DatabaseSurreal)?
+        .check()
+        .map_err(|_| PortfolioError::DatabaseSurreal)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env, str::FromStr};
+
+    use rust_decimal::Decimal;
+    use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
+
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+    async fn preserves_decimal_holdings_and_owner_scope() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+        let username = env::var("JARVIS_SURREAL_TEST_USER")?;
+        let password = env::var("JARVIS_SURREAL_TEST_PASS")?;
+        let namespace = format!("jarvis_portfolio_{}", Uuid::now_v7().simple());
+        let db = Surreal::new::<Ws>(&endpoint).await?;
+        db.signin(Root {
+            username: &username,
+            password: &password,
+        })
+        .await?;
+        db.use_ns(&namespace).use_db("core").await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+
+        let user_id = Uuid::now_v7();
+        db.query("CREATE users SET id = $id, display_name = 'tester', status = 'active', created_at = time::now(), updated_at = time::now()")
+            .bind(json!({"id": user_id.to_string()})).await?.check()?;
+        let holding = add_holding(
+            &db,
+            user_id,
+            "AAPL",
+            Decimal::from_str("10.125")?,
+            Decimal::from_str("150.25")?,
+            "USD",
+        )
+        .await?;
+        assert_eq!(holding.cost_basis(), Decimal::from_str("1521.28125")?);
+        assert_eq!(list_holdings(&db, user_id).await?.len(), 1);
+        assert!(!delete_holding(&db, Uuid::now_v7(), holding.id).await?);
+        assert!(delete_holding(&db, user_id, holding.id).await?);
+        Ok(())
+    }
 }

@@ -4,12 +4,12 @@
 //! Embeddings are stored as little-endian f32 blobs in `voice_profiles`.
 
 use axum::{extract::State, http::StatusCode, Json};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use jarvis_speech as speech;
 
-use crate::error::{bad_request, db_err, speech_err};
+use crate::error::{bad_request, speech_err};
 use crate::{AppState, Authed};
 
 fn encode_embedding(v: &[f32]) -> Vec<u8> {
@@ -21,6 +21,21 @@ fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+#[derive(Serialize)]
+struct VoiceBindings {
+    user_id: String,
+    #[serde(with = "serde_bytes")]
+    embedding: Vec<u8>,
+    dims: i64,
+    engine: String,
+}
+
+#[derive(Deserialize)]
+struct VoiceRow {
+    #[serde(with = "serde_bytes")]
+    embedding: Vec<u8>,
 }
 
 #[derive(Deserialize)]
@@ -42,11 +57,23 @@ pub(crate) async fn voice_status(
     authed: Authed,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let exists: Option<i32> = sqlx::query_scalar("select 1 from voice_profiles where user_id = $1")
-        .bind(authed.user.id)
-        .fetch_optional(&state.db)
+    let mut response = state
+        .db
+        .query("SELECT user_id FROM voice_profiles WHERE user_id = $user_id LIMIT 1")
+        .bind(json!({"user_id": authed.user.id.to_string()}))
         .await
-        .map_err(db_err)?;
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"internal error"})),
+            )
+        })?;
+    let exists: Option<serde_json::Value> = response.take(0).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"internal error"})),
+        )
+    })?;
     Ok(Json(json!({
         "enrolled": exists.is_some(),
         "engine": state.speech.label(),
@@ -62,19 +89,12 @@ pub(crate) async fn voice_enroll(
     let audio = to_audio(req)?;
     let embedding = state.speech.embed(&audio).await.map_err(speech_err)?;
     let bytes = encode_embedding(&embedding);
-    sqlx::query(
-        "insert into voice_profiles (user_id, embedding, dims, engine, updated_at) \
-         values ($1, $2, $3, $4, now()) \
-         on conflict (user_id) do update set \
-           embedding = $2, dims = $3, engine = $4, updated_at = now()",
-    )
-    .bind(authed.user.id)
-    .bind(&bytes)
-    .bind(embedding.len() as i32)
-    .bind(state.speech.label())
-    .execute(&state.db)
-    .await
-    .map_err(db_err)?;
+    state.db.query(
+        "UPSERT voice_profiles SET user_id = $user_id, embedding = <bytes>$embedding, dims = $dims, \
+         engine = $engine, created_at = time::now(), updated_at = time::now() RETURN NONE",
+    ).bind(VoiceBindings { user_id: authed.user.id.to_string(), embedding: bytes,
+        dims: embedding.len() as i64, engine: state.speech.label().to_string() }).await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"internal error"}))))?;
     Ok(Json(
         json!({ "status": "enrolled", "dims": embedding.len() }),
     ))
@@ -90,12 +110,23 @@ pub(crate) async fn voice_verify(
     let embedding = state.speech.embed(&audio).await.map_err(speech_err)?;
     let transcript = state.speech.transcribe(&audio).await.unwrap_or_default();
 
-    let stored: Option<Vec<u8>> =
-        sqlx::query_scalar("select embedding from voice_profiles where user_id = $1")
-            .bind(authed.user.id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(db_err)?;
+    let mut response = state
+        .db
+        .query("SELECT embedding FROM voice_profiles WHERE user_id = $user_id LIMIT 1")
+        .bind(json!({"user_id": authed.user.id.to_string()}))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"internal error"})),
+            )
+        })?;
+    let stored: Option<VoiceRow> = response.take(0).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"internal error"})),
+        )
+    })?;
 
     match stored {
         None => Ok(Json(json!({
@@ -104,8 +135,8 @@ pub(crate) async fn voice_verify(
             "score": 0.0,
             "transcript": transcript,
         }))),
-        Some(bytes) => {
-            let profile = decode_embedding(&bytes);
+        Some(row) => {
+            let profile = decode_embedding(&row.embedding);
             let score = speech::cosine(&profile, &embedding);
             Ok(Json(json!({
                 "enrolled": true,

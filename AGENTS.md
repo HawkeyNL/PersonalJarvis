@@ -22,7 +22,7 @@ Inspect the actual code, tests, deployment files, and current branch history bef
 
 - The backend is a Rust workspace. `services/api` is the Axum API; domain responsibilities live in `crates/*`.
 - The API is modular: `services/api/src/lib.rs` is the composition root; state, extraction, errors, rate limiting, metering, audit, validation, MCP, and route concerns are separate modules. Preserve that ownership and do not recreate a monolithic `lib.rs`.
-- PostgreSQL is the persistent system of record; pgvector is planned/used for the memory platform. Local supporting services run through `deploy/compose/docker-compose.yml`.
+- SurrealDB 2.6 is the persistent system of record. Local supporting services run through `deploy/compose/docker-compose.yml`; Core connects using a database-scoped account, never a root credential.
 - The macOS/iOS client is under `apps/client`. Server-side API keys remain in the backend environment; they never belong in clients, prompts, browser/UI automation, commits, logs, or tests.
 - Agent execution is deliberately constrained. The typed agent action allowlist, sandbox, timeout/output limits, kill switch, audit trail, and signed-approval flow are security boundaries, not convenience features.
 
@@ -59,13 +59,13 @@ private user devices
   → RivetLink / private network
   → Ubuntu Desktop Home Node
       ├─ Jarvis Core: native Rust process managed by systemd
-      ├─ Docker: PostgreSQL + pgvector and justified supporting services
+      ├─ Docker: SurrealDB and justified supporting services
       └─ non-root GUI session: TradingView, MT5/Wine, browser, Cua
 ```
 
 - Jarvis Core stays native under systemd; do not move it into the ordinary Docker stack. It must remain independently recoverable if Docker or a service fails.
 - Docker services use pinned images and persistent volumes. Do not add Redis, Kubernetes, public reverse proxies, or new platform infrastructure unless a demonstrated workload requires them.
-- SSH, RDP/VNC, PostgreSQL, Redis, Docker socket, and privileged APIs must not be public. Remote administration and GUI access use RivetLink/private networking with explicit device authorization, encryption, revocation, and auditable access.
+- SSH, RDP/VNC, SurrealDB, Redis, Docker socket, and privileged APIs must not be public. Remote administration and GUI access use RivetLink/private networking with explicit device authorization, encryption, revocation, and auditable access.
 - Inspect RivetLink's existing protocol and security model before integrating it or introducing a duplicate tunnel/VPN.
 - GUI applications run as non-root users with isolated data/configuration where feasible. A disconnected viewer must not terminate critical applications.
 - Document and test the supported GUI/remote-display approach, including X11/Wayland implications, before relying on it for automation.
@@ -94,7 +94,7 @@ cargo test --all
 cargo audit
 ```
 
-Integration tests need PostgreSQL and `DATABASE_URL`; use the compose setup and command documented in `README.md`. For a formatting failure, run `cargo fmt --all`, inspect the resulting diff, and commit only intentional formatting changes.
+Wire-protocol integration tests need a disposable SurrealDB instance and explicit `JARVIS_SURREAL_TEST_*` credentials; use the compose setup and command documented in `README.md`. For a formatting failure, run `cargo fmt --all`, inspect the resulting diff, and commit only intentional formatting changes.
 
 The CI workflow runs format → clippy → tests → audit, so a format failure prevents later checks from running. The last reviewed main run at commit `1055e19` was reported as format-only; verify the latest GitHub Actions result before repeating that conclusion or changing CI. Do not alter the workflow merely to mask a code formatting failure.
 
@@ -118,7 +118,7 @@ Work incrementally in this order, confirming the current state before starting:
 2. Complete/verify `jarvis-policy` integration so it remains the authoritative runtime decision path, with cross-caller regression tests.
 3. Maintain the trusted-proxy/client-IP model: never trust spoofed forwarding headers; cover direct, trusted-proxy, and untrusted-proxy cases.
 4. Build a typed tool/capability registry foundation before broadening agent execution.
-5. Establish the Home Node baseline: systemd Core, Docker PostgreSQL/pgvector with persistence, private access, health checks, and recovery.
+5. Establish the Home Node baseline: systemd Core, Docker SurrealDB with persistence, private access, health checks, backups and recovery.
 6. Introduce RivetLink and Cua only after their capability/policy, allowlist, audit, kill-switch, human-takeover, and GUI-session boundaries are proven.
 7. Extend security regression coverage for sandbox escapes, secret/Core/`.git` denials, signed approval/replay/expiry, audits, rate limits, input bounds, forwarding headers, and policy consistency.
 8. Only then expand agent runtime, data integrations, trading, backtesting, and other backlog features.

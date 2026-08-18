@@ -6,21 +6,29 @@ Deze repository is het centrale besturingsdocument voor mensen en coding-agents.
 
 ## Lokaal opstarten
 
-Snelstart om de volledige keten (Postgres → API → client) op je Mac te draaien.
+Snelstart om de volledige keten (SurrealDB → API → client) op je Mac te draaien.
 Uitgebreide uitleg staat in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ### Benodigdheden
 
 - **Rust** (stable, via [rustup](https://rustup.rs)) — versie gepind in `rust-toolchain.toml`
 - **Node 24** via [nvm](https://github.com/nvm-sh/nvm) — gepind in `.nvmrc`
-- **Docker Desktop** — voor de lokale Postgres
+- **Docker Desktop** — voor de lokale SurrealDB
 - **Xcode 26** (volledig, niet alleen CommandLineTools) — alleen nodig voor de macOS/iOS-client
 
 ### 1. Backend (API + database)
 
 ```bash
-# a. Start Postgres (wacht tot 'healthy')
+# a. Start SurrealDB (wacht tot de init-service klaar is)
 docker compose -f deploy/compose/docker-compose.yml up -d --wait
+
+# Eenmalig lokaal: maak de database-scoped Core-account aan.
+# Gebruik in productie een uniek wachtwoord uit een root-only secretbestand.
+printf '%s\n' "DEFINE USER core ON DATABASE PASSWORD 'replace-with-a-strong-secret' ROLES EDITOR;" \
+  | docker compose -f deploy/compose/docker-compose.yml exec -T surrealdb \
+      /surreal sql --hide-welcome --endpoint ws://127.0.0.1:8000 \
+      --username root --password "$SURREAL_ROOT_PASS" --auth-level root \
+      --namespace jarvis --database core
 
 # b. Kopieer de voorbeeld-config (pas aan indien nodig)
 cp .env.example .env
@@ -29,7 +37,9 @@ cp .env.example .env
 cargo run -p jarvis-api
 ```
 
-De API luistert op **`http://localhost:8080`** (`JARVIS_BIND_ADDR` in `.env`).
+De API luistert op **`http://localhost:8080`** (`JARVIS_BIND_ADDR` in `.env`). De
+Core gebruikt uitsluitend de database-scoped SurrealDB-account uit `.env`; geef
+hem nooit het SurrealDB-rootwachtwoord.
 Snel testen: `curl http://localhost:8080/livez` en `curl http://localhost:8080/readyz`.
 
 Belangrijkste endpoints:
@@ -141,10 +151,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
 
-Integratietests (`#[sqlx::test]`) hebben een draaiende Postgres + `DATABASE_URL` nodig:
+De opt-in SurrealDB wire-protocoltests vereisen een wegwerp-SurrealDB-instance;
+CI start deze service en geeft alleen testcredentials door:
 
 ```bash
-DATABASE_URL=postgres://jarvis:jarvis_dev_pw@localhost:5432/jarvis cargo test --all
+JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 \
+JARVIS_SURREAL_TEST_USER=root \
+JARVIS_SURREAL_TEST_PASS=<test-root-password> cargo test --all -- --ignored
 ```
 
 ## Voortgang bijhouden
@@ -169,7 +182,7 @@ Iedere coding-agent moet na werk taken afvinken, nieuwe taken toevoegen, tests v
 - [x] Monorepo aangemaakt
 - [x] Tauri-client gestart
 - [x] Rust/Axum API gestart
-- [x] PostgreSQL-migraties
+- [x] SurrealDB schema (SCHEMAFULL, versioned baseline)
 - [ ] Auth en sync
 - [ ] Agent runtime
 - [ ] IBKR paper read-only
@@ -189,7 +202,7 @@ Iedere coding-agent moet na werk taken afvinken, nieuwe taken toevoegen, tests v
 - [x] Rust workspace
 - [x] Tauri 2 + Vue 3 (macOS + iOS)
 - [x] Axum API
-- [x] PostgreSQL + SQLx
+- [x] SurrealDB + typed Rust repositories
 - [x] Docker Compose
 - [x] CI, logging en config
 
@@ -217,8 +230,7 @@ Iedere coding-agent moet na werk taken afvinken, nieuwe taken toevoegen, tests v
 
 ## Fase 1B — memory platform
 
-- [ ] PostgreSQL memory schema
-- [ ] pgvector
+- [ ] SurrealDB memory schema/vector index
 - [ ] Context Builder met tokenbudget
 - [ ] Memory consolidation
 - [ ] Versleutelde SQLite-clientcache
