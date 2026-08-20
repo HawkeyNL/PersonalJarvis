@@ -11,6 +11,21 @@ use uuid::Uuid;
 
 pub const MAX_TASK_SUMMARY_CHARS: usize = 8_000;
 
+/// The authoritative policy decision for requesting Codex engineering work.
+///
+/// This is intentionally an adapter over `jarvis-policy`, not a Codex-specific
+/// risk rule. A future API route must still bind a `RequireApproval` result to a
+/// real, device-signed pending action immediately before starting any process.
+pub fn request_policy(trusted_device: bool) -> jarvis_policy::PolicyDecision {
+    jarvis_policy::decide(&jarvis_policy::PolicyContext {
+        capability: jarvis_policy::Capability::ExecuteCode,
+        risk: jarvis_policy::RiskClass::Mutating,
+        trusted_device,
+        approved: false,
+        reversible: false,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
@@ -205,5 +220,14 @@ mod tests {
         assert_eq!(message["params"]["threadId"], "thr_123");
         assert_eq!(message["params"]["input"][0]["text"], "inspect only");
         assert!(message.get("command").is_none());
+    }
+
+    #[test]
+    fn engineering_work_uses_the_authoritative_policy_path() {
+        assert_eq!(
+            request_policy(true),
+            jarvis_policy::PolicyDecision::RequireApproval
+        );
+        assert_eq!(request_policy(false), jarvis_policy::PolicyDecision::Deny);
     }
 }

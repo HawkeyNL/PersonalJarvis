@@ -42,6 +42,11 @@ immutable commit-id. De doelmap moet buiten de live repository liggen en de
 caller krijgt een vaste argv-lijst, geen shell-string. Uitvoeren, opruimen en
 een API-route wachten op de approval- en auditkoppeling.
 
+De fase-1-crate vraagt nu al uitsluitend `jarvis-policy` om de
+`ExecuteCode`/`Mutating`-beslissing: een vertrouwd toestel krijgt
+`RequireApproval`, een onvertrouwde caller `Deny`. Dit is nog geen approval;
+alleen de bestaande device-handtekening kan die later werkelijk bewijzen.
+
 ## Gevolgen
 
 - Core blijft de autoriteit; Codex kan in deze fase niets uitvoeren.
