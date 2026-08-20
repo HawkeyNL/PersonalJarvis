@@ -7,10 +7,13 @@ Blueprint v2.6
 Fase 2 gestart: handmatig portfolio (holdings) werkt op iOS + macOS, achter de device-login. Fase 0 + Fase 1 afgerond.
 
 ## Eerstvolgende taak
-0. **IN PROGRESS — Codex engineering-adapter (ADR-037, PR #15)**: veilige
-   fase-1-fundering voor een lokale, typed Codex App Server-integratie. Geen
-   listener, toolgrant, credential of uitvoerrecht vóór worktree-, policy- en
-   signed-approval-grenzen aantoonbaar zijn.
+0. **IN PROGRESS — Codex engineering-adapter (ADR-037, PR #15)**: de typed
+   taak- en protocolfundering, policy-gate en worktreeplanning zijn aanwezig.
+   De optionele Home Node-isolatie gebruikt een aparte `jarvis-codex`-identity
+   met alleen een lokale Unix-socketgroep en root-afgedwongen immutable
+   worktrees. Er is nog geen listener die is ingeschakeld, toolgrant,
+   credential-flow, API-route of uitvoerrecht vóór signed approval, audit en
+   runtime-cancelgrenzen aantoonbaar zijn.
 1. **Stem/wake live valideren op macOS**: `tauri dev` herstarten (mic-fix), in Settings de stem inschrijven en verify testen; daarna `npm run setup-wakeword` en de wake-drempel (`WakeDetector.threshold`) tunen met echte audio (`onScore` logt elke stap).
 2. **Spraak end-to-end valideren op device**: STT (whisper.cpp) + speaker-verify (MFCC) zijn gebouwd. `brew install cmake` (klaar), model via `scripts/fetch-whisper-model.sh` (klaar), backend met `--features speech-whisper`. Test: transcript is echt; schrijf je stem opnieuw in (nu MFCC) en **tune de verify-drempel** (`JARVIS_SPEECH_VERIFY_THRESHOLD`) met de score-readout. Blijkt MFCC niet scherp genoeg → optionele ECAPA/wespeaker-ONNX-upgrade. Daarna: console-STT (mic → server-transcript) en wake-inferentie eventueel naar een Web Worker.
 
@@ -57,6 +60,17 @@ Parallel blijft staan: live test Jarvis-brein (`JARVIS_LLM_API_KEY` in backend-`
   `jarvis-api` blijft de enige systemd-service; `jarvis-core` maakt nog geen
   tweede daemon en neemt policy, approvals of sandboxing niet over. Release- en
   updatepaden, de agentsandbox en de documentatie volgen deze grenzen.
+
+- **Codex engineering-grenzen (ADR-037, PR #15)**: `jarvis-codex` bevat een
+  typed taakstate-machine en een kleine App Server-RPC-allowlist; hij start nog
+  geen proces. `jarvis-workspace` plant uitsluitend detached worktrees vanaf
+  een immutable commit en `jarvis-policy` beslist de `ExecuteCode`-risico's.
+  De optionele Home Node-unit blijft standaard uit: een aparte
+  `jarvis-codex`-identity beheert de lokale Unix-socket en eigen
+  credential-state; een root-only helper beschermt `jarvis-core` en `.git`
+  in worktrees met immutable attributes. De volgende slice moet de bestaande
+  signed approval direct vóór uitvoering verifiëren, auditten en annuleren;
+  zonder die grenzen wordt de unit niet ingeschakeld.
 
 - **MCP-server — Jarvis' read-only tools voor Claude Code (ADR-031)**: Jarvis biedt nu een **MCP-server** (`POST /mcp`) zodat Claude Code (de 4c-executor) en je eigen Claude-tooling zijn kennis kunnen **raadplegen** — `portfolio_summary`, `jarvis_status` (host/breinen/catalogus/budget) en `recent_conversations` (geheugen). **Alles alleen-lezen + eigenaar-gebonden**: geen secrets/Core, geen holdings wijzigen, geen orders, geen agent-acties. Transport is **Streamable HTTP in de bestaande api** (geen apart binary): hergebruikt de bestaande Bearer-auth (`Authed`), plain-JSON antwoorden, en **defensief protocol** — beantwoordt zowel klassieke `initialize` als `server/discover`, echoot de gevraagde `protocolVersion`, union-resultaten, notificaties → 202, onbekende methode/tool → JSON-RPC `-32601`, plus een **DNS-rebinding-guard** (niet-lokale browser-`Origin` → 403). Koppelen via `.mcp.json` (`type:"http"`, `url:http://localhost:8080/mcp`, `Authorization: Bearer <session-token>`). api 9 tests (+1 MCP), clippy schoon. Later spoor: Jarvis als MCP-**host** (externe read-only servers consumeren).
 - **Agentische uitvoering 4d — zelfontwikkeling als adviseur (ADR-029)**: de laatste agentische fase. Nieuw crate `jarvis-selfdev`: Jarvis leest zijn **eigen ecosysteem** (registry — host, breinen, model-catalogus, budget, agent-capabilities) en doet **concrete verbetervoorstellen aan zichzelf** via `POST /v1/system/self-improve` (sterk/plan-tier → JSON `{summary, proposals[{title, category, rationale, cost, requires_approval, steps}]}`). Strikt volgens jouw beleid: **alleen op verzoek** (geen achtergrond-loop), **advisory only** (bewerkt niets, draait niets — uitvoeren loopt via de 4b/4c-goedkeuringsgate), **niets betaalds auto-activeren** (`requires_approval` + kosten benoemd), en de **Core + Jarvis.md** worden nooit door de agent aangeraakt (owner-only, handmatig). Robuust: geen bruikbare JSON van het brein → de ruwe tekst wordt de samenvatting, het breekt nooit. Client: knop "Vraag om verbetervoorstellen" in Status toont de voorstellen (categorie, kosten, of goedkeuring nodig is, stappen). selfdev 4 tests, api 8 (+1), clippy schoon, client typecheck + build groen. Hiermee is fase 4 (ADR-029) compleet (4a→4d); vervolg: de MCP-laag (los spoor).

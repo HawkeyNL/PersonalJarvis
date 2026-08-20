@@ -1,0 +1,34 @@
+[Unit]
+Description=Jarvis Codex App Server (local engineering control plane)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=jarvis-codex
+Group=jarvis-codex
+UMask=0007
+RuntimeDirectory=jarvis-codex
+RuntimeDirectoryMode=0750
+StateDirectory=jarvis-codex
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/codex app-server --listen unix:///run/jarvis-codex/app-server.sock
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+ProtectHome=tmpfs
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/jarvis-codex /var/lib/jarvis-engineering
+
+[Install]
+WantedBy=multi-user.target

@@ -61,3 +61,18 @@ handhaaft, wordt niet geïntroduceerd.
   blijven buiten scope.
 - De typed lifecycle maakt timeout, annulering en veilige voortgang later
   testbaar zonder protocoldetails door de rest van de codebase te verspreiden.
+
+## Home Node-delegatie
+
+Voor de eerste optionele Home Node-Codex-inzet is beperkte Unix-socket
+groepsdelegatie gekozen. `jarvis-codex` bezit de App Server en diens
+credential-state. Het Core-account `jarvis` wordt uitsluitend lid van de
+groep `jarvis-codex` om de lokale runtime-socket te bereiken; het krijgt geen
+toegang tot de Codex-state-directory met modus `0700`.
+
+Engineering-worktrees worden voorbereid door een root-only operator-helper,
+niet door de API of een agent-tool. Deze maakt `jarvis-core` en `.git`
+root-owned en filesystem-immutable alvorens de rest van de worktree aan
+`jarvis-codex` te geven. De helper faalt gesloten wanneer immutable
+attributes niet kunnen worden toegepast. Dit is een begrensde
+besturingssysteemgrens, geen generieke root-broker.
