@@ -27,6 +27,10 @@ Het accepteert uitsluitend de App Server-methoden `initialize`, `thread/start`,
 `turn/start` en `turn/interrupt`. Het kan dus niet per ongeluk
 `thread/shellCommand`, `command/exec` of `process/spawn` doorgeven.
 
+`jarvis-workspace` valideert daarnaast een detached worktree-plan vanaf een
+immutable commit. Het kan geen Git-proces starten en heeft geen delete-operatie;
+die bevoegdheid wordt pas met signed approval en audit gekoppeld.
+
 De officiële App Server-documentatie adviseert stdio als standaardtransport;
 WebSockets zijn experimenteel en niet productie-ondersteund. Daarom komt er in
 deze fase geen listener of service op de Home Node.

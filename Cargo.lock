@@ -2221,6 +2221,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-workspace"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "jiff"
 version = "0.2.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
