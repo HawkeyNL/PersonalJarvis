@@ -3,7 +3,7 @@
 - Status: **geaccepteerd — fase 4a + 4b + 4c + 4d gebouwd** (read-only autonoom; mutaties achter device-getekende goedkeuring; Claude Code als confined uitvoerder; zelfontwikkeling als adviseur; kill switch default uit) — 13 augustus 2026
 - Bouwt op ADR-027 (kosten-router + registry + budget), ADR-028 (model-per-taak +
   plan→execute), de bestaande unlock/approval-flow (device-gebonden, cryptografisch),
-  en `core/Jarvis.md` §11 (Risk-Based Autonomy), §12 (Financial Safety), §13
+  en `jarvis-core/Jarvis.md` §11 (Risk-Based Autonomy), §12 (Financial Safety), §13
   (Security by Default), §28 (Reversibility), §29 (Auditability)
 
 ## Context
@@ -40,7 +40,7 @@ is geen andere weg naar de shell.
 | **Denied** (gevaarlijk/onomkeerbaar) | `sudo`, `rm -rf`, netwerk-exfiltratie, secrets lezen (`.env`, keychain, `~/.ssh`), pakket-install, **live-trading**, **schrijven naar de Core** | nooit — hard geweigerd |
 
 **De Core is een beschermd write-path (Jarvis.md §30).** Elke schrijf-/bewerk-/
-verwijder-actie op `core/**` (incl. `core/Jarvis.md`), de policy/permissions-config,
+verwijder-actie op `jarvis-core/**` (incl. `jarvis-core/Jarvis.md`), de policy/permissions-config,
 de allowlist zelf, en secrets (`.env`, keychain) is **onvoorwaardelijk Denied** —
 niet eens goedkeurbaar via de gate. Alleen de eigenaar wijzigt de Core, handmatig,
 buiten de agent om. Zo kan geen enkel model (hoe slim ook, §31) of prompt-injectie
@@ -97,7 +97,7 @@ zijn **tijdgebonden** en **actie-specifiek** (geen blanco cheque).
   (óók **NeedsApproval**) drijft **headless `claude` -p** als confined uitvoerder in
   de sandbox. Confinement is bewust op **deny-regels** gebaseerd (die gelden in élke
   permission-mode, ook `bypassPermissions`) i.p.v. op tool-vlaggen: `--settings` met
-  een deny-lijst blokkeert de Core (`core/**`), `.git`, secrets (`.env`/`*.pem`/
+  een deny-lijst blokkeert de Core (`jarvis-core/**`), `.git`, secrets (`.env`/`*.pem`/
   `*.key`/`.ssh`), de **shell (`Bash`)** en het **netwerk (`WebFetch`/`WebSearch`)** +
   `Agent`; `--permission-mode acceptEdits` laat edits non-interactief door. `current_dir`
   = de sandbox-root; er is **geen `--max-turns`**, dus een **harde proces-timeout (300s)**
@@ -147,7 +147,7 @@ zijn **tijdgebonden** en **actie-specifiek** (geen blanco cheque).
 
 ### Onaantastbaar — nooit via Jarvis, ook niet met goedkeuring
 
-- **`core/Jarvis.md`**: Jarvis wijzigt zijn eigen grondwet **nooit**. Punt.
+- **`jarvis-core/Jarvis.md`**: Jarvis wijzigt zijn eigen grondwet **nooit**. Punt.
 - **De sloten zelf**: policy, permissions, de allowlist, de veiligheidsconfig en
   secrets (`.env`, keychain). Als de agent zijn eigen hek (met één getekende
   goedkeuring) kon verzetten, ondermijnt dat de hele gate (§31 — Policy Is Not

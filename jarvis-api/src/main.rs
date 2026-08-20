@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!(brain = %llm.label(), "llm brain configured");
 
-    // Load Jarvis' identity (core/Jarvis.md) as the system prompt — the single
+    // Load Jarvis' identity (jarvis-core/Jarvis.md) as the system prompt — the single
     // source of truth for "what Jarvis is". Falls back to a built-in persona if
     // the file is absent, so the brain always has an identity.
     let (jarvis_system, persona_loaded) = jarvis_api::load_persona(&config.llm_persona_path);

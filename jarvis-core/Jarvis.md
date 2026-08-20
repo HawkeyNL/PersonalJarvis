@@ -982,7 +982,7 @@ Dit voorkomt een monolithische "god agent".
 
 ## Alleen de eigenaar wijzigt de Core
 
-De Core — dit document (`core/Jarvis.md`), de policy, de permissions en de veiligheidsconfig — wordt **alleen handmatig door de eigenaar** gewijzigd.
+De Core — dit document (`jarvis-core/Jarvis.md`), de policy, de permissions en de veiligheidsconfig — wordt **alleen handmatig door de eigenaar** gewijzigd.
 
 Jarvis en zijn agents mogen de Core **lezen, nooit schrijven**. Geen enkele geautomatiseerde actie, plan-stap of tool past deze bestanden aan; de uitvoerlaag weigert schrijven naar de Core hard (zie ADR-029). Een slimmer model verandert hier niets aan (§31).
 

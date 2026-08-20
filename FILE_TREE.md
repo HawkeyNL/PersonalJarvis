@@ -2,12 +2,12 @@
 
 ```text
 .
-├── apps/                    # desktop- en mobiele Jarvis-clients
+├── jarvis-api/              # native Rust API-binary (Home Node/systemd)
+├── jarvis-core/             # beschermde persona + Core-librarygrens
+├── jarvis-app/              # Tauri/Vue desktop- en mobiele clients
 ├── crates/                  # Rust-librarycrates
-├── services/                # Rust-binaries, waaronder jarvis-api
 ├── deploy/                  # lokale Compose en Home-Node-systemd
 ├── schema/                  # versiebeheer van het SurrealDB-schema
-├── core/                    # beschermde runtime-persona (`Jarvis.md`)
 ├── decisions/               # architecture decision records
 ├── security/                # verplichte securitystandaarden
 ├── docs/
@@ -23,4 +23,4 @@
 
 Voor de blueprint begin je bij
 [`docs/blueprint/00-start/02-reading-order.md`](docs/blueprint/00-start/02-reading-order.md).
-De volledige mapindeling is vastgelegd in ADR-020 en ADR-035.
+De volledige mapindeling is vastgelegd in ADR-020, ADR-035 en ADR-036.

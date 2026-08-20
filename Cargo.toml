@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "services/api",
+    "jarvis-api",
+    "jarvis-core",
     "crates/config",
     "crates/observability",
     "crates/identity",
@@ -21,7 +22,7 @@ members = [
 # intentionally excluded so backend CI (clippy -D warnings) stays fast and the
 # heavy tauri/wry deps don't enter the workspace graph.
 exclude = [
-    "apps/client/src-tauri",
+    "jarvis-app/src-tauri",
 ]
 
 [workspace.package]
@@ -85,3 +86,4 @@ jarvis-agent = { path = "crates/agent" }
 jarvis-selfdev = { path = "crates/selfdev" }
 jarvis-policy = { path = "crates/policy" }
 jarvis-store = { path = "crates/store" }
+jarvis-core = { path = "jarvis-core" }

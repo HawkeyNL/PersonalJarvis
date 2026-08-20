@@ -25,7 +25,7 @@ pub struct AppState {
     pub llm: Arc<dyn llm::LlmProvider>,
     /// Max output tokens per assistant reply.
     pub llm_max_tokens: u32,
-    /// Jarvis' identity/persona (from `core/Jarvis.md`), prepended as the system
+    /// Jarvis' identity/persona (from `jarvis-core/Jarvis.md`), prepended as the system
     /// prompt on every chat. The single source of truth for "what Jarvis is".
     pub jarvis_system: Arc<str>,
     /// Server-side speech engine (STT + speaker verification).

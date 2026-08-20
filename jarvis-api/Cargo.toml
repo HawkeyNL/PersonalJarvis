@@ -44,6 +44,7 @@ jarvis-orchestrator.workspace = true
 jarvis-agent.workspace = true
 jarvis-selfdev.workspace = true
 jarvis-store.workspace = true
+jarvis-core.workspace = true
 rust_decimal.workspace = true
 rand.workspace = true
 time.workspace = true

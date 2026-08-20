@@ -2031,6 +2031,7 @@ dependencies = [
  "hex",
  "jarvis-agent",
  "jarvis-config",
+ "jarvis-core",
  "jarvis-ibkr",
  "jarvis-identity",
  "jarvis-llm",
@@ -2063,6 +2064,10 @@ dependencies = [
  "figment",
  "serde",
 ]
+
+[[package]]
+name = "jarvis-core"
+version = "0.1.0"
 
 [[package]]
 name = "jarvis-ibkr"

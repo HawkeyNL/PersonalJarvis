@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document defines the next architecture direction for PersonalJarvis. It is an implementation brief for Codex/other coding agents. Read the current repository, `AGENTS.md`, `core/Jarvis.md`, existing ADRs, deployment docs, security hardening docs, and current API/Core code before changing anything.
+This document defines the next architecture direction for PersonalJarvis. It is an implementation brief for Codex/other coding agents. Read the current repository, `AGENTS.md`, `jarvis-core/Jarvis.md`, existing ADRs, deployment docs, security hardening docs, and current API/Core code before changing anything.
 
 Do not blindly copy this document into code. Reconcile it with the current implementation and preserve existing security guarantees.
 
@@ -254,7 +254,7 @@ Do not leak chain-of-thought or sensitive raw tool payloads in progress events. 
 Adapt to the repository rather than performing a gratuitous rewrite, but aim for clear boundaries comparable to:
 
 ```text
-services/api/
+jarvis-api/
   public transport / auth / DTOs / realtime
 
 crates/core/ or equivalent top-level runtime

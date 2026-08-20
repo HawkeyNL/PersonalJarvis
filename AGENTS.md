@@ -20,10 +20,10 @@ Inspect the actual code, tests, deployment files, and current branch history bef
 
 ## Current architecture
 
-- The backend is a Rust workspace. `services/api` is the Axum API; domain responsibilities live in `crates/*`.
-- The API is modular: `services/api/src/lib.rs` is the composition root; state, extraction, errors, rate limiting, metering, audit, validation, MCP, and route concerns are separate modules. Preserve that ownership and do not recreate a monolithic `lib.rs`.
+- The backend is a Rust workspace. `jarvis-api` is the Axum API; domain responsibilities live in `crates/*`.
+- The API is modular: `jarvis-api/src/lib.rs` is the composition root; state, extraction, errors, rate limiting, metering, audit, validation, MCP, and route concerns are separate modules. Preserve that ownership and do not recreate a monolithic `lib.rs`.
 - SurrealDB 2.6 is the persistent system of record. Local supporting services run through `deploy/compose/docker-compose.yml`; Core connects using a database-scoped account, never a root credential.
-- The macOS/iOS client is under `apps/client`. Server-side API keys remain in the backend environment; they never belong in clients, prompts, browser/UI automation, commits, logs, or tests.
+- The macOS/iOS client is under `jarvis-app`. Server-side API keys remain in the backend environment; they never belong in clients, prompts, browser/UI automation, commits, logs, or tests.
 - Agent execution is deliberately constrained. The typed agent action allowlist, sandbox, timeout/output limits, kill switch, audit trail, and signed-approval flow are security boundaries, not convenience features.
 
 ## Policy, approvals, and protected boundaries
@@ -43,7 +43,7 @@ request / LLM → jarvis-policy → capability + risk decision
 - No LLM response may directly execute arbitrary shell commands, sudo, host control, or unrestricted child processes.
 - The agent sandbox must prevent workspace escape through absolute paths, traversal, and symlinks.
 - Secrets are denied even for reads: do not expose `.env*`, keys, certificates, SSH material, credentials, or inherited full process environments.
-- `core/**` and `.git/**` are protected from agent writes. Do not weaken these protections, including through Claude Code or GUI automation.
+- `jarvis-core/**` and `.git/**` are protected from agent writes. Do not weaken these protections, including through Claude Code or GUI automation.
 - Keep kill switches default-off where currently designed, enforce resource/time/output bounds, use generic external errors, and audit privileged activity without logging secrets or sensitive prompt/UI data.
 
 Security failures fail closed. Do not relax a check merely to pass a test or accelerate a feature.

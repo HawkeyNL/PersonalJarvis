@@ -23,8 +23,8 @@ esac
     echo "missing executable: $release_dir/jarvis-api" >&2
     exit 1
 }
-[[ -f "$release_dir/core/Jarvis.md" ]] || {
-    echo "missing Core persona: $release_dir/core/Jarvis.md" >&2
+[[ -f "$release_dir/jarvis-core/Jarvis.md" ]] || {
+    echo "missing Core persona: $release_dir/jarvis-core/Jarvis.md" >&2
     exit 1
 }
 [[ -f /etc/jarvis/core.env ]] || {

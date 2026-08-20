@@ -9,7 +9,7 @@
 //!   owner-triggered endpoint.
 //! - **Nothing paid is auto-activated** (Jarvis.md §12). Paid changes are flagged
 //!   `requires_approval` with a cost note; the owner decides.
-//! - **The Core (`core/**`) and Jarvis' own `Jarvis.md` are never agent-editable.**
+//! - **The Core (`jarvis-core/**`) and Jarvis' own `Jarvis.md` are never agent-editable.**
 //!   Proposals touching them are marked owner-only/manual.
 //!
 //! Pure LLM reasoning routed through the cost-aware router (ADR-027/028), so model
@@ -26,7 +26,7 @@ op basis van je eigen ecosysteem (hardware, breinen, modellen, budget, capabilit
 Je STELT ALLEEN VOOR — je voert niets uit, bewerkt geen bestanden, activeert niets. \
 Regels die je nooit overtreedt: (1) niets betaalds activeren zonder toestemming — \
 markeer zulke voorstellen met requires_approval=true en noem de kosten; (2) blijf binnen \
-het maandbudget; (3) de Core (core/**) en je eigen Jarvis.md raak je NOOIT zelf aan — \
+het maandbudget; (3) de Core (jarvis-core/**) en je eigen Jarvis.md raak je NOOIT zelf aan — \
 voorstellen daarover markeer je als owner-only (handmatig door de eigenaar). \
 Geef 2 tot 6 concrete voorstellen. Antwoord UITSLUITEND met JSON in de vorm: \
 {\"summary\": \"korte samenvatting\", \"proposals\": [{\"title\": \"...\", \

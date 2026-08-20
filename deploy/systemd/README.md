@@ -62,7 +62,7 @@ sudo install -d -o root -g root -m 0755 /opt/jarvis/releases /etc/jarvis
 
 For a node that will receive automatic updates, bootstrap from the verified
 GitHub release archive, not a locally built directory. The archive includes the
-binary, `core/Jarvis.md`, an immutable tag/revision/migration manifest and its
+binary, `jarvis-core/Jarvis.md`, an immutable tag/revision/migration manifest and its
 published SHA-256 checksum. It is produced only after the release workflow's
 format, Clippy, test and audit gates pass.
 
@@ -112,7 +112,7 @@ Verify that the service account cannot alter release contents:
 
 ```bash
 sudo -u jarvis test ! -w /opt/jarvis/current/jarvis-api
-sudo -u jarvis test ! -w /opt/jarvis/current/core/Jarvis.md
+sudo -u jarvis test ! -w /opt/jarvis/current/jarvis-core/Jarvis.md
 ```
 
 ## 3. Create the production secret/configuration file
@@ -209,7 +209,7 @@ forwarding headers.
 Pushing a stable semantic-version tag such as `v0.1.0` starts the `Release Jarvis
 Core` GitHub workflow. It runs the full format, Clippy, test and dependency-audit gate again,
 then publishes an Ubuntu x86_64 release archive containing only `jarvis-api`,
-`core/Jarvis.md`, a tag/revision manifest with a database-migration fingerprint,
+`jarvis-core/Jarvis.md`, a tag/revision manifest with a database-migration fingerprint,
 and a SHA-256 checksum. The workflow
 has no SSH key, Home Node token or production secret, and never connects to the
 Home Node.

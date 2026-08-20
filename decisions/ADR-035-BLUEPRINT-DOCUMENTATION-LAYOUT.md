@@ -33,9 +33,9 @@ docs/blueprint/
 `README.md`, `AGENTS.md`, `STATUS.md`, `TODOS.md`, `STEPS.md` en
 `CHANGELOG.md` blijven op de root als navigatie- en governance-ingangspunten.
 
-`core/Jarvis.md` blijft eveneens op zijn bestaande pad. De API en de
+`jarvis-core/Jarvis.md` blijft eveneens op zijn bestaande pad. De API en de
 Home-Node-release bundelen dit bestand als runtime-persona; het valt bovendien
-onder de beschermde `core/**`-grens. Het is dus geen gewone blueprintmap.
+onder de beschermde `jarvis-core/**`-grens. Het is dus geen gewone blueprintmap.
 
 ## Gevolgen
 

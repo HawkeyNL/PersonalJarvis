@@ -2,7 +2,7 @@
 
 - Status: geaccepteerd (fases 1 + 2 + 3 gebouwd) — 13 augustus 2026
 - Bouwt op ADR-027 (kosten-bewuste brein-router + registry + budget) en op
-  `core/Jarvis.md` §6 (Orchestrator First), §7 (Agent Specialization),
+  `jarvis-core/Jarvis.md` §6 (Orchestrator First), §7 (Agent Specialization),
   §9 (Cheapest Sufficient Intelligence)
 
 ## Context

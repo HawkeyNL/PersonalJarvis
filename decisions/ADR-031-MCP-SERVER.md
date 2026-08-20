@@ -37,7 +37,7 @@ Elke `tools/call` levert `{content: [{type: "text", text: ...}]}`.
   wijzigen, agent-acties, live-trading: **niet** via MCP (blijven achter de
   bestaande auth/goedkeuring). IBKR blijft read-only (ADR-013).
 - **Geen secrets, geen Core.** De tools raken nooit `.env`/keys/keychain of
-  `core/**`; ze lezen alleen afgeleide, niet-gevoelige data.
+  `jarvis-core/**`; ze lezen alleen afgeleide, niet-gevoelige data.
 - **Eigenaar-gebonden.** Elke call draait onder de ingelogde eigenaar; geen
   multi-user, geen publieke route (single-user, ADR-029 §niet-doelen).
 - **Read-only sluit aan op 4c.** Dit is precies de kant die de confined Claude

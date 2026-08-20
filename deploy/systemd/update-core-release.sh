@@ -143,7 +143,7 @@ tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$staging_dir"
 release_dir="$staging_dir/$expected_top"
 [[ -f $release_dir/jarvis-api && ! -L $release_dir/jarvis-api ]] || fail "release binary is invalid"
 [[ -x $release_dir/jarvis-api ]] || fail "release binary is not executable"
-[[ -f $release_dir/core/Jarvis.md && ! -L $release_dir/core/Jarvis.md ]] || \
+[[ -f $release_dir/jarvis-core/Jarvis.md && ! -L $release_dir/jarvis-core/Jarvis.md ]] || \
     fail "Core persona is invalid"
 [[ -f $release_dir/release.json && ! -L $release_dir/release.json ]] || \
     fail "release manifest is invalid"

@@ -76,10 +76,10 @@ write_release() {
     local root=$1
     local tag=$2
     local schema_sha256=$3
-    mkdir -p "$root/jarvis-core-$tag/core"
+    mkdir -p "$root/jarvis-core-$tag/jarvis-core"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
     chmod 0755 "$root/jarvis-core-$tag/jarvis-api"
-    printf '# test persona\n' > "$root/jarvis-core-$tag/core/Jarvis.md"
+    printf '# test persona\n' > "$root/jarvis-core-$tag/jarvis-core/Jarvis.md"
     jq -n \
         --arg tag "$tag" \
         --arg schema_sha256 "$schema_sha256" \
