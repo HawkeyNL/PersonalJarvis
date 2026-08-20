@@ -15,7 +15,7 @@
 //! block the Core, `.git`, secrets, the shell and network. It is a *second*
 //! deliberate opt-in ([`Sandbox::with_claude_code`]) on top of the kill switch.
 //!
-//! The Core (`core/**`, policy, secrets) is never agent-writable — not via a
+//! The Core (`jarvis-core/**`, policy, secrets) is never agent-writable — not via a
 //! `write_file`, not via Claude Code, not even with a signed approval.
 
 use std::path::{Path, PathBuf};
@@ -245,10 +245,10 @@ impl Sandbox {
         Ok(target)
     }
 
-    /// The Core and version-control internals are never agent-writable. `core/**`
+    /// The Core and version-control internals are never agent-writable. `jarvis-core/**`
     /// is Jarvis' constitution (Jarvis.md §30); `.git/**` is not for direct writes.
     fn is_protected(&self, path: &Path) -> bool {
-        path.starts_with(self.root.join("core"))
+        path.starts_with(self.root.join("jarvis-core"))
             || path.components().any(|c| c.as_os_str() == ".git")
     }
 }
@@ -342,7 +342,7 @@ pub async fn preview(sandbox: &Sandbox, action: &Action) -> Result<String, Agent
                  workspace : {}\n\
                  model     : {model}\n\
                  permission: acceptEdits (deny-regels blijven gelden)\n\
-                 geweigerd : Core (core/**), .git, secrets (.env/*.pem/*.key/.ssh), Bash, WebFetch, WebSearch, Agent\n\
+                 geweigerd : Core (jarvis-core/**), .git, secrets (.env/*.pem/*.key/.ssh), Bash, WebFetch, WebSearch, Agent\n\
                  timeout   : {}s, geen netwerk, geen shell\n\
                  LET OP: Claude Code bewerkt zelfstandig bestanden — controleer de git-diff na afloop.",
                 sandbox.root().display(),
@@ -376,7 +376,7 @@ const CLAUDE_CODE_DISABLED: &str =
 fn claude_code_settings() -> &'static str {
     concat!(
         r#"{"permissions":{"deny":["#,
-        r#""Read(./core/**)","Edit(./core/**)","Write(./core/**)","#,
+        r#""Read(./jarvis-core/**)","Edit(./jarvis-core/**)","Write(./jarvis-core/**)","#,
         r#""Read(./.git/**)","Edit(./.git/**)","Write(./.git/**)","#,
         r#""Read(**/.env)","Read(**/.env.*)","Edit(**/.env)","Edit(**/.env.*)","Write(**/.env)","Write(**/.env.*)","#,
         r#""Read(**/*.pem)","Read(**/*.key)","Edit(**/*.pem)","Edit(**/*.key)","Write(**/*.pem)","Write(**/*.key)","#,
@@ -729,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn writes_a_file_but_never_the_core_or_secrets() {
         let (sb, dir) = temp_sandbox("write");
-        std::fs::create_dir_all(dir.join("core")).unwrap();
+        std::fs::create_dir_all(dir.join("jarvis-core")).unwrap();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
 
         // Happy path: write into the sandbox.
@@ -751,7 +751,7 @@ mod tests {
         let core = execute(
             &sb,
             &Action::WriteFile {
-                path: "core/Jarvis.md".into(),
+                path: "jarvis-core/Jarvis.md".into(),
                 content: "hack".into(),
             },
         )
@@ -763,7 +763,7 @@ mod tests {
 
         // .git internals, secrets, and escapes are denied too.
         assert!(matches!(
-            sb.resolve_write("core/anything.md"),
+            sb.resolve_write("jarvis-core/anything.md"),
             Err(AgentError::Denied(_))
         ));
         assert!(matches!(
@@ -780,7 +780,7 @@ mod tests {
         ));
 
         // And the Core stays untouched on disk.
-        assert!(!dir.join("core/Jarvis.md").exists());
+        assert!(!dir.join("jarvis-core/Jarvis.md").exists());
     }
 
     #[tokio::test]
@@ -799,7 +799,7 @@ mod tests {
         let denied = preview(
             &sb,
             &Action::WriteFile {
-                path: "core/x.md".into(),
+                path: "jarvis-core/x.md".into(),
                 content: "y".into(),
             },
         )
@@ -872,7 +872,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(claude_code_settings()).unwrap();
         let deny = v["permissions"]["deny"].as_array().unwrap();
         let rules: Vec<&str> = deny.iter().filter_map(|r| r.as_str()).collect();
-        assert!(rules.iter().any(|r| r.contains("core/")));
+        assert!(rules.iter().any(|r| r.contains("jarvis-core/")));
         assert!(rules.contains(&"Bash"));
         assert!(rules.contains(&"WebFetch"));
         assert!(rules.iter().any(|r| r.contains(".env")));
@@ -895,14 +895,14 @@ mod tests {
     #[test]
     fn changed_paths_and_protected_breaches() {
         let (sb, _dir) = temp_sandbox("cc_breach");
-        let porcelain = " M src/main.rs\n?? note.txt\nR  old.rs -> core/hack.rs\n M .env\n";
+        let porcelain = " M src/main.rs\n?? note.txt\nR  old.rs -> jarvis-core/hack.rs\n M .env\n";
         let paths = changed_paths(porcelain);
         assert!(paths.contains(&"src/main.rs".to_string()));
-        assert!(paths.contains(&"core/hack.rs".to_string())); // rename target
+        assert!(paths.contains(&"jarvis-core/hack.rs".to_string())); // rename target
         assert!(paths.contains(&".env".to_string()));
 
         let breaches = protected_breaches(&sb, &paths);
-        assert!(breaches.contains(&"core/hack.rs".to_string()));
+        assert!(breaches.contains(&"jarvis-core/hack.rs".to_string()));
         assert!(breaches.contains(&".env".to_string()));
         assert!(!breaches.contains(&"src/main.rs".to_string()));
     }

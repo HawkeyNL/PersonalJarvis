@@ -2,9 +2,10 @@
 
 ## Status
 
-Superseded in part by ADR-035 — 20 augustus 2026. De code-layout blijft
-leidend; de rootlocatie van blueprint-documentatie is vervangen door
-`docs/blueprint/`.
+Superseded in part by ADR-035 en ADR-036 — 20 augustus 2026. De code-layout
+blijft leidend; de rootlocatie van blueprint-documentatie is vervangen door
+`docs/blueprint/` en productgrenzen staan onder `jarvis-api/`, `jarvis-core/`
+en `jarvis-app/`.
 
 ## Context
 
@@ -21,24 +22,24 @@ sinds ADR-035 onder `docs/blueprint/`:
 ```text
 /Cargo.toml            # Rust workspace (root)
 /rust-toolchain.toml   # stable, met rustfmt + clippy
-/services/<bin>/       # binaire crates (jarvis-api, later orchestrator, broker-gateway)
+/jarvis-api/           # native API-binary voor de Home Node
+/jarvis-core/          # beschermde persona + toekomstige orchestratiegrens
+/jarvis-app/           # Tauri 2 + Vue 3 clients
 /crates/<lib>/         # library-crates (jarvis-config, jarvis-observability, later domain-core)
-/apps/<client>/        # Tauri 2 + Vue 3 clients
-/migrations/           # SQLx migraties (Postgres)
+/schema/               # versiebeheer van het SurrealDB-schema
 /deploy/compose/       # Docker Compose voor lokale ontwikkeling
 /.github/workflows/    # CI
 ```
 
-`services/` en `crates/` volgen de naamgeving uit
-`infra/DOCKER_AND_DEPLOYMENT.md` (`services/api`, `services/orchestrator`,
-`services/broker-gateway`). De crate-indeling volgt de modular-monolith
-uit ADR-003 en `backend/crates/`: begin met één workspace, splits later.
+`jarvis-api/`, `jarvis-core/` en `crates/` volgen de modular-monolith uit
+ADR-003: één Rust-workspace met duidelijke productgrenzen, verder opgesplitst
+wanneer daar een concrete runtimeverantwoordelijkheid voor is.
 
 ## Reden
 
 - Geen naamconflict tussen docs en code.
 - Docs blijven op de root vindbaar voor mens en coding-agents.
-- `services/` + `crates/` sluit aan op de bestaande blueprint-conventies.
+- Productgrenzen zijn direct herkenbaar vanaf de repositoryroot.
 
 ## Gevolgen
 

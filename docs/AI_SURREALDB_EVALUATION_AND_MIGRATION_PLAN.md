@@ -15,7 +15,7 @@ Evaluate whether PersonalJarvis should replace PostgreSQL + pgvector with Surrea
 
 This document is intentionally an evaluation and migration-planning brief. Do **not** immediately remove PostgreSQL, rewrite persistence code, or migrate production data. First inspect the current repository and prove that SurrealDB is the better fit for PersonalJarvis with concrete evidence.
 
-Read `AGENTS.md`, `core/Jarvis.md`, all persistence-related ADRs, migrations, SQLx usage, auth/audit code, trading/portfolio code, memory plans, deployment docs and release/update constraints before proposing changes.
+Read `AGENTS.md`, `jarvis-core/Jarvis.md`, all persistence-related ADRs, migrations, SQLx usage, auth/audit code, trading/portfolio code, memory plans, deployment docs and release/update constraints before proposing changes.
 
 ---
 

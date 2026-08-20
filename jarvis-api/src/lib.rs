@@ -36,6 +36,9 @@ mod validation;
 
 pub use extract::Authed;
 pub use state::AppState;
+// Compatibility re-export: persona ownership is in `jarvis-core`, while the
+// transport crate keeps this public helper available to existing callers.
+pub use jarvis_core::{load_persona, JARVIS_SYSTEM_FALLBACK};
 
 use audit::{agent_audit_log, security_audit_log};
 use mcp::mcp_endpoint;
@@ -133,26 +136,6 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     }
 }
 
-/// Fallback persona when `core/Jarvis.md` is absent (keeps dev/CI green without
-/// the file). The real identity lives in `core/Jarvis.md`, loaded at startup
-/// into [`AppState::jarvis_system`]. Kept plain: modern Claude models follow the
-/// system prompt closely.
-pub const JARVIS_SYSTEM_FALLBACK: &str = "Je bent Jarvis, de persoonlijke AI-assistent op het HUD-dashboard van de gebruiker. \
-Antwoord in het Nederlands, kort en duidelijk, in een rustige en behulpzame toon. \
-Je helpt met het systeem, de portfolio en trading-inzichten. \
-Zeg het eerlijk wanneer je iets niet zeker weet in plaats van te gokken. \
-Voer nooit trades of onomkeerbare acties uit — die vereisen altijd een expliciete bevestiging van de gebruiker.";
-
-/// Load Jarvis' persona from `path` (typically `core/Jarvis.md`). A missing,
-/// unreadable, or empty file falls back to [`JARVIS_SYSTEM_FALLBACK`] so the
-/// brain always has an identity. Returns the text and whether the file loaded.
-pub fn load_persona(path: &str) -> (Arc<str>, bool) {
-    match std::fs::read_to_string(path) {
-        Ok(text) if !text.trim().is_empty() => (Arc::from(text.trim()), true),
-        _ => (Arc::from(JARVIS_SYSTEM_FALLBACK), false),
-    }
-}
-
 /// Live brain availability for the router (`jarvis-llm`) — the bridge that makes
 /// it route on what's actually up *and* affordable (ADR-027). A backend is
 /// available iff the registry marks it available AND, for metered API backends,
@@ -216,22 +199,5 @@ mod tests {
     async fn root_reports_service_name() {
         let Json(body) = root().await;
         assert_eq!(body["service"], "jarvis-api");
-    }
-
-    #[test]
-    fn persona_falls_back_when_file_is_absent() {
-        let (text, loaded) = load_persona("does/not/exist/Jarvis.md");
-        assert!(!loaded);
-        assert_eq!(&*text, JARVIS_SYSTEM_FALLBACK);
-    }
-
-    #[test]
-    fn persona_loads_from_file_when_present() {
-        let path = std::env::temp_dir().join("jarvis_persona_test.md");
-        std::fs::write(&path, "  Je bent Jarvis, de kern.  \n").unwrap();
-        let (text, loaded) = load_persona(path.to_str().unwrap());
-        assert!(loaded);
-        assert_eq!(&*text, "Je bent Jarvis, de kern.");
-        let _ = std::fs::remove_file(&path);
     }
 }

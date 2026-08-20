@@ -7,7 +7,7 @@ described in `decisions/ADR-020-REPOSITORY-LAYOUT.md`.
 ## Prerequisites
 
 - **Rust** stable via rustup (pinned in `rust-toolchain.toml`)
-- **Node 24** via nvm (`nvm use`, pinned in `.nvmrc`) — for the client (`apps/client`)
+- **Node 24** via nvm (`nvm use`, pinned in `.nvmrc`) — for the client (`jarvis-app`)
 - **Docker** (local Postgres)
 
 ## Run the backend
@@ -34,13 +34,13 @@ Endpoints:
 ## Run the client (macOS)
 
 ```bash
-cd apps/client
+cd jarvis-app
 nvm use                          # Node 24 (see .nvmrc)
 npm install
 npm run tauri dev                # hot-reload dev window
 # or build a native .app bundle:
 npm run tauri build -- --bundles app
-# -> apps/client/src-tauri/target/release/bundle/macos/Jarvis.app
+# -> jarvis-app/src-tauri/target/release/bundle/macos/Jarvis.app
 ```
 
 Stack: Tauri 2 + Vue 3 + TypeScript, Pinia, Vue Router. The `greet` command
@@ -73,18 +73,18 @@ JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS
 
 ## Layout
 
-- `services/api` — Axum HTTP API (`jarvis-api`)
+- `jarvis-api` — Axum HTTP API (`jarvis-api`)
 - `crates/config` — typed configuration (`jarvis-config`)
 - `crates/observability` — logging/tracing (`jarvis-observability`)
 - `crates/identity` — user/device model + repository (`jarvis-identity`)
 - `migrations/` — SQLx migrations (Postgres)
 - `deploy/compose/` — local Docker stack
-- `apps/client` — Tauri 2 + Vue 3 client (macOS + iOS)
+- `jarvis-app` — Tauri 2 + Vue 3 client (macOS + iOS)
 
 ## Notes
 
 - Secrets never go in code or logs. `.env` is git-ignored and `database_url` is
   redacted from the config `Debug` output.
-- The client (`apps/client`, Tauri 2 + Vue 3) builds a native macOS app; iOS is
+- The client (`jarvis-app`, Tauri 2 + Vue 3) builds a native macOS app; iOS is
   the next target. Its `src-tauri` crate is excluded from the root Cargo
   workspace (see ADR-020) so backend CI stays fast.

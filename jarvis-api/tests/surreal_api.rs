@@ -163,7 +163,7 @@ async fn signed_agent_approval_is_single_use_and_core_stays_denied(
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::from(
                     serde_json::to_vec(
-                        &json!({"type":"write_file","path":"core/Jarvis.md","content":"no"}),
+                        &json!({"type":"write_file","path":"jarvis-core/Jarvis.md","content":"no"}),
                     )
                     .unwrap(),
                 ))

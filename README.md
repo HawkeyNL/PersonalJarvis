@@ -46,14 +46,14 @@ Belangrijkste endpoints:
 
 | Methode | Pad | Doel |
 |---------|-----|------|
-| GET | `/livez` · `/readyz` | liveness / readiness (pingt Postgres) |
+| GET | `/livez` · `/readyz` | liveness / readiness (pingt SurrealDB) |
 | POST | `/v1/auth/enroll` · `/challenge` · `/login` · `/logout` | device-bound auth (Ed25519) |
 | GET/DELETE | `/v1/devices` · `/v1/devices/{id}` | apparatenbeheer (Bearer-token) |
 | GET/POST/DELETE | `/v1/holdings` · `/v1/holdings/{id}` | portfolio (Decimal-geld) |
 | GET | `/v1/broker/ibkr/status` · `/positions` | IBKR read-only (via gateway) |
 | POST | `/v1/assistant/chat` | Jarvis-brein (Claude, Bearer-token) |
 
-#### API-codestructuur (`services/api`)
+#### API-codestructuur (`jarvis-api`)
 
 De API is opgesplitst in samenhangende modules; `lib.rs` is nog slechts de
 compositieroot (router-bedrading + health-probes). Handlers zijn per concern
@@ -79,7 +79,7 @@ gegroepeerd, elk met zijn eigen request-DTO's:
 | `routes/voice.rs` | STT + speaker-verificatie (gemaks-signaal, nooit het slot) |
 
 Unit-tests van privé-interne functies staan in de modules zelf; de HTTP-round-trip
-integratietests staan in `services/api/tests/api.rs` en spreken de crate alleen via
+integratietests staan in `jarvis-api/tests/surreal_api.rs` en spreken de crate alleen via
 haar publieke API aan.
 
 ### 2. Client (macOS)
@@ -87,19 +87,19 @@ haar publieke API aan.
 In een **tweede terminal**, met de API draaiend:
 
 ```bash
-cd apps/client
+cd jarvis-app
 nvm use            # Node 24 (zie .nvmrc)
 npm install        # eenmalig
 npm run tauri dev  # hot-reload dev-venster
 ```
 
 Native `.app` bouwen: `npm run tauri build -- --bundles app`
-→ `apps/client/src-tauri/target/release/bundle/macos/Jarvis.app`.
+→ `jarvis-app/src-tauri/target/release/bundle/macos/Jarvis.app`.
 
 ### 3. Client (iOS-simulator, optioneel)
 
 ```bash
-cd apps/client
+cd jarvis-app
 npm run tauri ios init                          # eenmalig
 npm run tauri ios build -- --target aarch64-sim --ci
 xcrun simctl install booted <pad/naar/Jarvis.app>
@@ -134,7 +134,7 @@ Handsfree activeren met **"Hey Jarvis"**, en alleen jouw stem (on-device via
 Picovoice — geen audio verlaat je toestel; zie `decisions/ADR-024`).
 
 ```bash
-cd apps/client
+cd jarvis-app
 npm run fetch-models   # haalt de Porcupine/Eagle-modellen (niet in git)
 ```
 
@@ -149,6 +149,7 @@ Touch ID-prompt — de biometrie blijft het slot.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
+cargo audit
 ```
 
 De opt-in SurrealDB wire-protocoltests vereisen een wegwerp-SurrealDB-instance;

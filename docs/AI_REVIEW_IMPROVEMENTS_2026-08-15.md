@@ -14,7 +14,7 @@ The goal is to improve maintainability and close the remaining gaps without addi
 
 ### Problem
 
-`services/api/src/lib.rs` has grown to roughly 121 KB. This makes ownership, review, testing, and future agent-generated changes unnecessarily difficult and increases the chance of accidental coupling.
+`jarvis-api/src/lib.rs` has grown to roughly 121 KB. This makes ownership, review, testing, and future agent-generated changes unnecessarily difficult and increases the chance of accidental coupling.
 
 ### Required change
 
@@ -23,7 +23,7 @@ Refactor the API crate into cohesive modules without changing external behavior.
 Suggested structure (adapt to the existing architecture rather than copying blindly):
 
 ```text
-services/api/src/
+jarvis-api/src/
   lib.rs
   state.rs
   error.rs

@@ -9,7 +9,7 @@
 ```yaml
 services:
   api:
-    build: ../../services/api
+    build: ../../jarvis-api
     restart: unless-stopped
     depends_on: [postgres]
     env_file: .env.api
