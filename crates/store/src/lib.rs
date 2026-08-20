@@ -17,13 +17,27 @@ struct SchemaVersion {
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("database connection failed")]
-    Connect(#[source] surrealdb::Error),
+    Connect(#[source] Box<surrealdb::Error>),
     #[error("database authentication failed")]
-    Authenticate(#[source] surrealdb::Error),
+    Authenticate(#[source] Box<surrealdb::Error>),
     #[error("database schema migration failed")]
-    Schema(#[source] surrealdb::Error),
+    Schema(#[source] Box<surrealdb::Error>),
     #[error("unsupported Jarvis schema version {0}")]
     UnsupportedSchema(i64),
+}
+
+impl StoreError {
+    pub fn connect(error: surrealdb::Error) -> Self {
+        Self::Connect(Box::new(error))
+    }
+
+    pub fn authenticate(error: surrealdb::Error) -> Self {
+        Self::Authenticate(Box::new(error))
+    }
+
+    pub fn schema(error: surrealdb::Error) -> Self {
+        Self::Schema(Box::new(error))
+    }
 }
 
 /// Private, authenticated SurrealDB connection used by Jarvis Core.
@@ -42,7 +56,7 @@ pub async fn connect(
 ) -> Result<Database, StoreError> {
     let db = Surreal::new::<Ws>(endpoint)
         .await
-        .map_err(StoreError::Connect)?;
+        .map_err(StoreError::connect)?;
     db.signin(DatabaseAuth {
         namespace,
         database,
@@ -50,11 +64,11 @@ pub async fn connect(
         password,
     })
     .await
-    .map_err(StoreError::Authenticate)?;
+    .map_err(StoreError::authenticate)?;
     db.use_ns(namespace)
         .use_db(database)
         .await
-        .map_err(StoreError::Connect)?;
+        .map_err(StoreError::connect)?;
     Ok(db)
 }
 
@@ -66,8 +80,8 @@ pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
     let mut version = db
         .query("SELECT version FROM schema_version:baseline")
         .await
-        .map_err(StoreError::Schema)?;
-    let current: Option<SchemaVersion> = version.take(0).map_err(StoreError::Schema)?;
+        .map_err(StoreError::schema)?;
+    let current: Option<SchemaVersion> = version.take(0).map_err(StoreError::schema)?;
     if let Some(current) = current {
         if current.version == 1 {
             return Ok(());
@@ -78,8 +92,8 @@ pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
 
     db.query(include_str!("../../../schema/surreal/0001_baseline.surql"))
         .await
-        .map_err(StoreError::Schema)?
+        .map_err(StoreError::schema)?
         .check()
-        .map_err(StoreError::Schema)?;
+        .map_err(StoreError::schema)?;
     Ok(())
 }

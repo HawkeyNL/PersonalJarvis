@@ -18,9 +18,9 @@ pub async fn record(db: &Database, entry: &UsageEntry) -> Result<(), jarvis_stor
         "cost_eur": entry.cost_eur,
     }))
     .await
-    .map_err(jarvis_store::StoreError::Schema)?
+    .map_err(jarvis_store::StoreError::schema)?
     .check()
-    .map_err(jarvis_store::StoreError::Schema)?;
+    .map_err(jarvis_store::StoreError::schema)?;
     Ok(())
 }
 
@@ -28,12 +28,12 @@ pub async fn month_total_eur(db: &Database) -> Result<f64, jarvis_store::StoreEr
     let mut response = db
         .query("SELECT math::sum(cost_eur) AS total FROM llm_usage WHERE ts >= time::floor(time::now(), 1mo)")
         .await
-        .map_err(jarvis_store::StoreError::Schema)?;
+        .map_err(jarvis_store::StoreError::schema)?;
     #[derive(serde::Deserialize)]
     struct Total {
         total: Option<f64>,
     }
-    let row: Option<Total> = response.take(0).map_err(jarvis_store::StoreError::Schema)?;
+    let row: Option<Total> = response.take(0).map_err(jarvis_store::StoreError::schema)?;
     Ok(row.and_then(|row| row.total).unwrap_or(0.0))
 }
 
@@ -51,8 +51,8 @@ pub async fn month_breakdown(
          WHERE ts >= time::floor(time::now(), 1mo) GROUP BY backend ORDER BY total DESC",
         )
         .await
-        .map_err(jarvis_store::StoreError::Schema)?;
-    let rows: Vec<Row> = response.take(0).map_err(jarvis_store::StoreError::Schema)?;
+        .map_err(jarvis_store::StoreError::schema)?;
+    let rows: Vec<Row> = response.take(0).map_err(jarvis_store::StoreError::schema)?;
     Ok(rows
         .into_iter()
         .map(|row| (row.backend, row.total.unwrap_or(0.0)))
