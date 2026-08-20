@@ -47,6 +47,13 @@ De fase-1-crate vraagt nu al uitsluitend `jarvis-policy` om de
 `RequireApproval`, een onvertrouwde caller `Deny`. Dit is nog geen approval;
 alleen de bestaande device-handtekening kan die later werkelijk bewijzen.
 
+Voordat fase 3 een `codex app-server`-proces mag starten, is een dedicated
+onprivileged Linux-identity met OS-level schrijfgrenzen een harde
+afhankelijkheid. App Server's `cwd`, sandboxinstellingen, tool-approvals en een
+diffscan zijn aanvullende lagen, maar bewijzen niet dat `jarvis-core/**` in een
+worktree niet te wijzigen is. Een proces dat die grens niet aantoonbaar
+handhaaft, wordt niet geïntroduceerd.
+
 ## Gevolgen
 
 - Core blijft de autoriteit; Codex kan in deze fase niets uitvoeren.

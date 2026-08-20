@@ -31,6 +31,22 @@ Het accepteert uitsluitend de App Server-methoden `initialize`, `thread/start`,
 immutable commit. Het kan geen Git-proces starten en heeft geen delete-operatie;
 die bevoegdheid wordt pas met signed approval en audit gekoppeld.
 
+## App Server schema-check (lokaal uitgevoerd)
+
+De lokaal geïnstalleerde Codex-versie genereert een versioned JSON-schema voor
+App Server. Dat bevestigt `turn/start` met een `cwd`, een sandbox-policy en
+server-initiated command/file-change approval callbacks. De schema's bevatten
+echter ook expliciete shell/process-capabilities. Jarvis mag die niet als een
+generieke doorgeefluik behandelen.
+
+Cruciaal: een `cwd` of modelinstructie maakt `jarvis-core/**` niet
+onwijzigbaar. Ook een diffscan na afloop is alleen detectie. Een echte executor
+mag daarom pas starten wanneer de dedicated, onprivileged Linux-identity op
+OS-niveau uitsluitend in de engineering-worktree kan schrijven en
+`jarvis-core/**`, `.git/**` en secretpaden daarbinnen niet kan muteren. De
+owner beheert die permissies; Jarvis/Codex krijgt nooit de bevoegdheid ze te
+veranderen.
+
 De officiële App Server-documentatie adviseert stdio als standaardtransport;
 WebSockets zijn experimenteel en niet productie-ondersteund. Daarom komt er in
 deze fase geen listener of service op de Home Node.
@@ -45,7 +61,8 @@ deze fase geen listener of service op de Home Node.
 ## Vervolgvolgorde
 
 1. review/merge van PR #15 als productplan;
-2. geïsoleerde worktrees en policy+signed-approval vóór een echte start;
-3. audit, taskopslag en veilige voortgang; daarna pas read-only scoped MCP;
-4. Home-Node-installatie/documentatie pas wanneer de lokale adapter en recovery
+2. dedicated Linux-identity + OS-level write bescherming voor een worktree;
+3. policy+signed approval, audit, taskopslag en veilige voortgang vóór start;
+4. daarna pas read-only scoped MCP;
+5. Home-Node-installatie/documentatie pas wanneer de lokale adapter en recovery
    aantoonbaar werken.
