@@ -2058,6 +2058,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-codex"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "jarvis-config"
 version = "0.1.0"
 dependencies = [
