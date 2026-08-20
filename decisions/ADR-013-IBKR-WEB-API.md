@@ -14,7 +14,7 @@ de **paper**-omgeving.
 
 - REST/JSON past direct op de Rust/Axum-backend (`reqwest`), zonder Python/Java
   SDK-sidecar voor read-only.
-- `integrations/IBKR.md` noemt de Web API "past conceptueel goed bij een backend".
+- `docs/blueprint/integrations/IBKR.md` noemt de Web API "past conceptueel goed bij een backend".
 - De TWS-API is uitgebreider maar socket-gebaseerd en operationeel zwaarder; niet
   nodig om posities/cash te lezen.
 

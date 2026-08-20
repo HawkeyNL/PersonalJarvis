@@ -2,19 +2,21 @@
 
 ## Status
 
-Accepted — 8 augustus 2026 (JAR-001).
+Superseded in part by ADR-035 — 20 augustus 2026. De code-layout blijft
+leidend; de rootlocatie van blueprint-documentatie is vervangen door
+`docs/blueprint/`.
 
 ## Context
 
-De repository bevat de volledige blueprint als markdown op de root
+De repository bevatte de volledige blueprint als markdown op de root
 (`architecture/`, `backend/`, `client/`, `api/`, `infra/`, ...). Die
 mapnamen zijn tegelijk logische plekken voor code, wat botst. Code moet
 duidelijk gescheiden blijven van de ontwerpdocumenten.
 
 ## Besluit
 
-Blueprint-docs blijven op hun huidige plek. Code komt in nieuwe,
-niet-botsende mappen:
+Code komt in nieuwe, niet-botsende mappen. De blueprint-documentatie staat
+sinds ADR-035 onder `docs/blueprint/`:
 
 ```text
 /Cargo.toml            # Rust workspace (root)

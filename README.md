@@ -338,12 +338,12 @@ Iedere coding-agent moet na werk taken afvinken, nieuwe taken toevoegen, tests v
 
 All coding agents must read:
 
-- `coding/CODE_AGENT_CONSTITUTION.md`
-- `coding/LANGUAGE_AGENT_ARCHITECTURE.md`
-- `coding/SECURITY_REVIEW_CHECKLIST.md`
-- `security/PUBLIC_API_SECURITY_STANDARD.md`
-- `security/ACCESS_CONTROL_MATRIX.md`
-- `security/INPUT_VALIDATION_STANDARD.md`
+- `docs/blueprint/coding/CODE_AGENT_CONSTITUTION.md`
+- `docs/blueprint/coding/LANGUAGE_AGENT_ARCHITECTURE.md`
+- `docs/blueprint/coding/SECURITY_REVIEW_CHECKLIST.md`
+- `docs/blueprint/security/PUBLIC_API_SECURITY_STANDARD.md`
+- `docs/blueprint/security/ACCESS_CONTROL_MATRIX.md`
+- `docs/blueprint/security/INPUT_VALIDATION_STANDARD.md`
 
 No public API is complete without rate limiting, secure credentials, server-side access control, input validation, audit and security tests.
 

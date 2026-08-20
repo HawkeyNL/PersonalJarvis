@@ -2,7 +2,7 @@
 
 See [CONVERSATION_AND_OUTPUT_POLICY](CONVERSATION_AND_OUTPUT_POLICY.md) for the
 chat surface and the rule that decides **when Jarvis may speak** (the audio-route
-/ earbud policy), and [ADR-021](../decisions/ADR-021-VOICE-OUTPUT-POLICY.md).
+/ earbud policy), and [ADR-021](../../../decisions/ADR-021-VOICE-OUTPUT-POLICY.md).
 
 ## Primary (TTS)
 - Fish Audio (voice synthesis and voice cloning where appropriate)

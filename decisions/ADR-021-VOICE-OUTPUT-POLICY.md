@@ -28,7 +28,7 @@ Route-detectie is native (Tauri-command `audio_output_route`, iOS
 **"oortje in"**-toggle als route-signaal (`unknown` → privé wanneer aan).
 
 Beslisvolgorde: master-uit → stil · privé route → praten · open route + toestaan
-→ praten · anders → stil. Zie [CONVERSATION_AND_OUTPUT_POLICY](../voice/CONVERSATION_AND_OUTPUT_POLICY.md).
+→ praten · anders → stil. Zie [CONVERSATION_AND_OUTPUT_POLICY](../docs/blueprint/voice/CONVERSATION_AND_OUTPUT_POLICY.md).
 
 ## Alternatieven
 

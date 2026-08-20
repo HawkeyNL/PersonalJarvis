@@ -2,7 +2,7 @@
 //
 // The audio route (earbud vs built-in speaker) decides speech, not the input
 // modality — so Jarvis speaks through your earbud even when you type back.
-// See voice/CONVERSATION_AND_OUTPUT_POLICY.md and decisions/ADR-021.
+// See docs/blueprint/voice/CONVERSATION_AND_OUTPUT_POLICY.md and decisions/ADR-021.
 import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 
