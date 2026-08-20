@@ -36,6 +36,12 @@ geïsoleerde development-worktree. Zij moet `jarvis-policy` gebruiken voor de
 start verifiëren en audit/events toevoegen. `thread/shellCommand` en
 `process/spawn` uit het App Server-protocol zijn geen toegestane Jarvis-calls.
 
+Fase 2 voegt `jarvis-workspace` toe. Die crate maakt nog geen worktree, maar
+valideert een plan voor precies één `git worktree add --detach` vanaf een
+immutable commit-id. De doelmap moet buiten de live repository liggen en de
+caller krijgt een vaste argv-lijst, geen shell-string. Uitvoeren, opruimen en
+een API-route wachten op de approval- en auditkoppeling.
+
 ## Gevolgen
 
 - Core blijft de autoriteit; Codex kan in deze fase niets uitvoeren.
