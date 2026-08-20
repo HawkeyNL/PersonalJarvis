@@ -7,6 +7,10 @@ Blueprint v2.6
 Fase 2 gestart: handmatig portfolio (holdings) werkt op iOS + macOS, achter de device-login. Fase 0 + Fase 1 afgerond.
 
 ## Eerstvolgende taak
+0. **IN PROGRESS — Codex engineering-adapter (ADR-037, PR #15)**: veilige
+   fase-1-fundering voor een lokale, typed Codex App Server-integratie. Geen
+   listener, toolgrant, credential of uitvoerrecht vóór worktree-, policy- en
+   signed-approval-grenzen aantoonbaar zijn.
 1. **Stem/wake live valideren op macOS**: `tauri dev` herstarten (mic-fix), in Settings de stem inschrijven en verify testen; daarna `npm run setup-wakeword` en de wake-drempel (`WakeDetector.threshold`) tunen met echte audio (`onScore` logt elke stap).
 2. **Spraak end-to-end valideren op device**: STT (whisper.cpp) + speaker-verify (MFCC) zijn gebouwd. `brew install cmake` (klaar), model via `scripts/fetch-whisper-model.sh` (klaar), backend met `--features speech-whisper`. Test: transcript is echt; schrijf je stem opnieuw in (nu MFCC) en **tune de verify-drempel** (`JARVIS_SPEECH_VERIFY_THRESHOLD`) met de score-readout. Blijkt MFCC niet scherp genoeg → optionele ECAPA/wespeaker-ONNX-upgrade. Daarna: console-STT (mic → server-transcript) en wake-inferentie eventueel naar een Web Worker.
 
