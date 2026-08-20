@@ -60,7 +60,7 @@ target="${WORKTREE_PARENT}/${task_id}"
 
 created_worktree=false
 cleanup() {
-  if "${created_worktree}"; then
+  if [[ "${created_worktree}" == true ]]; then
     git -C "${source_checkout}" worktree remove --force "${target}" || true
   fi
 }
@@ -69,8 +69,10 @@ trap cleanup ERR
 git -C "${source_checkout}" worktree add --detach "${target}" "${commit}"
 created_worktree=true
 
+# The reviewed, versioned .env.example template is not a credential. Every
+# actual environment file (including .env.production) remains disallowed.
 if find "${target}" -xdev \
-  \( -name '.env' -o -name '.env.*' -o -name '*.key' -o -name '*.pem' -o -path '*/.ssh/*' \) \
+  \( -name '.env' -o \( -name '.env.*' ! -name '.env.example' \) -o -name '*.key' -o -name '*.pem' -o -path '*/.ssh/*' \) \
   -print -quit | grep -q .; then
   echo "refusing a worktree containing secret-like files" >&2
   exit 65

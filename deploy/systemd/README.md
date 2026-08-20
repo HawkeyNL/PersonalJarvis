@@ -88,7 +88,8 @@ sudo systemd-analyze verify /etc/systemd/system/jarvis-codex.service
 ```
 
 The root-only worktree helper accepts only a primary checkout, UUID task ID,
-and immutable commit revision. It rejects secret-like files and makes
+and immutable commit revision. It rejects secret-like files (the reviewed,
+non-secret `.env.example` template is the sole environment-file exception) and makes
 `jarvis-core` and `.git` root-owned, non-writable, and immutable with
 `chattr +i`. This prevents the Codex account from changing, deleting, or
 renaming those paths. It fails closed when the filesystem does not support
