@@ -58,6 +58,50 @@ sudo install -d -o jarvis -g jarvis -m 0750 /var/lib/jarvis
 sudo install -d -o root -g root -m 0755 /opt/jarvis/releases /etc/jarvis
 ```
 
+## Optional Codex engineering isolation
+
+Codex App Server is **not part of the first Home Node deployment**. Do not
+enable this unit until the signed-approval API path for engineering tasks is
+implemented and reviewed.
+
+When it is enabled later, it runs as a separate non-login
+`jarvis-codex` account. Jarvis Core is only a supplementary member of the
+`jarvis-codex` group, so it can connect to the local Unix socket at
+`/run/jarvis-codex/app-server.sock`. Codex credentials and state remain in
+`/var/lib/jarvis-codex` with mode `0700`; Core must never read, write, or
+inherit them. The App Server has no TCP listener and must never be exposed
+through a public proxy.
+
+Prepare the account and install the optional files as root:
+
+```bash
+sudo useradd --system --user-group --home-dir /var/lib/jarvis-codex \
+  --shell /usr/sbin/nologin jarvis-codex
+sudo install -d -o root -g jarvis-codex -m 0770 /var/lib/jarvis-engineering
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
+sudo install -o root -g root -m 0755 deploy/systemd/prepare-codex-worktree.sh \
+  /usr/local/libexec/jarvis/prepare-codex-worktree
+sudo install -o root -g root -m 0644 deploy/systemd/jarvis-codex.service \
+  /etc/systemd/system/jarvis-codex.service
+sudo systemctl daemon-reload
+sudo systemd-analyze verify /etc/systemd/system/jarvis-codex.service
+```
+
+The root-only worktree helper accepts only a primary checkout, UUID task ID,
+and immutable commit revision. It rejects secret-like files (the reviewed,
+non-secret `.env.example` template is the sole environment-file exception) and makes
+`jarvis-core` and `.git` root-owned, non-writable, and immutable with
+`chattr +i`. This prevents the Codex account from changing, deleting, or
+renaming those paths. It fails closed when the filesystem does not support
+immutable attributes; deploy this optional boundary only on a supported local
+filesystem such as the default Ubuntu ext4 installation.
+
+The helper is deliberately not setuid, an API endpoint, or an agent tool. An
+operator invokes it with `sudo` only after an approved task has been
+materialized by the future engineering-task control plane. Never put Codex
+credentials in `/etc/jarvis/core.env`, the Core systemd unit, source control,
+or an agent prompt.
+
 ## 2. Stage an immutable, tagged release
 
 For a node that will receive automatic updates, bootstrap from the verified
