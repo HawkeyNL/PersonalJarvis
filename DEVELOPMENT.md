@@ -1,7 +1,7 @@
 # Development
 
 How to build and run the Jarvis backend locally. Architecture and design live in
-the blueprint docs (start at `00-start/02-reading-order.md`); the code layout is
+the blueprint docs (start at `docs/blueprint/00-start/02-reading-order.md`); the code layout is
 described in `decisions/ADR-020-REPOSITORY-LAYOUT.md`.
 
 ## Prerequisites

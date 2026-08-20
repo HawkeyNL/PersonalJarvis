@@ -101,4 +101,4 @@ Jarvis reageert alleen op **jouw** stem. Dit is stembiometrie bovenop STT:
 - Geen gevoelige financiële data hardop op een open route.
 - De reasoning/brain draait via de gekozen LLM-provider (DEC-001); TTS via de
   voice-stack (Fish Audio, met lokale fallback). Zie [VOICE_STACK](VOICE_STACK.md)
-  en [ADR-021](../decisions/ADR-021-VOICE-OUTPUT-POLICY.md).
+  en [ADR-021](../../../decisions/ADR-021-VOICE-OUTPUT-POLICY.md).

@@ -61,4 +61,4 @@ OpenTelemetry over:
 
 ## Incident runbooks
 
-Zie `runbooks/`.
+Zie `blueprint/runbooks/`.
