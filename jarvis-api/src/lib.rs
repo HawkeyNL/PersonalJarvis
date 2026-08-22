@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     middleware,
     routing::{delete, get, post},
@@ -103,6 +103,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/agent/audit", get(agent_audit_log))
         .route("/v1/system/audit", get(security_audit_log))
         .route("/mcp", post(mcp_endpoint))
+        // Every JSON endpoint has an explicit, bounded total request size.
+        // Endpoint-specific semantic limits remain in the handlers.
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         // Per-IP rate limiting on auth-sensitive endpoints (enroll/challenge/login).
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit_mw))
         .with_state(state)
@@ -123,7 +126,10 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     match state.db.query("RETURN 1").await {
         Ok(_) => (
             StatusCode::OK,
-            Json(json!({ "status": "ready", "environment": state.environment })),
+            // These probes are intentionally safe to publish through Caddy.
+            // Dependency names, environment and failure detail stay in the
+            // authenticated diagnostics and server logs.
+            Json(json!({ "status": "ready" })),
         ),
         Err(e) => {
             // Log the detail; never leak internal DB errors in the response body.

@@ -20,6 +20,9 @@ use crate::rate_limit;
 pub struct AppState {
     pub db: jarvis_store::Database,
     pub environment: String,
+    /// Production requests carrying bearer credentials must have arrived over
+    /// HTTPS through an explicitly trusted local reverse proxy.
+    pub require_https: bool,
     pub ibkr_gateway_url: String,
     /// The brain (DEC-001) — provider-abstracted, swappable at runtime.
     pub llm: Arc<dyn llm::LlmProvider>,

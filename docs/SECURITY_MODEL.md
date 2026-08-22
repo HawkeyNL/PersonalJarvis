@@ -72,7 +72,11 @@ Trading agents must never call an exchange/broker execution API directly. They p
 
 ## Home Node
 
-The UM890 Home Node should run Jarvis Core as a native systemd service. Stateful/supporting services such as PostgreSQL, pgvector, Redis, monitoring, and isolated workers should run in Docker. SSH should be available through a private network/VPN rather than exposing administration ports directly to the public internet.
+The UM890 Home Node runs Jarvis Core as a native systemd service and SurrealDB
+2.6 as private persistent Docker state. Caddy is the sole public ingress on TCP
+443 and proxies only to the loopback API; SSH remains private-network only.
+Redis, monitoring and workers are not deployment prerequisites and require a
+demonstrated need before introduction.
 
 ## Required future controls
 

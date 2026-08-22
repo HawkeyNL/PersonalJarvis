@@ -19,6 +19,7 @@ use jarvis_orchestrator as orchestrator;
 
 use crate::error::bad_request;
 use crate::metering::record_usage;
+use crate::rate_limit::allow_authenticated_device;
 use crate::validation;
 use crate::{AppState, Authed};
 
@@ -52,6 +53,20 @@ pub(crate) async fn assistant_chat(
     State(state): State<AppState>,
     Json(req): Json<ChatReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !allow_authenticated_device(
+        &state,
+        authed.device.id,
+        "llm",
+        state.auth_limits.llm_per_min,
+    ) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "rate limited",
+                "hint": "te veel pogingen; probeer het straks opnieuw",
+            })),
+        ));
+    }
     // Generous bounds so a single request cannot ship an unbounded transcript or
     // a giant paste into the LLM (real conversations stay well under these).
     if req.messages.len() > validation::MAX_CHAT_TURNS {
@@ -63,6 +78,15 @@ pub(crate) async fn assistant_chat(
         .any(|t| t.content.len() > validation::MAX_CHAT_CONTENT_LEN)
     {
         return Err(bad_request("message too long"));
+    }
+    if req
+        .messages
+        .iter()
+        .map(|turn| turn.content.len())
+        .sum::<usize>()
+        > 128_000
+    {
+        return Err(bad_request("conversation payload too large"));
     }
     let history: Vec<llm::ChatMessage> = req
         .messages

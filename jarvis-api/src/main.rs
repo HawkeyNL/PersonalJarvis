@@ -18,10 +18,17 @@ fn non_empty(s: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load `.env` for local development if present (ignored in production).
-    let _ = dotenvy::dotenv();
-
-    let config = AppConfig::load()?;
+    // A production service reads only its root-managed EnvironmentFile. Loading
+    // a nearby `.env` there would turn a release-directory file into a secret
+    // source. Development may still use the convenient local file.
+    let mut config = AppConfig::load()?;
+    if !config.environment.eq_ignore_ascii_case("production") {
+        let _ = dotenvy::dotenv();
+        config = AppConfig::load()?;
+    }
+    config
+        .validate_runtime_security()
+        .map_err(anyhow::Error::msg)?;
     jarvis_observability::init(config.log_json);
 
     // `config`'s Debug impl redacts database credentials, so this is safe to log.
@@ -201,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         db,
         environment: config.environment.clone(),
+        require_https: config.environment.eq_ignore_ascii_case("production"),
         ibkr_gateway_url: config.ibkr_gateway_url.clone(),
         llm,
         llm_max_tokens: config.llm_max_tokens,
@@ -221,6 +229,8 @@ async fn main() -> anyhow::Result<()> {
             login_per_min: config.auth_rate_login_per_min,
             login_max_failures: config.auth_login_max_failures,
             login_lock_secs: config.auth_login_lock_secs,
+            authenticated_per_min: config.authenticated_rate_per_min,
+            llm_per_min: config.llm_rate_per_min,
         },
         trusted_proxy_hops: config.trusted_proxy_hops,
         trusted_proxy_ips: Arc::new(trusted_proxy_ips),

@@ -28,6 +28,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
     AppState {
         db,
         environment: "test".to_string(),
+        require_https: false,
         ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
         llm: jarvis_llm::stub(),
         llm_max_tokens: 256,

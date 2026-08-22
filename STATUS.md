@@ -7,15 +7,19 @@ Blueprint v2.6
 Fase 2 gestart: handmatig portfolio (holdings) werkt op iOS + macOS, achter de device-login. Fase 0 + Fase 1 afgerond.
 
 ## Eerstvolgende taak
-0. **IN PROGRESS — Codex engineering-adapter (ADR-037, PR #15)**: de typed
+0. **IN PROGRESS — publieke Home Node-ingress (ADR-038)**: Caddy is de enige
+   publieke HTTPS-ingress op TCP 443; Core blijft loopback-only, SurrealDB en
+   Codex blijven privé. De resterende eigenaarstest is DNS/router/TLS en de
+   gecontroleerde eerste device-bootstrap vóór 443 wordt geopend.
+1. **Codex engineering-adapter (ADR-037)**: de typed
    taak- en protocolfundering, policy-gate en worktreeplanning zijn aanwezig.
    De optionele Home Node-isolatie gebruikt een aparte `jarvis-codex`-identity
    met alleen een lokale Unix-socketgroep en root-afgedwongen immutable
    worktrees. Er is nog geen listener die is ingeschakeld, toolgrant,
    credential-flow, API-route of uitvoerrecht vóór signed approval, audit en
    runtime-cancelgrenzen aantoonbaar zijn.
-1. **Stem/wake live valideren op macOS**: `tauri dev` herstarten (mic-fix), in Settings de stem inschrijven en verify testen; daarna `npm run setup-wakeword` en de wake-drempel (`WakeDetector.threshold`) tunen met echte audio (`onScore` logt elke stap).
-2. **Spraak end-to-end valideren op device**: STT (whisper.cpp) + speaker-verify (MFCC) zijn gebouwd. `brew install cmake` (klaar), model via `scripts/fetch-whisper-model.sh` (klaar), backend met `--features speech-whisper`. Test: transcript is echt; schrijf je stem opnieuw in (nu MFCC) en **tune de verify-drempel** (`JARVIS_SPEECH_VERIFY_THRESHOLD`) met de score-readout. Blijkt MFCC niet scherp genoeg → optionele ECAPA/wespeaker-ONNX-upgrade. Daarna: console-STT (mic → server-transcript) en wake-inferentie eventueel naar een Web Worker.
+2. **Stem/wake live valideren op macOS**: `tauri dev` herstarten (mic-fix), in Settings de stem inschrijven en verify testen; daarna `npm run setup-wakeword` en de wake-drempel (`WakeDetector.threshold`) tunen met echte audio (`onScore` logt elke stap).
+3. **Spraak end-to-end valideren op device**: STT (whisper.cpp) + speaker-verify (MFCC) zijn gebouwd. `brew install cmake` (klaar), model via `scripts/fetch-whisper-model.sh` (klaar), backend met `--features speech-whisper`. Test: transcript is echt; schrijf je stem opnieuw in (nu MFCC) en **tune de verify-drempel** (`JARVIS_SPEECH_VERIFY_THRESHOLD`) met de score-readout. Blijkt MFCC niet scherp genoeg → optionele ECAPA/wespeaker-ONNX-upgrade. Daarna: console-STT (mic → server-transcript) en wake-inferentie eventueel naar een Web Worker.
 
 Parallel blijft staan: live test Jarvis-brein (`JARVIS_LLM_API_KEY` in backend-`.env`, gesprek end-to-end), IBKR live zodra de Client Portal Gateway draait + ingelogd (paper eerst), en B — marktdata-provider (DEC-002) voor live koersen.
 
@@ -47,7 +51,15 @@ Parallel blijft staan: live test Jarvis-brein (`JARVIS_LLM_API_KEY` in backend-`
 - Lokale hardware versus cloud-API
 
 ## Laatste update
-20 augustus 2026
+22 augustus 2026
+
+- **Home Node public HTTPS (ADR-038)**: Caddy is vastgelegd als enige
+  TCP/443-ingress naar `127.0.0.1:8080`; productie weigert nu iedere
+  niet-loopback API-bind. Caddy gebruikt TLS-ALPN-01 zonder HTTP/80, en de
+  runbook bevat DNS, dynamisch-IP, UFW, router, reboot, externe en auth-tests.
+  Device-intrekking trekt sessies direct in; productie-bearers eisen een
+  trusted loopback Caddy-peer met `X-Forwarded-Proto: https`. CI valideert
+  ingress-templates en bouwt/typecheckt de client.
 
 - **Blueprint-documentatie geordend (ADR-035)**: de Markdown-only
   ontwerp-, domein- en securitymappen staan nu onder `docs/blueprint/`;

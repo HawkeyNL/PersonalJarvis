@@ -217,6 +217,7 @@ pub async fn revoke_device(db: &Database, device_id: Uuid) -> Result<(), Identit
             "BEGIN TRANSACTION; \
              UPDATE devices SET status = 'revoked', updated_at = time::now() WHERE record::id(id) = $id; \
              UPDATE device_keys SET revoked_at = time::now() WHERE device_id = $id AND revoked_at IS NONE; \
+             UPDATE sessions SET revoked_at = time::now() WHERE device_id = $id AND revoked_at IS NONE; \
              COMMIT TRANSACTION;",
         )
         .bind(json!({ "id": device_id.to_string() }))
@@ -331,7 +332,7 @@ pub async fn login(
     execute(
         db,
         "CREATE sessions SET id = $id, user_id = $user_id, device_id = $device_id, token_hash = <bytes>$token_hash, \
-         created_at = time::now(), expires_at = time::now() + 30d, last_used_at = NONE, revoked_at = NONE RETURN AFTER",
+         created_at = time::now(), expires_at = time::now() + 7d, last_used_at = NONE, revoked_at = NONE RETURN AFTER",
         SessionBindings {
             id: Uuid::now_v7().to_string(),
             user_id: owner.user_id.to_string(),
@@ -379,7 +380,7 @@ pub async fn authenticate(db: &Database, token: &str) -> Result<Authenticated, I
         .ok_or(IdentityError::AuthFailed)?;
     let device: Device = one(
         db,
-        &format!("SELECT {DEVICE_FIELDS} FROM devices WHERE record::id(id) = $id LIMIT 1"),
+        &format!("SELECT {DEVICE_FIELDS} FROM devices WHERE record::id(id) = $id AND status = 'active' LIMIT 1"),
         json!({ "id": session.device_id.to_string() }),
     )
     .await?
@@ -706,6 +707,11 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        // Revoking a device invalidates every existing bearer session at once;
+        // a stolen token must not remain useful until its normal expiry.
+        revoke_device(&db, device.id).await?;
+        assert!(authenticate(&db, &result.token).await.is_err());
         Ok(())
     }
 }

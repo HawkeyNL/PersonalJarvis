@@ -23,6 +23,7 @@ use crate::validation;
 use crate::{AppState, Authed};
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EnrollReq {
     name: String,
     platform: String,
@@ -80,6 +81,7 @@ pub(crate) async fn auth_enroll(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ChallengeReq {
     device_id: Uuid,
 }
@@ -91,7 +93,7 @@ pub(crate) async fn auth_challenge(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let challenge = identity::create_challenge(&state.db, req.device_id)
         .await
-        .map_err(internal)?;
+        .map_err(|_| unauthorized())?;
     Ok(Json(json!({
         "challenge_id": challenge.id,
         "nonce": hex::encode(challenge.nonce),
@@ -99,6 +101,7 @@ pub(crate) async fn auth_challenge(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LoginReq {
     device_id: Uuid,
     challenge_id: Uuid,
@@ -268,6 +271,7 @@ pub(crate) async fn unlock_pending(
 /// A device-signed approval: a hex Ed25519 signature over a pending nonce. Shared
 /// by the unlock flow and the agent pending-action approval.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApproveReq {
     /// Hex-encoded Ed25519 signature over the request nonce.
     pub(crate) signature: String,

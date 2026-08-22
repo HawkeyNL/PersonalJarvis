@@ -1,9 +1,10 @@
 // Small API client. Uses the Tauri HTTP plugin so requests are routed through
-// Rust (no webview CORS restrictions). The base URL is configurable so a real
-// device can later point at the Mac's LAN address instead of localhost.
+// Rust (no webview CORS restrictions). Configure a release with
+// VITE_JARVIS_API_BASE=https://api.example.com; development remains local.
 import { fetch } from "@tauri-apps/plugin-http";
 
-export const API_BASE = "http://localhost:8080";
+const configuredApiBase = import.meta.env.VITE_JARVIS_API_BASE?.trim();
+export const API_BASE = (configuredApiBase || "http://localhost:8080").replace(/\/$/, "");
 
 /** An HTTP error carrying the status code, so callers can react to e.g. 401. */
 export class ApiError extends Error {

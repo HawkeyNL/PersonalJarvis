@@ -31,6 +31,8 @@ pub struct AuthLimits {
     pub login_per_min: u32,
     pub login_max_failures: u32,
     pub login_lock_secs: u64,
+    pub authenticated_per_min: u32,
+    pub llm_per_min: u32,
 }
 
 impl Default for AuthLimits {
@@ -41,6 +43,8 @@ impl Default for AuthLimits {
             login_per_min: 20,
             login_max_failures: 5,
             login_lock_secs: 300,
+            authenticated_per_min: 300,
+            llm_per_min: 20,
         }
     }
 }
@@ -53,6 +57,8 @@ pub struct RateLimiter {
     /// separate from `hits` so a successful call can clear a caller's penalty.
     failures: Mutex<HashMap<String, (Instant, u32)>>,
 }
+
+const MAX_TRACKED_KEYS: usize = 4096;
 
 impl RateLimiter {
     pub fn new() -> Self {
@@ -67,8 +73,13 @@ impl RateLimiter {
         let mut map = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         // Opportunistic prune so the map cannot grow without bound over long
         // uptimes (otherwise bounded only by the number of distinct clients).
-        if map.len() > 4096 {
+        if map.len() >= MAX_TRACKED_KEYS {
             map.retain(|_, (start, _)| now.duration_since(*start) < window);
+            if map.len() >= MAX_TRACKED_KEYS && !map.contains_key(key) {
+                // Fail closed instead of allowing an attacker to grow the
+                // in-process limiter without bound via unique source keys.
+                return false;
+            }
         }
         let entry = map.entry(key.to_string()).or_insert((now, 0));
         if now.duration_since(entry.0) >= window {
@@ -83,6 +94,12 @@ impl RateLimiter {
     pub fn note_failure(&self, key: &str, window: Duration) -> u32 {
         let now = Instant::now();
         let mut map = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= MAX_TRACKED_KEYS {
+            map.retain(|_, (start, _)| now.duration_since(*start) < window);
+            if map.len() >= MAX_TRACKED_KEYS && !map.contains_key(key) {
+                return 0;
+            }
+        }
         let entry = map.entry(key.to_string()).or_insert((now, 0));
         if now.duration_since(entry.0) >= window {
             *entry = (now, 0);
@@ -154,15 +171,32 @@ pub(crate) fn client_ip(req: &Request, trusted_hops: u32, trusted_peers: &[IpAdd
 }
 
 /// The shared 429 response for any auth throttle.
-fn too_many_requests() -> Response {
+pub(crate) fn too_many_requests() -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, "60")],
         Json(json!({
             "error": "rate limited",
             "hint": "te veel pogingen; probeer het straks opnieuw",
         })),
     )
         .into_response()
+}
+
+/// Rate-limit an authenticated device. IP limits still protect anonymous
+/// traffic; this independent key prevents a single valid device from evading
+/// cost and workload controls by changing networks.
+pub(crate) fn allow_authenticated_device(
+    state: &AppState,
+    device_id: uuid::Uuid,
+    profile: &str,
+    per_min: u32,
+) -> bool {
+    state.rate_limiter.check(
+        &format!("{profile}:device:{device_id}"),
+        per_min,
+        Duration::from_secs(60),
+    )
 }
 
 /// Rate limiting for auth endpoints. A flat per-endpoint limit throttles all

@@ -6,9 +6,9 @@ operated Docker service; Core is deliberately not part of the Docker stack and
 does not receive Docker, root, or arbitrary-shell access.
 
 Do these steps from a trusted administrator session on the Ubuntu Desktop LTS
-Home Node. Remote access must already use RivetLink or another verified private
-network; do not expose SSH, the API, SurrealDB, RDP/VNC, or the Docker socket to
-the public internet.
+Home Node. SSH, SurrealDB, RDP/VNC, Codex and the Docker socket remain private.
+The only approved public application ingress is Caddy on TCP 443, as documented
+in [ADR-038](../../decisions/ADR-038-PUBLIC-HTTPS-INGRESS.md).
 
 ## 0. Do not deploy before this gate is green
 
@@ -187,19 +187,80 @@ JARVIS_AGENT_ENABLED=false
 JARVIS_AGENT_CLAUDE_CODE_ENABLED=false
 JARVIS_AGENT_WORKSPACE_ROOT=
 
-# No reverse proxy configured: ignore all X-Forwarded-For headers.
-JARVIS_TRUSTED_PROXY_HOPS=0
-JARVIS_TRUSTED_PROXY_IPS=
+# Caddy is the sole public ingress and directly connects over loopback. Core
+# trusts forwarding headers only from those exact direct peers.
+JARVIS_TRUSTED_PROXY_HOPS=1
+JARVIS_TRUSTED_PROXY_IPS=127.0.0.1,::1
+JARVIS_PUBLIC_HOSTNAME=api.example.com
+
+# Per-device controls complement the anonymous per-IP auth throttles.
+JARVIS_AUTHENTICATED_RATE_PER_MIN=300
+JARVIS_LLM_RATE_PER_MIN=20
 ```
 
 Add an LLM provider key only if it is needed. Empty provider keys are safer than
 copying development credentials. Confirm its absence from shell history and logs.
 
-RivetLink is not automatically a trusted HTTP proxy. Leave the proxy settings at
-zero unless a specific reverse proxy directly connects to Core. In that case, set
-the exact number of hops and direct proxy IPs; that proxy must overwrite any
-incoming `X-Forwarded-For` header. Core refuses to start when hops are enabled
-without an IP allowlist.
+RivetLink is not an HTTP proxy. Do not add it to the trusted-proxy allowlist.
+For this deployment Caddy is the only trusted direct peer; do not add a CDN or
+another proxy without a separate forwarding-header review. Core refuses startup
+when production attempts to bind a non-loopback socket or proxy hops lack an IP
+allowlist.
+
+## 3a. Public HTTPS ingress (Caddy, TCP 443 only)
+
+Do this only after Core and SurrealDB pass the local checks. The owner, not the
+repository, controls the router and DNS:
+
+1. Reserve a fixed LAN IP for the Home Node.
+2. Check whether the connection has a real public IPv4 address (not CGNAT).
+   For IPv6, publish AAAA only when the host firewall is equally strict.
+3. Create an A (and optional AAAA) record for `api.<owner-domain>` pointing to
+   that address. A dynamic connection may use any provider's DDNS updater; run
+   that updater as its own root-managed service with a low-TTL record, never in
+   Jarvis and never with DNS credentials in `core.env`.
+4. Forward **TCP 443 only** on the router to the Home Node. Do not forward 80,
+   8080, 8000, SSH, Docker, Codex, broker, metrics, RDP or VNC ports. Do not
+   enable UPnP/NAT-PMP for Jarvis.
+
+Install the normal Ubuntu Caddy package, then install the reviewed template and
+its public (non-secret) hostname file:
+
+```bash
+sudo apt update
+sudo apt install caddy
+sudo install -d -o root -g root -m 0755 /etc/systemd/system/caddy.service.d
+sudo install -o root -g root -m 0644 deploy/caddy/caddy.service.d-jarvis.conf \
+  /etc/systemd/system/caddy.service.d/jarvis.conf
+sudo install -o root -g root -m 0644 deploy/caddy/jarvis-public.env.example \
+  /etc/jarvis/public.env
+sudoedit /etc/jarvis/public.env
+sudo install -o root -g root -m 0644 deploy/caddy/Caddyfile /etc/caddy/Caddyfile
+sudo systemctl daemon-reload
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo systemctl enable --now caddy
+```
+
+The template uses TLS-ALPN-01 and disables HTTP-01, so Caddy obtains and renews
+certificates over port 443. Do not test repeatedly against production ACME while
+DNS or port forwarding is incomplete. Caddy's certificate storage is persistent
+system state; include it in the host configuration backup, not in a repository.
+
+Apply a minimal UFW baseline (adapt the private management subnet before
+allowing SSH; omitting the SSH rule is preferred):
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow 443/tcp comment 'Jarvis Caddy HTTPS'
+# Optional private administration only; never use a broad public SSH rule.
+sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp comment 'LAN SSH'
+sudo ufw enable
+sudo ufw status verbose
+```
+
+The public probes `/livez` and `/readyz` deliberately return only generic
+status. All detailed diagnostics stay behind device-bound authentication.
 
 ## 4. Install and start the systemd unit
 
@@ -243,6 +304,31 @@ curl --fail http://127.0.0.1:8080/livez
 curl --fail http://127.0.0.1:8080/readyz
 sudo systemctl show jarvis-core -p User -p NoNewPrivileges -p CapabilityBoundingSet -p ProtectSystem
 ```
+
+Then verify Caddy locally and from an external mobile connection:
+
+```bash
+curl --fail --proto '=https' "https://api.example.com/livez"
+curl --fail --proto '=https' "https://api.example.com/readyz"
+sudo ss -ltnp '( sport = :443 or sport = :8080 or sport = :8000 )'
+sudo systemctl reboot
+```
+
+After reboot, repeat both health checks. With phone Wi-Fi disabled, log in with
+an already trusted device, send a chat, then verify a bad signature, revoked
+device and revoked session fail. Check `journalctl -u jarvis-core -b` and the
+authenticated security audit. External port scans must show 443 only; check
+SSH independently from a network outside the LAN before considering it private.
+
+### Enrollment before public exposure
+
+`POST /v1/auth/enroll` is intentionally disabled in production. Before opening
+443, enrol the first owner device from a trusted local console or existing
+private-network administration session while the service is in a controlled
+development/bootstrap state, then restore `JARVIS_ENVIRONMENT=production` and
+start Core through systemd. Do not expose that bootstrap process through Caddy.
+Each later device requires a separately reviewed pairing flow; do not re-enable
+public enrollment as a shortcut.
 
 Confirm externally only through the authorised private-network path. Do not solve
 connectivity failures by binding `0.0.0.0`, disabling the firewall, or trusting

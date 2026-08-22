@@ -8,7 +8,10 @@
 // from `load()` for ergonomics; boxing it would break `?` in anyhow callers.
 #![allow(clippy::result_large_err)]
 
-use std::{fmt, net::IpAddr};
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 
 use figment::{
     providers::{Env, Format, Toml},
@@ -42,6 +45,12 @@ pub struct AppConfig {
     /// Deployment environment name (e.g. `development`, `production`).
     #[serde(default = "default_environment")]
     pub environment: String,
+
+    /// Public DNS name served by the local HTTPS reverse proxy. This is
+    /// deployment metadata for Caddy and must never contain a URL, path, or
+    /// credential. Empty keeps a private/local deployment possible.
+    #[serde(default)]
+    pub public_hostname: String,
 
     /// Base URL of the IBKR Client Portal Gateway (read-only proxy target).
     #[serde(default = "default_ibkr_gateway_url")]
@@ -187,6 +196,12 @@ pub struct AppConfig {
     /// Lockout window (seconds) for repeated failed logins.
     #[serde(default = "default_auth_login_lock_secs")]
     pub auth_login_lock_secs: u64,
+    /// Max authenticated requests per device per minute.
+    #[serde(default = "default_authenticated_rate")]
+    pub authenticated_rate_per_min: u32,
+    /// Max LLM/chat requests per authenticated device per minute.
+    #[serde(default = "default_llm_rate")]
+    pub llm_rate_per_min: u32,
 
     /// Trusted proxy hops in front of the API. 0 (default) ⇒ never trust
     /// `X-Forwarded-For`; use the socket peer address for rate-limit/audit keys.
@@ -202,7 +217,7 @@ pub struct AppConfig {
 }
 
 fn default_bind_addr() -> String {
-    "0.0.0.0:8080".to_string()
+    "127.0.0.1:8080".to_string()
 }
 
 fn default_surreal_namespace() -> String {
@@ -281,6 +296,14 @@ fn default_auth_login_max_failures() -> u32 {
 
 fn default_auth_login_lock_secs() -> u64 {
     300
+}
+
+fn default_authenticated_rate() -> u32 {
+    300
+}
+
+fn default_llm_rate() -> u32 {
+    20
 }
 
 fn default_claude_code_bin() -> String {
@@ -371,6 +394,38 @@ impl AppConfig {
         }
         Ok(peers)
     }
+
+    /// Validate deployment invariants that must fail closed before the server
+    /// opens a socket. Public TLS terminates at Caddy; production Core is never
+    /// allowed to become a directly reachable HTTP listener.
+    pub fn validate_runtime_security(&self) -> Result<(), String> {
+        if self.environment.eq_ignore_ascii_case("production") {
+            let bind_addr: SocketAddr = self
+                .bind_addr
+                .parse()
+                .map_err(|_| "JARVIS_BIND_ADDR must be an IP socket address in production")?;
+            if !bind_addr.ip().is_loopback() {
+                return Err(
+                    "production JARVIS_BIND_ADDR must use a loopback address; expose HTTPS only through Caddy"
+                        .to_string(),
+                );
+            }
+            if self.trusted_proxy_hops > 1 {
+                return Err(
+                    "production supports only the single directly connected Caddy proxy"
+                        .to_string(),
+                );
+            }
+        }
+
+        if !self.public_hostname.is_empty()
+            && (!self.public_hostname.is_ascii()
+                || self.public_hostname.contains(['/', ':', '@', ' ']))
+        {
+            return Err("JARVIS_PUBLIC_HOSTNAME must be a bare DNS hostname".to_string());
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for AppConfig {
@@ -384,6 +439,7 @@ impl fmt::Debug for AppConfig {
             .field("surreal_password", &redact(&self.surreal_password))
             .field("log_json", &self.log_json)
             .field("environment", &self.environment)
+            .field("public_hostname", &self.public_hostname)
             .field("ibkr_gateway_url", &self.ibkr_gateway_url)
             .field("llm_provider", &self.llm_provider)
             .field(
@@ -420,6 +476,11 @@ impl fmt::Debug for AppConfig {
             .field("agent_claude_code_enabled", &self.agent_claude_code_enabled)
             .field("agent_claude_code_bin", &self.agent_claude_code_bin)
             .field("agent_claude_code_model", &self.agent_claude_code_model)
+            .field(
+                "authenticated_rate_per_min",
+                &self.authenticated_rate_per_min,
+            )
+            .field("llm_rate_per_min", &self.llm_rate_per_min)
             .field("trusted_proxy_hops", &self.trusted_proxy_hops)
             .field("trusted_proxy_ips", &self.trusted_proxy_ips)
             .finish()
@@ -433,7 +494,7 @@ mod tests {
     #[test]
     fn debug_redacts_the_database_password() {
         let cfg = AppConfig {
-            bind_addr: "0.0.0.0:8080".to_string(),
+            bind_addr: "127.0.0.1:8080".to_string(),
             surreal_endpoint: "127.0.0.1:8000".to_string(),
             surreal_namespace: "jarvis".to_string(),
             surreal_database: "core".to_string(),
@@ -441,6 +502,7 @@ mod tests {
             surreal_password: "supersecret".to_string(),
             log_json: false,
             environment: "test".to_string(),
+            public_hostname: String::new(),
             ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
             llm_provider: "anthropic".to_string(),
             llm_api_key: "sk-ant-supersecretkey".to_string(),
@@ -479,6 +541,8 @@ mod tests {
             auth_rate_login_per_min: 20,
             auth_login_max_failures: 5,
             auth_login_lock_secs: 300,
+            authenticated_rate_per_min: 300,
+            llm_rate_per_min: 20,
             trusted_proxy_hops: 0,
             trusted_proxy_ips: String::new(),
         };
@@ -527,6 +591,26 @@ mod tests {
             jail.set_env("JARVIS_TRUSTED_PROXY_IPS", "127.0.0.1,::1");
             let cfg = AppConfig::load()?;
             assert_eq!(cfg.trusted_proxy_ips()?.len(), 2);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn production_requires_a_loopback_listener() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("JARVIS_SURREAL_ENDPOINT", "127.0.0.1:8000");
+            jail.set_env("JARVIS_SURREAL_USERNAME", "core");
+            jail.set_env("JARVIS_SURREAL_PASSWORD", "test-password");
+            jail.set_env("JARVIS_ENVIRONMENT", "production");
+            jail.set_env("JARVIS_BIND_ADDR", "0.0.0.0:8080");
+            assert!(AppConfig::load()?.validate_runtime_security().is_err());
+
+            jail.set_env("JARVIS_BIND_ADDR", "127.0.0.1:8080");
+            assert!(AppConfig::load()?.validate_runtime_security().is_ok());
+
+            jail.set_env("JARVIS_TRUSTED_PROXY_HOPS", "2");
+            jail.set_env("JARVIS_TRUSTED_PROXY_IPS", "127.0.0.1");
+            assert!(AppConfig::load()?.validate_runtime_security().is_err());
             Ok(())
         });
     }

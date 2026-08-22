@@ -1,0 +1,34 @@
+# Public Jarvis HTTPS ingress for the Ubuntu Home Node.
+#
+# Install this as /etc/caddy/Caddyfile and set JARVIS_PUBLIC_HOSTNAME through
+# the accompanying systemd drop-in. It intentionally uses TLS-ALPN-01 only, so
+# the router and firewall need to expose TCP 443 — never port 8080 or port 80.
+{
+	# Do not create an HTTP listener solely to redirect traffic. HTTP is not a
+	# supported public Jarvis transport.
+	auto_https disable_redirects
+}
+
+{$JARVIS_PUBLIC_HOSTNAME} {
+	# TLS-ALPN-01 validates on TCP 443. Disabling HTTP-01 makes the one-public-
+	# port requirement explicit instead of relying on firewall failure.
+	tls {
+		issuer acme {
+			disable_http_challenge
+		}
+	}
+
+	# The API is native-client oriented. It deliberately sets no browser CORS
+	# policy; Tauri uses its native HTTP plugin and bearer credentials are never
+	# made available to arbitrary web origins.
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Caddy overwrites incoming X-Forwarded-* by default when it is the first
+	# proxy. jarvis-api trusts these only from its loopback peer.
+	reverse_proxy 127.0.0.1:8080
+}

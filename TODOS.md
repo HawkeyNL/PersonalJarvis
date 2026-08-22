@@ -75,7 +75,7 @@
 ### JAR-051 — Language agents
 - [ ] Rust
 - [ ] TypeScript/Vue/Tauri
-- [ ] SQL/PostgreSQL
+- [ ] SurrealDB schema/persistence
 - [ ] Python Research
 - [ ] MQL5
 - [ ] Infrastructure
@@ -213,16 +213,16 @@ Status: `[ ] TODO`, `[-] IN PROGRESS`, `[x] DONE`, `[!] BLOCKED`, `[?] NEEDS DEC
 
 ## P2A — Memory Platform
 
-### JAR-250 — PostgreSQL memory schema
+### JAR-250 — SurrealDB memory schema
 - [ ] Status: TODO
 - Owner: Memory Agent
 - Dependencies: JAR-002
 - Acceptatie:
   - memories, entities, summaries en source references
-  - typed fields plus JSONB metadata
-  - migrations en indexes
+  - typed fields plus schema-controlled metadata
+  - versioned baseline en indexes
 
-### JAR-251 — pgvector integration
+### JAR-251 — SurrealDB vector integration
 - [ ] Status: TODO
 - Owner: Memory Agent
 - Dependencies: JAR-250
@@ -305,7 +305,7 @@ Status: `[ ] TODO`, `[-] IN PROGRESS`, `[x] DONE`, `[!] BLOCKED`, `[?] NEEDS DEC
 - [ ] summary-only defaults
 
 ### JAR-272 — Observatory persistence
-- [ ] PostgreSQL event storage
+- [ ] SurrealDB event storage
 - [ ] retention
 - [ ] replay queries
 

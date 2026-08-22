@@ -17,7 +17,7 @@ Geen medium/high-impact wijziging gaat rechtstreeks van verzoek naar code.
 # Stappenplan
 
 ## 1. Werkende lege applicatie
-Rust workspace, Tauri, Axum, PostgreSQL, Docker, CI en logging.
+Rust workspace, Tauri, Axum, SurrealDB, Docker, CI en logging.
 
 ## 2. Identity en sync
 Users, devices, sessions, keychain, SQLite-cache en cursor-sync.

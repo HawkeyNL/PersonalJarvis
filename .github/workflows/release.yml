@@ -17,20 +17,6 @@ jobs:
   release:
     name: Verify and publish Linux release
     runs-on: ubuntu-24.04
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-    env:
-      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
 
@@ -52,11 +38,35 @@ jobs:
       - name: Tests
         run: cargo test --all
 
+      - name: SurrealDB persistence security tests
+        run: |
+          docker run --detach --rm --name jarvis-surreal-test -p 127.0.0.1:8000:8000 \
+            surrealdb/surrealdb:v2.6.5 start --bind 0.0.0.0:8000 --user root --pass test-root-password memory
+          for attempt in $(seq 1 20); do
+            curl --fail --silent http://127.0.0.1:8000/health && break
+            sleep 1
+          done
+          JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 \
+          JARVIS_SURREAL_TEST_USER=root \
+          JARVIS_SURREAL_TEST_PASS=test-root-password \
+          cargo test -p jarvis-identity surreal::tests::challenge_login_cannot_be_replayed -- --ignored
+          JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 \
+          JARVIS_SURREAL_TEST_USER=root \
+          JARVIS_SURREAL_TEST_PASS=test-root-password \
+          cargo test -p jarvis-portfolio surreal::tests::preserves_decimal_holdings_and_owner_scope -- --ignored
+          JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 \
+          JARVIS_SURREAL_TEST_USER=root \
+          JARVIS_SURREAL_TEST_PASS=test-root-password \
+          cargo test -p jarvis-api --test surreal_api -- --ignored
+
       - name: Home Node updater safety fixtures
         run: sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-update-core-release.sh
 
       - name: Codex worktree isolation fixtures
         run: sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-prepare-codex-worktree.sh
+
+      - name: Public-ingress template safety checks
+        run: bash deploy/caddy/tests/test-caddy-template.sh
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked

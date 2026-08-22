@@ -38,7 +38,10 @@ SurrealDB is the durable source of truth. Redis is for ephemeral state, caching,
 
 ```text
 Internet
-   X  no direct SSH/admin exposure
+   |
+   +--> TCP 443 only --> Caddy --> 127.0.0.1:8080 jarvis-api
+
+   X  no direct SSH/admin/database/Codex exposure
 
 Private VPN / trusted network
    |
@@ -62,9 +65,9 @@ Only the interfaces that are explicitly required should be reachable. Database p
 |---|---|---|---|
 | Jarvis Core | systemd | automatic | SurrealDB/files |
 | SurrealDB | Docker | unless-stopped | Docker volume |
-| Redis | Docker | unless-stopped | ephemeral/persistent only when justified |
-| Workers | Docker | task-specific | temporary + durable results in SurrealDB |
-| Monitoring | Docker | unless-stopped | metrics volumes |
+| Redis | not deployed | n/a | add only after a demonstrated need |
+| Workers | not deployed | n/a | add only after a demonstrated need |
+| Monitoring | not deployed | n/a | authenticated diagnostics first |
 | Claude Code | host task runner | task-scoped | isolated worktree |
 | Codex | host task runner | task-scoped | isolated worktree |
 
@@ -85,7 +88,12 @@ Jarvis should request privileged operations from a narrow updater/guardian capab
 
 ## Backups
 
-Back up SurrealDB independently from Docker container lifecycle. Keep at least one recent local backup and one separate backup target. Never rely on a container volume alone as the backup strategy.
+Back up SurrealDB independently from Docker container lifecycle. Keep at least one
+recent encrypted local backup and one encrypted separate backup target. Restore
+into an isolated SurrealDB instance and verify device login before relying on a
+backup. Include `/etc/jarvis` and Caddy's persistent certificate state, but do
+not copy plaintext secrets to an unencrypted destination. Never rely on a
+container volume alone as the backup strategy.
 
 ## Future local AI
 

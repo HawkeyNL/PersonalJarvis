@@ -45,6 +45,10 @@ grep -qx 'JARVIS_ENVIRONMENT=production' /etc/jarvis/core.env || {
     echo "JARVIS_ENVIRONMENT must be production" >&2
     exit 1
 }
+grep -Eq '^JARVIS_BIND_ADDR=(127\.0\.0\.1|\[::1\]):[0-9]+$' /etc/jarvis/core.env || {
+    echo "production JARVIS_BIND_ADDR must bind only 127.0.0.1 or [::1]" >&2
+    exit 1
+}
 grep -qx 'JARVIS_AGENT_ENABLED=false' /etc/jarvis/core.env || {
     echo "agent execution must remain disabled for the initial deployment" >&2
     exit 1
@@ -63,6 +67,10 @@ hops=$(sed -n 's/^JARVIS_TRUSTED_PROXY_HOPS=//p' /etc/jarvis/core.env | tail -n 
 ips=$(sed -n 's/^JARVIS_TRUSTED_PROXY_IPS=//p' /etc/jarvis/core.env | tail -n 1)
 if [[ ${hops:-0} != 0 && -z ${ips:-} ]]; then
     echo "trusted proxy hops require JARVIS_TRUSTED_PROXY_IPS" >&2
+    exit 1
+fi
+if [[ ${hops:-0} != 0 && ${hops:-0} != 1 ]]; then
+    echo "the single local Caddy ingress requires JARVIS_TRUSTED_PROXY_HOPS=1" >&2
     exit 1
 fi
 

@@ -52,11 +52,12 @@ OpenTelemetry over:
 
 ## Back-ups
 
-- dagelijkse encrypted Postgres backup;
-- point-in-time recovery waar haalbaar;
+- dagelijkse encrypted SurrealDB-export/backup;
+- herstel naar een geïsoleerde SurrealDB-instance testen;
 - object storage versioning;
 - kwartaalgewijze restore test;
 - secrets apart back-uppen;
+- Home-Node-configuratie en Caddy-certificaatstaat apart en versleuteld bewaren;
 - Windows VPS-config en EA-code in Git, niet alleen image backup.
 
 ## Incident runbooks

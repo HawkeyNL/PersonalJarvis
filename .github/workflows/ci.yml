@@ -59,6 +59,9 @@ jobs:
       - name: Codex worktree isolation fixtures
         run: sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-prepare-codex-worktree.sh
 
+      - name: Public-ingress template safety checks
+        run: bash deploy/caddy/tests/test-caddy-template.sh
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
@@ -68,5 +71,19 @@ jobs:
       - name: Dependency vulnerability audit
         run: cargo audit
 
+  frontend:
+    name: Jarvis app — typecheck and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: jarvis-app/package-lock.json
+      - name: Install locked client dependencies
+        run: npm ci --prefix jarvis-app
+      - name: Typecheck and build client
+        run: npm run build --prefix jarvis-app
+
   # TODO (JAR-057): secret scan, SBOM and container scan.
-  # TODO (JAR-051): frontend typecheck/lint/test once apps/desktop lands.

@@ -1,6 +1,6 @@
 # Jarvis Personal AI Operating System Blueprint
 
-# Jarvis Blueprint v2.2
+# Jarvis Blueprint v2.6
 
 Deze repository is het centrale besturingsdocument voor mensen en coding-agents.
 
@@ -41,6 +41,11 @@ De API luistert op **`http://localhost:8080`** (`JARVIS_BIND_ADDR` in `.env`). D
 Core gebruikt uitsluitend de database-scoped SurrealDB-account uit `.env`; geef
 hem nooit het SurrealDB-rootwachtwoord.
 Snel testen: `curl http://localhost:8080/livez` en `curl http://localhost:8080/readyz`.
+
+Voor de Ubuntu Home Node bindt de API verplicht alleen op loopback en verzorgt
+Caddy TLS op `https://api.example.com`; zie de
+[productierunbook](deploy/systemd/README.md) en [ADR-038](decisions/ADR-038-PUBLIC-HTTPS-INGRESS.md).
+De clientbasis-URL is bij de build instelbaar via `VITE_JARVIS_API_BASE`.
 
 Belangrijkste endpoints:
 

@@ -12,6 +12,10 @@ use jarvis_speech as speech;
 use crate::error::{bad_request, speech_err};
 use crate::{AppState, Authed};
 
+/// At most five minutes of 48 kHz mono PCM. This is deliberately far above a
+/// normal voice command while bounding decode, embedding and transcription work.
+const MAX_AUDIO_SAMPLES: usize = 240_000;
+
 fn encode_embedding(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
@@ -46,8 +50,11 @@ pub(crate) struct AudioReq {
 }
 
 fn to_audio(req: AudioReq) -> Result<speech::Audio, (StatusCode, Json<Value>)> {
-    if req.pcm.is_empty() {
+    if req.pcm.is_empty() || req.pcm.len() > MAX_AUDIO_SAMPLES {
         return Err(bad_request("audio is required"));
+    }
+    if !(8_000..=48_000).contains(&req.sample_rate) {
+        return Err(bad_request("invalid sample_rate"));
     }
     Ok(speech::Audio::new(req.pcm, req.sample_rate))
 }
