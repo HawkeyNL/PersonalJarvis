@@ -60,11 +60,13 @@ target="${WORKTREE_PARENT}/${task_id}"
 
 created_worktree=false
 cleanup() {
-  if [[ "${created_worktree}" == true ]]; then
+  local exit_status=$?
+  if [[ "${exit_status}" -ne 0 && "${created_worktree}" == true ]]; then
     git -C "${source_checkout}" worktree remove --force "${target}" || true
   fi
+  exit "${exit_status}"
 }
-trap cleanup ERR
+trap cleanup EXIT
 
 git -C "${source_checkout}" worktree add --detach "${target}" "${commit}"
 created_worktree=true
@@ -94,5 +96,5 @@ for protected in "${PROTECTED_PATHS[@]}"; do
   chattr -R +i "${protected_path}"
 done
 
-trap - ERR
+trap - EXIT
 echo "${target}"
