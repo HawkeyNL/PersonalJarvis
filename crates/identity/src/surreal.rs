@@ -386,15 +386,15 @@ pub async fn approve_pairing_request(
     let response = db
         .query(
             "BEGIN TRANSACTION; \
-             LET $claim = UPDATE ONLY device_pairing_requests:$id \
+             LET $claim = UPDATE device_pairing_requests \
                SET status = 'approved', approved_by_device_id = $approver_device_id, resolved_at = time::now() \
-               WHERE user_id = $user_id AND status = 'pending' AND expires_at > time::now() RETURN AFTER; \
-             IF !$claim { THROW 'pairing request unavailable'; }; \
+               WHERE record::id(id) = $id AND user_id = $user_id AND status = 'pending' AND expires_at > time::now() RETURN AFTER; \
+             IF array::len($claim) = 0 { THROW 'pairing request unavailable'; }; \
              CREATE devices SET id = $device_id, user_id = $user_id, name = $name, platform = $platform, \
                status = 'active', created_at = time::now(), updated_at = time::now(); \
              CREATE device_keys SET id = $key_id, device_id = $device_id, algorithm = 'ed25519', \
                public_key = <bytes>$public_key, created_at = time::now(), revoked_at = NONE; \
-             UPDATE ONLY device_pairing_requests:$id SET activated_device_id = $device_id; \
+             UPDATE device_pairing_requests SET activated_device_id = $device_id WHERE record::id(id) = $id; \
              COMMIT TRANSACTION;",
         )
         .bind(DeviceKeyBindings {
