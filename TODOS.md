@@ -143,6 +143,22 @@ Status: `[ ] TODO`, `[-] IN PROGRESS`, `[x] DONE`, `[!] BLOCKED`, `[?] NEEDS DEC
 
 ## P1A — Home Node and Device Mesh
 
+### JAR-159 — OpenSandbox execution boundary
+- [-] Provider-/profilefundering en fail-closed policy-grens gebouwd (ADR-040).
+- [-] Pinned loopback-, proxy-auth-, private-DNS-egress- en sidecar-hardening-
+  patches en het private control-plane-manifest staan klaar;
+  activeer workloaduitvoering pas na Ubuntu/Kata-bewijs van loopback-only
+  managerpaden, egress-deny en adversarial tests.
+- [x] CI bewaakt de statische control-plane-invarianten (geen publieke poort,
+  loopback-default, geen workload socket/binds en verplichte proxy-auth).
+- [x] CI past de patches ook toe op de vaste upstream-commit en draait de
+  private-DNS-egress-regressietest met de upstream-Go-toolchain.
+- [x] De OpenSandbox-unit weigert starten zonder gevalideerde, immutable
+  Python- en uv-base-image-digests.
+- [x] Het OpenSandbox control-plane-credential is root-only (`0600`), niet
+  leesbaar voor `jarvis-core`.
+- [x] Egress-sidecars hebben vaste CPU-, geheugen-, PID- en privilegegrenzen.
+
 ### JAR-150 — Buy and install Home Node
 - [ ] choose ASUS NUC 14 Pro or reputable N100/N150 mini PC
 - [ ] 32 GB RAM target

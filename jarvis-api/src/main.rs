@@ -171,18 +171,19 @@ async fn main() -> anyhow::Result<()> {
             None
         } else {
             match jarvis_agent::Sandbox::new(root) {
-                Ok(mut sb) => {
-                    // Second, deliberate opt-in: the Claude Code executor (4c).
+                Ok(sb) => {
+                    // Direct host-process Claude Code is intentionally retired.
+                    // A future approved OpenSandbox-backed broker owns coding
+                    // execution; the flag cannot re-enable a host fallback.
                     if config.agent_claude_code_enabled {
-                        sb = sb.with_claude_code(jarvis_agent::ClaudeCodeCfg {
-                            bin: config.agent_claude_code_bin.clone(),
-                            model: config.agent_claude_code_model.clone(),
-                        });
+                        tracing::warn!(
+                            "JARVIS_AGENT_CLAUDE_CODE_ENABLED is ignored: direct execution requires OpenSandbox"
+                        );
                     }
                     tracing::info!(
                         root = %sb.root().display(),
                         enabled = config.agent_enabled,
-                        claude_code = config.agent_claude_code_enabled,
+                        claude_code = false,
                         "agent sandbox ready"
                     );
                     Some(Arc::new(sb))
@@ -198,9 +199,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(
             "AGENTIC EXECUTION IS ENABLED (mutaties achter getekende goedkeuring, ADR-029 4a/4b)"
         );
-        if config.agent_claude_code_enabled {
-            tracing::warn!("CLAUDE CODE EXECUTOR IS ENABLED (4c) — Jarvis mag bestanden bewerken via headless claude, achter goedkeuring");
-        }
     }
 
     let trusted_proxy_ips = config.trusted_proxy_ips().map_err(anyhow::Error::msg)?;

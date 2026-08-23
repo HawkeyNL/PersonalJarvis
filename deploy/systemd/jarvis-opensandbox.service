@@ -1,0 +1,33 @@
+[Unit]
+Description=Jarvis OpenSandbox private control plane
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+ConditionPathExists=/etc/jarvis/opensandbox.env
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/jarvis/opensandbox
+Environment=JARVIS_OPENSANDBOX_ENV_FILE=/etc/jarvis/opensandbox.env
+EnvironmentFile=/etc/jarvis/opensandbox.env
+ExecStartPre=/usr/local/libexec/jarvis/validate-opensandbox-env
+ExecStart=/usr/bin/docker compose -f /opt/jarvis/opensandbox/docker-compose.yml up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f /opt/jarvis/opensandbox/docker-compose.yml down
+RemainAfterExit=yes
+TimeoutStartSec=2min
+TimeoutStopSec=1min
+UMask=0077
+
+# This service is intentionally privileged because the trusted OpenSandbox
+# control plane needs the Docker socket. It is never used by jarvis-core and
+# must never be exposed through Caddy or a public port.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/docker /run/docker.sock
+
+[Install]
+WantedBy=multi-user.target

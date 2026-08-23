@@ -68,6 +68,36 @@ jobs:
       - name: Public-ingress template safety checks
         run: bash deploy/caddy/tests/test-caddy-template.sh
 
+      - name: OpenSandbox template safety checks
+        run: bash deploy/opensandbox/tests/test-opensandbox-template.sh
+
+      - name: Verify pinned OpenSandbox patches and egress regression test
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
+
+      - name: Apply pinned OpenSandbox patches
+        env:
+          OPENSANDBOX_COMMIT: 6b2023e9b7eb80a940d88e6ae05fcbc0eb0cf23f
+        run: |
+          set -euo pipefail
+          sandbox_source=$(mktemp -d)
+          trap 'rm -rf "$sandbox_source"' EXIT
+          git clone --no-checkout https://github.com/opensandbox-group/OpenSandbox.git "$sandbox_source"
+          git -C "$sandbox_source" fetch --depth=1 origin "$OPENSANDBOX_COMMIT"
+          git -C "$sandbox_source" checkout --detach FETCH_HEAD
+          test "$(git -C "$sandbox_source" rev-parse HEAD)" = "$OPENSANDBOX_COMMIT"
+          git -C "$sandbox_source" apply --check deploy/opensandbox/patches/0001-loopback-published-ports.patch
+          git -C "$sandbox_source" apply deploy/opensandbox/patches/0001-loopback-published-ports.patch
+          git -C "$sandbox_source" apply --check deploy/opensandbox/patches/0002-egress-private-range-deny.patch
+          git -C "$sandbox_source" apply deploy/opensandbox/patches/0002-egress-private-range-deny.patch
+          git -C "$sandbox_source" apply --check deploy/opensandbox/patches/0003-egress-sidecar-hardening.patch
+          git -C "$sandbox_source" apply deploy/opensandbox/patches/0003-egress-sidecar-hardening.patch
+          git -C "$sandbox_source" apply --check deploy/opensandbox/patches/0004-egress-sidecar-resource-limits.patch
+          git -C "$sandbox_source" apply deploy/opensandbox/patches/0004-egress-sidecar-resource-limits.patch
+          (cd "$sandbox_source/components/egress" && go test ./pkg/dnsproxy)
+        working-directory: ${{ github.workspace }}
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 

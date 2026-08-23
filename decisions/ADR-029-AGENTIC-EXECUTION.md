@@ -1,6 +1,8 @@
 # ADR-029 — Agentische uitvoering (Jarvis krijgt handen), veilig achter policy + goedkeuring
 
-- Status: **geaccepteerd — fase 4a + 4b + 4c + 4d gebouwd** (read-only autonoom; mutaties achter device-getekende goedkeuring; Claude Code als confined uitvoerder; zelfontwikkeling als adviseur; kill switch default uit) — 13 augustus 2026
+- Status: **gedeeltelijk superseded door ADR-040** — 4a/4b/4d blijven gebouwd;
+  de vroegere directe Claude Code-uitvoerder is hard uitgezet tot de
+  OpenSandbox-backed Codex-broker zijn runtime-gate heeft bewezen.
 - Bouwt op ADR-027 (kosten-router + registry + budget), ADR-028 (model-per-taak +
   plan→execute), de bestaande unlock/approval-flow (device-gebonden, cryptografisch),
   en `jarvis-core/Jarvis.md` §11 (Risk-Based Autonomy), §12 (Financial Safety), §13
@@ -93,21 +95,12 @@ zijn **tijdgebonden** en **actie-specifiek** (geen blanco cheque).
   het openstaande werk. De Core-bescherming geldt óók hier: nooit goedkeurbaar. api 6
   tests (nieuwe end-to-end approval-flow incl. replay-weigering + Core-weigering),
   agent 8, clippy schoon.
-- **4c — Claude Code aansturen ✅ gebouwd**: een nieuwe actie `claude_code {prompt}`
-  (óók **NeedsApproval**) drijft **headless `claude` -p** als confined uitvoerder in
-  de sandbox. Confinement is bewust op **deny-regels** gebaseerd (die gelden in élke
-  permission-mode, ook `bypassPermissions`) i.p.v. op tool-vlaggen: `--settings` met
-  een deny-lijst blokkeert de Core (`jarvis-core/**`), `.git`, secrets (`.env`/`*.pem`/
-  `*.key`/`.ssh`), de **shell (`Bash`)** en het **netwerk (`WebFetch`/`WebSearch`)** +
-  `Agent`; `--permission-mode acceptEdits` laat edits non-interactief door. `current_dir`
-  = de sandbox-root; er is **geen `--max-turns`**, dus een **harde proces-timeout (300s)**
-  begrenst de run. Geen API-key geïnjecteerd → CC draait op het **abonnement** (geen
-  metered kosten). De executor is een **tweede, bewuste opt-in**
-  (`JARVIS_AGENT_CLAUDE_CODE_ENABLED`, default **false**) bovenop de kill switch; zonder
-  dat wordt `claude_code` geweigerd. Na afloop toont Jarvis de **git-diff** + een
-  **breach-scan** (defense-in-depth: schreeuwt als een beschermd pad tóch geraakt is).
-  Loopt via de bestaande 4b-goedkeuringsmachinerie — geen nieuwe endpoints. agent 14
-  tests (+6), config 2, clippy schoon.
+- **4c — Claude Code aansturen ⏸ vervangen door ADR-040**: de vroegere directe
+  hostproces-uitvoerder bleek geen toereikende proces-/netwerkgrens voor
+  onbekende repositories. `claude_code` en de legacy featureflag worden daarom
+  hard geweigerd. Vervanging: een OpenSandbox-backed Codex-broker met dezelfde
+  device-getekende approval, disposable worktree, audit en resultaatvalidatie;
+  deze wordt pas aangesloten na de Ubuntu/Kata adversarial runtime-gate.
 - **4d — Zelfontwikkeling ✅ gebouwd**: crate `jarvis-selfdev` — een **adviseur**,
   geen uitvoerder. Endpoint `POST /v1/system/self-improve` (beveiligd, **op verzoek**;
   geen achtergrond-loop) laat Jarvis zijn **eigen ecosysteem** lezen (registry: host,

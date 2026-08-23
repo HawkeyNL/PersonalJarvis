@@ -12,7 +12,7 @@ Run these directly on Ubuntu:
 - private VPN/overlay networking
 - host firewall
 - hardware/OS monitoring
-- Claude Code and Codex CLI for controlled engineering tasks
+- the private OpenSandbox control plane for controlled engineering tasks
 
 The first Core unit is versioned at
 [`deploy/systemd/jarvis-core.service`](../deploy/systemd/jarvis-core.service).
@@ -54,7 +54,7 @@ Jarvis Core
    +--> Docker services on private networks
    +--> IBKR gateway
    +--> research providers
-   +--> Claude Code / Codex
+   +--> OpenSandbox (private control plane) → disposable coding/browser/data workloads
 ```
 
 Only the interfaces that are explicitly required should be reachable. Database ports should not be published publicly.
@@ -68,8 +68,8 @@ Only the interfaces that are explicitly required should be reachable. Database p
 | Redis | not deployed | n/a | add only after a demonstrated need |
 | Workers | not deployed | n/a | add only after a demonstrated need |
 | Monitoring | not deployed | n/a | authenticated diagnostics first |
-| Claude Code | host task runner | task-scoped | isolated worktree |
-| Codex | host task runner | task-scoped | isolated worktree |
+| OpenSandbox control plane | Docker/systemd, private loopback | automatic | disposable workloads |
+| Claude Code / Codex | inside an approved OpenSandbox workload | task-scoped | disposable worktree |
 
 ## Updates
 

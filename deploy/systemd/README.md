@@ -102,6 +102,37 @@ materialized by the future engineering-task control plane. Never put Codex
 credentials in `/etc/jarvis/core.env`, the Core systemd unit, source control,
 or an agent prompt.
 
+## Optional OpenSandbox execution isolation
+
+OpenSandbox is a supporting Docker service, not part of Jarvis Core and not a
+public API. Install it only after completing the adversarial verification gate
+in [`../opensandbox/README.md`](../opensandbox/README.md). The unit runs as
+root because its **trusted control plane** needs Docker; `jarvis-core` remains
+the unprivileged `jarvis` user and never receives Docker-group membership or a
+socket mount.
+
+From a reviewed release/check-out, install the fixed deployment directory and
+unit as root:
+
+```bash
+sudo install -d -o root -g root -m 0755 /opt/jarvis/opensandbox
+sudo cp -a deploy/opensandbox/. /opt/jarvis/opensandbox/
+sudo install -o root -g root -m 0755 deploy/opensandbox/validate-opensandbox-env.sh \
+  /usr/local/libexec/jarvis/validate-opensandbox-env
+sudo install -o root -g root -m 0644 deploy/systemd/jarvis-opensandbox.service \
+  /etc/systemd/system/jarvis-opensandbox.service
+sudo systemctl daemon-reload
+sudo systemd-analyze verify /etc/systemd/system/jarvis-opensandbox.service
+# Do not enable it before the OpenSandbox runtime gate is complete.
+sudo systemctl enable --now jarvis-opensandbox.service
+sudo systemctl status jarvis-opensandbox.service --no-pager
+```
+
+The service only reads `/etc/jarvis/opensandbox.env` (owner `root:root`, mode
+`0600`) and never exposes its API key to Jarvis Core or sandbox workloads. Verify
+`127.0.0.1:8090` and the dynamic 41000–41150 ports are loopback-only after
+every upgrade; if any listen publicly, stop and disable this unit immediately.
+
 ## 2. Stage an immutable, tagged release
 
 For a node that will receive automatic updates, bootstrap from the verified

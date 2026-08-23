@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+- Added the fail-closed `jarvis-sandbox` provider boundary and ADR-040, with an
+  authenticated loopback-only OpenSandbox control-plane candidate, bounded
+  command/output protocol, controlled task input/artifact paths, and a patched
+  DNS-to-nft path that rejects private/special-use destinations. Core wiring
+  remains disabled until Ubuntu adversarial isolation is proven.
+- Prevented the trusted OpenSandbox provider from honoring process proxy
+  environment variables, so its loopback API credential cannot be routed to an
+  accidental HTTP proxy.
+- Hardened the OpenSandbox egress sidecar with the same PID and
+  no-new-privileges constraints as workloads, while retaining only the network
+  capability needed to enforce its nft rules.
+- Removed the floating `uv` installation script from the control-plane build;
+  the builder now requires a verified immutable `uv` OCI image digest.
+- Made the OpenSandbox systemd unit reject missing or mutable Python/uv build
+  image references before it invokes Docker Compose.
+- Restricted the OpenSandbox control-plane key file to `root:root` mode `0600`;
+  Jarvis Core no longer shares group read access to that credential.
+- Added fixed CPU and memory ceilings to every OpenSandbox egress sidecar.
+- Disabled the legacy direct host-process Claude Code executor so it cannot
+  bypass the pending OpenSandbox/Codex execution boundary.
+- Added CI checks for OpenSandbox control-plane template invariants and for
+  applying the security patches to the pinned upstream source before running the
+  private-DNS egress regression test.
+
 ## v3.0 — 5 augustus 2026
 - Architecture Research en Codebase Impact Agents toegevoegd.
 - Onafhankelijke reviewers en Fix Agent-loop toegevoegd.
