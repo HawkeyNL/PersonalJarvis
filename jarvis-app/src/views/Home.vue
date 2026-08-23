@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from "vue";
 import { getJson, ApiError } from "../api";
-import { currentSession, login, clearSession, listDevices } from "../auth";
+import { currentSession, login, clearSession, listDevices, PairingPending } from "../auth";
 import ReactorCore from "../components/ReactorCore.vue";
 import JarvisConsole from "../components/JarvisConsole.vue";
 
@@ -10,7 +10,7 @@ import JarvisConsole from "../components/JarvisConsole.vue";
 // chat always has a valid session; there is no telemetry UI here anymore
 // (System/Trading tabs own that).
 const backend = ref<"checking" | "ok" | "fout">("checking");
-const auth = ref<"checking" | "in" | "uit" | "fout">("checking");
+const auth = ref<"checking" | "in" | "uit" | "wachten" | "fout">("checking");
 const online = computed(() => backend.value === "ok");
 
 let pollTimer: number | undefined;
@@ -63,8 +63,8 @@ async function refreshAuth() {
       }
     }
     auth.value = "in";
-  } catch {
-    auth.value = "fout";
+  } catch (error) {
+    auth.value = error instanceof PairingPending ? "wachten" : "fout";
   } finally {
     authTrying = false;
   }
@@ -83,6 +83,9 @@ onBeforeUnmount(() => clearInterval(pollTimer));
     <div class="backdrop">
       <ReactorCore name="Jarvis" :active="online" />
     </div>
+    <p v-if="auth === 'wachten'" class="pairing-wait">
+      Wacht op goedkeuring vanaf een vertrouwd Jarvis-apparaat.
+    </p>
     <!-- Floating conversation + hover-reveal input. -->
     <JarvisConsole />
   </section>
@@ -93,6 +96,13 @@ onBeforeUnmount(() => clearInterval(pollTimer));
   position: relative;
   height: 100%;
   min-height: 100%;
+}
+.pairing-wait {
+  position: relative;
+  z-index: 1;
+  margin: 2rem auto;
+  max-width: 28rem;
+  text-align: center;
 }
 
 /* The core sits fixed behind everything (under the translucent top bar/dock),

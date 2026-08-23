@@ -83,7 +83,17 @@ pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
         .map_err(StoreError::schema)?;
     let current: Option<SchemaVersion> = version.take(0).map_err(StoreError::schema)?;
     if let Some(current) = current {
+        if current.version == 2 {
+            return Ok(());
+        }
         if current.version == 1 {
+            db.query(include_str!(
+                "../../../schema/surreal/0002_device_pairing.surql"
+            ))
+            .await
+            .map_err(StoreError::schema)?
+            .check()
+            .map_err(StoreError::schema)?;
             return Ok(());
         }
         // An unknown schema must never be silently overwritten or downgraded.
@@ -95,5 +105,12 @@ pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
         .map_err(StoreError::schema)?
         .check()
         .map_err(StoreError::schema)?;
+    db.query(include_str!(
+        "../../../schema/surreal/0002_device_pairing.surql"
+    ))
+    .await
+    .map_err(StoreError::schema)?
+    .check()
+    .map_err(StoreError::schema)?;
     Ok(())
 }

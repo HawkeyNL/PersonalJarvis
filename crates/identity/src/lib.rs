@@ -150,6 +150,47 @@ pub struct UnlockRequest {
     pub created_at: OffsetDateTime,
 }
 
+/// An untrusted candidate device waiting for an approval from an active owner
+/// device. This record itself confers no login capability.
+#[derive(Debug, Clone)]
+pub struct PairingRequest {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub candidate_name: String,
+    pub candidate_platform: String,
+    pub candidate_public_key: Vec<u8>,
+    pub candidate_fingerprint: String,
+    pub nonce: Vec<u8>,
+    pub status: String,
+    pub created_at: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+}
+
+/// Canonical, domain-separated bytes that an approving device signs. This is
+/// intentionally not JSON and cannot be confused with a login, unlock or agent
+/// approval signature.
+pub fn pairing_approval_message(
+    request_id: Uuid,
+    nonce: &[u8],
+    candidate_public_key: &[u8],
+    user_id: Uuid,
+    approver_device_id: Uuid,
+    expires_at: OffsetDateTime,
+) -> Result<Vec<u8>, IdentityError> {
+    if nonce.len() != 32 || candidate_public_key.len() != 32 {
+        return Err(IdentityError::AuthFailed);
+    }
+    let mut message = Vec::with_capacity(26 + 16 + 32 + 32 + 16 + 16 + 8);
+    message.extend_from_slice(b"jarvis-device-pairing-v1\0");
+    message.extend_from_slice(request_id.as_bytes());
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(candidate_public_key);
+    message.extend_from_slice(user_id.as_bytes());
+    message.extend_from_slice(approver_device_id.as_bytes());
+    message.extend_from_slice(&expires_at.unix_timestamp().to_be_bytes());
+    Ok(message)
+}
+
 /// Verify an Ed25519 signature over `message` using a raw 32-byte public key.
 pub(crate) fn verify_signature(
     public_key: &[u8],
@@ -170,10 +211,12 @@ pub(crate) fn verify_signature(
 }
 
 pub use surreal::{
-    approve_unlock_request, authenticate, create_challenge, create_unlock_request, create_user,
-    deny_unlock_request, first_user_or_create, get_device, get_user, list_active_devices, login,
-    pending_unlock_requests, register_device, revoke_device, revoke_session, unlock_request_status,
-    verify_device_signature,
+    active_device_count, approve_pairing_request, approve_unlock_request, authenticate,
+    bootstrap_register_first_device, create_challenge, create_pairing_request,
+    create_unlock_request, create_user, deny_pairing_request, deny_unlock_request, first_user,
+    first_user_or_create, get_device, get_user, list_active_devices, login, pairing_request_status,
+    pairing_status_for_candidate, pending_pairing_requests, pending_unlock_requests,
+    register_device, revoke_device, revoke_session, unlock_request_status, verify_device_signature,
 };
 
 #[cfg(test)]
@@ -196,5 +239,26 @@ mod tests {
     #[test]
     fn platform_rejects_unknown() {
         assert!(Platform::parse("symbian").is_err());
+    }
+
+    #[test]
+    fn pairing_message_is_domain_separated_and_argument_bound() {
+        let request = Uuid::now_v7();
+        let user = Uuid::now_v7();
+        let approver = Uuid::now_v7();
+        let nonce = [7_u8; 32];
+        let key = [9_u8; 32];
+        let expires = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let message =
+            pairing_approval_message(request, &nonce, &key, user, approver, expires).unwrap();
+        assert!(message.starts_with(b"jarvis-device-pairing-v1\0"));
+        assert_ne!(message, nonce);
+        assert_ne!(
+            message,
+            pairing_approval_message(request, &nonce, &[8; 32], user, approver, expires).unwrap()
+        );
+        assert!(
+            pairing_approval_message(request, &[0; 31], &key, user, approver, expires).is_err()
+        );
     }
 }

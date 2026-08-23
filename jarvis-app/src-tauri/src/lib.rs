@@ -123,6 +123,37 @@ fn auth_sign(app: AppHandle, nonce_hex: String) -> Result<String, String> {
     Ok(hex::encode(key.sign(&nonce).to_bytes()))
 }
 
+/// Sign only the canonical device-pairing approval protocol. Keeping this
+/// separate from generic challenge signing prevents a UI bug from turning an
+/// arbitrary server string into a privileged enrollment approval.
+#[tauri::command]
+fn auth_sign_pairing_approval(
+    app: AppHandle,
+    request_id: String,
+    nonce_hex: String,
+    candidate_public_key_hex: String,
+    user_id: String,
+    approver_device_id: String,
+    expires_at: i64,
+) -> Result<String, String> {
+    let request_id = uuid::Uuid::parse_str(&request_id).map_err(|e| e.to_string())?;
+    let user_id = uuid::Uuid::parse_str(&user_id).map_err(|e| e.to_string())?;
+    let approver_device_id = uuid::Uuid::parse_str(&approver_device_id).map_err(|e| e.to_string())?;
+    let nonce = hex::decode(nonce_hex).map_err(|e| e.to_string())?;
+    let public_key = hex::decode(candidate_public_key_hex).map_err(|e| e.to_string())?;
+    if nonce.len() != 32 || public_key.len() != 32 { return Err("invalid pairing payload".to_string()); }
+    let mut message = Vec::with_capacity(26 + 16 + 32 + 32 + 16 + 16 + 8);
+    message.extend_from_slice(b"jarvis-device-pairing-v1\0");
+    message.extend_from_slice(request_id.as_bytes());
+    message.extend_from_slice(&nonce);
+    message.extend_from_slice(&public_key);
+    message.extend_from_slice(user_id.as_bytes());
+    message.extend_from_slice(approver_device_id.as_bytes());
+    message.extend_from_slice(&expires_at.to_be_bytes());
+    let key = get_or_create_signing_key(&app)?;
+    Ok(hex::encode(key.sign(&message).to_bytes()))
+}
+
 /// Persist the device id and session token after a successful login.
 #[tauri::command]
 fn auth_save(app: AppHandle, device_id: String, token: String) -> Result<(), String> {
@@ -222,6 +253,7 @@ pub fn run() {
             device_info,
             auth_public_key,
             auth_sign,
+            auth_sign_pairing_approval,
             auth_save,
             auth_session,
             auth_logout,

@@ -25,6 +25,12 @@ export async function getJson<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+export async function getJsonWithHeaders<T>(path: string, headers: Record<string, string>): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, { method: "GET", headers });
+  if (!res.ok) throw new ApiError(res.status, path);
+  return (await res.json()) as T;
+}
+
 export async function postJson<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
@@ -34,6 +40,12 @@ export async function postJson<T>(path: string, body: unknown): Promise<T> {
   if (!res.ok) {
     throw new ApiError(res.status, path);
   }
+  return (await res.json()) as T;
+}
+
+export async function postJsonWithHeaders<T>(path: string, body: unknown, headers: Record<string, string>): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
+  if (!res.ok) throw new ApiError(res.status, path);
   return (await res.json()) as T;
 }
 

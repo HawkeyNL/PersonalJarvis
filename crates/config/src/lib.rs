@@ -17,7 +17,30 @@ use figment::{
     providers::{Env, Format, Toml},
     Figment,
 };
+use ipnet::IpNet;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+
+/// Restricted first-device enrollment configuration. The raw secret is never
+/// retained here: Core only receives a SHA-256 verifier from its restricted
+/// systemd environment file.
+#[derive(Clone)]
+pub struct BootstrapEnrollment {
+    secret_hash: [u8; 32],
+    allowed_cidrs: Vec<IpNet>,
+}
+
+impl BootstrapEnrollment {
+    pub fn allows(&self, ip: IpAddr) -> bool {
+        self.allowed_cidrs.iter().any(|cidr| cidr.contains(&ip))
+    }
+
+    pub fn verifies(&self, supplied: &str) -> bool {
+        let actual = Sha256::digest(supplied.as_bytes());
+        actual.as_slice().ct_eq(&self.secret_hash).into()
+    }
+}
 
 /// Top-level application configuration.
 #[derive(Clone, Deserialize)]
@@ -214,6 +237,17 @@ pub struct AppConfig {
     /// forwarding headers. Empty (the default) means no proxy is trusted.
     #[serde(default)]
     pub trusted_proxy_ips: String,
+
+    /// SHA-256 verifier for the one-time first-owner bootstrap secret. Empty
+    /// disables production bootstrap; the raw secret belongs only to the local
+    /// root-operated provisioning/recovery procedure.
+    #[serde(default)]
+    pub bootstrap_secret_sha256: String,
+
+    /// Explicit LAN ranges allowed to perform first-owner bootstrap. Empty
+    /// disables bootstrap; public clients are never allowed implicitly.
+    #[serde(default)]
+    pub bootstrap_allowed_cidrs: String,
 }
 
 fn default_bind_addr() -> String {
@@ -395,6 +429,42 @@ impl AppConfig {
         Ok(peers)
     }
 
+    /// Parse the opt-in LAN-only bootstrap policy. Supplying only one half is
+    /// a configuration error; an absent policy intentionally means that no
+    /// first-device bootstrap endpoint is available.
+    pub fn bootstrap_enrollment(&self) -> Result<Option<BootstrapEnrollment>, String> {
+        let secret = self.bootstrap_secret_sha256.trim();
+        let ranges = self.bootstrap_allowed_cidrs.trim();
+        if secret.is_empty() && ranges.is_empty() {
+            return Ok(None);
+        }
+        if secret.is_empty() || ranges.is_empty() {
+            return Err("JARVIS_BOOTSTRAP_SECRET_SHA256 and JARVIS_BOOTSTRAP_ALLOWED_CIDRS must be configured together".to_string());
+        }
+        let bytes = hex::decode(secret).map_err(|_| {
+            "JARVIS_BOOTSTRAP_SECRET_SHA256 must be 32-byte hex SHA-256".to_string()
+        })?;
+        let secret_hash: [u8; 32] = bytes.try_into().map_err(|_| {
+            "JARVIS_BOOTSTRAP_SECRET_SHA256 must be 32-byte hex SHA-256".to_string()
+        })?;
+        let allowed_cidrs = ranges
+            .split(',')
+            .map(str::trim)
+            .filter(|cidr| !cidr.is_empty())
+            .map(|cidr| {
+                cidr.parse()
+                    .map_err(|_| format!("invalid bootstrap CIDR: {cidr}"))
+            })
+            .collect::<Result<Vec<IpNet>, _>>()?;
+        if allowed_cidrs.is_empty() {
+            return Err("JARVIS_BOOTSTRAP_ALLOWED_CIDRS must not be empty".to_string());
+        }
+        Ok(Some(BootstrapEnrollment {
+            secret_hash,
+            allowed_cidrs,
+        }))
+    }
+
     /// Validate deployment invariants that must fail closed before the server
     /// opens a socket. Public TLS terminates at Caddy; production Core is never
     /// allowed to become a directly reachable HTTP listener.
@@ -483,6 +553,11 @@ impl fmt::Debug for AppConfig {
             .field("llm_rate_per_min", &self.llm_rate_per_min)
             .field("trusted_proxy_hops", &self.trusted_proxy_hops)
             .field("trusted_proxy_ips", &self.trusted_proxy_ips)
+            .field(
+                "bootstrap_secret_sha256",
+                &redact(&self.bootstrap_secret_sha256),
+            )
+            .field("bootstrap_allowed_cidrs", &self.bootstrap_allowed_cidrs)
             .finish()
     }
 }
@@ -545,6 +620,8 @@ mod tests {
             llm_rate_per_min: 20,
             trusted_proxy_hops: 0,
             trusted_proxy_ips: String::new(),
+            bootstrap_secret_sha256: String::new(),
+            bootstrap_allowed_cidrs: String::new(),
         };
 
         let rendered = format!("{cfg:?}");
@@ -576,6 +653,70 @@ mod tests {
             assert_eq!(cfg.environment, "development"); // default
             Ok(())
         });
+    }
+
+    #[test]
+    fn bootstrap_policy_requires_both_inputs_and_limits_to_configured_lan() {
+        let mut cfg = AppConfig {
+            bind_addr: "127.0.0.1:8080".to_string(),
+            surreal_endpoint: "127.0.0.1:8000".to_string(),
+            surreal_namespace: "jarvis".to_string(),
+            surreal_database: "core".to_string(),
+            surreal_username: "core".to_string(),
+            surreal_password: "x".to_string(),
+            log_json: false,
+            environment: "production".to_string(),
+            public_hostname: String::new(),
+            ibkr_gateway_url: String::new(),
+            llm_provider: String::new(),
+            llm_api_key: String::new(),
+            llm_anthropic_base_url: String::new(),
+            llm_model: String::new(),
+            llm_model_hard: String::new(),
+            llm_model_cheap: String::new(),
+            llm_max_tokens: 1,
+            llm_ollama_url: String::new(),
+            llm_ollama_model: String::new(),
+            llm_claude_cli_bin: String::new(),
+            llm_persona_path: String::new(),
+            llm_openai_api_key: String::new(),
+            llm_openai_base_url: String::new(),
+            llm_openai_model: String::new(),
+            llm_openai_model_hard: String::new(),
+            llm_openai_model_cheap: String::new(),
+            llm_deepseek_api_key: String::new(),
+            llm_deepseek_base_url: String::new(),
+            llm_deepseek_model: String::new(),
+            llm_deepseek_model_hard: String::new(),
+            llm_deepseek_model_cheap: String::new(),
+            llm_monthly_budget_eur: 0.0,
+            llm_eur_per_usd: 0.0,
+            speech_provider: String::new(),
+            speech_verify_threshold: 0.0,
+            speech_whisper_model: None,
+            speech_whisper_language: String::new(),
+            agent_enabled: false,
+            agent_workspace_root: String::new(),
+            agent_claude_code_enabled: false,
+            agent_claude_code_bin: String::new(),
+            agent_claude_code_model: String::new(),
+            auth_rate_enroll_per_min: 1,
+            auth_rate_challenge_per_min: 1,
+            auth_rate_login_per_min: 1,
+            auth_login_max_failures: 1,
+            auth_login_lock_secs: 1,
+            authenticated_rate_per_min: 1,
+            llm_rate_per_min: 1,
+            trusted_proxy_hops: 0,
+            trusted_proxy_ips: String::new(),
+            bootstrap_secret_sha256: "00".repeat(32),
+            bootstrap_allowed_cidrs: String::new(),
+        };
+        assert!(cfg.bootstrap_enrollment().is_err());
+        cfg.bootstrap_allowed_cidrs = "192.168.10.0/24".to_string();
+        let policy = cfg.bootstrap_enrollment().unwrap().unwrap();
+        assert!(policy.allows("192.168.10.8".parse().unwrap()));
+        assert!(!policy.allows("8.8.8.8".parse().unwrap()));
     }
 
     #[test]

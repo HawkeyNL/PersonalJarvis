@@ -4,7 +4,7 @@
 // orchestrates the HTTP flow (enroll -> challenge -> login) and reads back the
 // session state. The private key never enters JS.
 import { invoke } from "@tauri-apps/api/core";
-import { deleteAuth, getJsonAuth, postAuth, postJson } from "./api";
+import { deleteAuth, getJsonAuth, getJsonWithHeaders, postAuth, postJson, postJsonWithHeaders } from "./api";
 
 export type Session = {
   device_id: string | null;
@@ -23,7 +23,14 @@ export function currentSession(): Promise<Session> {
   return invoke<Session>("auth_session");
 }
 
-/// Enroll (first time) and log in, storing the session token natively.
+const PAIRING_WAIT_KEY = "jarvis.pairing.wait";
+type PairingWait = { request_id: string; nonce: string; expires_at: number };
+export class PairingPending extends Error {
+  constructor() { super("Wacht op goedkeuring vanaf een vertrouwd Jarvis-apparaat."); }
+}
+
+/// Log in with the local device key. An unknown device creates one bounded
+/// pairing request and waits; it can never self-enrol through a session token.
 export async function login(): Promise<void> {
   const publicKey = await invoke<string>("auth_public_key");
   const info = await invoke<{ platform: string; name: string }>("device_info");
@@ -32,12 +39,29 @@ export async function login(): Promise<void> {
   let deviceId = session.device_id;
 
   if (!deviceId) {
-    const enroll = await postJson<{ device_id: string }>("/v1/auth/enroll", {
-      name: info.name,
-      platform: info.platform,
-      public_key: publicKey,
-    });
-    deviceId = enroll.device_id;
+    const stored = sessionStorage.getItem(PAIRING_WAIT_KEY);
+    if (stored) {
+      const waiting = JSON.parse(stored) as PairingWait;
+      const status = await getJsonWithHeaders<{ status: string; device_id: string | null }>(
+        `/v1/auth/pairing/requests/${waiting.request_id}/status`,
+        { "X-Jarvis-Pairing-Nonce": waiting.nonce },
+      );
+      if (status.status === "approved" && status.device_id) {
+        deviceId = status.device_id;
+        sessionStorage.removeItem(PAIRING_WAIT_KEY);
+      } else if (status.status === "pending") {
+        throw new PairingPending();
+      } else {
+        sessionStorage.removeItem(PAIRING_WAIT_KEY);
+        throw new Error("pairing request is verlopen of afgewezen");
+      }
+    } else {
+      const pairing = await postJson<PairingWait>("/v1/auth/pairing/requests", {
+        name: info.name, platform: info.platform, public_key: publicKey,
+      });
+      sessionStorage.setItem(PAIRING_WAIT_KEY, JSON.stringify(pairing));
+      throw new PairingPending();
+    }
   }
 
   const challenge = await postJson<{ challenge_id: string; nonce: string }>(
@@ -54,6 +78,18 @@ export async function login(): Promise<void> {
   });
 
   await invoke("auth_save", { deviceId, token: result.token });
+}
+
+/** Local-LAN first-owner bootstrap. The secret is used once, never persisted,
+ * and is expected to come from the root-operated Home Node provisioning flow. */
+export async function bootstrapFirstDevice(secret: string): Promise<void> {
+  const publicKey = await invoke<string>("auth_public_key");
+  const info = await invoke<{ platform: string; name: string }>("device_info");
+  const enrolled = await postJsonWithHeaders<{ device_id: string }>("/v1/auth/bootstrap", {
+    name: info.name, platform: info.platform, public_key: publicKey,
+  }, { "X-Jarvis-Bootstrap-Secret": secret });
+  await invoke("auth_save", { deviceId: enrolled.device_id, token: "" });
+  await login();
 }
 
 /** Drop the locally stored session token (keeps the enrolled device + key), so

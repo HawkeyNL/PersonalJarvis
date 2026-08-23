@@ -193,6 +193,11 @@ JARVIS_TRUSTED_PROXY_HOPS=1
 JARVIS_TRUSTED_PROXY_IPS=127.0.0.1,::1
 JARVIS_PUBLIC_HOSTNAME=api.example.com
 
+# First owner only: generate the raw value locally as root, show it once to the
+# owner, and put only its SHA-256 hex verifier here. Bootstrap is LAN-only.
+JARVIS_BOOTSTRAP_SECRET_SHA256=<sha256-of-one-time-secret>
+JARVIS_BOOTSTRAP_ALLOWED_CIDRS=192.168.1.0/24
+
 # Per-device controls complement the anonymous per-IP auth throttles.
 JARVIS_AUTHENTICATED_RATE_PER_MIN=300
 JARVIS_LLM_RATE_PER_MIN=20
@@ -322,13 +327,19 @@ SSH independently from a network outside the LAN before considering it private.
 
 ### Enrollment before public exposure
 
-`POST /v1/auth/enroll` is intentionally disabled in production. Before opening
-443, enrol the first owner device from a trusted local console or existing
-private-network administration session while the service is in a controlled
-development/bootstrap state, then restore `JARVIS_ENVIRONMENT=production` and
-start Core through systemd. Do not expose that bootstrap process through Caddy.
-Each later device requires a separately reviewed pairing flow; do not re-enable
-public enrollment as a shortcut.
+`POST /v1/auth/enroll` is intentionally disabled in production. Generate a
+fresh 32-byte bootstrap secret locally as root (`openssl rand -hex 32`), put
+only `printf %s "$secret" | sha256sum` in `JARVIS_BOOTSTRAP_SECRET_SHA256`, and
+set an explicit private LAN range in `JARVIS_BOOTSTRAP_ALLOWED_CIDRS`. Use the
+raw secret once with `/v1/auth/bootstrap` from that LAN; never place it in git,
+logs, shell history, or client storage. Once one active owner device exists,
+the bootstrap latch remains closed. Each later device uses remote pairing and
+requires biometric-gated, Ed25519-signed approval from an active device.
+
+If every trusted device is lost, recovery is a local/root Home Node operation:
+rotate the bootstrap verifier and explicitly reset the fail-closed bootstrap
+latch after confirming there are no active devices. There is no public recovery
+endpoint and no reason to re-enable development enrollment.
 
 Confirm externally only through the authorised private-network path. Do not solve
 connectivity failures by binding `0.0.0.0`, disabling the firewall, or trusting

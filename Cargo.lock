@@ -2074,7 +2074,11 @@ name = "jarvis-config"
 version = "0.1.0"
 dependencies = [
  "figment",
+ "hex",
+ "ipnet",
  "serde",
+ "sha2",
+ "subtle",
 ]
 
 [[package]]

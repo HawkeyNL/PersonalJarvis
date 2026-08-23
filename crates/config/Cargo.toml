@@ -8,6 +8,10 @@ publish = false
 [dependencies]
 serde.workspace = true
 figment.workspace = true
+ipnet.workspace = true
+sha2.workspace = true
+hex.workspace = true
+subtle.workspace = true
 
 [dev-dependencies]
 # Enables `figment::Jail` for hermetic env-var tests.

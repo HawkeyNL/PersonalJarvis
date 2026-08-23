@@ -46,7 +46,8 @@ use rate_limit::rate_limit_mw;
 pub use rate_limit::{AuthLimits, RateLimiter};
 use routes::agent::{agent_action, agent_pending, agent_pending_approve, agent_pending_deny};
 use routes::auth::{
-    auth_challenge, auth_enroll, auth_login, auth_logout, delete_device, list_devices,
+    auth_bootstrap, auth_challenge, auth_enroll, auth_login, auth_logout, auth_me, delete_device,
+    list_devices, pairing_approve, pairing_create, pairing_deny, pairing_pending, pairing_status,
     unlock_approve, unlock_deny, unlock_pending, unlock_request, unlock_status,
 };
 use routes::broker::{ibkr_positions, ibkr_status};
@@ -65,8 +66,20 @@ pub fn build_router(state: AppState) -> Router {
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/v1/auth/enroll", post(auth_enroll))
+        .route("/v1/auth/bootstrap", post(auth_bootstrap))
+        .route(
+            "/v1/auth/pairing/requests",
+            post(pairing_create).get(pairing_pending),
+        )
+        .route(
+            "/v1/auth/pairing/requests/{id}/approve",
+            post(pairing_approve),
+        )
+        .route("/v1/auth/pairing/requests/{id}/deny", post(pairing_deny))
+        .route("/v1/auth/pairing/requests/{id}/status", get(pairing_status))
         .route("/v1/auth/challenge", post(auth_challenge))
         .route("/v1/auth/login", post(auth_login))
+        .route("/v1/auth/me", get(auth_me))
         .route("/v1/auth/logout", post(auth_logout))
         .route("/v1/auth/unlock/request", post(unlock_request))
         .route("/v1/auth/unlock/pending", get(unlock_pending))

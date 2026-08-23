@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use serde::Deserialize;
@@ -78,6 +78,254 @@ pub(crate) async fn auth_enroll(
         "user_id": user.id,
         "device_id": device.id,
     })))
+}
+
+/// First-owner bootstrap is deliberately unlike development enrollment: only a
+/// locally provisioned verifier, an explicit LAN client range, and an empty
+/// trusted-device set permit it. The raw secret is supplied in a header so it
+/// never becomes JSON/audit content.
+pub(crate) async fn auth_bootstrap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    Json(req): Json<EnrollReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(policy) = state.bootstrap_enrollment.as_ref() else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "bootstrap unavailable" })),
+        ));
+    };
+    // Reconstruct the trusted-peer decision from the real socket. A direct
+    // caller cannot make an XFF header trusted; Caddy is the only configured
+    // loopback peer allowed to supply one.
+    let client_ip = if state.trusted_proxy_hops > 0 && state.trusted_proxy_ips.contains(&peer.ip())
+    {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|raw| raw.split(',').next_back())
+            .and_then(|ip| ip.trim().parse().ok())
+    } else {
+        Some(peer.ip())
+    };
+    if !client_ip.is_some_and(|ip| policy.allows(ip)) {
+        record_security_event(&state, None, "auth.bootstrap", "rejected_network", None).await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "bootstrap unavailable" })),
+        ));
+    }
+    let secret = headers
+        .get("x-jarvis-bootstrap-secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !policy.verifies(secret) {
+        record_security_event(&state, None, "auth.bootstrap", "invalid_secret", None).await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "bootstrap unavailable" })),
+        ));
+    }
+    validate_enrollment(&req)?;
+    let platform =
+        identity::Platform::parse(&req.platform).map_err(|_| bad_request("unknown platform"))?;
+    let key =
+        hex::decode(&req.public_key).map_err(|_| bad_request("invalid public_key encoding"))?;
+    let (user, device) =
+        identity::bootstrap_register_first_device(&state.db, &req.name, platform, &key)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "bootstrap unavailable" })),
+                )
+            })?;
+    record_security_event(&state, Some(device.id), "auth.bootstrap", "ok", None).await;
+    Ok(Json(json!({ "user_id": user.id, "device_id": device.id })))
+}
+
+fn validate_enrollment(req: &EnrollReq) -> Result<(), (StatusCode, Json<Value>)> {
+    if !validation::bounded_text(&req.name, validation::MAX_DEVICE_NAME_LEN) {
+        return Err(bad_request("invalid device name"));
+    }
+    if !validation::bounded_text(&req.platform, validation::MAX_PLATFORM_LEN) {
+        return Err(bad_request("invalid platform"));
+    }
+    if !validation::is_hex_of_len(&req.public_key, validation::ED25519_PUBLIC_KEY_HEX_LEN) {
+        return Err(bad_request("invalid public_key"));
+    }
+    Ok(())
+}
+
+/// An untrusted candidate can request pairing but cannot select an owner: the
+/// single existing Jarvis owner is resolved server-side. No bearer token is
+/// accepted or needed for this non-authoritative waiting record.
+pub(crate) async fn pairing_create(
+    State(state): State<AppState>,
+    Json(req): Json<EnrollReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    validate_enrollment(&req)?;
+    let user = identity::first_user(&state.db)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "first device bootstrap required" })),
+            )
+        })?;
+    if identity::active_device_count(&state.db)
+        .await
+        .map_err(internal)?
+        == 0
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "first device bootstrap required" })),
+        ));
+    }
+    let platform =
+        identity::Platform::parse(&req.platform).map_err(|_| bad_request("unknown platform"))?;
+    let key =
+        hex::decode(&req.public_key).map_err(|_| bad_request("invalid public_key encoding"))?;
+    let pairing = identity::create_pairing_request(&state.db, user.id, &req.name, platform, &key)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "pairing request unavailable" })),
+            )
+        })?;
+    record_security_event(
+        &state,
+        None,
+        "device.pairing_request",
+        "created",
+        Some(&pairing.candidate_fingerprint[..16]),
+    )
+    .await;
+    Ok(Json(
+        json!({ "request_id": pairing.id, "nonce": hex::encode(pairing.nonce), "expires_at": pairing.expires_at.unix_timestamp() }),
+    ))
+}
+
+pub(crate) async fn pairing_pending(
+    authed: Authed,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let requests = identity::pending_pairing_requests(&state.db, authed.user.id)
+        .await
+        .map_err(internal)?;
+    let items: Vec<Value> = requests.iter().map(|r| json!({
+        "id": r.id, "device_name": r.candidate_name, "platform": r.candidate_platform,
+        "fingerprint": &r.candidate_fingerprint[..16], "nonce": hex::encode(&r.nonce),
+        "candidate_public_key": hex::encode(&r.candidate_public_key), "created_at": r.created_at.unix_timestamp(), "expires_at": r.expires_at.unix_timestamp(),
+    })).collect();
+    Ok(Json(json!({ "requests": items })))
+}
+
+/// Candidate polling is authorised by the 256-bit request nonce in a header;
+/// it is not a bearer credential and never grants API access. Keeping it out of
+/// the URL prevents accidental proxy/history leakage.
+pub(crate) async fn pairing_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let nonce = headers
+        .get("x-jarvis-pairing-nonce")
+        .and_then(|v| v.to_str().ok())
+        .filter(|value| validation::is_hex_of_len(value, 64))
+        .and_then(|value| hex::decode(value).ok())
+        .ok_or_else(unauthorized)?;
+    let Some((status, device_id, just_expired)) =
+        identity::pairing_status_for_candidate(&state.db, id, &nonce)
+            .await
+            .map_err(|_| unauthorized())?
+    else {
+        return Err(unauthorized());
+    };
+    if just_expired {
+        record_security_event(
+            &state,
+            None,
+            "device.pairing_request",
+            "expired",
+            Some(&id.to_string()),
+        )
+        .await;
+    }
+    Ok(Json(json!({ "status": status, "device_id": device_id })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PairingApproveReq {
+    signature: String,
+}
+
+pub(crate) async fn pairing_approve(
+    authed: Authed,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<PairingApproveReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !validation::is_hex_of_len(&req.signature, validation::ED25519_SIGNATURE_HEX_LEN) {
+        return Err(bad_request("invalid signature"));
+    }
+    let sig = hex::decode(&req.signature).map_err(|_| bad_request("invalid signature encoding"))?;
+    let device = match identity::approve_pairing_request(
+        &state.db,
+        id,
+        authed.user.id,
+        authed.device.id,
+        &sig,
+    )
+    .await
+    {
+        Ok(device) => device,
+        Err(_) => {
+            record_security_event(
+                &state,
+                Some(authed.device.id),
+                "device.pairing_approval",
+                "failed",
+                Some(&id.to_string()),
+            )
+            .await;
+            return Err(unauthorized());
+        }
+    };
+    record_security_event(
+        &state,
+        Some(authed.device.id),
+        "device.pairing_approval",
+        "ok",
+        Some(&device.id.to_string()),
+    )
+    .await;
+    record_security_event(&state, Some(device.id), "device.activated", "ok", None).await;
+    Ok(Json(json!({ "status": "approved" })))
+}
+
+pub(crate) async fn pairing_deny(
+    authed: Authed,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    identity::deny_pairing_request(&state.db, id, authed.user.id, authed.device.id)
+        .await
+        .map_err(|_| unauthorized())?;
+    record_security_event(
+        &state,
+        Some(authed.device.id),
+        "device.pairing_request",
+        "denied",
+        Some(&id.to_string()),
+    )
+    .await;
+    Ok(Json(json!({ "status": "denied" })))
 }
 
 #[derive(Deserialize)]
@@ -159,6 +407,12 @@ pub(crate) async fn list_devices(
         })
         .collect();
     Ok(Json(json!({ "devices": items })))
+}
+
+/// Minimal authenticated identity metadata used to bind native pairing signing
+/// without exposing user details to untrusted candidates.
+pub(crate) async fn auth_me(authed: Authed) -> Json<Value> {
+    Json(json!({ "user_id": authed.user.id, "device_id": authed.device.id }))
 }
 
 /// Log out: revoke the current session server-side.

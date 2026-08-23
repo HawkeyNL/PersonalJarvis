@@ -204,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let trusted_proxy_ips = config.trusted_proxy_ips().map_err(anyhow::Error::msg)?;
+    let bootstrap_enrollment = config.bootstrap_enrollment().map_err(anyhow::Error::msg)?;
 
     let state = AppState {
         db,
@@ -234,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
         },
         trusted_proxy_hops: config.trusted_proxy_hops,
         trusted_proxy_ips: Arc::new(trusted_proxy_ips),
+        bootstrap_enrollment,
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

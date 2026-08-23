@@ -60,4 +60,7 @@ pub struct AppState {
     pub trusted_proxy_hops: u32,
     /// Direct peer IPs of the proxies allowed to supply forwarding headers.
     pub trusted_proxy_ips: Arc<Vec<IpAddr>>,
+    /// LAN-only, one-time first-owner bootstrap verifier. `None` means no
+    /// bootstrap route is usable; it is intentionally not a general secret bag.
+    pub bootstrap_enrollment: Option<jarvis_config::BootstrapEnrollment>,
 }

@@ -144,11 +144,15 @@ fn peer_ip(req: &Request) -> Option<IpAddr> {
 /// exact proxy-hop count. The proxy must overwrite incoming forwarding headers;
 /// otherwise no application can distinguish a client-supplied value. A malformed
 /// or short header falls back to the direct peer address.
-pub(crate) fn client_ip(req: &Request, trusted_hops: u32, trusted_peers: &[IpAddr]) -> String {
+pub(crate) fn resolved_client_ip(
+    req: &Request,
+    trusted_hops: u32,
+    trusted_peers: &[IpAddr],
+) -> Option<IpAddr> {
     let peer = peer_ip(req);
     let peer_is_trusted = peer.is_some_and(|ip| trusted_peers.contains(&ip));
     if trusted_hops == 0 || !peer_is_trusted {
-        return peer.map_or_else(|| "local".to_string(), |ip| ip.to_string());
+        return peer;
     }
     let hops = trusted_hops as usize;
     if let Some(xff) = req
@@ -164,10 +168,15 @@ pub(crate) fn client_ip(req: &Request, trusted_hops: u32, trusted_peers: &[IpAdd
             .collect::<Result<_, _>>()
             .ok();
         if let Some(ips) = ips.filter(|ips| ips.len() >= hops) {
-            return ips[ips.len() - hops].to_string();
+            return Some(ips[ips.len() - hops]);
         }
     }
-    peer.map_or_else(|| "local".to_string(), |ip| ip.to_string())
+    peer
+}
+
+pub(crate) fn client_ip(req: &Request, trusted_hops: u32, trusted_peers: &[IpAddr]) -> String {
+    resolved_client_ip(req, trusted_hops, trusted_peers)
+        .map_or_else(|| "local".to_string(), |ip| ip.to_string())
 }
 
 /// The shared 429 response for any auth throttle.
@@ -221,8 +230,13 @@ pub(crate) async fn rate_limit_mw(
     // Flat per-endpoint rate limit.
     let flat = match path.as_str() {
         "/v1/auth/enroll" => Some(limits.enroll_per_min),
+        "/v1/auth/bootstrap" => Some(limits.enroll_per_min.min(3)),
+        "/v1/auth/pairing/requests" => Some(limits.enroll_per_min.min(5)),
         "/v1/auth/challenge" => Some(limits.challenge_per_min),
         "/v1/auth/login" => Some(limits.login_per_min),
+        _ if path.starts_with("/v1/auth/pairing/requests/") && path.ends_with("/status") => {
+            Some(limits.challenge_per_min)
+        }
         _ => None,
     };
     if let Some(max) = flat {

@@ -4,8 +4,10 @@ import { useRoute } from "vue-router";
 import NavIcon from "./components/NavIcon.vue";
 import AppLock from "./components/AppLock.vue";
 import UnlockApprovals from "./components/UnlockApprovals.vue";
+import PairingApprovals from "./components/PairingApprovals.vue";
 import { locked, initLock, noteActivity } from "./lock";
 import { startApprovalPolling, stopApprovalPolling } from "./unlockApprovals";
+import { startPairingPolling, stopPairingPolling } from "./pairingApprovals";
 import { maybeStartWake, stopWake } from "./voicewake";
 
 const route = useRoute();
@@ -44,6 +46,7 @@ onMounted(() => {
   timer = window.setInterval(tick, 1000);
   initLock();
   startApprovalPolling(); // this device can approve other devices' unlocks
+  startPairingPolling();
   maybeStartWake(); // resume "Hey Jarvis" if it was enabled
   window.addEventListener("pointerdown", noteActivity, { passive: true });
   window.addEventListener("keydown", noteActivity);
@@ -51,6 +54,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   clearInterval(timer);
   stopApprovalPolling();
+  stopPairingPolling();
   stopWake();
   window.removeEventListener("pointerdown", noteActivity);
   window.removeEventListener("keydown", noteActivity);
@@ -88,6 +92,7 @@ onBeforeUnmount(() => {
 
     <!-- Incoming unlock approvals for other devices (phone side). -->
     <UnlockApprovals />
+    <PairingApprovals />
     <!-- Full-screen biometric gate on desktop when the lock is enabled. -->
     <AppLock v-if="locked" />
   </div>
