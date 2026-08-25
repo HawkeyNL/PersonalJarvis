@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  backend:
+    name: Rust — fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --all
+
+      - name: SurrealDB persistence security tests
+        run: |
+          docker run --detach --rm --name jarvis-surreal-test -p 127.0.0.1:8000:8000 \
+            surrealdb/surrealdb:v2.6.5 start --bind 0.0.0.0:8000 --user root --pass test-root-password memory
+          for attempt in $(seq 1 20); do
+            curl --fail --silent http://127.0.0.1:8000/health && break
+            sleep 1
+          done
+          JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 \
+          JARVIS_SURREAL_TEST_USER=root \
+          JARVIS_SURREAL_TEST_PASS=test-root-password \
+          cargo test -p jarvis-identity surreal::tests::challenge_login_cannot_be_replayed -- --ignored
+          JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 \
+          JARVIS_SURREAL_TEST_USER=root \
+          JARVIS_SURREAL_TEST_PASS=test-root-password \
+          cargo test -p jarvis-portfolio surreal::tests::preserves_decimal_holdings_and_owner_scope -- --ignored
+          JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 \
+          JARVIS_SURREAL_TEST_USER=root \
+          JARVIS_SURREAL_TEST_PASS=test-root-password \
+          cargo test -p jarvis-api --test surreal_api -- --ignored
+
+      - name: Home Node updater safety fixtures
+        run: sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-update-core-release.sh
+
+      - name: Production Home Node bootstrap safety checks
+        run: bash deploy/systemd/tests/test-production-bootstrap-assets.sh
+
+      - name: Home Node release staging fixtures
+        run: sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-stage-core-release.sh
+
+      - name: Codex worktree isolation fixtures
+        run: sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-prepare-codex-worktree.sh
+
+      - name: Public-ingress template safety checks
+        run: bash deploy/caddy/tests/test-caddy-template.sh
+
+      - name: OpenSandbox template safety checks
+        run: bash deploy/opensandbox/tests/test-opensandbox-template.sh
+
+      - name: Verify pinned OpenSandbox patches and egress regression test
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
+
+      - name: Apply pinned OpenSandbox patches
+        env:
+          OPENSANDBOX_COMMIT: 6b2023e9b7eb80a940d88e6ae05fcbc0eb0cf23f
+        run: |
+          set -euo pipefail
+          sandbox_source=$(mktemp -d)
+          trap 'rm -rf "$sandbox_source"' EXIT
+          git clone --no-checkout https://github.com/opensandbox-group/OpenSandbox.git "$sandbox_source"
+          git -C "$sandbox_source" fetch --depth=1 origin "$OPENSANDBOX_COMMIT"
+          git -C "$sandbox_source" checkout --detach FETCH_HEAD
+          test "$(git -C "$sandbox_source" rev-parse HEAD)" = "$OPENSANDBOX_COMMIT"
+          git -C "$sandbox_source" apply --check "$GITHUB_WORKSPACE/deploy/opensandbox/patches/0001-loopback-published-ports.patch"
+          git -C "$sandbox_source" apply "$GITHUB_WORKSPACE/deploy/opensandbox/patches/0001-loopback-published-ports.patch"
+          git -C "$sandbox_source" apply --check "$GITHUB_WORKSPACE/deploy/opensandbox/patches/0002-egress-private-range-deny.patch"
+          git -C "$sandbox_source" apply "$GITHUB_WORKSPACE/deploy/opensandbox/patches/0002-egress-private-range-deny.patch"
+          git -C "$sandbox_source" apply --check "$GITHUB_WORKSPACE/deploy/opensandbox/patches/0003-egress-sidecar-hardening.patch"
+          git -C "$sandbox_source" apply "$GITHUB_WORKSPACE/deploy/opensandbox/patches/0003-egress-sidecar-hardening.patch"
+          git -C "$sandbox_source" apply --check "$GITHUB_WORKSPACE/deploy/opensandbox/patches/0004-egress-sidecar-resource-limits.patch"
+          git -C "$sandbox_source" apply "$GITHUB_WORKSPACE/deploy/opensandbox/patches/0004-egress-sidecar-resource-limits.patch"
+          (cd "$sandbox_source/components/egress" && go test ./pkg/dnsproxy)
+        working-directory: ${{ github.workspace }}
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Check dependency-exception expiry
+        run: test "$(date -u +%F)" \< "2026-10-01"
+
+      - name: Dependency vulnerability audit
+        run: cargo audit
+
+  frontend:
+    name: Jarvis app — typecheck and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: jarvis-app/package-lock.json
+      - name: Install locked client dependencies
+        run: npm ci --prefix jarvis-app
+      - name: Typecheck and build client
+        run: npm run build --prefix jarvis-app
+
+  # TODO (JAR-057): secret scan, SBOM and container scan.

@@ -1,0 +1,3 @@
+[advisories]
+# See security/DEPENDENCY_EXCEPTIONS.md. CI independently enforces expiry.
+ignore = ["RUSTSEC-2026-0235"]

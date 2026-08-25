@@ -1,0 +1,24 @@
+diff --git a/server/opensandbox_server/services/docker/networking.py b/server/opensandbox_server/services/docker/networking.py
+index 46ebf8d..b8e1867 100644
+--- a/server/opensandbox_server/services/docker/networking.py
++++ b/server/opensandbox_server/services/docker/networking.py
+@@ -435,6 +435,19 @@ class DockerNetworkingMixin:
+             "cap_add": ["NET_ADMIN"],
+             "port_bindings": normalize_port_bindings(sidecar_port_bindings),
+         }
++        docker_cfg = self.app_config.docker
++        # The egress sidecar needs NET_ADMIN only to install its own nft rules;
++        # it must still inherit the workload's process and privilege ceilings.
++        # Do not set a broad privileged flag merely to configure egress.
++        if docker_cfg.no_new_privileges:
++            base_sidecar_host_config_kwargs["security_opt"] = ["no-new-privileges:true"]
++        if docker_cfg.pids_limit is not None:
++            base_sidecar_host_config_kwargs["pids_limit"] = docker_cfg.pids_limit
++        cap_drop = [
++            cap for cap in docker_cfg.drop_capabilities if cap != "NET_ADMIN"
++        ]
++        if cap_drop:
++            base_sidecar_host_config_kwargs["cap_drop"] = cap_drop
+         if runtime_volume_name:
+             base_sidecar_host_config_kwargs["binds"] = [
+                 f"{runtime_volume_name}:{OPENSANDBOX_RUNTIME_MOUNT_PATH}:rw"

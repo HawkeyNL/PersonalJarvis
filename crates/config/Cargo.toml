@@ -1,0 +1,18 @@
+[package]
+name = "jarvis-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+figment.workspace = true
+ipnet.workspace = true
+sha2.workspace = true
+hex.workspace = true
+subtle.workspace = true
+
+[dev-dependencies]
+# Enables `figment::Jail` for hermetic env-var tests.
+figment = { workspace = true, features = ["test"] }

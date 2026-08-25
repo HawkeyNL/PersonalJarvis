@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+members = [
+    "jarvis-api",
+    "jarvis-core",
+    "crates/config",
+    "crates/observability",
+    "crates/identity",
+    "crates/portfolio",
+    "crates/ibkr",
+    "crates/llm",
+    "crates/speech",
+    "crates/registry",
+    "crates/usage",
+    "crates/orchestrator",
+    "crates/agent",
+    "crates/selfdev",
+    "crates/policy",
+    "crates/store",
+    "crates/codex",
+    "crates/workspace",
+    "crates/sandbox",
+]
+# The Tauri client crate builds via its own tooling (npm run tauri ...) and is
+# intentionally excluded so backend CI (clippy -D warnings) stays fast and the
+# heavy tauri/wry deps don't enter the workspace graph.
+exclude = [
+    "jarvis-app/src-tauri",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.82"
+
+[workspace.dependencies]
+# async runtime + web
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+# database
+# SurrealDB 2.6 is deliberately pinned to the server major/minor used by the
+# Home Node.  We only enable the websocket client transport: the database stays
+# a separate, private service and is never embedded in the Core process.
+surrealdb = { version = "2.6.5", default-features = false, features = ["protocol-ws", "rustls"] }
+
+# serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bytes = "0.11"
+
+# config
+figment = { version = "0.10", features = ["toml", "env"] }
+dotenvy = "0.15"
+
+# errors
+anyhow = "1"
+thiserror = "1"
+
+# ids and time
+uuid = { version = "1", features = ["v7", "serde"] }
+time = { version = "0.3", features = ["serde"] }
+
+# decimal money (never floats for money)
+rust_decimal = { version = "1", features = ["serde-str"] }
+
+# crypto (device-bound auth)
+ed25519-dalek = "2"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+ipnet = "2"
+subtle = "2"
+
+# logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# internal crates
+jarvis-config = { path = "crates/config" }
+jarvis-observability = { path = "crates/observability" }
+jarvis-identity = { path = "crates/identity" }
+jarvis-portfolio = { path = "crates/portfolio" }
+jarvis-ibkr = { path = "crates/ibkr" }
+jarvis-llm = { path = "crates/llm" }
+jarvis-speech = { path = "crates/speech" }
+jarvis-registry = { path = "crates/registry" }
+jarvis-usage = { path = "crates/usage" }
+jarvis-orchestrator = { path = "crates/orchestrator" }
+jarvis-agent = { path = "crates/agent" }
+jarvis-selfdev = { path = "crates/selfdev" }
+jarvis-policy = { path = "crates/policy" }
+jarvis-store = { path = "crates/store" }
+jarvis-codex = { path = "crates/codex" }
+jarvis-workspace = { path = "crates/workspace" }
+jarvis-sandbox = { path = "crates/sandbox" }
+jarvis-core = { path = "jarvis-core" }

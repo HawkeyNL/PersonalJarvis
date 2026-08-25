@@ -1,0 +1,109 @@
+diff --git a/components/egress/pkg/dnsproxy/proxy.go b/components/egress/pkg/dnsproxy/proxy.go
+index 09e6f36..846abef 100644
+--- a/components/egress/pkg/dnsproxy/proxy.go
++++ b/components/egress/pkg/dnsproxy/proxy.go
+@@ -347,7 +347,10 @@ func (p *Proxy) publishBlocked(domain string) {
+ 	})
+ }
+ 
+-// extractResolvedIPs collects A/AAAA from resp.Answer with TTLs for dynamic nft elements.
++// extractResolvedIPs collects globally routable A/AAAA records from resp.Answer with
++// TTLs for dynamic nft elements. Private and special-use destinations must never be
++// promoted into the allow set: an otherwise permitted hostname could be used for DNS
++// rebinding against the host, LAN, Docker bridge, or cloud metadata service.
+ func extractResolvedIPs(resp *dns.Msg) []nftables.ResolvedIP {
+ 	if resp == nil || len(resp.Answer) == 0 {
+ 		return nil
+@@ -364,6 +367,9 @@ func extractResolvedIPs(resp *dns.Msg) []nftables.ResolvedIP {
+ 			if err != nil {
+ 				continue
+ 			}
++			if isForbiddenEgressAddr(addr) {
++				continue
++			}
+ 			out = append(out, nftables.ResolvedIP{Addr: addr, TTL: time.Duration(v.Hdr.Ttl) * time.Second})
+ 		case *dns.AAAA:
+ 			if v.AAAA == nil {
+@@ -373,12 +379,36 @@ func extractResolvedIPs(resp *dns.Msg) []nftables.ResolvedIP {
+ 			if err != nil {
+ 				continue
+ 			}
++			if isForbiddenEgressAddr(addr) {
++				continue
++			}
+ 			out = append(out, nftables.ResolvedIP{Addr: addr, TTL: time.Duration(v.Hdr.Ttl) * time.Second})
+ 		}
+ 	}
+ 	return out
+ }
+ 
++func isForbiddenEgressAddr(addr netip.Addr) bool {
++	addr = addr.Unmap()
++	if !addr.IsValid() || addr.IsUnspecified() || addr.IsLoopback() || addr.IsPrivate() ||
++		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsMulticast() {
++		return true
++	}
++
++	if addr.Is4() {
++		// CGNAT (RFC 6598), the "this network" block, and benchmarking space
++		// are not public Internet destinations. RFC1918 ranges are covered by
++		// IsPrivate above.
++		return netip.MustParsePrefix("0.0.0.0/8").Contains(addr) ||
++			netip.MustParsePrefix("100.64.0.0/10").Contains(addr) ||
++			netip.MustParsePrefix("198.18.0.0/15").Contains(addr)
++	}
++
++	// IPv4-mapped addresses were unmapped above. Unique-local IPv6 is covered
++	// by IsPrivate; documentation space is intentionally rejected as well.
++	return netip.MustParsePrefix("2001:db8::/32").Contains(addr)
++}
++
+ const fallbackUpstream = "8.8.8.8:53"
+ 
+ // DiscoverUpstreams is env OPENSANDBOX_EGRESS_DNS_UPSTREAM if set, else /etc/resolv.conf (with caps/fallbacks).
+diff --git a/components/egress/pkg/dnsproxy/proxy_test.go b/components/egress/pkg/dnsproxy/proxy_test.go
+index cab1ed2..a8b6c7d 100644
+--- a/components/egress/pkg/dnsproxy/proxy_test.go
++++ b/components/egress/pkg/dnsproxy/proxy_test.go
+@@ -62,7 +62,7 @@ func TestExtractResolvedIPs(t *testing.T) {
+ 	msg := new(dns.Msg)
+ 	msg.Answer = []dns.RR{
+ 		&dns.A{Hdr: dns.RR_Header{Name: "example.com.", Ttl: 120}, A: net.ParseIP("1.2.3.4")},
+-		&dns.AAAA{Hdr: dns.RR_Header{Name: "example.com.", Ttl: 60}, AAAA: net.ParseIP("2001:db8::1")},
++		&dns.AAAA{Hdr: dns.RR_Header{Name: "example.com.", Ttl: 60}, AAAA: net.ParseIP("2606:4700:4700::1111")},
+ 		&dns.A{Hdr: dns.RR_Header{Name: "example.com.", Ttl: 90}, A: net.ParseIP("5.6.7.8")},
+ 	}
+ 	ips := extractResolvedIPs(msg)
+@@ -70,12 +70,31 @@ func TestExtractResolvedIPs(t *testing.T) {
+ 	// Order follows Answer; check first A and AAAA
+ 	require.Equal(t, "1.2.3.4", ips[0].Addr.String(), "first IP mismatch")
+ 	require.Equal(t, 120*time.Second, ips[0].TTL, "first IP TTL mismatch")
+-	require.Equal(t, "2001:db8::1", ips[1].Addr.String(), "second IP mismatch")
++	require.Equal(t, "2606:4700:4700::1111", ips[1].Addr.String(), "second IP mismatch")
+ 	require.Equal(t, 60*time.Second, ips[1].TTL, "second IP TTL mismatch")
+ 	require.Equal(t, "5.6.7.8", ips[2].Addr.String(), "third IP mismatch")
+ 	require.Equal(t, 90*time.Second, ips[2].TTL, "third IP TTL mismatch")
+ }
+ 
++func TestExtractResolvedIPs_RejectsPrivateAndSpecialUseDestinations(t *testing.T) {
++	msg := new(dns.Msg)
++	msg.Answer = []dns.RR{
++		&dns.A{Hdr: dns.RR_Header{Name: "rebind.example.", Ttl: 60}, A: net.ParseIP("127.0.0.1")},
++		&dns.A{Hdr: dns.RR_Header{Name: "rebind.example.", Ttl: 60}, A: net.ParseIP("192.168.1.1")},
++		&dns.A{Hdr: dns.RR_Header{Name: "rebind.example.", Ttl: 60}, A: net.ParseIP("172.17.0.1")},
++		&dns.A{Hdr: dns.RR_Header{Name: "rebind.example.", Ttl: 60}, A: net.ParseIP("169.254.169.254")},
++		&dns.A{Hdr: dns.RR_Header{Name: "rebind.example.", Ttl: 60}, A: net.ParseIP("100.64.0.1")},
++		&dns.AAAA{Hdr: dns.RR_Header{Name: "rebind.example.", Ttl: 60}, AAAA: net.ParseIP("::1")},
++		&dns.AAAA{Hdr: dns.RR_Header{Name: "rebind.example.", Ttl: 60}, AAAA: net.ParseIP("fc00::1")},
++		&dns.AAAA{Hdr: dns.RR_Header{Name: "rebind.example.", Ttl: 60}, AAAA: net.ParseIP("fe80::1")},
++		&dns.A{Hdr: dns.RR_Header{Name: "public.example.", Ttl: 60}, A: net.ParseIP("1.1.1.1")},
++	}
++
++	ips := extractResolvedIPs(msg)
++	require.Len(t, ips, 1, "private or special-use DNS answers must not become nft allow rules")
++	require.Equal(t, "1.1.1.1", ips[0].Addr.String())
++}
++
+ func TestExtractResolvedIPs_EmptyOrNil(t *testing.T) {
+ 	require.Nil(t, extractResolvedIPs(nil), "nil msg: expected nil")
+ 	msg := new(dns.Msg)

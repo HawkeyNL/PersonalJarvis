@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Static regression checks for the production-only Home Node bootstrap assets.
+# They deliberately do not touch /etc, Docker, systemd, or the network.
+set -euo pipefail
+
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
+compose="$repo_dir/deploy/surrealdb/docker-compose.yml"
+env_example="$repo_dir/deploy/surrealdb/surrealdb.env.example"
+prepare="$repo_dir/deploy/systemd/prepare-home-node.sh"
+config="$repo_dir/deploy/systemd/generate-core-env.sh"
+provision="$repo_dir/deploy/surrealdb/provision-core-user.sh"
+stage="$repo_dir/deploy/systemd/stage-core-release.sh"
+verify="$repo_dir/deploy/systemd/verify-home-node.sh"
+core_unit="$repo_dir/deploy/systemd/jarvis-core.service"
+db_unit="$repo_dir/deploy/systemd/jarvis-surrealdb.service"
+
+for file in "$compose" "$env_example" "$prepare" "$config" "$provision" "$stage" "$verify" "$core_unit" "$db_unit"; do
+    [[ -f $file ]] || { echo "missing production bootstrap asset: $file" >&2; exit 1; }
+done
+bash -n "$prepare" "$config" "$provision" "$stage" "$verify"
+
+grep -Eq '^SURREALDB_IMAGE=surrealdb/surrealdb@sha256:[0-9a-f]{64}$' "$env_example"
+grep -Fq '127.0.0.1:8000:8000' "$compose"
+! grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]):8000' "$compose"
+grep -Fq 'privileged: false' "$compose"
+grep -Fq 'no-new-privileges:true' "$compose"
+! grep -Fq '/var/run/docker.sock' "$compose"
+grep -Fq 'cap_drop:' "$compose"
+grep -Fq 'mem_limit:' "$compose"
+grep -Fq 'pids_limit:' "$compose"
+
+grep -Fq 'must not be a Docker-group member' "$prepare"
+grep -Fq '/opt/jarvis/releases' "$prepare"
+grep -Fq '/etc/jarvis' "$prepare"
+grep -Fq 'JARVIS_AGENT_ENABLED=false' "$config"
+grep -Fq 'JARVIS_AGENT_CLAUDE_CODE_ENABLED=false' "$config"
+grep -Fq 'JARVIS_TRUSTED_PROXY_HOPS=0' "$config"
+grep -Fq 'JARVIS_BOOTSTRAP_SECRET_SHA256=' "$config"
+grep -Fq 'sha256sum' "$config"
+grep -Fq 'root:jarvis' "$config"
+grep -Fq '0640' "$config"
+grep -Fq 'refusing to rotate credentials or bootstrap state' "$config"
+grep -Fq 'existing Core user retained; no credentials rotated' "$provision"
+grep -Fq 'ROLES EDITOR' "$provision"
+! grep -Fq 'SURREAL_ROOT_PASSWORD=' "$config"
+
+grep -Fq 'sha256sum --strict --check' "$stage"
+grep -Fq 'release manifest does not bind this tag' "$stage"
+grep -Fq 'moving "latest" endpoint' "$stage"
+grep -Fq 'release.verification' "$stage"
+grep -Fq 'release was not staged by the verified-release helper' "$repo_dir/deploy/systemd/install-home-node-core.sh"
+grep -Fq 'must not contain symlinks' "$repo_dir/deploy/systemd/install-home-node-core.sh"
+grep -Fq 'User=jarvis' "$core_unit"
+! grep -Fq 'SupplementaryGroups=jarvis-codex' "$core_unit"
+grep -Fq 'After=network-online.target jarvis-surrealdb.service' "$core_unit"
+grep -Fq 'User=root' "$db_unit"
+grep -Fq 'start-production-surrealdb' "$db_unit"
+grep -Fq 'jarvis-opensandbox.service' "$verify"
+
+echo "Production Home Node bootstrap asset checks passed"

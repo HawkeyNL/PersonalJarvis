@@ -1,0 +1,36 @@
+# Production-only SurrealDB service for the Ubuntu Home Node.
+#
+# This is intentionally separate from ../compose/docker-compose.yml: that file
+# is a disposable development stack and must never become the production path.
+name: jarvis-surrealdb
+
+services:
+  surrealdb:
+    # SURREALDB_IMAGE must be an immutable digest; the operator helper rejects
+    # floating tags before Docker is invoked.
+    image: ${SURREALDB_IMAGE:?set an immutable SurrealDB image digest}
+    restart: unless-stopped
+    # RocksDB needs a writable data directory. The container itself gets no
+    # Docker socket, host network, capabilities, or privileged mode.
+    user: "0:0"
+    command: >-
+      start --bind 0.0.0.0:8000 --user ${SURREAL_ROOT_USER:?set root user}
+      --pass ${SURREAL_ROOT_PASSWORD:?set root password} rocksdb:/data/jarvis.db
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - /var/lib/jarvis/surrealdb:/data
+    healthcheck:
+      test: ["CMD", "/surreal", "isready", "--endpoint", "http://127.0.0.1:8000"]
+      interval: 10s
+      timeout: 3s
+      retries: 18
+      start_period: 15s
+    mem_limit: 2g
+    cpus: "2.0"
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    privileged: false

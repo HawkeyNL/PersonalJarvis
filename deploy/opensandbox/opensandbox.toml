@@ -1,0 +1,49 @@
+# Home Node OpenSandbox configuration (ADR-040).
+# This file is installed root-owned; the API key comes only from the restricted
+# environment file through OPENSANDBOX_SERVER_API_KEY.
+
+[server]
+host = "127.0.0.1"
+port = 8090
+max_sandbox_timeout_seconds = 900
+limit_concurrency = 8
+timeout_keep_alive = 15
+timeout_graceful_shutdown = 10
+
+[runtime]
+type = "docker"
+# Set both images to verified, immutable registry digests before deployment.
+execd_image = "REPLACE_WITH_VERIFIED_EXECD_IMAGE_DIGEST"
+
+[store]
+type = "sqlite"
+path = "/var/lib/opensandbox/opensandbox.db"
+
+[storage]
+# No host-path inputs or inherited binds are permitted for Jarvis workloads.
+allowed_host_paths = []
+
+[docker]
+# Required by OpenSandbox egress policy. Never use host networking for a task.
+network_mode = "bridge"
+# ADR-040 patch: every generated execd/HTTP/egress mapping is loopback-only.
+publish_host = "127.0.0.1"
+host_ip = "127.0.0.1"
+port_range_min = 41000
+port_range_max = 41150
+pids_limit = 128
+no_new_privileges = true
+sandbox_binds = []
+drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
+
+[egress]
+image = "REPLACE_WITH_VERIFIED_EGRESS_IMAGE_DIGEST"
+# DNS-only filtering is insufficient for this boundary.
+mode = "dns+nft"
+disable_ipv6 = true
+readiness_timeout_seconds = 30
+
+[ingress]
+# Jarvis does not expose sandbox workload ingress.
+mode = "direct"
+

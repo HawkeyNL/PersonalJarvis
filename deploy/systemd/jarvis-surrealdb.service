@@ -1,0 +1,32 @@
+[Unit]
+Description=Private production SurrealDB for Jarvis Core
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/jarvis/surrealdb.env
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+User=root
+Group=root
+ExecStart=/usr/local/libexec/jarvis/start-production-surrealdb
+ExecStop=/usr/bin/docker compose --env-file /etc/jarvis/surrealdb.env -f /opt/jarvis/surrealdb/docker-compose.yml stop
+TimeoutStartSec=3min
+TimeoutStopSec=45s
+UMask=0077
+
+# This trusted, root-operated container manager is the only component here with
+# Docker access. The Core itself never gets the socket or Docker group.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ReadWritePaths=/var/lib/jarvis /run/docker.sock
+
+[Install]
+WantedBy=multi-user.target

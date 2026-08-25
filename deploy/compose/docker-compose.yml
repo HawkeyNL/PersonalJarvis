@@ -1,0 +1,27 @@
+# Local SurrealDB development stack. Jarvis Core remains a native process;
+# this container is private persistence only and is never a public API.
+name: jarvis-dev
+
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:v2.6.5
+    # The official image runs as an unprivileged UID but Docker creates a new
+    # named volume as root. Start the isolated datastore as root so RocksDB can
+    # initialize that volume; Core itself remains an unprivileged systemd user.
+    user: "0:0"
+    restart: unless-stopped
+    # Listen on the container interface; the published host port is still bound
+    # to loopback only, so SurrealDB is never exposed beyond this machine.
+    command: start --bind 0.0.0.0:8000 --user ${SURREAL_ROOT_USER:-root} --pass ${SURREAL_ROOT_PASS:-change-this-dev-root-password} rocksdb:/data/jarvis.db
+    ports:
+      - "127.0.0.1:${SURREAL_PORT:-8000}:8000"
+    volumes:
+      - surreal_data:/data
+    healthcheck:
+      test: ["CMD", "/surreal", "isready", "--endpoint", "http://127.0.0.1:8000"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  surreal_data:

@@ -1,0 +1,37 @@
+# Trusted OpenSandbox control plane for the Ubuntu Home Node. This service owns
+# the Docker socket, but sandbox workloads never receive it. Host networking is
+# used only so loopback-published workload ports are reachable by the trusted
+# local server proxy; its own HTTP listener remains 127.0.0.1:8090.
+services:
+  opensandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        OPENSANDBOX_COMMIT: "6b2023e9b7eb80a940d88e6ae05fcbc0eb0cf23f"
+        # A mutable base-image tag must never be used for this trusted build.
+        PYTHON_BASE_IMAGE: ${OPENSANDBOX_PYTHON_BASE_IMAGE:?set OPENSANDBOX_PYTHON_BASE_IMAGE to a verified python:3.10-slim digest}
+        # `uv` is copied from this immutable image; do not fetch an install
+        # script while building the trusted control-plane image.
+        UV_IMAGE: ${OPENSANDBOX_UV_IMAGE:?set OPENSANDBOX_UV_IMAGE to a verified ghcr.io/astral-sh/uv digest}
+    image: jarvis-opensandbox:6b2023e9-loopback1
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:mode=1777,noexec,nosuid,size=64m
+    environment:
+      SANDBOX_CONFIG_PATH: /etc/opensandbox/opensandbox.toml
+    env_file:
+      # Production overrides this with JARVIS_OPENSANDBOX_ENV_FILE=/etc/jarvis/opensandbox.env.
+      # The checked-in default contains no key, so an accidental deployment fails closed.
+      - ${JARVIS_OPENSANDBOX_ENV_FILE:-./opensandbox.env.example}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/jarvis/opensandbox.toml:/etc/opensandbox/opensandbox.toml:ro
+      - opensandbox_state:/var/lib/opensandbox
+
+volumes:
+  opensandbox_state:

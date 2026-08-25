@@ -1,0 +1,24 @@
+[package]
+name = "jarvis-speech"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+# Real STT via whisper.cpp (whisper-rs). Needs a C++ toolchain + cmake to build
+# (`brew install cmake`), so it is off by default and the workspace/CI build the
+# stub. Enable through the api crate: `--features speech-whisper`.
+whisper = ["dep:whisper-rs", "dep:tokio"]
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+rustfft = "6"
+whisper-rs = { version = "0.14", optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true

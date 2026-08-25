@@ -1,0 +1,11 @@
+[package]
+name = "jarvis-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+surrealdb.workspace = true
+thiserror.workspace = true
+serde.workspace = true

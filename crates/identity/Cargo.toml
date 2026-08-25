@@ -1,0 +1,23 @@
+[package]
+name = "jarvis-identity"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+jarvis-store.workspace = true
+surrealdb.workspace = true
+uuid.workspace = true
+time.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+sha2.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+serde_bytes.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

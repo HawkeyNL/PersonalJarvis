@@ -1,0 +1,211 @@
+//! System introspection: this month's LLM spend vs. budget (ADR-027), the
+//! resource/agent registry (host + brains + model catalog), and self-development.
+//! Self-improve is **advisory only** — Jarvis reads its own ecosystem and returns
+//! concrete proposals but never acts; carrying one out goes through the approval
+//! gate, and the Core + `Jarvis.md` stay owner-only, manual.
+
+use std::sync::atomic::Ordering;
+
+use axum::{extract::State, http::StatusCode, Json};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use jarvis_registry as registry;
+use jarvis_selfdev as selfdev;
+use jarvis_usage as usage;
+
+use crate::error::bad_request;
+use crate::metering::record_usage;
+use crate::validation;
+use crate::{AppState, Authed};
+
+/// This month's LLM spend vs. the budget, with a per-backend breakdown (ADR-027).
+pub(crate) async fn system_usage(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
+    let spent_eur = state.spent_cents.load(Ordering::Relaxed) as f64 / 100.0;
+    let budget_eur = state.budget_cents as f64 / 100.0;
+    let breakdown = usage::month_breakdown(&state.db).await.unwrap_or_default();
+    let by_backend: Vec<Value> = breakdown
+        .into_iter()
+        .map(|(backend, eur)| json!({ "backend": backend, "spent_eur": eur }))
+        .collect();
+    Json(json!({
+        "budget_eur": budget_eur,
+        "spent_eur": spent_eur,
+        "remaining_eur": (budget_eur - spent_eur).max(0.0),
+        "over_budget": spent_eur >= budget_eur,
+        "by_backend": by_backend,
+    }))
+}
+
+/// Jarvis' resource/agent registry — available brains + cost + the host it runs
+/// on (ADR-027 stage 3). Cached from startup; POST `/refresh` re-probes.
+pub(crate) async fn system_registry(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
+    let value = state
+        .registry
+        .read()
+        .map(|reg| serde_json::to_value(&*reg).unwrap_or_else(|_| json!({})))
+        .unwrap_or_else(|_| json!({}));
+    Json(value)
+}
+
+pub(crate) async fn system_registry_refresh(
+    _authed: Authed,
+    State(state): State<AppState>,
+) -> Json<Value> {
+    let fresh = registry::collect(&state.registry_input).await;
+    if let Ok(mut reg) = state.registry.write() {
+        *reg = fresh.clone();
+    }
+    Json(serde_json::to_value(&fresh).unwrap_or_else(|_| json!({})))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SelfImproveReq {
+    /// Optional area to focus the advice on (e.g. "goedkopere modellen").
+    #[serde(default)]
+    focus: Option<String>,
+}
+
+/// Jarvis proposes improvements to ITSELF (ADR-029 fase 4d) — **advisory only**.
+/// It reads its own ecosystem (registry + budget + agent capabilities) and returns
+/// concrete proposals; it never acts. Carrying one out goes through the approval
+/// gate (4b/4c); the Core and `Jarvis.md` stay owner-only, manual. On request only.
+pub(crate) async fn system_self_improve(
+    _authed: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<SelfImproveReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(focus) = req.focus.as_deref() {
+        if focus.len() > validation::MAX_FOCUS_LEN {
+            return Err(bad_request("focus too long"));
+        }
+    }
+    let ecosystem = match state.registry.read() {
+        Ok(reg) => render_ecosystem(&reg, state.agent_enabled, state.agent_sandbox.is_some()),
+        Err(_) => "(ecosysteem tijdelijk niet leesbaar)".to_string(),
+    };
+    let spent_eur = state.spent_cents.load(Ordering::Relaxed) as f64 / 100.0;
+    let budget_eur = state.budget_cents as f64 / 100.0;
+    match selfdev::propose(
+        &state.llm,
+        &state.jarvis_system,
+        &ecosystem,
+        budget_eur,
+        spent_eur,
+        req.focus.as_deref(),
+    )
+    .await
+    {
+        Ok(report) => {
+            for reply in &report.calls {
+                record_usage(&state, reply).await;
+            }
+            let proposals: Vec<Value> = report
+                .proposals
+                .iter()
+                .map(|p| {
+                    json!({
+                        "title": p.title,
+                        "category": p.category,
+                        "rationale": p.rationale,
+                        "cost": p.cost,
+                        "requires_approval": p.requires_approval,
+                        "steps": p.steps,
+                    })
+                })
+                .collect();
+            Ok(Json(json!({
+                "summary": report.summary,
+                "proposals": proposals,
+                "note": "Jarvis stelt alleen voor — uitvoeren gaat via jouw goedkeuring (4b/4c); \
+                         de Core en Jarvis.md blijven handmatig, alleen door jou.",
+            })))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "self-improve failed");
+            Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": "brain unavailable",
+                    "hint": "controleer je brein-config (router/keys/Ollama)",
+                })),
+            ))
+        }
+    }
+}
+
+/// Render the registry into a compact text snapshot for the self-dev advisor.
+/// Shared with the MCP `jarvis_status` tool.
+pub(crate) fn render_ecosystem(
+    reg: &registry::Registry,
+    agent_enabled: bool,
+    has_workspace: bool,
+) -> String {
+    let h = &reg.host;
+    let mut s = format!(
+        "Host: {} {}, {} ({} cores), {:.1} GB RAM, GPU: {}\nActief brein: {}\n",
+        h.os, h.arch, h.cpu, h.cpu_cores, h.mem_total_gb, h.gpu, reg.active_brain
+    );
+    s.push_str("\nBreinen:\n");
+    for b in &reg.brains {
+        s.push_str(&format!(
+            "- {} [{}] beschikbaar: {} — {}\n",
+            b.label,
+            enum_str(&b.cost),
+            yesno(b.available),
+            b.note
+        ));
+    }
+    s.push_str("\nModel-catalogus:\n");
+    for m in &reg.models {
+        s.push_str(&format!(
+            "- {} ({}, {}, {}) beschikbaar: {}\n",
+            m.id,
+            m.backend,
+            enum_str(&m.class),
+            enum_str(&m.cost),
+            yesno(m.available)
+        ));
+    }
+    s.push_str("\nTools op de host:\n");
+    for t in &reg.software {
+        let v = t
+            .version
+            .as_deref()
+            .map(|v| format!(" ({v})"))
+            .unwrap_or_default();
+        s.push_str(&format!(
+            "- {}: {}{}\n",
+            t.name,
+            if t.present { "aanwezig" } else { "afwezig" },
+            v
+        ));
+    }
+    s.push_str(&format!(
+        "\nAgent-capabilities: agent {}, werkmap {}\n",
+        if agent_enabled { "AAN" } else { "uit" },
+        if has_workspace {
+            "geconfigureerd"
+        } else {
+            "geen"
+        }
+    ));
+    s
+}
+
+/// Serialize a small lowercase-tagged enum (ModelClass/ModelCost/CostTier) to its
+/// string form for display.
+fn enum_str<T: serde::Serialize>(t: &T) -> String {
+    serde_json::to_value(t)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn yesno(b: bool) -> &'static str {
+    if b {
+        "ja"
+    } else {
+        "nee"
+    }
+}

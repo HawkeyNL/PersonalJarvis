@@ -1,0 +1,28 @@
+[Unit]
+Description=Install the latest verified Jarvis Core GitHub release
+Wants=network-online.target
+After=network-online.target jarvis-core.service
+ConditionPathExists=/etc/jarvis/updater.env
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/jarvis/updater.env
+ExecStart=/usr/local/libexec/jarvis/update-core-release
+UMask=0077
+
+# The updater is privileged only to replace immutable releases below /opt and
+# to request a restart of its single unit. It never receives Core's secrets.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ReadWritePaths=/opt/jarvis

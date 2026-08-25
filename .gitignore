@@ -1,0 +1,28 @@
+# Rust
+/target
+**/target/
+**/*.rs.bk
+
+# Environment / secrets — never commit real values
+.env
+.env.*
+!.env.example
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+
+# Tauri build output
+apps/**/src-tauri/target/
+
+# SQLx offline data (regenerated)
+/.sqlx
+
+# Speech models (fetched via scripts/fetch-whisper-model.sh)
+/models/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

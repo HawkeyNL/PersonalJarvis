@@ -1,0 +1,147 @@
+diff --git a/server/opensandbox_server/middleware/auth.py b/server/opensandbox_server/middleware/auth.py
+index a311c73..6442cd1 100644
+--- a/server/opensandbox_server/middleware/auth.py
++++ b/server/opensandbox_server/middleware/auth.py
+@@ -79,9 +79,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
+         if any(request.url.path.startswith(path) for path in self.EXEMPT_PATHS):
+             return await call_next(request)
+ 
+-        if self._is_proxy_path(request.url.path) and not self._is_multi_tenant:
+-            return await call_next(request)
+-
+         # If no API keys configured AND no tenant provider → skip auth
+         if not self._is_multi_tenant and not self.valid_api_keys:
+             return await call_next(request)
+diff --git a/server/opensandbox_server/config.py b/server/opensandbox_server/config.py
+index 2ceb7e8..f6d9552 100644
+--- a/server/opensandbox_server/config.py
++++ b/server/opensandbox_server/config.py
+@@ -861,6 +861,20 @@ class DockerConfig(BaseModel):
+             "Docker host IP or hostname for bridge-mode endpoint URLs when the server runs in a container."
+         ),
+     )
++    publish_host: str = Field(
++        default="127.0.0.1",
++        description=(
++            "Host IP address used for dynamically published sandbox ports. "
++            "Set to 127.0.0.1 for a private single-host manager."
++        ),
++    )
++
++    @field_validator("publish_host")
++    @classmethod
++    def validate_publish_host(cls, value: str) -> str:
++        if not _is_valid_ip(value):
++            raise ValueError("docker.publish_host must be an IP address.")
++        return value
+     drop_capabilities: list[str] = Field(
+         default_factory=lambda: [
+             "AUDIT_WRITE",
+diff --git a/server/opensandbox_server/services/docker/docker_service.py b/server/opensandbox_server/services/docker/docker_service.py
+index 6e0fda1..d8facca 100644
+--- a/server/opensandbox_server/services/docker/docker_service.py
++++ b/server/opensandbox_server/services/docker/docker_service.py
+@@ -805,7 +805,12 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
+ 
+                 egress_token = generate_egress_token()
+                 labels[SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY] = egress_token
+-                sidecar_port_bindings = allocate_port_bindings([*exposed_ports, "18080"], min_port=self.app_config.docker.port_range_min, max_port=self.app_config.docker.port_range_max)
++                sidecar_port_bindings = allocate_port_bindings(
++                    [*exposed_ports, "18080"],
++                    publish_host=self.app_config.docker.publish_host,
++                    min_port=self.app_config.docker.port_range_min,
++                    max_port=self.app_config.docker.port_range_max,
++                )
+                 host_execd_port = sidecar_port_bindings["44772"][1]
+                 host_http_port = sidecar_port_bindings["8080"][1]
+                 egress_api_binding = sidecar_port_bindings.get("18080")
+@@ -848,7 +853,12 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
+                     gpu_count=effective_gpu_count,
+                 )
+                 if self.network_mode != HOST_NETWORK_MODE:
+-                    port_bindings = allocate_port_bindings(exposed_ports, min_port=self.app_config.docker.port_range_min, max_port=self.app_config.docker.port_range_max)
++                    port_bindings = allocate_port_bindings(
++                        exposed_ports,
++                        publish_host=self.app_config.docker.publish_host,
++                        min_port=self.app_config.docker.port_range_min,
++                        max_port=self.app_config.docker.port_range_max,
++                    )
+                     host_execd_port = port_bindings["44772"][1]
+                     host_http_port = port_bindings["8080"][1]
+                     host_config_kwargs["port_bindings"] = normalize_port_bindings(port_bindings)
+diff --git a/server/opensandbox_server/services/docker/networking.py b/server/opensandbox_server/services/docker/networking.py
+index 46ebf8d..91bafa9 100644
+--- a/server/opensandbox_server/services/docker/networking.py
++++ b/server/opensandbox_server/services/docker/networking.py
+@@ -424,8 +424,8 @@ class DockerNetworkingMixin:
+                     sidecar_env.append(f"{key}={value}")
+ 
+         sidecar_port_bindings: dict[str, tuple[str, int]] = {
+-            "44772": ("0.0.0.0", host_execd_port),
+-            "8080": ("0.0.0.0", host_http_port),
++            "44772": (self.app_config.docker.publish_host, host_execd_port),
++            "8080": (self.app_config.docker.publish_host, host_http_port),
+         }
+         if extra_port_bindings:
+             sidecar_port_bindings.update(extra_port_bindings)
+diff --git a/server/opensandbox_server/services/docker/port_allocator.py b/server/opensandbox_server/services/docker/port_allocator.py
+index 8cf19dc..e368757 100644
+--- a/server/opensandbox_server/services/docker/port_allocator.py
++++ b/server/opensandbox_server/services/docker/port_allocator.py
+@@ -22,11 +22,7 @@ from fastapi import HTTPException, status
+ 
+ from opensandbox_server.services.constants import SandboxErrorCodes
+ 
+-DOCKER_PUBLISH_HOST = "0.0.0.0"
+-# The probe is a short-lived availability check and must match Docker's
+-# publish scope; probing only localhost can miss ports bound on other host
+-# interfaces that Docker would later fail to publish.
+-PORT_PROBE_HOST = DOCKER_PUBLISH_HOST
++DEFAULT_DOCKER_PUBLISH_HOST = "127.0.0.1"
+ 
+ 
+ def normalize_container_port_spec(port_spec: str) -> str:
+@@ -52,6 +48,7 @@ def normalize_port_bindings(
+ 
+ 
+ def allocate_host_port(
++    publish_host: str = DEFAULT_DOCKER_PUBLISH_HOST,
+     min_port: int = 40000,
+     max_port: int = 60000,
+     attempts: int = 50,
+@@ -65,7 +62,7 @@ def allocate_host_port(
+                 # This does not listen for or accept connections; it mirrors the
+                 # later Docker publish binding to catch host-wide port conflicts.
+                 # codeql[py/bind-socket-all-network-interfaces]
+-                sock.bind((PORT_PROBE_HOST, port))
++                sock.bind((publish_host, port))
+             except OSError:
+                 continue
+             return port
+@@ -74,6 +71,7 @@ def allocate_host_port(
+ 
+ def allocate_port_bindings(
+     container_ports: list[str],
++    publish_host: str = DEFAULT_DOCKER_PUBLISH_HOST,
+     min_port: int = 40000,
+     max_port: int = 60000,
+ ) -> Dict[str, tuple[str, int]]:
+@@ -82,7 +80,9 @@ def allocate_port_bindings(
+     bindings: Dict[str, tuple[str, int]] = {}
+     for container_port in container_ports:
+         while True:
+-            host_port = allocate_host_port(min_port=min_port, max_port=max_port)
++            host_port = allocate_host_port(
++                publish_host=publish_host, min_port=min_port, max_port=max_port
++            )
+             if host_port is None:
+                 raise HTTPException(
+                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+@@ -93,6 +93,6 @@ def allocate_port_bindings(
+                 )
+             if host_port not in allocated_ports:
+                 allocated_ports.add(host_port)
+-                bindings[container_port] = (DOCKER_PUBLISH_HOST, host_port)
++                bindings[container_port] = (publish_host, host_port)
+                 break
+     return bindings

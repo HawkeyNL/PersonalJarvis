@@ -1,0 +1,16 @@
+{
+  "name": "jarvis-blueprint-v3.0",
+  "generated_at": "2026-08-05T21:00:00+02:00",
+  "files": 636,
+  "markdown_files": 635,
+  "language": "nl",
+  "purpose": "technical blueprint",
+  "features_added": [
+    "home-node",
+    "device-mesh",
+    "headless-ssh-management",
+    "remote-screen",
+    "api-quota-guardian",
+    "infrastructure-galaxy"
+  ]
+}
