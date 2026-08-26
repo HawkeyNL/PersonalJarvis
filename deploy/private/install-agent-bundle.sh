@@ -7,6 +7,7 @@ set -euo pipefail
 readonly bundle_root=/var/lib/jarvis/agents
 readonly releases_dir="$bundle_root/releases"
 readonly current_link="$bundle_root/current"
+readonly validator=${JARVIS_AGENT_BUNDLE_VALIDATOR:-/usr/local/libexec/jarvis/jarvis-agent-bundle}
 fail() { echo "private agents: $*" >&2; exit 1; }
 usage() { echo "Usage: sudo $0 --source /path/to/PersonalJarvisAgents" >&2; exit 64; }
 
@@ -20,6 +21,7 @@ done
 [[ ${EUID} -eq 0 ]] || fail "must run as root"
 [[ -n $source_root ]] || usage
 for command in jq sha256sum find mktemp realpath; do command -v "$command" >/dev/null 2>&1 || fail "$command is required"; done
+[[ -x $validator && ! -L $validator ]] || fail "validated agent-bundle helper is unavailable"
 
 source_root=$(realpath -e -- "$source_root") || fail "private checkout does not exist"
 source_agents="$source_root/agents"
@@ -36,14 +38,11 @@ count=0
 while IFS= read -r -d '' source_file; do
     [[ -f $source_file && ! -L $source_file ]] || fail "agent source is unsafe"
     base=${source_file##*/}
-    [[ $base =~ ^[0-9]{2}_[A-Za-z0-9_]+\.md$ ]] || continue
-    id=$(printf '%s' "${base%.md}" | tr '[:upper:]_' '[:lower:]-')
-    target="$stage/agents/$id.json"
-    jq -n --rawfile instructions "$source_file" \
-        --arg id "$id" \
-        --arg name "${base%.md}" \
-        '{id:$id,name:$name,description:"Private owner-provided agent profile.",model_policy:"default",instructions:$instructions,requested_capabilities:[],allowed_tools:[],denied_actions:[],limits:{max_runtime_seconds:300,max_context_chars:20000,max_output_chars:12000,max_parallel_runs:1}}' \
-        > "$target"
+    [[ $base =~ ^(0[1-9]|1[0-9])_[A-Za-z0-9_]+\.md$ ]] || continue
+    target="$stage/agents/${base%.md}.json"
+    "$validator" validate "$source_file" "$target" || fail "agent definition failed validation"
+    id=$(jq -er '.id | strings | select(test("^[A-Za-z0-9_-]{1,64}$"))' "$target") || fail "validated agent has unsafe ID"
+    mv -- "$target" "$stage/agents/$id.json"
     ((count += 1))
 done < <(find "$source_agents" -maxdepth 1 -type f -name '*.md' -print0 | LC_ALL=C sort -z)
 ((count > 0)) || fail "no numbered private agent profiles found"

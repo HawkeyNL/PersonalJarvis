@@ -9,7 +9,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -58,6 +58,8 @@ pub struct AgentDefinition {
     pub limits: AgentLimits,
 }
 
+/// Strict versioned frontmatter used only at the trusted private-bundle
+/// deployment boundary. Runtime loads the resulting hash-checked JSON bundle.
 /// Hard upper bounds declared by an agent profile. Core still applies its own
 /// policy and deployment limits; a profile can only request less capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +90,33 @@ pub struct AgentBundleEntry {
 pub struct AgentRegistry {
     bundle_id: String,
     agents: Vec<AgentDefinition>,
+}
+
+/// Immutable registry generation. A reload constructs a complete new snapshot;
+/// callers holding an older snapshot (including active runs) remain valid.
+#[derive(Debug, Clone)]
+pub struct AgentRegistrySnapshot {
+    pub generation: u64,
+    pub registry: Arc<AgentRegistry>,
+}
+
+/// Core-owned loader for the staged bundle only. It neither knows nor accepts
+/// a Git checkout, credentials, or arbitrary private source path.
+#[derive(Debug)]
+pub struct AgentLoader {
+    bundle_path: PathBuf,
+    current: RwLock<Arc<AgentRegistrySnapshot>>,
+}
+
+/// A model-generated change can be shown to an owner, but represents no write
+/// capability. Deployment remains a separately authenticated root operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentChangeProposal {
+    pub id: Uuid,
+    pub agent_id: String,
+    pub base_bundle_id: String,
+    pub summary: String,
+    pub unified_diff: String,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -208,12 +237,173 @@ impl AgentRegistry {
     }
 }
 
+impl AgentLoader {
+    /// Parses a private Markdown profile without executing any instructions.
+    /// Only an exact `---` YAML frontmatter block followed by non-empty
+    /// Markdown is accepted; unsupported fields and capabilities fail closed.
+    pub fn parse_markdown(markdown: &str) -> Result<AgentDefinition, AgentRegistryError> {
+        let remainder = markdown
+            .strip_prefix("---\n")
+            .ok_or(AgentRegistryError::MalformedBundle)?;
+        let (frontmatter, instructions) = remainder
+            .split_once("\n---\n")
+            .ok_or(AgentRegistryError::MalformedBundle)?;
+        let frontmatter = parse_frontmatter(frontmatter)?;
+        let agent = AgentDefinition {
+            id: required_frontmatter(&frontmatter, "id")?.to_string(),
+            name: required_frontmatter(&frontmatter, "name")?.to_string(),
+            description: required_frontmatter(&frontmatter, "description")?.to_string(),
+            model_policy: required_frontmatter(&frontmatter, "model_policy")?.to_string(),
+            instructions: instructions.trim().to_string(),
+            requested_capabilities: parse_capabilities(&frontmatter)?,
+            allowed_tools: Vec::new(),
+            denied_actions: Vec::new(),
+            limits: AgentLimits {
+                max_runtime_seconds: required_frontmatter(&frontmatter, "max_runtime_seconds")
+                    .and_then(parse_number)?,
+                max_context_chars: required_frontmatter(&frontmatter, "max_context_chars")
+                    .and_then(parse_number)?,
+                max_output_chars: required_frontmatter(&frontmatter, "max_output_chars")
+                    .and_then(parse_number)?,
+                max_parallel_runs: required_frontmatter(&frontmatter, "max_parallel_runs")
+                    .and_then(parse_number)?,
+            },
+        };
+        validate_definition(&agent)?;
+        Ok(agent)
+    }
+
+    pub fn load(bundle_path: impl Into<PathBuf>) -> Result<Self, AgentRegistryError> {
+        let bundle_path = bundle_path.into();
+        let registry = Arc::new(AgentRegistry::load(&bundle_path)?);
+        Ok(Self {
+            bundle_path,
+            current: RwLock::new(Arc::new(AgentRegistrySnapshot {
+                generation: 1,
+                registry,
+            })),
+        })
+    }
+
+    pub fn snapshot(&self) -> Arc<AgentRegistrySnapshot> {
+        self.current
+            .read()
+            .expect("agent registry lock poisoned")
+            .clone()
+    }
+
+    /// Loads and validates a whole replacement first. If it fails, the active
+    /// snapshot is unchanged; no partial registry can become visible.
+    pub fn reload(&self) -> Result<Arc<AgentRegistrySnapshot>, AgentRegistryError> {
+        let registry = Arc::new(AgentRegistry::load(&self.bundle_path)?);
+        let mut current = self.current.write().expect("agent registry lock poisoned");
+        let next = Arc::new(AgentRegistrySnapshot {
+            generation: current.generation.saturating_add(1),
+            registry,
+        });
+        *current = next.clone();
+        Ok(next)
+    }
+}
+
+fn parse_frontmatter(
+    input: &str,
+) -> Result<std::collections::BTreeMap<String, String>, AgentRegistryError> {
+    const ALLOWED: &[&str] = &[
+        "schema_version",
+        "id",
+        "name",
+        "description",
+        "model_policy",
+        "requested_capabilities",
+        "max_runtime_seconds",
+        "max_context_chars",
+        "max_output_chars",
+        "max_parallel_runs",
+    ];
+    let mut values = std::collections::BTreeMap::new();
+    let mut active_list = false;
+    for line in input.lines() {
+        if let Some(item) = line.strip_prefix("  - ") {
+            if !active_list || item.trim().is_empty() {
+                return Err(AgentRegistryError::MalformedBundle);
+            }
+            values
+                .entry("requested_capabilities".into())
+                .and_modify(|value: &mut String| {
+                    value.push(',');
+                    value.push_str(item.trim());
+                });
+            continue;
+        }
+        active_list = false;
+        let (key, value) = line
+            .split_once(':')
+            .ok_or(AgentRegistryError::MalformedBundle)?;
+        let key = key.trim();
+        if !ALLOWED.contains(&key) || values.contains_key(key) {
+            return Err(AgentRegistryError::MalformedBundle);
+        }
+        let value = value.trim();
+        if key == "requested_capabilities" {
+            if !value.is_empty() {
+                return Err(AgentRegistryError::MalformedBundle);
+            }
+            active_list = true;
+            values.insert(key.to_string(), String::new());
+        } else if value.is_empty() {
+            return Err(AgentRegistryError::MalformedBundle);
+        } else {
+            values.insert(key.to_string(), value.to_string());
+        }
+    }
+    if values.get("schema_version").map(String::as_str) != Some("1") {
+        return Err(AgentRegistryError::MalformedBundle);
+    }
+    Ok(values)
+}
+
+fn required_frontmatter<'a>(
+    values: &'a std::collections::BTreeMap<String, String>,
+    key: &'static str,
+) -> Result<&'a str, AgentRegistryError> {
+    values
+        .get(key)
+        .map(String::as_str)
+        .ok_or(AgentRegistryError::MalformedBundle)
+}
+
+fn parse_number<T: std::str::FromStr>(value: &str) -> Result<T, AgentRegistryError> {
+    value
+        .parse()
+        .map_err(|_| AgentRegistryError::MalformedBundle)
+}
+
+fn parse_capabilities(
+    values: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<Capability>, AgentRegistryError> {
+    values
+        .get("requested_capabilities")
+        .map_or(Ok(Vec::new()), |value| {
+            value
+                .split(',')
+                .filter(|part| !part.is_empty())
+                .map(|capability| {
+                    serde_json::from_value(serde_json::Value::String(capability.to_string()))
+                        .map_err(|_| AgentRegistryError::MalformedBundle)
+                })
+                .collect()
+        })
+}
+
 /// A temporary Core-owned agent invocation. It is not a Linux service and
 /// cannot recursively create other runs through this primitive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRun {
     pub id: Uuid,
     pub agent_id: String,
+    pub bundle_id: String,
+    pub registry_generation: u64,
     pub effective_capabilities: Vec<Capability>,
     pub timeout: Duration,
     pub max_context_chars: usize,
@@ -241,11 +431,33 @@ impl AgentRun {
         Ok(Self {
             id: Uuid::now_v7(),
             agent_id: agent_id.to_string(),
+            bundle_id: registry.bundle_id.clone(),
+            registry_generation: 0,
             effective_capabilities,
             timeout: Duration::from_secs(agent.limits.max_runtime_seconds),
             max_context_chars: agent.limits.max_context_chars,
             max_output_chars: agent.limits.max_output_chars,
         })
+    }
+
+    pub fn from_snapshot(
+        snapshot: &AgentRegistrySnapshot,
+        agent_id: &str,
+        core_allowed: &[Capability],
+        device_allowed: &[Capability],
+        task_allowed: &[Capability],
+        active_runs_for_agent: u16,
+    ) -> Result<Self, AgentRegistryError> {
+        let mut run = Self::new(
+            &snapshot.registry,
+            agent_id,
+            core_allowed,
+            device_allowed,
+            task_allowed,
+            active_runs_for_agent,
+        )?;
+        run.registry_generation = snapshot.generation;
+        Ok(run)
     }
 }
 
@@ -353,6 +565,33 @@ mod tests {
         (directory, hash)
     }
 
+    const VALID_MARKDOWN_AGENT: &str = "---\nschema_version: 1\nid: research\nname: Research\ndescription: Synthetic fixture\nmodel_policy: research\nrequested_capabilities:\n  - read_data\nmax_runtime_seconds: 30\nmax_context_chars: 1000\nmax_output_chars: 500\nmax_parallel_runs: 1\n---\n\n# Research\n\nSummarise trusted input.\n";
+
+    #[test]
+    fn strict_markdown_loader_accepts_only_versioned_frontmatter() {
+        let agent = AgentLoader::parse_markdown(VALID_MARKDOWN_AGENT).unwrap();
+        assert_eq!(agent.id, "research");
+        assert_eq!(agent.requested_capabilities, vec![Capability::ReadData]);
+        assert!(agent.instructions.contains("Summarise"));
+        assert!(matches!(
+            AgentLoader::parse_markdown("# no frontmatter"),
+            Err(AgentRegistryError::MalformedBundle)
+        ));
+        assert!(matches!(
+            AgentLoader::parse_markdown(
+                &VALID_MARKDOWN_AGENT.replace("schema_version: 1", "schema_version: 2")
+            ),
+            Err(AgentRegistryError::MalformedBundle)
+        ));
+        assert!(matches!(
+            AgentLoader::parse_markdown(&VALID_MARKDOWN_AGENT.replace(
+                "model_policy: research",
+                "model_policy: research\nroot_shell: true"
+            )),
+            Err(AgentRegistryError::MalformedBundle)
+        ));
+    }
+
     #[test]
     fn registry_loads_a_hashed_synthetic_bundle_and_intersects_capabilities() {
         let (directory, _) = fixture_registry();
@@ -421,5 +660,43 @@ mod tests {
             Err(AgentRegistryError::ConcurrencyLimit)
         );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn failed_reload_keeps_the_previous_generation_and_runs_are_pinned() {
+        let (directory, _) = fixture_registry();
+        let loader = AgentLoader::load(&directory).unwrap();
+        let first = loader.snapshot();
+        let run = AgentRun::from_snapshot(
+            &first,
+            "research",
+            &[Capability::ReadData],
+            &[Capability::ReadData],
+            &[Capability::ReadData],
+            0,
+        )
+        .unwrap();
+        assert_eq!(run.registry_generation, 1);
+        std::fs::write(directory.join("agents/research.json"), b"tampered").unwrap();
+        assert!(matches!(
+            loader.reload(),
+            Err(AgentRegistryError::HashMismatch)
+        ));
+        assert_eq!(loader.snapshot().generation, 1);
+        assert_eq!(run.bundle_id, first.registry.bundle_id());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn change_proposal_has_no_write_capability() {
+        let proposal = AgentChangeProposal {
+            id: Uuid::now_v7(),
+            agent_id: "research".into(),
+            base_bundle_id: "bundle-test".into(),
+            summary: "Request a wording change".into(),
+            unified_diff: "--- a/agents/research.md\n+++ b/agents/research.md".into(),
+        };
+        assert_eq!(proposal.agent_id, "research");
+        assert!(!proposal.unified_diff.is_empty());
     }
 }

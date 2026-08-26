@@ -19,7 +19,28 @@ if ! getent passwd jarvis >/dev/null; then
 fi
 mkdir -p "$fixture/private/personaljarvis/jarvis-core" "$fixture/private/agents"
 printf 'Synthetic owner persona.\n' > "$fixture/private/personaljarvis/jarvis-core/Jarvis.md"
-printf '# Synthetic agent\n' > "$fixture/private/agents/01_TEST_AGENT.md"
+cat > "$fixture/private/agents/01_TEST_AGENT.md" <<'EOF'
+---
+schema_version: 1
+id: test-agent
+name: Test Agent
+description: Synthetic fixture
+model_policy: default
+max_runtime_seconds: 30
+max_context_chars: 1000
+max_output_chars: 500
+max_parallel_runs: 1
+---
+
+Synthetic instructions.
+EOF
+cat > "$fixture/validator" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $1 == validate && $# == 3 ]] || exit 1
+jq -n --rawfile instructions "$2" '{id:"test-agent",name:"Test Agent",description:"Synthetic fixture",model_policy:"default",instructions:$instructions,requested_capabilities:[],allowed_tools:[],denied_actions:[],limits:{max_runtime_seconds:30,max_context_chars:1000,max_output_chars:500,max_parallel_runs:1}}' > "$3"
+EOF
+chmod 0755 "$fixture/validator"
 
 bash "$repo_dir/deploy/private/install-private-config.sh" --source "$fixture/private"
 [[ $(stat -c '%U:%G:%a' /etc/jarvis/Jarvis.md) == root:jarvis:640 ]]
@@ -32,12 +53,12 @@ if bash "$repo_dir/deploy/private/install-private-config.sh" --source "$fixture/
 fi
 [[ $(sha256sum /etc/jarvis/Jarvis.md | awk '{print $1}') == "$before" ]]
 
-bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"
+JARVIS_AGENT_BUNDLE_VALIDATOR="$fixture/validator" bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"
 bundle=$(readlink -f /var/lib/jarvis/agents/current)
 [[ -f $bundle/manifest.json ]]
 [[ $(stat -c '%U:%G:%a' "$bundle/manifest.json") == root:root:644 ]]
 ln -s /etc/passwd "$fixture/private/agents/02_EVIL.md"
-if bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"; then
+if JARVIS_AGENT_BUNDLE_VALIDATOR="$fixture/validator" bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"; then
     echo "agent symlink was accepted" >&2
     exit 1
 fi

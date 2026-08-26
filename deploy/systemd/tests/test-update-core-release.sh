@@ -79,6 +79,8 @@ write_release() {
     mkdir -p "$root/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
     chmod 0755 "$root/jarvis-core-$tag/jarvis-api"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-agent-bundle"
+    chmod 0755 "$root/jarvis-core-$tag/jarvis-agent-bundle"
     jq -n \
         --arg tag "$tag" \
         --arg schema_sha256 "$schema_sha256" \
