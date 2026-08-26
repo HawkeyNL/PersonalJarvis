@@ -81,7 +81,8 @@ jobs:
             echo "release tag must use stable vMAJOR.MINOR.PATCH form" >&2
             exit 1
           }
-          cargo build --locked --release -p jarvis-api -p jarvis-core --bin jarvis-agent-bundle
+          cargo build --locked --release -p jarvis-api --bin jarvis-api
+          cargo build --locked --release -p jarvis-core --bin jarvis-agent-bundle
           staging=$(mktemp -d)
           trap 'rm -rf "$staging"' EXIT
           release_dir="$staging/jarvis-core-$RELEASE_TAG"
