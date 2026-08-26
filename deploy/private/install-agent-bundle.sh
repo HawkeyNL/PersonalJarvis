@@ -24,8 +24,8 @@ for command in jq sha256sum find mktemp realpath; do command -v "$command" >/dev
 source_root=$(realpath -e -- "$source_root") || fail "private checkout does not exist"
 source_agents="$source_root/agents"
 [[ -d $source_agents && ! -L $source_agents ]] || fail "agents directory is missing or unsafe"
-find "$source_agents" -maxdepth 1 -type l -print -quit | grep -q . && \
-    fail "agent source contains a symlink"
+source_symlink=$(find "$source_agents" -maxdepth 1 -type l -print -quit)
+[[ -z $source_symlink ]] || fail "agent source contains a symlink"
 
 install -d -o root -g root -m 0755 "$bundle_root" "$releases_dir"
 stage=$(mktemp -d "$releases_dir/.staging.XXXXXXXX")

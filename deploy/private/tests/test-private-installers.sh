@@ -34,7 +34,8 @@ fi
 
 bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"
 bundle=$(readlink -f /var/lib/jarvis/agents/current)
-[[ -f $bundle/manifest.json && ! -w $bundle/manifest.json ]]
+[[ -f $bundle/manifest.json ]]
+[[ $(stat -c '%U:%G:%a' "$bundle/manifest.json") == root:root:644 ]]
 ln -s /etc/passwd "$fixture/private/agents/02_EVIL.md"
 if bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"; then
     echo "agent symlink was accepted" >&2
