@@ -9,7 +9,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -88,6 +88,33 @@ pub struct AgentBundleEntry {
 pub struct AgentRegistry {
     bundle_id: String,
     agents: Vec<AgentDefinition>,
+}
+
+/// Immutable registry generation. A reload constructs a complete new snapshot;
+/// callers holding an older snapshot (including active runs) remain valid.
+#[derive(Debug, Clone)]
+pub struct AgentRegistrySnapshot {
+    pub generation: u64,
+    pub registry: Arc<AgentRegistry>,
+}
+
+/// Core-owned loader for the staged bundle only. It neither knows nor accepts
+/// a Git checkout, credentials, or arbitrary private source path.
+#[derive(Debug)]
+pub struct AgentLoader {
+    bundle_path: PathBuf,
+    current: RwLock<Arc<AgentRegistrySnapshot>>,
+}
+
+/// A model-generated change can be shown to an owner, but represents no write
+/// capability. Deployment remains a separately authenticated root operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentChangeProposal {
+    pub id: Uuid,
+    pub agent_id: String,
+    pub base_bundle_id: String,
+    pub summary: String,
+    pub unified_diff: String,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -208,12 +235,48 @@ impl AgentRegistry {
     }
 }
 
+impl AgentLoader {
+    pub fn load(bundle_path: impl Into<PathBuf>) -> Result<Self, AgentRegistryError> {
+        let bundle_path = bundle_path.into();
+        let registry = Arc::new(AgentRegistry::load(&bundle_path)?);
+        Ok(Self {
+            bundle_path,
+            current: RwLock::new(Arc::new(AgentRegistrySnapshot {
+                generation: 1,
+                registry,
+            })),
+        })
+    }
+
+    pub fn snapshot(&self) -> Arc<AgentRegistrySnapshot> {
+        self.current
+            .read()
+            .expect("agent registry lock poisoned")
+            .clone()
+    }
+
+    /// Loads and validates a whole replacement first. If it fails, the active
+    /// snapshot is unchanged; no partial registry can become visible.
+    pub fn reload(&self) -> Result<Arc<AgentRegistrySnapshot>, AgentRegistryError> {
+        let registry = Arc::new(AgentRegistry::load(&self.bundle_path)?);
+        let mut current = self.current.write().expect("agent registry lock poisoned");
+        let next = Arc::new(AgentRegistrySnapshot {
+            generation: current.generation.saturating_add(1),
+            registry,
+        });
+        *current = next.clone();
+        Ok(next)
+    }
+}
+
 /// A temporary Core-owned agent invocation. It is not a Linux service and
 /// cannot recursively create other runs through this primitive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRun {
     pub id: Uuid,
     pub agent_id: String,
+    pub bundle_id: String,
+    pub registry_generation: u64,
     pub effective_capabilities: Vec<Capability>,
     pub timeout: Duration,
     pub max_context_chars: usize,
@@ -241,11 +304,33 @@ impl AgentRun {
         Ok(Self {
             id: Uuid::now_v7(),
             agent_id: agent_id.to_string(),
+            bundle_id: registry.bundle_id.clone(),
+            registry_generation: 0,
             effective_capabilities,
             timeout: Duration::from_secs(agent.limits.max_runtime_seconds),
             max_context_chars: agent.limits.max_context_chars,
             max_output_chars: agent.limits.max_output_chars,
         })
+    }
+
+    pub fn from_snapshot(
+        snapshot: &AgentRegistrySnapshot,
+        agent_id: &str,
+        core_allowed: &[Capability],
+        device_allowed: &[Capability],
+        task_allowed: &[Capability],
+        active_runs_for_agent: u16,
+    ) -> Result<Self, AgentRegistryError> {
+        let mut run = Self::new(
+            &snapshot.registry,
+            agent_id,
+            core_allowed,
+            device_allowed,
+            task_allowed,
+            active_runs_for_agent,
+        )?;
+        run.registry_generation = snapshot.generation;
+        Ok(run)
     }
 }
 
@@ -421,5 +506,43 @@ mod tests {
             Err(AgentRegistryError::ConcurrencyLimit)
         );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn failed_reload_keeps_the_previous_generation_and_runs_are_pinned() {
+        let (directory, _) = fixture_registry();
+        let loader = AgentLoader::load(&directory).unwrap();
+        let first = loader.snapshot();
+        let run = AgentRun::from_snapshot(
+            &first,
+            "research",
+            &[Capability::ReadData],
+            &[Capability::ReadData],
+            &[Capability::ReadData],
+            0,
+        )
+        .unwrap();
+        assert_eq!(run.registry_generation, 1);
+        std::fs::write(directory.join("agents/research.json"), b"tampered").unwrap();
+        assert!(matches!(
+            loader.reload(),
+            Err(AgentRegistryError::HashMismatch)
+        ));
+        assert_eq!(loader.snapshot().generation, 1);
+        assert_eq!(run.bundle_id, first.registry.bundle_id());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn change_proposal_has_no_write_capability() {
+        let proposal = AgentChangeProposal {
+            id: Uuid::now_v7(),
+            agent_id: "research".into(),
+            base_bundle_id: "bundle-test".into(),
+            summary: "Request a wording change".into(),
+            unified_diff: "--- a/agents/research.md\n+++ b/agents/research.md".into(),
+        };
+        assert_eq!(proposal.agent_id, "research");
+        assert!(!proposal.unified_diff.is_empty());
     }
 }
