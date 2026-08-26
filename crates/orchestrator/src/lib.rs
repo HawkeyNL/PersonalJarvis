@@ -48,7 +48,7 @@ pub struct Orchestration {
 }
 
 /// Plan a task, execute each step on a cheap model, then synthesize + check.
-/// `persona` is prepended as the system identity (from `jarvis-core/Jarvis.md`).
+/// `persona` is prepended as the system identity (from protected Home Node configuration).
 pub async fn plan_and_execute(
     llm: &Arc<dyn LlmProvider>,
     task: &str,

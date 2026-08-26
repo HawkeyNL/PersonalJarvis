@@ -76,10 +76,9 @@ write_release() {
     local root=$1
     local tag=$2
     local schema_sha256=$3
-    mkdir -p "$root/jarvis-core-$tag/jarvis-core"
+    mkdir -p "$root/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
     chmod 0755 "$root/jarvis-core-$tag/jarvis-api"
-    printf '# test persona\n' > "$root/jarvis-core-$tag/jarvis-core/Jarvis.md"
     jq -n \
         --arg tag "$tag" \
         --arg schema_sha256 "$schema_sha256" \
@@ -95,6 +94,10 @@ seed_active_release() {
     write_release /opt/jarvis/releases "$tag" "$schema_sha256"
     mv "/opt/jarvis/releases/jarvis-core-$tag" "/opt/jarvis/releases/$tag"
     ln -s "/opt/jarvis/releases/$tag" /opt/jarvis/current
+    install -d -o root -g root -m 0750 /etc/jarvis
+    printf 'synthetic protected persona\n' > /etc/jarvis/Jarvis.md
+    chown root:root /etc/jarvis/Jarvis.md
+    chmod 0600 /etc/jarvis/Jarvis.md
 }
 
 prepare_candidate() {

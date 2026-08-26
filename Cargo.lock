@@ -2084,6 +2084,15 @@ dependencies = [
 [[package]]
 name = "jarvis-core"
 version = "0.1.0"
+dependencies = [
+ "hex",
+ "jarvis-policy",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "uuid",
+]
 
 [[package]]
 name = "jarvis-ibkr"

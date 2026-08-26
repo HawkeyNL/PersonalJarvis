@@ -34,5 +34,13 @@ for helper in generate-core-env.sh stage-core-release.sh verify-home-node.sh; do
         "$repo_dir/deploy/systemd/$helper" \
         "/usr/local/libexec/jarvis/${helper%.sh}"
 done
+for helper in install-private-config.sh install-agent-bundle.sh; do
+    install -o root -g root -m 0755 \
+        "$repo_dir/deploy/private/$helper" \
+        "/usr/local/libexec/jarvis/${helper%.sh}"
+done
+install -o root -g root -m 0755 \
+    "$repo_dir/deploy/private/jarvis-private-update.sh" \
+    /usr/local/sbin/jarvis-private-update
 
 echo "Home Node preparation: Jarvis-owned directories and unprivileged service identity are ready."

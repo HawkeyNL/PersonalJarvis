@@ -14,8 +14,7 @@ sidecar_limits_patch="$repo_root/deploy/opensandbox/patches/0004-egress-sidecar-
 env_example="$repo_root/deploy/opensandbox/opensandbox.env.example"
 unit="$repo_root/deploy/systemd/jarvis-opensandbox.service"
 env_validator="$repo_root/deploy/opensandbox/validate-opensandbox-env.sh"
-ci="$repo_root/.github/workflows/ci.yml"
-release_ci="$repo_root/.github/workflows/release.yml"
+ci_script="$repo_root/scripts/ci/verify-deployment-security.sh"
 
 require() {
   local pattern=$1 file=$2
@@ -105,12 +104,9 @@ fi
 # The source patch has a regression test against the exact upstream revision.
 # Static template checks alone are insufficient because an upstream source move
 # could otherwise make a patch apply differently or fail only during deploy.
-for workflow in "$ci" "$release_ci"; do
-  require '          go-version: "1.25.0"' "$workflow"
-  require '          OPENSANDBOX_COMMIT: 6b2023e9b7eb80a940d88e6ae05fcbc0eb0cf23f' "$workflow"
-  require '          git -C "$sandbox_source" apply "$GITHUB_WORKSPACE/deploy/opensandbox/patches/0003-egress-sidecar-hardening.patch"' "$workflow"
-  require '          git -C "$sandbox_source" apply "$GITHUB_WORKSPACE/deploy/opensandbox/patches/0004-egress-sidecar-resource-limits.patch"' "$workflow"
-  require '          (cd "$sandbox_source/components/egress" && go test ./pkg/dnsproxy)' "$workflow"
-done
+require 'readonly opensandbox_commit=6b2023e9b7eb80a940d88e6ae05fcbc0eb0cf23f' "$ci_script"
+require '  0003-egress-sidecar-hardening.patch \' "$ci_script"
+require '  0004-egress-sidecar-resource-limits.patch; do' "$ci_script"
+require '(cd "$sandbox_source/components/egress" && go test ./pkg/dnsproxy)' "$ci_script"
 
 echo "OpenSandbox template safety checks passed"
