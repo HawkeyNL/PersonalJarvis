@@ -9,6 +9,10 @@ publish = false
 name = "jarvis_core"
 path = "src/lib.rs"
 
+[[bin]]
+name = "jarvis-agent-bundle"
+path = "src/bin/jarvis-agent-bundle.rs"
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

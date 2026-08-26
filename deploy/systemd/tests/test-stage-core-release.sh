@@ -36,6 +36,8 @@ write_asset() {
     mkdir -p "$asset/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$asset/jarvis-core-$tag/jarvis-api"
     chmod 0755 "$asset/jarvis-core-$tag/jarvis-api"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$asset/jarvis-core-$tag/jarvis-agent-bundle"
+    chmod 0755 "$asset/jarvis-core-$tag/jarvis-agent-bundle"
     jq -n --arg tag "$manifest_tag" \
       '{tag:$tag,revision:"0123456789abcdef0123456789abcdef01234567",schema_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
       > "$asset/jarvis-core-$tag/release.json"

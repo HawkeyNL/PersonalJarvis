@@ -50,11 +50,6 @@ else
     status UNCHANGED "existing Core environment and scoped database credentials"
 fi
 
-status UPDATE "protected owner persona"
-bash /usr/local/libexec/jarvis/install-private-config --source "$private_agents"
-status UPDATE "private agent bundle"
-bash /usr/local/libexec/jarvis/install-agent-bundle --source "$private_agents"
-
 if [[ ! -e /etc/jarvis/updater.env ]]; then
     install -o root -g root -m 0600 /dev/null /etc/jarvis/updater.env
     printf '%s\n' 'JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis' > /etc/jarvis/updater.env
@@ -69,6 +64,11 @@ if [[ ! -d /opt/jarvis/releases/$release_tag ]]; then
 else
     status UNCHANGED "verified public release $release_tag"
 fi
+status UPDATE "protected owner persona"
+bash /usr/local/libexec/jarvis/install-private-config --source "$private_agents"
+status UPDATE "private agent bundle"
+JARVIS_AGENT_BUNDLE_VALIDATOR="/opt/jarvis/releases/$release_tag/jarvis-agent-bundle" \
+    bash /usr/local/libexec/jarvis/install-agent-bundle --source "$private_agents"
 status UPDATE "systemd services"
 bash "$repo_dir/deploy/systemd/install-home-node-core.sh" "/opt/jarvis/releases/$release_tag"
 systemctl enable --now jarvis-updater.timer
