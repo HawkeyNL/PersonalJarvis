@@ -72,6 +72,8 @@ JARVIS_BOOTSTRAP_SECRET_SHA256=$bootstrap_hash
 JARVIS_BOOTSTRAP_ALLOWED_CIDRS=$bootstrap_cidr
 JARVIS_AUTHENTICATED_RATE_PER_MIN=300
 JARVIS_LLM_RATE_PER_MIN=20
+JARVIS_LLM_PERSONA_PATH=/etc/jarvis/Jarvis.md
+JARVIS_AGENT_BUNDLE_PATH=/var/lib/jarvis/agents/current
 EOF
 chown root:jarvis "$tmp"
 chmod 0640 "$tmp"

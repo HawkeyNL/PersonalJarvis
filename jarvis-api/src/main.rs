@@ -146,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!(brain = %llm.label(), "llm brain configured");
 
-    // Load Jarvis' identity (jarvis-core/Jarvis.md) as the system prompt — the single
+    // Load Jarvis' protected identity (/etc/jarvis/Jarvis.md) as the system prompt — the single
     // source of truth for "what Jarvis is". Falls back to a built-in persona if
     // the file is absent, so the brain always has an identity.
     let (jarvis_system, persona_loaded) = jarvis_api::load_persona(&config.llm_persona_path);
@@ -154,6 +154,26 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(path = %config.llm_persona_path, chars = jarvis_system.len(), "Jarvis persona loaded");
     } else {
         tracing::warn!(path = %config.llm_persona_path, "no persona file; using built-in fallback persona");
+    }
+
+    // Private agent definitions are installed by the owner as an immutable
+    // bundle. Public releases never contain them. Production fails closed when
+    // the registry is absent or malformed; development can still run without a
+    // private checkout and uses the generic Core only.
+    let agent_bundle_path = std::env::var("JARVIS_AGENT_BUNDLE_PATH")
+        .unwrap_or_else(|_| "/var/lib/jarvis/agents/current".to_string());
+    match jarvis_core::AgentRegistry::load(&agent_bundle_path) {
+        Ok(agent_registry) => tracing::info!(
+            bundle = %agent_registry.bundle_id(),
+            agent_count = agent_registry.agents().len(),
+            "private AgentRegistry loaded"
+        ),
+        Err(error) if config.environment.eq_ignore_ascii_case("production") => {
+            anyhow::bail!("protected AgentRegistry is unavailable: {error}");
+        }
+        Err(error) => {
+            tracing::warn!(path = %agent_bundle_path, %error, "private AgentRegistry unavailable in development")
+        }
     }
 
     // Record the resolved brain for display (Status "AI-RESOURCES") and refresh.

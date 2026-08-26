@@ -32,8 +32,8 @@ find "$release_dir" -xdev -type l -print -quit | grep -q . && {
     echo "missing executable: $release_dir/jarvis-api" >&2
     exit 1
 }
-[[ -f "$release_dir/jarvis-core/Jarvis.md" ]] || {
-    echo "missing Core persona: $release_dir/jarvis-core/Jarvis.md" >&2
+[[ -f /etc/jarvis/Jarvis.md && ! -L /etc/jarvis/Jarvis.md ]] || {
+    echo "missing protected persona: /etc/jarvis/Jarvis.md" >&2
     exit 1
 }
 [[ -f "$release_dir/release.json" && ! -L "$release_dir/release.json" ]] || {
@@ -76,6 +76,10 @@ install -d -o jarvis -g jarvis -m 0750 /var/lib/jarvis
 # ownership/mode; accepting a symlink or broad mode here would weaken Core.
 [[ $(stat -c '%U:%G:%a' /etc/jarvis/core.env) == root:jarvis:640 ]] || {
     echo "/etc/jarvis/core.env must be root:jarvis mode 0640" >&2
+    exit 1
+}
+[[ $(stat -c '%U:%G:%a' /etc/jarvis/Jarvis.md) == root:jarvis:640 ]] || {
+    echo "/etc/jarvis/Jarvis.md must be root:jarvis mode 0640" >&2
     exit 1
 }
 
@@ -123,6 +127,9 @@ install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
 install -o root -g root -m 0755 \
     "$repo_dir/deploy/systemd/update-core-release.sh" \
     /usr/local/libexec/jarvis/update-core-release
+install -o root -g root -m 0755 \
+    "$repo_dir/deploy/systemd/verify-home-node.sh" \
+    /usr/local/libexec/jarvis/verify-home-node
 install -o root -g root -m 0644 \
     "$repo_dir/deploy/systemd/jarvis-updater.service" \
     /etc/systemd/system/jarvis-updater.service

@@ -25,9 +25,19 @@ loopback_only() {
     done < <(ss -ltnH "sport = :$port")
     return 0
 }
+agent_bundle_valid() {
+    local bundle count
+    [[ -L /var/lib/jarvis/agents/current ]] || return 1
+    bundle=$(readlink -f /var/lib/jarvis/agents/current) || return 1
+    [[ $bundle == /var/lib/jarvis/agents/releases/* && -f $bundle/manifest.json && ! -L $bundle/manifest.json ]] || return 1
+    [[ $(stat -c '%U:%G:%a' "$bundle") == root:root:700 || $(stat -c '%U:%G:%a' "$bundle") == root:root:755 ]] || return 1
+    count=$(jq -er '.agents | length | select(. > 0)' "$bundle/manifest.json") || return 1
+    printf 'agent bundle: %s (%s agents)\n' "${bundle##*/}" "$count"
+}
 
 [[ ${EUID} -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
 command -v ss >/dev/null 2>&1 || { echo "ss is required" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
 
 check getent passwd jarvis
 check bash -c '! id -nG jarvis | tr " " "\\n" | grep -qx docker'
@@ -35,10 +45,13 @@ check expect_mode /var/lib/jarvis jarvis:jarvis:750
 check expect_mode /var/lib/jarvis/surrealdb root:root:700
 check expect_mode /etc/jarvis root:root:750
 check expect_mode /etc/jarvis/core.env root:jarvis:640
+check expect_mode /etc/jarvis/Jarvis.md root:jarvis:640
+check agent_bundle_valid
 check expect_mode /etc/jarvis/surrealdb.env root:root:600
 check systemctl is-active --quiet docker.service
 check systemctl is-active --quiet jarvis-surrealdb.service
 check systemctl is-active --quiet jarvis-core.service
+check systemctl is-enabled --quiet jarvis-updater.timer
 check bash -c 'docker compose --env-file /etc/jarvis/surrealdb.env -f /opt/jarvis/surrealdb/docker-compose.yml ps --status running --services | grep -qx surrealdb'
 check loopback_only 8000
 check loopback_only 8080
@@ -48,7 +61,9 @@ check runuser -u jarvis -- test ! -r /var/run/docker.sock
 check bash -c '[[ $(systemctl show -p User --value jarvis-core.service) == jarvis ]]'
 check bash -c '[[ $(systemctl show -p NoNewPrivileges --value jarvis-core.service) == yes ]]'
 check runuser -u jarvis -- test ! -w /opt/jarvis/current/jarvis-api
-check runuser -u jarvis -- test ! -w /opt/jarvis/current/jarvis-core/Jarvis.md
+check runuser -u jarvis -- test -r /etc/jarvis/Jarvis.md
+check runuser -u jarvis -- test ! -w /etc/jarvis/Jarvis.md
+check bash -c 'sha256sum /etc/jarvis/Jarvis.md | cut -c1-12 >/dev/null'
 check bash -c '! systemctl is-enabled --quiet jarvis-opensandbox.service'
 check bash -c '! systemctl is-active --quiet jarvis-opensandbox.service'
 

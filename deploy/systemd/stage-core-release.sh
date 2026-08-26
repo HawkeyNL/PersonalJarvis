@@ -59,7 +59,10 @@ tar -xzf "$staging/$artifact" --no-same-owner --no-same-permissions -C "$staging
 
 release_dir="$staging/$expected_top"
 [[ -x $release_dir/jarvis-api && ! -L $release_dir/jarvis-api ]] || fail "release binary is invalid"
-[[ -f $release_dir/jarvis-core/Jarvis.md && ! -L $release_dir/jarvis-core/Jarvis.md ]] || fail "Core persona is invalid"
+# The protected persona is supplied separately from the private owner checkout.
+# A public software release must never contain Jarvis.md or agent definitions.
+find "$release_dir" -type f \( -name 'Jarvis.md' -o -path '*/agents/*' \) -print -quit | grep -q . && \
+    fail "release contains protected private configuration"
 [[ -f $release_dir/release.json && ! -L $release_dir/release.json ]] || fail "release manifest is invalid"
 jq -e --arg tag "$tag" '
     .tag == $tag and

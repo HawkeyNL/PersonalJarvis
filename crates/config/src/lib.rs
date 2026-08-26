@@ -121,7 +121,7 @@ pub struct AppConfig {
     #[serde(default = "default_claude_cli_bin")]
     pub llm_claude_cli_bin: String,
 
-    /// Path to Jarvis' canonical identity/persona doc (`jarvis-core/Jarvis.md`), loaded
+    /// Path to Jarvis' protected canonical identity/persona doc (`/etc/jarvis/Jarvis.md`), loaded
     /// at startup as the system prompt. Missing/empty ⇒ a built-in fallback
     /// persona is used. This is the single source of truth for "what Jarvis is".
     #[serde(default = "default_llm_persona_path")]
@@ -309,7 +309,7 @@ fn default_claude_cli_bin() -> String {
 }
 
 fn default_llm_persona_path() -> String {
-    "jarvis-core/Jarvis.md".to_string()
+    "/etc/jarvis/Jarvis.md".to_string()
 }
 
 fn default_auth_rate_enroll() -> u32 {
@@ -589,7 +589,7 @@ mod tests {
             llm_ollama_url: "http://localhost:11434".to_string(),
             llm_ollama_model: "llama3.2".to_string(),
             llm_claude_cli_bin: "claude".to_string(),
-            llm_persona_path: "jarvis-core/Jarvis.md".to_string(),
+            llm_persona_path: "/etc/jarvis/Jarvis.md".to_string(),
             llm_openai_api_key: "sk-openai-supersecret".to_string(),
             llm_openai_base_url: "https://api.openai.com/v1".to_string(),
             llm_openai_model: "gpt-4o".to_string(),

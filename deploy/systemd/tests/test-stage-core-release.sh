@@ -33,10 +33,9 @@ write_asset() {
     local artifact="jarvis-core-$tag-linux-x86_64.tar.gz"
     local asset="$fixture/asset"
     rm -rf -- "$asset"
-    mkdir -p "$asset/jarvis-core-$tag/jarvis-core"
+    mkdir -p "$asset/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$asset/jarvis-core-$tag/jarvis-api"
     chmod 0755 "$asset/jarvis-core-$tag/jarvis-api"
-    printf '# persona\n' > "$asset/jarvis-core-$tag/jarvis-core/Jarvis.md"
     jq -n --arg tag "$manifest_tag" \
       '{tag:$tag,revision:"0123456789abcdef0123456789abcdef01234567",schema_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
       > "$asset/jarvis-core-$tag/release.json"
@@ -71,4 +70,22 @@ if run_stage v1.2.5; then
     exit 1
 fi
 [[ ! -e /opt/jarvis/releases/v1.2.5 ]]
+
+rm -rf -- /opt/jarvis
+install -d -o root -g root -m 0755 /opt/jarvis/releases
+write_asset v1.2.6 v1.2.6
+mkdir -p "$fixture/leaked/jarvis-core-v1.2.6/jarvis-core"
+printf 'private persona must never be published\n' > "$fixture/leaked/jarvis-core-v1.2.6/Jarvis.md"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fixture/leaked/jarvis-core-v1.2.6/jarvis-api"
+chmod 0755 "$fixture/leaked/jarvis-core-v1.2.6/jarvis-api"
+jq -n --arg tag v1.2.6 \
+  '{tag:$tag,revision:"0123456789abcdef0123456789abcdef01234567",schema_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
+  > "$fixture/leaked/jarvis-core-v1.2.6/release.json"
+tar -C "$fixture/leaked" -czf "$fixture/jarvis-core-v1.2.6-linux-x86_64.tar.gz" jarvis-core-v1.2.6
+(cd "$fixture" && sha256sum jarvis-core-v1.2.6-linux-x86_64.tar.gz > jarvis-core-v1.2.6-linux-x86_64.tar.gz.sha256)
+if run_stage v1.2.6; then
+    echo "release containing a protected persona was accepted" >&2
+    exit 1
+fi
+[[ ! -e /opt/jarvis/releases/v1.2.6 ]]
 echo "Home Node release-staging fixture tests passed"

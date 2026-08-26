@@ -209,8 +209,8 @@ impl Sandbox {
 
     /// Resolve a path to **write** to: the file need not exist yet, but its parent
     /// must exist inside the sandbox, and the target may never be the Core, a
-    /// secret, or inside `.git`. This is the hard guarantee that Jarvis can't
-    /// rewrite its own rules (ADR-029 / Jarvis.md §30).
+    /// secret, or inside `.git`. Absolute protected configuration (including
+    /// `/etc/jarvis/Jarvis.md`) is rejected before this resolver is entered.
     fn resolve_write(&self, rel: &str) -> Result<PathBuf, AgentError> {
         if Path::new(rel).is_absolute() {
             return Err(AgentError::OutsideSandbox);
@@ -689,6 +689,10 @@ mod tests {
         ));
         assert!(matches!(
             sb.resolve_write("/etc/passwd"),
+            Err(AgentError::OutsideSandbox)
+        ));
+        assert!(matches!(
+            sb.resolve_write("/etc/jarvis/Jarvis.md"),
             Err(AgentError::OutsideSandbox)
         ));
 

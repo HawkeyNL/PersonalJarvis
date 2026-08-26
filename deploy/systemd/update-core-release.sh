@@ -143,8 +143,10 @@ tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$staging_dir"
 release_dir="$staging_dir/$expected_top"
 [[ -f $release_dir/jarvis-api && ! -L $release_dir/jarvis-api ]] || fail "release binary is invalid"
 [[ -x $release_dir/jarvis-api ]] || fail "release binary is not executable"
-[[ -f $release_dir/jarvis-core/Jarvis.md && ! -L $release_dir/jarvis-core/Jarvis.md ]] || \
-    fail "Core persona is invalid"
+find "$release_dir" -type f \( -name 'Jarvis.md' -o -path '*/agents/*' \) -print -quit | grep -q . && \
+    fail "release contains protected private configuration"
+[[ -f /etc/jarvis/Jarvis.md && ! -L /etc/jarvis/Jarvis.md ]] || \
+    fail "protected persona is absent; use the owner-controlled private installer"
 [[ -f $release_dir/release.json && ! -L $release_dir/release.json ]] || \
     fail "release manifest is invalid"
 [[ $(jq -er '.tag | strings' "$release_dir/release.json") == "$tag" ]] || \
