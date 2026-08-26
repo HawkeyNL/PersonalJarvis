@@ -38,7 +38,7 @@ count=0
 while IFS= read -r -d '' source_file; do
     [[ -f $source_file && ! -L $source_file ]] || fail "agent source is unsafe"
     base=${source_file##*/}
-    [[ $base =~ ^[0-9]{2}_[A-Za-z0-9_]+\.md$ ]] || continue
+    [[ $base =~ ^(0[1-9]|1[0-9])_[A-Za-z0-9_]+\.md$ ]] || continue
     target="$stage/agents/${base%.md}.json"
     "$validator" validate "$source_file" "$target" || fail "agent definition failed validation"
     id=$(jq -er '.id | strings | select(test("^[A-Za-z0-9_-]{1,64}$"))' "$target") || fail "validated agent has unsafe ID"
