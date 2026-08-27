@@ -36,6 +36,10 @@ write_asset() {
     mkdir -p "$asset/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$asset/jarvis-core-$tag/jarvis-api"
     chmod 0755 "$asset/jarvis-core-$tag/jarvis-api"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$asset/jarvis-core-$tag/jarvis-config-broker"
+    chmod 0755 "$asset/jarvis-core-$tag/jarvis-config-broker"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$asset/jarvis-core-$tag/jarvis-codex-broker"
+    chmod 0755 "$asset/jarvis-core-$tag/jarvis-codex-broker"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$asset/jarvis-core-$tag/jarvis-agent-bundle"
     chmod 0755 "$asset/jarvis-core-$tag/jarvis-agent-bundle"
     jq -n --arg tag "$manifest_tag" \
@@ -80,6 +84,10 @@ mkdir -p "$fixture/leaked/jarvis-core-v1.2.6/jarvis-core"
 printf 'private persona must never be published\n' > "$fixture/leaked/jarvis-core-v1.2.6/Jarvis.md"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$fixture/leaked/jarvis-core-v1.2.6/jarvis-api"
 chmod 0755 "$fixture/leaked/jarvis-core-v1.2.6/jarvis-api"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fixture/leaked/jarvis-core-v1.2.6/jarvis-config-broker"
+chmod 0755 "$fixture/leaked/jarvis-core-v1.2.6/jarvis-config-broker"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fixture/leaked/jarvis-core-v1.2.6/jarvis-codex-broker"
+chmod 0755 "$fixture/leaked/jarvis-core-v1.2.6/jarvis-codex-broker"
 jq -n --arg tag v1.2.6 \
   '{tag:$tag,revision:"0123456789abcdef0123456789abcdef01234567",schema_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
   > "$fixture/leaked/jarvis-core-v1.2.6/release.json"

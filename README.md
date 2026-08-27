@@ -9,3 +9,8 @@ See [LICENSE](LICENSE).
 
 Home Node model-routing and credential operations are documented in
 [docs/MODEL_ROUTING_OPERATIONS.md](docs/MODEL_ROUTING_OPERATIONS.md).
+
+For a provisioned Home Node, the canonical root-operated owner interface is
+[`sudo jarvis ...`](docs/JARVIS_ADMIN_CLI.md). It wraps the existing verified
+release updater, model policy, credential manager, private-agent updater, and
+bounded diagnostics without giving those privileges to Jarvis Core.

@@ -11,13 +11,14 @@ config="$repo_dir/deploy/systemd/generate-core-env.sh"
 provision="$repo_dir/deploy/surrealdb/provision-core-user.sh"
 stage="$repo_dir/deploy/systemd/stage-core-release.sh"
 verify="$repo_dir/deploy/systemd/verify-home-node.sh"
+admin="$repo_dir/deploy/systemd/jarvis-admin.sh"
 core_unit="$repo_dir/deploy/systemd/jarvis-core.service"
 db_unit="$repo_dir/deploy/systemd/jarvis-surrealdb.service"
 
-for file in "$compose" "$env_example" "$prepare" "$config" "$provision" "$stage" "$verify" "$core_unit" "$db_unit"; do
+for file in "$compose" "$env_example" "$prepare" "$config" "$provision" "$stage" "$verify" "$admin" "$core_unit" "$db_unit"; do
     [[ -f $file ]] || { echo "missing production bootstrap asset: $file" >&2; exit 1; }
 done
-bash -n "$prepare" "$config" "$provision" "$stage" "$verify"
+bash -n "$prepare" "$config" "$provision" "$stage" "$verify" "$admin"
 
 grep -Eq '^SURREALDB_IMAGE=surrealdb/surrealdb@sha256:[0-9a-f]{64}$' "$env_example"
 grep -Fq '127.0.0.1:8000:8000' "$compose"
@@ -67,5 +68,7 @@ grep -Fq 'jarvis-opensandbox.service' "$verify"
 grep -Fq 'jarvis_cannot_replace_current' "$verify"
 grep -Fq 'test ! -r /etc/jarvis/surrealdb.env' "$verify"
 grep -Fq 'did not become ready; recent service diagnostics follow' "$repo_dir/deploy/systemd/install-home-node-core.sh"
+grep -Fq '/usr/local/sbin/jarvis' "$prepare"
+grep -Fq '/usr/local/sbin/jarvis' "$repo_dir/deploy/systemd/install-home-node-core.sh"
 
 echo "Production Home Node bootstrap asset checks passed"

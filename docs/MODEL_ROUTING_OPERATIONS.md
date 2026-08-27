@@ -17,10 +17,10 @@ database telemetry, agent bundles, sandbox workloads or Codex worktrees.
 Use a controlling terminal; keys are never accepted as normal CLI arguments:
 
 ```bash
-sudo jarvis-credentials list
-sudo jarvis-credentials set openai
-sudo jarvis-credentials test openai
-sudo jarvis-credentials remove openai
+sudo jarvis credentials list
+sudo jarvis credentials set openai
+sudo jarvis credentials test openai
+sudo jarvis credentials remove openai
 ```
 
 `set` installs a temporary root-only file atomically, restarts Core and waits
@@ -40,11 +40,11 @@ are recorded as `configured` or `provider_api` but disabled. Local Ollama is ava
 unless the owner explicitly disables its exact model.
 
 ```bash
-sudo jarvis-models refresh
-sudo jarvis-models list
-sudo jarvis-models enable openai-api gpt-4o-mini
-sudo jarvis-models disable openai-api gpt-4o
-sudo jarvis-models show openai-api gpt-4o-mini
+sudo jarvis models refresh
+sudo jarvis models list
+sudo jarvis models enable openai-api gpt-4o-mini
+sudo jarvis models disable openai-api gpt-4o
+sudo jarvis models show openai-api gpt-4o-mini
 ```
 
 The policy matches the literal provider and model ID. A newly listed or renamed
@@ -63,7 +63,7 @@ issue/expiry times and the current policy SHA-256. The broker independently
 checks the active device key, signature, TTL and one-time replay marker before
 atomically replacing the policy; a changed policy requires a fresh signature.
 
-Credentials remain root-TTY-only through `jarvis-credentials`. They are not
+Credentials remain root-TTY-only through `jarvis credentials`. They are not
 sent through the app or broker until a separately reviewed sealed secret-transfer
 protocol exists; there is deliberately no unsafe fallback.
 

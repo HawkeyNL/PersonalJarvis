@@ -43,7 +43,7 @@ for helper in initialize-production-surrealdb.sh start-production-surrealdb.sh p
         "$repo_dir/deploy/surrealdb/$helper" \
         "/usr/local/libexec/jarvis/${helper%.sh}"
 done
-for helper in generate-core-env.sh stage-core-release.sh verify-home-node.sh jarvis-models.sh; do
+for helper in generate-core-env.sh stage-core-release.sh verify-home-node.sh jarvis-models.sh jarvis-admin.sh; do
     [[ -f "$repo_dir/deploy/systemd/$helper" ]] || continue
     install -o root -g root -m 0755 \
         "$repo_dir/deploy/systemd/$helper" \
@@ -55,6 +55,9 @@ install -o root -g root -m 0755 \
 install -o root -g root -m 0755 \
     "$repo_dir/deploy/systemd/jarvis-credentials.sh" \
     /usr/local/sbin/jarvis-credentials
+install -o root -g root -m 0755 \
+    "$repo_dir/deploy/systemd/jarvis-admin.sh" \
+    /usr/local/sbin/jarvis
 for helper in install-private-config.sh install-agent-bundle.sh; do
     install -o root -g root -m 0755 \
         "$repo_dir/deploy/private/$helper" \
