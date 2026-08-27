@@ -58,6 +58,42 @@ pub struct AgentDefinition {
     pub limits: AgentLimits,
 }
 
+/// A deliberately small, provider-neutral request made by a private agent
+/// profile. It selects only a quality/mode floor; the LLM router still applies
+/// the root-owned exact model allowlist, health, budget and task policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentModelPolicy {
+    Fast,
+    Standard,
+    Strong,
+    Research,
+}
+
+impl AgentModelPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fast" | "utility" => Some(Self::Fast),
+            "default" | "standard" => Some(Self::Standard),
+            "strong" | "frontier" | "coding" | "trading" => Some(Self::Strong),
+            "research" => Some(Self::Research),
+            _ => None,
+        }
+    }
+
+    /// Names match `jarvis_llm::RoutingMode` without making Core own provider
+    /// routing or credentials. The executor passes this only as a minimum
+    /// quality request to the router.
+    pub const fn routing_mode(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Standard => "auto",
+            Self::Strong => "deep",
+            Self::Research => "research",
+        }
+    }
+}
+
 /// Strict versioned frontmatter used only at the trusted private-bundle
 /// deployment boundary. Runtime loads the resulting hash-checked JSON bundle.
 /// Hard upper bounds declared by an agent profile. Core still applies its own
@@ -405,6 +441,8 @@ pub struct AgentRun {
     pub bundle_id: String,
     pub registry_generation: u64,
     pub effective_capabilities: Vec<Capability>,
+    /// Profile-requested quality floor, not a provider/model grant.
+    pub model_policy: AgentModelPolicy,
     pub timeout: Duration,
     pub max_context_chars: usize,
     pub max_output_chars: usize,
@@ -428,12 +466,16 @@ impl AgentRun {
         let effective_capabilities = registry
             .effective_capabilities(agent_id, core_allowed, device_allowed, task_allowed)
             .ok_or(AgentRegistryError::MissingBundle)?;
+        let model_policy = AgentModelPolicy::parse(&agent.model_policy).ok_or(
+            AgentRegistryError::InvalidDefinition("unknown model policy"),
+        )?;
         Ok(Self {
             id: Uuid::now_v7(),
             agent_id: agent_id.to_string(),
             bundle_id: registry.bundle_id.clone(),
             registry_generation: 0,
             effective_capabilities,
+            model_policy,
             timeout: Duration::from_secs(agent.limits.max_runtime_seconds),
             max_context_chars: agent.limits.max_context_chars,
             max_output_chars: agent.limits.max_output_chars,
@@ -496,6 +538,11 @@ fn validate_definition(agent: &AgentDefinition) -> Result<(), AgentRegistryError
     {
         return Err(AgentRegistryError::InvalidDefinition(
             "required fields or limits",
+        ));
+    }
+    if AgentModelPolicy::parse(&agent.model_policy).is_none() {
+        return Err(AgentRegistryError::InvalidDefinition(
+            "unknown model policy",
         ));
     }
     let mut capabilities = BTreeSet::new();
@@ -648,6 +695,8 @@ mod tests {
         .unwrap();
         assert_eq!(run.timeout, Duration::from_secs(30));
         assert_eq!(run.effective_capabilities, vec![Capability::ReadData]);
+        assert_eq!(run.model_policy, AgentModelPolicy::Standard);
+        assert_eq!(run.model_policy.routing_mode(), "auto");
         assert_eq!(
             AgentRun::new(
                 &registry,
@@ -660,6 +709,16 @@ mod tests {
             Err(AgentRegistryError::ConcurrencyLimit)
         );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn agent_model_policy_is_provider_neutral_and_fail_closed() {
+        assert_eq!(
+            AgentModelPolicy::parse("research"),
+            Some(AgentModelPolicy::Research)
+        );
+        assert_eq!(AgentModelPolicy::parse("gpt-4.1"), None);
+        assert_eq!(AgentModelPolicy::Strong.routing_mode(), "deep");
     }
 
     #[test]
