@@ -57,8 +57,8 @@ use routes::chat::{
 };
 use routes::portfolio::{add_holding, get_holdings, remove_holding};
 use routes::system::{
-    system_model_policy, system_registry, system_registry_refresh, system_self_improve,
-    system_usage,
+    system_budget_preflight, system_model_policy, system_registry, system_registry_refresh,
+    system_self_improve, system_usage,
 };
 use routes::voice::{voice_enroll, voice_status, voice_verify};
 
@@ -109,6 +109,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/system/registry/refresh", post(system_registry_refresh))
         .route("/v1/system/usage", get(system_usage))
         .route("/v1/system/models", get(system_model_policy))
+        .route("/v1/system/budget/preflight", post(system_budget_preflight))
         .route("/v1/system/self-improve", post(system_self_improve))
         .route("/v1/agent/action", post(agent_action))
         .route("/v1/agent/pending", get(agent_pending))

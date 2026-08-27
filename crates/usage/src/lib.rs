@@ -135,6 +135,51 @@ pub struct UsageEntry {
     pub cost_eur: f64,
 }
 
+/// Bounded, explicitly uncertain preflight estimate for a multi-call task.
+/// It is policy input, never a promise or a hidden reasoning trace.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CostEstimate {
+    pub low_eur: f64,
+    pub likely_eur: f64,
+    pub high_eur: f64,
+    pub price_status: PriceStatus,
+}
+
+pub fn estimate_task_cost(
+    backend: &str,
+    model: &str,
+    input_tokens_per_call: u32,
+    output_tokens_per_call: u32,
+    calls: u32,
+    eur_per_usd: f64,
+) -> CostEstimate {
+    let likely = cost_eur(
+        backend,
+        model,
+        input_tokens_per_call.saturating_mul(calls),
+        output_tokens_per_call.saturating_mul(calls),
+        0,
+        eur_per_usd,
+    );
+    let status = price_status(backend, model);
+    let low_factor = if status == PriceStatus::Unknown {
+        1.0
+    } else {
+        0.6
+    };
+    let high_factor = if status == PriceStatus::Unknown {
+        2.5
+    } else {
+        1.6
+    };
+    CostEstimate {
+        low_eur: likely * low_factor,
+        likely_eur: likely,
+        high_eur: likely * high_factor,
+        price_status: status,
+    }
+}
+
 /// SurrealDB persistence functions. Failures remain best-effort at the caller,
 /// so metering cannot break an assistant reply.
 pub use surreal::{month_breakdown, month_total_eur, record, release_task, reserve_task};
@@ -350,5 +395,14 @@ mod tests {
         assert_eq!(book.reserve("too-large", 101), Err(BudgetError::RequestCap));
         assert_eq!(price_status("xai-api", "future-grok"), PriceStatus::Unknown);
         assert!(cost_eur("xai-api", "future-grok", 1_000, 1_000, 0, 0.92) > 0.0);
+    }
+
+    #[test]
+    fn preflight_exposes_a_range_and_is_conservative_for_unknown_prices() {
+        let known = estimate_task_cost("openai-api", "gpt-4o-mini", 1_000, 500, 10, 0.92);
+        assert!(known.low_eur < known.likely_eur && known.likely_eur < known.high_eur);
+        let unknown = estimate_task_cost("xai-api", "future-grok", 1_000, 500, 10, 0.92);
+        assert_eq!(unknown.price_status, PriceStatus::Unknown);
+        assert!(unknown.high_eur > unknown.likely_eur);
     }
 }

@@ -78,6 +78,60 @@ pub(crate) async fn system_model_policy(
 }
 
 #[derive(Deserialize)]
+pub(crate) struct BudgetPreflightReq {
+    provider: String,
+    model: String,
+    input_tokens_per_call: u32,
+    output_tokens_per_call: u32,
+    calls: u32,
+}
+
+/// Bounded owner-visible cost preflight for a planned long task.  It neither
+/// executes work nor enables models; a disabled model cannot be probed into
+/// becoming eligible through this endpoint.
+pub(crate) async fn system_budget_preflight(
+    _authed: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<BudgetPreflightReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if req.provider.len() > 64 || req.model.len() > 256 || req.calls == 0 || req.calls > 10_000 {
+        return Err(bad_request("invalid budget preflight"));
+    }
+    if !state.model_policy.allows(&req.provider, &req.model) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "model is not owner-enabled" })),
+        ));
+    }
+    let estimate = usage::estimate_task_cost(
+        &req.provider,
+        &req.model,
+        req.input_tokens_per_call,
+        req.output_tokens_per_call,
+        req.calls,
+        state.eur_per_usd,
+    );
+    let budget = state.budget_book.snapshot();
+    let high_cents = (estimate.high_eur * 100.0).ceil().max(0.0) as u64;
+    let recommendation = if high_cents > budget.remaining_hard_cents {
+        "do_not_start"
+    } else if budget.above_soft_limit {
+        "proceed_cost_consciously"
+    } else {
+        "proceed"
+    };
+    Ok(Json(json!({
+        "provider": req.provider,
+        "model": req.model,
+        "calls": req.calls,
+        "estimate": estimate,
+        "remaining_hard_eur": budget.remaining_hard_cents as f64 / 100.0,
+        "recommendation": recommendation,
+        "note": "Estimate only; a long-running task requires a bounded reservation and checkpoints before execution.",
+    })))
+}
+
+#[derive(Deserialize)]
 pub(crate) struct SelfImproveReq {
     /// Optional area to focus the advice on (e.g. "goedkopere modellen").
     #[serde(default)]
