@@ -4,6 +4,9 @@
 # packages, creates secrets, opens firewall ports, or grants Docker/root access to
 # the Jarvis service account.
 set -euo pipefail
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+# shellcheck disable=SC1091 # dynamic repository root
+source "$repo_dir/deploy/lib/ui.sh"
 
 usage() {
     echo "Usage: sudo $0 /opt/jarvis/releases/vMAJOR.MINOR.PATCH" >&2
@@ -124,7 +127,6 @@ if [[ ${hops:-0} != 0 && ${hops:-0} != 1 ]]; then
     exit 1
 fi
 
-repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 install -o root -g root -m 0644 \
     "$repo_dir/deploy/systemd/jarvis-core.service" \
     /etc/systemd/system/jarvis-core.service
@@ -132,6 +134,7 @@ install -o root -g root -m 0644 \
     "$repo_dir/deploy/systemd/jarvis-surrealdb.service" \
     /etc/systemd/system/jarvis-surrealdb.service
 install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
+install -o root -g root -m 0644 "$repo_dir/deploy/lib/ui.sh" /usr/local/libexec/jarvis/ui.sh
 install -o root -g root -m 0755 \
     "$release_dir/jarvis-agent-bundle" \
     /usr/local/libexec/jarvis/jarvis-agent-bundle
@@ -159,6 +162,7 @@ systemd-analyze verify /etc/systemd/system/jarvis-core.service
 systemd-analyze verify /etc/systemd/system/jarvis-surrealdb.service
 systemd-analyze verify /etc/systemd/system/jarvis-updater.service
 systemd-analyze verify /etc/systemd/system/jarvis-updater.timer
+ui_detail "Starting SurrealDB and Jarvis Core …"
 systemctl enable --now jarvis-surrealdb.service
 systemctl enable --now jarvis-core
 
@@ -175,11 +179,13 @@ for _attempt in $(seq 1 15); do
     sleep 1
 done
 if [[ $core_ready != true ]]; then
-    echo "Jarvis Core did not become ready; recent service diagnostics follow:" >&2
+    ui_error "Jarvis Core did not become ready; recent service diagnostics follow:"
     systemctl --no-pager --full status jarvis-core.service || true
     journalctl --no-pager -u jarvis-core.service -n 80 || true
     exit 1
 fi
-systemctl --no-pager --full status jarvis-core
-
-echo "Jarvis Core is running from $release_dir"
+ui_success "Jarvis Core active"
+ui_success "/livez ready"
+ui_success "/readyz ready"
+[[ ${JARVIS_VERBOSE:-0} == 1 ]] && systemctl --no-pager --full status jarvis-core
+ui_detail "Jarvis Core is running from $release_dir"

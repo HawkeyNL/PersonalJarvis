@@ -3,6 +3,7 @@ set -euo pipefail
 
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-update-core-release.sh
 bash deploy/systemd/tests/test-production-bootstrap-assets.sh
+bash deploy/systemd/tests/test-output-presentation.sh
 sudo env GITHUB_ACTIONS=true bash deploy/surrealdb/tests/test-provision-core-user-shellless.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-stage-core-release.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-prepare-codex-worktree.sh

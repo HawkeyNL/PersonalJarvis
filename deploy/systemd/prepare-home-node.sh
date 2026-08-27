@@ -6,6 +6,7 @@ set -euo pipefail
 
 fail() { echo "Home Node preparation: $*" >&2; exit 1; }
 [[ ${EUID} -eq 0 ]] || fail "must run as root"
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 
 if ! getent passwd jarvis >/dev/null; then
     useradd --system --user-group --home-dir /var/lib/jarvis --shell /usr/sbin/nologin jarvis
@@ -19,8 +20,8 @@ install -d -o root -g root -m 0755 /opt/jarvis /opt/jarvis/releases
 # inputs.  Individual secrets below this directory remain root:root 0600.
 install -d -o root -g jarvis -m 0750 /etc/jarvis
 install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
+install -o root -g root -m 0644 "$repo_dir/deploy/lib/ui.sh" /usr/local/libexec/jarvis/ui.sh
 
-repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 install -d -o root -g root -m 0755 /opt/jarvis/surrealdb
 install -o root -g root -m 0644 \
     "$repo_dir/deploy/surrealdb/docker-compose.yml" \
