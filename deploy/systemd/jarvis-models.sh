@@ -11,6 +11,7 @@ readonly core_env=/etc/jarvis/core.env
 fail() { echo "jarvis-models: $*" >&2; exit 1; }
 [[ ${EUID} -eq 0 ]] || fail "must run as root"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
+command -v curl >/dev/null 2>&1 || fail "curl is required"
 
 usage() {
     cat >&2 <<'EOF'
@@ -93,8 +94,57 @@ configured_models() {
         ] | map(select(.[1] != "")) | unique'
 }
 
+provider_secret_var() {
+    case $1 in
+        openai-api) printf '%s\n' JARVIS_LLM_OPENAI_API_KEY ;;
+        deepseek-api) printf '%s\n' JARVIS_LLM_DEEPSEEK_API_KEY ;;
+        xai-api) printf '%s\n' JARVIS_LLM_XAI_API_KEY ;;
+        zai-api) printf '%s\n' JARVIS_LLM_ZAI_API_KEY ;;
+        ollama-cloud) printf '%s\n' JARVIS_LLM_OLLAMA_CLOUD_API_KEY ;;
+        *) return 1 ;;
+    esac
+}
+
+provider_base_url() {
+    case $1 in
+        openai-api) printf '%s\n' "${JARVIS_LLM_OPENAI_BASE_URL:-https://api.openai.com/v1}" ;;
+        deepseek-api) printf '%s\n' "${JARVIS_LLM_DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}" ;;
+        xai-api) printf '%s\n' "${JARVIS_LLM_XAI_BASE_URL:-https://api.x.ai/v1}" ;;
+        zai-api) printf '%s\n' "${JARVIS_LLM_ZAI_BASE_URL:-https://api.z.ai/api/paas/v4}" ;;
+        ollama-cloud) printf '%s\n' "${JARVIS_LLM_OLLAMA_CLOUD_BASE_URL:-}" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Official OpenAI-compatible `/models` discovery. The key exists only in an
+# ephemeral mode-0600 curl config, never in curl argv, output, or policy JSON.
+discover_remote_models() {
+    local provider=$1 variable credential_file key base config response
+    variable=$(provider_secret_var "$provider") || return 0
+    credential_file="/etc/jarvis/secrets/${provider%-api}.env"
+    [[ $provider != ollama-cloud ]] || credential_file=/etc/jarvis/secrets/ollama-cloud.env
+    [[ -f $credential_file && ! -L $credential_file ]] || return 0
+    set -a
+    # shellcheck disable=SC1090,SC1091 # root-managed credential input
+    source "$credential_file"
+    set +a
+    key=${!variable:-}
+    [[ -n $key ]] || return 0
+    base=$(provider_base_url "$provider")
+    [[ -n $base && $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 0
+    config=$(mktemp /run/jarvis-model-discovery.XXXXXX)
+    trap 'rm -f -- "$config"; unset key' RETURN
+    umask 077
+    printf 'url = "%s/models"\nheader = "Authorization: Bearer %s"\n' "${base%/}" "$key" > "$config"
+    unset key
+    response=$(curl --config "$config" --fail --silent --show-error --max-time 10 2>/dev/null) || { trap - RETURN; rm -f -- "$config"; return 0; }
+    trap - RETURN
+    rm -f -- "$config"
+    jq -r --arg provider "$provider" '.data[]?.id? | select(type == "string" and length > 0 and length <= 256) | [$provider, .] | @json' <<<"$response" || true
+}
+
 refresh() {
-    local provider=${1:-} old known merged
+    local provider=${1:-} old known discovered merged
     [[ -z $provider ]] || valid_provider "$provider" || fail "unknown provider"
     old=$(if [[ -f $policy_file ]]; then cat "$policy_file"; else empty_policy; fi)
     jq -e '.version == 1 and (.models | type == "array")' <<<"$old" >/dev/null || fail "existing policy is malformed"
@@ -102,6 +152,12 @@ refresh() {
     if [[ -n $provider ]]; then
         known=$(jq --arg provider "$provider" '[.[] | select(.[0] == $provider)]' <<<"$known")
     fi
+    discovered='[]'
+    for candidate in openai-api deepseek-api xai-api zai-api ollama-cloud; do
+        [[ -z $provider || $provider == "$candidate" ]] || continue
+        discovered=$(jq -s 'map(fromjson?) | map(select(. != null))' <(discover_remote_models "$candidate") 2>/dev/null || printf '[]')
+        [[ $discovered != '[]' ]] && known=$(jq -n --argjson known "$known" --argjson discovered "$discovered" '$known + $discovered | unique' )
+    done
     # Retain all existing records (including disabled discovered models) across
     # refresh failures.  New remote entries are disabled.  Local Ollama is the
     # explicit offline default, not an accidental cloud authorization.
