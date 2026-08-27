@@ -4,6 +4,7 @@
 set -euo pipefail
 
 readonly secret_dir=/etc/jarvis/secrets
+readonly core_env=/etc/jarvis/core.env
 
 fail() { echo "jarvis-credentials: $*" >&2; exit 1; }
 [[ ${EUID} -eq 0 ]] || fail "must run as root"
@@ -118,13 +119,79 @@ test_credential() {
     provider_var "$provider" >/dev/null || fail "unknown provider"
     file=$(credential_file "$provider")
     [[ -f $file && ! -L $file && $(stat -c '%U:%G:%a' "$file") == root:jarvis:640 ]] || fail "not configured or unsafe permissions"
-    # Do not source the credential or call a paid generation endpoint here.
-    # A bounded Core health check proves file loading/restart viability; provider
-    # discovery/health belongs to the authenticated router and is non-secret.
+    if ! probe_provider "$provider" "$file"; then
+        fail "provider rejected or did not answer the bounded credential probe"
+    fi
     if ! systemctl is-active --quiet jarvis-core.service || ! wait_healthy; then
         fail "Core is not healthy"
     fi
-    echo "jarvis-credentials: $provider is installed with safe permissions; no paid request was made."
+    echo "jarvis-credentials: $provider credential probe and Core health check succeeded; no generation request was made."
+}
+
+# Authenticated, read-only provider probe.  The key is written only into an
+# ephemeral mode-0600 curl config in /run, never onto curl's argv or stdout.
+# Every endpoint below is metadata-only and must not create a paid generation.
+probe_provider() {
+    local provider=$1 file=$2 variable key escaped_key base config http_code
+    command -v curl >/dev/null 2>&1 || fail "curl is required for credential testing"
+    variable=$(provider_var "$provider") || return 1
+    set -a
+    # shellcheck disable=SC1090,SC1091 # root-managed single-provider secret
+    source "$file"
+    set +a
+    key=${!variable:-}
+    [[ -n $key ]] || return 1
+    escaped_key=$(curl_config_escape "$key")
+    config=$(mktemp /run/jarvis-credential-test.XXXXXX)
+    trap 'rm -f -- "$config"; unset key' RETURN
+    umask 077
+    case $provider in
+        anthropic)
+            base=https://api.anthropic.com
+            [[ -f $core_env && ! -L $core_env ]] && {
+                # shellcheck disable=SC1090,SC1091 # root-managed Core config
+                source "$core_env"
+                base=${JARVIS_LLM_ANTHROPIC_BASE_URL:-$base}
+            }
+            [[ $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 1
+            printf 'url = "%s/v1/models?limit=1"\nheader = "x-api-key: %s"\nheader = "anthropic-version: 2023-06-01"\n' "${base%/}" "$escaped_key" > "$config"
+            ;;
+        openai|deepseek|xai|zai|ollama-cloud)
+            base=$(openai_compatible_base_url "$provider") || return 1
+            [[ $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 1
+            printf 'url = "%s/models"\nheader = "Authorization: Bearer %s"\n' "${base%/}" "$escaped_key" > "$config"
+            ;;
+        *) return 1 ;;
+    esac
+    unset key
+    http_code=$(curl --config "$config" --output /dev/null --silent --show-error --max-time 10 --write-out '%{http_code}' || true)
+    trap - RETURN
+    rm -f -- "$config"
+    [[ $http_code =~ ^2[0-9]{2}$ ]]
+}
+
+# curl config uses quoted values. Escape the only two metacharacters that may
+# occur in an opaque provider credential without ever echoing it to a terminal.
+curl_config_escape() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '%s' "$value"
+}
+
+openai_compatible_base_url() {
+    local provider=$1
+    [[ -f $core_env && ! -L $core_env ]] || return 1
+    # shellcheck disable=SC1090,SC1091 # root-managed Core config
+    source "$core_env"
+    case $provider in
+        openai) printf '%s\n' "${JARVIS_LLM_OPENAI_BASE_URL:-https://api.openai.com/v1}" ;;
+        deepseek) printf '%s\n' "${JARVIS_LLM_DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}" ;;
+        xai) printf '%s\n' "${JARVIS_LLM_XAI_BASE_URL:-https://api.x.ai/v1}" ;;
+        zai) printf '%s\n' "${JARVIS_LLM_ZAI_BASE_URL:-https://api.z.ai/api/paas/v4}" ;;
+        ollama-cloud) printf '%s\n' "${JARVIS_LLM_OLLAMA_CLOUD_BASE_URL:-}" ;;
+        *) return 1 ;;
+    esac
 }
 
 remove_credential() {

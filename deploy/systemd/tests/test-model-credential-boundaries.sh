@@ -30,6 +30,10 @@ grep -Fq "mktemp \"\$secret_dir/." "$credentials"
 grep -Fq 'chown root:jarvis' "$credentials"
 grep -Fq 'chmod 0640' "$credentials"
 grep -Fq 'restoring prior credential state' "$credentials"
+grep -Fq 'probe_provider' "$credentials"
+grep -Fq 'mktemp /run/jarvis-credential-test' "$credentials"
+grep -Fq 'curl --config "$config"' "$credentials"
+grep -Fq 'no generation request was made' "$credentials"
 
 # Provider access policy is exact, starts remote models disabled, and uses an
 # atomic replacement.  Local Ollama is distinguished from ollama-cloud.

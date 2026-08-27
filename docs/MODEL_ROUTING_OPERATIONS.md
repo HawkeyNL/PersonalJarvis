@@ -25,7 +25,10 @@ sudo jarvis-credentials remove openai
 
 `set` installs a temporary root-only file atomically, restarts Core and waits
 for `/livez` and `/readyz`.  A failed restart restores the old credential
-state. `test` intentionally does not perform a paid generation request.
+state. `test` performs a bounded authenticated metadata probe (`/models` where
+the provider supports it; Anthropic's model-list endpoint otherwise) using an
+ephemeral root-only curl config, then checks Core health. It intentionally does
+not perform a paid generation request or print a provider response.
 Local Ollama has no credential. Remote Ollama is a distinct `ollama-cloud`
 provider and must use an explicit credential and model allowlist entry.
 
@@ -33,7 +36,7 @@ provider and must use an explicit credential and model allowlist entry.
 
 The root-owned `/etc/jarvis/model-policy.json` is the canonical policy.  The
 first setup creates it through `jarvis-models refresh`. Configured remote models
-are recorded as `discovered` but disabled. Local Ollama is available by default
+are recorded as `configured` or `provider_api` but disabled. Local Ollama is available by default
 unless the owner explicitly disables its exact model.
 
 ```bash
@@ -51,9 +54,18 @@ entries if a provider/discovery operation is unavailable.
 ## Routing, health and spend
 
 Requests use `auto` (default), `fast`, `deep`, or `research`. Older `tier`
-hints map to the same quality floor. The selected mode is returned as
-non-secret response metadata; provider/model selection is internal and never
-reveals keys or hidden reasoning.
+hints map to the same quality floor. A deterministic classifier establishes a
+minimum quality floor from the original request before cost is considered; it
+does not replace the message with a summary. In particular, Fast cannot reduce
+deterministically safety-sensitive, research, coding or complex work below its
+required floor. The selected mode is returned as non-secret response metadata;
+provider/model selection is internal and never reveals keys or hidden reasoning.
+
+Provider faults are classified without logging response bodies. Authentication,
+rate-limit, transport and temporary availability failures receive a bounded
+in-process cooldown, so Core falls back only to another enabled provider that
+still meets the task floor instead of retrying a known-bad credential on every
+request.
 
 Metered execution is accounted per backend/model. Local Ollama and the local
 subscription CLI are distinct from paid API backends. Unknown remote prices are
