@@ -10,7 +10,7 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::StatusCode,
     middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde_json::{json, Value};
@@ -52,13 +52,14 @@ use routes::auth::{
 };
 use routes::broker::{ibkr_positions, ibkr_status};
 use routes::chat::{
-    assistant_chat, assistant_orchestrate, delete_conversation, get_conversation,
-    list_conversations,
+    assistant_chat, assistant_orchestrate, conversation_brain_set, delete_conversation,
+    get_conversation, list_conversations,
 };
 use routes::portfolio::{add_holding, get_holdings, remove_holding};
 use routes::system::{
-    system_budget_preflight, system_model_policy, system_privileged_config, system_registry,
-    system_registry_refresh, system_self_improve, system_usage,
+    system_brain, system_brain_set, system_budget_preflight, system_model_policy,
+    system_privileged_config, system_registry, system_registry_refresh, system_self_improve,
+    system_usage,
 };
 use routes::voice::{voice_enroll, voice_status, voice_verify};
 
@@ -102,6 +103,7 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/conversations/{id}",
             get(get_conversation).delete(delete_conversation),
         )
+        .route("/v1/conversations/{id}/brain", put(conversation_brain_set))
         .route("/v1/voice/status", get(voice_status))
         .route("/v1/voice/enroll", post(voice_enroll))
         .route("/v1/voice/verify", post(voice_verify))
@@ -109,6 +111,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/system/registry/refresh", post(system_registry_refresh))
         .route("/v1/system/usage", get(system_usage))
         .route("/v1/system/models", get(system_model_policy))
+        .route("/v1/system/brain", get(system_brain).put(system_brain_set))
         .route("/v1/system/budget/preflight", post(system_budget_preflight))
         .route(
             "/v1/system/config/privileged",

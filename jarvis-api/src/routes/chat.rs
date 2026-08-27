@@ -21,6 +21,7 @@ use jarvis_orchestrator as orchestrator;
 use crate::error::bad_request;
 use crate::metering::{record_usage, record_usage_with_metadata};
 use crate::rate_limit::allow_authenticated_device;
+use crate::routes::system::{validate_brain_selection, BrainPreferenceReq};
 use crate::validation;
 use crate::{AppState, Authed};
 
@@ -176,7 +177,7 @@ pub(crate) async fn assistant_chat(
     // conversation below remains the model input; no lossy summary or hidden
     // model-selection prompt is substituted for the owner's request.
     let requirements = llm::classify_task(mode, &new_msg);
-    let chat = llm::ChatRequest {
+    let mut chat = llm::ChatRequest {
         system: Some(
             req.system
                 .unwrap_or_else(|| state.jarvis_system.to_string()),
@@ -188,6 +189,22 @@ pub(crate) async fn assistant_chat(
         // The router picks the concrete model per backend (ADR-028 fase 2).
         model: None,
     };
+    // Explicit Deep/Research requests retain their quality-floor semantics.
+    // The owner default is only applied to ordinary Auto conversation turns;
+    // every persisted selection was allowlist-validated and is checked again
+    // here to fail closed after a policy reload/revocation.
+    if mode == llm::RoutingMode::Auto {
+        let preferred = conversation_brain_override(&state.db, conv_id, authed.user.id).await;
+        let preferred = match preferred {
+            Some(preferred) => Some(preferred),
+            None => async_global_brain(&state, authed.user.id).await,
+        };
+        if let Some((provider, model)) = preferred {
+            if state.model_policy.allows(&provider, &model) {
+                chat.model = Some(model);
+            }
+        }
+    }
 
     let llm_started = Instant::now();
     let request_id = Uuid::now_v7().to_string();
@@ -252,6 +269,41 @@ pub(crate) async fn assistant_chat(
             ))
         }
     }
+}
+
+async fn conversation_brain_override(
+    db: &jarvis_store::Database,
+    conversation_id: Uuid,
+    user_id: Uuid,
+) -> Option<(String, String)> {
+    #[derive(Deserialize)]
+    struct Row {
+        brain_provider: Option<String>,
+        brain_model: Option<String>,
+    }
+    db.query("SELECT brain_provider, brain_model FROM conversations WHERE record::id(id) = $id AND user_id = $user_id LIMIT 1")
+        .bind(json!({"id":conversation_id.to_string(), "user_id":user_id.to_string()})).await.ok()
+        .and_then(|mut r| r.take::<Option<Row>>(0).ok()).flatten()
+        .and_then(|r| r.brain_provider.zip(r.brain_model))
+}
+
+async fn async_global_brain(state: &AppState, user_id: Uuid) -> Option<(String, String)> {
+    #[derive(Deserialize)]
+    struct Row {
+        provider: Option<String>,
+        model: Option<String>,
+    }
+    state
+        .db
+        .query(
+            "SELECT provider, model FROM owner_brain_preferences WHERE user_id = $user_id LIMIT 1",
+        )
+        .bind(json!({"user_id":user_id.to_string()}))
+        .await
+        .ok()
+        .and_then(|mut r| r.take::<Option<Row>>(0).ok())
+        .flatten()
+        .and_then(|r| r.provider.zip(r.model))
 }
 
 /// Ask a cheap model whether `new_msg` continues the current topic, and get a
@@ -454,6 +506,31 @@ pub(crate) async fn get_conversation(
     Ok(Json(
         json!({ "id": id, "title": title, "messages": messages }),
     ))
+}
+
+/// Set or clear this conversation's owner-selected default. The actual router
+/// still checks the root-owned allowlist at execution time, so a later policy
+/// revocation turns this into Auto instead of granting stale access.
+pub(crate) async fn conversation_brain_set(
+    authed: Authed,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<BrainPreferenceReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    validate_brain_selection(&state, req.provider.as_deref(), req.model.as_deref())?;
+    let mut response = state.db.query(
+        "UPDATE conversations SET brain_provider = $provider, brain_model = $model, updated_at = time::now() \
+         WHERE record::id(id) = $id AND user_id = $user_id RETURN record::id(id) AS id",
+    ).bind(json!({"id":id.to_string(), "user_id":authed.user.id.to_string(), "provider":req.provider, "model":req.model})).await
+        .map_err(|_| internal_error())?;
+    let updated: Option<Value> = response.take(0).map_err(|_| internal_error())?;
+    if updated.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"no such conversation"})),
+        ));
+    }
+    Ok(Json(json!({"status":"updated"})))
 }
 
 /// Delete a conversation and its messages (ON DELETE CASCADE) — owner-only.

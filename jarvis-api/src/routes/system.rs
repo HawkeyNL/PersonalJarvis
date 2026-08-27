@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use jarvis_registry as registry;
 use jarvis_selfdev as selfdev;
@@ -19,6 +20,103 @@ use crate::error::bad_request;
 use crate::metering::record_usage;
 use crate::validation;
 use crate::{AppState, Authed};
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct BrainPreferenceReq {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrainPreferenceRow {
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+/// Owner-visible default conversational brain. `null/null` means Auto. This
+/// is deliberately application state, not a protected persona/model-policy
+/// mutation: selection remains constrained by the root-owned allowlist.
+pub(crate) async fn system_brain(authed: Authed, State(state): State<AppState>) -> Json<Value> {
+    let preference = brain_preference(&state.db, authed.user.id).await;
+    let enabled: Vec<Value> = state
+        .model_policy
+        .models
+        .iter()
+        .filter(|entry| entry.enabled)
+        .map(|entry| json!({"provider": entry.provider, "model": entry.model, "source": entry.source}))
+        .collect();
+    Json(json!({"default": preference, "enabled_models": enabled}))
+}
+
+pub(crate) async fn system_brain_set(
+    authed: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<BrainPreferenceReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    validate_brain_selection(&state, req.provider.as_deref(), req.model.as_deref())?;
+    state.db.query(
+        "UPSERT owner_brain_preferences:$id SET id = $id, user_id = $user_id, provider = $provider, model = $model, updated_at = time::now() RETURN NONE",
+    ).bind(json!({"id": authed.user.id.to_string(), "user_id": authed.user.id.to_string(), "provider": req.provider, "model": req.model})).await
+        .map_err(|_| internal_error())?;
+    record_security_event(
+        &state,
+        Some(authed.device.id),
+        "owner_brain_preference",
+        "changed",
+        Some(if req.provider.is_some() {
+            "explicit"
+        } else {
+            "auto"
+        }),
+    )
+    .await;
+    Ok(Json(
+        json!({"status":"updated", "default": brain_preference(&state.db, authed.user.id).await}),
+    ))
+}
+
+pub(crate) fn validate_brain_selection(
+    state: &AppState,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    match (provider, model) {
+        (None, None) => Ok(()),
+        (Some(provider), Some(model)) if state.model_policy.allows(provider, model) => Ok(()),
+        _ => Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"model is not owner-enabled"})),
+        )),
+    }
+}
+
+pub(crate) async fn brain_preference(db: &jarvis_store::Database, user_id: Uuid) -> Value {
+    let row: Option<BrainPreferenceRow> = db
+        .query(
+            "SELECT provider, model FROM owner_brain_preferences WHERE user_id = $user_id LIMIT 1",
+        )
+        .bind(json!({"user_id": user_id.to_string()}))
+        .await
+        .ok()
+        .and_then(|mut response| response.take(0).ok())
+        .flatten();
+    match row {
+        Some(BrainPreferenceRow {
+            provider: Some(provider),
+            model: Some(model),
+        }) => json!({"mode":"pinned","provider":provider,"model":model}),
+        _ => json!({"mode":"auto"}),
+    }
+}
+
+fn internal_error() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error":"internal error"})),
+    )
+}
 
 /// Forward one typed, signed owner operation to the *local* root broker. The
 /// bearer session only identifies the caller; it cannot authorize anything:
