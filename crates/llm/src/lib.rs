@@ -26,7 +26,8 @@ pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use router::{always_available, Availability, CatalogModel, ModelClass, RouterProvider};
 pub use types::{
-    ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, Role, RoutingMode, Tier, Usage,
+    classify_task, ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, Role,
+    RoutingMode, TaskRequirements, Tier, Usage,
 };
 
 /// A swappable brain: given a conversation, produce a reply.

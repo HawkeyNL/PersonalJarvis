@@ -76,6 +76,117 @@ impl RoutingMode {
     }
 }
 
+/// Deterministic, bounded routing facts derived from the original user input.
+/// This never replaces or summarizes the input: the selected model still
+/// receives the complete original conversation. It merely establishes a
+/// minimum quality floor before the router considers latency or cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskRequirements {
+    pub tier: Tier,
+    pub needs_research: bool,
+    pub likely_tool_use: bool,
+    pub safety_sensitive: bool,
+    pub routing_reason: &'static str,
+}
+
+/// Determine a conservative quality floor without making an extra LLM call.
+/// Explicit Deep/Research requests always win. Fast mode remains fast for
+/// ordinary utility questions but cannot downgrade a deterministic safety,
+/// research, coding or financial-risk signal below the standard tier.
+pub fn classify_task(mode: RoutingMode, original_request: &str) -> TaskRequirements {
+    let normalized = original_request.to_ascii_lowercase();
+    let needs_research = matches!(mode, RoutingMode::Research)
+        || [
+            "onderzoek",
+            "research",
+            "bronnen",
+            "sources",
+            "actueel",
+            "latest",
+            "nieuws",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle));
+    let likely_tool_use = [
+        "code",
+        "debug",
+        "repository",
+        "repo",
+        "bestand",
+        "file",
+        "analyseer data",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+    let safety_sensitive = [
+        "trade",
+        "handelen",
+        "order",
+        "portfolio",
+        "beveilig",
+        "security",
+        "secret",
+        "credential",
+        "wachtwoord",
+        "approval",
+        "goedkeur",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+    let inherently_deep = needs_research
+        || likely_tool_use
+        || safety_sensitive
+        || original_request.chars().count() > 4_000
+        || ["vergelijk", "plan", "strategie", "architectuur", "redeneer"]
+            .iter()
+            .any(|needle| normalized.contains(needle));
+
+    match mode {
+        RoutingMode::Deep => TaskRequirements {
+            tier: Tier::Hard,
+            needs_research,
+            likely_tool_use,
+            safety_sensitive,
+            routing_reason: "Deep reasoning requested; strong-quality routing floor applied.",
+        },
+        RoutingMode::Research => TaskRequirements {
+            tier: Tier::Hard,
+            needs_research: true,
+            likely_tool_use: true,
+            safety_sensitive,
+            routing_reason: "Research requested; strong-quality routing floor and approved research tooling may be used.",
+        },
+        RoutingMode::Fast if !inherently_deep => TaskRequirements {
+            tier: Tier::Cheap,
+            needs_research,
+            likely_tool_use,
+            safety_sensitive,
+            routing_reason: "Fast mode requested; utility-quality routing floor applied.",
+        },
+        RoutingMode::Fast => TaskRequirements {
+            tier: Tier::Default,
+            needs_research,
+            likely_tool_use,
+            safety_sensitive,
+            routing_reason: "Fast mode retained a standard-quality floor for this task's safety or complexity.",
+        },
+        RoutingMode::Auto if inherently_deep => TaskRequirements {
+            tier: Tier::Hard,
+            needs_research,
+            likely_tool_use,
+            safety_sensitive,
+            routing_reason: "Task complexity or safety relevance selected a strong-quality routing floor.",
+        },
+        RoutingMode::Auto => TaskRequirements {
+            tier: Tier::Default,
+            needs_research,
+            likely_tool_use,
+            safety_sensitive,
+            routing_reason: "Automatic quality/capability routing selected a standard-quality floor.",
+        },
+    }
+}
+
 impl Tier {
     /// Parse a tier hint from the client (permissive; unknown ⇒ default).
     pub fn parse(s: &str) -> Self {
@@ -231,6 +342,26 @@ mod tests {
             }
             .failure_category(),
             ProviderFailure::ContextOverflow
+        );
+    }
+
+    #[test]
+    fn fast_cannot_downgrade_a_safety_sensitive_task() {
+        let task = classify_task(RoutingMode::Fast, "Voer deze trade meteen uit");
+        assert_eq!(task.tier, Tier::Default);
+        assert!(task.safety_sensitive);
+    }
+
+    #[test]
+    fn research_and_deep_have_a_strong_floor() {
+        assert_eq!(
+            classify_task(RoutingMode::Research, "kort").tier,
+            Tier::Hard
+        );
+        assert_eq!(classify_task(RoutingMode::Deep, "kort").tier, Tier::Hard);
+        assert_eq!(
+            classify_task(RoutingMode::Fast, "bedankt").tier,
+            Tier::Cheap
         );
     }
 }

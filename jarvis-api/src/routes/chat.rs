@@ -171,12 +171,16 @@ pub(crate) async fn assistant_chat(
                 })
                 .unwrap_or_default()
         });
+    // Classification establishes a quality floor only. The complete original
+    // conversation below remains the model input; no lossy summary or hidden
+    // model-selection prompt is substituted for the owner's request.
+    let requirements = llm::classify_task(mode, &new_msg);
     let chat = llm::ChatRequest {
         system: Some(
             req.system
                 .unwrap_or_else(|| state.jarvis_system.to_string()),
         ),
-        tier: mode.tier(),
+        tier: requirements.tier,
         mode,
         messages,
         max_tokens: state.llm_max_tokens,
@@ -200,7 +204,7 @@ pub(crate) async fn assistant_chat(
                 "reply": reply.text,
                 "model": reply.model,
                 "backend": reply.backend,
-                "routing_reason": routing_reason(mode),
+                "routing_reason": requirements.routing_reason,
                 "stop_reason": reply.stop_reason,
                 "conversation_id": conv_id,
                 "conversation_title": conv_title,
@@ -232,19 +236,6 @@ pub(crate) async fn assistant_chat(
                     "conversation_id": conv_id,
                 })),
             ))
-        }
-    }
-}
-
-fn routing_reason(mode: llm::RoutingMode) -> &'static str {
-    match mode {
-        llm::RoutingMode::Auto => {
-            "Automatic quality/capability routing among owner-enabled models."
-        }
-        llm::RoutingMode::Fast => "Fast mode requested; minimum utility quality retained.",
-        llm::RoutingMode::Deep => "Deep reasoning requested; strong-quality routing floor applied.",
-        llm::RoutingMode::Research => {
-            "Research mode requested; strong-quality routing floor applied."
         }
     }
 }
