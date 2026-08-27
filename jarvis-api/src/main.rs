@@ -301,6 +301,8 @@ async fn main() -> anyhow::Result<()> {
         pricing_registry: Arc::new(pricing_registry),
         privileged_broker_socket: (!config.privileged_broker_socket.trim().is_empty())
             .then(|| Arc::<str>::from(config.privileged_broker_socket.trim())),
+        codex_broker_socket: (!config.codex_broker_socket.trim().is_empty())
+            .then(|| Arc::<str>::from(config.codex_broker_socket.trim())),
         budget_cents,
         spent_cents,
         budget_book,

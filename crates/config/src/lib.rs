@@ -132,6 +132,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub privileged_broker_socket: String,
 
+    /// Local-only Codex/OpenSandbox broker socket. Empty disables coding
+    /// execution; Core never substitutes a host Codex process.
+    #[serde(default)]
+    pub codex_broker_socket: String,
+
     /// Path/name of the `claude` CLI, used when `llm_provider = "claude-cli"`
     /// (runs the brain on your Claude subscription; see decisions/ADR-027).
     #[serde(default = "default_claude_cli_bin")]
@@ -618,6 +623,8 @@ impl fmt::Debug for AppConfig {
             .field("llm_ollama_model", &self.llm_ollama_model)
             .field("llm_model_policy_path", &self.llm_model_policy_path)
             .field("llm_pricing_registry_path", &self.llm_pricing_registry_path)
+            .field("privileged_broker_socket", &self.privileged_broker_socket)
+            .field("codex_broker_socket", &self.codex_broker_socket)
             .field("llm_claude_cli_bin", &self.llm_claude_cli_bin)
             .field("llm_persona_path", &self.llm_persona_path)
             .field("llm_openai_api_key", &redact(&self.llm_openai_api_key))
@@ -699,6 +706,7 @@ mod tests {
             llm_model_policy_path: "/etc/jarvis/model-policy.json".to_string(),
             llm_pricing_registry_path: "/etc/jarvis/pricing-registry.json".to_string(),
             privileged_broker_socket: String::new(),
+            codex_broker_socket: String::new(),
             llm_claude_cli_bin: "claude".to_string(),
             llm_persona_path: "/etc/jarvis/Jarvis.md".to_string(),
             llm_openai_api_key: "sk-openai-supersecret".to_string(),
@@ -808,6 +816,7 @@ mod tests {
             llm_model_policy_path: String::new(),
             llm_pricing_registry_path: String::new(),
             privileged_broker_socket: String::new(),
+            codex_broker_socket: String::new(),
             llm_claude_cli_bin: String::new(),
             llm_persona_path: String::new(),
             llm_openai_api_key: String::new(),

@@ -225,6 +225,39 @@ pub fn privileged_config_approval_message(
     Ok(message)
 }
 
+/// Canonical, domain-separated bytes for a privileged Codex/OpenSandbox coding
+/// operation. A signature for configuration, pairing or agent approval can
+/// therefore never be replayed as approval to start coding work.
+#[allow(clippy::too_many_arguments)]
+pub fn codex_coding_approval_message(
+    action: &str,
+    payload_hash: &[u8; 32],
+    request_id: Uuid,
+    nonce: &[u8],
+    user_id: Uuid,
+    device_id: Uuid,
+    issued_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+    target_state_hash: &[u8; 32],
+) -> Result<Vec<u8>, IdentityError> {
+    if action.is_empty() || action.len() > 64 || nonce.len() != 32 || expires_at < issued_at {
+        return Err(IdentityError::AuthFailed);
+    }
+    let mut message = Vec::with_capacity(64 + action.len());
+    message.extend_from_slice(b"jarvis-codex-coding-v1\0");
+    message.extend_from_slice(&(action.len() as u16).to_be_bytes());
+    message.extend_from_slice(action.as_bytes());
+    message.extend_from_slice(payload_hash);
+    message.extend_from_slice(request_id.as_bytes());
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(user_id.as_bytes());
+    message.extend_from_slice(device_id.as_bytes());
+    message.extend_from_slice(&issued_at.unix_timestamp().to_be_bytes());
+    message.extend_from_slice(&expires_at.unix_timestamp().to_be_bytes());
+    message.extend_from_slice(target_state_hash);
+    Ok(message)
+}
+
 /// Verify an Ed25519 signature over `message` using a raw 32-byte public key.
 pub fn verify_signature(
     public_key: &[u8],
@@ -345,5 +378,38 @@ mod tests {
             &state,
         )
         .is_err());
+    }
+
+    #[test]
+    fn coding_message_has_a_distinct_domain() {
+        let issued = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let coding = codex_coding_approval_message(
+            "coding.start",
+            &[1; 32],
+            Uuid::nil(),
+            &[2; 32],
+            Uuid::nil(),
+            Uuid::nil(),
+            issued,
+            issued + time::Duration::minutes(1),
+            &[3; 32],
+        )
+        .unwrap();
+        assert!(coding.starts_with(b"jarvis-codex-coding-v1\0"));
+        assert_ne!(
+            coding,
+            privileged_config_approval_message(
+                "coding.start",
+                &[1; 32],
+                Uuid::nil(),
+                &[2; 32],
+                Uuid::nil(),
+                Uuid::nil(),
+                issued,
+                issued + time::Duration::minutes(1),
+                &[3; 32],
+            )
+            .unwrap()
+        );
     }
 }

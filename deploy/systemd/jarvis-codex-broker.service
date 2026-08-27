@@ -1,0 +1,38 @@
+[Unit]
+Description=Jarvis local Codex/OpenSandbox approval broker
+After=network-online.target jarvis-surrealdb.service jarvis-opensandbox.service
+Wants=network-online.target
+ConditionPathExists=/etc/jarvis/codex-broker.env
+
+[Service]
+Type=exec
+User=jarvis-codex
+# The socket is group-readable only by the unprivileged Core identity. This is
+# not a privilege grant: every start/resume is independently device-signed.
+Group=jarvis
+EnvironmentFile=/etc/jarvis/codex-broker.env
+RuntimeDirectory=jarvis-codex-broker
+RuntimeDirectoryMode=0750
+StateDirectory=jarvis-codex-broker
+StateDirectoryMode=0700
+ExecStart=/opt/jarvis/current/jarvis-codex-broker
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=20s
+TimeoutStopSec=30s
+UMask=0007
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+InaccessiblePaths=/etc/jarvis/Jarvis.md /etc/jarvis/secrets
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/jarvis-codex-broker /run/jarvis-codex-broker
+
+[Install]
+WantedBy=multi-user.target

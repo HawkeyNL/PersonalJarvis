@@ -42,6 +42,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         model_policy: Arc::new(jarvis_llm::ModelAccessPolicy::deny_by_default()),
         pricing_registry: Arc::new(jarvis_usage::PricingRegistry::builtin()),
         privileged_broker_socket: None,
+        codex_broker_socket: None,
         budget_cents: 5000,
         spent_cents: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         budget_book: Arc::new(jarvis_usage::BudgetBook::new(

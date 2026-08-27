@@ -55,7 +55,10 @@ use routes::chat::{
     assistant_chat, assistant_orchestrate, conversation_brain_set, delete_conversation,
     get_conversation, list_conversations,
 };
-use routes::coding::{create as coding_create, lifecycle as coding_lifecycle, list as coding_list};
+use routes::coding::{
+    create as coding_create, lifecycle as coding_lifecycle, list as coding_list,
+    start_or_resume as coding_start_or_resume,
+};
 use routes::portfolio::{add_holding, get_holdings, remove_holding};
 use routes::system::{
     system_brain, system_brain_set, system_budget_preflight, system_model_policy,
@@ -101,6 +104,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/assistant/orchestrate", post(assistant_orchestrate))
         .route("/v1/coding/sessions", get(coding_list).post(coding_create))
         .route("/v1/coding/sessions/{id}", post(coding_lifecycle))
+        .route(
+            "/v1/coding/sessions/{id}/{mode}",
+            post(coding_start_or_resume),
+        )
         .route("/v1/conversations", get(list_conversations))
         .route(
             "/v1/conversations/{id}",
