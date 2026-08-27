@@ -194,6 +194,11 @@ prepare_candidate v5.0.0 "$same_migrations"
 run_updater
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v5.0.1 ]]
 [[ ! -e /opt/jarvis/releases/v5.0.0 ]]
+if run_updater --version v5.0.0; then
+    echo "explicit downgrade unexpectedly succeeded" >&2
+    exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v5.0.1 ]]
 
 # A check is strictly non-mutating and uses a useful exit status for scripts.
 seed_active_release v6.0.0 "$same_migrations"

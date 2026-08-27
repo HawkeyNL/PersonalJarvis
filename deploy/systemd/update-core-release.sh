@@ -159,6 +159,10 @@ if [[ -n $current_tag && $current_tag == "$tag" ]]; then
     exit 0
 fi
 if [[ -n $current_tag ]] && ! version_is_newer "$tag" "$current_tag"; then
+    if [[ $mode == latest ]]; then
+        echo "jarvis updater: refusing automatic downgrade from $current_tag to $tag"
+        exit 0
+    fi
     fail "refusing downgrade from $current_tag to $tag; use the explicit rollback operation"
 fi
 
