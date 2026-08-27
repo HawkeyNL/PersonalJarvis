@@ -229,7 +229,11 @@ impl LlmProvider for RouterProvider {
                 Ok(reply) => return Ok(reply),
                 Err(LlmError::Refused) => return Err(LlmError::Refused),
                 Err(e) => {
-                    tracing::warn!(backend = %candidate.id, error = %e, "brain failed; routing to next");
+                    tracing::warn!(
+                        backend = %candidate.id,
+                        failure = ?e.failure_category(),
+                        "brain failed; routing to next"
+                    );
                     last = Some(e);
                 }
             }

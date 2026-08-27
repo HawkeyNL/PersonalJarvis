@@ -155,7 +155,7 @@ refresh() {
     discovered='[]'
     for candidate in openai-api deepseek-api xai-api zai-api ollama-cloud; do
         [[ -z $provider || $provider == "$candidate" ]] || continue
-        discovered=$(jq -s 'map(fromjson?) | map(select(. != null))' <(discover_remote_models "$candidate") 2>/dev/null || printf '[]')
+        discovered=$(jq -s 'map(fromjson?) | map(select(. != null) + ["provider_api"])' <(discover_remote_models "$candidate") 2>/dev/null || printf '[]')
         [[ $discovered != '[]' ]] && known=$(jq -n --argjson known "$known" --argjson discovered "$discovered" '$known + $discovered | unique' )
     done
     # Retain all existing records (including disabled discovered models) across
@@ -164,7 +164,7 @@ refresh() {
     merged=$(jq -n --argjson old "$old" --argjson known "$known" '
       reduce $known[] as $item ($old;
         if any(.models[]; .provider == $item[0] and .model == $item[1]) then .
-        else .models += [{provider:$item[0], model:$item[1], enabled:($item[0] == "ollama"), source:"configured"}]
+        else .models += [{provider:$item[0], model:$item[1], enabled:($item[0] == "ollama"), source:($item[2] // "configured")}]
         end)
       | .version = 1
       | .models |= sort_by(.provider, .model)')

@@ -136,7 +136,10 @@ pub struct ChatReply {
 pub enum LlmError {
     #[error("llm transport failed")]
     Http(#[from] reqwest::Error),
-    #[error("llm provider error: HTTP {status}: {body}")]
+    // Provider bodies can reflect request material or contain operational
+    // details.  Keep them for in-process classification, but never render
+    // them through Display: callers routinely log `LlmError`.
+    #[error("llm provider returned HTTP {status}")]
     Api { status: u16, body: String },
     #[error("the model declined to answer")]
     Refused,
@@ -144,6 +147,46 @@ pub enum LlmError {
     Empty,
     #[error("llm is not configured: {0}")]
     NotConfigured(String),
+}
+
+/// Safe, provider-neutral failure information for routing and observability.
+/// It intentionally excludes provider response text, prompts and credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailure {
+    Transport,
+    RateLimited,
+    Authentication,
+    Unavailable,
+    ContextOverflow,
+    MalformedResponse,
+    Refused,
+    NotConfigured,
+}
+
+impl LlmError {
+    pub fn failure_category(&self) -> ProviderFailure {
+        match self {
+            Self::Http(_) => ProviderFailure::Transport,
+            Self::Api {
+                status: 401 | 403, ..
+            } => ProviderFailure::Authentication,
+            Self::Api {
+                status: 408 | 504, ..
+            } => ProviderFailure::Transport,
+            Self::Api {
+                status: 413 | 422,
+                body,
+            } if body.to_ascii_lowercase().contains("context") => ProviderFailure::ContextOverflow,
+            Self::Api { status: 429, .. } => ProviderFailure::RateLimited,
+            Self::Api {
+                status: 500..=599, ..
+            } => ProviderFailure::Unavailable,
+            Self::Api { .. } | Self::Empty => ProviderFailure::MalformedResponse,
+            Self::Refused => ProviderFailure::Refused,
+            Self::NotConfigured(_) => ProviderFailure::NotConfigured,
+        }
+    }
 }
 
 /// Truncate a string to at most `max` characters (char-safe), for error bodies.
@@ -154,5 +197,40 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_error_display_redacts_body_but_classifies_it() {
+        let error = LlmError::Api {
+            status: 401,
+            body: "recognizable-test-secret".into(),
+        };
+        assert_eq!(error.failure_category(), ProviderFailure::Authentication);
+        assert!(!error.to_string().contains("recognizable-test-secret"));
+    }
+
+    #[test]
+    fn rate_limit_and_context_overflow_are_distinct() {
+        assert_eq!(
+            LlmError::Api {
+                status: 429,
+                body: String::new()
+            }
+            .failure_category(),
+            ProviderFailure::RateLimited
+        );
+        assert_eq!(
+            LlmError::Api {
+                status: 413,
+                body: "context length exceeded".into()
+            }
+            .failure_category(),
+            ProviderFailure::ContextOverflow
+        );
     }
 }

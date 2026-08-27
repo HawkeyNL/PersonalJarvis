@@ -40,6 +40,7 @@ grep -Fq "provider == \$item[0] and .model == \$item[1]" "$models"
 grep -Fq "Official OpenAI-compatible \`/models\` discovery" "$models"
 grep -Fq "curl --config \"\$config\"" "$models"
 grep -Fq 'mktemp /run/jarvis-model-discovery' "$models"
+grep -Fq 'provider_api' "$models"
 grep -Fq 'return 0; }' "$models"
 if grep -Eq 'curl[[:space:]].*-H[[:space:]]+.*Authorization' "$models"; then
     echo "model discovery exposes an authorization header in argv" >&2
