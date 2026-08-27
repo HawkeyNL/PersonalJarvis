@@ -37,6 +37,14 @@ grep -Fq 'new remote models remain disabled' "$models"
 grep -Fq 'atomic_write' "$models"
 grep -Fq 'ollama-cloud' "$models"
 grep -Fq "provider == \$item[0] and .model == \$item[1]" "$models"
+grep -Fq "Official OpenAI-compatible \`/models\` discovery" "$models"
+grep -Fq "curl --config \"\$config\"" "$models"
+grep -Fq 'mktemp /run/jarvis-model-discovery' "$models"
+grep -Fq 'return 0; }' "$models"
+if grep -Eq 'curl[[:space:]].*-H[[:space:]]+.*Authorization' "$models"; then
+    echo "model discovery exposes an authorization header in argv" >&2
+    exit 1
+fi
 grep -Fq '/etc/jarvis/secrets' "$prepare"
 
 for provider in anthropic openai deepseek xai zai ollama-cloud; do
