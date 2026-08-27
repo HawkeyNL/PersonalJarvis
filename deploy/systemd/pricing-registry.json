@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "source": "owner-reviewed-baseline-2026-08-27",
+  "updated_at": "2026-08-27",
+  "models": [
+    {"provider":"anthropic-api","model":"claude-opus-5","input_per_million_usd":5.0,"output_per_million_usd":25.0},
+    {"provider":"anthropic-api","model":"claude-sonnet-5","input_per_million_usd":3.0,"output_per_million_usd":15.0},
+    {"provider":"anthropic-api","model":"claude-haiku-4-5","input_per_million_usd":1.0,"output_per_million_usd":5.0},
+    {"provider":"openai-api","model":"gpt-4o","input_per_million_usd":2.5,"output_per_million_usd":10.0},
+    {"provider":"openai-api","model":"gpt-4o-mini","input_per_million_usd":0.15,"output_per_million_usd":0.6},
+    {"provider":"openai-api","model":"gpt-4.1","input_per_million_usd":2.5,"output_per_million_usd":10.0},
+    {"provider":"openai-api","model":"gpt-4.1-mini","input_per_million_usd":0.15,"output_per_million_usd":0.6},
+    {"provider":"deepseek-api","model":"deepseek-chat","input_per_million_usd":0.27,"output_per_million_usd":1.1},
+    {"provider":"deepseek-api","model":"deepseek-reasoner","input_per_million_usd":0.55,"output_per_million_usd":2.19}
+  ]
+}

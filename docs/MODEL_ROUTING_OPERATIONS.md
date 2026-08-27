@@ -73,6 +73,14 @@ explicitly marked unknown and are conservatively charged for accounting; they
 are never treated as free. The monthly hard cap remains a fail-closed stop,
 with a soft threshold for cost-aware selection and a per-request hard cap.
 
+`/etc/jarvis/pricing-registry.json` is a root-owned, Core-readable (`0640`)
+versioned registry with a source note and update date. Entries are exact
+provider/model pairs. It is initialized once during setup and is deliberately
+not changed by release updates. An owner can stage a reviewed replacement
+atomically, retain the ownership/mode, then restart Core; malformed or missing
+input falls back to the built-in conservative registry and is logged without
+affecting availability.
+
 The current in-process reservation gate prevents concurrent requests from
 oversubscribing the Home Node's configured monthly ceiling and reconciles with
 durable SurrealDB usage after replies. Long-task projections are also retained

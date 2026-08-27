@@ -20,6 +20,11 @@ install -d -o root -g root -m 0755 /opt/jarvis /opt/jarvis/releases
 # inputs.  Individual secrets below this directory remain root:root 0600.
 install -d -o root -g jarvis -m 0750 /etc/jarvis
 install -d -o root -g jarvis -m 0750 /etc/jarvis/secrets
+if [[ ! -e /etc/jarvis/pricing-registry.json ]]; then
+    install -o root -g jarvis -m 0640 \
+        "$repo_dir/deploy/systemd/pricing-registry.json" \
+        /etc/jarvis/pricing-registry.json
+fi
 install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
 install -o root -g root -m 0644 "$repo_dir/deploy/lib/ui.sh" /usr/local/libexec/jarvis/ui.sh
 

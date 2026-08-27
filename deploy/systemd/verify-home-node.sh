@@ -97,6 +97,9 @@ if [[ -e /etc/jarvis/model-policy.json ]]; then
     check "Model policy readable by Core" jarvis_reads /etc/jarvis/model-policy.json
     check "Model policy read-only to Core" jarvis_cannot_write /etc/jarvis/model-policy.json
 fi
+check "Pricing registry permissions" expect_mode /etc/jarvis/pricing-registry.json root:jarvis:640
+check "Pricing registry readable by Core" jarvis_reads /etc/jarvis/pricing-registry.json
+check "Pricing registry read-only to Core" jarvis_cannot_write /etc/jarvis/pricing-registry.json
 check "Agent manifest readable by Core" jarvis_reads /var/lib/jarvis/agents/current/manifest.json
 check "Agent bundle is not writable by jarvis" jarvis_cannot_create_in "$(active_bundle)"
 check "Agent activation cannot be replaced by jarvis" jarvis_cannot_replace_current

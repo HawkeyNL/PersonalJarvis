@@ -8,9 +8,9 @@
 //! Prices are best-effort estimates in USD per 1M tokens (providers bill in USD);
 //! they can drift, so treat the budget as a safety cap, not an exact invoice.
 
-use std::{collections::BTreeMap, sync::Mutex};
+use std::{collections::BTreeMap, fs, path::Path, sync::Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 pub mod surreal;
 
 /// The metered backends — the only ones that spend money.
@@ -37,6 +37,117 @@ pub struct Price {
     pub cache_read: f64,
 }
 
+/// Root-managed, versioned pricing metadata.  Provider prices change often,
+/// so routing/accounting never treats source code fragments as an irreversible
+/// price authority.  A missing or malformed registry fails safely to the
+/// conservative built-in baseline; an unknown remote model is never free.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PricingRegistry {
+    pub version: u32,
+    pub source: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub models: Vec<PricingEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PricingEntry {
+    pub provider: String,
+    pub model: String,
+    pub input_per_million_usd: f64,
+    pub output_per_million_usd: f64,
+    #[serde(default)]
+    pub cache_read_per_million_usd: Option<f64>,
+}
+
+impl PricingRegistry {
+    pub fn builtin() -> Self {
+        Self {
+            version: 1,
+            source: "built-in-conservative-baseline".into(),
+            updated_at: "2026-08-27".into(),
+            models: vec![
+                entry("anthropic-api", "claude-opus-5", 5.0, 25.0),
+                entry("anthropic-api", "claude-sonnet-5", 3.0, 15.0),
+                entry("anthropic-api", "claude-haiku-4-5", 1.0, 5.0),
+                entry("openai-api", "gpt-4o", 2.5, 10.0),
+                entry("openai-api", "gpt-4o-mini", 0.15, 0.60),
+                entry("openai-api", "gpt-4.1", 2.5, 10.0),
+                entry("openai-api", "gpt-4.1-mini", 0.15, 0.60),
+                entry("deepseek-api", "deepseek-chat", 0.27, 1.10),
+                entry("deepseek-api", "deepseek-reasoner", 0.55, 2.19),
+            ],
+        }
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
+        let raw = fs::read_to_string(path.as_ref())
+            .map_err(|error| format!("pricing registry is unavailable: {error}"))?;
+        let registry: Self = serde_json::from_str(&raw)
+            .map_err(|error| format!("pricing registry is malformed: {error}"))?;
+        registry.validate()?;
+        Ok(registry)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 || self.source.trim().is_empty() || self.updated_at.trim().is_empty() {
+            return Err("unsupported or incomplete pricing registry".into());
+        }
+        let mut seen = BTreeMap::new();
+        for entry in &self.models {
+            if entry.provider.trim().is_empty()
+                || entry.model.trim().is_empty()
+                || !entry.input_per_million_usd.is_finite()
+                || !entry.output_per_million_usd.is_finite()
+                || entry.input_per_million_usd < 0.0
+                || entry.output_per_million_usd < 0.0
+                || entry
+                    .cache_read_per_million_usd
+                    .is_some_and(|price| !price.is_finite() || price < 0.0)
+                || seen
+                    .insert((entry.provider.clone(), entry.model.clone()), ())
+                    .is_some()
+            {
+                return Err("pricing registry contains an invalid or duplicate entry".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn price_for(&self, backend: &str, model: &str) -> (Price, PriceStatus) {
+        if !is_metered(backend) {
+            return (Price::new(0.0, 0.0), PriceStatus::Local);
+        }
+        if let Some(entry) = self
+            .models
+            .iter()
+            .find(|entry| entry.provider == backend && entry.model == model)
+        {
+            return (
+                Price {
+                    input: entry.input_per_million_usd,
+                    output: entry.output_per_million_usd,
+                    cache_read: entry
+                        .cache_read_per_million_usd
+                        .unwrap_or(entry.input_per_million_usd * 0.1),
+                },
+                PriceStatus::Known,
+            );
+        }
+        (Price::new(3.0, 15.0), PriceStatus::Unknown)
+    }
+}
+
+fn entry(provider: &str, model: &str, input: f64, output: f64) -> PricingEntry {
+    PricingEntry {
+        provider: provider.into(),
+        model: model.into(),
+        input_per_million_usd: input,
+        output_per_million_usd: output,
+        cache_read_per_million_usd: None,
+    }
+}
+
 /// Price metadata is versioned in source and intentionally distinguishes an
 /// unknown remote price from a free local model.  The conservative fallback is
 /// used for accounting only; the registry/UI can show its `Unknown` state.
@@ -49,22 +160,7 @@ pub enum PriceStatus {
 }
 
 pub fn price_status(backend: &str, model: &str) -> PriceStatus {
-    if !is_metered(backend) {
-        PriceStatus::Local
-    } else if known_price(model) {
-        PriceStatus::Known
-    } else {
-        PriceStatus::Unknown
-    }
-}
-
-fn known_price(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    [
-        "opus", "sonnet", "haiku", "gpt-", "o1", "o3", "o4", "deepseek",
-    ]
-    .iter()
-    .any(|fragment| model.contains(fragment))
+    PricingRegistry::builtin().price_for(backend, model).1
 }
 
 impl Price {
@@ -81,26 +177,7 @@ impl Price {
 /// models fall back to a deliberately *not-cheap* estimate so we never silently
 /// undercount and blow past the budget.
 pub fn price_for(model: &str) -> Price {
-    let m = model.to_ascii_lowercase();
-    // Order matters: check the more specific fragment first.
-    if m.contains("opus") {
-        Price::new(5.0, 25.0)
-    } else if m.contains("sonnet") {
-        Price::new(3.0, 15.0)
-    } else if m.contains("haiku") {
-        Price::new(1.0, 5.0)
-    } else if m.contains("gpt-4o-mini") || m.contains("gpt-4.1-mini") || m.contains("o4-mini") {
-        Price::new(0.15, 0.60)
-    } else if m.contains("gpt-4o") || m.contains("gpt-4.1") {
-        Price::new(2.5, 10.0)
-    } else if m.contains("deepseek-reasoner") {
-        Price::new(0.55, 2.19)
-    } else if m.contains("deepseek") {
-        Price::new(0.27, 1.10)
-    } else {
-        // Unknown metered model: assume a mid/expensive tier, not free.
-        Price::new(3.0, 15.0)
-    }
+    PricingRegistry::builtin().price_for("openai-api", model).0
 }
 
 /// Estimated cost in EUR for one call. Free backends (plan/local) return 0.0.
@@ -112,10 +189,30 @@ pub fn cost_eur(
     cache_read_tokens: u32,
     eur_per_usd: f64,
 ) -> f64 {
+    cost_eur_with_registry(
+        &PricingRegistry::builtin(),
+        backend,
+        model,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        eur_per_usd,
+    )
+}
+
+pub fn cost_eur_with_registry(
+    registry: &PricingRegistry,
+    backend: &str,
+    model: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+    eur_per_usd: f64,
+) -> f64 {
     if !is_metered(backend) {
         return 0.0;
     }
-    let p = price_for(model);
+    let (p, _) = registry.price_for(backend, model);
     let per_mtok = |tokens: u32, usd: f64| (tokens as f64 / 1_000_000.0) * usd;
     let usd = per_mtok(input_tokens, p.input)
         + per_mtok(output_tokens, p.output)
@@ -153,7 +250,28 @@ pub fn estimate_task_cost(
     calls: u32,
     eur_per_usd: f64,
 ) -> CostEstimate {
-    let likely = cost_eur(
+    estimate_task_cost_with_registry(
+        &PricingRegistry::builtin(),
+        backend,
+        model,
+        input_tokens_per_call,
+        output_tokens_per_call,
+        calls,
+        eur_per_usd,
+    )
+}
+
+pub fn estimate_task_cost_with_registry(
+    registry: &PricingRegistry,
+    backend: &str,
+    model: &str,
+    input_tokens_per_call: u32,
+    output_tokens_per_call: u32,
+    calls: u32,
+    eur_per_usd: f64,
+) -> CostEstimate {
+    let likely = cost_eur_with_registry(
+        registry,
         backend,
         model,
         input_tokens_per_call.saturating_mul(calls),
@@ -161,7 +279,7 @@ pub fn estimate_task_cost(
         0,
         eur_per_usd,
     );
-    let status = price_status(backend, model);
+    let status = registry.price_for(backend, model).1;
     let low_factor = if status == PriceStatus::Unknown {
         1.0
     } else {
@@ -404,5 +522,45 @@ mod tests {
         let unknown = estimate_task_cost("xai-api", "future-grok", 1_000, 500, 10, 0.92);
         assert_eq!(unknown.price_status, PriceStatus::Unknown);
         assert!(unknown.high_eur > unknown.likely_eur);
+    }
+
+    #[test]
+    fn registry_uses_exact_provider_model_entries_and_unknown_is_conservative() {
+        let registry = PricingRegistry {
+            version: 1,
+            source: "test".into(),
+            updated_at: "2026-08-27".into(),
+            models: vec![entry("openai-api", "exact-model", 0.1, 0.2)],
+        };
+        assert!(registry.validate().is_ok());
+        assert_eq!(
+            registry.price_for("openai-api", "exact-model").1,
+            PriceStatus::Known
+        );
+        assert_eq!(
+            registry.price_for("openai-api", "exact-model-latest").1,
+            PriceStatus::Unknown
+        );
+        assert!(
+            cost_eur_with_registry(
+                &registry,
+                "openai-api",
+                "exact-model-latest",
+                1_000,
+                1_000,
+                0,
+                1.0
+            ) > 0.0
+        );
+    }
+
+    #[test]
+    fn registry_rejects_duplicate_or_negative_prices() {
+        let mut registry = PricingRegistry::builtin();
+        registry.models.push(registry.models[0].clone());
+        assert!(registry.validate().is_err());
+        let mut registry = PricingRegistry::builtin();
+        registry.models[0].input_per_million_usd = -1.0;
+        assert!(registry.validate().is_err());
     }
 }

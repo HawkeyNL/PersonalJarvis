@@ -17,7 +17,8 @@ pub(crate) async fn record_usage(state: &AppState, reply: &llm::ChatReply) {
     let (Some(u), Some(backend)) = (&reply.usage, reply.backend.as_deref()) else {
         return;
     };
-    let cost = usage::cost_eur(
+    let cost = usage::cost_eur_with_registry(
+        &state.pricing_registry,
         backend,
         &reply.model,
         u.input_tokens,

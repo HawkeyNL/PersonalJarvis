@@ -190,6 +190,15 @@ async fn main() -> anyhow::Result<()> {
             jarvis_llm::ModelAccessPolicy::deny_by_default()
         }
     };
+    let pricing_registry = match jarvis_usage::PricingRegistry::load(
+        &config.llm_pricing_registry_path,
+    ) {
+        Ok(registry) => registry,
+        Err(error) => {
+            tracing::warn!(path = %config.llm_pricing_registry_path, %error, "pricing registry unavailable; using conservative built-in pricing");
+            jarvis_usage::PricingRegistry::builtin()
+        }
+    };
     let llm = jarvis_llm::build_router_with_policy(
         provider_cfg,
         availability,
@@ -289,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
         registry,
         registry_input: Arc::new(registry_input),
         model_policy: Arc::new(model_policy),
+        pricing_registry: Arc::new(pricing_registry),
         budget_cents,
         spent_cents,
         budget_book,

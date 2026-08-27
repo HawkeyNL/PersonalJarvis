@@ -103,7 +103,8 @@ pub(crate) async fn system_budget_preflight(
             Json(json!({ "error": "model is not owner-enabled" })),
         ));
     }
-    let estimate = usage::estimate_task_cost(
+    let estimate = usage::estimate_task_cost_with_registry(
+        &state.pricing_registry,
         &req.provider,
         &req.model,
         req.input_tokens_per_call,

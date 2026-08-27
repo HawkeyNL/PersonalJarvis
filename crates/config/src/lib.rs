@@ -122,6 +122,11 @@ pub struct AppConfig {
     #[serde(default = "default_llm_model_policy_path")]
     pub llm_model_policy_path: String,
 
+    /// Root-owned, versioned provider pricing metadata. It is not a secret;
+    /// malformed/missing input falls back to conservative built-in pricing.
+    #[serde(default = "default_llm_pricing_registry_path")]
+    pub llm_pricing_registry_path: String,
+
     /// Path/name of the `claude` CLI, used when `llm_provider = "claude-cli"`
     /// (runs the brain on your Claude subscription; see decisions/ADR-027).
     #[serde(default = "default_claude_cli_bin")]
@@ -361,6 +366,10 @@ fn default_ollama_model() -> String {
 
 fn default_llm_model_policy_path() -> String {
     "/etc/jarvis/model-policy.json".to_string()
+}
+
+fn default_llm_pricing_registry_path() -> String {
+    "/etc/jarvis/pricing-registry.json".to_string()
 }
 
 fn default_claude_cli_bin() -> String {
@@ -603,6 +612,7 @@ impl fmt::Debug for AppConfig {
             .field("llm_ollama_url", &self.llm_ollama_url)
             .field("llm_ollama_model", &self.llm_ollama_model)
             .field("llm_model_policy_path", &self.llm_model_policy_path)
+            .field("llm_pricing_registry_path", &self.llm_pricing_registry_path)
             .field("llm_claude_cli_bin", &self.llm_claude_cli_bin)
             .field("llm_persona_path", &self.llm_persona_path)
             .field("llm_openai_api_key", &redact(&self.llm_openai_api_key))
@@ -682,6 +692,7 @@ mod tests {
             llm_ollama_url: "http://localhost:11434".to_string(),
             llm_ollama_model: "llama3.2".to_string(),
             llm_model_policy_path: "/etc/jarvis/model-policy.json".to_string(),
+            llm_pricing_registry_path: "/etc/jarvis/pricing-registry.json".to_string(),
             llm_claude_cli_bin: "claude".to_string(),
             llm_persona_path: "/etc/jarvis/Jarvis.md".to_string(),
             llm_openai_api_key: "sk-openai-supersecret".to_string(),
@@ -789,6 +800,7 @@ mod tests {
             llm_ollama_url: String::new(),
             llm_ollama_model: String::new(),
             llm_model_policy_path: String::new(),
+            llm_pricing_registry_path: String::new(),
             llm_claude_cli_bin: String::new(),
             llm_persona_path: String::new(),
             llm_openai_api_key: String::new(),
