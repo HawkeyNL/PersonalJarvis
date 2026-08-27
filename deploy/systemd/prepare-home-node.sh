@@ -13,6 +13,11 @@ if ! getent passwd jarvis >/dev/null; then
 fi
 id -nG jarvis | tr ' ' '\n' | grep -qx docker && fail "jarvis must not be a Docker-group member"
 
+if ! getent passwd jarvis-codex >/dev/null; then
+    useradd --system --user-group --home-dir /var/lib/jarvis-codex --shell /usr/sbin/nologin jarvis-codex
+fi
+id -nG jarvis-codex | tr ' ' '\n' | grep -qx docker && fail "jarvis-codex must not be a Docker-group member"
+
 install -d -o jarvis -g jarvis -m 0750 /var/lib/jarvis
 install -d -o root -g root -m 0700 /var/lib/jarvis/config-broker /var/lib/jarvis/config-broker/replays
 install -d -o root -g root -m 0700 /var/lib/jarvis/surrealdb

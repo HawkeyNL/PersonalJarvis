@@ -39,6 +39,10 @@ find "$release_dir" -xdev -type l -print -quit | grep -q . && {
     echo "missing executable: $release_dir/jarvis-config-broker" >&2
     exit 1
 }
+[[ -x "$release_dir/jarvis-codex-broker" ]] || {
+    echo "missing executable: $release_dir/jarvis-codex-broker" >&2
+    exit 1
+}
 [[ -x "$release_dir/jarvis-agent-bundle" ]] || {
     echo "missing agent-bundle validator: $release_dir/jarvis-agent-bundle" >&2
     exit 1
@@ -138,6 +142,9 @@ install -o root -g root -m 0644 \
     "$repo_dir/deploy/systemd/jarvis-config-broker.service" \
     /etc/systemd/system/jarvis-config-broker.service
 install -o root -g root -m 0644 \
+    "$repo_dir/deploy/systemd/jarvis-codex-broker.service" \
+    /etc/systemd/system/jarvis-codex-broker.service
+install -o root -g root -m 0644 \
     "$repo_dir/deploy/systemd/jarvis-surrealdb.service" \
     /etc/systemd/system/jarvis-surrealdb.service
 install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
@@ -173,6 +180,7 @@ ln -sfn "$release_dir" /opt/jarvis/current
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/jarvis-core.service
 systemd-analyze verify /etc/systemd/system/jarvis-config-broker.service
+systemd-analyze verify /etc/systemd/system/jarvis-codex-broker.service
 systemd-analyze verify /etc/systemd/system/jarvis-surrealdb.service
 systemd-analyze verify /etc/systemd/system/jarvis-updater.service
 systemd-analyze verify /etc/systemd/system/jarvis-updater.timer
