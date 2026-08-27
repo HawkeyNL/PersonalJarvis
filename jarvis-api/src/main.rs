@@ -299,6 +299,8 @@ async fn main() -> anyhow::Result<()> {
         registry_input: Arc::new(registry_input),
         model_policy: Arc::new(model_policy),
         pricing_registry: Arc::new(pricing_registry),
+        privileged_broker_socket: (!config.privileged_broker_socket.trim().is_empty())
+            .then(|| Arc::<str>::from(config.privileged_broker_socket.trim())),
         budget_cents,
         spent_cents,
         budget_book,

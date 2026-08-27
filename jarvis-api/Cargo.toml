@@ -45,9 +45,12 @@ jarvis-agent.workspace = true
 jarvis-selfdev.workspace = true
 jarvis-store.workspace = true
 jarvis-core.workspace = true
+jarvis-privileged.workspace = true
 rust_decimal.workspace = true
 rand.workspace = true
 time.workspace = true
+sha2.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

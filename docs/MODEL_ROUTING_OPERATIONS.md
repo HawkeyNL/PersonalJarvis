@@ -51,6 +51,22 @@ The policy matches the literal provider and model ID. A newly listed or renamed
 model does not inherit another model's permission. Refresh retains existing
 entries if a provider/discovery operation is unavailable.
 
+### App-mediated owner changes
+
+The Home Node contains a minimal local root broker for app model toggles. It is
+a Unix-socket service only: no HTTP listener, shell, arbitrary path,
+environment or command operation. Its sole allowlisted operation changes the
+enabled bit of an already discovered exact provider/model pair. A Bearer session
+is never sufficient. The owner device signs a domain-separated canonical
+payload containing action, payload hash, request ID, nonce, owner/device IDs,
+issue/expiry times and the current policy SHA-256. The broker independently
+checks the active device key, signature, TTL and one-time replay marker before
+atomically replacing the policy; a changed policy requires a fresh signature.
+
+Credentials remain root-TTY-only through `jarvis-credentials`. They are not
+sent through the app or broker until a separately reviewed sealed secret-transfer
+protocol exists; there is deliberately no unsafe fallback.
+
 ## Routing, health and spend
 
 Requests use `auto` (default), `fast`, `deep`, or `research`. Older `tier`

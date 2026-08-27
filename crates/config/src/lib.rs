@@ -127,6 +127,11 @@ pub struct AppConfig {
     #[serde(default = "default_llm_pricing_registry_path")]
     pub llm_pricing_registry_path: String,
 
+    /// Root-broker Unix socket. Empty keeps privileged app mutations disabled;
+    /// Core never falls back to a direct filesystem write.
+    #[serde(default)]
+    pub privileged_broker_socket: String,
+
     /// Path/name of the `claude` CLI, used when `llm_provider = "claude-cli"`
     /// (runs the brain on your Claude subscription; see decisions/ADR-027).
     #[serde(default = "default_claude_cli_bin")]
@@ -693,6 +698,7 @@ mod tests {
             llm_ollama_model: "llama3.2".to_string(),
             llm_model_policy_path: "/etc/jarvis/model-policy.json".to_string(),
             llm_pricing_registry_path: "/etc/jarvis/pricing-registry.json".to_string(),
+            privileged_broker_socket: String::new(),
             llm_claude_cli_bin: "claude".to_string(),
             llm_persona_path: "/etc/jarvis/Jarvis.md".to_string(),
             llm_openai_api_key: "sk-openai-supersecret".to_string(),
@@ -801,6 +807,7 @@ mod tests {
             llm_ollama_model: String::new(),
             llm_model_policy_path: String::new(),
             llm_pricing_registry_path: String::new(),
+            privileged_broker_socket: String::new(),
             llm_claude_cli_bin: String::new(),
             llm_persona_path: String::new(),
             llm_openai_api_key: String::new(),

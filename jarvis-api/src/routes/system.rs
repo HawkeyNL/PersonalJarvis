@@ -14,10 +14,121 @@ use jarvis_registry as registry;
 use jarvis_selfdev as selfdev;
 use jarvis_usage as usage;
 
+use crate::audit::record_security_event;
 use crate::error::bad_request;
 use crate::metering::record_usage;
 use crate::validation;
 use crate::{AppState, Authed};
+
+/// Forward one typed, signed owner operation to the *local* root broker. The
+/// bearer session only identifies the caller; it cannot authorize anything:
+/// the broker independently validates the Ed25519 signature, owner device,
+/// exact canonical payload, expiry and one-time request ID before mutation.
+pub(crate) async fn system_privileged_config(
+    authed: Authed,
+    State(state): State<AppState>,
+    Json(request): Json<jarvis_privileged::SignedRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if request.user_id != authed.user.id || request.device_id != authed.device.id {
+        record_security_event(
+            &state,
+            Some(authed.device.id),
+            "privileged_config",
+            "denied",
+            Some("principal mismatch"),
+        )
+        .await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"privileged operation denied"})),
+        ));
+    }
+    request
+        .message()
+        .map_err(|_| bad_request("invalid privileged approval"))?;
+    request
+        .reject_if_expired(time::OffsetDateTime::now_utc())
+        .map_err(|_| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"privileged approval expired"})),
+            )
+        })?;
+    let Some(socket) = state.privileged_broker_socket.as_deref() else {
+        record_security_event(
+            &state,
+            Some(authed.device.id),
+            "privileged_config",
+            "denied",
+            Some("broker unavailable"),
+        )
+        .await;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"privileged configuration unavailable"})),
+        ));
+    };
+    let result = forward_to_broker(socket, &request).await;
+    match result {
+        Ok(()) => {
+            record_security_event(
+                &state,
+                Some(authed.device.id),
+                "privileged_config",
+                "forwarded",
+                Some(request.operation.action()),
+            )
+            .await;
+            Ok(Json(json!({"status":"accepted","restart_required":true})))
+        }
+        Err(()) => {
+            record_security_event(
+                &state,
+                Some(authed.device.id),
+                "privileged_config",
+                "denied",
+                Some(request.operation.action()),
+            )
+            .await;
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"privileged operation denied"})),
+            ))
+        }
+    }
+}
+
+async fn forward_to_broker(
+    socket: &str,
+    request: &jarvis_privileged::SignedRequest,
+) -> Result<(), ()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::UnixStream::connect(socket),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    let (read, mut write) = stream.into_split();
+    let encoded = serde_json::to_vec(&json!({"request": request})).map_err(|_| ())?;
+    if encoded.len() > 16 * 1024 {
+        return Err(());
+    }
+    write.write_all(&encoded).await.map_err(|_| ())?;
+    write.write_all(b"\n").await.map_err(|_| ())?;
+    let mut reply = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        BufReader::new(read).read_line(&mut reply),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    (reply.trim() == r#"{"status":"applied"}"#)
+        .then_some(())
+        .ok_or(())
+}
 
 /// This month's LLM spend vs. the budget, with a per-backend breakdown (ADR-027).
 pub(crate) async fn system_usage(_authed: Authed, State(state): State<AppState>) -> Json<Value> {

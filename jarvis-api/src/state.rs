@@ -45,6 +45,9 @@ pub struct AppState {
     /// Root-owned/versioned provider pricing. Missing or malformed deployment
     /// input is replaced with conservative built-in pricing at startup.
     pub pricing_registry: Arc<jarvis_usage::PricingRegistry>,
+    /// Optional local root-broker socket. This is not a credential and a
+    /// request is still independently signature-verified by the broker.
+    pub privileged_broker_socket: Option<Arc<str>>,
     /// Hard monthly spend cap in EUR-cents across metered API backends (ADR-027).
     pub budget_cents: u64,
     /// Metered spend so far this month, in EUR-cents. Mirrors the DB (refreshed

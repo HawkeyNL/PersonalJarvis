@@ -106,6 +106,8 @@ check "Agent activation cannot be replaced by jarvis" jarvis_cannot_replace_curr
 ui_step "Secrets and optional services"
 check "Docker socket is unreadable by jarvis" runuser -u jarvis -- test ! -r /var/run/docker.sock
 check "Root SurrealDB credentials are unreadable" runuser -u jarvis -- test ! -r /etc/jarvis/surrealdb.env
+check "Privileged broker service is active" systemctl is-active --quiet jarvis-config-broker.service
+check "Privileged broker has no public TCP listener" bash -c '! ss -ltnp 2>/dev/null | grep -Fq jarvis-config-broker'
 for provider_secret in /etc/jarvis/secrets/*.env; do
     [[ -e $provider_secret ]] || continue
     check "Provider credential permissions (${provider_secret##*/})" expect_mode "$provider_secret" root:jarvis:640

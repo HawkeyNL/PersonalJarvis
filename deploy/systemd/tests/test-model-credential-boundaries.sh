@@ -13,6 +13,15 @@ pricing="$repo_dir/deploy/systemd/pricing-registry.json"
 for file in "$credentials" "$models" "$unit" "$prepare"; do
     [[ -f $file ]] || { echo "missing model security asset: $file" >&2; exit 1; }
 done
+broker="$repo_dir/deploy/systemd/jarvis-config-broker.service"
+[[ -f $broker ]] || { echo "missing privileged config broker unit" >&2; exit 1; }
+grep -Fq 'User=root' "$broker"
+grep -Fq 'EnvironmentFile=/etc/jarvis/core.env' "$broker"
+grep -Fq 'ReadWritePaths=/etc/jarvis/model-policy.json' "$broker"
+if grep -Eq 'ExecStart=.*(sh|bash)|/bin/(sh|bash)' "$broker"; then
+    echo "privileged broker must not expose a shell" >&2
+    exit 1
+fi
 [[ -f $pricing ]] || { echo "missing pricing registry fixture" >&2; exit 1; }
 bash -n "$credentials" "$models" "$prepare"
 jq -e '

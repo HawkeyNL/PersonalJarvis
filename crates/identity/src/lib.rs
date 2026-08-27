@@ -191,8 +191,42 @@ pub fn pairing_approval_message(
     Ok(message)
 }
 
+/// Canonical, domain-separated bytes for a privileged Home Node configuration
+/// mutation.  Unlike an ordinary session, this proves that a trusted device
+/// explicitly approved this exact request.  It deliberately is not JSON: JSON
+/// object ordering or omitted fields must never change what is signed.
+#[allow(clippy::too_many_arguments)] // protocol fields intentionally remain explicit and ordered
+pub fn privileged_config_approval_message(
+    action: &str,
+    payload_hash: &[u8; 32],
+    request_id: Uuid,
+    nonce: &[u8],
+    user_id: Uuid,
+    device_id: Uuid,
+    issued_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+    target_state_hash: &[u8; 32],
+) -> Result<Vec<u8>, IdentityError> {
+    if action.is_empty() || action.len() > 64 || nonce.len() != 32 || expires_at < issued_at {
+        return Err(IdentityError::AuthFailed);
+    }
+    let mut message = Vec::with_capacity(64 + action.len());
+    message.extend_from_slice(b"jarvis-privileged-config-v1\0");
+    message.extend_from_slice(&(action.len() as u16).to_be_bytes());
+    message.extend_from_slice(action.as_bytes());
+    message.extend_from_slice(payload_hash);
+    message.extend_from_slice(request_id.as_bytes());
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(user_id.as_bytes());
+    message.extend_from_slice(device_id.as_bytes());
+    message.extend_from_slice(&issued_at.unix_timestamp().to_be_bytes());
+    message.extend_from_slice(&expires_at.unix_timestamp().to_be_bytes());
+    message.extend_from_slice(target_state_hash);
+    Ok(message)
+}
+
 /// Verify an Ed25519 signature over `message` using a raw 32-byte public key.
-pub(crate) fn verify_signature(
+pub fn verify_signature(
     public_key: &[u8],
     message: &[u8],
     signature: &[u8],
@@ -260,5 +294,56 @@ mod tests {
         assert!(
             pairing_approval_message(request, &[0; 31], &key, user, approver, expires).is_err()
         );
+    }
+
+    #[test]
+    fn privileged_message_binds_every_security_relevant_field() {
+        let payload = [1_u8; 32];
+        let state = [2_u8; 32];
+        let request = Uuid::now_v7();
+        let user = Uuid::now_v7();
+        let device = Uuid::now_v7();
+        let issued = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let expires = issued + time::Duration::minutes(2);
+        let message = privileged_config_approval_message(
+            "model.set_enabled",
+            &payload,
+            request,
+            &[3; 32],
+            user,
+            device,
+            issued,
+            expires,
+            &state,
+        )
+        .unwrap();
+        assert!(message.starts_with(b"jarvis-privileged-config-v1\0"));
+        assert_ne!(
+            message,
+            privileged_config_approval_message(
+                "model.set_enabled",
+                &[4; 32],
+                request,
+                &[3; 32],
+                user,
+                device,
+                issued,
+                expires,
+                &state,
+            )
+            .unwrap()
+        );
+        assert!(privileged_config_approval_message(
+            "model.set_enabled",
+            &payload,
+            request,
+            &[3; 31],
+            user,
+            device,
+            issued,
+            expires,
+            &state,
+        )
+        .is_err());
     }
 }

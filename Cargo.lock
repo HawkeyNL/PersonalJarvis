@@ -2038,16 +2038,19 @@ dependencies = [
  "jarvis-observability",
  "jarvis-orchestrator",
  "jarvis-portfolio",
+ "jarvis-privileged",
  "jarvis-registry",
  "jarvis-selfdev",
  "jarvis-speech",
  "jarvis-store",
  "jarvis-usage",
+ "libc",
  "rand 0.8.7",
  "rust_decimal",
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha2",
  "surrealdb",
  "time",
  "tokio",
@@ -2177,6 +2180,21 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "jarvis-privileged"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "jarvis-identity",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "time",
  "uuid",
 ]
 
