@@ -35,6 +35,10 @@ pub(crate) struct ChatReq {
     /// Optional tier hint: `default` | `hard` | `cheap`.
     #[serde(default)]
     tier: Option<String>,
+    /// Provider-neutral request intent. `tier` is retained only for older
+    /// clients and maps to the same semantic routing floor.
+    #[serde(default)]
+    mode: Option<String>,
     /// Optional system-prompt override (defaults to the Jarvis persona).
     #[serde(default)]
     system: Option<String>,
@@ -153,16 +157,27 @@ pub(crate) async fn assistant_chat(
     } else {
         history
     };
+    let mode = req
+        .mode
+        .as_deref()
+        .map(llm::RoutingMode::parse)
+        .unwrap_or_else(|| {
+            req.tier
+                .as_deref()
+                .map(|tier| match llm::Tier::parse(tier) {
+                    llm::Tier::Cheap => llm::RoutingMode::Fast,
+                    llm::Tier::Hard => llm::RoutingMode::Deep,
+                    llm::Tier::Default => llm::RoutingMode::Auto,
+                })
+                .unwrap_or_default()
+        });
     let chat = llm::ChatRequest {
         system: Some(
             req.system
                 .unwrap_or_else(|| state.jarvis_system.to_string()),
         ),
-        tier: req
-            .tier
-            .as_deref()
-            .map(llm::Tier::parse)
-            .unwrap_or_default(),
+        tier: mode.tier(),
+        mode,
         messages,
         max_tokens: state.llm_max_tokens,
         // The router picks the concrete model per backend (ADR-028 fase 2).
@@ -184,10 +199,13 @@ pub(crate) async fn assistant_chat(
             Ok(Json(json!({
                 "reply": reply.text,
                 "model": reply.model,
+                "backend": reply.backend,
+                "routing_reason": routing_reason(mode),
                 "stop_reason": reply.stop_reason,
                 "conversation_id": conv_id,
                 "conversation_title": conv_title,
                 "new_topic": new_topic,
+                "routing_mode": mode,
             })))
         }
         Err(llm::LlmError::Refused) => {
@@ -218,6 +236,19 @@ pub(crate) async fn assistant_chat(
     }
 }
 
+fn routing_reason(mode: llm::RoutingMode) -> &'static str {
+    match mode {
+        llm::RoutingMode::Auto => {
+            "Automatic quality/capability routing among owner-enabled models."
+        }
+        llm::RoutingMode::Fast => "Fast mode requested; minimum utility quality retained.",
+        llm::RoutingMode::Deep => "Deep reasoning requested; strong-quality routing floor applied.",
+        llm::RoutingMode::Research => {
+            "Research mode requested; strong-quality routing floor applied."
+        }
+    }
+}
+
 /// Ask a cheap model whether `new_msg` continues the current topic, and get a
 /// short title for the (new) topic. Best-effort: any failure keeps the current
 /// conversation (or, with none, derives a title) so chat never breaks (ADR-030).
@@ -239,6 +270,7 @@ async fn classify_topic(
     let req = llm::ChatRequest {
         system: Some(system.to_string()),
         tier: llm::Tier::Cheap,
+        mode: llm::RoutingMode::Fast,
         messages: vec![llm::ChatMessage::user(&user)],
         max_tokens: 60,
         model: None,

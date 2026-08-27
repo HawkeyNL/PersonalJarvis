@@ -39,11 +39,18 @@ pub struct AppState {
     pub registry: Arc<RwLock<registry::Registry>>,
     /// Inputs to re-collect the registry on refresh.
     pub registry_input: Arc<registry::CollectInput>,
+    /// Immutable snapshot loaded from the root-owned allowlist at startup.
+    /// Changes are activated by the root-operated command/restart flow.
+    pub model_policy: Arc<llm::ModelAccessPolicy>,
     /// Hard monthly spend cap in EUR-cents across metered API backends (ADR-027).
     pub budget_cents: u64,
     /// Metered spend so far this month, in EUR-cents. Mirrors the DB (refreshed
     /// after each call) so the router's sync budget gate can read it cheaply.
     pub spent_cents: Arc<AtomicU64>,
+    /// Atomic request/task reservations.  Reservations are separate from
+    /// durable usage rows so concurrent work cannot oversubscribe the monthly
+    /// hard cap before post-call metering catches up.
+    pub budget_book: Arc<jarvis_usage::BudgetBook>,
     /// EUR per 1 USD, to price provider (USD) usage into the EUR budget.
     pub eur_per_usd: f64,
     /// Agentic execution kill switch (ADR-029) — Jarvis has no hands unless true.

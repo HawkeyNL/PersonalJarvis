@@ -46,9 +46,11 @@ pub(crate) async fn record_usage(state: &AppState, reply: &llm::ChatReply) {
     }
     // Re-read the month total so the gate stays correct across a month rollover.
     match usage::month_total_eur(&state.db).await {
-        Ok(total) => state
-            .spent_cents
-            .store((total * 100.0).round() as u64, Ordering::Relaxed),
+        Ok(total) => {
+            let cents = (total * 100.0).round() as u64;
+            state.spent_cents.store(cents, Ordering::Relaxed);
+            state.budget_book.reconcile_actual(cents);
+        }
         Err(e) => tracing::warn!(error = %e, "failed to refresh monthly spend"),
     }
 }

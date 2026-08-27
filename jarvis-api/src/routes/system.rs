@@ -23,6 +23,7 @@ use crate::{AppState, Authed};
 pub(crate) async fn system_usage(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
     let spent_eur = state.spent_cents.load(Ordering::Relaxed) as f64 / 100.0;
     let budget_eur = state.budget_cents as f64 / 100.0;
+    let reservation = state.budget_book.snapshot();
     let breakdown = usage::month_breakdown(&state.db).await.unwrap_or_default();
     let by_backend: Vec<Value> = breakdown
         .into_iter()
@@ -33,6 +34,9 @@ pub(crate) async fn system_usage(_authed: Authed, State(state): State<AppState>)
         "spent_eur": spent_eur,
         "remaining_eur": (budget_eur - spent_eur).max(0.0),
         "over_budget": spent_eur >= budget_eur,
+        "reserved_eur": reservation.reserved_cents as f64 / 100.0,
+        "remaining_hard_eur": reservation.remaining_hard_cents as f64 / 100.0,
+        "above_soft_budget": reservation.above_soft_limit,
         "by_backend": by_backend,
     }))
 }
@@ -57,6 +61,20 @@ pub(crate) async fn system_registry_refresh(
         *reg = fresh.clone();
     }
     Json(serde_json::to_value(&fresh).unwrap_or_else(|_| json!({})))
+}
+
+/// Owner-authenticated, non-secret view of the exact model allowlist.  Mutation
+/// is intentionally root-operated for now; a bearer session alone must not
+/// rewrite Home Node policy or activate paid models.
+pub(crate) async fn system_model_policy(
+    _authed: Authed,
+    State(state): State<AppState>,
+) -> Json<Value> {
+    Json(json!({
+        "version": state.model_policy.version,
+        "models": state.model_policy.models,
+        "mutation": "root-operated: sudo jarvis-models enable|disable",
+    }))
 }
 
 #[derive(Deserialize)]

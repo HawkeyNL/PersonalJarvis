@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use jarvis_llm::{ChatMessage, ChatReply, ChatRequest, LlmError, LlmProvider, Tier};
+use jarvis_llm::{ChatMessage, ChatReply, ChatRequest, LlmError, LlmProvider, RoutingMode, Tier};
 
 /// Cap on plan size — keeps latency/cost bounded and the plan focused.
 const MAX_STEPS: usize = 6;
@@ -116,6 +116,11 @@ async fn chat_once(
         system: Some(system),
         messages: vec![ChatMessage::user(content)],
         tier,
+        mode: match tier {
+            Tier::Cheap => RoutingMode::Fast,
+            Tier::Hard => RoutingMode::Deep,
+            Tier::Default => RoutingMode::Auto,
+        },
         max_tokens: MAX_TOKENS,
         model: None,
     };

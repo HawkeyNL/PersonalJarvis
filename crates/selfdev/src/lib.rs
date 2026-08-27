@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use jarvis_llm::{ChatMessage, ChatReply, ChatRequest, LlmError, LlmProvider, Tier};
+use jarvis_llm::{ChatMessage, ChatReply, ChatRequest, LlmError, LlmProvider, RoutingMode, Tier};
 
 const MAX_TOKENS: u32 = 1200;
 
@@ -77,6 +77,7 @@ pub async fn propose(
         system: Some(system),
         messages: vec![ChatMessage::user(user)],
         tier: Tier::Hard, // planning about oneself — the strong tier
+        mode: RoutingMode::Deep,
         max_tokens: MAX_TOKENS,
         model: None,
     };

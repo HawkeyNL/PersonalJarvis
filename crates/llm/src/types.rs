@@ -45,6 +45,37 @@ pub enum Tier {
     Cheap,
 }
 
+/// User-visible routing intent.  This is deliberately provider-neutral: it
+/// expresses the required depth, not a credential or a mutable model alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingMode {
+    #[default]
+    Auto,
+    Fast,
+    Deep,
+    Research,
+}
+
+impl RoutingMode {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fast" | "cheap" | "quick" => Self::Fast,
+            "deep" | "hard" => Self::Deep,
+            "research" => Self::Research,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn tier(self) -> Tier {
+        match self {
+            Self::Fast => Tier::Cheap,
+            Self::Deep | Self::Research => Tier::Hard,
+            Self::Auto => Tier::Default,
+        }
+    }
+}
+
 impl Tier {
     /// Parse a tier hint from the client (permissive; unknown ⇒ default).
     pub fn parse(s: &str) -> Self {
@@ -62,6 +93,9 @@ pub struct ChatRequest {
     pub system: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub tier: Tier,
+    /// Requested semantic mode.  `tier` remains for internal backwards
+    /// compatibility with existing orchestration callers.
+    pub mode: RoutingMode,
     pub max_tokens: u32,
     /// Explicit model override chosen by the router (ADR-028 fase 2). `None` ⇒
     /// the provider picks its own model for `tier`.

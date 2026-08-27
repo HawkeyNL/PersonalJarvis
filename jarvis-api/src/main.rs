@@ -75,6 +75,18 @@ async fn main() -> anyhow::Result<()> {
         deepseek_model: config.llm_deepseek_model.clone(),
         deepseek_model_hard: config.llm_deepseek_model_hard.clone(),
         deepseek_model_cheap: config.llm_deepseek_model_cheap.clone(),
+        has_xai_key: !config.llm_xai_api_key.trim().is_empty(),
+        xai_model: config.llm_xai_model.clone(),
+        xai_model_hard: config.llm_xai_model_hard.clone(),
+        xai_model_cheap: config.llm_xai_model_cheap.clone(),
+        has_zai_key: !config.llm_zai_api_key.trim().is_empty(),
+        zai_model: config.llm_zai_model.clone(),
+        zai_model_hard: config.llm_zai_model_hard.clone(),
+        zai_model_cheap: config.llm_zai_model_cheap.clone(),
+        has_ollama_cloud_key: !config.llm_ollama_cloud_api_key.trim().is_empty(),
+        ollama_cloud_model: config.llm_ollama_cloud_model.clone(),
+        ollama_cloud_model_hard: config.llm_ollama_cloud_model_hard.clone(),
+        ollama_cloud_model_cheap: config.llm_ollama_cloud_model_cheap.clone(),
         speech_provider: config.speech_provider.clone(),
         whisper_model: config.speech_whisper_model.clone(),
         active_brain: String::new(),
@@ -117,6 +129,27 @@ async fn main() -> anyhow::Result<()> {
             model_hard: config.llm_deepseek_model_hard.clone(),
             model_cheap: config.llm_deepseek_model_cheap.clone(),
         },
+        xai: jarvis_llm::OpenAiBackend {
+            api_key: non_empty(&config.llm_xai_api_key),
+            base_url: config.llm_xai_base_url.clone(),
+            model_default: config.llm_xai_model.clone(),
+            model_hard: config.llm_xai_model_hard.clone(),
+            model_cheap: config.llm_xai_model_cheap.clone(),
+        },
+        zai: jarvis_llm::OpenAiBackend {
+            api_key: non_empty(&config.llm_zai_api_key),
+            base_url: config.llm_zai_base_url.clone(),
+            model_default: config.llm_zai_model.clone(),
+            model_hard: config.llm_zai_model_hard.clone(),
+            model_cheap: config.llm_zai_model_cheap.clone(),
+        },
+        ollama_cloud: jarvis_llm::OpenAiBackend {
+            api_key: non_empty(&config.llm_ollama_cloud_api_key),
+            base_url: config.llm_ollama_cloud_base_url.clone(),
+            model_default: config.llm_ollama_cloud_model.clone(),
+            model_hard: config.llm_ollama_cloud_model_hard.clone(),
+            model_cheap: config.llm_ollama_cloud_model_cheap.clone(),
+        },
     };
     // Cost guardrail (ADR-027): a hard monthly EUR cap on metered API backends.
     // Seed the in-memory spend counter from this month's DB total so the gate is
@@ -124,26 +157,45 @@ async fn main() -> anyhow::Result<()> {
     let budget_cents = (config.llm_monthly_budget_eur * 100.0).round().max(0.0) as u64;
     let spent_eur = jarvis_usage::month_total_eur(&db).await.unwrap_or(0.0);
     let spent_cents = Arc::new(AtomicU64::new((spent_eur * 100.0).round().max(0.0) as u64));
+    let budget_book = Arc::new(jarvis_usage::BudgetBook::new(
+        jarvis_usage::BudgetLimits {
+            monthly_soft_cents: (config.llm_monthly_soft_budget_eur * 100.0)
+                .round()
+                .max(0.0) as u64,
+            monthly_hard_cents: budget_cents,
+            per_request_hard_cents: (config.llm_request_hard_cap_eur * 100.0).round().max(0.0)
+                as u64,
+        },
+        spent_cents.load(std::sync::atomic::Ordering::Relaxed),
+    ));
     tracing::info!(
         budget_eur = config.llm_monthly_budget_eur,
         spent_eur,
         "llm monthly budget"
     );
 
-    let llm = match config.llm_provider.to_ascii_lowercase().as_str() {
-        "router" | "auto" => {
-            let availability = Arc::new(BrainAvailability {
-                registry: registry.clone(),
-                spent_cents: spent_cents.clone(),
-                budget_cents,
-            });
-            // The router picks the cheapest sufficient model from the catalog
-            // of *available* models (ADR-028 fase 2).
-            let catalog = jarvis_api::router_catalog(&registry);
-            jarvis_llm::build_router(provider_cfg, availability, catalog)
+    // All production requests go through this one router.  Keeping legacy
+    // single-provider configuration values must not create an allowlist or
+    // budget bypass around the owner model policy.
+    let availability = Arc::new(BrainAvailability {
+        registry: registry.clone(),
+        spent_cents: spent_cents.clone(),
+        budget_cents,
+    });
+    let catalog = jarvis_api::router_catalog(&registry);
+    let model_policy = match jarvis_llm::ModelAccessPolicy::load(&config.llm_model_policy_path) {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(path = %config.llm_model_policy_path, %error, "model access policy unavailable; remote models disabled");
+            jarvis_llm::ModelAccessPolicy::deny_by_default()
         }
-        _ => jarvis_llm::build_provider(provider_cfg),
     };
+    let llm = jarvis_llm::build_router_with_policy(
+        provider_cfg,
+        availability,
+        catalog,
+        model_policy.clone(),
+    );
     tracing::info!(brain = %llm.label(), "llm brain configured");
 
     // Load Jarvis' protected identity (/etc/jarvis/Jarvis.md) as the system prompt — the single
@@ -236,8 +288,10 @@ async fn main() -> anyhow::Result<()> {
         speech_verify_threshold: config.speech_verify_threshold,
         registry,
         registry_input: Arc::new(registry_input),
+        model_policy: Arc::new(model_policy),
         budget_cents,
         spent_cents,
+        budget_book,
         eur_per_usd: config.llm_eur_per_usd,
         agent_enabled: config.agent_enabled,
         agent_sandbox,

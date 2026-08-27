@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::types::{ChatReply, ChatRequest, LlmError, Tier};
-use crate::LlmProvider;
+use crate::{LlmProvider, ModelAccessPolicy};
 
 /// Live availability of a backend, by id — implemented by the api over the
 /// resource registry (`jarvis-registry`), so the router routes on what's up now.
@@ -60,14 +60,32 @@ pub struct RouterProvider {
     availability: Arc<dyn Availability>,
     /// Available models per backend, cheapest-first within a class (ADR-028).
     catalog: Vec<CatalogModel>,
+    /// Root-owned, explicit allowlist.  Provider credentials do not imply
+    /// permission to route to a model.
+    model_policy: ModelAccessPolicy,
     label: String,
 }
 
 impl RouterProvider {
+    #[cfg(test)]
     pub(crate) fn new(
         candidates: Vec<Candidate>,
         availability: Arc<dyn Availability>,
         catalog: Vec<CatalogModel>,
+    ) -> Self {
+        Self::with_policy(
+            candidates,
+            availability,
+            catalog,
+            ModelAccessPolicy::deny_by_default(),
+        )
+    }
+
+    pub(crate) fn with_policy(
+        candidates: Vec<Candidate>,
+        availability: Arc<dyn Availability>,
+        catalog: Vec<CatalogModel>,
+        model_policy: ModelAccessPolicy,
     ) -> Self {
         let ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
         let label = format!("router[{}]", ids.join(","));
@@ -75,6 +93,7 @@ impl RouterProvider {
             candidates,
             availability,
             catalog,
+            model_policy,
             label,
         }
     }
@@ -96,11 +115,11 @@ impl RouterProvider {
     /// its own tier model.
     fn model_for(&self, backend: &str, tier: Tier) -> Option<String> {
         for want in Self::target_classes(tier) {
-            if let Some(m) = self
-                .catalog
-                .iter()
-                .find(|m| m.backend == backend && m.class == *want)
-            {
+            if let Some(m) = self.catalog.iter().find(|m| {
+                m.backend == backend
+                    && m.class == *want
+                    && self.model_policy.allows(&m.backend, &m.id)
+            }) {
                 return Some(m.id.clone());
             }
         }
@@ -117,17 +136,30 @@ impl RouterProvider {
                 "ollama",
                 "claude-cli",
                 "deepseek-api",
+                "zai-api",
                 "openai-api",
+                "xai-api",
                 "anthropic-api",
+                "ollama-cloud",
             ],
             Tier::Default => &[
                 "claude-cli",
                 "anthropic-api",
                 "openai-api",
                 "deepseek-api",
+                "xai-api",
+                "zai-api",
+                "ollama-cloud",
                 "ollama",
             ],
-            Tier::Hard => &["claude-cli", "anthropic-api", "openai-api"],
+            Tier::Hard => &[
+                "claude-cli",
+                "anthropic-api",
+                "openai-api",
+                "xai-api",
+                "zai-api",
+                "ollama-cloud",
+            ],
         }
     }
 
@@ -149,6 +181,13 @@ impl RouterProvider {
             available
         }
     }
+
+    fn requested_model_is_allowed(&self, backend: &str, model: &str) -> bool {
+        self.catalog
+            .iter()
+            .any(|entry| entry.backend == backend && entry.id == model)
+            && self.model_policy.allows(backend, model)
+    }
 }
 
 #[async_trait]
@@ -169,17 +208,22 @@ impl LlmProvider for RouterProvider {
             // Pick the cheapest sufficient model for this backend + tier; if the
             // request already names a model, respect it. Fall back to the
             // provider's own tier model when the catalog has nothing.
-            let chosen = req
-                .model
-                .clone()
-                .or_else(|| self.model_for(&candidate.id, req.tier));
-            let attempt = if chosen == req.model {
-                req.clone()
-            } else {
-                ChatRequest {
-                    model: chosen,
-                    ..req.clone()
+            let chosen = match req.model.as_deref() {
+                Some(model) if self.requested_model_is_allowed(&candidate.id, model) => {
+                    Some(model.to_string())
                 }
+                Some(_) => None,
+                None => self.model_for(&candidate.id, req.tier),
+            };
+            // Never fall through to a provider's configured default: that would
+            // turn an API key or a mutable provider alias into an implicit
+            // model authorization bypass.
+            let Some(chosen) = chosen else {
+                continue;
+            };
+            let attempt = ChatRequest {
+                model: Some(chosen),
+                ..req.clone()
             };
             match candidate.provider.chat(&attempt).await {
                 Ok(reply) => return Ok(reply),
@@ -266,9 +310,26 @@ mod tests {
         ]
     }
 
+    fn allow_catalog(catalog: &[CatalogModel]) -> ModelAccessPolicy {
+        ModelAccessPolicy {
+            version: 1,
+            models: catalog
+                .iter()
+                .map(|model| crate::ModelAccessEntry {
+                    provider: model.backend.clone(),
+                    model: model.id.clone(),
+                    enabled: true,
+                    source: "test".into(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn picks_low_models_by_default_and_strong_for_hard() {
-        let r = RouterProvider::new(all(), always_available(), catalog());
+        let c = catalog();
+        let r =
+            RouterProvider::with_policy(all(), always_available(), c.clone(), allow_catalog(&c));
         // Default → light on the plan (cheap sufficient, free).
         assert_eq!(
             r.model_for("claude-cli", Tier::Default).as_deref(),
@@ -315,11 +376,14 @@ mod tests {
             id: "claude-cli".into(),
             provider: Arc::new(EchoModel),
         }];
-        let r = RouterProvider::new(cands, always_available(), catalog());
+        let c = catalog();
+        let r =
+            RouterProvider::with_policy(cands, always_available(), c.clone(), allow_catalog(&c));
         let ask = |tier| ChatRequest {
             system: None,
             messages: vec![ChatMessage::user("hi")],
             tier,
+            mode: crate::RoutingMode::Auto,
             max_tokens: 16,
             model: None,
         };
@@ -423,17 +487,67 @@ mod tests {
             cand("claude-cli", false),
             cand("anthropic-api", true),
         ];
-        let r = RouterProvider::new(cands, always_available(), vec![]);
+        let c = vec![
+            CatalogModel {
+                backend: "claude-cli".into(),
+                id: "plan".into(),
+                class: ModelClass::Mid,
+            },
+            CatalogModel {
+                backend: "anthropic-api".into(),
+                id: "sonnet".into(),
+                class: ModelClass::Mid,
+            },
+            CatalogModel {
+                backend: "ollama".into(),
+                id: "local".into(),
+                class: ModelClass::Mid,
+            },
+        ];
+        let r =
+            RouterProvider::with_policy(cands, always_available(), c.clone(), allow_catalog(&c));
         let reply = r
             .chat(&ChatRequest {
                 system: None,
                 messages: vec![ChatMessage::user("hi")],
                 tier: Tier::Default,
+                mode: crate::RoutingMode::Auto,
                 max_tokens: 16,
                 model: None,
             })
             .await
             .unwrap();
         assert_eq!(reply.text, "anthropic-api");
+    }
+
+    #[tokio::test]
+    async fn disabled_model_cannot_be_reached_by_fallback_or_override() {
+        let cands = vec![cand("anthropic-api", true)];
+        let catalog = vec![CatalogModel {
+            backend: "anthropic-api".into(),
+            id: "claude-test".into(),
+            class: ModelClass::Mid,
+        }];
+        let policy = ModelAccessPolicy {
+            version: 1,
+            models: vec![crate::ModelAccessEntry {
+                provider: "anthropic-api".into(),
+                model: "claude-test".into(),
+                enabled: false,
+                source: "test".into(),
+            }],
+        };
+        let router = RouterProvider::with_policy(cands, always_available(), catalog, policy);
+        let result = router
+            .chat(&ChatRequest {
+                system: None,
+                messages: vec![ChatMessage::user("hi")],
+                tier: Tier::Default,
+                mode: crate::RoutingMode::Auto,
+                max_tokens: 16,
+                model: Some("claude-test".into()),
+            })
+            .await;
+        assert!(matches!(result, Err(LlmError::NotConfigured(_))));
     }
 }

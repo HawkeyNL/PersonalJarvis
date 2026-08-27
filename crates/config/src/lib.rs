@@ -116,6 +116,12 @@ pub struct AppConfig {
     #[serde(default = "default_ollama_model")]
     pub llm_ollama_model: String,
 
+    /// Root-owned JSON allowlist of exact provider/model pairs.  A credential
+    /// alone never enables a remote model.  Missing/empty policy therefore
+    /// leaves remote providers safely unavailable.
+    #[serde(default = "default_llm_model_policy_path")]
+    pub llm_model_policy_path: String,
+
     /// Path/name of the `claude` CLI, used when `llm_provider = "claude-cli"`
     /// (runs the brain on your Claude subscription; see decisions/ADR-027).
     #[serde(default = "default_claude_cli_bin")]
@@ -151,10 +157,59 @@ pub struct AppConfig {
     #[serde(default = "default_deepseek_model")]
     pub llm_deepseek_model_cheap: String,
 
+    /// xAI/Grok API (OpenAI-compatible). Empty key keeps it disabled.
+    #[serde(default)]
+    pub llm_xai_api_key: String,
+    #[serde(default = "default_xai_base_url")]
+    pub llm_xai_base_url: String,
+    #[serde(default)]
+    pub llm_xai_model: String,
+    #[serde(default)]
+    pub llm_xai_model_hard: String,
+    #[serde(default)]
+    pub llm_xai_model_cheap: String,
+
+    /// Z.ai/GLM API (OpenAI-compatible only when the owner configures a
+    /// supported endpoint/models). Empty key keeps it disabled.
+    #[serde(default)]
+    pub llm_zai_api_key: String,
+    #[serde(default = "default_zai_base_url")]
+    pub llm_zai_base_url: String,
+    #[serde(default)]
+    pub llm_zai_model: String,
+    #[serde(default)]
+    pub llm_zai_model_hard: String,
+    #[serde(default)]
+    pub llm_zai_model_cheap: String,
+
+    /// Credentialed remote Ollama API.  Local Ollama remains a separate,
+    /// loopback-only provider and needs no API key.
+    #[serde(default)]
+    pub llm_ollama_cloud_api_key: String,
+    #[serde(default)]
+    pub llm_ollama_cloud_base_url: String,
+    #[serde(default)]
+    pub llm_ollama_cloud_model: String,
+    #[serde(default)]
+    pub llm_ollama_cloud_model_hard: String,
+    #[serde(default)]
+    pub llm_ollama_cloud_model_cheap: String,
+
     /// Hard monthly spend cap (EUR) across all metered API backends. Once
     /// reached, the router refuses paid calls and falls back to the plan/Ollama.
     #[serde(default = "default_llm_monthly_budget_eur")]
     pub llm_monthly_budget_eur: f64,
+
+    /// Soft monthly threshold.  Above it routing may prefer a cheaper model
+    /// that still satisfies the task quality floor; it never downgrades below
+    /// that floor.
+    #[serde(default = "default_llm_monthly_soft_budget_eur")]
+    pub llm_monthly_soft_budget_eur: f64,
+
+    /// Hard cap for one request/task in EUR.  Zero disables paid requests
+    /// rather than meaning unlimited.
+    #[serde(default = "default_llm_request_hard_cap_eur")]
+    pub llm_request_hard_cap_eur: f64,
 
     /// EUR per 1 USD, to convert provider (USD) pricing into the EUR budget.
     #[serde(default = "default_eur_per_usd")]
@@ -304,6 +359,10 @@ fn default_ollama_model() -> String {
     "llama3.2".to_string()
 }
 
+fn default_llm_model_policy_path() -> String {
+    "/etc/jarvis/model-policy.json".to_string()
+}
+
 fn default_claude_cli_bin() -> String {
     "claude".to_string()
 }
@@ -368,8 +427,24 @@ fn default_deepseek_model_hard() -> String {
     "deepseek-reasoner".to_string()
 }
 
+fn default_xai_base_url() -> String {
+    "https://api.x.ai/v1".to_string()
+}
+
+fn default_zai_base_url() -> String {
+    "https://api.z.ai/api/paas/v4".to_string()
+}
+
 fn default_llm_monthly_budget_eur() -> f64 {
     50.0
+}
+
+fn default_llm_monthly_soft_budget_eur() -> f64 {
+    40.0
+}
+
+fn default_llm_request_hard_cap_eur() -> f64 {
+    5.0
 }
 
 fn default_eur_per_usd() -> f64 {
@@ -527,6 +602,7 @@ impl fmt::Debug for AppConfig {
             .field("llm_max_tokens", &self.llm_max_tokens)
             .field("llm_ollama_url", &self.llm_ollama_url)
             .field("llm_ollama_model", &self.llm_ollama_model)
+            .field("llm_model_policy_path", &self.llm_model_policy_path)
             .field("llm_claude_cli_bin", &self.llm_claude_cli_bin)
             .field("llm_persona_path", &self.llm_persona_path)
             .field("llm_openai_api_key", &redact(&self.llm_openai_api_key))
@@ -535,7 +611,24 @@ impl fmt::Debug for AppConfig {
             .field("llm_deepseek_api_key", &redact(&self.llm_deepseek_api_key))
             .field("llm_deepseek_base_url", &self.llm_deepseek_base_url)
             .field("llm_deepseek_model", &self.llm_deepseek_model)
+            .field("llm_xai_api_key", &redact(&self.llm_xai_api_key))
+            .field("llm_xai_base_url", &self.llm_xai_base_url)
+            .field("llm_xai_model", &self.llm_xai_model)
+            .field("llm_zai_api_key", &redact(&self.llm_zai_api_key))
+            .field("llm_zai_base_url", &self.llm_zai_base_url)
+            .field("llm_zai_model", &self.llm_zai_model)
+            .field(
+                "llm_ollama_cloud_api_key",
+                &redact(&self.llm_ollama_cloud_api_key),
+            )
+            .field("llm_ollama_cloud_base_url", &self.llm_ollama_cloud_base_url)
+            .field("llm_ollama_cloud_model", &self.llm_ollama_cloud_model)
             .field("llm_monthly_budget_eur", &self.llm_monthly_budget_eur)
+            .field(
+                "llm_monthly_soft_budget_eur",
+                &self.llm_monthly_soft_budget_eur,
+            )
+            .field("llm_request_hard_cap_eur", &self.llm_request_hard_cap_eur)
             .field("llm_eur_per_usd", &self.llm_eur_per_usd)
             .field("speech_provider", &self.speech_provider)
             .field("speech_verify_threshold", &self.speech_verify_threshold)
@@ -588,6 +681,7 @@ mod tests {
             llm_max_tokens: 1024,
             llm_ollama_url: "http://localhost:11434".to_string(),
             llm_ollama_model: "llama3.2".to_string(),
+            llm_model_policy_path: "/etc/jarvis/model-policy.json".to_string(),
             llm_claude_cli_bin: "claude".to_string(),
             llm_persona_path: "/etc/jarvis/Jarvis.md".to_string(),
             llm_openai_api_key: "sk-openai-supersecret".to_string(),
@@ -600,7 +694,24 @@ mod tests {
             llm_deepseek_model: "deepseek-chat".to_string(),
             llm_deepseek_model_hard: "deepseek-reasoner".to_string(),
             llm_deepseek_model_cheap: "deepseek-chat".to_string(),
+            llm_xai_api_key: "xai-supersecret".to_string(),
+            llm_xai_base_url: "https://api.x.ai/v1".to_string(),
+            llm_xai_model: String::new(),
+            llm_xai_model_hard: String::new(),
+            llm_xai_model_cheap: String::new(),
+            llm_zai_api_key: "zai-supersecret".to_string(),
+            llm_zai_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            llm_zai_model: String::new(),
+            llm_zai_model_hard: String::new(),
+            llm_zai_model_cheap: String::new(),
+            llm_ollama_cloud_api_key: "ollama-supersecret".to_string(),
+            llm_ollama_cloud_base_url: String::new(),
+            llm_ollama_cloud_model: String::new(),
+            llm_ollama_cloud_model_hard: String::new(),
+            llm_ollama_cloud_model_cheap: String::new(),
             llm_monthly_budget_eur: 50.0,
+            llm_monthly_soft_budget_eur: 40.0,
+            llm_request_hard_cap_eur: 5.0,
             llm_eur_per_usd: 0.92,
             speech_provider: "stub".to_string(),
             speech_verify_threshold: 0.5,
@@ -677,6 +788,7 @@ mod tests {
             llm_max_tokens: 1,
             llm_ollama_url: String::new(),
             llm_ollama_model: String::new(),
+            llm_model_policy_path: String::new(),
             llm_claude_cli_bin: String::new(),
             llm_persona_path: String::new(),
             llm_openai_api_key: String::new(),
@@ -689,7 +801,24 @@ mod tests {
             llm_deepseek_model: String::new(),
             llm_deepseek_model_hard: String::new(),
             llm_deepseek_model_cheap: String::new(),
+            llm_xai_api_key: String::new(),
+            llm_xai_base_url: String::new(),
+            llm_xai_model: String::new(),
+            llm_xai_model_hard: String::new(),
+            llm_xai_model_cheap: String::new(),
+            llm_zai_api_key: String::new(),
+            llm_zai_base_url: String::new(),
+            llm_zai_model: String::new(),
+            llm_zai_model_hard: String::new(),
+            llm_zai_model_cheap: String::new(),
+            llm_ollama_cloud_api_key: String::new(),
+            llm_ollama_cloud_base_url: String::new(),
+            llm_ollama_cloud_model: String::new(),
+            llm_ollama_cloud_model_hard: String::new(),
+            llm_ollama_cloud_model_cheap: String::new(),
             llm_monthly_budget_eur: 0.0,
+            llm_monthly_soft_budget_eur: 0.0,
+            llm_request_hard_cap_eur: 0.0,
             llm_eur_per_usd: 0.0,
             speech_provider: String::new(),
             speech_verify_threshold: 0.0,

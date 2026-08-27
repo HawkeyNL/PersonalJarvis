@@ -126,6 +126,18 @@ pub struct CollectInput {
     pub deepseek_model: String,
     pub deepseek_model_hard: String,
     pub deepseek_model_cheap: String,
+    pub has_xai_key: bool,
+    pub xai_model: String,
+    pub xai_model_hard: String,
+    pub xai_model_cheap: String,
+    pub has_zai_key: bool,
+    pub zai_model: String,
+    pub zai_model_hard: String,
+    pub zai_model_cheap: String,
+    pub has_ollama_cloud_key: bool,
+    pub ollama_cloud_model: String,
+    pub ollama_cloud_model_hard: String,
+    pub ollama_cloud_model_cheap: String,
     pub speech_provider: String,
     pub whisper_model: Option<String>,
     /// The built router's label (e.g. `claude-cli:…→anthropic:…`).
@@ -280,6 +292,30 @@ fn derive_models(
         &input.deepseek_model_hard,
         ModelCost::Cheap,
     );
+    add_cloud(
+        "xai-api",
+        input.has_xai_key,
+        &input.xai_model_cheap,
+        &input.xai_model,
+        &input.xai_model_hard,
+        ModelCost::Mid,
+    );
+    add_cloud(
+        "zai-api",
+        input.has_zai_key,
+        &input.zai_model_cheap,
+        &input.zai_model,
+        &input.zai_model_hard,
+        ModelCost::Cheap,
+    );
+    add_cloud(
+        "ollama-cloud",
+        input.has_ollama_cloud_key,
+        &input.ollama_cloud_model_cheap,
+        &input.ollama_cloud_model,
+        &input.ollama_cloud_model_hard,
+        ModelCost::Mid,
+    );
 
     // Local Ollama models actually installed — all free; treat as light by default.
     for id in ollama_models {
@@ -312,6 +348,39 @@ fn derive_brains(
                 "headless `claude` CLI (plan)".into()
             } else {
                 format!("`{}` niet gevonden", input.claude_cli_bin)
+            },
+        },
+        Brain {
+            id: "xai-api".into(),
+            label: format!("xAI API · {}", input.xai_model),
+            cost: CostTier::Metered,
+            available: input.has_xai_key,
+            note: if input.has_xai_key {
+                "per-token".into()
+            } else {
+                "geen API-key gezet".into()
+            },
+        },
+        Brain {
+            id: "zai-api".into(),
+            label: format!("Z.ai API · {}", input.zai_model),
+            cost: CostTier::Metered,
+            available: input.has_zai_key,
+            note: if input.has_zai_key {
+                "per-token".into()
+            } else {
+                "geen API-key gezet".into()
+            },
+        },
+        Brain {
+            id: "ollama-cloud".into(),
+            label: format!("Ollama Cloud · {}", input.ollama_cloud_model),
+            cost: CostTier::Metered,
+            available: input.has_ollama_cloud_key,
+            note: if input.has_ollama_cloud_key {
+                "credentialed remote API".into()
+            } else {
+                "geen API-key gezet".into()
             },
         },
         Brain {
@@ -443,6 +512,18 @@ mod tests {
             deepseek_model: "deepseek-chat".into(),
             deepseek_model_hard: "deepseek-reasoner".into(),
             deepseek_model_cheap: "deepseek-chat".into(),
+            has_xai_key: true,
+            xai_model: "grok-test".into(),
+            xai_model_hard: "grok-test".into(),
+            xai_model_cheap: "grok-mini-test".into(),
+            has_zai_key: true,
+            zai_model: "glm-test".into(),
+            zai_model_hard: "glm-test".into(),
+            zai_model_cheap: "glm-mini-test".into(),
+            has_ollama_cloud_key: false,
+            ollama_cloud_model: String::new(),
+            ollama_cloud_model_hard: String::new(),
+            ollama_cloud_model_cheap: String::new(),
             speech_provider: "whisper".into(),
             whisper_model: Some("models/ggml-base.bin".into()),
             active_brain: "claude-cli:…→anthropic:…".into(),
@@ -530,7 +611,7 @@ mod tests {
         let mut i = input();
         i.claude_cli_bin = "definitely-not-a-real-binary-xyz".into();
         let reg = collect(&i).await;
-        assert_eq!(reg.brains.len(), 5);
+        assert_eq!(reg.brains.len(), 8);
         assert!(reg.host.cpu_cores >= 1);
         assert!(!reg.host.os.is_empty());
     }
