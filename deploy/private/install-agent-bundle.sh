@@ -29,7 +29,10 @@ source_agents="$source_root/agents"
 source_symlink=$(find "$source_agents" -maxdepth 1 -type l -print -quit)
 [[ -z $source_symlink ]] || fail "agent source contains a symlink"
 
-install -d -o root -g root -m 0755 "$bundle_root" "$releases_dir"
+# Core may traverse and read immutable definitions, but never owns or writes
+# the activation tree.  The parent /var/lib/jarvis remains Core-owned for
+# legitimate runtime state; this protected subtree is root-owned.
+install -d -o root -g jarvis -m 0750 "$bundle_root" "$releases_dir"
 stage=$(mktemp -d "$releases_dir/.staging.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 mkdir -p "$stage/agents"
@@ -59,12 +62,24 @@ jq -n --arg bundle_id "$bundle_id" --argjson agents "$manifest_entries" \
 
 final_dir="$releases_dir/$bundle_id"
 if [[ -e $final_dir ]]; then
+    [[ -d $final_dir && ! -L $final_dir ]] || fail "existing bundle path is unsafe"
+    # Repair only root-controlled metadata on a known immutable release.  This
+    # is needed when upgrading a v0.0.7 Home Node whose otherwise valid bundle
+    # was too restrictive for the service user to traverse.
+    chown -R root:jarvis "$final_dir"
+    find "$final_dir" -type d -exec chmod 0750 {} +
+    find "$final_dir" -type f -exec chmod 0640 {} +
     rm -rf -- "$stage"
     trap - EXIT
     echo "UNCHANGED private agent bundle $bundle_id ($count agents)"
 else
-    chown -R root:root "$stage"
-    chmod -R go-w "$stage"
+    # Complete all validation before making the staged tree available to the
+    # service group.  Files are read-only and every directory is only
+    # traversable/readable, so the atomic rename never exposes a writable
+    # active bundle to jarvis.
+    chown -R root:jarvis "$stage"
+    find "$stage" -type d -exec chmod 0750 {} +
+    find "$stage" -type f -exec chmod 0640 {} +
     mv --no-target-directory "$stage" "$final_dir"
     trap - EXIT
     echo "CREATE private agent bundle $bundle_id ($count agents)"

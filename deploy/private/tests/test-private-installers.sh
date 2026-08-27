@@ -42,8 +42,12 @@ jq -n --rawfile instructions "$2" '{id:"test-agent",name:"Test Agent",descriptio
 EOF
 chmod 0755 "$fixture/validator"
 
+install -d -o root -g root -m 0750 /etc/jarvis
 bash "$repo_dir/deploy/private/install-private-config.sh" --source "$fixture/private"
+[[ $(stat -c '%U:%G:%a' /etc/jarvis) == root:jarvis:750 ]]
 [[ $(stat -c '%U:%G:%a' /etc/jarvis/Jarvis.md) == root:jarvis:640 ]]
+runuser -u jarvis -- test -r /etc/jarvis/Jarvis.md
+runuser -u jarvis -- test ! -w /etc/jarvis/Jarvis.md
 before=$(sha256sum /etc/jarvis/Jarvis.md | awk '{print $1}')
 rm "$fixture/private/personaljarvis/jarvis-core/Jarvis.md"
 ln -s /etc/passwd "$fixture/private/personaljarvis/jarvis-core/Jarvis.md"
@@ -56,7 +60,30 @@ fi
 JARVIS_AGENT_BUNDLE_VALIDATOR="$fixture/validator" bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"
 bundle=$(readlink -f /var/lib/jarvis/agents/current)
 [[ -f $bundle/manifest.json ]]
-[[ $(stat -c '%U:%G:%a' "$bundle/manifest.json") == root:root:644 ]]
+[[ $(stat -c '%U:%G:%a' /var/lib/jarvis/agents) == root:jarvis:750 ]]
+[[ $(stat -c '%U:%G:%a' /var/lib/jarvis/agents/releases) == root:jarvis:750 ]]
+[[ $(stat -c '%U:%G:%a' "$bundle") == root:jarvis:750 ]]
+[[ $(stat -c '%U:%G:%a' "$bundle/agents") == root:jarvis:750 ]]
+[[ $(stat -c '%U:%G:%a' "$bundle/manifest.json") == root:jarvis:640 ]]
+agent=$(find "$bundle/agents" -type f -name '*.json' -print -quit)
+[[ -n $agent && $(stat -c '%U:%G:%a' "$agent") == root:jarvis:640 ]]
+runuser -u jarvis -- test -r "$bundle/manifest.json"
+runuser -u jarvis -- test ! -w "$bundle/manifest.json"
+runuser -u jarvis -- test -r "$agent"
+runuser -u jarvis -- test ! -w "$agent"
+# shellcheck disable=SC2016 # $1 is expanded by the child shell.
+runuser -u jarvis -- bash -c '! touch -- "$1/.jarvis-test"' _ "$bundle"
+# shellcheck disable=SC2016 # $1 is expanded by the child shell.
+runuser -u jarvis -- bash -c '! ln -s releases/nope "$1/.current-test"' _ /var/lib/jarvis/agents
+install -o root -g root -m 0600 /dev/null /etc/jarvis/surrealdb.env
+runuser -u jarvis -- test ! -r /etc/jarvis/surrealdb.env
+# An idempotent private update repairs the restrictive v0.0.7 bundle metadata
+# without changing its content or activation target.
+chown -R root:root "$bundle"
+chmod 0700 "$bundle"
+JARVIS_AGENT_BUNDLE_VALIDATOR="$fixture/validator" bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"
+[[ $(stat -c '%U:%G:%a' "$bundle") == root:jarvis:750 ]]
+runuser -u jarvis -- test -r "$bundle/manifest.json"
 ln -s /etc/passwd "$fixture/private/agents/02_EVIL.md"
 if JARVIS_AGENT_BUNDLE_VALIDATOR="$fixture/validator" bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"; then
     echo "agent symlink was accepted" >&2

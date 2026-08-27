@@ -30,6 +30,9 @@ ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ReadWritePaths=/var/lib/jarvis
+# Agent releases are a root-activated read-only subtree even though Core may
+# retain unrelated runtime state below /var/lib/jarvis.
+ReadOnlyPaths=/var/lib/jarvis/agents
 
 [Install]
 WantedBy=multi-user.target

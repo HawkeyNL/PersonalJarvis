@@ -15,7 +15,9 @@ id -nG jarvis | tr ' ' '\n' | grep -qx docker && fail "jarvis must not be a Dock
 install -d -o jarvis -g jarvis -m 0750 /var/lib/jarvis
 install -d -o root -g root -m 0700 /var/lib/jarvis/surrealdb
 install -d -o root -g root -m 0755 /opt/jarvis /opt/jarvis/releases
-install -d -o root -g root -m 0750 /etc/jarvis
+# The service needs directory traversal to read only its explicitly group-readable
+# inputs.  Individual secrets below this directory remain root:root 0600.
+install -d -o root -g jarvis -m 0750 /etc/jarvis
 install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)

@@ -42,6 +42,8 @@ jobs:
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-identity surreal::tests::challenge_login_cannot_be_replayed -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-portfolio surreal::tests::preserves_decimal_holdings_and_owner_scope -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-api --test surreal_api -- --ignored
+      - name: Protected-input Core startup regression
+        run: sudo env GITHUB_ACTIONS=true JARVIS_API_BINARY="$GITHUB_WORKSPACE/target/debug/jarvis-api" bash deploy/systemd/tests/test-core-startup-protected-inputs.sh
 
   deployment-security:
     name: Deployment and sandbox security fixtures

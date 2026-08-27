@@ -30,7 +30,10 @@ source_file="$source_root/personaljarvis/jarvis-core/Jarvis.md"
 [[ $(stat -c '%F' "$source_file") == "regular file" ]] || fail "private Jarvis.md is not a regular file"
 
 source_hash=$(sha256sum "$source_file" | awk '{print $1}')
-install -d -o root -g root -m 0750 "$destination_dir" "$history_dir"
+# Only the directory is group-traversable: do not apply this to every file
+# beneath /etc/jarvis, which would disclose root-only deployment secrets.
+install -d -o root -g jarvis -m 0750 "$destination_dir"
+install -d -o root -g root -m 0700 "$history_dir"
 if [[ -f $destination && ! -L $destination ]]; then
     current_hash=$(sha256sum "$destination" | awk '{print $1}')
     if [[ $current_hash == "$source_hash" ]]; then

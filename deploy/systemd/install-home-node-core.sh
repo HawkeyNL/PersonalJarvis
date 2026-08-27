@@ -86,6 +86,10 @@ install -d -o jarvis -g jarvis -m 0750 /var/lib/jarvis
     echo "/etc/jarvis/Jarvis.md must be root:jarvis mode 0640" >&2
     exit 1
 }
+[[ $(stat -c '%U:%G:%a' /etc/jarvis) == root:jarvis:750 ]] || {
+    echo "/etc/jarvis must be root:jarvis mode 0750 so Core can traverse protected inputs" >&2
+    exit 1
+}
 
 grep -qx 'JARVIS_ENVIRONMENT=production' /etc/jarvis/core.env || {
     echo "JARVIS_ENVIRONMENT must be production" >&2
@@ -158,8 +162,24 @@ systemd-analyze verify /etc/systemd/system/jarvis-updater.timer
 systemctl enable --now jarvis-surrealdb.service
 systemctl enable --now jarvis-core
 
-curl --fail --silent --show-error http://127.0.0.1:8080/livez >/dev/null
-curl --fail --silent --show-error http://127.0.0.1:8080/readyz >/dev/null
+core_ready=false
+for _attempt in $(seq 1 15); do
+    if curl --fail --silent --show-error --max-time 2 http://127.0.0.1:8080/livez >/dev/null \
+        && curl --fail --silent --show-error --max-time 2 http://127.0.0.1:8080/readyz >/dev/null; then
+        core_ready=true
+        break
+    fi
+    if systemctl is-failed --quiet jarvis-core.service; then
+        break
+    fi
+    sleep 1
+done
+if [[ $core_ready != true ]]; then
+    echo "Jarvis Core did not become ready; recent service diagnostics follow:" >&2
+    systemctl --no-pager --full status jarvis-core.service || true
+    journalctl --no-pager -u jarvis-core.service -n 80 || true
+    exit 1
+fi
 systemctl --no-pager --full status jarvis-core
 
 echo "Jarvis Core is running from $release_dir"
