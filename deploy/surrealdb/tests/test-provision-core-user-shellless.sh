@@ -91,7 +91,7 @@ assert_absent() {
 assert_absent_nul() {
     local needle=$1
     local file=$2
-    if grep -Fzq "$needle" "$file"; then
+    if grep -Fzxq "$needle" "$file"; then
         echo "unexpected argument found in $file" >&2
         exit 1
     fi
