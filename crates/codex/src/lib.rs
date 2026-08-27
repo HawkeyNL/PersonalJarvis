@@ -4,9 +4,16 @@
 //! workspace, or grant a tool. It models the small safe subset of the Codex App
 //! Server JSON-RPC protocol that a later, policy-gated adapter may use.
 
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
+
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -17,6 +24,8 @@ pub const MAX_CODING_ARTIFACTS: u8 = 32;
 pub const MAX_CODING_OUTPUT_BYTES: u64 = 512 * 1024;
 pub const ACTION_CODING_START: &str = "coding.start";
 pub const ACTION_CODING_RESUME: &str = "coding.resume";
+pub const ACTION_CODEX_RUN_APPROVED_TASK: &str = "codex.run_approved_task";
+pub const MAX_CAPABILITY_REQUESTS: usize = 4;
 
 /// This is the only runtime command the trusted broker may pass to the Codex
 /// image. It is server-owned; untrusted API input cannot supply a shell,
@@ -61,6 +70,298 @@ impl BrokerRequest {
             }
             Self::CancelCodingRun { .. } | Self::GetCodingRunStatus { .. } => Ok(()),
             _ => Err(CodingProtocolError::InvalidOperation),
+        }
+    }
+}
+
+/// The only API operation a sandbox Codex runtime may invoke on the trusted
+/// broker. It is not an OpenAI proxy: no model, URL, arbitrary headers or
+/// arbitrary request body can be selected by the sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokeredCodexOperation {
+    RunApprovedTask,
+}
+
+impl BrokeredCodexOperation {
+    pub fn action(self) -> &'static str {
+        ACTION_CODEX_RUN_APPROVED_TASK
+    }
+}
+
+/// Claims recorded exclusively in the trusted broker. The sandbox sees an
+/// opaque token, never an OpenAI/Codex credential or the long-lived broker
+/// secret used to contact a provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunCapabilityClaims {
+    pub run_id: Uuid,
+    pub coding_session_id: Uuid,
+    pub repository: RepositoryIdentity,
+    pub base_commit_sha: String,
+    pub expires_at: OffsetDateTime,
+    pub budget_reservation_id: Uuid,
+    pub budget_limit_cents: u64,
+    pub operation: BrokeredCodexOperation,
+}
+
+impl RunCapabilityClaims {
+    pub fn from_signed_request(
+        run_id: Uuid,
+        request: &SignedCodingRequest,
+        budget_limit_cents: u64,
+    ) -> Result<Self, CapabilityError> {
+        request
+            .operation
+            .validate()
+            .map_err(|_| CapabilityError::InvalidClaims)?;
+        if budget_limit_cents == 0 {
+            return Err(CapabilityError::InvalidClaims);
+        }
+        let (coding_session_id, repository, base_commit_sha, budget_reservation_id) =
+            match &request.operation {
+                CodingOperation::StartCodingRun {
+                    coding_session_id,
+                    repository,
+                    base_commit_sha,
+                    budget_reservation_id,
+                    ..
+                }
+                | CodingOperation::ResumeCodingRun {
+                    coding_session_id,
+                    repository,
+                    base_commit_sha,
+                    budget_reservation_id,
+                    ..
+                } => (
+                    *coding_session_id,
+                    repository.clone(),
+                    base_commit_sha.clone(),
+                    *budget_reservation_id,
+                ),
+            };
+        Ok(Self {
+            run_id,
+            coding_session_id,
+            repository,
+            base_commit_sha,
+            expires_at: request.expires_at,
+            budget_reservation_id,
+            budget_limit_cents,
+            operation: BrokeredCodexOperation::RunApprovedTask,
+        })
+    }
+}
+
+/// The opaque value copied to a disposable sandbox. It intentionally does not
+/// implement Debug or Serialize, preventing accidental tracing or API output.
+pub struct RunCapabilityToken(String);
+
+impl RunCapabilityToken {
+    fn random() -> Self {
+        let mut bytes = [0_u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        Self(hex::encode(bytes))
+    }
+
+    /// Bytes for the one generated sandbox input file. This is the sole place
+    /// an ephemeral capability crosses the trust boundary.
+    pub fn sandbox_input(&self) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "broker_operation": ACTION_CODEX_RUN_APPROVED_TASK,
+            "capability_token": self.0,
+        }))
+        .expect("fixed capability input serializes")
+    }
+}
+
+/// A request sent by the Codex runtime to the local broker API. All binding
+/// fields are repeated and checked against stored claims; no caller supplied
+/// path, command or provider/model selection exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokeredCodexRequest {
+    pub request_id: Uuid,
+    pub run_id: Uuid,
+    pub coding_session_id: Uuid,
+    pub repository: RepositoryIdentity,
+    pub base_commit_sha: String,
+    pub budget_reservation_id: Uuid,
+    pub operation: BrokeredCodexOperation,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CapabilityError {
+    #[error("invalid run capability claims")]
+    InvalidClaims,
+    #[error("run capability is unknown or invalid")]
+    InvalidToken,
+    #[error("run capability expired")]
+    Expired,
+    #[error("run capability was revoked")]
+    Revoked,
+    #[error("run capability request is not bound to this run")]
+    WrongRun,
+    #[error("run capability request is not bound to this repository")]
+    WrongRepository,
+    #[error("run capability operation is denied")]
+    OperationDenied,
+    #[error("run capability request was replayed")]
+    Replay,
+    #[error("run capability budget is exhausted")]
+    BudgetExceeded,
+}
+
+struct StoredCapability {
+    token_hash: [u8; 32],
+    claims: RunCapabilityClaims,
+    status: CapabilityStatus,
+    used_request_ids: HashSet<Uuid>,
+    used_cents: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapabilityStatus {
+    Active,
+    Completed,
+    Cancelled,
+}
+
+/// Trusted broker-side in-memory capability authority. A broker restart loses
+/// the authority and thus revokes all outstanding tokens by design. Production
+/// durable run state may be added later, but must never recreate token secrets.
+#[derive(Default)]
+pub struct RunCapabilityAuthority {
+    capabilities: Mutex<HashMap<[u8; 32], StoredCapability>>,
+}
+
+impl RunCapabilityAuthority {
+    pub fn mint(&self, claims: RunCapabilityClaims) -> Result<RunCapabilityToken, CapabilityError> {
+        claims
+            .repository
+            .validate()
+            .map_err(|_| CapabilityError::InvalidClaims)?;
+        if !is_commit_sha(&claims.base_commit_sha) || claims.expires_at <= OffsetDateTime::now_utc()
+        {
+            return Err(CapabilityError::InvalidClaims);
+        }
+        let token = RunCapabilityToken::random();
+        let hash: [u8; 32] = Sha256::digest(token.0.as_bytes()).into();
+        let mut capabilities = self
+            .capabilities
+            .lock()
+            .map_err(|_| CapabilityError::Revoked)?;
+        capabilities.insert(
+            hash,
+            StoredCapability {
+                token_hash: hash,
+                claims,
+                status: CapabilityStatus::Active,
+                used_request_ids: HashSet::new(),
+                used_cents: 0,
+            },
+        );
+        Ok(token)
+    }
+
+    /// Authorize a single narrow runtime request and atomically reserve its
+    /// budget. Replaying the same request ID, changing any binding, exceeding
+    /// the budget or using a cancelled/completed token fails closed.
+    pub fn authorize(
+        &self,
+        token: &RunCapabilityToken,
+        request: &BrokeredCodexRequest,
+        reserve_cents: u64,
+        now: OffsetDateTime,
+    ) -> Result<(), CapabilityError> {
+        self.authorize_raw(&token.0, request, reserve_cents, now)
+    }
+
+    /// Validate raw token text received from the sandbox narrow broker API.
+    /// The text is hashed immediately and is never stored, logged or returned.
+    pub fn authorize_raw(
+        &self,
+        token: &str,
+        request: &BrokeredCodexRequest,
+        reserve_cents: u64,
+        now: OffsetDateTime,
+    ) -> Result<(), CapabilityError> {
+        if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(CapabilityError::InvalidToken);
+        }
+        let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let mut capabilities = self
+            .capabilities
+            .lock()
+            .map_err(|_| CapabilityError::Revoked)?;
+        let Some(stored) = capabilities.get_mut(&hash) else {
+            return Err(CapabilityError::InvalidToken);
+        };
+        if stored.token_hash.ct_eq(&hash).unwrap_u8() != 1 {
+            return Err(CapabilityError::InvalidToken);
+        }
+        if stored.status != CapabilityStatus::Active {
+            return Err(CapabilityError::Revoked);
+        }
+        if now > stored.claims.expires_at {
+            return Err(CapabilityError::Expired);
+        }
+        if request.run_id != stored.claims.run_id
+            || request.coding_session_id != stored.claims.coding_session_id
+            || request.budget_reservation_id != stored.claims.budget_reservation_id
+        {
+            return Err(CapabilityError::WrongRun);
+        }
+        if request.repository != stored.claims.repository
+            || request.base_commit_sha != stored.claims.base_commit_sha
+        {
+            return Err(CapabilityError::WrongRepository);
+        }
+        if request.operation != stored.claims.operation {
+            return Err(CapabilityError::OperationDenied);
+        }
+        if !stored.used_request_ids.insert(request.request_id)
+            || stored.used_request_ids.len() > MAX_CAPABILITY_REQUESTS
+        {
+            return Err(CapabilityError::Replay);
+        }
+        if reserve_cents == 0
+            || stored.used_cents.saturating_add(reserve_cents) > stored.claims.budget_limit_cents
+        {
+            return Err(CapabilityError::BudgetExceeded);
+        }
+        stored.used_cents = stored.used_cents.saturating_add(reserve_cents);
+        Ok(())
+    }
+
+    pub fn revoke_for_cancel(&self, token: &RunCapabilityToken) {
+        self.set_status(token, CapabilityStatus::Cancelled);
+    }
+    pub fn revoke_for_completion(&self, token: &RunCapabilityToken) {
+        self.set_status(token, CapabilityStatus::Completed);
+    }
+
+    fn set_status(&self, token: &RunCapabilityToken, status: CapabilityStatus) {
+        let hash: [u8; 32] = Sha256::digest(token.0.as_bytes()).into();
+        if let Ok(mut capabilities) = self.capabilities.lock() {
+            if let Some(stored) = capabilities.get_mut(&hash) {
+                stored.status = status;
+            }
+        }
+    }
+
+    /// Cancellation/completion are driven by the trusted run registry, which
+    /// has the run ID but never needs to retain or re-read token plaintext.
+    pub fn revoke_run(&self, run_id: Uuid, completed: bool) {
+        if let Ok(mut capabilities) = self.capabilities.lock() {
+            for capability in capabilities
+                .values_mut()
+                .filter(|item| item.claims.run_id == run_id)
+            {
+                capability.status = if completed {
+                    CapabilityStatus::Completed
+                } else {
+                    CapabilityStatus::Cancelled
+                };
+            }
         }
     }
 }
@@ -125,21 +426,21 @@ pub enum CodingRunError {
 }
 
 /// Run exactly one approved coding task in a disposable OpenSandbox workload.
-/// This has no host-process branch: an unavailable provider, missing scoped
-/// Codex credential, invalid snapshot or provider error fails before or during
-/// the sandbox lifecycle and never invokes a local Codex CLI.
+/// This has no host-process branch: an unavailable provider, missing broker
+/// capability, invalid snapshot or provider error fails before or during the
+/// sandbox lifecycle and never invokes a local Codex CLI.
 pub async fn execute_in_sandbox<P: jarvis_sandbox::SandboxProvider>(
     provider: &P,
     request: &SignedCodingRequest,
     snapshot: RepositorySnapshot,
-    codex_credential: Option<jarvis_sandbox::ScopedSecret>,
+    capability: Option<RunCapabilityToken>,
 ) -> Result<CodingRunResult, CodingRunError> {
     request
         .operation
         .validate()
         .map_err(|_| CodingRunError::SandboxFailed)?;
     snapshot.validate_for(&request.operation)?;
-    let credential = codex_credential.ok_or(CodingRunError::CodexAuthenticationUnavailable)?;
+    let capability = capability.ok_or(CodingRunError::CodexAuthenticationUnavailable)?;
     if !matches!(
         provider.availability().await,
         jarvis_sandbox::SandboxAvailability::Available
@@ -182,9 +483,15 @@ pub async fn execute_in_sandbox<P: jarvis_sandbox::SandboxProvider>(
             .await
             .map_err(|_| CodingRunError::SandboxFailed)?;
         provider
-            .provide_scoped_secret(&handle, credential)
+            .upload(
+                &handle,
+                jarvis_sandbox::TaskInput {
+                    name: "codex-capability.json".into(),
+                    bytes: capability.sandbox_input(),
+                },
+            )
             .await
-            .map_err(|_| CodingRunError::CodexAuthenticationUnavailable)?;
+            .map_err(|_| CodingRunError::SandboxFailed)?;
         let execution = provider
             .exec(&handle, &task.command)
             .await
@@ -874,6 +1181,16 @@ mod tests {
         }
     }
 
+    fn capability_for(
+        request: &SignedCodingRequest,
+    ) -> (RunCapabilityAuthority, RunCapabilityToken) {
+        let authority = RunCapabilityAuthority::default();
+        let claims =
+            RunCapabilityClaims::from_signed_request(Uuid::now_v7(), request, 100).unwrap();
+        let token = authority.mint(claims).unwrap();
+        (authority, token)
+    }
+
     #[test]
     fn coding_protocol_has_no_arbitrary_command_path_or_environment() {
         let request = signed_start();
@@ -1011,7 +1328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coding_execution_never_falls_back_without_scoped_auth() {
+    async fn coding_execution_never_falls_back_without_broker_capability() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let provider = TestProvider {
             calls: calls.clone(),
@@ -1039,20 +1356,110 @@ mod tests {
             calls: calls.clone(),
             available: true,
         };
+        let request = signed_start();
+        let (_, capability) = capability_for(&request);
         let result = execute_in_sandbox(
             &provider,
-            &signed_start(),
+            &request,
             RepositorySnapshot {
                 base_commit_sha: "a".repeat(40),
                 archive: vec![1],
             },
-            Some(jarvis_sandbox::ScopedSecret {
-                scope_id: "task-scoped".into(),
-            }),
+            Some(capability),
         )
         .await
         .unwrap();
         assert_eq!(result.status, "completed");
         assert_eq!(calls.lock().unwrap().last(), Some(&"terminate"));
+    }
+
+    fn broker_request(claims: &RunCapabilityClaims) -> BrokeredCodexRequest {
+        BrokeredCodexRequest {
+            request_id: Uuid::now_v7(),
+            run_id: claims.run_id,
+            coding_session_id: claims.coding_session_id,
+            repository: claims.repository.clone(),
+            base_commit_sha: claims.base_commit_sha.clone(),
+            budget_reservation_id: claims.budget_reservation_id,
+            operation: claims.operation,
+        }
+    }
+
+    #[test]
+    fn capability_is_bound_and_replay_expiry_budget_and_revocation_fail_closed() {
+        let request = signed_start();
+        let authority = RunCapabilityAuthority::default();
+        let claims =
+            RunCapabilityClaims::from_signed_request(Uuid::now_v7(), &request, 10).unwrap();
+        let token = authority.mint(claims.clone()).unwrap();
+        let first_request = broker_request(&claims);
+        let now = OffsetDateTime::now_utc();
+        authority.authorize(&token, &first_request, 5, now).unwrap();
+        assert_eq!(
+            authority.authorize(&token, &first_request, 1, now),
+            Err(CapabilityError::Replay)
+        );
+        assert_eq!(
+            authority.authorize_raw("not-a-token", &broker_request(&claims), 1, now),
+            Err(CapabilityError::InvalidToken)
+        );
+
+        let mut wrong_repo = broker_request(&claims);
+        wrong_repo.repository.name = "OtherRepo".into();
+        assert_eq!(
+            authority.authorize(&token, &wrong_repo, 1, now),
+            Err(CapabilityError::WrongRepository)
+        );
+        let mut wrong_run = broker_request(&claims);
+        wrong_run.run_id = Uuid::now_v7();
+        assert_eq!(
+            authority.authorize(&token, &wrong_run, 1, now),
+            Err(CapabilityError::WrongRun)
+        );
+        let too_much = broker_request(&claims);
+        assert_eq!(
+            authority.authorize(&token, &too_much, 6, now),
+            Err(CapabilityError::BudgetExceeded)
+        );
+        authority.revoke_for_cancel(&token);
+        let after_cancel = broker_request(&claims);
+        assert_eq!(
+            authority.authorize(&token, &after_cancel, 1, now),
+            Err(CapabilityError::Revoked)
+        );
+
+        let expiry_claims = RunCapabilityClaims {
+            expires_at: now + Duration::seconds(1),
+            ..claims
+        };
+        let expiry_token = authority.mint(expiry_claims.clone()).unwrap();
+        assert_eq!(
+            authority.authorize(
+                &expiry_token,
+                &broker_request(&expiry_claims),
+                1,
+                now + Duration::seconds(2)
+            ),
+            Err(CapabilityError::Expired)
+        );
+    }
+
+    #[test]
+    fn completion_revokes_a_capability_and_token_material_is_not_debuggable() {
+        let request = signed_start();
+        let (authority, token) = capability_for(&request);
+        let claims =
+            RunCapabilityClaims::from_signed_request(Uuid::now_v7(), &request, 10).unwrap();
+        // Different claim/run deliberately cannot authorize against the first token.
+        authority.revoke_for_completion(&token);
+        assert_eq!(
+            authority.authorize(
+                &token,
+                &broker_request(&claims),
+                1,
+                OffsetDateTime::now_utc()
+            ),
+            Err(CapabilityError::Revoked)
+        );
     }
 }

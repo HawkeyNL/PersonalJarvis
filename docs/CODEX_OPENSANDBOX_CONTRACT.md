@@ -29,15 +29,37 @@ The profile retains the existing OpenSandbox default-deny egress policy. Its
 allowlist is limited to package/source registries; loopback, RFC1918, link-local
 and Docker/host ranges remain denied, including through DNS rebinding.
 
-## Credential activation gate
+## Broker-mediated authentication
 
-OpenSandbox's current provider adapter intentionally returns unavailable for
-`provide_scoped_secret`. Consequently a missing task-scoped Codex credential
-fails before sandbox creation; it never falls back to a host `codex` process.
-The Home Node must not enable the Codex broker socket until the runtime proves a
-narrow credential-vault integration (or a short-lived broker-mediated token)
-that does not expose a long-lived API key in the image, environment, artifacts
-or logs. This is an activation gate, not a convenience TODO.
+The Codex broker retains the long-lived provider credential in its own
+root-managed service environment; it is never represented in the sandbox
+provider API, image, environment, artifacts or logs. Following a signed start
+or resume, the broker may mint a cryptographically random, opaque capability
+token. It stores only the SHA-256 token verifier with these claims:
+
+- run and coding-session IDs;
+- repository identity and exact base SHA;
+- expiry, reservation ID and budget ceiling;
+- the sole allowed operation: `codex.run_approved_task`.
+
+The sandbox receives that temporary token only in its generated task input. A
+broker request must repeat every binding; the broker checks token hash, TTL,
+run state, operation, repository/base SHA, request-ID replay and budget before
+using its own provider credential. Cancellation, completion and broker restart
+revoke outstanding tokens. The broker does not expose model selection, a
+generic OpenAI endpoint, credential inspection, arbitrary request bodies or
+general command execution.
+
+## Production activation gate
+
+The present OpenSandbox network policy correctly blocks sandbox-to-host and
+private-network connections. It therefore cannot yet reach the narrow broker
+API without an explicit, reviewable OpenSandbox-native task proxy that preserves
+the same per-run capability checks. The Home Node must not enable the Codex
+broker socket or real runs until that reverse/task-proxy mechanism is proven
+end-to-end. A missing broker-auth path fails before sandbox creation; it never
+falls back to a host `codex` process. This is an activation gate, not a
+convenience TODO.
 
 When that gate is met, each completed, failed, timed-out or cancelled run still
 terminates its disposable sandbox. Resume starts a new sandbox from the current
