@@ -83,12 +83,29 @@ pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
         .map_err(StoreError::schema)?;
     let current: Option<SchemaVersion> = version.take(0).map_err(StoreError::schema)?;
     if let Some(current) = current {
+        if current.version == 4 {
+            return Ok(());
+        }
         if current.version == 3 {
+            db.query(include_str!(
+                "../../../schema/surreal/0004_llm_routing_telemetry.surql"
+            ))
+            .await
+            .map_err(StoreError::schema)?
+            .check()
+            .map_err(StoreError::schema)?;
             return Ok(());
         }
         if current.version == 2 {
             db.query(include_str!(
                 "../../../schema/surreal/0003_llm_budget_reservations.surql"
+            ))
+            .await
+            .map_err(StoreError::schema)?
+            .check()
+            .map_err(StoreError::schema)?;
+            db.query(include_str!(
+                "../../../schema/surreal/0004_llm_routing_telemetry.surql"
             ))
             .await
             .map_err(StoreError::schema)?
@@ -106,6 +123,13 @@ pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
             .map_err(StoreError::schema)?;
             db.query(include_str!(
                 "../../../schema/surreal/0003_llm_budget_reservations.surql"
+            ))
+            .await
+            .map_err(StoreError::schema)?
+            .check()
+            .map_err(StoreError::schema)?;
+            db.query(include_str!(
+                "../../../schema/surreal/0004_llm_routing_telemetry.surql"
             ))
             .await
             .map_err(StoreError::schema)?
@@ -131,6 +155,13 @@ pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
     .map_err(StoreError::schema)?;
     db.query(include_str!(
         "../../../schema/surreal/0003_llm_budget_reservations.surql"
+    ))
+    .await
+    .map_err(StoreError::schema)?
+    .check()
+    .map_err(StoreError::schema)?;
+    db.query(include_str!(
+        "../../../schema/surreal/0004_llm_routing_telemetry.surql"
     ))
     .await
     .map_err(StoreError::schema)?

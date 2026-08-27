@@ -223,13 +223,50 @@ pub fn cost_eur_with_registry(
 /// One recorded call.
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageEntry {
+    pub request_id: String,
     pub backend: String,
     pub model: String,
+    pub routing_mode: String,
+    pub quality_tier: String,
+    pub agent_id: Option<String>,
+    pub latency_ms: i64,
+    pub status: String,
+    pub failure_category: Option<String>,
+    pub fallback_count: i32,
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub cache_read_tokens: i32,
     pub cache_write_tokens: i32,
     pub cost_eur: f64,
+}
+
+/// Non-content routing facts persisted alongside a model call.  It is
+/// deliberately unable to carry a prompt, response, credential or signature.
+#[derive(Debug, Clone)]
+pub struct UsageMetadata {
+    pub request_id: String,
+    pub routing_mode: String,
+    pub quality_tier: String,
+    pub agent_id: Option<String>,
+    pub latency_ms: i64,
+    pub status: String,
+    pub failure_category: Option<String>,
+    pub fallback_count: i32,
+}
+
+impl Default for UsageMetadata {
+    fn default() -> Self {
+        Self {
+            request_id: uuid::Uuid::now_v7().to_string(),
+            routing_mode: "internal".into(),
+            quality_tier: "unknown".into(),
+            agent_id: None,
+            latency_ms: 0,
+            status: "succeeded".into(),
+            failure_category: None,
+            fallback_count: 0,
+        }
+    }
 }
 
 /// Bounded, explicitly uncertain preflight estimate for a multi-call task.

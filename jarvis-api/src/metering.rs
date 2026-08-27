@@ -14,6 +14,14 @@ use crate::AppState;
 /// backends (plan/Ollama) cost nothing and are skipped. Billing must never break
 /// a chat, so DB errors are logged, not surfaced.
 pub(crate) async fn record_usage(state: &AppState, reply: &llm::ChatReply) {
+    record_usage_with_metadata(state, reply, usage::UsageMetadata::default()).await;
+}
+
+pub(crate) async fn record_usage_with_metadata(
+    state: &AppState,
+    reply: &llm::ChatReply,
+    metadata: usage::UsageMetadata,
+) {
     let (Some(u), Some(backend)) = (&reply.usage, reply.backend.as_deref()) else {
         return;
     };
@@ -34,8 +42,16 @@ pub(crate) async fn record_usage(state: &AppState, reply: &llm::ChatReply) {
         return; // plan/local: nothing to bill or count
     }
     let entry = usage::UsageEntry {
+        request_id: metadata.request_id,
         backend: backend.to_string(),
         model: reply.model.clone(),
+        routing_mode: metadata.routing_mode,
+        quality_tier: metadata.quality_tier,
+        agent_id: metadata.agent_id,
+        latency_ms: metadata.latency_ms,
+        status: metadata.status,
+        failure_category: metadata.failure_category,
+        fallback_count: metadata.fallback_count,
         input_tokens: u.input_tokens as i32,
         output_tokens: u.output_tokens as i32,
         cache_read_tokens: u.cache_read_tokens as i32,

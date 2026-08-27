@@ -11,6 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Instant;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -18,7 +19,7 @@ use jarvis_llm as llm;
 use jarvis_orchestrator as orchestrator;
 
 use crate::error::bad_request;
-use crate::metering::record_usage;
+use crate::metering::{record_usage, record_usage_with_metadata};
 use crate::rate_limit::allow_authenticated_device;
 use crate::validation;
 use crate::{AppState, Authed};
@@ -188,9 +189,22 @@ pub(crate) async fn assistant_chat(
         model: None,
     };
 
+    let llm_started = Instant::now();
+    let request_id = Uuid::now_v7().to_string();
     match state.llm.chat(&chat).await {
         Ok(reply) => {
-            record_usage(&state, &reply).await;
+            record_usage_with_metadata(
+                &state,
+                &reply,
+                jarvis_usage::UsageMetadata {
+                    request_id,
+                    routing_mode: format!("{mode:?}").to_ascii_lowercase(),
+                    quality_tier: format!("{:?}", requirements.tier).to_ascii_lowercase(),
+                    latency_ms: llm_started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                    ..Default::default()
+                },
+            )
+            .await;
             append_message(
                 &state.db,
                 conv_id,

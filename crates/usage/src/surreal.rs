@@ -7,12 +7,17 @@ use super::UsageEntry;
 
 pub async fn record(db: &Database, entry: &UsageEntry) -> Result<(), jarvis_store::StoreError> {
     db.query(
-        "CREATE llm_usage SET id = $id, ts = time::now(), backend = $backend, model = $model, \
+        "CREATE llm_usage SET id = $id, ts = time::now(), request_id = $request_id, backend = $backend, model = $model, \
+         routing_mode = $routing_mode, quality_tier = $quality_tier, agent_id = $agent_id, latency_ms = $latency_ms, \
+         status = $status, failure_category = $failure_category, fallback_count = $fallback_count, \
          input_tokens = $input_tokens, output_tokens = $output_tokens, cache_read_tokens = $cache_read_tokens, \
          cache_write_tokens = $cache_write_tokens, cost_eur = $cost_eur RETURN NONE",
     )
     .bind(json!({
-        "id": Uuid::now_v7().to_string(), "backend": entry.backend, "model": entry.model,
+        "id": Uuid::now_v7().to_string(), "request_id": entry.request_id, "backend": entry.backend, "model": entry.model,
+        "routing_mode": entry.routing_mode, "quality_tier": entry.quality_tier, "agent_id": entry.agent_id,
+        "latency_ms": entry.latency_ms, "status": entry.status, "failure_category": entry.failure_category,
+        "fallback_count": entry.fallback_count,
         "input_tokens": entry.input_tokens, "output_tokens": entry.output_tokens,
         "cache_read_tokens": entry.cache_read_tokens, "cache_write_tokens": entry.cache_write_tokens,
         "cost_eur": entry.cost_eur,
