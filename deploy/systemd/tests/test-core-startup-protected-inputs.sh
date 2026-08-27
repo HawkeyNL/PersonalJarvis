@@ -8,6 +8,10 @@ api_bin=${JARVIS_API_BINARY:?set JARVIS_API_BINARY to the built jarvis-api}
 [[ -x $api_bin ]] || { echo "jarvis-api binary is unavailable" >&2; exit 1; }
 
 fixture=$(mktemp -d)
+chmod 0755 "$fixture"
+install -d -o root -g root -m 0755 "$fixture/bin"
+install -o root -g root -m 0755 "$api_bin" "$fixture/bin/jarvis-api"
+api_bin="$fixture/bin/jarvis-api"
 pid=
 created_user=false
 cleanup() {
