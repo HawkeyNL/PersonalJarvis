@@ -47,11 +47,18 @@ runuser -u jarvis -- test ! -w /etc/jarvis/Jarvis.md
 runuser -u jarvis -- test ! -w /var/lib/jarvis/agents/current/manifest.json
 runuser -u jarvis -- test ! -r /etc/jarvis/surrealdb.env
 
+# Match production's database-scoped Core identity rather than granting this
+# fixture the provisioning-only root account.
+printf "DEFINE USER core ON DATABASE PASSWORD 'ci-core-password' ROLES EDITOR;\n" \
+    | docker exec -i jarvis-surreal-test /surreal sql --hide-welcome \
+        --endpoint ws://127.0.0.1:8000 --username root --password test-root-password \
+        --auth-level root --namespace jarvis --database core >/dev/null
+
 runuser -u jarvis -- env \
     JARVIS_ENVIRONMENT=production JARVIS_BIND_ADDR=127.0.0.1:18080 \
     JARVIS_SURREAL_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_NAMESPACE=jarvis \
-    JARVIS_SURREAL_DATABASE=core JARVIS_SURREAL_USERNAME=root \
-    JARVIS_SURREAL_PASSWORD=test-root-password JARVIS_LLM_PROVIDER=ollama \
+    JARVIS_SURREAL_DATABASE=core JARVIS_SURREAL_USERNAME=core \
+    JARVIS_SURREAL_PASSWORD=ci-core-password JARVIS_LLM_PROVIDER=ollama \
     JARVIS_LLM_PERSONA_PATH=/etc/jarvis/Jarvis.md \
     JARVIS_AGENT_BUNDLE_PATH=/var/lib/jarvis/agents/current \
     "$api_bin" >"$fixture/api.log" 2>&1 &
