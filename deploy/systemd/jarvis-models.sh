@@ -15,7 +15,7 @@ command -v jq >/dev/null 2>&1 || fail "jq is required"
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  sudo jarvis-models refresh
+  sudo jarvis-models refresh [provider]
   sudo jarvis-models list [provider]
   sudo jarvis-models enable <provider> <model>
   sudo jarvis-models disable <provider> <model>
@@ -72,20 +72,36 @@ configured_models() {
         --arg deepseek_default "${JARVIS_LLM_DEEPSEEK_MODEL:-}" \
         --arg deepseek_hard "${JARVIS_LLM_DEEPSEEK_MODEL_HARD:-}" \
         --arg deepseek_cheap "${JARVIS_LLM_DEEPSEEK_MODEL_CHEAP:-}" \
+        --arg xai_default "${JARVIS_LLM_XAI_MODEL:-}" \
+        --arg xai_hard "${JARVIS_LLM_XAI_MODEL_HARD:-}" \
+        --arg xai_cheap "${JARVIS_LLM_XAI_MODEL_CHEAP:-}" \
+        --arg zai_default "${JARVIS_LLM_ZAI_MODEL:-}" \
+        --arg zai_hard "${JARVIS_LLM_ZAI_MODEL_HARD:-}" \
+        --arg zai_cheap "${JARVIS_LLM_ZAI_MODEL_CHEAP:-}" \
+        --arg ollama_cloud_default "${JARVIS_LLM_OLLAMA_CLOUD_MODEL:-}" \
+        --arg ollama_cloud_hard "${JARVIS_LLM_OLLAMA_CLOUD_MODEL_HARD:-}" \
+        --arg ollama_cloud_cheap "${JARVIS_LLM_OLLAMA_CLOUD_MODEL_CHEAP:-}" \
         --arg ollama "${JARVIS_LLM_OLLAMA_MODEL:-}" \
         '[
           ["anthropic-api", $anthropic_default], ["anthropic-api", $anthropic_hard], ["anthropic-api", $anthropic_cheap],
           ["openai-api", $openai_default], ["openai-api", $openai_hard], ["openai-api", $openai_cheap],
           ["deepseek-api", $deepseek_default], ["deepseek-api", $deepseek_hard], ["deepseek-api", $deepseek_cheap],
+          ["xai-api", $xai_default], ["xai-api", $xai_hard], ["xai-api", $xai_cheap],
+          ["zai-api", $zai_default], ["zai-api", $zai_hard], ["zai-api", $zai_cheap],
+          ["ollama-cloud", $ollama_cloud_default], ["ollama-cloud", $ollama_cloud_hard], ["ollama-cloud", $ollama_cloud_cheap],
           ["ollama", $ollama]
         ] | map(select(.[1] != "")) | unique'
 }
 
 refresh() {
-    local old known merged
+    local provider=${1:-} old known merged
+    [[ -z $provider ]] || valid_provider "$provider" || fail "unknown provider"
     old=$(if [[ -f $policy_file ]]; then cat "$policy_file"; else empty_policy; fi)
     jq -e '.version == 1 and (.models | type == "array")' <<<"$old" >/dev/null || fail "existing policy is malformed"
     known=$(configured_models)
+    if [[ -n $provider ]]; then
+        known=$(jq --arg provider "$provider" '[.[] | select(.[0] == $provider)]' <<<"$known")
+    fi
     # Retain all existing records (including disabled discovered models) across
     # refresh failures.  New remote entries are disabled.  Local Ollama is the
     # explicit offline default, not an accidental cloud authorization.
@@ -137,7 +153,7 @@ show_model() {
 }
 
 case ${1:-} in
-    refresh) (($# == 1)) || usage; refresh ;;
+    refresh) (($# == 1 || $# == 2)) || usage; refresh "${2:-}" ;;
     list) (($# == 1 || $# == 2)) || usage; list_models "${2:-}" ;;
     enable) (($# == 3)) || usage; set_state "$2" "$3" true ;;
     disable) (($# == 3)) || usage; set_state "$2" "$3" false ;;
