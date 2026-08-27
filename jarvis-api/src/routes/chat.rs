@@ -11,6 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Instant;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -18,7 +19,7 @@ use jarvis_llm as llm;
 use jarvis_orchestrator as orchestrator;
 
 use crate::error::bad_request;
-use crate::metering::record_usage;
+use crate::metering::{record_usage, record_usage_with_metadata};
 use crate::rate_limit::allow_authenticated_device;
 use crate::validation;
 use crate::{AppState, Authed};
@@ -35,6 +36,10 @@ pub(crate) struct ChatReq {
     /// Optional tier hint: `default` | `hard` | `cheap`.
     #[serde(default)]
     tier: Option<String>,
+    /// Provider-neutral request intent. `tier` is retained only for older
+    /// clients and maps to the same semantic routing floor.
+    #[serde(default)]
+    mode: Option<String>,
     /// Optional system-prompt override (defaults to the Jarvis persona).
     #[serde(default)]
     system: Option<String>,
@@ -153,25 +158,53 @@ pub(crate) async fn assistant_chat(
     } else {
         history
     };
+    let mode = req
+        .mode
+        .as_deref()
+        .map(llm::RoutingMode::parse)
+        .unwrap_or_else(|| {
+            req.tier
+                .as_deref()
+                .map(|tier| match llm::Tier::parse(tier) {
+                    llm::Tier::Cheap => llm::RoutingMode::Fast,
+                    llm::Tier::Hard => llm::RoutingMode::Deep,
+                    llm::Tier::Default => llm::RoutingMode::Auto,
+                })
+                .unwrap_or_default()
+        });
+    // Classification establishes a quality floor only. The complete original
+    // conversation below remains the model input; no lossy summary or hidden
+    // model-selection prompt is substituted for the owner's request.
+    let requirements = llm::classify_task(mode, &new_msg);
     let chat = llm::ChatRequest {
         system: Some(
             req.system
                 .unwrap_or_else(|| state.jarvis_system.to_string()),
         ),
-        tier: req
-            .tier
-            .as_deref()
-            .map(llm::Tier::parse)
-            .unwrap_or_default(),
+        tier: requirements.tier,
+        mode,
         messages,
         max_tokens: state.llm_max_tokens,
         // The router picks the concrete model per backend (ADR-028 fase 2).
         model: None,
     };
 
+    let llm_started = Instant::now();
+    let request_id = Uuid::now_v7().to_string();
     match state.llm.chat(&chat).await {
         Ok(reply) => {
-            record_usage(&state, &reply).await;
+            record_usage_with_metadata(
+                &state,
+                &reply,
+                jarvis_usage::UsageMetadata {
+                    request_id,
+                    routing_mode: format!("{mode:?}").to_ascii_lowercase(),
+                    quality_tier: format!("{:?}", requirements.tier).to_ascii_lowercase(),
+                    latency_ms: llm_started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                    ..Default::default()
+                },
+            )
+            .await;
             append_message(
                 &state.db,
                 conv_id,
@@ -184,10 +217,13 @@ pub(crate) async fn assistant_chat(
             Ok(Json(json!({
                 "reply": reply.text,
                 "model": reply.model,
+                "backend": reply.backend,
+                "routing_reason": requirements.routing_reason,
                 "stop_reason": reply.stop_reason,
                 "conversation_id": conv_id,
                 "conversation_title": conv_title,
                 "new_topic": new_topic,
+                "routing_mode": mode,
             })))
         }
         Err(llm::LlmError::Refused) => {
@@ -239,6 +275,7 @@ async fn classify_topic(
     let req = llm::ChatRequest {
         system: Some(system.to_string()),
         tier: llm::Tier::Cheap,
+        mode: llm::RoutingMode::Fast,
         messages: vec![llm::ChatMessage::user(&user)],
         max_tokens: 60,
         model: None,

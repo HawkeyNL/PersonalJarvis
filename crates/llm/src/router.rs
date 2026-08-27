@@ -6,12 +6,16 @@
 //! safety net: if the registry says none are up, try them anyway). Falls through
 //! on any error except a genuine refusal.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 
-use crate::types::{ChatReply, ChatRequest, LlmError, Tier};
-use crate::LlmProvider;
+use crate::types::{ChatReply, ChatRequest, LlmError, ProviderFailure, Tier};
+use crate::{LlmProvider, ModelAccessPolicy};
 
 /// Live availability of a backend, by id — implemented by the api over the
 /// resource registry (`jarvis-registry`), so the router routes on what's up now.
@@ -55,19 +59,47 @@ pub(crate) struct Candidate {
     pub(crate) provider: Arc<dyn LlmProvider>,
 }
 
+/// Short, bounded retry suppression for a failing backend. This is deliberately
+/// process-local: the resource registry remains the durable availability view,
+/// while the router avoids paying/retrying the same known-bad provider on every
+/// request. It stores only a backend id, safe category and a monotonic deadline.
+#[derive(Debug, Clone, Copy)]
+struct HealthCooldown {
+    until: Instant,
+}
+
 pub struct RouterProvider {
     candidates: Vec<Candidate>,
     availability: Arc<dyn Availability>,
     /// Available models per backend, cheapest-first within a class (ADR-028).
     catalog: Vec<CatalogModel>,
+    /// Root-owned, explicit allowlist.  Provider credentials do not imply
+    /// permission to route to a model.
+    model_policy: ModelAccessPolicy,
+    health: Mutex<BTreeMap<String, HealthCooldown>>,
     label: String,
 }
 
 impl RouterProvider {
+    #[cfg(test)]
     pub(crate) fn new(
         candidates: Vec<Candidate>,
         availability: Arc<dyn Availability>,
         catalog: Vec<CatalogModel>,
+    ) -> Self {
+        Self::with_policy(
+            candidates,
+            availability,
+            catalog,
+            ModelAccessPolicy::deny_by_default(),
+        )
+    }
+
+    pub(crate) fn with_policy(
+        candidates: Vec<Candidate>,
+        availability: Arc<dyn Availability>,
+        catalog: Vec<CatalogModel>,
+        model_policy: ModelAccessPolicy,
     ) -> Self {
         let ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
         let label = format!("router[{}]", ids.join(","));
@@ -75,6 +107,8 @@ impl RouterProvider {
             candidates,
             availability,
             catalog,
+            model_policy,
+            health: Mutex::new(BTreeMap::new()),
             label,
         }
     }
@@ -96,11 +130,11 @@ impl RouterProvider {
     /// its own tier model.
     fn model_for(&self, backend: &str, tier: Tier) -> Option<String> {
         for want in Self::target_classes(tier) {
-            if let Some(m) = self
-                .catalog
-                .iter()
-                .find(|m| m.backend == backend && m.class == *want)
-            {
+            if let Some(m) = self.catalog.iter().find(|m| {
+                m.backend == backend
+                    && m.class == *want
+                    && self.model_policy.allows(&m.backend, &m.id)
+            }) {
                 return Some(m.id.clone());
             }
         }
@@ -117,22 +151,91 @@ impl RouterProvider {
                 "ollama",
                 "claude-cli",
                 "deepseek-api",
+                "zai-api",
                 "openai-api",
+                "xai-api",
                 "anthropic-api",
+                "ollama-cloud",
             ],
             Tier::Default => &[
                 "claude-cli",
                 "anthropic-api",
                 "openai-api",
                 "deepseek-api",
+                "xai-api",
+                "zai-api",
+                "ollama-cloud",
                 "ollama",
             ],
-            Tier::Hard => &["claude-cli", "anthropic-api", "openai-api"],
+            Tier::Hard => &[
+                "claude-cli",
+                "anthropic-api",
+                "openai-api",
+                "xai-api",
+                "zai-api",
+                "ollama-cloud",
+            ],
         }
     }
 
+    fn cooldown_for(failure: ProviderFailure) -> Duration {
+        match failure {
+            // Repeated auth failures are both noisy and futile until an owner
+            // rotates the credential. Keep the cooldown bounded so a healthy
+            // credential reload naturally recovers without a process restart.
+            ProviderFailure::Authentication => Duration::from_secs(15 * 60),
+            ProviderFailure::RateLimited => Duration::from_secs(60),
+            ProviderFailure::Unavailable | ProviderFailure::Transport => Duration::from_secs(30),
+            ProviderFailure::ContextOverflow | ProviderFailure::MalformedResponse => {
+                Duration::from_secs(15)
+            }
+            ProviderFailure::NotConfigured => Duration::from_secs(5 * 60),
+            // A policy refusal is not a provider-health failure and returns
+            // directly from `chat`, so this value is never used in practice.
+            ProviderFailure::Refused => Duration::ZERO,
+        }
+    }
+
+    fn is_healthy(&self, backend: &str) -> bool {
+        let now = Instant::now();
+        let mut health = self.health.lock().expect("router health mutex poisoned");
+        match health.get(backend).copied() {
+            Some(cooldown) if cooldown.until > now => false,
+            Some(_) => {
+                health.remove(backend);
+                true
+            }
+            None => true,
+        }
+    }
+
+    fn record_failure(&self, backend: &str, failure: ProviderFailure) {
+        let cooldown = Self::cooldown_for(failure);
+        if cooldown.is_zero() {
+            return;
+        }
+        self.health
+            .lock()
+            .expect("router health mutex poisoned")
+            .insert(
+                backend.to_string(),
+                HealthCooldown {
+                    until: Instant::now() + cooldown,
+                },
+            );
+    }
+
+    fn record_success(&self, backend: &str) {
+        self.health
+            .lock()
+            .expect("router health mutex poisoned")
+            .remove(backend);
+    }
+
     /// The backends to try, in order: policy order ∩ existing candidates,
-    /// preferring available ones — but if none look available, try them all.
+    /// preferring registry-available ones. A recent health cooldown is never
+    /// overridden by the old "try everything" safety net: that would turn a
+    /// revoked credential or 429 into an unbounded request-by-request retry.
     fn plan(&self, tier: Tier) -> Vec<&Candidate> {
         let ordered: Vec<&Candidate> = Self::policy(tier)
             .iter()
@@ -143,11 +246,21 @@ impl RouterProvider {
             .copied()
             .filter(|c| self.availability.is_available(&c.id))
             .collect();
-        if available.is_empty() {
+        let base = if available.is_empty() {
             ordered
         } else {
             available
-        }
+        };
+        base.into_iter()
+            .filter(|candidate| self.is_healthy(&candidate.id))
+            .collect()
+    }
+
+    fn requested_model_is_allowed(&self, backend: &str, model: &str) -> bool {
+        self.catalog
+            .iter()
+            .any(|entry| entry.backend == backend && entry.id == model)
+            && self.model_policy.allows(backend, model)
     }
 }
 
@@ -169,23 +282,37 @@ impl LlmProvider for RouterProvider {
             // Pick the cheapest sufficient model for this backend + tier; if the
             // request already names a model, respect it. Fall back to the
             // provider's own tier model when the catalog has nothing.
-            let chosen = req
-                .model
-                .clone()
-                .or_else(|| self.model_for(&candidate.id, req.tier));
-            let attempt = if chosen == req.model {
-                req.clone()
-            } else {
-                ChatRequest {
-                    model: chosen,
-                    ..req.clone()
+            let chosen = match req.model.as_deref() {
+                Some(model) if self.requested_model_is_allowed(&candidate.id, model) => {
+                    Some(model.to_string())
                 }
+                Some(_) => None,
+                None => self.model_for(&candidate.id, req.tier),
+            };
+            // Never fall through to a provider's configured default: that would
+            // turn an API key or a mutable provider alias into an implicit
+            // model authorization bypass.
+            let Some(chosen) = chosen else {
+                continue;
+            };
+            let attempt = ChatRequest {
+                model: Some(chosen),
+                ..req.clone()
             };
             match candidate.provider.chat(&attempt).await {
-                Ok(reply) => return Ok(reply),
+                Ok(reply) => {
+                    self.record_success(&candidate.id);
+                    return Ok(reply);
+                }
                 Err(LlmError::Refused) => return Err(LlmError::Refused),
                 Err(e) => {
-                    tracing::warn!(backend = %candidate.id, error = %e, "brain failed; routing to next");
+                    let failure = e.failure_category();
+                    self.record_failure(&candidate.id, failure);
+                    tracing::warn!(
+                        backend = %candidate.id,
+                        failure = ?failure,
+                        "brain failed; routing to next"
+                    );
                     last = Some(e);
                 }
             }
@@ -266,9 +393,26 @@ mod tests {
         ]
     }
 
+    fn allow_catalog(catalog: &[CatalogModel]) -> ModelAccessPolicy {
+        ModelAccessPolicy {
+            version: 1,
+            models: catalog
+                .iter()
+                .map(|model| crate::ModelAccessEntry {
+                    provider: model.backend.clone(),
+                    model: model.id.clone(),
+                    enabled: true,
+                    source: "test".into(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn picks_low_models_by_default_and_strong_for_hard() {
-        let r = RouterProvider::new(all(), always_available(), catalog());
+        let c = catalog();
+        let r =
+            RouterProvider::with_policy(all(), always_available(), c.clone(), allow_catalog(&c));
         // Default → light on the plan (cheap sufficient, free).
         assert_eq!(
             r.model_for("claude-cli", Tier::Default).as_deref(),
@@ -315,11 +459,14 @@ mod tests {
             id: "claude-cli".into(),
             provider: Arc::new(EchoModel),
         }];
-        let r = RouterProvider::new(cands, always_available(), catalog());
+        let c = catalog();
+        let r =
+            RouterProvider::with_policy(cands, always_available(), c.clone(), allow_catalog(&c));
         let ask = |tier| ChatRequest {
             system: None,
             messages: vec![ChatMessage::user("hi")],
             tier,
+            mode: crate::RoutingMode::Auto,
             max_tokens: 16,
             model: None,
         };
@@ -423,17 +570,79 @@ mod tests {
             cand("claude-cli", false),
             cand("anthropic-api", true),
         ];
-        let r = RouterProvider::new(cands, always_available(), vec![]);
+        let c = vec![
+            CatalogModel {
+                backend: "claude-cli".into(),
+                id: "plan".into(),
+                class: ModelClass::Mid,
+            },
+            CatalogModel {
+                backend: "anthropic-api".into(),
+                id: "sonnet".into(),
+                class: ModelClass::Mid,
+            },
+            CatalogModel {
+                backend: "ollama".into(),
+                id: "local".into(),
+                class: ModelClass::Mid,
+            },
+        ];
+        let r =
+            RouterProvider::with_policy(cands, always_available(), c.clone(), allow_catalog(&c));
         let reply = r
             .chat(&ChatRequest {
                 system: None,
                 messages: vec![ChatMessage::user("hi")],
                 tier: Tier::Default,
+                mode: crate::RoutingMode::Auto,
                 max_tokens: 16,
                 model: None,
             })
             .await
             .unwrap();
         assert_eq!(reply.text, "anthropic-api");
+        // The malformed first response receives a bounded health cooldown, so
+        // the next request does not repeatedly hit the same failing backend.
+        assert_eq!(ids(r.plan(Tier::Default)), ["anthropic-api", "ollama"]);
+    }
+
+    #[test]
+    fn auth_cooldown_is_longer_than_transient_failures() {
+        assert!(
+            RouterProvider::cooldown_for(ProviderFailure::Authentication)
+                > RouterProvider::cooldown_for(ProviderFailure::RateLimited)
+        );
+        assert!(RouterProvider::cooldown_for(ProviderFailure::Refused).is_zero());
+    }
+
+    #[tokio::test]
+    async fn disabled_model_cannot_be_reached_by_fallback_or_override() {
+        let cands = vec![cand("anthropic-api", true)];
+        let catalog = vec![CatalogModel {
+            backend: "anthropic-api".into(),
+            id: "claude-test".into(),
+            class: ModelClass::Mid,
+        }];
+        let policy = ModelAccessPolicy {
+            version: 1,
+            models: vec![crate::ModelAccessEntry {
+                provider: "anthropic-api".into(),
+                model: "claude-test".into(),
+                enabled: false,
+                source: "test".into(),
+            }],
+        };
+        let router = RouterProvider::with_policy(cands, always_available(), catalog, policy);
+        let result = router
+            .chat(&ChatRequest {
+                system: None,
+                messages: vec![ChatMessage::user("hi")],
+                tier: Tier::Default,
+                mode: crate::RoutingMode::Auto,
+                max_tokens: 16,
+                model: Some("claude-test".into()),
+            })
+            .await;
+        assert!(matches!(result, Err(LlmError::NotConfigured(_))));
     }
 }

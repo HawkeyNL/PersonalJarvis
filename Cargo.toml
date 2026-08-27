@@ -20,6 +20,7 @@ members = [
     "crates/codex",
     "crates/workspace",
     "crates/sandbox",
+    "crates/privileged",
 ]
 # The Tauri client crate builds via its own tooling (npm run tauri ...) and is
 # intentionally excluded so backend CI (clippy -D warnings) stays fast and the
@@ -94,4 +95,5 @@ jarvis-store = { path = "crates/store" }
 jarvis-codex = { path = "crates/codex" }
 jarvis-workspace = { path = "crates/workspace" }
 jarvis-sandbox = { path = "crates/sandbox" }
+jarvis-privileged = { path = "crates/privileged" }
 jarvis-core = { path = "jarvis-core" }

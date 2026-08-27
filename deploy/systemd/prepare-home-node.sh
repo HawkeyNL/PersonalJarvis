@@ -14,11 +14,18 @@ fi
 id -nG jarvis | tr ' ' '\n' | grep -qx docker && fail "jarvis must not be a Docker-group member"
 
 install -d -o jarvis -g jarvis -m 0750 /var/lib/jarvis
+install -d -o root -g root -m 0700 /var/lib/jarvis/config-broker /var/lib/jarvis/config-broker/replays
 install -d -o root -g root -m 0700 /var/lib/jarvis/surrealdb
 install -d -o root -g root -m 0755 /opt/jarvis /opt/jarvis/releases
 # The service needs directory traversal to read only its explicitly group-readable
 # inputs.  Individual secrets below this directory remain root:root 0600.
 install -d -o root -g jarvis -m 0750 /etc/jarvis
+install -d -o root -g jarvis -m 0750 /etc/jarvis/secrets
+if [[ ! -e /etc/jarvis/pricing-registry.json ]]; then
+    install -o root -g jarvis -m 0640 \
+        "$repo_dir/deploy/systemd/pricing-registry.json" \
+        /etc/jarvis/pricing-registry.json
+fi
 install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
 install -o root -g root -m 0644 "$repo_dir/deploy/lib/ui.sh" /usr/local/libexec/jarvis/ui.sh
 
@@ -31,12 +38,18 @@ for helper in initialize-production-surrealdb.sh start-production-surrealdb.sh p
         "$repo_dir/deploy/surrealdb/$helper" \
         "/usr/local/libexec/jarvis/${helper%.sh}"
 done
-for helper in generate-core-env.sh stage-core-release.sh verify-home-node.sh; do
+for helper in generate-core-env.sh stage-core-release.sh verify-home-node.sh jarvis-models.sh; do
     [[ -f "$repo_dir/deploy/systemd/$helper" ]] || continue
     install -o root -g root -m 0755 \
         "$repo_dir/deploy/systemd/$helper" \
         "/usr/local/libexec/jarvis/${helper%.sh}"
 done
+install -o root -g root -m 0755 \
+    "$repo_dir/deploy/systemd/jarvis-models.sh" \
+    /usr/local/sbin/jarvis-models
+install -o root -g root -m 0755 \
+    "$repo_dir/deploy/systemd/jarvis-credentials.sh" \
+    /usr/local/sbin/jarvis-credentials
 for helper in install-private-config.sh install-agent-bundle.sh; do
     install -o root -g root -m 0755 \
         "$repo_dir/deploy/private/$helper" \

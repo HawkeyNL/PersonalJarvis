@@ -9,6 +9,14 @@ User=jarvis
 Group=jarvis
 WorkingDirectory=/opt/jarvis/current
 EnvironmentFile=/etc/jarvis/core.env
+# Provider credentials are independent, root-managed files.  A missing file is
+# normal on a fresh/offline Home Node; no secret appears in this unit or argv.
+EnvironmentFile=-/etc/jarvis/secrets/anthropic.env
+EnvironmentFile=-/etc/jarvis/secrets/openai.env
+EnvironmentFile=-/etc/jarvis/secrets/deepseek.env
+EnvironmentFile=-/etc/jarvis/secrets/xai.env
+EnvironmentFile=-/etc/jarvis/secrets/zai.env
+EnvironmentFile=-/etc/jarvis/secrets/ollama-cloud.env
 ExecStart=/opt/jarvis/current/jarvis-api
 Restart=on-failure
 RestartSec=5s

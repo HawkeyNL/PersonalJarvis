@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Static security regression coverage for PR #26.  No real provider or secret
+# is required in CI.
+set -euo pipefail
+
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
+credentials="$repo_dir/deploy/systemd/jarvis-credentials.sh"
+models="$repo_dir/deploy/systemd/jarvis-models.sh"
+unit="$repo_dir/deploy/systemd/jarvis-core.service"
+prepare="$repo_dir/deploy/systemd/prepare-home-node.sh"
+pricing="$repo_dir/deploy/systemd/pricing-registry.json"
+
+for file in "$credentials" "$models" "$unit" "$prepare"; do
+    [[ -f $file ]] || { echo "missing model security asset: $file" >&2; exit 1; }
+done
+broker="$repo_dir/deploy/systemd/jarvis-config-broker.service"
+[[ -f $broker ]] || { echo "missing privileged config broker unit" >&2; exit 1; }
+grep -Fq 'User=root' "$broker"
+grep -Fq 'EnvironmentFile=/etc/jarvis/core.env' "$broker"
+grep -Fq 'ReadWritePaths=/etc/jarvis/model-policy.json' "$broker"
+if grep -Eq 'ExecStart=.*(sh|bash)|/bin/(sh|bash)' "$broker"; then
+    echo "privileged broker must not expose a shell" >&2
+    exit 1
+fi
+[[ -f $pricing ]] || { echo "missing pricing registry fixture" >&2; exit 1; }
+bash -n "$credentials" "$models" "$prepare"
+jq -e '
+  .version == 1
+  and (.source | type == "string" and length > 0)
+  and (.updated_at | type == "string" and length > 0)
+  and (.models | type == "array" and length > 0)
+  and all(.models[]; (.provider | type == "string" and length > 0) and (.model | type == "string" and length > 0) and (.input_per_million_usd >= 0) and (.output_per_million_usd >= 0))
+' "$pricing" >/dev/null
+
+# Credentials require a TTY, use hidden input, and are never accepted through
+# argv/stdin.  The secret variable must not be printed or passed to curl.
+grep -Fq "requires a controlling TTY" "$credentials"
+grep -Fq "read -r -s secret </dev/tty" "$credentials"
+if grep -Eq "echo.*\\\$secret" "$credentials"; then
+    echo "credential manager prints a secret variable" >&2
+    exit 1
+fi
+if grep -Eq 'curl[[:space:]].*-H' "$credentials"; then
+    echo "credential manager sends credentials to curl" >&2
+    exit 1
+fi
+grep -Fq "mktemp \"\$secret_dir/." "$credentials"
+grep -Fq 'chown root:jarvis' "$credentials"
+grep -Fq 'chmod 0640' "$credentials"
+grep -Fq 'restoring prior credential state' "$credentials"
+grep -Fq 'probe_provider' "$credentials"
+grep -Fq 'mktemp /run/jarvis-credential-test' "$credentials"
+grep -Fq 'curl --config "$config"' "$credentials"
+grep -Fq 'no generation request was made' "$credentials"
+
+# Provider access policy is exact, starts remote models disabled, and uses an
+# atomic replacement.  Local Ollama is distinguished from ollama-cloud.
+grep -Fq 'new remote models remain disabled' "$models"
+grep -Fq 'atomic_write' "$models"
+grep -Fq 'ollama-cloud' "$models"
+grep -Fq "provider == \$item[0] and .model == \$item[1]" "$models"
+grep -Fq "Official OpenAI-compatible \`/models\` discovery" "$models"
+grep -Fq "curl --config \"\$config\"" "$models"
+grep -Fq 'mktemp /run/jarvis-model-discovery' "$models"
+grep -Fq 'provider_api' "$models"
+grep -Fq 'return 0; }' "$models"
+if grep -Eq 'curl[[:space:]].*-H[[:space:]]+.*Authorization' "$models"; then
+    echo "model discovery exposes an authorization header in argv" >&2
+    exit 1
+fi
+grep -Fq '/etc/jarvis/secrets' "$prepare"
+grep -Fq '/etc/jarvis/pricing-registry.json' "$prepare"
+grep -Fq '[[ ! -e /etc/jarvis/pricing-registry.json ]]' "$prepare"
+
+for provider in anthropic openai deepseek xai zai ollama-cloud; do
+    grep -Fq "EnvironmentFile=-/etc/jarvis/secrets/$provider.env" "$unit"
+done
+
+echo "Model/credential boundary checks passed"

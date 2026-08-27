@@ -77,6 +77,7 @@ check "jarvis service identity exists" getent passwd jarvis
 check "jarvis has no Docker access" bash -c '! id -nG jarvis | tr " " "\\n" | grep -qx docker'
 check "Jarvis state directory permissions" expect_mode /var/lib/jarvis jarvis:jarvis:750
 check "Protected configuration permissions" expect_mode /etc/jarvis root:jarvis:750
+check "Provider secret directory permissions" expect_mode /etc/jarvis/secrets root:jarvis:750
 check "Protected persona permissions" expect_mode /etc/jarvis/Jarvis.md root:jarvis:640
 check "Agent bundle is valid and immutable" agent_bundle_valid
 ui_step "Services and network"
@@ -91,12 +92,26 @@ check "/livez responds" curl --fail --silent --show-error --max-time 5 http://12
 check "/readyz responds" curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/readyz
 check "Persona readable by Core" jarvis_reads /etc/jarvis/Jarvis.md
 check "Persona is read-only to Core" jarvis_cannot_write /etc/jarvis/Jarvis.md
+if [[ -e /etc/jarvis/model-policy.json ]]; then
+    check "Model policy permissions" expect_mode /etc/jarvis/model-policy.json root:jarvis:640
+    check "Model policy readable by Core" jarvis_reads /etc/jarvis/model-policy.json
+    check "Model policy read-only to Core" jarvis_cannot_write /etc/jarvis/model-policy.json
+fi
+check "Pricing registry permissions" expect_mode /etc/jarvis/pricing-registry.json root:jarvis:640
+check "Pricing registry readable by Core" jarvis_reads /etc/jarvis/pricing-registry.json
+check "Pricing registry read-only to Core" jarvis_cannot_write /etc/jarvis/pricing-registry.json
 check "Agent manifest readable by Core" jarvis_reads /var/lib/jarvis/agents/current/manifest.json
 check "Agent bundle is not writable by jarvis" jarvis_cannot_create_in "$(active_bundle)"
 check "Agent activation cannot be replaced by jarvis" jarvis_cannot_replace_current
 ui_step "Secrets and optional services"
 check "Docker socket is unreadable by jarvis" runuser -u jarvis -- test ! -r /var/run/docker.sock
 check "Root SurrealDB credentials are unreadable" runuser -u jarvis -- test ! -r /etc/jarvis/surrealdb.env
+check "Privileged broker service is active" systemctl is-active --quiet jarvis-config-broker.service
+check "Privileged broker has no public TCP listener" bash -c '! ss -ltnp 2>/dev/null | grep -Fq jarvis-config-broker'
+for provider_secret in /etc/jarvis/secrets/*.env; do
+    [[ -e $provider_secret ]] || continue
+    check "Provider credential permissions (${provider_secret##*/})" expect_mode "$provider_secret" root:jarvis:640
+done
 if [[ -e /etc/jarvis/updater.env ]]; then
     check "Updater credentials permissions" expect_mode /etc/jarvis/updater.env root:root:600
     check "Updater credentials are unreadable" runuser -u jarvis -- test ! -r /etc/jarvis/updater.env

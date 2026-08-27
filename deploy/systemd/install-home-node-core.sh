@@ -35,6 +35,10 @@ find "$release_dir" -xdev -type l -print -quit | grep -q . && {
     echo "missing executable: $release_dir/jarvis-api" >&2
     exit 1
 }
+[[ -x "$release_dir/jarvis-config-broker" ]] || {
+    echo "missing executable: $release_dir/jarvis-config-broker" >&2
+    exit 1
+}
 [[ -x "$release_dir/jarvis-agent-bundle" ]] || {
     echo "missing agent-bundle validator: $release_dir/jarvis-agent-bundle" >&2
     exit 1
@@ -131,6 +135,9 @@ install -o root -g root -m 0644 \
     "$repo_dir/deploy/systemd/jarvis-core.service" \
     /etc/systemd/system/jarvis-core.service
 install -o root -g root -m 0644 \
+    "$repo_dir/deploy/systemd/jarvis-config-broker.service" \
+    /etc/systemd/system/jarvis-config-broker.service
+install -o root -g root -m 0644 \
     "$repo_dir/deploy/systemd/jarvis-surrealdb.service" \
     /etc/systemd/system/jarvis-surrealdb.service
 install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
@@ -159,11 +166,13 @@ ln -sfn "$release_dir" /opt/jarvis/current
 
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/jarvis-core.service
+systemd-analyze verify /etc/systemd/system/jarvis-config-broker.service
 systemd-analyze verify /etc/systemd/system/jarvis-surrealdb.service
 systemd-analyze verify /etc/systemd/system/jarvis-updater.service
 systemd-analyze verify /etc/systemd/system/jarvis-updater.timer
 ui_detail "Starting SurrealDB and Jarvis Core …"
 systemctl enable --now jarvis-surrealdb.service
+systemctl enable --now jarvis-config-broker.service
 systemctl enable --now jarvis-core
 
 core_ready=false

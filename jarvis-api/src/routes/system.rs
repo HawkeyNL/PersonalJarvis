@@ -14,15 +14,127 @@ use jarvis_registry as registry;
 use jarvis_selfdev as selfdev;
 use jarvis_usage as usage;
 
+use crate::audit::record_security_event;
 use crate::error::bad_request;
 use crate::metering::record_usage;
 use crate::validation;
 use crate::{AppState, Authed};
 
+/// Forward one typed, signed owner operation to the *local* root broker. The
+/// bearer session only identifies the caller; it cannot authorize anything:
+/// the broker independently validates the Ed25519 signature, owner device,
+/// exact canonical payload, expiry and one-time request ID before mutation.
+pub(crate) async fn system_privileged_config(
+    authed: Authed,
+    State(state): State<AppState>,
+    Json(request): Json<jarvis_privileged::SignedRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if request.user_id != authed.user.id || request.device_id != authed.device.id {
+        record_security_event(
+            &state,
+            Some(authed.device.id),
+            "privileged_config",
+            "denied",
+            Some("principal mismatch"),
+        )
+        .await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"privileged operation denied"})),
+        ));
+    }
+    request
+        .message()
+        .map_err(|_| bad_request("invalid privileged approval"))?;
+    request
+        .reject_if_expired(time::OffsetDateTime::now_utc())
+        .map_err(|_| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"privileged approval expired"})),
+            )
+        })?;
+    let Some(socket) = state.privileged_broker_socket.as_deref() else {
+        record_security_event(
+            &state,
+            Some(authed.device.id),
+            "privileged_config",
+            "denied",
+            Some("broker unavailable"),
+        )
+        .await;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"privileged configuration unavailable"})),
+        ));
+    };
+    let result = forward_to_broker(socket, &request).await;
+    match result {
+        Ok(()) => {
+            record_security_event(
+                &state,
+                Some(authed.device.id),
+                "privileged_config",
+                "forwarded",
+                Some(request.operation.action()),
+            )
+            .await;
+            Ok(Json(json!({"status":"accepted","restart_required":true})))
+        }
+        Err(()) => {
+            record_security_event(
+                &state,
+                Some(authed.device.id),
+                "privileged_config",
+                "denied",
+                Some(request.operation.action()),
+            )
+            .await;
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"privileged operation denied"})),
+            ))
+        }
+    }
+}
+
+async fn forward_to_broker(
+    socket: &str,
+    request: &jarvis_privileged::SignedRequest,
+) -> Result<(), ()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::UnixStream::connect(socket),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    let (read, mut write) = stream.into_split();
+    let encoded = serde_json::to_vec(&json!({"request": request})).map_err(|_| ())?;
+    if encoded.len() > 16 * 1024 {
+        return Err(());
+    }
+    write.write_all(&encoded).await.map_err(|_| ())?;
+    write.write_all(b"\n").await.map_err(|_| ())?;
+    let mut reply = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        BufReader::new(read).read_line(&mut reply),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    (reply.trim() == r#"{"status":"applied"}"#)
+        .then_some(())
+        .ok_or(())
+}
+
 /// This month's LLM spend vs. the budget, with a per-backend breakdown (ADR-027).
 pub(crate) async fn system_usage(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
     let spent_eur = state.spent_cents.load(Ordering::Relaxed) as f64 / 100.0;
     let budget_eur = state.budget_cents as f64 / 100.0;
+    let reservation = state.budget_book.snapshot();
     let breakdown = usage::month_breakdown(&state.db).await.unwrap_or_default();
     let by_backend: Vec<Value> = breakdown
         .into_iter()
@@ -33,6 +145,9 @@ pub(crate) async fn system_usage(_authed: Authed, State(state): State<AppState>)
         "spent_eur": spent_eur,
         "remaining_eur": (budget_eur - spent_eur).max(0.0),
         "over_budget": spent_eur >= budget_eur,
+        "reserved_eur": reservation.reserved_cents as f64 / 100.0,
+        "remaining_hard_eur": reservation.remaining_hard_cents as f64 / 100.0,
+        "above_soft_budget": reservation.above_soft_limit,
         "by_backend": by_backend,
     }))
 }
@@ -57,6 +172,75 @@ pub(crate) async fn system_registry_refresh(
         *reg = fresh.clone();
     }
     Json(serde_json::to_value(&fresh).unwrap_or_else(|_| json!({})))
+}
+
+/// Owner-authenticated, non-secret view of the exact model allowlist.  Mutation
+/// is intentionally root-operated for now; a bearer session alone must not
+/// rewrite Home Node policy or activate paid models.
+pub(crate) async fn system_model_policy(
+    _authed: Authed,
+    State(state): State<AppState>,
+) -> Json<Value> {
+    Json(json!({
+        "version": state.model_policy.version,
+        "models": state.model_policy.models,
+        "mutation": "root-operated: sudo jarvis-models enable|disable",
+    }))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BudgetPreflightReq {
+    provider: String,
+    model: String,
+    input_tokens_per_call: u32,
+    output_tokens_per_call: u32,
+    calls: u32,
+}
+
+/// Bounded owner-visible cost preflight for a planned long task.  It neither
+/// executes work nor enables models; a disabled model cannot be probed into
+/// becoming eligible through this endpoint.
+pub(crate) async fn system_budget_preflight(
+    _authed: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<BudgetPreflightReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if req.provider.len() > 64 || req.model.len() > 256 || req.calls == 0 || req.calls > 10_000 {
+        return Err(bad_request("invalid budget preflight"));
+    }
+    if !state.model_policy.allows(&req.provider, &req.model) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "model is not owner-enabled" })),
+        ));
+    }
+    let estimate = usage::estimate_task_cost_with_registry(
+        &state.pricing_registry,
+        &req.provider,
+        &req.model,
+        req.input_tokens_per_call,
+        req.output_tokens_per_call,
+        req.calls,
+        state.eur_per_usd,
+    );
+    let budget = state.budget_book.snapshot();
+    let high_cents = (estimate.high_eur * 100.0).ceil().max(0.0) as u64;
+    let recommendation = if high_cents > budget.remaining_hard_cents {
+        "do_not_start"
+    } else if budget.above_soft_limit {
+        "proceed_cost_consciously"
+    } else {
+        "proceed"
+    };
+    Ok(Json(json!({
+        "provider": req.provider,
+        "model": req.model,
+        "calls": req.calls,
+        "estimate": estimate,
+        "remaining_hard_eur": budget.remaining_hard_cents as f64 / 100.0,
+        "recommendation": recommendation,
+        "note": "Estimate only; a long-running task requires a bounded reservation and checkpoints before execution.",
+    })))
 }
 
 #[derive(Deserialize)]

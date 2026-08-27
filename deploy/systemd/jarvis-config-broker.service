@@ -1,0 +1,28 @@
+[Unit]
+Description=Jarvis privileged configuration broker
+After=network-online.target jarvis-surrealdb.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=root
+Group=jarvis
+EnvironmentFile=/etc/jarvis/core.env
+ExecStart=/opt/jarvis/current/jarvis-config-broker
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=20s
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+LockPersonality=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ReadWritePaths=/etc/jarvis/model-policy.json /var/lib/jarvis/config-broker /run/jarvis-config-broker
+
+[Install]
+WantedBy=multi-user.target

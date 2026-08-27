@@ -182,6 +182,10 @@ if systemctl restart jarvis-core.service && \
     curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
         --retry 11 --retry-delay 5 --retry-connrefused \
         http://127.0.0.1:8080/readyz >/dev/null; then
+    # The broker resolves its executable through /opt/jarvis/current too, but
+    # must be restarted explicitly so a verified release cannot leave its old
+    # privileged code resident. Absence is tolerated for pre-broker installs.
+    systemctl try-restart jarvis-config-broker.service >/dev/null 2>&1 || true
     echo "jarvis updater: activated $tag"
     exit 0
 fi

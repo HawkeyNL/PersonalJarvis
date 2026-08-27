@@ -8,6 +8,7 @@
 mod anthropic;
 mod claude_cli;
 mod fallback;
+mod model_policy;
 mod ollama;
 mod openai_compat;
 mod router;
@@ -20,10 +21,14 @@ use async_trait::async_trait;
 pub use anthropic::AnthropicProvider;
 pub use claude_cli::ClaudeCliProvider;
 pub use fallback::FallbackProvider;
+pub use model_policy::{ModelAccessEntry, ModelAccessPolicy};
 pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use router::{always_available, Availability, CatalogModel, ModelClass, RouterProvider};
-pub use types::{ChatMessage, ChatReply, ChatRequest, LlmError, Role, Tier, Usage};
+pub use types::{
+    classify_task, ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, Role,
+    RoutingMode, TaskRequirements, Tier, Usage,
+};
 
 /// A swappable brain: given a conversation, produce a reply.
 #[async_trait]
@@ -65,6 +70,13 @@ pub struct ProviderConfig {
     pub openai: OpenAiBackend,
     /// DeepSeek backend (OpenAI-compatible; key + base URL + per-tier models).
     pub deepseek: OpenAiBackend,
+    /// xAI/Grok backend (OpenAI-compatible).
+    pub xai: OpenAiBackend,
+    /// Z.ai/GLM backend (OpenAI-compatible when explicitly configured).
+    pub zai: OpenAiBackend,
+    /// Credentialed remote Ollama API.  This is intentionally distinct from
+    /// the local loopback Ollama provider.
+    pub ollama_cloud: OpenAiBackend,
 }
 
 /// Build the local Ollama brain, if the client constructs (no network yet).
@@ -200,6 +212,23 @@ pub fn build_router(
     availability: Arc<dyn Availability>,
     catalog: Vec<router::CatalogModel>,
 ) -> Arc<dyn LlmProvider> {
+    build_router_with_policy(
+        cfg,
+        availability,
+        catalog,
+        ModelAccessPolicy::deny_by_default(),
+    )
+}
+
+/// Build a router with the explicit owner model allowlist.  A configured API
+/// key is deliberately insufficient: only exact enabled provider/model pairs
+/// can reach a remote provider.
+pub fn build_router_with_policy(
+    cfg: ProviderConfig,
+    availability: Arc<dyn Availability>,
+    catalog: Vec<router::CatalogModel>,
+    model_policy: ModelAccessPolicy,
+) -> Arc<dyn LlmProvider> {
     let mut candidates = Vec::new();
     if let Some(ollama) = build_ollama(&cfg) {
         candidates.push(router::Candidate {
@@ -229,10 +258,35 @@ pub fn build_router(
             provider: anthropic,
         });
     }
+    if let Some(xai) = build_openai_compat("xai", "xai-api", &cfg.xai) {
+        candidates.push(router::Candidate {
+            id: "xai-api".into(),
+            provider: xai,
+        });
+    }
+    if let Some(zai) = build_openai_compat("zai", "zai-api", &cfg.zai) {
+        candidates.push(router::Candidate {
+            id: "zai-api".into(),
+            provider: zai,
+        });
+    }
+    if let Some(ollama_cloud) =
+        build_openai_compat("ollama-cloud", "ollama-cloud", &cfg.ollama_cloud)
+    {
+        candidates.push(router::Candidate {
+            id: "ollama-cloud".into(),
+            provider: ollama_cloud,
+        });
+    }
     if candidates.is_empty() {
         return Arc::new(Unconfigured);
     }
-    Arc::new(RouterProvider::new(candidates, availability, catalog))
+    Arc::new(RouterProvider::with_policy(
+        candidates,
+        availability,
+        catalog,
+        model_policy,
+    ))
 }
 
 /// A brain that always errors — when nothing is configured.
@@ -300,6 +354,7 @@ mod tests {
                 system: None,
                 messages: vec![ChatMessage::user("hoi Jarvis")],
                 tier: Tier::Default,
+                mode: RoutingMode::Auto,
                 max_tokens: 64,
                 model: None,
             })
@@ -324,6 +379,9 @@ mod tests {
             claude_cli_bin: "claude".into(),
             openai: OpenAiBackend::default(),
             deepseek: OpenAiBackend::default(),
+            xai: OpenAiBackend::default(),
+            zai: OpenAiBackend::default(),
+            ollama_cloud: OpenAiBackend::default(),
         });
         // With no API key, this resolves to the Ollama-only brain.
         assert_eq!(brain.label(), "ollama:llama3.2");
@@ -343,6 +401,9 @@ mod tests {
             claude_cli_bin: "claude".into(),
             openai: OpenAiBackend::default(),
             deepseek: OpenAiBackend::default(),
+            xai: OpenAiBackend::default(),
+            zai: OpenAiBackend::default(),
+            ollama_cloud: OpenAiBackend::default(),
         });
         // CLI primary, API as the fallback ("vangnet als de CLI vol is").
         assert_eq!(
@@ -365,6 +426,9 @@ mod tests {
             claude_cli_bin: "claude".into(),
             openai: OpenAiBackend::default(),
             deepseek: OpenAiBackend::default(),
+            xai: OpenAiBackend::default(),
+            zai: OpenAiBackend::default(),
+            ollama_cloud: OpenAiBackend::default(),
         });
         // Registry-aware router over local + plan + API, in fixed id order.
         assert_eq!(brain.label(), "router[ollama,claude-cli,anthropic-api]");
