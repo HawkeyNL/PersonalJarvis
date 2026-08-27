@@ -13,9 +13,14 @@ services:
     # RocksDB needs a writable data directory. The container itself gets no
     # Docker socket, host network, capabilities, or privileged mode.
     user: "0:0"
-    command: >-
-      start --bind 0.0.0.0:8000 --user ${SURREAL_ROOT_USER:?set root user}
-      --pass ${SURREAL_ROOT_PASSWORD:?set root password} rocksdb:/data/jarvis.db
+    # The official image is intentionally shell-less. Keep root credentials in
+    # the container environment so the `/surreal sql` provisioning invocation
+    # inherits them without putting either password in `docker exec` argv.
+    environment:
+      SURREAL_BIND: 0.0.0.0:8000
+      SURREAL_USER: ${SURREAL_ROOT_USER:?set root user}
+      SURREAL_PASS: ${SURREAL_ROOT_PASSWORD:?set root password}
+    command: start rocksdb:/data/jarvis.db
     ports:
       - "127.0.0.1:8000:8000"
     volumes:

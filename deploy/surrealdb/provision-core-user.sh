@@ -55,25 +55,21 @@ if [[ -e $marker ]]; then
 fi
 
 core_password=$(openssl rand -base64 48)
+[[ $core_password =~ ^[A-Za-z0-9+/=]+$ ]] || fail "generated Core password has an unsafe format"
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 compose_file=${JARVIS_SURREALDB_COMPOSE_FILE:-/opt/jarvis/surrealdb/docker-compose.yml}
 [[ -f $compose_file ]] || compose_file="$repo_dir/deploy/surrealdb/docker-compose.yml"
 
-# The credentials travel only through the container's short-lived environment,
-# never through host argv or a shell history. The generated base64 password
-# contains no quote characters, so it is safe in this fixed SQL literal.
-# This statement creates exactly the database-scoped EDITOR account required by
-# current Core.
-docker compose --env-file "$env_file" -f "$compose_file" exec -T \
-    -e SURREAL_ROOT_PASSWORD="$SURREAL_ROOT_PASSWORD" \
-    -e JARVIS_CORE_DATABASE_PASSWORD="$core_password" surrealdb \
-    sh -ceu '
-        printf "DEFINE USER %s ON DATABASE PASSWORD '\''%s'\'' ROLES EDITOR;\\n" \
-          "$1" "$JARVIS_CORE_DATABASE_PASSWORD" \
-          | /surreal sql --hide-welcome --endpoint ws://127.0.0.1:8000 \
-              --username root --password "$SURREAL_ROOT_PASSWORD" --auth-level root \
-              --namespace "$2" --database "$3" >/dev/null
-    ' sh "$username" "$namespace" "$database"
+# The root credential is inherited from the root-managed container environment;
+# it is not sent with docker exec and therefore never appears in host argv. The
+# generated base64 password contains no quote characters, so it is safe in this
+# fixed SQL literal. Feed the statement through stdin directly to the official,
+# shell-less image's `/surreal sql` binary. This creates exactly the
+# database-scoped EDITOR account required by current Core.
+printf "DEFINE USER %s ON DATABASE PASSWORD '%s' ROLES EDITOR;\\n" "$username" "$core_password" \
+    | docker compose --env-file "$env_file" -f "$compose_file" exec -T surrealdb \
+        /surreal sql --hide-welcome --endpoint ws://127.0.0.1:8000 \
+            --auth-level root --namespace "$namespace" --database "$database" >/dev/null
 
 umask 077
 printf '%s' "$core_password" > "$password_file"
