@@ -157,6 +157,12 @@ install -o root -g root -m 0644 \
 install -o root -g root -m 0644 \
     "$repo_dir/deploy/systemd/jarvis-updater.timer" \
     /etc/systemd/system/jarvis-updater.timer
+install -o root -g root -m 0644 \
+    "$repo_dir/deploy/systemd/jarvis-private-agent-updater.service" \
+    /etc/systemd/system/jarvis-private-agent-updater.service
+install -o root -g root -m 0644 \
+    "$repo_dir/deploy/systemd/jarvis-private-agent-updater.timer" \
+    /etc/systemd/system/jarvis-private-agent-updater.timer
 
 # A release is immutable: the unprivileged service cannot modify its binary or
 # Core persona even if an application-level control were bypassed.

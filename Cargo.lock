@@ -2030,6 +2030,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "jarvis-agent",
+ "jarvis-codex",
  "jarvis-config",
  "jarvis-core",
  "jarvis-ibkr",

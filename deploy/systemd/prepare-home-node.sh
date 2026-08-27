@@ -56,6 +56,9 @@ for helper in install-private-config.sh install-agent-bundle.sh; do
         "/usr/local/libexec/jarvis/${helper%.sh}"
 done
 install -o root -g root -m 0755 \
+    "$repo_dir/deploy/private/jarvis-private-agent-poll.sh" \
+    /usr/local/libexec/jarvis/private-agent-poll
+install -o root -g root -m 0755 \
     "$repo_dir/deploy/private/jarvis-private-update.sh" \
     /usr/local/sbin/jarvis-private-update
 

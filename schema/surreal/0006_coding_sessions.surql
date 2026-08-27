@@ -1,0 +1,14 @@
+BEGIN TRANSACTION;
+DEFINE TABLE IF NOT EXISTS coding_sessions SCHEMAFULL PERMISSIONS NONE;
+DEFINE FIELD IF NOT EXISTS id ON coding_sessions TYPE string;
+DEFINE FIELD IF NOT EXISTS user_id ON coding_sessions TYPE string;
+DEFINE FIELD IF NOT EXISTS repository ON coding_sessions TYPE string;
+DEFINE FIELD IF NOT EXISTS base_revision ON coding_sessions TYPE string;
+DEFINE FIELD IF NOT EXISTS objective ON coding_sessions TYPE string;
+DEFINE FIELD IF NOT EXISTS state ON coding_sessions TYPE string ASSERT $value IN ['active','suspended','completed','cancelled','archived'];
+DEFINE FIELD IF NOT EXISTS checkpoint ON coding_sessions TYPE option<object>;
+DEFINE FIELD IF NOT EXISTS created_at ON coding_sessions TYPE datetime;
+DEFINE FIELD IF NOT EXISTS updated_at ON coding_sessions TYPE datetime;
+DEFINE INDEX IF NOT EXISTS coding_sessions_user_updated ON coding_sessions FIELDS user_id, updated_at;
+UPDATE schema_version:baseline SET version = 6, applied_at = time::now();
+COMMIT TRANSACTION;

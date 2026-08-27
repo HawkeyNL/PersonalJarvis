@@ -1,0 +1,9 @@
+[Unit]
+Description=Poll trusted PersonalJarvisAgents main
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=15m
+RandomizedDelaySec=60
+Persistent=true
+[Install]
+WantedBy=timers.target

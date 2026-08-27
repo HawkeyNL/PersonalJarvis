@@ -1,0 +1,13 @@
+[Unit]
+Description=Jarvis private agent bundle updater
+After=network-online.target
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/jarvis/private-agent-updater.env
+ExecStart=/usr/local/libexec/jarvis/private-agent-poll
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/jarvis/agents

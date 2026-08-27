@@ -60,7 +60,7 @@ thiserror = "1"
 
 # ids and time
 uuid = { version = "1", features = ["v7", "serde"] }
-time = { version = "0.3", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 
 # decimal money (never floats for money)
 rust_decimal = { version = "1", features = ["serde-str"] }

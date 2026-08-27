@@ -46,6 +46,7 @@ jarvis-selfdev.workspace = true
 jarvis-store.workspace = true
 jarvis-core.workspace = true
 jarvis-privileged.workspace = true
+jarvis-codex.workspace = true
 rust_decimal.workspace = true
 rand.workspace = true
 time.workspace = true
