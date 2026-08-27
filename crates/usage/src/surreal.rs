@@ -58,3 +58,44 @@ pub async fn month_breakdown(
         .map(|row| (row.backend, row.total.unwrap_or(0.0)))
         .collect())
 }
+
+/// Persist a bounded long-task projection.  The Home Node's process-local gate
+/// rejects concurrent oversubscription during execution; this durable record
+/// makes crash recovery and stale-reservation cleanup observable.
+pub async fn reserve_task(
+    db: &Database,
+    task_id: &str,
+    user_id: Option<&str>,
+    projected_cents: u64,
+    ttl_seconds: u64,
+) -> Result<(), jarvis_store::StoreError> {
+    db.query(
+        "CREATE llm_budget_reservations SET id = $id, task_id = $task_id, user_id = $user_id, \
+         projected_cents = $projected_cents, status = 'active', created_at = time::now(), \
+         expires_at = time::now() + <duration>$ttl RETURN NONE",
+    )
+    .bind(json!({
+        "id": Uuid::now_v7().to_string(), "task_id": task_id, "user_id": user_id,
+        "projected_cents": projected_cents as i64, "ttl": format!("{}s", ttl_seconds),
+    }))
+    .await
+    .map_err(jarvis_store::StoreError::schema)?
+    .check()
+    .map_err(jarvis_store::StoreError::schema)?;
+    Ok(())
+}
+
+/// Idempotently releases a reservation; an expired/released task can never be
+/// revived by this helper.
+pub async fn release_task(db: &Database, task_id: &str) -> Result<(), jarvis_store::StoreError> {
+    db.query(
+        "UPDATE llm_budget_reservations SET status = 'released', released_at = time::now() \
+         WHERE task_id = $task_id AND status = 'active' RETURN NONE",
+    )
+    .bind(json!({ "task_id": task_id }))
+    .await
+    .map_err(jarvis_store::StoreError::schema)?
+    .check()
+    .map_err(jarvis_store::StoreError::schema)?;
+    Ok(())
+}

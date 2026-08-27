@@ -137,7 +137,7 @@ pub struct UsageEntry {
 
 /// SurrealDB persistence functions. Failures remain best-effort at the caller,
 /// so metering cannot break an assistant reply.
-pub use surreal::{month_breakdown, month_total_eur, record};
+pub use surreal::{month_breakdown, month_total_eur, record, release_task, reserve_task};
 
 /// EUR-cent limits for the current calendar month.  Zero is a real hard stop,
 /// never an implicit unlimited budget.

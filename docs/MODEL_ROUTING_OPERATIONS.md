@@ -63,9 +63,11 @@ with a soft threshold for cost-aware selection and a per-request hard cap.
 
 The current in-process reservation gate prevents concurrent requests from
 oversubscribing the Home Node's configured monthly ceiling and reconciles with
-durable SurrealDB usage after replies. Long-running multi-agent jobs remain
-owner-approved work: do not treat the generic chat endpoint as an unrestricted
-background spend executor.
+durable SurrealDB usage after replies. Long-task projections are also retained
+in the private `llm_budget_reservations` table with an expiry/release lifecycle,
+so a restart cannot silently turn a reservation into permanent spend state.
+Long-running multi-agent jobs remain owner-approved work: do not treat the
+generic chat endpoint as an unrestricted background spend executor.
 
 ## Security notes
 
