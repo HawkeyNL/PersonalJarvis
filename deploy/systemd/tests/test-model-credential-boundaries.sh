@@ -8,11 +8,20 @@ credentials="$repo_dir/deploy/systemd/jarvis-credentials.sh"
 models="$repo_dir/deploy/systemd/jarvis-models.sh"
 unit="$repo_dir/deploy/systemd/jarvis-core.service"
 prepare="$repo_dir/deploy/systemd/prepare-home-node.sh"
+pricing="$repo_dir/deploy/systemd/pricing-registry.json"
 
 for file in "$credentials" "$models" "$unit" "$prepare"; do
     [[ -f $file ]] || { echo "missing model security asset: $file" >&2; exit 1; }
 done
+[[ -f $pricing ]] || { echo "missing pricing registry fixture" >&2; exit 1; }
 bash -n "$credentials" "$models" "$prepare"
+jq -e '
+  .version == 1
+  and (.source | type == "string" and length > 0)
+  and (.updated_at | type == "string" and length > 0)
+  and (.models | type == "array" and length > 0)
+  and all(.models[]; (.provider | type == "string" and length > 0) and (.model | type == "string" and length > 0) and (.input_per_million_usd >= 0) and (.output_per_million_usd >= 0))
+' "$pricing" >/dev/null
 
 # Credentials require a TTY, use hidden input, and are never accepted through
 # argv/stdin.  The secret variable must not be printed or passed to curl.
@@ -51,6 +60,8 @@ if grep -Eq 'curl[[:space:]].*-H[[:space:]]+.*Authorization' "$models"; then
     exit 1
 fi
 grep -Fq '/etc/jarvis/secrets' "$prepare"
+grep -Fq '/etc/jarvis/pricing-registry.json' "$prepare"
+grep -Fq '[[ ! -e /etc/jarvis/pricing-registry.json ]]' "$prepare"
 
 for provider in anthropic openai deepseek xai zai ollama-cloud; do
     grep -Fq "EnvironmentFile=-/etc/jarvis/secrets/$provider.env" "$unit"
