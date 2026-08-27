@@ -216,6 +216,7 @@ run_updater --version v7.0.1
 # Rollback may only select an already verified release below the managed root.
 seed_active_release v8.0.1 "$same_migrations"
 write_release /opt/jarvis/releases v8.0.0 "$same_migrations"
+mv /opt/jarvis/releases/jarvis-core-v8.0.0 /opt/jarvis/releases/v8.0.0
 run_updater --rollback
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.0.0 ]]
 
