@@ -4,13 +4,15 @@
 //! evaluates owner input as a shell command and it is not exposed by the API.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     ffi::OsStr,
     fs::{self, File, OpenOptions},
-    io::{self, IsTerminal, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitStatus, Stdio},
+    sync::mpsc,
+    thread,
 };
 
 use anyhow::{bail, Context, Result};
@@ -23,7 +25,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph, Row, Table},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const RELEASES_ROOT: &str = "/opt/jarvis/releases";
 const CURRENT_RELEASE: &str = "/opt/jarvis/current";
@@ -258,11 +260,11 @@ fn run() -> Result<()> {
         Commands::Version => version(&presentation),
         Commands::Status => status(&presentation),
         Commands::Health => health(&presentation, cli.verbose),
-        Commands::Logs(args) => logs(args),
-        Commands::Update(args) => update(args, cli.verbose),
+        Commands::Logs(args) => logs(args, &presentation),
+        Commands::Update(args) => update(args, &presentation, cli.verbose),
         Commands::MigrateInstalledTooling => migrate_installed_tooling(),
-        Commands::Models(args) => models(args, cli.verbose),
-        Commands::Credentials(args) => credentials(args, cli.verbose),
+        Commands::Models(args) => models(args, &presentation, cli.verbose),
+        Commands::Credentials(args) => credentials(args, &presentation, cli.verbose),
         Commands::Agents(args) => agents(args, &presentation, cli.verbose),
         Commands::Services {
             command: ServicesCommand::Status,
@@ -474,12 +476,49 @@ fn render_compact_status(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn table_tui(title: &str, headers: Vec<String>, rows: Vec<Vec<String>>) -> Result<()> {
+    ratatui::run(|terminal| -> io::Result<()> {
+        loop {
+            terminal.draw(|frame| {
+                let area = frame.area();
+                let column_count = headers.len().max(1) as u16;
+                let widths = vec![Constraint::Ratio(1, column_count.into()); headers.len()];
+                let block = Block::default()
+                    .title(format!(" {title} · q / Esc to close "))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan));
+                let table_rows = rows.iter().map(|row| Row::new(row.clone()));
+                frame.render_widget(
+                    Table::new(table_rows, widths)
+                        .header(Row::new(headers.clone()).style(Style::default().fg(Color::Cyan)))
+                        .block(block),
+                    area,
+                );
+            })?;
+            if event::poll(std::time::Duration::from_millis(250))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press
+                        && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                            || (key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)))
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    })
+    .map_err(Into::into)
+}
+
 fn status_report() -> Result<StatusReport> {
     let mut services = BTreeMap::new();
     for (label, unit) in [
         ("Core", "jarvis-core.service"),
         ("SurrealDB", "jarvis-surrealdb.service"),
         ("Config broker", "jarvis-config-broker.service"),
+        ("Codex broker", "jarvis-codex-broker.service"),
         ("OpenSandbox", "jarvis-opensandbox.service"),
     ] {
         services.insert(label, systemctl_state("is-active", unit));
@@ -534,12 +573,40 @@ fn active_bundle() -> Result<Option<AgentBundle>> {
 }
 
 fn health(presentation: &Presentation, verbose: bool) -> Result<()> {
+    if presentation.json {
+        let mut command = trusted_command(Path::new(LIBEXEC).join("verify-home-node"));
+        let output = command
+            .stdin(Stdio::null())
+            .output()
+            .context("start trusted health verifier")?;
+        if !output.status.success() {
+            io::stderr().write_all(&output.stderr)?;
+            return ensure_success(output.status);
+        }
+        println!("{}", serde_json::json!({"healthy": true}));
+        return Ok(());
+    }
     presentation.intro("Jarvis Home Node health");
     run_program(
         Path::new(LIBEXEC).join("verify-home-node"),
         std::iter::empty::<&str>(),
         SubprocessMode::from_verbose(verbose),
     )?;
+    if presentation.interactive && io::stdin().is_terminal() {
+        let report = status_report()?;
+        let mut rows: Vec<Vec<String>> = report
+            .services
+            .into_iter()
+            .map(|(name, state)| vec![name.to_owned(), state])
+            .collect();
+        rows.push(vec!["Deployment verifier".to_owned(), "passed".to_owned()]);
+        rows.push(vec!["Updater".to_owned(), report.updater_enabled]);
+        return table_tui(
+            "Jarvis Health",
+            vec!["Check".to_owned(), "Result".to_owned()],
+            rows,
+        );
+    }
     presentation.outro("Health verification passed");
     Ok(())
 }
@@ -548,18 +615,54 @@ fn services(presentation: &Presentation) -> Result<()> {
     status(presentation)
 }
 
-fn logs(args: LogsArgs) -> Result<()> {
+fn logs(args: LogsArgs, presentation: &Presentation) -> Result<()> {
     let mut command = trusted_command("journalctl");
     command
         .args(["--no-pager", "-u", args.target.unit(), "-n"])
         .arg(args.lines.to_string());
     if args.follow {
+        if presentation.json {
+            bail!("--json cannot be combined with streaming logs --follow");
+        }
         command.arg("-f");
     }
-    run_command(&mut command, SubprocessMode::InheritedInteractive)
+    if presentation.json {
+        let output = command.output().context("read allowlisted Jarvis logs")?;
+        ensure_success(output.status)?;
+        let lines: Vec<_> = String::from_utf8(output.stdout)?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "unit": args.target.unit(),
+                "lines": lines
+            }))?
+        );
+        Ok(())
+    } else if presentation.interactive && io::stdin().is_terminal() {
+        if args.follow {
+            run_process_tui(
+                &mut command,
+                "Jarvis Logs",
+                format!("Following {}…", args.target.unit()),
+            )
+        } else {
+            let output = command.output().context("read allowlisted Jarvis logs")?;
+            ensure_success(output.status)?;
+            let rows = String::from_utf8(output.stdout)?
+                .lines()
+                .map(|line| vec![line.to_owned()])
+                .collect();
+            table_tui("Jarvis Logs", vec![args.target.unit().to_owned()], rows)
+        }
+    } else {
+        run_command(&mut command, SubprocessMode::InheritedInteractive)
+    }
 }
 
-fn update(args: UpdateArgs, verbose: bool) -> Result<()> {
+fn update(args: UpdateArgs, presentation: &Presentation, verbose: bool) -> Result<()> {
     // The narrowly scoped updater helper owns the same lock and release
     // transaction until its migration is complete.  Taking it here would
     // deadlock the child; no second update policy is introduced.
@@ -579,7 +682,113 @@ fn update(args: UpdateArgs, verbose: bool) -> Result<()> {
     } else {
         command.arg("--latest");
     }
-    run_command(&mut command, SubprocessMode::from_verbose(verbose))
+    if presentation.json {
+        if !(args.check || args.status) {
+            bail!("--json is supported only for non-mutating update --check/--status");
+        }
+        let mode = if args.check { "check" } else { "status" };
+        let output = command.output().context("start trusted updater")?;
+        if !output.status.success() && !(args.check && output.status.code() == Some(2)) {
+            io::stderr().write_all(&output.stderr)?;
+            return ensure_success(output.status);
+        }
+        let values = parse_key_value_output(&String::from_utf8(output.stdout)?)?;
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({"mode": mode, "values": values}))?
+        );
+        Ok(())
+    } else if presentation.interactive && io::stdin().is_terminal() && !verbose {
+        run_process_tui(
+            &mut command,
+            "Jarvis Update",
+            "Starting verified update transaction…".to_owned(),
+        )
+    } else {
+        run_command(&mut command, SubprocessMode::from_verbose(verbose))
+    }
+}
+
+fn run_process_tui(command: &mut ProcessCommand, title: &str, initial: String) -> Result<()> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("start trusted updater")?;
+    let (sender, receiver) = mpsc::channel::<String>();
+    if let Some(stdout) = child.stdout.take() {
+        forward_update_lines(stdout, sender.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        forward_update_lines(stderr, sender.clone());
+    }
+    drop(sender);
+    let terminal_result = ratatui::run(|terminal| -> io::Result<ExitStatus> {
+        let mut messages = VecDeque::from([initial]);
+        let spinner = ["◐", "◓", "◑", "◒"];
+        let mut tick = 0usize;
+        loop {
+            while let Ok(message) = receiver.try_recv() {
+                if messages.len() == 12 {
+                    messages.pop_front();
+                }
+                messages.push_back(message);
+            }
+            terminal.draw(|frame| {
+                let block = Block::default()
+                    .title(format!(
+                        " {title} {} · Esc/Ctrl-C to stop ",
+                        spinner[tick % spinner.len()]
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan));
+                frame.render_widget(
+                    Paragraph::new(messages.iter().cloned().collect::<Vec<_>>().join("\n"))
+                        .block(block),
+                    frame.area(),
+                );
+            })?;
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if event::poll(std::time::Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press
+                        && (key.code == KeyCode::Esc
+                            || (key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)))
+                    {
+                        child.kill()?;
+                        let _ = child.wait();
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "operation cancelled by owner",
+                        ));
+                    }
+                }
+            }
+            tick = tick.wrapping_add(1);
+        }
+    });
+    let status = match terminal_result {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("interactive terminal operation failed");
+        }
+    };
+    ensure_success(status)
+}
+
+fn forward_update_lines<R: Read + Send + 'static>(stream: R, sender: mpsc::Sender<String>) {
+    thread::spawn(move || {
+        for line in io::BufReader::new(stream).lines().map_while(Result::ok) {
+            let _ = sender.send(line);
+        }
+    });
 }
 
 /// Complete the only unavoidable legacy boundary: a v0.0.10 updater can
@@ -599,15 +808,31 @@ fn migrate_installed_tooling() -> Result<()> {
             bail!("versioned tooling is unsafe or not executable");
         }
     }
-    atomic_install(&admin, Path::new("/usr/local/sbin/jarvis"))?;
     fs::create_dir_all(LIBEXEC).context("create privileged helper directory")?;
-    atomic_install(&updater, &Path::new(LIBEXEC).join("update-core-release"))?;
-    ensure_updater_config()?;
+    // Validate/create trusted configuration before changing either executable.
+    // A configuration failure therefore cannot leave a partially migrated CLI.
+    let updater_config_created = ensure_updater_config()?;
+    if let Err(error) = install_tooling_pair(
+        &admin,
+        Path::new("/usr/local/sbin/jarvis"),
+        &updater,
+        &Path::new(LIBEXEC).join("update-core-release"),
+    ) {
+        rollback_new_updater_config(updater_config_created, Path::new("/etc/jarvis/updater.env"))?;
+        return Err(error);
+    }
     println!("jarvis: installed tooling migrated from verified active release");
     Ok(())
 }
 
-fn atomic_install(source: &Path, destination: &Path) -> Result<()> {
+fn rollback_new_updater_config(created: bool, path: &Path) -> Result<()> {
+    if created {
+        fs::remove_file(path).context("roll back newly created updater configuration")?;
+    }
+    Ok(())
+}
+
+fn stage_executable(source: &Path, destination: &Path) -> Result<PathBuf> {
     let parent = destination
         .parent()
         .context("tooling destination has no parent")?;
@@ -618,13 +843,87 @@ fn atomic_install(source: &Path, destination: &Path) -> Result<()> {
             .and_then(OsStr::to_str)
             .unwrap_or("jarvis")
     ));
+    if temporary.exists() {
+        fs::remove_file(&temporary).context("remove stale tooling stage")?;
+    }
     fs::copy(source, &temporary).context("stage versioned tooling")?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))?;
-    fs::rename(&temporary, destination).context("activate versioned tooling")?;
+    Ok(temporary)
+}
+
+fn backup_tool(destination: &Path) -> Result<Option<PathBuf>> {
+    let metadata = match fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect installed tooling"),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("installed tooling destination is unsafe");
+    }
+    let backup = destination.with_file_name(format!(
+        ".{}.previous",
+        destination
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("jarvis")
+    ));
+    if backup.exists() {
+        fs::remove_file(&backup).context("remove stale tooling backup")?;
+    }
+    fs::copy(destination, &backup).context("backup installed tooling")?;
+    fs::set_permissions(&backup, fs::Permissions::from_mode(0o755))?;
+    Ok(Some(backup))
+}
+
+fn restore_tool(destination: &Path, backup: Option<&Path>) -> Result<()> {
+    if let Some(backup) = backup {
+        fs::rename(backup, destination).context("restore installed tooling")?;
+    } else if destination.exists() {
+        fs::remove_file(destination).context("remove newly installed tooling")?;
+    }
     Ok(())
 }
 
-fn ensure_updater_config() -> Result<()> {
+fn install_tooling_pair(
+    admin_source: &Path,
+    admin_destination: &Path,
+    updater_source: &Path,
+    updater_destination: &Path,
+) -> Result<()> {
+    let admin_stage = stage_executable(admin_source, admin_destination)?;
+    let updater_stage = stage_executable(updater_source, updater_destination)?;
+    let admin_backup = backup_tool(admin_destination)?;
+    let updater_backup = backup_tool(updater_destination)?;
+
+    if let Err(error) = fs::rename(&updater_stage, updater_destination) {
+        let _ = fs::remove_file(&admin_stage);
+        let _ = fs::remove_file(&updater_stage);
+        if let Some(backup) = admin_backup.as_deref() {
+            let _ = fs::remove_file(backup);
+        }
+        if let Some(backup) = updater_backup.as_deref() {
+            let _ = fs::remove_file(backup);
+        }
+        bail!("activate versioned updater: {error}");
+    }
+    if let Err(error) = fs::rename(&admin_stage, admin_destination) {
+        restore_tool(updater_destination, updater_backup.as_deref())?;
+        let _ = fs::remove_file(&admin_stage);
+        if let Some(backup) = admin_backup.as_deref() {
+            let _ = fs::remove_file(backup);
+        }
+        bail!("activate versioned admin CLI: {error}; updater restored");
+    }
+    if let Some(backup) = admin_backup {
+        let _ = fs::remove_file(backup);
+    }
+    if let Some(backup) = updater_backup {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
+}
+
+fn ensure_updater_config() -> Result<bool> {
     let path = Path::new("/etc/jarvis/updater.env");
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -636,7 +935,7 @@ fn ensure_updater_config() -> Result<()> {
                 bail!("existing updater configuration permissions are unsafe");
             }
             parse_updater_config(&fs::read_to_string(path).context("read updater configuration")?)?;
-            return Ok(());
+            return Ok(false);
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("inspect updater configuration"),
@@ -649,10 +948,96 @@ fn ensure_updater_config() -> Result<()> {
     )?;
     fs::set_permissions(temporary, fs::Permissions::from_mode(0o600))?;
     fs::rename(temporary, path).context("activate updater configuration")?;
-    Ok(())
+    Ok(true)
 }
 
-fn models(args: ModelsArgs, verbose: bool) -> Result<()> {
+#[derive(Debug, Deserialize, Serialize)]
+struct ModelPolicy {
+    version: u8,
+    models: Vec<ModelRecord>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ModelRecord {
+    provider: String,
+    model: String,
+    enabled: bool,
+    source: String,
+}
+
+fn read_model_policy() -> Result<ModelPolicy> {
+    let path = Path::new("/etc/jarvis/model-policy.json");
+    let metadata = fs::symlink_metadata(path).context("inspect model policy")?;
+    let config_directory =
+        fs::symlink_metadata("/etc/jarvis").context("inspect config directory")?;
+    if metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.gid() != config_directory.gid()
+        || metadata.permissions().mode() & 0o777 != 0o640
+    {
+        bail!("model policy permissions are unsafe");
+    }
+    let policy: ModelPolicy =
+        serde_json::from_slice(&fs::read(path).context("read model policy")?)?;
+    if policy.version != 1 {
+        bail!("unsupported model policy version");
+    }
+    Ok(policy)
+}
+
+fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Result<()> {
+    if presentation.json
+        && !matches!(
+            &args.command,
+            ModelsCommand::List { .. } | ModelsCommand::Show { .. }
+        )
+    {
+        bail!("--json is supported only for read-only models list/show");
+    }
+    if let ModelsCommand::List { provider } = &args.command {
+        let mut policy = read_model_policy()?;
+        if let Some(provider) = provider {
+            policy
+                .models
+                .retain(|model| model.provider == provider.as_str());
+        }
+        if presentation.json {
+            println!("{}", serde_json::to_string(&policy)?);
+        } else if presentation.interactive && io::stdin().is_terminal() {
+            let rows = policy
+                .models
+                .into_iter()
+                .map(|model| {
+                    vec![
+                        model.provider,
+                        model.model,
+                        if model.enabled { "yes" } else { "no" }.to_owned(),
+                        model.source,
+                    ]
+                })
+                .collect();
+            return table_tui(
+                "Jarvis Models",
+                ["Provider", "Model", "Enabled", "Source"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                rows,
+            );
+        } else {
+            println!("{:<16} {:<36} {:<8} SOURCE", "PROVIDER", "MODEL", "ENABLED");
+            for model in policy.models {
+                println!(
+                    "{:<16} {:<36} {:<8} {}",
+                    model.provider,
+                    model.model,
+                    if model.enabled { "yes" } else { "no" },
+                    model.source
+                );
+            }
+        }
+        return Ok(());
+    }
     let arguments: Vec<String> = match args.command {
         ModelsCommand::Refresh { provider } => vec!["refresh".to_owned()]
             .into_iter()
@@ -672,13 +1057,98 @@ fn models(args: ModelsArgs, verbose: bool) -> Result<()> {
             vec!["show".to_owned(), provider.as_str().to_owned(), model.0]
         }
     };
-    compatibility_helper("jarvis-models", arguments, verbose)
+    compatibility_helper("jarvis-models", arguments, presentation, verbose, true)
 }
 
-fn credentials(args: CredentialsArgs, verbose: bool) -> Result<()> {
+#[derive(Debug, Serialize)]
+struct CredentialStatus {
+    provider: &'static str,
+    configured: bool,
+}
+
+fn credential_statuses() -> Vec<CredentialStatus> {
+    let expected_group = fs::symlink_metadata("/etc/jarvis/secrets")
+        .ok()
+        .map(|metadata| metadata.gid());
+    [
+        "anthropic",
+        "openai",
+        "deepseek",
+        "xai",
+        "zai",
+        "ollama-cloud",
+    ]
+    .into_iter()
+    .map(|provider| {
+        let path = Path::new("/etc/jarvis/secrets").join(format!("{provider}.env"));
+        let configured = fs::symlink_metadata(path).is_ok_and(|metadata| {
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == 0
+                && Some(metadata.gid()) == expected_group
+                && metadata.permissions().mode() & 0o777 == 0o640
+        });
+        CredentialStatus {
+            provider,
+            configured,
+        }
+    })
+    .collect()
+}
+
+fn credentials(args: CredentialsArgs, presentation: &Presentation, verbose: bool) -> Result<()> {
+    if presentation.json && !matches!(&args.command, CredentialsCommand::List) {
+        bail!("--json is supported only for read-only credentials list");
+    }
+    if matches!(&args.command, CredentialsCommand::List) {
+        let statuses = credential_statuses();
+        if presentation.json {
+            println!("{}", serde_json::to_string(&statuses)?);
+        } else if presentation.interactive && io::stdin().is_terminal() {
+            let mut rows: Vec<Vec<String>> = statuses
+                .into_iter()
+                .map(|status| {
+                    vec![
+                        status.provider.to_owned(),
+                        if status.configured {
+                            "configured"
+                        } else {
+                            "not-configured"
+                        }
+                        .to_owned(),
+                    ]
+                })
+                .collect();
+            rows.push(vec![
+                "ollama-local".to_owned(),
+                "no credential required".to_owned(),
+            ]);
+            return table_tui(
+                "Jarvis Credentials",
+                vec!["Provider".to_owned(), "Status".to_owned()],
+                rows,
+            );
+        } else {
+            println!("{:<16} STATUS", "PROVIDER");
+            for status in statuses {
+                println!(
+                    "{:<16} {}",
+                    status.provider,
+                    if status.configured {
+                        "configured"
+                    } else {
+                        "not-configured"
+                    }
+                );
+            }
+            println!("{:<16} no credential required", "ollama-local");
+        }
+        return Ok(());
+    }
     // Compatibility boundary: the helper owns only protected file mechanics and
     // reads secrets directly from /dev/tty. Rust deliberately inherits that
     // controlling TTY; it never captures, receives, or logs a credential.
+    let tui_safe = matches!(&args.command, CredentialsCommand::Test { .. });
     let arguments = match args.command {
         CredentialsCommand::List => vec!["list".to_owned()],
         CredentialsCommand::Set { provider } => {
@@ -691,10 +1161,22 @@ fn credentials(args: CredentialsArgs, verbose: bool) -> Result<()> {
             vec!["remove".to_owned(), provider.as_str().to_owned()]
         }
     };
-    compatibility_helper("jarvis-credentials", arguments, verbose)
+    compatibility_helper(
+        "jarvis-credentials",
+        arguments,
+        presentation,
+        verbose,
+        tui_safe,
+    )
 }
 
-fn compatibility_helper(name: &str, args: Vec<String>, verbose: bool) -> Result<()> {
+fn compatibility_helper(
+    name: &str,
+    args: Vec<String>,
+    presentation: &Presentation,
+    verbose: bool,
+    tui_safe: bool,
+) -> Result<()> {
     let allowed = matches!(name, "jarvis-models" | "jarvis-credentials");
     if !allowed {
         bail!("unsupported internal helper");
@@ -703,15 +1185,32 @@ fn compatibility_helper(name: &str, args: Vec<String>, verbose: bool) -> Result<
     let _lock = lock;
     let mut command = trusted_command(Path::new(SBIN).join(name));
     command.args(args);
-    run_command(&mut command, SubprocessMode::from_verbose(verbose))
+    if tui_safe && presentation.interactive && io::stdin().is_terminal() && !verbose {
+        run_process_tui(
+            &mut command,
+            "Jarvis Administration",
+            "Executing typed protected operation…".to_owned(),
+        )
+    } else {
+        run_command(&mut command, SubprocessMode::from_verbose(verbose))
+    }
 }
 
 fn agents(args: AgentsArgs, presentation: &Presentation, verbose: bool) -> Result<()> {
+    if presentation.json && !matches!(&args.command, AgentsCommand::Status) {
+        bail!("--json is supported only for read-only agents status");
+    }
     match args.command {
         AgentsCommand::Status => {
             let bundle = active_bundle()?.context("no active private agent bundle")?;
             if presentation.json {
                 println!("{}", serde_json::to_string(&bundle)?);
+            } else if presentation.interactive && io::stdin().is_terminal() {
+                return table_tui(
+                    "Jarvis Agents",
+                    vec!["Bundle".to_owned(), "Agents".to_owned()],
+                    vec![vec![bundle.id, bundle.agent_count.to_string()]],
+                );
             } else {
                 println!(
                     "Agent bundle: {} ({} agents)",
@@ -720,22 +1219,38 @@ fn agents(args: AgentsArgs, presentation: &Presentation, verbose: bool) -> Resul
             }
             Ok(())
         }
-        AgentsCommand::Check => run_program(
-            Path::new(LIBEXEC).join("private-agent-poll"),
-            ["--check"],
-            if verbose {
-                SubprocessMode::Streamed
+        AgentsCommand::Check => {
+            let mut command = trusted_command(Path::new(LIBEXEC).join("private-agent-poll"));
+            command.arg("--check");
+            if presentation.interactive && io::stdin().is_terminal() && !verbose {
+                run_process_tui(
+                    &mut command,
+                    "Jarvis Agents",
+                    "Checking private agent source and active bundle…".to_owned(),
+                )
             } else {
-                SubprocessMode::Captured
-            },
-        ),
+                run_command(
+                    &mut command,
+                    if verbose {
+                        SubprocessMode::Streamed
+                    } else {
+                        SubprocessMode::Captured
+                    },
+                )
+            }
+        }
         AgentsCommand::Update => {
             let _lock = mutation_lock("/run/jarvis-private-agent-update.lock")?;
-            run_program(
-                Path::new(LIBEXEC).join("private-agent-poll"),
-                std::iter::empty::<&str>(),
-                SubprocessMode::from_verbose(verbose),
-            )
+            let mut command = trusted_command(Path::new(LIBEXEC).join("private-agent-poll"));
+            if presentation.interactive && io::stdin().is_terminal() && !verbose {
+                run_process_tui(
+                    &mut command,
+                    "Jarvis Agents",
+                    "Validating and activating private agent update…".to_owned(),
+                )
+            } else {
+                run_command(&mut command, SubprocessMode::from_verbose(verbose))
+            }
         }
         AgentsCommand::Rollback { yes } => {
             if !yes {
@@ -761,7 +1276,6 @@ fn confirm(prompt: &str) -> Result<()> {
     write!(tty, "{prompt} [y/N] ")?;
     tty.flush()?;
     let mut answer = String::new();
-    use std::io::BufRead;
     io::BufReader::new(&tty)
         .read_line(&mut answer)
         .context("read confirmation")?;
@@ -956,6 +1470,20 @@ fn valid_repository(value: &str) -> bool {
     valid_segment(segments.next()) && valid_segment(segments.next()) && segments.next().is_none()
 }
 
+fn parse_key_value_output(output: &str) -> Result<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let (key, value) = line
+            .split_once(':')
+            .context("trusted helper returned malformed structured output")?;
+        let key = key.trim().to_ascii_lowercase().replace(' ', "_");
+        if key.is_empty() || values.insert(key, value.trim().to_owned()).is_some() {
+            bail!("trusted helper returned duplicate or empty field");
+        }
+    }
+    Ok(values)
+}
+
 fn parse_release_tag(input: &str) -> Result<String, String> {
     if valid_release_tag(input) {
         Ok(input.to_owned())
@@ -1101,27 +1629,128 @@ mod tests {
     }
 
     #[test]
-    fn atomic_install_replaces_only_completed_file() {
+    fn dashboard_includes_codex_broker_state() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let report = StatusReport {
+            release: Some("v0.0.14".to_owned()),
+            services: BTreeMap::from([
+                ("Core", "active".to_owned()),
+                ("Codex broker", "active".to_owned()),
+            ]),
+            updater_enabled: "enabled".to_owned(),
+            agent_bundle: None,
+        };
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_status_dashboard(frame, &report))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Codex broker"));
+    }
+
+    #[test]
+    fn updater_plain_status_has_strict_json_conversion() {
+        let values = parse_key_value_output(
+            "Current:  v0.0.13\nPrevious: v0.0.12\nLatest: v0.0.14\nUpdater: enabled\n",
+        )
+        .unwrap();
+        assert_eq!(values.get("current").map(String::as_str), Some("v0.0.13"));
+        assert_eq!(values.get("previous").map(String::as_str), Some("v0.0.12"));
+        assert!(parse_key_value_output("not structured\n").is_err());
+        assert!(parse_key_value_output("Current: one\nCurrent: two\n").is_err());
+    }
+
+    #[test]
+    fn model_policy_json_round_trips_without_credentials() {
+        let policy: ModelPolicy = serde_json::from_str(
+            r#"{"version":1,"models":[{"provider":"openai-api","model":"gpt-test","enabled":false,"source":"fixture"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(policy.models.len(), 1);
+        let output = serde_json::to_string(&policy).unwrap();
+        assert!(!output.contains("credential"));
+        assert!(!output.contains("api_key"));
+    }
+
+    #[test]
+    fn tooling_pair_replaces_both_completed_files() {
         let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("source");
-        let destination = directory.path().join("destination");
-        fs::write(&source, "verified tooling").unwrap();
-        fs::write(&destination, "old tooling").unwrap();
-        atomic_install(&source, &destination).unwrap();
-        assert_eq!(fs::read_to_string(destination).unwrap(), "verified tooling");
+        let admin_source = directory.path().join("admin-source");
+        let updater_source = directory.path().join("updater-source");
+        let admin_destination = directory.path().join("jarvis");
+        let updater_destination = directory.path().join("updater");
+        fs::write(&admin_source, "verified admin").unwrap();
+        fs::write(&updater_source, "verified updater").unwrap();
+        fs::write(&admin_destination, "old admin").unwrap();
+        fs::write(&updater_destination, "old updater").unwrap();
+        install_tooling_pair(
+            &admin_source,
+            &admin_destination,
+            &updater_source,
+            &updater_destination,
+        )
+        .unwrap();
         assert_eq!(
-            fs::metadata(directory.path().join(".destination.new"))
-                .err()
-                .map(|error| error.kind()),
-            Some(io::ErrorKind::NotFound)
+            fs::read_to_string(&admin_destination).unwrap(),
+            "verified admin"
         );
         assert_eq!(
-            fs::metadata(directory.path().join("destination"))
+            fs::read_to_string(&updater_destination).unwrap(),
+            "verified updater"
+        );
+        assert_eq!(
+            fs::metadata(admin_destination)
                 .unwrap()
                 .permissions()
                 .mode()
                 & 0o777,
             0o755
         );
+    }
+
+    #[test]
+    fn tooling_pair_preflight_failure_keeps_both_installed_tools() {
+        let directory = tempfile::tempdir().unwrap();
+        let admin_source = directory.path().join("admin-source");
+        let updater_source = directory.path().join("updater-source");
+        let admin_destination = directory.path().join("jarvis");
+        let updater_destination = directory.path().join("updater");
+        fs::write(&admin_source, "verified admin").unwrap();
+        fs::write(&updater_source, "verified updater").unwrap();
+        fs::create_dir(&admin_destination).unwrap();
+        fs::write(&updater_destination, "old updater").unwrap();
+        assert!(install_tooling_pair(
+            &admin_source,
+            &admin_destination,
+            &updater_source,
+            &updater_destination,
+        )
+        .is_err());
+        assert!(admin_destination.is_dir());
+        assert_eq!(
+            fs::read_to_string(updater_destination).unwrap(),
+            "old updater"
+        );
+    }
+
+    #[test]
+    fn failed_legacy_migration_rolls_back_only_new_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let created = directory.path().join("created.env");
+        let existing = directory.path().join("existing.env");
+        fs::write(&created, "new").unwrap();
+        fs::write(&existing, "existing").unwrap();
+        rollback_new_updater_config(true, &created).unwrap();
+        rollback_new_updater_config(false, &existing).unwrap();
+        assert!(!created.exists());
+        assert_eq!(fs::read_to_string(existing).unwrap(), "existing");
     }
 }

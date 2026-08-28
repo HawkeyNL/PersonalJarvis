@@ -104,7 +104,7 @@ cleanup() {
     esac
 }
 
-for command in curl flock jq sha256sum tar systemctl readlink mv ln mktemp install; do
+for command in awk curl flock jq sha256sum tar systemctl readlink mv ln mktemp install; do
     require_command "$command"
 done
 
@@ -149,6 +149,40 @@ if [[ -f $current_target/release.json && ! -L $current_target/release.json ]]; t
 fi
 previous_tag=$(find "$releases_dir" -mindepth 1 -maxdepth 1 -type d -name 'v*' ! -samefile "$current_target" -printf '%f\n' | LC_ALL=C sort -V | tail -n 1)
 
+restart_brokers() {
+    systemctl try-restart jarvis-config-broker.service >/dev/null 2>&1 || true
+    systemctl try-restart jarvis-codex-broker.service >/dev/null 2>&1 || true
+}
+
+install_versioned_tooling() {
+    local release=$1 admin_tmp updater_tmp admin_previous updater_previous
+    admin_tmp=/usr/local/sbin/.jarvis.new
+    updater_tmp=/usr/local/libexec/jarvis/.update-core-release.new
+    admin_previous=/usr/local/sbin/.jarvis.previous
+    updater_previous=/usr/local/libexec/jarvis/.update-core-release.previous
+    rm -f -- "$admin_tmp" "$updater_tmp" "$admin_previous" "$updater_previous"
+    install -o root -g root -m 0755 "$release/jarvis" "$admin_tmp" || return 1
+    install -o root -g root -m 0755 "$release/update-core-release" "$updater_tmp" || return 1
+    [[ -f /usr/local/sbin/jarvis && ! -L /usr/local/sbin/jarvis ]] && \
+        install -o root -g root -m 0755 /usr/local/sbin/jarvis "$admin_previous"
+    [[ -f /usr/local/libexec/jarvis/update-core-release && ! -L /usr/local/libexec/jarvis/update-core-release ]] && \
+        install -o root -g root -m 0755 /usr/local/libexec/jarvis/update-core-release "$updater_previous"
+    if ! mv -Tf "$updater_tmp" /usr/local/libexec/jarvis/update-core-release; then
+        rm -f -- "$admin_tmp" "$updater_tmp" "$admin_previous" "$updater_previous"
+        return 1
+    fi
+    if ! mv -Tf "$admin_tmp" /usr/local/sbin/jarvis; then
+        if [[ -f $updater_previous ]]; then
+            mv -Tf "$updater_previous" /usr/local/libexec/jarvis/update-core-release || return 1
+        else
+            rm -f -- /usr/local/libexec/jarvis/update-core-release
+        fi
+        rm -f -- "$admin_tmp" "$updater_tmp" "$admin_previous" "$updater_previous"
+        return 1
+    fi
+    rm -f -- "$admin_previous" "$updater_previous"
+}
+
 rollback() {
     local previous temporary_link
     previous=$(find "$releases_dir" -mindepth 1 -maxdepth 1 -type d -name 'v*' ! -samefile "$current_target" -printf '%f\n' | LC_ALL=C sort -V | tail -n 1)
@@ -159,9 +193,9 @@ rollback() {
     rm -f -- "$temporary_link"
     ln -s "$releases_dir/$previous" "$temporary_link"
     mv -Tf "$temporary_link" "$current_link"
-    if systemctl restart jarvis-core.service && curl --fail --silent --show-error --connect-timeout 2 --max-time 5 --retry 11 --retry-delay 5 --retry-connrefused http://127.0.0.1:8080/readyz >/dev/null; then
-        systemctl try-restart jarvis-config-broker.service >/dev/null 2>&1 || true
-        systemctl try-restart jarvis-codex-broker.service >/dev/null 2>&1 || true
+    if systemctl restart jarvis-core.service && curl --fail --silent --show-error --connect-timeout 2 --max-time 5 --retry 11 --retry-delay 5 --retry-connrefused http://127.0.0.1:8080/readyz >/dev/null && \
+        install_versioned_tooling "$releases_dir/$previous"; then
+        restart_brokers
         echo "jarvis updater: rolled back to $previous"
         exit 0
     fi
@@ -169,7 +203,8 @@ rollback() {
     ln -s "$current_target" "$temporary_link"
     mv -Tf "$temporary_link" "$current_link"
     systemctl restart jarvis-core.service >/dev/null 2>&1 || true
-    fail "rollback target failed readiness; restored $current_tag"
+    restart_brokers
+    fail "rollback target or its tooling failed activation; restored $current_tag"
 }
 
 [[ $mode != rollback ]] || rollback
@@ -191,6 +226,7 @@ prerelease=$(jq -r '.prerelease' "$metadata") || fail "release prerelease state 
 [[ $prerelease == true || $prerelease == false ]] || fail "release prerelease state is invalid"
 [[ $draft == false && $prerelease == false ]] || fail "latest release is not a stable release"
 [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "release tag must use stable vMAJOR.MINOR.PATCH form"
+echo "jarvis updater: resolved stable release $tag"
 if [[ $mode == status ]]; then
     printf 'Current:  %s\nPrevious: %s\nLatest:   %s\nUpdater:  %s\n' "${current_tag:-unavailable}" "${previous_tag:-unavailable}" "$tag" "$(systemctl is-enabled jarvis-updater.timer 2>/dev/null || printf unavailable)"
     exit 0
@@ -235,6 +271,7 @@ curl "${curl_args[@]}" "$checksum_url" -o "$staging_dir/$checksum"
     cd "$staging_dir"
     sha256sum --strict --check "$checksum"
 )
+echo "jarvis updater: published SHA-256 verified"
 
 # Fail closed on archive paths outside its single expected top-level directory.
 expected_top="jarvis-core-$tag"
@@ -276,6 +313,7 @@ jq -er '.revision | strings | test("^[0-9a-f]{40}$")' "$release_dir/release.json
     fail "release manifest revision is invalid"
 candidate_schema_sha256=$(schema_fingerprint "$release_dir/release.json") || \
     fail "release manifest schema fingerprint is invalid"
+echo "jarvis updater: archive and release manifest validated"
 
 # A failed readiness check can roll the binary back, but it cannot safely
 # reverse a schema change. Require an
@@ -285,11 +323,20 @@ candidate_schema_sha256=$(schema_fingerprint "$release_dir/release.json") || \
 [[ $current_schema_sha256 == "$candidate_schema_sha256" ]] || \
     fail "release changes the database schema; automatic update refused, deploy manually with backup and recovery verification"
 
+# Bind the immutable installed directory to the archive that passed the
+# published SHA-256 check. Rollback never accepts an auto-installed release
+# without this root-owned verification marker.
+verified_sha256=$(sha256sum "$archive" | awk '{print $1}')
+printf '%s  %s\n' "$verified_sha256" "$artifact" > "$release_dir/release.verification"
+chown root:root "$release_dir/release.verification"
+chmod 0644 "$release_dir/release.verification"
+
 chown -R root:root "$release_dir"
 chmod -R go-w "$release_dir"
 mv --no-target-directory "$release_dir" "$releases_dir/$tag"
 cleanup
 staging_dir=
+echo "jarvis updater: immutable release staged"
 
 previous_target=$current_target
 temporary_link=/opt/jarvis/.current.new
@@ -301,44 +348,18 @@ if systemctl restart jarvis-core.service && \
     curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
         --retry 11 --retry-delay 5 --retry-connrefused \
         http://127.0.0.1:8080/readyz >/dev/null; then
-    # The broker resolves its executable through /opt/jarvis/current too, but
-    # must be restarted explicitly so a verified release cannot leave its old
-    # privileged code resident. Absence is tolerated for pre-broker installs.
-    systemctl try-restart jarvis-config-broker.service >/dev/null 2>&1 || true
-    systemctl try-restart jarvis-codex-broker.service >/dev/null 2>&1 || true
-    # Keep the canonical owner CLI and updater in lockstep with the verified
-    # release, but only after Core passed readiness. Stage both first. If the
-    # second activation fails, restore the first before returning an error so a
-    # healthy Core is never intentionally paired with mixed admin tooling.
-    admin_tmp=/usr/local/sbin/.jarvis.new
-    updater_tmp=/usr/local/libexec/jarvis/.update-core-release.new
-    admin_previous=/usr/local/sbin/.jarvis.previous
-    updater_previous=/usr/local/libexec/jarvis/.update-core-release.previous
-    rm -f -- "$admin_tmp" "$updater_tmp" "$admin_previous" "$updater_previous"
-    install -o root -g root -m 0755 "$releases_dir/$tag/jarvis" "$admin_tmp"
-    install -o root -g root -m 0755 "$releases_dir/$tag/update-core-release" "$updater_tmp"
-    [[ -f /usr/local/sbin/jarvis && ! -L /usr/local/sbin/jarvis ]] && \
-        install -o root -g root -m 0755 /usr/local/sbin/jarvis "$admin_previous"
-    [[ -f /usr/local/libexec/jarvis/update-core-release && ! -L /usr/local/libexec/jarvis/update-core-release ]] && \
-        install -o root -g root -m 0755 /usr/local/libexec/jarvis/update-core-release "$updater_previous"
-    if ! mv -Tf "$updater_tmp" /usr/local/libexec/jarvis/update-core-release; then
-        fail "could not activate verified updater tooling"
+    echo "jarvis updater: Core readiness passed"
+    if install_versioned_tooling "$releases_dir/$tag"; then
+        echo "jarvis updater: administrative tooling activated"
+        restart_brokers
+        echo "jarvis updater: activated $tag"
+        exit 0
     fi
-    if ! mv -Tf "$admin_tmp" /usr/local/sbin/jarvis; then
-        if [[ -f $updater_previous ]]; then
-            mv -Tf "$updater_previous" /usr/local/libexec/jarvis/update-core-release || true
-        else
-            rm -f -- /usr/local/libexec/jarvis/update-core-release
-        fi
-        fail "could not activate verified administrative tooling; updater restored"
-    fi
-    rm -f -- "$admin_previous" "$updater_previous"
-    echo "jarvis updater: activated $tag"
-    exit 0
 fi
 
-echo "jarvis updater: $tag failed readiness; restoring previous release" >&2
+echo "jarvis updater: $tag failed readiness or tooling activation; restoring previous release" >&2
 ln -s "$previous_target" "$temporary_link"
 mv -Tf "$temporary_link" "$current_link"
 systemctl restart jarvis-core.service || true
-fail "rollback completed after failed readiness; inspect journalctl -u jarvis-core"
+restart_brokers
+fail "rollback completed after failed activation; inspect journalctl -u jarvis-core"
