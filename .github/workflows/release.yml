@@ -85,6 +85,7 @@ jobs:
           cargo build --locked --release -p jarvis-api --bin jarvis-config-broker
           cargo build --locked --release -p jarvis-api --bin jarvis-codex-broker
           cargo build --locked --release -p jarvis-core --bin jarvis-agent-bundle
+          cargo build --locked --release -p jarvis-admin --bin jarvis
           staging=$(mktemp -d)
           trap 'rm -rf "$staging"' EXIT
           release_dir="$staging/jarvis-core-$RELEASE_TAG"
@@ -93,6 +94,7 @@ jobs:
           install -m 0755 target/release/jarvis-config-broker "$release_dir/jarvis-config-broker"
           install -m 0755 target/release/jarvis-codex-broker "$release_dir/jarvis-codex-broker"
           install -m 0755 target/release/jarvis-agent-bundle "$release_dir/jarvis-agent-bundle"
+          install -m 0755 target/release/jarvis "$release_dir/jarvis"
           schema_manifest="$staging/schema.sha256"
           while IFS= read -r schema; do sha256sum "schema/surreal/$schema"; done < <(find schema/surreal -type f -name '*.surql' -printf '%P\n' | LC_ALL=C sort) > "$schema_manifest"
           schema_sha256=$(sha256sum "$schema_manifest" | awk '{print $1}')
