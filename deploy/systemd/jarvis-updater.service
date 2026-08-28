@@ -9,7 +9,9 @@ Type=oneshot
 User=root
 Group=root
 EnvironmentFile=/etc/jarvis/updater.env
-ExecStart=/usr/local/libexec/jarvis/update-core-release
+# The Rust CLI is the sole owner-facing control plane.  Its typed update
+# transaction invokes the fixed extraction helper internally where needed.
+ExecStart=/usr/local/sbin/jarvis update --latest
 UMask=0077
 
 # The updater is privileged only to replace immutable releases below /opt and

@@ -73,5 +73,6 @@ grep -Fq '/usr/local/sbin/jarvis' "$repo_dir/deploy/systemd/install-home-node-co
 grep -Fq 'RuntimeDirectory=jarvis-config-broker' "$repo_dir/deploy/systemd/jarvis-config-broker.service"
 grep -Fq 'StateDirectory=jarvis/config-broker' "$repo_dir/deploy/systemd/jarvis-config-broker.service"
 grep -Fq 'ui_run_tty "Root configuration checked"' "$repo_dir/deploy/systemd/setup-home-node.sh"
+grep -Fq 'ExecStart=/usr/local/sbin/jarvis update --latest' "$repo_dir/deploy/systemd/jarvis-updater.service"
 
 echo "Production Home Node bootstrap asset checks passed"

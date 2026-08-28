@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Canonical, root-operated Home Node administration interface.  It deliberately
-# dispatches only a small allowlist of typed operations to existing privileged
-# helpers; it is never an arbitrary command or systemctl passthrough.
+# Deprecated compatibility reference.  The canonical root-operated interface
+# is the Rust binary installed as /usr/local/sbin/jarvis from a verified
+# release.  This script is deliberately not installed at that path.
 set -euo pipefail
 
 readonly libexec=/usr/local/libexec/jarvis

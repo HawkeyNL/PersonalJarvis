@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Root-operated provider credential manager.  Values are accepted only from the
+# Deprecated compatibility helper behind the typed Rust `sudo jarvis credentials`
+# interface. Values are accepted only from the
 # controlling TTY and are never rendered, logged, or supplied in argv.
 set -euo pipefail
 
