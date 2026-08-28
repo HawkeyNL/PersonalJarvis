@@ -178,7 +178,28 @@ install -o root -g root -m 0644 \
 # Core persona even if an application-level control were bypassed.
 chown -R root:root "$release_dir"
 chmod -R go-w "$release_dir"
-ln -sfn "$release_dir" /opt/jarvis/current
+
+previous_release=
+if [[ -L /opt/jarvis/current ]]; then
+    previous_release=$(readlink -f /opt/jarvis/current)
+    [[ $previous_release == /opt/jarvis/releases/* && -d $previous_release ]] || {
+        echo "existing active release is outside the managed release root" >&2
+        exit 1
+    }
+fi
+activate_release() {
+    local target=$1 temporary=/opt/jarvis/.current.new
+    rm -f -- "$temporary"
+    ln -s "$target" "$temporary"
+    mv -Tf "$temporary" /opt/jarvis/current
+}
+restore_previous_release() {
+    [[ -n $previous_release ]] || return 0
+    ui_warning "Restoring previous verified release ${previous_release##*/}"
+    activate_release "$previous_release"
+    systemctl try-restart jarvis-config-broker.service >/dev/null 2>&1 || true
+    systemctl try-restart jarvis-core.service >/dev/null 2>&1 || true
+}
 
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/jarvis-core.service
@@ -188,9 +209,26 @@ systemd-analyze verify /etc/systemd/system/jarvis-surrealdb.service
 systemd-analyze verify /etc/systemd/system/jarvis-updater.service
 systemd-analyze verify /etc/systemd/system/jarvis-updater.timer
 ui_detail "Starting SurrealDB and Jarvis Core …"
-systemctl enable --now jarvis-surrealdb.service
-systemctl enable --now jarvis-config-broker.service
-systemctl enable --now jarvis-core
+if ! systemctl enable --now jarvis-surrealdb.service; then
+    ui_error "SurrealDB could not start; active release was not changed"
+    exit 1
+fi
+
+# The symlink transition is atomic. From here every failed required service or
+# readiness check restores the previous known-good release before returning.
+activate_release "$release_dir"
+if ! systemctl enable --now jarvis-config-broker.service; then
+    ui_error "Config broker could not start"
+    restore_previous_release
+    echo "Hint: sudo jarvis logs config-broker" >&2
+    exit 1
+fi
+if ! systemctl enable --now jarvis-core.service; then
+    ui_error "Jarvis Core could not start"
+    restore_previous_release
+    echo "Hint: sudo jarvis logs core" >&2
+    exit 1
+fi
 
 core_ready=false
 for _attempt in $(seq 1 15); do
@@ -208,6 +246,8 @@ if [[ $core_ready != true ]]; then
     ui_error "Jarvis Core did not become ready; recent service diagnostics follow:"
     systemctl --no-pager --full status jarvis-core.service || true
     journalctl --no-pager -u jarvis-core.service -n 80 || true
+    restore_previous_release
+    echo "Hint: sudo jarvis logs core" >&2
     exit 1
 fi
 ui_success "Jarvis Core active"

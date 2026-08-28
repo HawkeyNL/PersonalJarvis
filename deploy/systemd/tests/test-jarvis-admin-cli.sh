@@ -13,7 +13,7 @@ bash -n "$admin" "$updater"
 help=$(bash "$admin" --help)
 [[ $help == *'update [--latest|--version TAG|--check|--status|--rollback [--yes]]'* ]]
 [[ $help == *'credentials <list|set|test|remove>'* ]]
-[[ $help == *'logs <core|surrealdb|updater|agents>'* ]]
+[[ $help == *'logs <core|config-broker|surrealdb|updater|agents>'* ]]
 if bash "$admin" arbitrary-command >/dev/null 2>&1; then
     echo "arbitrary command was accepted" >&2
     exit 1
@@ -31,6 +31,7 @@ if grep -Eq '(^|[^[:alnum:]_])eval([[:space:]]|$)' "$admin"; then
 fi
 grep -Fq 'jarvis-core.service jarvis-surrealdb.service' "$admin"
 grep -Fq 'core) unit=jarvis-core.service' "$admin"
+grep -Fq 'config-broker) unit=jarvis-config-broker.service' "$admin"
 grep -Fq 'credentials) ' "$admin"
 grep -Fq 'models status takes no options' "$admin"
 grep -Fq "with_lock \"\$config_lock\"" "$admin"
