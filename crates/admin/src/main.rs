@@ -8,7 +8,7 @@ use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{self, IsTerminal, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitStatus, Stdio},
 };
@@ -418,7 +418,7 @@ fn services(presentation: &Presentation) -> Result<()> {
 }
 
 fn logs(args: LogsArgs) -> Result<()> {
-    let mut command = ProcessCommand::new("journalctl");
+    let mut command = trusted_command("journalctl");
     command
         .args(["--no-pager", "-u", args.target.unit(), "-n"])
         .arg(args.lines.to_string());
@@ -432,7 +432,8 @@ fn update(args: UpdateArgs, verbose: bool) -> Result<()> {
     // The narrowly scoped updater helper owns the same lock and release
     // transaction until its migration is complete.  Taking it here would
     // deadlock the child; no second update policy is introduced.
-    let mut command = ProcessCommand::new(Path::new(LIBEXEC).join("update-core-release"));
+    let mut command = trusted_command(Path::new(LIBEXEC).join("update-core-release"));
+    load_updater_environment(&mut command)?;
     if args.check {
         command.arg("--check");
     } else if args.status {
@@ -499,7 +500,7 @@ fn compatibility_helper(name: &str, args: Vec<String>, verbose: bool) -> Result<
     }
     let lock = mutation_lock(CONFIG_LOCK)?;
     let _lock = lock;
-    let mut command = ProcessCommand::new(Path::new(SBIN).join(name));
+    let mut command = trusted_command(Path::new(SBIN).join(name));
     command.args(args);
     run_command(&mut command, SubprocessMode::from_verbose(verbose))
 }
@@ -591,7 +592,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = ProcessCommand::new(program);
+    let mut command = trusted_command(program);
     command.args(args);
     run_command(&mut command, mode)
 }
@@ -628,7 +629,7 @@ fn ensure_success(status: ExitStatus) -> Result<()> {
 }
 
 fn systemctl_state(action: &str, unit: &str) -> String {
-    ProcessCommand::new("systemctl")
+    trusted_command("systemctl")
         .args([action, unit])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -638,6 +639,68 @@ fn systemctl_state(action: &str, unit: &str) -> String {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|value| value.trim().to_owned())
         .unwrap_or_else(|| "inactive".to_owned())
+}
+
+/// A child never inherits the invoking administrator's environment.  This
+/// prevents an arbitrary `LD_*`, proxy, credential, or provider variable from
+/// changing a privileged helper's behaviour.  Helpers receive only their
+/// normal root-owned configuration files and the minimum execution context.
+fn trusted_command(program: impl AsRef<OsStr>) -> ProcessCommand {
+    let mut command = ProcessCommand::new(program);
+    command
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("HOME", "/root")
+        .env("LANG", "C.UTF-8");
+    command
+}
+
+/// The updater's configuration is root-owned and its values are not secrets:
+/// the optional netrc is passed as a *path*, which the helper validates before
+/// opening.  We deliberately do not source shell syntax or forward any other
+/// inherited variables.
+fn load_updater_environment(command: &mut ProcessCommand) -> Result<()> {
+    let path = Path::new("/etc/jarvis/updater.env");
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect updater configuration"),
+    };
+    if metadata.file_type().is_symlink() || metadata.permissions().mode() & 0o077 != 0 {
+        bail!("updater configuration permissions are unsafe");
+    }
+    for line in fs::read_to_string(path)
+        .context("read updater configuration")?
+        .lines()
+    {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "JARVIS_UPDATE_REPOSITORY" if valid_repository(value) => {
+                command.env(key, value);
+            }
+            "JARVIS_GITHUB_CURL_NETRC" if Path::new(value).is_absolute() => {
+                command.env(key, value);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn valid_repository(value: &str) -> bool {
+    let mut segments = value.split('/');
+    let valid_segment = |segment: Option<&str>| {
+        segment.is_some_and(|segment| {
+            !segment.is_empty()
+                && segment.len() <= 100
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+    };
+    valid_segment(segments.next()) && valid_segment(segments.next()) && segments.next().is_none()
 }
 
 fn parse_release_tag(input: &str) -> Result<String, String> {
@@ -685,5 +748,36 @@ mod tests {
         std::env::set_var("NO_COLOR", "1");
         assert!(!Presentation::new(false).interactive);
         std::env::remove_var("NO_COLOR");
+    }
+
+    #[test]
+    fn typed_model_input_rejects_newline_injection() {
+        assert!(Cli::try_parse_from(["jarvis", "models", "enable", "openai-api", "x\ny"]).is_err());
+    }
+
+    #[test]
+    fn mutation_lock_is_exclusive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.lock");
+        let _first = mutation_lock(&path).unwrap();
+        assert!(mutation_lock(&path).is_err());
+    }
+
+    #[test]
+    fn child_environment_is_minimal() {
+        let command = trusted_command("true");
+        let environment: BTreeMap<_, _> = command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect();
+        assert_eq!(environment.get(OsStr::new("HOME")), Some(&"/root".into()));
+        assert!(!environment.contains_key(OsStr::new("JARVIS_LLM_OPENAI_API_KEY")));
+    }
+
+    #[test]
+    fn repository_allowlist_rejects_shell_syntax() {
+        assert!(valid_repository("HawkeyNL/PersonalJarvis"));
+        assert!(!valid_repository("HawkeyNL/PersonalJarvis;id"));
+        assert!(!valid_repository("../../etc/passwd"));
     }
 }
