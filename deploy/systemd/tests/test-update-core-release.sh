@@ -51,7 +51,7 @@ done
 [[ -n $url ]] || { echo "curl invocation lacks a URL" >&2; exit 1; }
 
 case "$url" in
-    */releases/latest)
+    */releases/latest|*/releases/tags/*)
         cat "$JARVIS_UPDATER_FIXTURE/metadata.json"
         ;;
     *.tar.gz.sha256)
@@ -79,6 +79,10 @@ write_release() {
     mkdir -p "$root/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
     chmod 0755 "$root/jarvis-core-$tag/jarvis-api"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-config-broker"
+    chmod 0755 "$root/jarvis-core-$tag/jarvis-config-broker"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-codex-broker"
+    chmod 0755 "$root/jarvis-core-$tag/jarvis-codex-broker"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-agent-bundle"
     chmod 0755 "$root/jarvis-core-$tag/jarvis-agent-bundle"
     jq -n \
@@ -86,6 +90,7 @@ write_release() {
         --arg schema_sha256 "$schema_sha256" \
         '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256}' \
         > "$root/jarvis-core-$tag/release.json"
+    printf 'verified synthetic artifact\n' > "$root/jarvis-core-$tag/release.verification"
 }
 
 seed_active_release() {
@@ -140,7 +145,7 @@ run_updater() {
         JARVIS_UPDATER_FIXTURE="$fixture_dir" \
         JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis \
         JARVIS_UPDATER_READYZ_FAIL="${JARVIS_UPDATER_READYZ_FAIL:-false}" \
-        bash "$updater"
+        bash "$updater" "$@"
 }
 
 same_migrations=$(printf 'a%.0s' {1..64})
@@ -189,5 +194,47 @@ prepare_candidate v5.0.0 "$same_migrations"
 run_updater
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v5.0.1 ]]
 [[ ! -e /opt/jarvis/releases/v5.0.0 ]]
+if run_updater --version v5.0.0; then
+    echo "explicit downgrade unexpectedly succeeded" >&2
+    exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v5.0.1 ]]
+
+# A check is strictly non-mutating and uses a useful exit status for scripts.
+seed_active_release v6.0.0 "$same_migrations"
+prepare_candidate v6.0.1 "$same_migrations"
+if run_updater --check; then
+    echo "available update check unexpectedly returned success" >&2
+    exit 1
+else
+    [[ $? == 2 ]]
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v6.0.0 ]]
+
+# Explicit versions still use the same published-release metadata and verified
+# artifact path; they are not raw tags or arbitrary URLs.
+seed_active_release v7.0.0 "$same_migrations"
+prepare_candidate v7.0.1 "$same_migrations"
+run_updater --version v7.0.1
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v7.0.1 ]]
+
+# Rollback may only select an already verified release below the managed root.
+seed_active_release v8.0.1 "$same_migrations"
+write_release /opt/jarvis/releases v8.0.0 "$same_migrations"
+mv /opt/jarvis/releases/jarvis-core-v8.0.0 /opt/jarvis/releases/v8.0.0
+run_updater --rollback
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.0.0 ]]
+
+# Drafts and prereleases are never update targets even when their tag/assets
+# appear structurally valid.
+seed_active_release v9.0.0 "$same_migrations"
+prepare_candidate v9.0.1 "$same_migrations"
+jq '.draft = true' "$fixture_dir/metadata.json" > "$fixture_dir/metadata.tmp"
+mv "$fixture_dir/metadata.tmp" "$fixture_dir/metadata.json"
+if run_updater; then
+    echo "draft release was accepted" >&2
+    exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v9.0.0 ]]
 
 echo "Home Node updater fixture tests passed"

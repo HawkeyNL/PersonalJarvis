@@ -156,6 +156,9 @@ install -o root -g root -m 0755 \
     "$repo_dir/deploy/systemd/update-core-release.sh" \
     /usr/local/libexec/jarvis/update-core-release
 install -o root -g root -m 0755 \
+    "$repo_dir/deploy/systemd/jarvis-admin.sh" \
+    /usr/local/sbin/jarvis
+install -o root -g root -m 0755 \
     "$repo_dir/deploy/systemd/verify-home-node.sh" \
     /usr/local/libexec/jarvis/verify-home-node
 install -o root -g root -m 0644 \

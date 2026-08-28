@@ -71,7 +71,7 @@ ui_run "Private agent bundle activated" env JARVIS_AGENT_BUNDLE_VALIDATOR="/opt/
 if [[ ! -e /etc/jarvis/model-policy.json ]]; then
     ui_run "Owner model policy initialized (remote models disabled)" /usr/local/sbin/jarvis-models refresh
 else
-    ui_warning "Owner model policy unchanged; use sudo jarvis-models refresh to discover configured models"
+    ui_warning "Owner model policy unchanged; use sudo jarvis models refresh to discover configured models"
 fi
 ui_step "[5/7] Services and health"
 ui_run "Jarvis Core installed and ready" bash "$repo_dir/deploy/systemd/install-home-node-core.sh" "/opt/jarvis/releases/$release_tag"
