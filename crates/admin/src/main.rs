@@ -818,13 +818,17 @@ fn migrate_installed_tooling() -> Result<()> {
         &updater,
         &Path::new(LIBEXEC).join("update-core-release"),
     ) {
-        if updater_config_created {
-            fs::remove_file("/etc/jarvis/updater.env")
-                .context("roll back newly created updater configuration")?;
-        }
+        rollback_new_updater_config(updater_config_created, Path::new("/etc/jarvis/updater.env"))?;
         return Err(error);
     }
     println!("jarvis: installed tooling migrated from verified active release");
+    Ok(())
+}
+
+fn rollback_new_updater_config(created: bool, path: &Path) -> Result<()> {
+    if created {
+        fs::remove_file(path).context("roll back newly created updater configuration")?;
+    }
     Ok(())
 }
 
@@ -1735,5 +1739,18 @@ mod tests {
             fs::read_to_string(updater_destination).unwrap(),
             "old updater"
         );
+    }
+
+    #[test]
+    fn failed_legacy_migration_rolls_back_only_new_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let created = directory.path().join("created.env");
+        let existing = directory.path().join("existing.env");
+        fs::write(&created, "new").unwrap();
+        fs::write(&existing, "existing").unwrap();
+        rollback_new_updater_config(true, &created).unwrap();
+        rollback_new_updater_config(false, &existing).unwrap();
+        assert!(!created.exists());
+        assert_eq!(fs::read_to_string(existing).unwrap(), "existing");
     }
 }
