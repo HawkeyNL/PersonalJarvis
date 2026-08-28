@@ -42,6 +42,8 @@ write_asset() {
     chmod 0755 "$asset/jarvis-core-$tag/jarvis-codex-broker"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$asset/jarvis-core-$tag/jarvis-agent-bundle"
     chmod 0755 "$asset/jarvis-core-$tag/jarvis-agent-bundle"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$asset/jarvis-core-$tag/jarvis"
+    chmod 0755 "$asset/jarvis-core-$tag/jarvis"
     jq -n --arg tag "$manifest_tag" \
       '{tag:$tag,revision:"0123456789abcdef0123456789abcdef01234567",schema_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
       > "$asset/jarvis-core-$tag/release.json"
@@ -57,6 +59,7 @@ install -d -o root -g root -m 0755 /opt/jarvis/releases
 write_asset v1.2.3 v1.2.3
 run_stage v1.2.3
 [[ -x /opt/jarvis/releases/v1.2.3/jarvis-api ]]
+[[ -x /opt/jarvis/releases/v1.2.3/jarvis ]]
 [[ -f /opt/jarvis/releases/v1.2.3/release.verification ]]
 [[ $(stat -c '%U:%G:%a' /opt/jarvis/releases/v1.2.3) == root:root:755 ]]
 

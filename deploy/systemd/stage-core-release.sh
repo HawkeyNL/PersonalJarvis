@@ -62,6 +62,7 @@ release_dir="$staging/$expected_top"
 [[ -x $release_dir/jarvis-config-broker && ! -L $release_dir/jarvis-config-broker ]] || fail "config broker is invalid"
 [[ -x $release_dir/jarvis-codex-broker && ! -L $release_dir/jarvis-codex-broker ]] || fail "Codex broker is invalid"
 [[ -x $release_dir/jarvis-agent-bundle && ! -L $release_dir/jarvis-agent-bundle ]] || fail "agent-bundle validator is invalid"
+[[ -x $release_dir/jarvis && ! -L $release_dir/jarvis ]] || fail "Jarvis admin binary is invalid"
 # The protected persona is supplied separately from the private owner checkout.
 # A public software release must never contain Jarvis.md or agent definitions.
 find "$release_dir" -type f \( -name 'Jarvis.md' -o -path '*/agents/*' \) -print -quit | grep -q . && \

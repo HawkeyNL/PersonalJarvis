@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Root-operated owner model allowlist.  This command intentionally never reads
+# Deprecated compatibility helper behind the typed Rust `sudo jarvis models`
+# interface.  This command intentionally never reads
 # or displays provider credentials; Core receives only the resulting protected
 # JSON policy through its normal root:jarvis read-only configuration boundary.
 set -euo pipefail

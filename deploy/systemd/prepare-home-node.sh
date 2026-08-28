@@ -19,7 +19,9 @@ fi
 id -nG jarvis-codex | tr ' ' '\n' | grep -qx docker && fail "jarvis-codex must not be a Docker-group member"
 
 install -d -o jarvis -g jarvis -m 0750 /var/lib/jarvis
-install -d -o root -g root -m 0700 /var/lib/jarvis/config-broker /var/lib/jarvis/config-broker/replays
+# The config broker's persistent and ephemeral state are intentionally created
+# by its systemd StateDirectory=/RuntimeDirectory= lifecycle.  Pre-creating
+# /run would be lost at reboot and fails ProtectSystem namespace setup.
 install -d -o root -g root -m 0700 /var/lib/jarvis/surrealdb
 install -d -o root -g root -m 0755 /opt/jarvis /opt/jarvis/releases
 # The service needs directory traversal to read only its explicitly group-readable
@@ -55,9 +57,10 @@ install -o root -g root -m 0755 \
 install -o root -g root -m 0755 \
     "$repo_dir/deploy/systemd/jarvis-credentials.sh" \
     /usr/local/sbin/jarvis-credentials
-install -o root -g root -m 0755 \
-    "$repo_dir/deploy/systemd/jarvis-admin.sh" \
-    /usr/local/sbin/jarvis
+# `jarvis-admin.sh` is retained only as an internal migration reference.  The
+# canonical `sudo jarvis` binary is installed from a verified release by
+# install-home-node-core.sh; bootstrap deliberately does not publish a
+# checkout-owned root CLI at that path.
 for helper in install-private-config.sh install-agent-bundle.sh; do
     install -o root -g root -m 0755 \
         "$repo_dir/deploy/private/$helper" \

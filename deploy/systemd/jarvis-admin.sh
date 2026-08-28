@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Canonical, root-operated Home Node administration interface.  It deliberately
-# dispatches only a small allowlist of typed operations to existing privileged
-# helpers; it is never an arbitrary command or systemctl passthrough.
+# Deprecated compatibility reference.  The canonical root-operated interface
+# is the Rust binary installed as /usr/local/sbin/jarvis from a verified
+# release.  This script is deliberately not installed at that path.
 set -euo pipefail
 
 readonly libexec=/usr/local/libexec/jarvis
@@ -26,7 +26,7 @@ Commands:
   credentials <list|set|test|remove> ...
   agents <status|check|update|rollback [--yes]>
   services status                 Show allowlisted service states
-  logs <core|surrealdb|updater|agents> [--lines N] [--follow]
+  logs <core|config-broker|surrealdb|updater|agents> [--lines N] [--follow]
   help                            Show this help
 
 Run 'sudo jarvis <command> --help' for command-specific help.
@@ -163,16 +163,17 @@ logs() {
     shift || true
     case $target in
         core) unit=jarvis-core.service ;;
+        config-broker) unit=jarvis-config-broker.service ;;
         surrealdb) unit=jarvis-surrealdb.service ;;
         updater) unit=jarvis-updater.service ;;
         agents) unit=jarvis-private-agent-updater.service ;;
-        *) fail "unknown log target '$target'; allowed: core, surrealdb, updater, agents" ;;
+        *) fail "unknown log target '$target'; allowed: core, config-broker, surrealdb, updater, agents" ;;
     esac
     while (($#)); do
         case $1 in
             --lines) [[ ${2:-} =~ ^[1-9][0-9]{0,3}$ ]] || fail "--lines must be 1..9999"; lines=$2; shift 2 ;;
             --follow) follow=true; shift ;;
-            --help|-h) echo "Usage: sudo jarvis logs <core|surrealdb|updater|agents> [--lines N] [--follow]"; return ;;
+            --help|-h) echo "Usage: sudo jarvis logs <core|config-broker|surrealdb|updater|agents> [--lines N] [--follow]"; return ;;
             *) fail "unknown logs option '$1'" ;;
         esac
     done
