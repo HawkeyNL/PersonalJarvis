@@ -15,7 +15,14 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use fs2::FileExt;
+use ratatui::{
+    layout::{Constraint, Layout},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Paragraph, Row, Table},
+};
 use serde::Serialize;
 
 const RELEASES_ROOT: &str = "/opt/jarvis/releases";
@@ -327,6 +334,9 @@ fn status(presentation: &Presentation) -> Result<()> {
         println!("{}", serde_json::to_string(&report)?);
         return Ok(());
     }
+    if presentation.interactive && io::stdin().is_terminal() {
+        return status_tui(&report);
+    }
     presentation.intro("Jarvis Home Node");
     println!(
         "  Release          {}",
@@ -344,6 +354,92 @@ fn status(presentation: &Presentation) -> Result<()> {
     println!("  Updater          {}", report.updater_enabled);
     presentation.outro("Status collected without reading secrets");
     Ok(())
+}
+
+fn status_tui(report: &StatusReport) -> Result<()> {
+    // `ratatui::run` installs restoration/panic handling around the alternate
+    // screen.  Business state is computed before this call, so no privileged
+    // operation is coupled to terminal widgets or input events.
+    ratatui::run(|terminal| -> io::Result<()> {
+        loop {
+            terminal.draw(|frame| render_status_dashboard(frame, report))?;
+            if event::poll(std::time::Duration::from_millis(250))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press
+                        && matches!(
+                            key.code,
+                            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('c')
+                        )
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    })
+    .map_err(Into::into)
+}
+
+fn render_status_dashboard(frame: &mut ratatui::Frame, report: &StatusReport) {
+    let area = frame.area();
+    let outer = Block::default()
+        .title(" Jarvis Home Node · q / Esc to close ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let rows = report.services.iter().map(|(name, state)| {
+        let healthy = state == "active";
+        Row::new(vec![
+            name.to_string(),
+            state.to_string(),
+            if healthy { "✓" } else { "!" }.to_owned(),
+        ])
+        .style(Style::default().fg(if healthy { Color::Green } else { Color::Yellow }))
+    });
+    let sections = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(5),
+        Constraint::Length(3),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Release ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                report.release.as_deref().unwrap_or("unavailable"),
+                Style::default().fg(Color::Cyan),
+            ),
+        ])),
+        sections[0],
+    );
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Percentage(45),
+                Constraint::Percentage(40),
+                Constraint::Length(3),
+            ],
+        )
+        .header(Row::new(["Service", "Status", ""]).style(Style::default().fg(Color::DarkGray)))
+        .block(Block::default().borders(Borders::TOP)),
+        sections[1],
+    );
+    let agents = report
+        .agent_bundle
+        .as_ref()
+        .map_or("unavailable".to_owned(), |bundle| {
+            format!("{} agents · {}", bundle.agent_count, bundle.id)
+        });
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Agents: {agents}    Updater: {}",
+            report.updater_enabled
+        )),
+        sections[2],
+    );
 }
 
 fn status_report() -> Result<StatusReport> {
