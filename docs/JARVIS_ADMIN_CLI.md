@@ -20,6 +20,21 @@ dashboard; press `q`, Esc, or Ctrl-C to leave it. Redirected output,
 example, `sudo jarvis --json status` emits stable JSON without ANSI controls,
 prompts, or an alternate terminal screen.
 
+Machine-readable read-only forms also include:
+
+```bash
+sudo jarvis --json health
+sudo jarvis --json update --check
+sudo jarvis --json update --status
+sudo jarvis --json models list
+sudo jarvis --json credentials list
+sudo jarvis --json agents status
+sudo jarvis --json logs core --lines 100
+```
+
+JSON mode rejects mutating updates and streaming `logs --follow`; it never
+silently prompts or emits terminal control sequences.
+
 ## Updates
 
 ```bash
@@ -43,6 +58,12 @@ setup and is never taken from the invoking shell environment. A release carries
 the versioned Rust admin binary and updater helper alongside Core. After Core
 readiness succeeds, those two tools are staged and activated together from the
 already checksum-verified artifact.
+
+The installed release receives a root-owned `release.verification` marker only
+after the downloaded archive passes its published SHA-256. Explicit rollback
+activates the historical Core, Rust CLI and updater helper as one unit. If
+readiness or tooling activation fails, the previous symlink, Core and tooling
+are restored before the operation reports failure.
 
 ### Legacy v0.0.10 mixed-tooling recovery
 

@@ -21,7 +21,8 @@ mkdir -p "$fake_bin"
 cleanup() {
     rm -rf -- "$fixture_dir" /opt/jarvis
     rm -f -- /etc/jarvis/updater.env
-    rm -f -- /usr/local/sbin/jarvis /usr/local/libexec/jarvis/update-core-release
+    rm -rf -- /usr/local/sbin/jarvis
+    rm -f -- /usr/local/libexec/jarvis/update-core-release
 }
 trap cleanup EXIT
 
@@ -122,6 +123,9 @@ prepare_candidate() {
     rm -rf -- "$asset_root"
     mkdir -p "$asset_root"
     write_release "$asset_root" "$tag" "$schema_sha256"
+    # Published artifacts do not carry an installation marker. The updater
+    # must create it only after validating the downloaded archive checksum.
+    rm -f -- "$asset_root/jarvis-core-$tag/release.verification"
     rm -f -- "$fixture_dir"/*.tar.gz "$fixture_dir"/*.tar.gz.sha256
     tar -C "$asset_root" -czf "$fixture_dir/$artifact" "jarvis-core-$tag"
     (
@@ -169,6 +173,8 @@ prepare_candidate v1.0.1 "$same_migrations"
 run_updater
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v1.0.1 ]]
 [[ -f /opt/jarvis/releases/v1.0.1/release.json ]]
+[[ -f /opt/jarvis/releases/v1.0.1/release.verification ]]
+grep -Eq "^[0-9a-f]{64}  jarvis-core-v1.0.1-linux-x86_64.tar.gz$" /opt/jarvis/releases/v1.0.1/release.verification
 cmp /opt/jarvis/releases/v1.0.1/jarvis /usr/local/sbin/jarvis
 cmp /opt/jarvis/releases/v1.0.1/update-core-release /usr/local/libexec/jarvis/update-core-release
 [[ $(stat -c '%U:%G:%a' /etc/jarvis/updater.env) == root:root:600 ]]
@@ -229,6 +235,23 @@ fi
 cmp "$fixture_dir/admin-before-readiness-failure" /usr/local/sbin/jarvis
 cmp "$fixture_dir/updater-before-readiness-failure" /usr/local/libexec/jarvis/update-core-release
 
+# A tooling activation failure after candidate readiness must restore Core and
+# both canonical tools, never leave a mixed-version installation.
+seed_active_release v4.1.0 "$same_migrations"
+prepare_candidate v4.1.1 "$same_migrations"
+cp /usr/local/libexec/jarvis/update-core-release "$fixture_dir/updater-before-tooling-failure"
+rm -f -- /usr/local/sbin/jarvis
+mkdir /usr/local/sbin/jarvis
+if run_updater; then
+    echo "update with failed tooling activation unexpectedly succeeded" >&2
+    exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v4.1.0 ]]
+cmp "$fixture_dir/updater-before-tooling-failure" /usr/local/libexec/jarvis/update-core-release
+rm -rf -- /usr/local/sbin/jarvis
+printf 'restored synthetic admin\n' > /usr/local/sbin/jarvis
+chmod 0755 /usr/local/sbin/jarvis
+
 # The timer must never replace a newer active binary with an older release.
 seed_active_release v5.0.1 "$same_migrations"
 prepare_candidate v5.0.0 "$same_migrations"
@@ -265,6 +288,20 @@ write_release /opt/jarvis/releases v8.0.0 "$same_migrations"
 mv /opt/jarvis/releases/jarvis-core-v8.0.0 /opt/jarvis/releases/v8.0.0
 run_updater --rollback
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.0.0 ]]
+cmp /opt/jarvis/releases/v8.0.0/jarvis /usr/local/sbin/jarvis
+cmp /opt/jarvis/releases/v8.0.0/update-core-release /usr/local/libexec/jarvis/update-core-release
+
+# A release installed by the automatic path must itself remain an eligible,
+# version-consistent rollback target after a later successful update.
+seed_active_release v8.1.0 "$same_migrations"
+prepare_candidate v8.1.1 "$same_migrations"
+run_updater
+prepare_candidate v8.1.2 "$same_migrations"
+run_updater
+run_updater --rollback
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.1.1 ]]
+cmp /opt/jarvis/releases/v8.1.1/jarvis /usr/local/sbin/jarvis
+cmp /opt/jarvis/releases/v8.1.1/update-core-release /usr/local/libexec/jarvis/update-core-release
 
 # Drafts and prereleases are never update targets even when their tag/assets
 # appear structurally valid.

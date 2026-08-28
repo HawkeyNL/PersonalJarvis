@@ -11,8 +11,11 @@ model, credential and agent operations return typed state and execute fixed
 allowlisted helpers. The TUI only renders that state; it never grants
 capabilities or executes shell input.
 
-- Interactive TTY: `sudo jarvis status` opens a compact dashboard (`q` or Esc
-  closes it).
+- Interactive TTY: `sudo jarvis status` opens a compact dashboard (`q`, Esc or
+  Ctrl-C closes it). Health, model, credential and agent status use the same
+  responsive table language. Bounded log snapshots use full-screen tables;
+  `logs --follow` keeps a rolling view and updates stream through a cancellable
+  TUI.
 - Pipes, `TERM=dumb`, `NO_COLOR`, and `--json`: use plain/stable output; JSON
   never enables alternate-screen, ANSI animation, cursor changes or prompts.
 - Root remains required for administration. The Core service stays
@@ -21,5 +24,8 @@ capabilities or executes shell input.
   errors and panics. Secret prompts remain separate TTY-only flows and never
   enter the dashboard state or JSON output.
 
-The UI intentionally remains restrained: fast commands retain plain output,
-while dashboards and future long-running transaction progress can use the TUI.
+Update progress is driven by messages emitted only after the underlying
+release resolver, SHA-256 verifier, archive validator, immutable stager,
+readiness probe and tooling activator complete their real step. Esc/Ctrl-C
+terminates the child operation and restores the terminal. Fast commands retain
+plain output where a full-screen interface adds no value.
