@@ -21,6 +21,7 @@ mkdir -p "$fake_bin"
 cleanup() {
     rm -rf -- "$fixture_dir" /opt/jarvis
     rm -f -- /etc/jarvis/updater.env
+    rm -f -- /usr/local/sbin/jarvis /usr/local/libexec/jarvis/update-core-release
 }
 trap cleanup EXIT
 
@@ -86,9 +87,10 @@ write_release() {
     chmod 0755 "$root/jarvis-core-$tag/jarvis-codex-broker"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-agent-bundle"
     chmod 0755 "$root/jarvis-core-$tag/jarvis-agent-bundle"
-    printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis"
+    printf '#!/usr/bin/env bash\nprintf "Jarvis admin %s\\n"\n' "$tag" > "$root/jarvis-core-$tag/jarvis"
     chmod 0755 "$root/jarvis-core-$tag/jarvis"
     cp "$updater" "$root/jarvis-core-$tag/update-core-release"
+    printf '\n# verified release tooling: %s\n' "$tag" >> "$root/jarvis-core-$tag/update-core-release"
     chmod 0755 "$root/jarvis-core-$tag/update-core-release"
     jq -n \
         --arg tag "$tag" \
@@ -155,11 +157,20 @@ run_updater() {
 same_migrations=$(printf 'a%.0s' {1..64})
 changed_migrations=$(printf 'b%.0s' {1..64})
 
+# A realistic legacy layout has an old shell dispatcher/updater outside the
+# active release. A successful activation must replace both from the already
+# verified candidate, never from a checkout or inherited environment.
+install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
+printf 'legacy admin tooling\n' > /usr/local/sbin/jarvis
+printf 'legacy updater tooling\n' > /usr/local/libexec/jarvis/update-core-release
+chmod 0755 /usr/local/sbin/jarvis /usr/local/libexec/jarvis/update-core-release
 seed_active_release v1.0.0 "$same_migrations"
 prepare_candidate v1.0.1 "$same_migrations"
 run_updater
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v1.0.1 ]]
 [[ -f /opt/jarvis/releases/v1.0.1/release.json ]]
+cmp /opt/jarvis/releases/v1.0.1/jarvis /usr/local/sbin/jarvis
+cmp /opt/jarvis/releases/v1.0.1/update-core-release /usr/local/libexec/jarvis/update-core-release
 [[ $(stat -c '%U:%G:%a' /etc/jarvis/updater.env) == root:root:600 ]]
 grep -qx 'JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis' /etc/jarvis/updater.env
 grep -qx 'JARVIS_UPDATE_CHANNEL=stable' /etc/jarvis/updater.env
@@ -207,12 +218,16 @@ fi
 # A readiness failure after activation must restore the previous Core binary.
 seed_active_release v4.0.0 "$same_migrations"
 prepare_candidate v4.0.1 "$same_migrations"
+cp /usr/local/sbin/jarvis "$fixture_dir/admin-before-readiness-failure"
+cp /usr/local/libexec/jarvis/update-core-release "$fixture_dir/updater-before-readiness-failure"
 if JARVIS_UPDATER_READYZ_FAIL=true run_updater; then
     echo "update with failed readiness unexpectedly succeeded" >&2
     exit 1
 fi
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v4.0.0 ]]
 [[ -e /opt/jarvis/releases/v4.0.1 ]]
+cmp "$fixture_dir/admin-before-readiness-failure" /usr/local/sbin/jarvis
+cmp "$fixture_dir/updater-before-readiness-failure" /usr/local/libexec/jarvis/update-core-release
 
 # The timer must never replace a newer active binary with an older release.
 seed_active_release v5.0.1 "$same_migrations"

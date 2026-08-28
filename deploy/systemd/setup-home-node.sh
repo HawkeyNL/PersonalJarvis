@@ -56,7 +56,10 @@ fi
 
 if [[ ! -e /etc/jarvis/updater.env ]]; then
     install -o root -g root -m 0600 /dev/null /etc/jarvis/updater.env
-    printf '%s\n' 'JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis' > /etc/jarvis/updater.env
+    printf '%s\n' \
+        'JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis' \
+        'JARVIS_UPDATE_CHANNEL=stable' \
+        > /etc/jarvis/updater.env
     ui_success "Public release updater configuration created"
 else
     ui_warning "Public release updater configuration unchanged"
