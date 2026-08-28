@@ -34,6 +34,7 @@ for unit in "$repo_dir"/deploy/systemd/*.service "$repo_dir"/deploy/systemd/*.ti
     sed -E \
         -e "s#^ExecStart=/opt/jarvis/current/[^[:space:]]+#ExecStart=$stub#" \
         -e "s#^ExecStart=/usr/local/(sbin|libexec)/jarvis[^[:space:]]*#ExecStart=$stub#" \
+        -e "s#^ExecStart=/usr/local/bin/codex#ExecStart=$stub#" \
         "$unit" > "$candidate"
     systemd-analyze verify "$candidate"
 done
