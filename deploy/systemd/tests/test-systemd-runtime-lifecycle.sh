@@ -32,9 +32,9 @@ chmod 0755 "$stub"
 for unit in "$repo_dir"/deploy/systemd/*.service "$repo_dir"/deploy/systemd/*.timer; do
     candidate="$fixture_dir/${unit##*/}"
     sed -E \
-        -e "s#^ExecStart=/opt/jarvis/current/[^[:space:]]+#ExecStart=$stub#" \
-        -e "s#^ExecStart=/usr/local/(sbin|libexec)/jarvis[^[:space:]]*#ExecStart=$stub#" \
-        -e "s#^ExecStart=/usr/local/bin/codex#ExecStart=$stub#" \
+        -e "s#^(ExecStart|ExecStartPre)=/opt/jarvis/current/[^[:space:]]+#\\1=$stub#" \
+        -e "s#^(ExecStart|ExecStartPre)=/usr/local/(sbin|libexec)/jarvis[^[:space:]]*#\\1=$stub#" \
+        -e "s#^(ExecStart|ExecStartPre)=/usr/local/bin/codex#\\1=$stub#" \
         "$unit" > "$candidate"
     systemd-analyze verify "$candidate"
 done
