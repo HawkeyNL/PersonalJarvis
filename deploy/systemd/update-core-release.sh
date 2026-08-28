@@ -262,6 +262,8 @@ release_dir="$staging_dir/$expected_top"
     fail "Codex broker is invalid"
 [[ -x $release_dir/jarvis && ! -L $release_dir/jarvis ]] || \
     fail "Jarvis admin binary is invalid"
+[[ -x $release_dir/update-core-release && ! -L $release_dir/update-core-release ]] || \
+    fail "versioned updater helper is invalid"
 find "$release_dir" -type f \( -name 'Jarvis.md' -o -path '*/agents/*' \) -print -quit | grep -q . && \
     fail "release contains protected private configuration"
 [[ -f /etc/jarvis/Jarvis.md && ! -L /etc/jarvis/Jarvis.md ]] || \
@@ -310,6 +312,9 @@ if systemctl restart jarvis-core.service && \
     admin_tmp=/usr/local/sbin/.jarvis.new
     install -o root -g root -m 0755 "$releases_dir/$tag/jarvis" "$admin_tmp"
     mv -Tf "$admin_tmp" /usr/local/sbin/jarvis
+    updater_tmp=/usr/local/libexec/jarvis/.update-core-release.new
+    install -o root -g root -m 0755 "$releases_dir/$tag/update-core-release" "$updater_tmp"
+    mv -Tf "$updater_tmp" /usr/local/libexec/jarvis/update-core-release
     echo "jarvis updater: activated $tag"
     exit 0
 fi

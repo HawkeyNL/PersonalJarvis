@@ -88,6 +88,8 @@ write_release() {
     chmod 0755 "$root/jarvis-core-$tag/jarvis-agent-bundle"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis"
     chmod 0755 "$root/jarvis-core-$tag/jarvis"
+    cp "$updater" "$root/jarvis-core-$tag/update-core-release"
+    chmod 0755 "$root/jarvis-core-$tag/update-core-release"
     jq -n \
         --arg tag "$tag" \
         --arg schema_sha256 "$schema_sha256" \

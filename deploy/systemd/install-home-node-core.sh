@@ -51,6 +51,10 @@ find "$release_dir" -xdev -type l -print -quit | grep -q . && {
     echo "missing executable: $release_dir/jarvis" >&2
     exit 1
 }
+[[ -x "$release_dir/update-core-release" ]] || {
+    echo "missing versioned updater helper: $release_dir/update-core-release" >&2
+    exit 1
+}
 [[ -f /etc/jarvis/Jarvis.md && ! -L /etc/jarvis/Jarvis.md ]] || {
     echo "missing protected persona: /etc/jarvis/Jarvis.md" >&2
     exit 1
@@ -157,7 +161,7 @@ install -o root -g root -m 0755 \
     "$release_dir/jarvis-agent-bundle" \
     /usr/local/libexec/jarvis/jarvis-agent-bundle
 install -o root -g root -m 0755 \
-    "$repo_dir/deploy/systemd/update-core-release.sh" \
+    "$release_dir/update-core-release" \
     /usr/local/libexec/jarvis/update-core-release
 # The administrative surface is shipped with the verified release.  Do not
 # install a checkout-owned shell dispatcher at this canonical owner path.

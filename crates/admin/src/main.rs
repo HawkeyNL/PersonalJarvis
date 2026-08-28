@@ -44,6 +44,8 @@ enum Commands {
     Health,
     Logs(LogsArgs),
     Update(UpdateArgs),
+    /// One-time migration for installations activated by a legacy updater.
+    MigrateInstalledTooling,
     Models(ModelsArgs),
     Credentials(CredentialsArgs),
     Agents(AgentsArgs),
@@ -251,6 +253,7 @@ fn run() -> Result<()> {
         Commands::Health => health(&presentation, cli.verbose),
         Commands::Logs(args) => logs(args),
         Commands::Update(args) => update(args, cli.verbose),
+        Commands::MigrateInstalledTooling => migrate_installed_tooling(),
         Commands::Models(args) => models(args, cli.verbose),
         Commands::Credentials(args) => credentials(args, cli.verbose),
         Commands::Agents(args) => agents(args, &presentation, cli.verbose),
@@ -449,6 +452,64 @@ fn update(args: UpdateArgs, verbose: bool) -> Result<()> {
         command.arg("--latest");
     }
     run_command(&mut command, SubprocessMode::from_verbose(verbose))
+}
+
+/// Complete the only unavoidable legacy boundary: a v0.0.10 updater can
+/// activate a verified release but did not replace its own tools.  This command
+/// is run directly from `/opt/jarvis/current/jarvis`, which is already part of
+/// that verified release.  Future updates perform this atomically themselves.
+fn migrate_installed_tooling() -> Result<()> {
+    let release = fs::canonicalize(CURRENT_RELEASE).context("resolve active release")?;
+    if !release.starts_with(RELEASES_ROOT) {
+        bail!("active release is outside the managed release root");
+    }
+    let admin = release.join("jarvis");
+    let updater = release.join("update-core-release");
+    for path in [&admin, &updater] {
+        let metadata = fs::symlink_metadata(path).context("inspect versioned tooling")?;
+        if metadata.file_type().is_symlink() || metadata.permissions().mode() & 0o111 == 0 {
+            bail!("versioned tooling is unsafe or not executable");
+        }
+    }
+    atomic_install(&admin, Path::new("/usr/local/sbin/jarvis"))?;
+    fs::create_dir_all(LIBEXEC).context("create privileged helper directory")?;
+    atomic_install(&updater, &Path::new(LIBEXEC).join("update-core-release"))?;
+    ensure_updater_config()?;
+    println!("jarvis: installed tooling migrated from verified active release");
+    Ok(())
+}
+
+fn atomic_install(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("tooling destination has no parent")?;
+    let temporary = parent.join(format!(
+        ".{}.new",
+        destination
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("jarvis")
+    ));
+    fs::copy(source, &temporary).context("stage versioned tooling")?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))?;
+    fs::rename(&temporary, destination).context("activate versioned tooling")?;
+    Ok(())
+}
+
+fn ensure_updater_config() -> Result<()> {
+    let path = Path::new("/etc/jarvis/updater.env");
+    if path.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all("/etc/jarvis").context("create updater config directory")?;
+    let temporary = Path::new("/etc/jarvis/.updater.env.new");
+    fs::write(
+        temporary,
+        "JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis\nJARVIS_UPDATE_CHANNEL=stable\n",
+    )?;
+    fs::set_permissions(temporary, fs::Permissions::from_mode(0o600))?;
+    fs::rename(temporary, path).context("activate updater configuration")?;
+    Ok(())
 }
 
 fn models(args: ModelsArgs, verbose: bool) -> Result<()> {
