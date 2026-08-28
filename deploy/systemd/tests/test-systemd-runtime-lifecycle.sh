@@ -18,7 +18,23 @@ if grep -Fq 'mkdir /run/jarvis-config-broker' "$prepare"; then
     exit 1
 fi
 
+fixture_dir=$(mktemp -d)
+trap 'rm -rf -- "$fixture_dir"' EXIT
+stub="$fixture_dir/jarvis-stub"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$stub"
+chmod 0755 "$stub"
+
+# `systemd-analyze verify` validates that ExecStart exists.  Production units
+# deliberately point at the atomically activated release, which is absent in a
+# clean CI runner.  Verify copies with only those fixed binary paths replaced;
+# this still catches unit syntax and hardening regressions without mutating
+# /opt, /usr/local, or the runner's service state.
 for unit in "$repo_dir"/deploy/systemd/*.service "$repo_dir"/deploy/systemd/*.timer; do
-    systemd-analyze verify "$unit"
+    candidate="$fixture_dir/${unit##*/}"
+    sed -E \
+        -e "s#^ExecStart=/opt/jarvis/current/[^[:space:]]+#ExecStart=$stub#" \
+        -e "s#^ExecStart=/usr/local/(sbin|libexec)/jarvis[^[:space:]]*#ExecStart=$stub#" \
+        "$unit" > "$candidate"
+    systemd-analyze verify "$candidate"
 done
 echo "Systemd runtime lifecycle checks passed"
