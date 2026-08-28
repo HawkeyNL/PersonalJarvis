@@ -37,7 +37,10 @@ ui_heading "Jarvis Home Node Setup — $release_tag"
 ui_step "[1/7] Preparing host"
 ui_run "Service identity and directories ready" bash "$repo_dir/deploy/systemd/prepare-home-node.sh"
 ui_step "[2/7] SurrealDB"
-ui_run "Root configuration checked" bash "$repo_dir/deploy/surrealdb/initialize-production-surrealdb.sh"
+# This helper prompts for the root database secret on first setup.  Do not run
+# it through ui_run: ui_run captures stdout/stderr and would destroy its TTY
+# boundary in normal (non-verbose) setup mode.
+ui_run_tty "Root configuration checked" bash "$repo_dir/deploy/surrealdb/initialize-production-surrealdb.sh"
 ui_run "SurrealDB container healthy" bash /usr/local/libexec/jarvis/start-production-surrealdb
 
 password_file=/run/jarvis-core-db-password

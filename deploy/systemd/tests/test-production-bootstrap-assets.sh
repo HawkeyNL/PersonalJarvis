@@ -70,5 +70,8 @@ grep -Fq 'test ! -r /etc/jarvis/surrealdb.env' "$verify"
 grep -Fq 'did not become ready; recent service diagnostics follow' "$repo_dir/deploy/systemd/install-home-node-core.sh"
 grep -Fq '/usr/local/sbin/jarvis' "$prepare"
 grep -Fq '/usr/local/sbin/jarvis' "$repo_dir/deploy/systemd/install-home-node-core.sh"
+grep -Fq 'RuntimeDirectory=jarvis-config-broker' "$repo_dir/deploy/systemd/jarvis-config-broker.service"
+grep -Fq 'StateDirectory=jarvis/config-broker' "$repo_dir/deploy/systemd/jarvis-config-broker.service"
+grep -Fq 'ui_run_tty "Root configuration checked"' "$repo_dir/deploy/systemd/setup-home-node.sh"
 
 echo "Production Home Node bootstrap asset checks passed"

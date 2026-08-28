@@ -19,7 +19,9 @@ fi
 id -nG jarvis-codex | tr ' ' '\n' | grep -qx docker && fail "jarvis-codex must not be a Docker-group member"
 
 install -d -o jarvis -g jarvis -m 0750 /var/lib/jarvis
-install -d -o root -g root -m 0700 /var/lib/jarvis/config-broker /var/lib/jarvis/config-broker/replays
+# The config broker's persistent and ephemeral state are intentionally created
+# by its systemd StateDirectory=/RuntimeDirectory= lifecycle.  Pre-creating
+# /run would be lost at reboot and fails ProtectSystem namespace setup.
 install -d -o root -g root -m 0700 /var/lib/jarvis/surrealdb
 install -d -o root -g root -m 0755 /opt/jarvis /opt/jarvis/releases
 # The service needs directory traversal to read only its explicitly group-readable

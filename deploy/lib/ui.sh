@@ -30,3 +30,23 @@ ui_run() {
         return "$status"
     fi
 }
+
+# Security-sensitive provisioning helpers intentionally require a controlling
+# terminal so one-time secrets can never be redirected into captured output.
+# Keep their stdin/stdout attached to the owner terminal in normal pretty mode.
+ui_run_tty() {
+    local label=$1
+    shift
+    [[ -t 0 && -t 1 && -r /dev/tty && -w /dev/tty ]] || {
+        ui_error "$label requires an interactive terminal"
+        return 1
+    }
+    ui_detail "$label …"
+    if "$@"; then
+        ui_success "$label"
+    else
+        local status=$?
+        ui_error "$label failed; inspect the message above"
+        return "$status"
+    fi
+}

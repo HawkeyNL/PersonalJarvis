@@ -3,6 +3,8 @@ set -euo pipefail
 
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-update-core-release.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-jarvis-admin-cli.sh
+bash deploy/systemd/tests/test-ui-tty.sh
+bash deploy/systemd/tests/test-systemd-runtime-lifecycle.sh
 bash deploy/systemd/tests/test-production-bootstrap-assets.sh
 bash deploy/systemd/tests/test-output-presentation.sh
 bash deploy/systemd/tests/test-model-credential-boundaries.sh
