@@ -8,14 +8,21 @@ use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{self, IsTerminal, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitStatus, Stdio},
 };
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use fs2::FileExt;
+use ratatui::{
+    layout::{Constraint, Layout},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Paragraph, Row, Table},
+};
 use serde::Serialize;
 
 const RELEASES_ROOT: &str = "/opt/jarvis/releases";
@@ -44,6 +51,8 @@ enum Commands {
     Health,
     Logs(LogsArgs),
     Update(UpdateArgs),
+    /// One-time migration for installations activated by a legacy updater.
+    MigrateInstalledTooling,
     Models(ModelsArgs),
     Credentials(CredentialsArgs),
     Agents(AgentsArgs),
@@ -251,6 +260,7 @@ fn run() -> Result<()> {
         Commands::Health => health(&presentation, cli.verbose),
         Commands::Logs(args) => logs(args),
         Commands::Update(args) => update(args, cli.verbose),
+        Commands::MigrateInstalledTooling => migrate_installed_tooling(),
         Commands::Models(args) => models(args, cli.verbose),
         Commands::Credentials(args) => credentials(args, cli.verbose),
         Commands::Agents(args) => agents(args, &presentation, cli.verbose),
@@ -283,25 +293,35 @@ impl Presentation {
     fn new(json: bool) -> Self {
         Self {
             json,
-            interactive: !json
-                && io::stdout().is_terminal()
-                && std::env::var_os("NO_COLOR").is_none(),
+            interactive: !json && terminal_supports_rich_output(),
         }
     }
     fn intro(&self, text: &str) {
-        if self.interactive {
-            let _ = cliclack::intro(text);
-        } else if !self.json {
+        if !self.json {
             println!("{text}");
         }
     }
     fn outro(&self, text: &str) {
-        if self.interactive {
-            let _ = cliclack::outro(text);
-        } else if !self.json {
+        if !self.json {
             println!("{text}");
         }
     }
+}
+
+fn terminal_supports_rich_output() -> bool {
+    terminal_supports_rich_output_for(
+        io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").is_none(),
+        std::env::var("TERM").ok().as_deref(),
+    )
+}
+
+fn terminal_supports_rich_output_for(
+    stdout_is_tty: bool,
+    color_allowed: bool,
+    term: Option<&str>,
+) -> bool {
+    stdout_is_tty && color_allowed && term != Some("dumb")
 }
 
 fn version(presentation: &Presentation) -> Result<()> {
@@ -324,6 +344,9 @@ fn status(presentation: &Presentation) -> Result<()> {
         println!("{}", serde_json::to_string(&report)?);
         return Ok(());
     }
+    if presentation.interactive && io::stdin().is_terminal() {
+        return status_tui(&report);
+    }
     presentation.intro("Jarvis Home Node");
     println!(
         "  Release          {}",
@@ -341,6 +364,114 @@ fn status(presentation: &Presentation) -> Result<()> {
     println!("  Updater          {}", report.updater_enabled);
     presentation.outro("Status collected without reading secrets");
     Ok(())
+}
+
+fn status_tui(report: &StatusReport) -> Result<()> {
+    // `ratatui::run` installs restoration/panic handling around the alternate
+    // screen.  Business state is computed before this call, so no privileged
+    // operation is coupled to terminal widgets or input events.
+    ratatui::run(|terminal| -> io::Result<()> {
+        loop {
+            terminal.draw(|frame| render_status_dashboard(frame, report))?;
+            if event::poll(std::time::Duration::from_millis(250))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press
+                        && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                            || (key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)))
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    })
+    .map_err(Into::into)
+}
+
+fn render_status_dashboard(frame: &mut ratatui::Frame, report: &StatusReport) {
+    let area = frame.area();
+    let outer = Block::default()
+        .title(" Jarvis Home Node · q / Esc to close ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    if inner.width < 44 || inner.height < 10 {
+        render_compact_status(frame, inner, report);
+        return;
+    }
+    let rows = report.services.iter().map(|(name, state)| {
+        let healthy = state == "active";
+        Row::new(vec![
+            name.to_string(),
+            state.to_string(),
+            if healthy { "✓" } else { "!" }.to_owned(),
+        ])
+        .style(Style::default().fg(if healthy { Color::Green } else { Color::Yellow }))
+    });
+    let sections = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(5),
+        Constraint::Length(3),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Release ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                report.release.as_deref().unwrap_or("unavailable"),
+                Style::default().fg(Color::Cyan),
+            ),
+        ])),
+        sections[0],
+    );
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Percentage(45),
+                Constraint::Percentage(40),
+                Constraint::Length(3),
+            ],
+        )
+        .header(Row::new(["Service", "Status", ""]).style(Style::default().fg(Color::DarkGray)))
+        .block(Block::default().borders(Borders::TOP)),
+        sections[1],
+    );
+    let agents = report
+        .agent_bundle
+        .as_ref()
+        .map_or("unavailable".to_owned(), |bundle| {
+            format!("{} agents · {}", bundle.agent_count, bundle.id)
+        });
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Agents: {agents}    Updater: {}",
+            report.updater_enabled
+        )),
+        sections[2],
+    );
+}
+
+fn render_compact_status(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    report: &StatusReport,
+) {
+    let mut lines = vec![Line::from(format!(
+        "Release: {}",
+        report.release.as_deref().unwrap_or("unavailable")
+    ))];
+    lines.extend(
+        report
+            .services
+            .iter()
+            .map(|(name, state)| Line::from(format!("{name}: {state}"))),
+    );
+    lines.push(Line::from(format!("Updater: {}", report.updater_enabled)));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn status_report() -> Result<StatusReport> {
@@ -451,6 +582,76 @@ fn update(args: UpdateArgs, verbose: bool) -> Result<()> {
     run_command(&mut command, SubprocessMode::from_verbose(verbose))
 }
 
+/// Complete the only unavoidable legacy boundary: a v0.0.10 updater can
+/// activate a verified release but did not replace its own tools.  This command
+/// is run directly from `/opt/jarvis/current/jarvis`, which is already part of
+/// that verified release.  Future updates perform this atomically themselves.
+fn migrate_installed_tooling() -> Result<()> {
+    let release = fs::canonicalize(CURRENT_RELEASE).context("resolve active release")?;
+    if !release.starts_with(RELEASES_ROOT) {
+        bail!("active release is outside the managed release root");
+    }
+    let admin = release.join("jarvis");
+    let updater = release.join("update-core-release");
+    for path in [&admin, &updater] {
+        let metadata = fs::symlink_metadata(path).context("inspect versioned tooling")?;
+        if metadata.file_type().is_symlink() || metadata.permissions().mode() & 0o111 == 0 {
+            bail!("versioned tooling is unsafe or not executable");
+        }
+    }
+    atomic_install(&admin, Path::new("/usr/local/sbin/jarvis"))?;
+    fs::create_dir_all(LIBEXEC).context("create privileged helper directory")?;
+    atomic_install(&updater, &Path::new(LIBEXEC).join("update-core-release"))?;
+    ensure_updater_config()?;
+    println!("jarvis: installed tooling migrated from verified active release");
+    Ok(())
+}
+
+fn atomic_install(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("tooling destination has no parent")?;
+    let temporary = parent.join(format!(
+        ".{}.new",
+        destination
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("jarvis")
+    ));
+    fs::copy(source, &temporary).context("stage versioned tooling")?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))?;
+    fs::rename(&temporary, destination).context("activate versioned tooling")?;
+    Ok(())
+}
+
+fn ensure_updater_config() -> Result<()> {
+    let path = Path::new("/etc/jarvis/updater.env");
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || metadata.uid() != 0
+                || metadata.gid() != 0
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                bail!("existing updater configuration permissions are unsafe");
+            }
+            parse_updater_config(&fs::read_to_string(path).context("read updater configuration")?)?;
+            return Ok(());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect updater configuration"),
+    }
+    fs::create_dir_all("/etc/jarvis").context("create updater config directory")?;
+    let temporary = Path::new("/etc/jarvis/.updater.env.new");
+    fs::write(
+        temporary,
+        "JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis\nJARVIS_UPDATE_CHANNEL=stable\n",
+    )?;
+    fs::set_permissions(temporary, fs::Permissions::from_mode(0o600))?;
+    fs::rename(temporary, path).context("activate updater configuration")?;
+    Ok(())
+}
+
 fn models(args: ModelsArgs, verbose: bool) -> Result<()> {
     let arguments: Vec<String> = match args.command {
         ModelsCommand::Refresh { provider } => vec!["refresh".to_owned()]
@@ -549,11 +750,29 @@ fn confirm(prompt: &str) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("refusing non-interactive mutation; pass --yes after reviewing the target");
     }
-    let confirmed = cliclack::confirm(prompt).initial_value(false).interact()?;
-    if !confirmed {
+    // Confirmation is deliberately a tiny, fixed TTY interaction.  No owner
+    // input becomes a command, and credentials use their own hidden /dev/tty
+    // reader in the compatibility helper.
+    let mut tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .context("open controlling terminal for confirmation")?;
+    write!(tty, "{prompt} [y/N] ")?;
+    tty.flush()?;
+    let mut answer = String::new();
+    use std::io::BufRead;
+    io::BufReader::new(&tty)
+        .read_line(&mut answer)
+        .context("read confirmation")?;
+    if !confirmation_answer(&answer) {
         bail!("unchanged");
     }
     Ok(())
+}
+
+fn confirmation_answer(answer: &str) -> bool {
+    matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
 }
 
 fn mutation_lock(path: impl AsRef<Path>) -> Result<File> {
@@ -666,27 +885,61 @@ fn load_updater_environment(command: &mut ProcessCommand) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).context("inspect updater configuration"),
     };
-    if metadata.file_type().is_symlink() || metadata.permissions().mode() & 0o077 != 0 {
+    if metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.gid() != 0
+        || metadata.permissions().mode() & 0o077 != 0
+    {
         bail!("updater configuration permissions are unsafe");
     }
-    for line in fs::read_to_string(path)
-        .context("read updater configuration")?
-        .lines()
-    {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key {
-            "JARVIS_UPDATE_REPOSITORY" if valid_repository(value) => {
-                command.env(key, value);
-            }
-            "JARVIS_GITHUB_CURL_NETRC" if Path::new(value).is_absolute() => {
-                command.env(key, value);
-            }
-            _ => {}
-        }
+    let config =
+        parse_updater_config(&fs::read_to_string(path).context("read updater configuration")?)?;
+    // The versioned helper independently validates the same root-owned file.
+    // These are the sole compatibility values forwarded to an older helper;
+    // no caller environment crosses the root boundary.
+    command.env("JARVIS_UPDATE_REPOSITORY", config.repository);
+    if let Some(netrc) = config.github_curl_netrc {
+        command.env("JARVIS_GITHUB_CURL_NETRC", netrc);
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TrustedUpdaterConfig {
+    repository: String,
+    github_curl_netrc: Option<PathBuf>,
+}
+
+fn parse_updater_config(contents: &str) -> Result<TrustedUpdaterConfig> {
+    let mut repository = None;
+    let mut netrc = None;
+    for line in contents.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .context("updater configuration is malformed")?;
+        match key {
+            "JARVIS_UPDATE_REPOSITORY" => {
+                if repository.replace(value.to_owned()).is_some() || !valid_repository(value) {
+                    bail!("updater repository is invalid or duplicated");
+                }
+            }
+            "JARVIS_UPDATE_CHANNEL" if value == "stable" => {}
+            "JARVIS_GITHUB_CURL_NETRC" => {
+                let candidate = PathBuf::from(value);
+                if !candidate.is_absolute() || netrc.replace(candidate).is_some() {
+                    bail!("updater netrc path is invalid or duplicated");
+                }
+            }
+            _ => bail!("updater configuration contains an unsupported key"),
+        }
+    }
+    Ok(TrustedUpdaterConfig {
+        repository: repository.context("updater repository is missing")?,
+        github_curl_netrc: netrc,
+    })
 }
 
 fn valid_repository(value: &str) -> bool {
@@ -745,9 +998,22 @@ mod tests {
     }
     #[test]
     fn no_color_disables_interactive_rendering() {
-        std::env::set_var("NO_COLOR", "1");
-        assert!(!Presentation::new(false).interactive);
-        std::env::remove_var("NO_COLOR");
+        assert!(!terminal_supports_rich_output_for(
+            true,
+            false,
+            Some("xterm-256color")
+        ));
+        assert!(!terminal_supports_rich_output_for(true, true, Some("dumb")));
+        assert!(!terminal_supports_rich_output_for(
+            false,
+            true,
+            Some("xterm-256color")
+        ));
+        assert!(terminal_supports_rich_output_for(
+            true,
+            true,
+            Some("xterm-256color")
+        ));
     }
 
     #[test]
@@ -779,5 +1045,83 @@ mod tests {
         assert!(valid_repository("HawkeyNL/PersonalJarvis"));
         assert!(!valid_repository("HawkeyNL/PersonalJarvis;id"));
         assert!(!valid_repository("../../etc/passwd"));
+    }
+
+    #[test]
+    fn trusted_updater_config_is_strict_and_never_shell_parsed() {
+        let config = parse_updater_config(
+            "JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis\nJARVIS_UPDATE_CHANNEL=stable\n",
+        )
+        .unwrap();
+        assert_eq!(config.repository, "HawkeyNL/PersonalJarvis");
+        assert!(parse_updater_config("JARVIS_UPDATE_REPOSITORY=bad;id\n").is_err());
+        assert!(parse_updater_config("JARVIS_UPDATE_REPOSITORY=a/b\nUNKNOWN=x\n").is_err());
+        assert!(parse_updater_config(
+            "JARVIS_UPDATE_REPOSITORY=a/b\nJARVIS_UPDATE_REPOSITORY=c/d\n"
+        )
+        .is_err());
+        assert!(parse_updater_config(
+            "JARVIS_UPDATE_REPOSITORY=a/b\nJARVIS_GITHUB_CURL_NETRC=relative\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn confirmation_is_explicit_and_non_secret() {
+        assert!(confirmation_answer("yes\n"));
+        assert!(confirmation_answer("Y"));
+        assert!(!confirmation_answer(""));
+        assert!(!confirmation_answer("yes; id"));
+    }
+
+    #[test]
+    fn dashboard_renders_compactly_on_narrow_terminals() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let report = StatusReport {
+            release: Some("v0.0.13".to_owned()),
+            services: BTreeMap::from([("Core", "active".to_owned())]),
+            updater_enabled: "enabled".to_owned(),
+            agent_bundle: None,
+        };
+        let backend = TestBackend::new(32, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_status_dashboard(frame, &report))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Release:"));
+        assert!(rendered.contains("Core:"));
+    }
+
+    #[test]
+    fn atomic_install_replaces_only_completed_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        fs::write(&source, "verified tooling").unwrap();
+        fs::write(&destination, "old tooling").unwrap();
+        atomic_install(&source, &destination).unwrap();
+        assert_eq!(fs::read_to_string(destination).unwrap(), "verified tooling");
+        assert_eq!(
+            fs::metadata(directory.path().join(".destination.new"))
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::NotFound)
+        );
+        assert_eq!(
+            fs::metadata(directory.path().join("destination"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
     }
 }

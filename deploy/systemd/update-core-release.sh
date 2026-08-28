@@ -262,6 +262,8 @@ release_dir="$staging_dir/$expected_top"
     fail "Codex broker is invalid"
 [[ -x $release_dir/jarvis && ! -L $release_dir/jarvis ]] || \
     fail "Jarvis admin binary is invalid"
+[[ -x $release_dir/update-core-release && ! -L $release_dir/update-core-release ]] || \
+    fail "versioned updater helper is invalid"
 find "$release_dir" -type f \( -name 'Jarvis.md' -o -path '*/agents/*' \) -print -quit | grep -q . && \
     fail "release contains protected private configuration"
 [[ -f /etc/jarvis/Jarvis.md && ! -L /etc/jarvis/Jarvis.md ]] || \
@@ -304,12 +306,33 @@ if systemctl restart jarvis-core.service && \
     # privileged code resident. Absence is tolerated for pre-broker installs.
     systemctl try-restart jarvis-config-broker.service >/dev/null 2>&1 || true
     systemctl try-restart jarvis-codex-broker.service >/dev/null 2>&1 || true
-    # Keep the canonical owner CLI in lockstep with the verified release, but
-    # only after Core passed readiness.  A temporary file plus rename avoids a
-    # partially written root command if the machine loses power mid-update.
+    # Keep the canonical owner CLI and updater in lockstep with the verified
+    # release, but only after Core passed readiness. Stage both first. If the
+    # second activation fails, restore the first before returning an error so a
+    # healthy Core is never intentionally paired with mixed admin tooling.
     admin_tmp=/usr/local/sbin/.jarvis.new
+    updater_tmp=/usr/local/libexec/jarvis/.update-core-release.new
+    admin_previous=/usr/local/sbin/.jarvis.previous
+    updater_previous=/usr/local/libexec/jarvis/.update-core-release.previous
+    rm -f -- "$admin_tmp" "$updater_tmp" "$admin_previous" "$updater_previous"
     install -o root -g root -m 0755 "$releases_dir/$tag/jarvis" "$admin_tmp"
-    mv -Tf "$admin_tmp" /usr/local/sbin/jarvis
+    install -o root -g root -m 0755 "$releases_dir/$tag/update-core-release" "$updater_tmp"
+    [[ -f /usr/local/sbin/jarvis && ! -L /usr/local/sbin/jarvis ]] && \
+        install -o root -g root -m 0755 /usr/local/sbin/jarvis "$admin_previous"
+    [[ -f /usr/local/libexec/jarvis/update-core-release && ! -L /usr/local/libexec/jarvis/update-core-release ]] && \
+        install -o root -g root -m 0755 /usr/local/libexec/jarvis/update-core-release "$updater_previous"
+    if ! mv -Tf "$updater_tmp" /usr/local/libexec/jarvis/update-core-release; then
+        fail "could not activate verified updater tooling"
+    fi
+    if ! mv -Tf "$admin_tmp" /usr/local/sbin/jarvis; then
+        if [[ -f $updater_previous ]]; then
+            mv -Tf "$updater_previous" /usr/local/libexec/jarvis/update-core-release || true
+        else
+            rm -f -- /usr/local/libexec/jarvis/update-core-release
+        fi
+        fail "could not activate verified administrative tooling; updater restored"
+    fi
+    rm -f -- "$admin_previous" "$updater_previous"
     echo "jarvis updater: activated $tag"
     exit 0
 fi

@@ -44,6 +44,8 @@ write_asset() {
     chmod 0755 "$asset/jarvis-core-$tag/jarvis-agent-bundle"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$asset/jarvis-core-$tag/jarvis"
     chmod 0755 "$asset/jarvis-core-$tag/jarvis"
+    cp "$repo_dir/deploy/systemd/update-core-release.sh" "$asset/jarvis-core-$tag/update-core-release"
+    chmod 0755 "$asset/jarvis-core-$tag/update-core-release"
     jq -n --arg tag "$manifest_tag" \
       '{tag:$tag,revision:"0123456789abcdef0123456789abcdef01234567",schema_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
       > "$asset/jarvis-core-$tag/release.json"

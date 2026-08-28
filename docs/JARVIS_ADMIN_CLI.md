@@ -14,6 +14,12 @@ sudo jarvis update
 the idempotent Home Node preparation/install flow. It does not grant Jarvis
 Core, agents, Codex, or OpenSandbox any administrative authority.
 
+On an interactive terminal, `sudo jarvis status` opens a compact Ratatui
+dashboard; press `q`, Esc, or Ctrl-C to leave it. Redirected output,
+`TERM=dumb`, `NO_COLOR`, and `--json` remain plain and script-friendly. For
+example, `sudo jarvis --json status` emits stable JSON without ANSI controls,
+prompts, or an alternate terminal screen.
+
 ## Updates
 
 ```bash
@@ -32,11 +38,34 @@ activation restores the previous known-good release. Automatic timer updates
 continue to refuse schema-changing releases; perform those manually with a
 backup and recovery plan.
 
+The update source is a root-owned `/etc/jarvis/updater.env`; it is created by
+setup and is never taken from the invoking shell environment. A release carries
+the versioned Rust admin binary and updater helper alongside Core. After Core
+readiness succeeds, those two tools are staged and activated together from the
+already checksum-verified artifact.
+
+### Legacy v0.0.10 mixed-tooling recovery
+
+Old installers could activate a new Core while leaving the old shell admin
+helper in place. To cross that one unavoidable boundary, install a release that
+contains `migrate-installed-tooling` with the legacy updater, then run the
+verified binary directly once:
+
+```bash
+sudo env JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis \
+  jarvis update --version vMAJOR.MINOR.PATCH
+sudo /opt/jarvis/current/jarvis migrate-installed-tooling
+sudo jarvis update --check
+```
+
+The migration atomically installs only the CLI and updater bundled in the
+active verified release and writes `/etc/jarvis/updater.env` as `root:root
+0600`. Thereafter normal updates need no repository environment variable.
+
 ## Models and credentials
 
 ```bash
 sudo jarvis models list
-sudo jarvis models status
 sudo jarvis models refresh
 sudo jarvis models enable openai-api gpt-4o-mini
 sudo jarvis credentials list
@@ -61,6 +90,10 @@ The private repository credential remains confined to the root-only private
 agent updater. The Core, agent bundle, Codex and OpenSandbox do not receive it.
 Agent rollback may only select a validated immutable bundle already under
 `/var/lib/jarvis/agents/releases`.
+
+Destructive operations prompt only on a controlling TTY. In automation they
+fail closed unless their explicit `--yes` option is supplied. Credential input
+is never rendered by the TUI or emitted in JSON.
 
 ## Diagnostics
 

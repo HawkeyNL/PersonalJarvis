@@ -17,7 +17,7 @@ sudo jarvis ...
 Use:
 
 - `clap` for command hierarchy, arguments and generated help;
-- `cliclack` for restrained interactive presentation/prompts;
+- Ratatui with the Crossterm backend for restrained interactive presentation;
 - `serde` / `serde_json` for structured config/release/API data;
 - `reqwest` for release/API discovery instead of shelling out to `curl` where practical;
 - `tokio` only where async materially improves network/process orchestration;

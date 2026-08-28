@@ -95,6 +95,7 @@ jobs:
           install -m 0755 target/release/jarvis-codex-broker "$release_dir/jarvis-codex-broker"
           install -m 0755 target/release/jarvis-agent-bundle "$release_dir/jarvis-agent-bundle"
           install -m 0755 target/release/jarvis "$release_dir/jarvis"
+          install -m 0755 deploy/systemd/update-core-release.sh "$release_dir/update-core-release"
           schema_manifest="$staging/schema.sha256"
           while IFS= read -r schema; do sha256sum "schema/surreal/$schema"; done < <(find schema/surreal -type f -name '*.surql' -printf '%P\n' | LC_ALL=C sort) > "$schema_manifest"
           schema_sha256=$(sha256sum "$schema_manifest" | awk '{print $1}')

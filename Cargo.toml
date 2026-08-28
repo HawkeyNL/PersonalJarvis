@@ -59,9 +59,10 @@ dotenvy = "0.15"
 anyhow = "1"
 thiserror = "1"
 clap = { version = "4.5", features = ["derive"] }
-cliclack = "0.3"
 fs2 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
 
 # ids and time
 uuid = { version = "1", features = ["v7", "serde"] }
