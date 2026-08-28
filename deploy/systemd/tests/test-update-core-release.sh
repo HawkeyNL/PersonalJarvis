@@ -20,6 +20,7 @@ mkdir -p "$fake_bin"
 
 cleanup() {
     rm -rf -- "$fixture_dir" /opt/jarvis
+    rm -f -- /etc/jarvis/updater.env
 }
 trap cleanup EXIT
 
@@ -145,7 +146,6 @@ prepare_candidate() {
 run_updater() {
     PATH="$fake_bin:$PATH" \
         JARVIS_UPDATER_FIXTURE="$fixture_dir" \
-        JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis \
         JARVIS_UPDATER_READYZ_FAIL="${JARVIS_UPDATER_READYZ_FAIL:-false}" \
         bash "$updater" "$@"
 }
@@ -158,6 +158,28 @@ prepare_candidate v1.0.1 "$same_migrations"
 run_updater
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v1.0.1 ]]
 [[ -f /opt/jarvis/releases/v1.0.1/release.json ]]
+[[ $(stat -c '%U:%G:%a' /etc/jarvis/updater.env) == root:root:600 ]]
+grep -qx 'JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis' /etc/jarvis/updater.env
+grep -qx 'JARVIS_UPDATE_CHANNEL=stable' /etc/jarvis/updater.env
+
+# A shell-supplied repository must not redirect a configured root update.
+seed_active_release v1.1.0 "$same_migrations"
+prepare_candidate v1.1.1 "$same_migrations"
+JARVIS_UPDATE_REPOSITORY=attacker/redirect run_updater
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v1.1.1 ]]
+
+# Malformed trusted configuration fails closed rather than falling back to an
+# inherited environment. Restore the canonical config for later fixtures.
+printf 'JARVIS_UPDATE_REPOSITORY=attacker/redirect;id\n' > /etc/jarvis/updater.env
+chmod 0600 /etc/jarvis/updater.env
+seed_active_release v1.2.0 "$same_migrations"
+prepare_candidate v1.2.1 "$same_migrations"
+if run_updater; then
+    echo "corrupted updater config unexpectedly succeeded" >&2
+    exit 1
+fi
+printf 'JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis\nJARVIS_UPDATE_CHANNEL=stable\n' > /etc/jarvis/updater.env
+chmod 0600 /etc/jarvis/updater.env
 
 seed_active_release v2.0.0 "$same_migrations"
 prepare_candidate v2.0.1 "$changed_migrations"

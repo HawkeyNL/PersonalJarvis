@@ -6,8 +6,11 @@ set -euo pipefail
 readonly releases_dir=/opt/jarvis/releases
 readonly current_link=/opt/jarvis/current
 readonly lock_file=/run/jarvis-updater.lock
-readonly api_url="${JARVIS_GITHUB_API_URL:-https://api.github.com}"
-readonly repository="${JARVIS_UPDATE_REPOSITORY:?JARVIS_UPDATE_REPOSITORY is required}"
+readonly updater_config=/etc/jarvis/updater.env
+readonly canonical_repository=HawkeyNL/PersonalJarvis
+readonly api_url=https://api.github.com
+repository=
+github_curl_netrc=
 
 usage() {
     cat >&2 <<'EOF'
@@ -28,6 +31,53 @@ require_command() {
 fail() {
     echo "jarvis updater: $*" >&2
     exit 1
+}
+
+valid_repository() {
+    [[ $1 =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+}
+
+write_default_updater_config() {
+    local temporary
+    install -d -o root -g root -m 0750 /etc/jarvis
+    temporary=$(mktemp /etc/jarvis/.updater.env.XXXXXX)
+    trap 'rm -f -- "$temporary"' RETURN
+    printf 'JARVIS_UPDATE_REPOSITORY=%s\nJARVIS_UPDATE_CHANNEL=stable\n' "$canonical_repository" > "$temporary"
+    chown root:root "$temporary"
+    chmod 0600 "$temporary"
+    mv -f -- "$temporary" "$updater_config"
+    trap - RETURN
+    echo "jarvis updater: migrated trusted updater configuration for $canonical_repository" >&2
+}
+
+load_updater_config() {
+    local line key value seen_repository=false
+    if [[ ! -e $updater_config ]]; then
+        # v0.0.10 did not persist an update source. This one-time migration is
+        # intentionally the public canonical repository, never caller input.
+        write_default_updater_config
+    fi
+    [[ -f $updater_config && ! -L $updater_config ]] || fail "updater configuration is unsafe"
+    [[ $(stat -c '%U:%G:%a' "$updater_config") == root:root:600 ]] || \
+        fail "updater configuration must be root:root mode 0600"
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -z $line || $line == \#* ]] && continue
+        [[ $line == *=* ]] || fail "updater configuration is malformed"
+        key=${line%%=*}
+        value=${line#*=}
+        case $key in
+            JARVIS_UPDATE_REPOSITORY)
+                [[ $seen_repository == false ]] || fail "updater repository is duplicated"
+                valid_repository "$value" || fail "updater repository is invalid"
+                repository=$value
+                seen_repository=true
+                ;;
+            JARVIS_UPDATE_CHANNEL) [[ $value == stable ]] || fail "updater channel is invalid" ;;
+            JARVIS_GITHUB_CURL_NETRC) [[ $value == /* ]] || fail "updater netrc path is invalid"; github_curl_netrc=$value ;;
+            *) fail "updater configuration contains an unsupported key" ;;
+        esac
+    done < "$updater_config"
+    [[ $seen_repository == true ]] || fail "updater repository is missing"
 }
 
 version_is_newer() {
@@ -59,8 +109,7 @@ for command in curl flock jq sha256sum tar systemctl readlink mv ln mktemp insta
 done
 
 [[ ${EUID} -eq 0 ]] || fail "must run as root"
-[[ $repository =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "invalid repository"
-[[ $api_url == https://api.github.com ]] || fail "only the GitHub API endpoint is supported"
+load_updater_config
 [[ -d $releases_dir && -L $current_link ]] || fail "expected Jarvis release layout is absent"
 
 mode=latest
@@ -78,11 +127,11 @@ esac
 # Optional private-repository access is supplied through a root-only curl netrc
 # file, never through the unit, process environment, or an argument.
 curl_args=(--fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 10 --max-time 60)
-if [[ -n ${JARVIS_GITHUB_CURL_NETRC:-} ]]; then
-    [[ -f $JARVIS_GITHUB_CURL_NETRC ]] || fail "configured curl netrc does not exist"
-    [[ $(stat -c '%U:%a' "$JARVIS_GITHUB_CURL_NETRC") == root:600 ]] || \
+if [[ -n $github_curl_netrc ]]; then
+    [[ -f $github_curl_netrc ]] || fail "configured curl netrc does not exist"
+    [[ $(stat -c '%U:%a' "$github_curl_netrc") == root:600 ]] || \
         fail "curl netrc must be root-owned with mode 0600"
-    curl_args+=(--netrc-file "$JARVIS_GITHUB_CURL_NETRC")
+    curl_args+=(--netrc-file "$github_curl_netrc")
 fi
 
 exec 9>"$lock_file"
