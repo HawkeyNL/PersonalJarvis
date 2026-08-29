@@ -155,17 +155,20 @@ restart_brokers() {
 }
 
 verification_marker_valid() {
-    local release=$1 expected_tag=$2 marker line manifest_sha256
+    local release=$1 expected_tag=$2 marker marker_kind marker_value extra manifest_sha256
     marker=$release/release.verification
     [[ -f $marker && ! -L $marker ]] || return 1
     [[ $(stat -c '%U:%G:%a' "$marker") == root:root:644 ]] || return 1
-    IFS= read -r line < "$marker" || return 1
-    if [[ $line =~ ^[0-9a-f]{64}[[:space:]][[:space:]]jarvis-core-${expected_tag}-linux-x86_64\.tar\.gz$ ]]; then
+    read -r marker_kind marker_value extra < "$marker" || return 1
+    [[ -z $extra ]] || return 1
+    if [[ ${#marker_kind} -eq 64 && $marker_kind != *[!0-9a-f]* && \
+        $marker_value == "jarvis-core-$expected_tag-linux-x86_64.tar.gz" ]]; then
         return 0
     fi
-    if [[ $line =~ ^legacy-active-release-manifest[[:space:]]([0-9a-f]{64})$ ]]; then
+    if [[ $marker_kind == legacy-active-release-manifest && ${#marker_value} -eq 64 && \
+        $marker_value != *[!0-9a-f]* ]]; then
         manifest_sha256=$(sha256sum "$release/release.json" | awk '{print $1}')
-        [[ ${BASH_REMATCH[1]} == "$manifest_sha256" ]]
+        [[ $marker_value == "$manifest_sha256" ]]
         return
     fi
     return 1
