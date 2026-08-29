@@ -80,6 +80,7 @@ write_release() {
     local tag=$2
     local schema_sha256=$3
     mkdir -p "$root/jarvis-core-$tag"
+    chmod 0755 "$root/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
     chmod 0755 "$root/jarvis-core-$tag/jarvis-api"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-config-broker"
@@ -98,6 +99,7 @@ write_release() {
         --arg schema_sha256 "$schema_sha256" \
         '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256}' \
         > "$root/jarvis-core-$tag/release.json"
+    chmod 0644 "$root/jarvis-core-$tag/release.json"
     printf '%064d  jarvis-core-%s-linux-x86_64.tar.gz\n' 0 "$tag" \
         > "$root/jarvis-core-$tag/release.verification"
     chmod 0644 "$root/jarvis-core-$tag/release.verification"
