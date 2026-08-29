@@ -175,7 +175,7 @@ verification_marker_valid() {
 }
 
 migrate_legacy_release_verification() {
-    local release=$1 expected_tag=$2 temporary manifest_sha256
+    local release=$1 expected_tag=$2 temporary manifest_sha256 unsafe_entry
     if [[ -e $release/release.verification ]]; then
         verification_marker_valid "$release" "$expected_tag" || \
             fail "installed release has an invalid verification marker: $expected_tag"
@@ -196,8 +196,10 @@ migrate_legacy_release_verification() {
         [[ -f $release/$executable && ! -L $release/$executable && -x $release/$executable ]] || \
             fail "legacy release tooling is invalid: $expected_tag"
     done
-    if find "$release" -xdev \( -type l -o ! -user root -o ! -group root -o -perm /022 \) -print -quit | grep -q .; then
-        fail "legacy release permissions are unsafe: $expected_tag"
+    unsafe_entry=$(find "$release" -xdev \( -type l -o ! -user root -o ! -group root -o -perm /022 \) \
+        -printf '%P (%y %u:%g %m)\n' -quit)
+    if [[ -n $unsafe_entry ]]; then
+        fail "legacy release permissions are unsafe: $expected_tag: $unsafe_entry"
     fi
 
     manifest_sha256=$(sha256sum "$release/release.json" | awk '{print $1}')
