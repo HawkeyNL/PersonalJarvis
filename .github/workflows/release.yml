@@ -20,7 +20,7 @@ jobs:
     name: Rust validation
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
@@ -44,17 +44,18 @@ jobs:
     name: Deployment and sandbox security fixtures
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.25.0"
+          cache: false
       - run: bash scripts/ci/verify-deployment-security.sh
 
   dependency-audit:
     name: Dependency vulnerability audit
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.1
       - run: cargo install cargo-audit --locked
       - run: test "$(date -u +%F)" \< "2026-10-01"
@@ -65,7 +66,7 @@ jobs:
     needs: [rust-validation, deployment-security, dependency-audit]
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
       - name: Record canonical builder
@@ -91,7 +92,7 @@ jobs:
           SOURCE_DATE_EPOCH: "0"
         run: bash scripts/release/build-linux.sh package "$RELEASE_TAG" "$RELEASE_REVISION"
       - name: Upload Home Node acceptance candidate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: jarvis-home-node-candidate-${{ github.ref_name }}
           path: |
@@ -112,7 +113,7 @@ jobs:
         env:
           ACCEPTED_REVISION: ${{ vars.HOME_NODE_ACCEPTED_REVISION }}
         run: test "$ACCEPTED_REVISION" = "$GITHUB_SHA"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: jarvis-home-node-candidate-${{ github.ref_name }}
           path: dist

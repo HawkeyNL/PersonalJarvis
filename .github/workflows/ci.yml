@@ -20,7 +20,7 @@ jobs:
     name: Rust — fmt, clippy, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
@@ -49,10 +49,11 @@ jobs:
     name: Deployment and sandbox security fixtures
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.25.0"
+          cache: false
       - name: Verify deployment and OpenSandbox boundaries
         run: bash scripts/ci/verify-deployment-security.sh
 
@@ -60,7 +61,7 @@ jobs:
     name: Dependency vulnerability audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.1
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
@@ -72,8 +73,8 @@ jobs:
     name: Jarvis app — typecheck and build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
