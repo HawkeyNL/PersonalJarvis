@@ -10,9 +10,10 @@ use std::{
     io::{self, BufRead, IsTerminal, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, ExitStatus, Stdio},
-    sync::mpsc,
+    process::{Child, Command as ProcessCommand, ExitStatus, Stdio},
+    sync::{mpsc, Arc, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
@@ -93,6 +94,9 @@ enum TuiPreviewScenario {
     Models,
     Credentials,
     Agents,
+    UpdateCenter,
+    UpdateCenterFailure,
+    UpdateCheckInline,
     UpdateRunning,
     UpdateSuccess,
     UpdateFailureRollback,
@@ -546,6 +550,7 @@ enum TuiExitReason {
     Escape,
     CtrlC,
     ProcessCompleted,
+    SelectedClose,
 }
 
 impl std::fmt::Display for TuiExitReason {
@@ -555,6 +560,7 @@ impl std::fmt::Display for TuiExitReason {
             Self::Escape => "Escape key",
             Self::CtrlC => "Ctrl-C",
             Self::ProcessCompleted => "child process completed",
+            Self::SelectedClose => "Close action",
         })
     }
 }
@@ -905,6 +911,24 @@ fn tui_preview(scenario: &TuiPreviewScenario, trace_enabled: bool) -> Result<()>
             vec![vec!["fixture-bundle-2026-08-29".to_owned(), "7".to_owned()]],
             trace_enabled,
         ),
+        TuiPreviewScenario::UpdateCenter => update_center_tui(
+            trace_enabled,
+            Some(FixtureUpdateMode {
+                fail_mutations: false,
+            }),
+        ),
+        TuiPreviewScenario::UpdateCenterFailure => update_center_tui(
+            trace_enabled,
+            Some(FixtureUpdateMode {
+                fail_mutations: true,
+            }),
+        ),
+        TuiPreviewScenario::UpdateCheckInline => {
+            println!("Current:  v0.0.15");
+            println!("Latest:   v0.0.16");
+            println!("Update:   available");
+            Ok(())
+        }
         TuiPreviewScenario::UpdateRunning => table_tui(
             "Jarvis Update · running fixture",
             vec!["State".to_owned(), "Latest safe event".to_owned()],
@@ -1122,50 +1146,1090 @@ fn logs(args: LogsArgs, presentation: &Presentation) -> Result<()> {
 }
 
 fn update(args: UpdateArgs, presentation: &Presentation, verbose: bool) -> Result<()> {
-    // The narrowly scoped updater helper owns the same lock and release
-    // transaction until its migration is complete.  Taking it here would
-    // deadlock the child; no second update policy is introduced.
-    let mut command = trusted_command(Path::new(LIBEXEC).join("update-core-release"));
-    load_updater_environment(&mut command)?;
-    if args.check {
-        command.arg("--check");
-    } else if args.status {
-        command.arg("--status");
-    } else if args.rollback {
-        if !args.yes {
-            confirm("Rollback Core to the previous verified release?")?;
+    let invocation = UpdateInvocation::from_args(&args);
+    if matches!(invocation, UpdateInvocation::Center) {
+        if presentation.json {
+            bail!("--json update requires an explicit read-only --check or --status operation");
         }
-        command.arg("--rollback");
-    } else if let Some(version) = args.version {
-        command.args(["--version", &version]);
-    } else {
-        command.arg("--latest");
+        if presentation.interactive && io::stdin().is_terminal() {
+            return update_center_tui(presentation.tui_trace, None);
+        }
+        bail!(
+            "non-interactive update requires --check, --status, --latest, --version, or --rollback"
+        );
     }
-    if presentation.json {
-        if !(args.check || args.status) {
-            bail!("--json is supported only for non-mutating update --check/--status");
+
+    if presentation.json
+        && !matches!(
+            invocation,
+            UpdateInvocation::Check | UpdateInvocation::Status
+        )
+    {
+        bail!("--json is supported only for non-mutating update --check/--status");
+    }
+    if matches!(invocation, UpdateInvocation::Rollback) && !args.yes {
+        confirm("Rollback Core to the previous verified release?")?;
+    }
+
+    let mut command = trusted_updater_command()?;
+    match &invocation {
+        UpdateInvocation::Check => {
+            command.arg("--check");
         }
-        let mode = if args.check { "check" } else { "status" };
+        UpdateInvocation::Status => {
+            command.arg("--status");
+        }
+        UpdateInvocation::Latest => {
+            command.arg("--latest");
+        }
+        UpdateInvocation::Version(version) => {
+            command.args(["--version", version]);
+        }
+        UpdateInvocation::Rollback => {
+            command.arg("--rollback");
+        }
+        UpdateInvocation::Center => unreachable!("handled above"),
+    }
+
+    if matches!(
+        invocation,
+        UpdateInvocation::Check | UpdateInvocation::Status
+    ) {
         let output = command.output().context("start trusted updater")?;
-        if !output.status.success() && !(args.check && output.status.code() == Some(2)) {
+        let check_available =
+            matches!(invocation, UpdateInvocation::Check) && output.status.code() == Some(2);
+        if !output.status.success() && !check_available {
             io::stderr().write_all(&output.stderr)?;
             return ensure_success(output.status);
         }
-        let values = parse_key_value_output(&String::from_utf8(output.stdout)?)?;
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({"mode": mode, "values": values}))?
-        );
+        if presentation.json {
+            let values = parse_key_value_output(&String::from_utf8(output.stdout)?)?;
+            let mode = if matches!(invocation, UpdateInvocation::Check) {
+                "check"
+            } else {
+                "status"
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({"mode": mode, "values": values}))?
+            );
+        } else {
+            io::stdout().write_all(&output.stdout)?;
+            io::stderr().write_all(&output.stderr)?;
+            if check_available {
+                io::stdout().flush()?;
+                io::stderr().flush()?;
+                std::process::exit(2);
+            }
+        }
+        return Ok(());
+    }
+
+    run_command(&mut command, SubprocessMode::from_verbose(verbose))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UpdateInvocation {
+    Center,
+    Check,
+    Status,
+    Latest,
+    Version(String),
+    Rollback,
+}
+
+impl UpdateInvocation {
+    fn from_args(args: &UpdateArgs) -> Self {
+        if args.check {
+            Self::Check
+        } else if args.status {
+            Self::Status
+        } else if args.latest {
+            Self::Latest
+        } else if let Some(version) = &args.version {
+            Self::Version(version.clone())
+        } else if args.rollback {
+            Self::Rollback
+        } else {
+            Self::Center
+        }
+    }
+}
+
+fn trusted_updater_command() -> Result<ProcessCommand> {
+    let mut command = trusted_command(Path::new(LIBEXEC).join("update-core-release"));
+    load_updater_environment(&mut command)?;
+    Ok(command)
+}
+
+#[derive(Clone, Debug, Default)]
+struct UpdateSummary {
+    current: Option<String>,
+    latest: Option<String>,
+    previous: Option<String>,
+    updater: Option<String>,
+    update_available: Option<bool>,
+}
+
+impl UpdateSummary {
+    fn merge_helper_output(&mut self, output: &str) -> Result<()> {
+        let values = parse_key_value_output(output)?;
+        for (key, destination) in [
+            ("current", &mut self.current),
+            ("latest", &mut self.latest),
+            ("previous", &mut self.previous),
+            ("updater", &mut self.updater),
+        ] {
+            if let Some(value) = values.get(key) {
+                *destination = (value != "unavailable").then(|| value.clone());
+            }
+        }
+        self.update_available = values
+            .get("update")
+            .map(|value| value == "available")
+            .or_else(|| match (&self.latest, &self.current) {
+                (Some(latest), Some(current)) => Some(release_is_newer(latest, current)),
+                _ => None,
+            });
         Ok(())
-    } else if presentation.interactive && io::stdin().is_terminal() && !verbose {
-        run_process_tui(
-            &mut command,
-            "Jarvis Update",
-            "Starting verified update transaction…".to_owned(),
-            presentation.tui_trace,
-        )
+    }
+}
+
+fn release_is_newer(candidate: &str, current: &str) -> bool {
+    fn components(tag: &str) -> Option<[u64; 3]> {
+        let mut parts = tag.strip_prefix('v')?.split('.');
+        let value = [
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        ];
+        parts.next().is_none().then_some(value)
+    }
+    matches!((components(candidate), components(current)), (Some(candidate), Some(current)) if candidate > current)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RollbackCandidate {
+    version: String,
+    current: bool,
+    verified: bool,
+    rollback_capable: bool,
+    reason: String,
+}
+
+#[derive(Clone, Debug)]
+enum UpdateOperation {
+    Status,
+    Check,
+    Latest,
+    Version(String),
+    Candidates,
+    Rollback(String),
+}
+
+impl UpdateOperation {
+    fn configure(&self, command: &mut ProcessCommand) {
+        match self {
+            Self::Status => {
+                command.arg("--status");
+            }
+            Self::Check => {
+                command.arg("--check");
+            }
+            Self::Latest => {
+                command.arg("--latest");
+            }
+            Self::Version(version) => {
+                command.args(["--version", version]);
+            }
+            Self::Candidates => {
+                command.arg("--rollback-candidates");
+            }
+            Self::Rollback(version) => {
+                command.args(["--rollback-version", version]);
+            }
+        }
+    }
+
+    fn is_mutating(&self) -> bool {
+        matches!(self, Self::Latest | Self::Version(_) | Self::Rollback(_))
+    }
+
+    fn title(&self) -> String {
+        match self {
+            Self::Status => "Refreshing Update Center".to_owned(),
+            Self::Check => "Checking for updates".to_owned(),
+            Self::Latest => "Updating to latest stable release".to_owned(),
+            Self::Version(version) => format!("Installing {version}"),
+            Self::Candidates => "Loading rollback candidates".to_owned(),
+            Self::Rollback(version) => format!("Rolling back to {version}"),
+        }
+    }
+}
+
+enum ChildStream {
+    Stdout(String),
+    Stderr(String),
+}
+
+struct UpdateChild {
+    child: Child,
+    pending: Arc<Mutex<VecDeque<ChildStream>>>,
+    readers: Vec<thread::JoinHandle<()>>,
+    operation: UpdateOperation,
+    stdout: VecDeque<String>,
+    stderr: VecDeque<String>,
+}
+
+struct ChildOutcome {
+    operation: UpdateOperation,
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+impl UpdateChild {
+    fn spawn(operation: UpdateOperation) -> Result<Self> {
+        let mut command = trusted_updater_command()?;
+        operation.configure(&mut command);
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("start trusted updater")?;
+        let pending = Arc::new(Mutex::new(VecDeque::new()));
+        let mut readers = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            readers.push(forward_child_lines(stdout, Arc::clone(&pending), false));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            readers.push(forward_child_lines(stderr, Arc::clone(&pending), true));
+        }
+        Ok(Self {
+            child,
+            pending,
+            readers,
+            operation,
+            stdout: VecDeque::new(),
+            stderr: VecDeque::new(),
+        })
+    }
+
+    fn drain(&mut self, messages: &mut VecDeque<String>) {
+        let drained = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.drain(..).collect::<Vec<_>>()
+        };
+        for message in drained {
+            let (line, destination) = match message {
+                ChildStream::Stdout(line) => (line, &mut self.stdout),
+                ChildStream::Stderr(line) => (line, &mut self.stderr),
+            };
+            push_bounded(destination, line.clone(), 256);
+            push_bounded(messages, sanitize_terminal_line(&line), 18);
+        }
+    }
+
+    fn try_status(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn finish(mut self, status: ExitStatus, messages: &mut VecDeque<String>) -> ChildOutcome {
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+        self.drain(messages);
+        ChildOutcome {
+            operation: self.operation.clone(),
+            status,
+            stdout: std::mem::take(&mut self.stdout)
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            stderr: std::mem::take(&mut self.stderr)
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    fn terminate(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+    }
+}
+
+impl Drop for UpdateChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn forward_child_lines<R: Read + Send + 'static>(
+    stream: R,
+    pending: Arc<Mutex<VecDeque<ChildStream>>>,
+    stderr: bool,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        for line in io::BufReader::new(stream).lines().map_while(Result::ok) {
+            let message = if stderr {
+                ChildStream::Stderr(line)
+            } else {
+                ChildStream::Stdout(line)
+            };
+            let mut pending = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.len() == 128 {
+                pending.pop_front();
+            }
+            pending.push_back(message);
+        }
+    })
+}
+
+fn push_bounded(lines: &mut VecDeque<String>, line: String, capacity: usize) {
+    if lines.len() == capacity {
+        lines.pop_front();
+    }
+    lines.push_back(line);
+}
+
+fn sanitize_terminal_line(line: &str) -> String {
+    line.chars()
+        .filter(|character| !character.is_control() || *character == '\t')
+        .take(240)
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateScreen {
+    Overview,
+    Running,
+    VersionInput,
+    RollbackSelection,
+    RollbackConfirm,
+    Result,
+}
+
+#[derive(Clone, Debug)]
+struct UpdateResultState {
+    success: bool,
+    title: String,
+    detail: String,
+}
+
+#[derive(Clone, Copy)]
+struct FixtureUpdateMode {
+    fail_mutations: bool,
+}
+
+struct UpdateCenter {
+    summary: UpdateSummary,
+    screen: UpdateScreen,
+    selected: usize,
+    input: String,
+    input_error: Option<String>,
+    candidates: Vec<RollbackCandidate>,
+    confirmation: Option<RollbackCandidate>,
+    result: Option<UpdateResultState>,
+    messages: VecDeque<String>,
+    last_result: Option<String>,
+    active: Option<UpdateChild>,
+    operation: Option<UpdateOperation>,
+    fixture: Option<FixtureUpdateMode>,
+    fixture_completion: Option<Instant>,
+    animation_tick: usize,
+}
+
+impl UpdateCenter {
+    fn live() -> Result<Self> {
+        let mut center = Self::base(None);
+        center.start(UpdateOperation::Status)?;
+        Ok(center)
+    }
+
+    #[cfg(feature = "tui-preview")]
+    fn fixture(fail_mutations: bool) -> Self {
+        let mut center = Self::base(Some(FixtureUpdateMode { fail_mutations }));
+        center.summary = UpdateSummary {
+            current: Some("v0.0.15".to_owned()),
+            latest: Some("v0.0.16".to_owned()),
+            previous: Some("v0.0.14".to_owned()),
+            updater: Some("enabled".to_owned()),
+            update_available: Some(true),
+        };
+        center.last_result = Some("Fixture data only · no administrative capability".to_owned());
+        center
+    }
+
+    fn base(fixture: Option<FixtureUpdateMode>) -> Self {
+        Self {
+            summary: UpdateSummary::default(),
+            screen: UpdateScreen::Overview,
+            selected: 0,
+            input: String::new(),
+            input_error: None,
+            candidates: Vec::new(),
+            confirmation: None,
+            result: None,
+            messages: VecDeque::new(),
+            last_result: None,
+            active: None,
+            operation: None,
+            fixture,
+            fixture_completion: None,
+            animation_tick: 0,
+        }
+    }
+
+    fn start(&mut self, operation: UpdateOperation) -> Result<()> {
+        self.messages.clear();
+        push_bounded(&mut self.messages, operation.title(), 18);
+        self.selected = 0;
+        self.screen = UpdateScreen::Running;
+        self.operation = Some(operation.clone());
+        if self.fixture.is_some() {
+            self.fixture_completion = Some(Instant::now() + Duration::from_millis(300));
+        } else {
+            self.active = Some(UpdateChild::spawn(operation)?);
+        }
+        Ok(())
+    }
+
+    fn tick(&mut self) -> Result<()> {
+        self.animation_tick = self.animation_tick.wrapping_add(1);
+        if self
+            .fixture_completion
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.fixture_completion = None;
+            let operation = self
+                .operation
+                .take()
+                .context("fixture operation is missing")?;
+            self.complete_fixture(operation);
+            return Ok(());
+        }
+
+        let status = if let Some(active) = self.active.as_mut() {
+            active.drain(&mut self.messages);
+            active.try_status().context("poll trusted updater")?
+        } else {
+            None
+        };
+        if let Some(status) = status {
+            let active = self.active.take().context("completed updater is missing")?;
+            let outcome = active.finish(status, &mut self.messages);
+            self.operation = None;
+            if let Err(error) = self.complete(outcome) {
+                self.show_result(
+                    false,
+                    "Update operation failed".to_owned(),
+                    sanitize_terminal_line(&format!(
+                        "Trusted helper response could not be validated: {error}"
+                    )),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn complete(&mut self, outcome: ChildOutcome) -> Result<()> {
+        let check_success =
+            matches!(outcome.operation, UpdateOperation::Check) && outcome.status.code() == Some(2);
+        if !outcome.status.success() && !check_success {
+            let rolled_back = outcome.stderr.contains("rollback completed")
+                || outcome.stderr.contains("restored")
+                || outcome.stdout.contains("rolled back");
+            let detail = outcome
+                .stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .or_else(|| {
+                    outcome
+                        .stdout
+                        .lines()
+                        .rev()
+                        .find(|line| !line.trim().is_empty())
+                })
+                .map(sanitize_terminal_line)
+                .unwrap_or_else(|| format!("trusted updater exited with {}", outcome.status));
+            self.show_result(
+                false,
+                if rolled_back {
+                    "Update failed · previous release restored".to_owned()
+                } else {
+                    "Update operation failed".to_owned()
+                },
+                detail,
+            );
+            return Ok(());
+        }
+        match outcome.operation {
+            UpdateOperation::Status => {
+                self.summary.merge_helper_output(&outcome.stdout)?;
+                self.last_result = Some("Update status refreshed".to_owned());
+                self.screen = UpdateScreen::Overview;
+            }
+            UpdateOperation::Check => {
+                self.summary.merge_helper_output(&outcome.stdout)?;
+                self.last_result = Some(match self.summary.update_available {
+                    Some(true) => "Update available".to_owned(),
+                    Some(false) => "Already up to date".to_owned(),
+                    None => "Update check completed".to_owned(),
+                });
+                self.screen = UpdateScreen::Overview;
+            }
+            UpdateOperation::Candidates => {
+                self.candidates = serde_json::from_str(&outcome.stdout)
+                    .context("trusted updater returned invalid rollback candidate JSON")?;
+                self.selected = 0;
+                self.screen = UpdateScreen::RollbackSelection;
+            }
+            UpdateOperation::Latest => {
+                let target = self
+                    .summary
+                    .latest
+                    .as_deref()
+                    .unwrap_or("latest stable release");
+                let target = target.to_owned();
+                self.summary.current = Some(target.clone());
+                self.summary.update_available = Some(false);
+                self.show_result(
+                    true,
+                    format!("Updated successfully to {target}"),
+                    "The trusted updater completed activation and Core readiness checks."
+                        .to_owned(),
+                );
+            }
+            UpdateOperation::Version(version) => {
+                self.summary.current = Some(version.clone());
+                self.summary.update_available = self
+                    .summary
+                    .latest
+                    .as_deref()
+                    .map(|latest| release_is_newer(latest, &version));
+                self.show_result(
+                    true,
+                    format!("Updated successfully to {version}"),
+                    "The trusted updater completed activation and Core readiness checks."
+                        .to_owned(),
+                );
+            }
+            UpdateOperation::Rollback(version) => {
+                self.summary.previous = self.summary.current.replace(version.clone());
+                self.summary.update_available = self
+                    .summary
+                    .latest
+                    .as_deref()
+                    .map(|latest| release_is_newer(latest, &version));
+                self.show_result(
+                    true,
+                    format!("Rolled back successfully to {version}"),
+                    "The trusted updater completed activation and Core readiness checks."
+                        .to_owned(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_fixture(&mut self, operation: UpdateOperation) {
+        let fail_mutations = self.fixture.is_some_and(|fixture| fixture.fail_mutations);
+        match operation {
+            UpdateOperation::Status => {
+                self.last_result = Some("Fixture status refreshed".to_owned());
+                self.screen = UpdateScreen::Overview;
+            }
+            UpdateOperation::Check => {
+                self.last_result = Some("Update available: v0.0.16".to_owned());
+                self.screen = UpdateScreen::Overview;
+            }
+            UpdateOperation::Candidates => {
+                self.candidates = vec![
+                    RollbackCandidate {
+                        version: "v0.0.15".to_owned(),
+                        current: true,
+                        verified: true,
+                        rollback_capable: false,
+                        reason: "active release".to_owned(),
+                    },
+                    RollbackCandidate {
+                        version: "v0.0.14".to_owned(),
+                        current: false,
+                        verified: true,
+                        rollback_capable: true,
+                        reason: "eligible".to_owned(),
+                    },
+                    RollbackCandidate {
+                        version: "v0.0.10-legacy".to_owned(),
+                        current: false,
+                        verified: false,
+                        rollback_capable: false,
+                        reason: "verification marker is missing or invalid".to_owned(),
+                    },
+                ];
+                self.screen = UpdateScreen::RollbackSelection;
+            }
+            operation @ (UpdateOperation::Latest
+            | UpdateOperation::Version(_)
+            | UpdateOperation::Rollback(_)) => {
+                let target = match &operation {
+                    UpdateOperation::Latest => "v0.0.16".to_owned(),
+                    UpdateOperation::Version(version) | UpdateOperation::Rollback(version) => {
+                        version.clone()
+                    }
+                    _ => unreachable!(),
+                };
+                if fail_mutations {
+                    self.show_result(
+                        false,
+                        "Update failed".to_owned(),
+                        "Fixture readiness failure; previous release restored".to_owned(),
+                    );
+                } else {
+                    self.show_result(
+                        true,
+                        format!("Updated successfully to {target}"),
+                        "Fixture completion is persistent until owner dismissal".to_owned(),
+                    );
+                }
+            }
+        }
+        self.operation = None;
+    }
+
+    fn show_result(&mut self, success: bool, title: String, detail: String) {
+        self.last_result = Some(title.clone());
+        self.result = Some(UpdateResultState {
+            success,
+            title,
+            detail,
+        });
+        self.selected = 0;
+        self.screen = UpdateScreen::Result;
+    }
+
+    fn running_mutation(&self) -> bool {
+        self.operation
+            .as_ref()
+            .is_some_and(UpdateOperation::is_mutating)
+    }
+
+    fn terminate_active(&mut self) {
+        if let Some(active) = self.active.take() {
+            active.terminate();
+        }
+        self.fixture_completion = None;
+        self.operation = None;
+    }
+
+    fn handle_event(&mut self, event: Event) -> Result<Option<TuiExitReason>> {
+        let Event::Key(key) = event else {
+            return Ok(None);
+        };
+        if key.kind != KeyEventKind::Press {
+            return Ok(None);
+        }
+        let ctrl_c =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.code == KeyCode::Char('q') || ctrl_c {
+            if self.running_mutation() {
+                self.last_result = Some(
+                    "Trusted mutation is in a non-cancellable phase; wait for its result"
+                        .to_owned(),
+                );
+                return Ok(None);
+            }
+            self.terminate_active();
+            return Ok(Some(if ctrl_c {
+                TuiExitReason::CtrlC
+            } else {
+                TuiExitReason::Quit
+            }));
+        }
+        if key.code == KeyCode::Esc {
+            if self.running_mutation() {
+                self.last_result = Some(
+                    "Trusted mutation is in a non-cancellable phase; wait for its result"
+                        .to_owned(),
+                );
+            } else if self.screen == UpdateScreen::Overview {
+                return Ok(Some(TuiExitReason::Escape));
+            } else {
+                self.terminate_active();
+                self.screen = UpdateScreen::Overview;
+                self.selected = 0;
+            }
+            return Ok(None);
+        }
+
+        if self.screen == UpdateScreen::VersionInput {
+            match key.code {
+                KeyCode::Backspace => {
+                    self.input.pop();
+                    self.input_error = None;
+                }
+                KeyCode::Char(character)
+                    if self.input.len() < 32
+                        && (character.is_ascii_digit() || matches!(character, 'v' | '.')) =>
+                {
+                    self.input.push(character);
+                    self.input_error = None;
+                }
+                KeyCode::Enter => {
+                    if valid_release_tag(&self.input) {
+                        self.start(UpdateOperation::Version(self.input.clone()))?;
+                    } else {
+                        self.input_error = Some("Use vMAJOR.MINOR.PATCH".to_owned());
+                    }
+                }
+                _ => {}
+            }
+            return Ok(None);
+        }
+
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::Enter => return self.activate_selection(),
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    fn selection_count(&self) -> usize {
+        match self.screen {
+            UpdateScreen::Overview => 6,
+            UpdateScreen::RollbackSelection => self.candidates.len().max(1),
+            UpdateScreen::RollbackConfirm | UpdateScreen::Result => 2,
+            UpdateScreen::Running | UpdateScreen::VersionInput => 1,
+        }
+    }
+
+    fn move_selection(&mut self, direction: isize) {
+        let count = self.selection_count();
+        if count <= 1 {
+            return;
+        }
+        self.selected = if direction < 0 {
+            self.selected.checked_sub(1).unwrap_or(count - 1)
+        } else {
+            (self.selected + 1) % count
+        };
+    }
+
+    fn activate_selection(&mut self) -> Result<Option<TuiExitReason>> {
+        match self.screen {
+            UpdateScreen::Overview => match self.selected {
+                0 => self.start(UpdateOperation::Check)?,
+                1 => self.start(UpdateOperation::Latest)?,
+                2 => {
+                    self.input.clear();
+                    self.input_error = None;
+                    self.screen = UpdateScreen::VersionInput;
+                }
+                3 => self.start(UpdateOperation::Candidates)?,
+                4 => self.start(UpdateOperation::Status)?,
+                5 => return Ok(Some(TuiExitReason::SelectedClose)),
+                _ => unreachable!(),
+            },
+            UpdateScreen::RollbackSelection => {
+                if let Some(candidate) = self.candidates.get(self.selected).cloned() {
+                    if candidate.rollback_capable {
+                        self.confirmation = Some(candidate);
+                        self.selected = 0;
+                        self.screen = UpdateScreen::RollbackConfirm;
+                    } else {
+                        self.last_result = Some(format!(
+                            "{} is unavailable: {}",
+                            candidate.version, candidate.reason
+                        ));
+                    }
+                }
+            }
+            UpdateScreen::RollbackConfirm => {
+                if self.selected == 0 {
+                    self.screen = UpdateScreen::RollbackSelection;
+                } else if let Some(candidate) = self.confirmation.clone() {
+                    self.start(UpdateOperation::Rollback(candidate.version))?;
+                }
+            }
+            UpdateScreen::Result => {
+                if self.selected == 0 {
+                    self.screen = UpdateScreen::Overview;
+                    self.selected = 0;
+                } else {
+                    return Ok(Some(TuiExitReason::SelectedClose));
+                }
+            }
+            UpdateScreen::Running | UpdateScreen::VersionInput => {}
+        }
+        Ok(None)
+    }
+}
+
+fn update_center_tui(trace_enabled: bool, fixture: Option<FixtureUpdateMode>) -> Result<()> {
+    let mut center = if let Some(fixture) = fixture {
+        #[cfg(feature = "tui-preview")]
+        {
+            UpdateCenter::fixture(fixture.fail_mutations)
+        }
+        #[cfg(not(feature = "tui-preview"))]
+        {
+            let _ = fixture;
+            unreachable!("fixture Update Center is unavailable in production")
+        }
     } else {
-        run_command(&mut command, SubprocessMode::from_verbose(verbose))
+        UpdateCenter::live()?
+    };
+    let mut trace = TuiTrace::new(trace_enabled);
+    let mut first_frame = true;
+    let mut last_screen = None;
+    let result = ratatui::run(|terminal| -> io::Result<TuiExitReason> {
+        trace.record("Update Center application closure entered");
+        loop {
+            center
+                .tick()
+                .map_err(|error| io::Error::other(format!("Update Center state: {error:#}")))?;
+            if last_screen != Some(center.screen) {
+                let size = trace.io("terminal.size", terminal.size())?;
+                trace.io("terminal.resize", terminal.resize(size.into()))?;
+                last_screen = Some(center.screen);
+            }
+            let draw = terminal
+                .draw(|frame| render_update_center(frame, &center))
+                .map(|_| ());
+            trace.io("terminal.draw", draw)?;
+            if first_frame {
+                trace.record("first Update Center frame drawn");
+                first_frame = false;
+            }
+            let ready = trace.io("event.poll", event::poll(Duration::from_millis(100)))?;
+            if ready {
+                let event = trace.io("event.read", event::read())?;
+                trace.record_event(&event);
+                if let Some(reason) = center
+                    .handle_event(event)
+                    .map_err(|error| io::Error::other(format!("Update Center input: {error:#}")))?
+                {
+                    return Ok(reason);
+                }
+            }
+        }
+    });
+    center.terminate_active();
+    let reason = result.as_ref().ok().copied();
+    trace.finish("update-center", &result, reason, true);
+    result.map(|_| ()).map_err(Into::into)
+}
+
+fn render_update_center(frame: &mut ratatui::Frame, center: &UpdateCenter) {
+    let area = frame.area();
+    let outer = Block::default()
+        .title(" Jarvis Update Center · ↑/↓ or j/k · Enter · q/Esc ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let summary_lines = vec![
+        Line::from(format!(
+            "Current active release: {}",
+            center.summary.current.as_deref().unwrap_or("loading…")
+        )),
+        Line::from(format!(
+            "Latest stable release: {}",
+            center.summary.latest.as_deref().unwrap_or("loading…")
+        )),
+        Line::from(format!(
+            "Update available: {}",
+            match center.summary.update_available {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            }
+        )),
+        Line::from(format!(
+            "Updater timer: {}",
+            center.summary.updater.as_deref().unwrap_or("loading…")
+        )),
+        Line::from(format!(
+            "Rollback release: {}",
+            center.summary.previous.as_deref().unwrap_or("unavailable")
+        )),
+        Line::from(format!(
+            "Last result: {}",
+            center
+                .last_result
+                .as_deref()
+                .unwrap_or("none in this session")
+        )),
+    ];
+    if inner.height < 15 || inner.width < 48 {
+        let mut lines = summary_lines;
+        lines.push(Line::from(""));
+        lines.extend(update_screen_lines(center));
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+    let sections = Layout::vertical([
+        Constraint::Length(7),
+        Constraint::Min(5),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(summary_lines).block(Block::default().borders(Borders::BOTTOM)),
+        sections[0],
+    );
+    frame.render_widget(Paragraph::new(update_screen_lines(center)), sections[1]);
+    let footer = if center.running_mutation() {
+        "Trusted mutation running · cancellation disabled during transactional activation"
+    } else {
+        "Esc: back/close · q: close · Ctrl-C: close"
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+        sections[2],
+    );
+}
+
+fn update_screen_lines(center: &UpdateCenter) -> Vec<Line<'static>> {
+    let selected_line = |index: usize, label: String| {
+        if center.selected == index {
+            Line::styled(format!("> {label}"), Style::default().fg(Color::Cyan))
+        } else {
+            Line::from(format!("  {label}"))
+        }
+    };
+    match center.screen {
+        UpdateScreen::Overview => [
+            "Check for updates",
+            "Update to latest",
+            "Install specific version",
+            "Rollback",
+            "Refresh",
+            "Close",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| selected_line(index, label.to_owned()))
+        .collect(),
+        UpdateScreen::Running => {
+            let spinner = ["◐", "◓", "◑", "◒"];
+            let mut lines = vec![Line::styled(
+                format!(
+                    "{} {}",
+                    spinner[center.animation_tick % spinner.len()],
+                    center
+                        .operation
+                        .as_ref()
+                        .map(UpdateOperation::title)
+                        .unwrap_or_else(|| "Working".to_owned())
+                ),
+                Style::default().fg(Color::Cyan),
+            )];
+            lines.extend(center.messages.iter().cloned().map(Line::from));
+            lines
+        }
+        UpdateScreen::VersionInput => {
+            let mut lines = vec![
+                Line::styled("Install specific version", Style::default().fg(Color::Cyan)),
+                Line::from(format!("> {}", center.input)),
+                Line::from("Type vMAJOR.MINOR.PATCH and press Enter"),
+            ];
+            if let Some(error) = &center.input_error {
+                lines.push(Line::styled(error.clone(), Style::default().fg(Color::Red)));
+            }
+            lines
+        }
+        UpdateScreen::RollbackSelection => {
+            let mut lines = vec![Line::styled(
+                "Rollback candidates · version | current | verified | rollback | reason",
+                Style::default().fg(Color::Cyan),
+            )];
+            if center.candidates.is_empty() {
+                lines.push(Line::from("No managed release candidates found"));
+            } else {
+                let start = center.selected.saturating_sub(4);
+                let end = (start + 8).min(center.candidates.len());
+                lines.extend(
+                    center
+                        .candidates
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .take(end - start)
+                        .map(|(index, candidate)| {
+                            selected_line(
+                                index,
+                                format!(
+                                    "{} | {} | {} | {} | {}",
+                                    candidate.version,
+                                    candidate.current,
+                                    candidate.verified,
+                                    candidate.rollback_capable,
+                                    candidate.reason
+                                ),
+                            )
+                        }),
+                );
+            }
+            lines
+        }
+        UpdateScreen::RollbackConfirm => {
+            let candidate = center
+                .confirmation
+                .as_ref()
+                .map(|candidate| candidate.version.as_str())
+                .unwrap_or("unavailable");
+            vec![
+                Line::styled(
+                    format!("Confirm rollback to {candidate}?"),
+                    Style::default().fg(Color::Yellow),
+                ),
+                selected_line(0, "Cancel".to_owned()),
+                selected_line(1, format!("Rollback to {candidate}")),
+            ]
+        }
+        UpdateScreen::Result => {
+            let result = center.result.as_ref();
+            vec![
+                Line::styled(
+                    result
+                        .map_or("Operation complete", |result| result.title.as_str())
+                        .to_owned(),
+                    Style::default().fg(if result.is_some_and(|result| result.success) {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
+                ),
+                Line::from(
+                    result
+                        .map_or("", |result| result.detail.as_str())
+                        .to_owned(),
+                ),
+                Line::from(""),
+                selected_line(0, "Back to Update Center".to_owned()),
+                selected_line(1, "Close".to_owned()),
+            ]
+        }
     }
 }
 
@@ -2005,6 +3069,30 @@ mod tests {
     fn update_modes_cannot_be_combined() {
         assert!(Cli::try_parse_from(["jarvis", "update", "--latest", "--check"]).is_err());
     }
+
+    #[test]
+    fn bare_update_is_a_center_but_explicit_modes_are_not() {
+        let bare = Cli::try_parse_from(["jarvis", "update"]).unwrap();
+        let Commands::Update(bare) = bare.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(UpdateInvocation::from_args(&bare), UpdateInvocation::Center);
+
+        let check = Cli::try_parse_from(["jarvis", "update", "--check"]).unwrap();
+        let Commands::Update(check) = check.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(UpdateInvocation::from_args(&check), UpdateInvocation::Check);
+
+        let latest = Cli::try_parse_from(["jarvis", "update", "--latest"]).unwrap();
+        let Commands::Update(latest) = latest.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(
+            UpdateInvocation::from_args(&latest),
+            UpdateInvocation::Latest
+        );
+    }
     #[test]
     fn log_target_is_allowlisted() {
         assert!(Cli::try_parse_from(["jarvis", "logs", "arbitrary.service"]).is_err());
@@ -2200,6 +3288,125 @@ mod tests {
         assert_eq!(values.get("previous").map(String::as_str), Some("v0.0.12"));
         assert!(parse_key_value_output("not structured\n").is_err());
         assert!(parse_key_value_output("Current: one\nCurrent: two\n").is_err());
+    }
+
+    #[test]
+    fn update_summary_merges_status_and_check_without_ui_side_effects() {
+        let mut summary = UpdateSummary::default();
+        summary
+            .merge_helper_output(
+                "jarvis updater: resolved stable release v0.0.16\nCurrent: v0.0.15\nPrevious: v0.0.14\nLatest: v0.0.16\nUpdater: enabled\n",
+            )
+            .unwrap();
+        assert_eq!(summary.current.as_deref(), Some("v0.0.15"));
+        assert_eq!(summary.previous.as_deref(), Some("v0.0.14"));
+        assert_eq!(summary.update_available, Some(true));
+        summary
+            .merge_helper_output("Current: v0.0.16\nLatest: v0.0.16\nUpdate: not available\n")
+            .unwrap();
+        assert_eq!(summary.update_available, Some(false));
+        assert_eq!(summary.updater.as_deref(), Some("enabled"));
+    }
+
+    #[test]
+    fn release_version_comparison_is_strict() {
+        assert!(release_is_newer("v0.0.16", "v0.0.15"));
+        assert!(release_is_newer("v1.0.0", "v0.99.99"));
+        assert!(!release_is_newer("v0.0.15", "v0.0.15"));
+        assert!(!release_is_newer("not-a-tag", "v0.0.15"));
+    }
+
+    #[test]
+    fn update_center_renders_narrow_fixture_and_unavailable_history() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut center = UpdateCenter::base(Some(FixtureUpdateMode {
+            fail_mutations: false,
+        }));
+        center.summary.current = Some("v0.0.15".to_owned());
+        center.summary.latest = Some("v0.0.16".to_owned());
+        center.candidates = vec![RollbackCandidate {
+            version: "v0.0.10".to_owned(),
+            current: false,
+            verified: false,
+            rollback_capable: false,
+            reason: "verification marker is missing or invalid".to_owned(),
+        }];
+        center.screen = UpdateScreen::RollbackSelection;
+        let backend = TestBackend::new(44, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_update_center(frame, &center))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Current active release"));
+        assert!(rendered.contains("v0.0.10"));
+        assert!(!rendered.contains("credential"));
+        assert!(!rendered.contains("api_key"));
+    }
+
+    #[test]
+    fn update_progress_is_bounded_and_strips_terminal_controls() {
+        let mut messages = VecDeque::new();
+        for index in 0..40 {
+            push_bounded(&mut messages, format!("line {index}"), 18);
+        }
+        assert_eq!(messages.len(), 18);
+        assert_eq!(
+            sanitize_terminal_line("safe\u{1b}[31msecret"),
+            "safe[31msecret"
+        );
+    }
+
+    #[test]
+    fn rollback_selection_requires_eligible_target_and_explicit_confirmation() {
+        let mut center = UpdateCenter::base(Some(FixtureUpdateMode {
+            fail_mutations: false,
+        }));
+        center.screen = UpdateScreen::RollbackSelection;
+        center.candidates = vec![
+            RollbackCandidate {
+                version: "v0.0.10".to_owned(),
+                current: false,
+                verified: false,
+                rollback_capable: false,
+                reason: "invalid legacy release".to_owned(),
+            },
+            RollbackCandidate {
+                version: "v0.0.14".to_owned(),
+                current: false,
+                verified: true,
+                rollback_capable: true,
+                reason: "eligible".to_owned(),
+            },
+        ];
+
+        center.activate_selection().unwrap();
+        assert_eq!(center.screen, UpdateScreen::RollbackSelection);
+        assert!(center.confirmation.is_none());
+
+        center.selected = 1;
+        center.activate_selection().unwrap();
+        assert_eq!(center.screen, UpdateScreen::RollbackConfirm);
+        assert_eq!(center.selected, 0, "confirmation must default to Cancel");
+        center.activate_selection().unwrap();
+        assert_eq!(center.screen, UpdateScreen::RollbackSelection);
+
+        center.selected = 1;
+        center.activate_selection().unwrap();
+        center.selected = 1;
+        center.activate_selection().unwrap();
+        assert_eq!(center.screen, UpdateScreen::Running);
+        assert!(matches!(
+            center.operation,
+            Some(UpdateOperation::Rollback(ref version)) if version == "v0.0.14"
+        ));
     }
 
     #[test]

@@ -31,6 +31,11 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --all
+      - name: Rootless Update Center PTY lifecycle
+        run: |
+          cargo build -p jarvis-admin --features tui-preview
+          python3 scripts/ci/test-admin-tui-pty.py target/debug/jarvis \
+            --fixture-preview --preview-scenario update-center
       - name: SurrealDB persistence security tests
         run: |
           docker run --detach --rm --name jarvis-surreal-test -p 127.0.0.1:8000:8000 \

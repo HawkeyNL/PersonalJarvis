@@ -336,6 +336,33 @@ grep -Eq '^legacy-active-release-manifest [0-9a-f]{64}$' \
 cmp /opt/jarvis/releases/v8.2.0/jarvis /usr/local/sbin/jarvis
 cmp /opt/jarvis/releases/v8.2.0/update-core-release /usr/local/libexec/jarvis/update-core-release
 
+# Candidate enumeration is read-only and never promotes malformed legacy
+# directories. Invalid history also cannot mask a valid rollback target or
+# block a later unrelated update.
+seed_active_release v8.3.2 "$same_migrations"
+write_release /opt/jarvis/releases v8.3.1 "$same_migrations"
+mv /opt/jarvis/releases/jarvis-core-v8.3.1 /opt/jarvis/releases/v8.3.1
+write_release /opt/jarvis/releases v99.0.0 "$same_migrations"
+mv /opt/jarvis/releases/jarvis-core-v99.0.0 /opt/jarvis/releases/v99.0.0
+printf 'forged marker\n' > /opt/jarvis/releases/v99.0.0/release.verification
+candidates=$(run_updater --rollback-candidates)
+jq -e '.[] | select(.version == "v8.3.2" and .current == true and .rollback_capable == false)' \
+    <<< "$candidates" >/dev/null
+jq -e '.[] | select(.version == "v8.3.1" and .verified == true and .rollback_capable == true)' \
+    <<< "$candidates" >/dev/null
+jq -e '.[] | select(.version == "v99.0.0" and .verified == false and .rollback_capable == false and (.reason | length > 0))' \
+    <<< "$candidates" >/dev/null
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.3.2 ]]
+if run_updater --rollback-version v99.0.0; then
+    echo "invalid explicit rollback candidate unexpectedly succeeded" >&2
+    exit 1
+fi
+run_updater --rollback-version v8.3.1
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.3.1 ]]
+prepare_candidate v8.3.3 "$same_migrations"
+run_updater
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.3.3 ]]
+
 # Drafts and prereleases are never update targets even when their tag/assets
 # appear structurally valid.
 seed_active_release v9.0.0 "$same_migrations"

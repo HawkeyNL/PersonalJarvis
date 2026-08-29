@@ -16,6 +16,10 @@ capabilities or executes shell input.
   responsive table language. Bounded log snapshots use full-screen tables;
   `logs --follow` keeps a rolling view and updates stream through a cancellable
   TUI.
+- Interactive `sudo jarvis update` opens one persistent Update Center session.
+  Checks refresh that screen in place; update and rollback results remain until
+  owner dismissal. Arrow keys or `j`/`k` navigate and Enter activates the
+  selected allowlisted action.
 - Pipes, `TERM=dumb`, `NO_COLOR`, and `--json`: use plain/stable output; JSON
   never enables alternate-screen, ANSI animation, cursor changes or prompts.
 - Root remains required for administration. The Core service stays
@@ -26,8 +30,11 @@ capabilities or executes shell input.
 
 Update progress is driven by messages emitted only after the underlying
 release resolver, SHA-256 verifier, archive validator, immutable stager,
-readiness probe and tooling activator complete their real step. Esc/Ctrl-C
-terminates the child operation and restores the terminal. Fast commands retain
+readiness probe and tooling activator complete their real step. Read-only child
+operations can be cancelled and reaped. Transactional mutations deliberately
+remain non-cancellable while the trusted helper may be activating or
+recovering a release; their final success, failure or rollback state stays on
+screen. Explicit fast `update --check` and `update --status` commands retain
 plain output where a full-screen interface adds no value.
 
 ## Safe diagnostics and fixture preview
@@ -55,6 +62,8 @@ cargo run -p jarvis-admin --features tui-preview -- tui-preview degraded-status
 cargo run -p jarvis-admin --features tui-preview -- tui-preview models
 cargo run -p jarvis-admin --features tui-preview -- tui-preview credentials
 cargo run -p jarvis-admin --features tui-preview -- tui-preview agents
+cargo run -p jarvis-admin --features tui-preview -- tui-preview update-center
+cargo run -p jarvis-admin --features tui-preview -- tui-preview update-center-failure
 cargo run -p jarvis-admin --features tui-preview -- tui-preview update-running
 cargo run -p jarvis-admin --features tui-preview -- tui-preview update-success
 cargo run -p jarvis-admin --features tui-preview -- tui-preview update-failure-rollback

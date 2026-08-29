@@ -38,12 +38,26 @@ silently prompts or emits terminal control sequences.
 ## Updates
 
 ```bash
-sudo jarvis update                 # latest published stable release
+sudo jarvis update                 # persistent Update Center on an interactive TTY
+sudo jarvis update --latest         # explicit latest published stable release
 sudo jarvis update --version v0.0.9
 sudo jarvis update --check          # non-mutating; exit 2 means available
 sudo jarvis update --status
 sudo jarvis update --rollback       # asks for confirmation
 ```
+
+The Update Center remains open while checks and trusted updater operations run.
+It shows the active and latest stable releases, update availability, updater
+timer state, rollback availability and the last result in the current session.
+Use the arrow keys or `j`/`k`, Enter, Esc and `q`. Successful and failed
+operations remain visible until the owner returns to the overview or closes the
+screen. Bare `jarvis update` is rejected outside an interactive rich terminal;
+automation must select an explicit operation.
+
+Explicit `--check` and `--status` never initialize Ratatui or an alternate
+screen. They print stable inline output; their `--json` variants remain
+machine-readable. Explicit `--latest`, `--version` and `--rollback` remain
+available for reviewed automation and SSH workflows.
 
 Only GitHub Releases that are neither draft nor prerelease are accepted. The
 existing verified-release protocol downloads the artifact and checksum over
@@ -64,6 +78,14 @@ after the downloaded archive passes its published SHA-256. Explicit rollback
 activates the historical Core, Rust CLI and updater helper as one unit. If
 readiness or tooling activation fails, the previous symlink, Core and tooling
 are restored before the operation reports failure.
+
+The trusted helper enumerates rollback candidates for the Update Center and
+reports version, current/verified state, rollback eligibility and a bounded
+reason. It independently validates the managed-root path, stable tag,
+manifest, verification marker, expected binaries/tooling, ownership,
+permissions and schema compatibility. Invalid historical releases are shown as
+unavailable or skipped; they cannot mask a valid target or block an unrelated
+future update.
 
 Releases installed by an updater older than v0.0.14 may lack that persisted
 marker even though the legacy updater verified the published checksum. On the

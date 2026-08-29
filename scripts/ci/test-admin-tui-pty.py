@@ -31,6 +31,8 @@ PREVIEW_SCENARIOS = (
     "models",
     "credentials",
     "agents",
+    "update-center",
+    "update-center-failure",
     "update-running",
     "update-success",
     "update-failure-rollback",
@@ -70,6 +72,26 @@ def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         process.wait(timeout=2)
+
+
+def wait_for_marker(
+    fd: int,
+    process: subprocess.Popen[bytes],
+    output: bytearray,
+    marker: bytes,
+    description: str,
+    timeout: float = 8,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while marker not in output and time.monotonic() < deadline:
+        output.extend(read_available(fd, 0.1))
+        if process.poll() is not None:
+            raise AssertionError(
+                f"process exited before {description}: code={process.returncode}; "
+                f"output={bytes(output)!r}"
+            )
+    if marker not in output:
+        raise AssertionError(f"did not observe {description}: output={bytes(output)!r}")
 
 
 def pty_status_smoke(
@@ -119,7 +141,8 @@ def pty_status_smoke(
             output.extend(read_available(master, 0.05))
             if process.poll() is not None:
                 raise AssertionError(
-                    f"persistent TUI exited without an exit key: code={process.returncode}"
+                    f"persistent TUI exited without an exit key: code={process.returncode}; "
+                    f"output={bytes(output)!r}"
                 )
 
         set_size(master, 30, 100)
@@ -174,6 +197,96 @@ def json_never_uses_tui(binary: Path, include_status: bool) -> None:
             )
 
 
+def fixture_update_center_flow(binary: Path, fail_update: bool) -> None:
+    master, slave = pty.openpty()
+    set_size(master, 24, 80)
+    before = termios.tcgetattr(master)
+    scenario = "update-center-failure" if fail_update else "update-center"
+    process = subprocess.Popen(
+        [str(binary), "tui-preview", scenario],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+        start_new_session=True,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TERM": "xterm-256color"},
+    )
+    os.close(slave)
+    output = bytearray()
+    try:
+        wait_for_marker(master, process, output, b"Jarvis Update Center", "Update Center frame")
+        if ALT_SCREEN_ENTER not in output:
+            raise AssertionError("Update Center did not enter the alternate screen")
+
+        if not fail_update:
+            output.clear()
+            os.write(master, b"\r")
+            wait_for_marker(
+                master,
+                process,
+                output,
+                b"> Check for updates",
+                "completed in-place update check",
+            )
+            if process.poll() is not None:
+                raise AssertionError("Update Center closed after its quick check completed")
+
+        output.clear()
+        os.write(master, b"j\r")
+        expected = b"failed" if fail_update else b"Updated"
+        wait_for_marker(master, process, output, expected, "persistent update result")
+        alive_until = time.monotonic() + 0.75
+        while time.monotonic() < alive_until:
+            output.extend(read_available(master, 0.05))
+            if process.poll() is not None:
+                raise AssertionError("Update Center closed before owner dismissed its result")
+
+        set_size(master, 18, 52)
+        time.sleep(0.15)
+        if process.poll() is not None:
+            raise AssertionError("Update Center exited while handling terminal resize")
+        os.write(master, b"q")
+        process.wait(timeout=5)
+        output.extend(read_available(master, 0.5))
+        if process.returncode != 0:
+            raise AssertionError(
+                f"Update Center failed on q: code={process.returncode}; output={bytes(output)!r}"
+            )
+        after = termios.tcgetattr(master)
+        restored_flags = termios.ICANON | termios.ECHO
+        if before[3] & restored_flags != after[3] & restored_flags:
+            raise AssertionError("Update Center did not restore canonical input and echo")
+        if ALT_SCREEN_LEAVE not in output or CURSOR_SHOW not in output:
+            raise AssertionError("Update Center did not fully restore terminal state")
+    finally:
+        terminate_process_group(process)
+        os.close(master)
+
+
+def fixture_inline_check_never_uses_tui(binary: Path) -> None:
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        [str(binary), "tui-preview", "update-check-inline"],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+        start_new_session=True,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TERM": "xterm-256color"},
+    )
+    os.close(slave)
+    try:
+        process.wait(timeout=5)
+        output = read_available(master, 0.5)
+        if process.returncode != 0 or b"Update:   available" not in output:
+            raise AssertionError(f"fixture inline update check failed: {output!r}")
+        if ALT_SCREEN_ENTER in output or ALT_SCREEN_LEAVE in output:
+            raise AssertionError("inline update check initialized an alternate-screen TUI")
+    finally:
+        terminate_process_group(process)
+        os.close(master)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=Path)
@@ -206,6 +319,10 @@ def main() -> int:
             exit_name,
             exit_bytes,
         )
+    if args.fixture_preview:
+        fixture_update_center_flow(binary, fail_update=False)
+        fixture_update_center_flow(binary, fail_update=True)
+        fixture_inline_check_never_uses_tui(binary)
     json_never_uses_tui(binary, include_status=not args.fixture_preview)
     print(f"Jarvis PTY smoke passed for exact binary: {binary}")
     return 0

@@ -14,7 +14,7 @@ github_curl_netrc=
 
 usage() {
     cat >&2 <<'EOF'
-Usage: update-core-release [--latest|--version vMAJOR.MINOR.PATCH|--check|--status|--rollback]
+Usage: update-core-release [--latest|--version vMAJOR.MINOR.PATCH|--check|--status|--rollback|--rollback-candidates|--rollback-version vMAJOR.MINOR.PATCH]
 
 No argument is equivalent to --latest and is used by the systemd timer.
 EOF
@@ -51,11 +51,17 @@ write_default_updater_config() {
 }
 
 load_updater_config() {
+    local allow_migration=$1
     local line key value seen_repository=false
     if [[ ! -e $updater_config ]]; then
         # v0.0.10 did not persist an update source. This one-time migration is
         # intentionally the public canonical repository, never caller input.
-        write_default_updater_config
+        if [[ $allow_migration == true ]]; then
+            write_default_updater_config
+        else
+            repository=$canonical_repository
+            return
+        fi
     fi
     [[ -f $updater_config && ! -L $updater_config ]] || fail "updater configuration is unsafe"
     [[ $(stat -c '%U:%G:%a' "$updater_config") == root:root:600 ]] || \
@@ -108,10 +114,6 @@ for command in awk curl find flock jq sha256sum stat tar systemctl readlink mv l
     require_command "$command"
 done
 
-[[ ${EUID} -eq 0 ]] || fail "must run as root"
-load_updater_config
-[[ -d $releases_dir && -L $current_link ]] || fail "expected Jarvis release layout is absent"
-
 mode=latest
 requested_tag=
 case ${1:-} in
@@ -121,8 +123,17 @@ case ${1:-} in
     --check) [[ $# == 1 ]] || usage; mode=check ;;
     --status) [[ $# == 1 ]] || usage; mode=status ;;
     --rollback) [[ $# == 1 ]] || usage; mode=rollback ;;
+    --rollback-candidates) [[ $# == 1 ]] || usage; mode=rollback_candidates ;;
+    --rollback-version) [[ $# == 2 && $2 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage; mode=rollback_version; requested_tag=$2 ;;
     *) usage ;;
 esac
+
+[[ ${EUID} -eq 0 ]] || fail "must run as root"
+case $mode in
+    check|status|rollback_candidates) load_updater_config false ;;
+    *) load_updater_config true ;;
+esac
+[[ -d $releases_dir && -L $current_link ]] || fail "expected Jarvis release layout is absent"
 
 # Optional private-repository access is supplied through a root-only curl netrc
 # file, never through the unit, process environment, or an argument.
@@ -147,7 +158,7 @@ if [[ -f $current_target/release.json && ! -L $current_target/release.json ]]; t
         fail "installed release manifest has an unsafe tag"
     current_schema_sha256=$(schema_fingerprint "$current_target/release.json" 2>/dev/null || true)
 fi
-previous_tag=$(find "$releases_dir" -mindepth 1 -maxdepth 1 -type d -name 'v*' ! -samefile "$current_target" -printf '%f\n' | LC_ALL=C sort -V | tail -n 1)
+previous_tag=
 
 restart_brokers() {
     systemctl try-restart jarvis-config-broker.service >/dev/null 2>&1 || true
@@ -215,6 +226,138 @@ migrate_legacy_release_verification() {
     echo "jarvis updater: migrated verification state for legacy release $expected_tag"
 }
 
+# Populate non-secret inspection fields for one managed release directory.
+# Callers must use these fields rather than trusting a directory name alone.
+inspect_release() {
+    local tag=$1 release="$releases_dir/$1" canonical unsafe_entry manifest_tag schema
+    inspected_current=false
+    inspected_verified=false
+    inspected_rollback_capable=false
+    inspected_structurally_valid=false
+    inspected_reason="unavailable"
+    inspected_schema=
+
+    [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+        inspected_reason="invalid release directory name"
+        return 0
+    }
+    [[ -d $release && ! -L $release ]] || {
+        inspected_reason="release directory is missing or unsafe"
+        return 0
+    }
+    canonical=$(readlink -f -- "$release" 2>/dev/null || true)
+    [[ $canonical == "$release" && $canonical == "$releases_dir"/* ]] || {
+        inspected_reason="release directory resolves outside managed root"
+        return 0
+    }
+    unsafe_entry=$(find "$release" -xdev \( -type l -o ! -user root -o ! -group root -o -perm /022 \) \
+        -printf '%P (%y %u:%g %m)\n' -quit)
+    [[ -z $unsafe_entry ]] || {
+        inspected_reason="unsafe ownership, permissions, or link"
+        return 0
+    }
+    [[ -f $release/release.json && ! -L $release/release.json ]] || {
+        inspected_reason="release manifest is missing or unsafe"
+        return 0
+    }
+    manifest_tag=$(jq -er '.tag | strings' "$release/release.json" 2>/dev/null || true)
+    [[ $manifest_tag == "$tag" ]] || {
+        inspected_reason="release manifest tag does not match directory"
+        return 0
+    }
+    schema=$(schema_fingerprint "$release/release.json" 2>/dev/null || true)
+    [[ -n $schema ]] || {
+        inspected_reason="release manifest schema fingerprint is invalid"
+        return 0
+    }
+    for executable in jarvis-api jarvis-agent-bundle jarvis-config-broker jarvis-codex-broker jarvis update-core-release; do
+        [[ -f $release/$executable && ! -L $release/$executable && -x $release/$executable ]] || {
+            inspected_reason="expected release binary or tooling is unavailable"
+            return 0
+        }
+    done
+
+    inspected_structurally_valid=true
+    inspected_schema=$schema
+    [[ $release -ef $current_target ]] && inspected_current=true
+    if verification_marker_valid "$release" "$tag"; then
+        inspected_verified=true
+    else
+        inspected_reason="verification marker is missing or invalid"
+        return 0
+    fi
+    if [[ $inspected_current == true ]]; then
+        inspected_reason="active release"
+    elif [[ -z $current_schema_sha256 ]]; then
+        inspected_reason="active release schema fingerprint is unavailable"
+    elif [[ $schema != "$current_schema_sha256" ]]; then
+        inspected_reason="schema fingerprint differs from active release"
+    else
+        inspected_rollback_capable=true
+        inspected_reason="eligible"
+    fi
+}
+
+managed_release_tags() {
+    find "$releases_dir" -mindepth 1 -maxdepth 1 -type d \
+        -regextype posix-extended -regex "$releases_dir/v[0-9]+\.[0-9]+\.[0-9]+" \
+        -printf '%f\n' | LC_ALL=C sort -Vr
+}
+
+find_verified_previous() {
+    local candidate
+    while IFS= read -r candidate; do
+        inspect_release "$candidate"
+        if [[ $inspected_rollback_capable == true ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(managed_release_tags)
+    return 1
+}
+
+list_rollback_candidates() {
+    local candidate first=true
+    printf '['
+    while IFS= read -r candidate; do
+        inspect_release "$candidate"
+        [[ $first == true ]] || printf ','
+        first=false
+        jq -nc \
+            --arg version "$candidate" \
+            --argjson current "$inspected_current" \
+            --argjson verified "$inspected_verified" \
+            --argjson rollback_capable "$inspected_rollback_capable" \
+            --arg reason "$inspected_reason" \
+            '{version: $version, current: $current, verified: $verified, rollback_capable: $rollback_capable, reason: $reason}'
+    done < <(managed_release_tags)
+    printf ']\n'
+}
+
+# Preserve the one-time legacy compatibility boundary, but skip malformed
+# historical directories instead of letting them block unrelated updates.
+find_or_migrate_rollback_target() {
+    local candidate
+    while IFS= read -r candidate; do
+        inspect_release "$candidate"
+        [[ $inspected_current == false ]] || continue
+        if [[ $inspected_rollback_capable == true ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        if [[ $inspected_structurally_valid == true && ! -e $releases_dir/$candidate/release.verification && \
+            -n $current_schema_sha256 && $inspected_schema == "$current_schema_sha256" ]]; then
+            migrate_legacy_release_verification "$releases_dir/$candidate" "$candidate" >&2
+            inspect_release "$candidate"
+            if [[ $inspected_rollback_capable == true ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        fi
+    done < <(managed_release_tags)
+    return 1
+}
+
 install_versioned_tooling() {
     local release=$1 admin_tmp updater_tmp admin_previous updater_previous
     admin_tmp=/usr/local/sbin/.jarvis.new
@@ -246,11 +389,15 @@ install_versioned_tooling() {
 
 rollback() {
     local previous temporary_link
-    previous=$(find "$releases_dir" -mindepth 1 -maxdepth 1 -type d -name 'v*' ! -samefile "$current_target" -printf '%f\n' | LC_ALL=C sort -V | tail -n 1)
-    [[ -n $previous && -d $releases_dir/$previous && ! -L $releases_dir/$previous ]] || fail "no known verified historical release is available"
-    [[ -f $releases_dir/$previous/release.json ]] || fail "historical release is not verified"
-    verification_marker_valid "$releases_dir/$previous" "$previous" || fail "historical release is not verified"
-    jq -e --arg tag "$previous" '.tag == $tag and (.schema_sha256 | strings | test("^[0-9a-f]{64}$"))' "$releases_dir/$previous/release.json" >/dev/null || fail "historical release manifest is invalid"
+    if [[ $mode == rollback_version ]]; then
+        previous=$requested_tag
+        inspect_release "$previous"
+        [[ $inspected_rollback_capable == true ]] || \
+            fail "requested rollback release is unavailable: $previous: $inspected_reason"
+    else
+        previous=$(find_or_migrate_rollback_target || true)
+        [[ -n $previous ]] || fail "no known verified historical release is available"
+    fi
     temporary_link=/opt/jarvis/.current.new
     rm -f -- "$temporary_link"
     ln -s "$releases_dir/$previous" "$temporary_link"
@@ -269,12 +416,20 @@ rollback() {
     fail "rollback target or its tooling failed activation; restored $current_tag"
 }
 
-if [[ $mode == latest || $mode == version || $mode == rollback ]]; then
+if [[ $mode == latest || $mode == version || $mode == rollback || $mode == rollback_version ]]; then
     [[ -z $current_tag ]] || migrate_legacy_release_verification "$current_target" "$current_tag"
-    [[ -z $previous_tag ]] || migrate_legacy_release_verification "$releases_dir/$previous_tag" "$previous_tag"
 fi
 
-[[ $mode != rollback ]] || rollback
+if [[ $mode == rollback_candidates ]]; then
+    list_rollback_candidates
+    exit 0
+fi
+
+if [[ $mode == rollback || $mode == rollback_version ]]; then
+    rollback
+fi
+
+previous_tag=$(find_verified_previous || true)
 
 metadata=$(mktemp)
 staging_dir=
