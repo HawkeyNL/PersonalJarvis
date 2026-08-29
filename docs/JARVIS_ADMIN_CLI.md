@@ -139,3 +139,29 @@ Log targets are allowlisted; the command is not a generic `journalctl` or
 The previous `jarvis-models`, `jarvis-credentials`, and private updater helpers
 remain compatibility/internal fallbacks, but normal owner operations should use
 `sudo jarvis ...`.
+
+## Home Node development without replacing production
+
+Clone and build as the normal owner, never through `sudo cargo` or `sudo cargo
+run`:
+
+```bash
+mkdir -p ~/dev
+git clone https://github.com/HawkeyNL/PersonalJarvis.git ~/dev/PersonalJarvis
+cd ~/dev/PersonalJarvis
+cargo build -p jarvis-admin --bin jarvis
+cargo run -p jarvis-admin --features tui-preview -- tui-preview healthy-status
+cargo run -p jarvis-admin -- terminal-diagnostics
+```
+
+After reviewing the exact binary, install it under a separate name for
+root-only, read-only integration tests:
+
+```bash
+sudo install -o root -g root -m 0755 target/debug/jarvis /usr/local/sbin/jarvis-dev
+sudo /usr/local/sbin/jarvis-dev --tui-trace status
+```
+
+This does not replace `/usr/local/sbin/jarvis`. Do not perform a mutating
+update through `jarvis-dev` until the read-only acceptance matrix in
+`docs/RELEASE_CANDIDATE.md` passes.

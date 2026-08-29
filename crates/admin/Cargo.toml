@@ -8,6 +8,11 @@ rust-version.workspace = true
 name = "jarvis"
 path = "src/main.rs"
 
+[features]
+# Fixture-only rootless visual preview. This feature grants no administrative
+# capability and is intentionally absent from release builds.
+tui-preview = []
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

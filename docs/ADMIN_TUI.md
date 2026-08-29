@@ -29,3 +29,39 @@ release resolver, SHA-256 verifier, archive validator, immutable stager,
 readiness probe and tooling activator complete their real step. Esc/Ctrl-C
 terminates the child operation and restores the terminal. Fast commands retain
 plain output where a full-screen interface adds no value.
+
+## Safe diagnostics and fixture preview
+
+`jarvis terminal-diagnostics` is a rootless, read-only command. It reports only
+TTY booleans, `TERM`, dimensions, `NO_COLOR`, the rich-output decision,
+Crossterm raw-mode/alternate-screen/event-poll availability, restoration and
+whether sudo metadata is present. It does not enumerate the environment or
+read Jarvis configuration. `--json` emits the same bounded report as JSON.
+
+Use `--tui-trace` on an interactive command to print a bounded, non-secret
+lifecycle trace after Ratatui restores the terminal. The trace records the
+first successful frame, resize/event classes, the failing I/O stage, and an
+explicit exit reason. It never records pasted or typed contents.
+Persistent views that close successfully in under 0.75 seconds report their
+exit reason automatically after terminal restoration, so a flash cannot remain
+an unexplained exit-zero result.
+
+The rootless preview is compiled only when its opt-in feature is selected and
+contains fixture data only:
+
+```bash
+cargo run -p jarvis-admin --features tui-preview -- tui-preview healthy-status
+cargo run -p jarvis-admin --features tui-preview -- tui-preview degraded-status
+cargo run -p jarvis-admin --features tui-preview -- tui-preview models
+cargo run -p jarvis-admin --features tui-preview -- tui-preview credentials
+cargo run -p jarvis-admin --features tui-preview -- tui-preview agents
+cargo run -p jarvis-admin --features tui-preview -- tui-preview update-running
+cargo run -p jarvis-admin --features tui-preview -- tui-preview update-success
+cargo run -p jarvis-admin --features tui-preview -- tui-preview update-failure-rollback
+cargo run -p jarvis-admin --features tui-preview -- tui-preview logs
+cargo run -p jarvis-admin --features tui-preview -- tui-preview narrow-long
+```
+
+Resize these views and exercise `q`, Esc, and Ctrl-C. The feature is absent
+from release builds and the preview path performs no system reads, subprocess
+execution, mutation, or privileged operation.

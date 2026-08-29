@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -55,55 +55,69 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
       - run: cargo install cargo-audit --locked
       - run: test "$(date -u +%F)" \< "2026-10-01"
       - run: cargo audit
 
   release:
-    name: Build and publish Linux release
+    name: Build and test Linux release candidate
     needs: [rust-validation, deployment-security, dependency-audit]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
-      - name: Build release artifact
+      - name: Record canonical builder
+        run: |
+          cat /etc/os-release
+          rustc -Vv
+          cargo -Vv
+          cc --version
+      - name: Build release candidate once
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_REVISION: ${{ github.sha }}
           SOURCE_DATE_EPOCH: "0"
-        run: |
-          set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-            echo "release tag must use stable vMAJOR.MINOR.PATCH form" >&2
-            exit 1
-          }
-          cargo build --locked --release -p jarvis-api --bin jarvis-api
-          cargo build --locked --release -p jarvis-api --bin jarvis-config-broker
-          cargo build --locked --release -p jarvis-api --bin jarvis-codex-broker
-          cargo build --locked --release -p jarvis-core --bin jarvis-agent-bundle
-          cargo build --locked --release -p jarvis-admin --bin jarvis
-          staging=$(mktemp -d)
-          trap 'rm -rf "$staging"' EXIT
-          release_dir="$staging/jarvis-core-$RELEASE_TAG"
-          mkdir -p "$release_dir"
-          install -m 0755 target/release/jarvis-api "$release_dir/jarvis-api"
-          install -m 0755 target/release/jarvis-config-broker "$release_dir/jarvis-config-broker"
-          install -m 0755 target/release/jarvis-codex-broker "$release_dir/jarvis-codex-broker"
-          install -m 0755 target/release/jarvis-agent-bundle "$release_dir/jarvis-agent-bundle"
-          install -m 0755 target/release/jarvis "$release_dir/jarvis"
-          install -m 0755 deploy/systemd/update-core-release.sh "$release_dir/update-core-release"
-          schema_manifest="$staging/schema.sha256"
-          while IFS= read -r schema; do sha256sum "schema/surreal/$schema"; done < <(find schema/surreal -type f -name '*.surql' -printf '%P\n' | LC_ALL=C sort) > "$schema_manifest"
-          schema_sha256=$(sha256sum "$schema_manifest" | awk '{print $1}')
-          jq -n --arg tag "$RELEASE_TAG" --arg revision "$RELEASE_REVISION" --arg schema_sha256 "$schema_sha256" '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256}' > "$release_dir/release.json"
-          mkdir -p dist
-          artifact="jarvis-core-$RELEASE_TAG-linux-x86_64.tar.gz"
-          tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner -C "$staging" -czf "dist/$artifact" "jarvis-core-$RELEASE_TAG"
-          (cd dist && sha256sum "$artifact" > "$artifact.sha256")
+        run: bash scripts/release/build-linux.sh stage "$RELEASE_TAG" "$RELEASE_REVISION"
+      - name: PTY smoke test exact staged admin binary
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: sudo -n python3 scripts/ci/test-admin-tui-pty.py "dist/candidate/jarvis-core-$RELEASE_TAG/jarvis"
+      - name: Package tested candidate bytes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REVISION: ${{ github.sha }}
+          SOURCE_DATE_EPOCH: "0"
+        run: bash scripts/release/build-linux.sh package "$RELEASE_TAG" "$RELEASE_REVISION"
+      - name: Upload Home Node acceptance candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-home-node-candidate-${{ github.ref_name }}
+          path: |
+            dist/jarvis-core-${{ github.ref_name }}-linux-x86_64.tar.gz
+            dist/jarvis-core-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish accepted Home Node bytes
+    needs: release
+    runs-on: ubuntu-26.04
+    environment: home-node-release-acceptance
+    permissions:
+      contents: write
+    steps:
+      - name: Require acceptance of this exact revision
+        env:
+          ACCEPTED_REVISION: ${{ vars.HOME_NODE_ACCEPTED_REVISION }}
+        run: test "$ACCEPTED_REVISION" = "$GITHUB_SHA"
+      - uses: actions/download-artifact@v4
+        with:
+          name: jarvis-home-node-candidate-${{ github.ref_name }}
+          path: dist
+      - name: Verify candidate checksum
+        run: cd dist && sha256sum --check "jarvis-core-${GITHUB_REF_NAME}-linux-x86_64.tar.gz.sha256"
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

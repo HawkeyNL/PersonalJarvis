@@ -17,7 +17,13 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{
+        self, disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    },
+};
 use fs2::FileExt;
 use ratatui::{
     layout::{Constraint, Layout},
@@ -42,6 +48,9 @@ struct Cli {
     /// Stream subprocess diagnostics instead of capturing non-secret output.
     #[arg(long, global = true)]
     verbose: bool,
+    /// Print non-secret terminal lifecycle and exit-reason diagnostics after a TUI closes.
+    #[arg(long, global = true)]
+    tui_trace: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -49,6 +58,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Version,
+    /// Report safe, non-secret terminal and Crossterm capabilities.
+    TerminalDiagnostics,
     Status,
     Health,
     Logs(LogsArgs),
@@ -62,6 +73,31 @@ enum Commands {
         #[command(subcommand)]
         command: ServicesCommand,
     },
+    #[cfg(feature = "tui-preview")]
+    /// Render fixture-only TUI states without administrative access.
+    TuiPreview(TuiPreviewArgs),
+}
+
+#[cfg(feature = "tui-preview")]
+#[derive(Debug, Args)]
+struct TuiPreviewArgs {
+    #[arg(value_enum, default_value_t = TuiPreviewScenario::HealthyStatus)]
+    scenario: TuiPreviewScenario,
+}
+
+#[cfg(feature = "tui-preview")]
+#[derive(Clone, Debug, ValueEnum)]
+enum TuiPreviewScenario {
+    HealthyStatus,
+    DegradedStatus,
+    Models,
+    Credentials,
+    Agents,
+    UpdateRunning,
+    UpdateSuccess,
+    UpdateFailureRollback,
+    Logs,
+    NarrowLong,
 }
 
 #[derive(Debug, Args)]
@@ -254,10 +290,24 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Commands::TerminalDiagnostics) {
+        return terminal_diagnostics(cli.json);
+    }
+    #[cfg(feature = "tui-preview")]
+    if let Commands::TuiPreview(args) = &cli.command {
+        if cli.json {
+            bail!("fixture TUI preview does not support --json");
+        }
+        if !io::stdin().is_terminal() || !terminal_supports_rich_output() {
+            bail!("fixture TUI preview requires an interactive terminal with rich output enabled");
+        }
+        return tui_preview(&args.scenario, cli.tui_trace);
+    }
     require_root()?;
-    let presentation = Presentation::new(cli.json);
+    let presentation = Presentation::new(cli.json, cli.tui_trace);
     match cli.command {
         Commands::Version => version(&presentation),
+        Commands::TerminalDiagnostics => unreachable!("handled before root-only commands"),
         Commands::Status => status(&presentation),
         Commands::Health => health(&presentation, cli.verbose),
         Commands::Logs(args) => logs(args, &presentation),
@@ -269,6 +319,8 @@ fn run() -> Result<()> {
         Commands::Services {
             command: ServicesCommand::Status,
         } => services(&presentation),
+        #[cfg(feature = "tui-preview")]
+        Commands::TuiPreview(_) => unreachable!("handled before root-only commands"),
     }
 }
 
@@ -290,12 +342,14 @@ fn libc_geteuid() -> u32 {
 struct Presentation {
     json: bool,
     interactive: bool,
+    tui_trace: bool,
 }
 impl Presentation {
-    fn new(json: bool) -> Self {
+    fn new(json: bool, tui_trace: bool) -> Self {
         Self {
             json,
             interactive: !json && terminal_supports_rich_output(),
+            tui_trace,
         }
     }
     fn intro(&self, text: &str) {
@@ -326,6 +380,124 @@ fn terminal_supports_rich_output_for(
     stdout_is_tty && color_allowed && term != Some("dumb")
 }
 
+fn terminal_diagnostics(json: bool) -> Result<()> {
+    let stdin_is_tty = io::stdin().is_terminal();
+    let stdout_is_tty = io::stdout().is_terminal();
+    let stderr_is_tty = io::stderr().is_terminal();
+    let term = std::env::var("TERM").ok();
+    let no_color = std::env::var_os("NO_COLOR").is_some();
+    let dimensions = terminal::size().ok();
+    let rich_output = terminal_supports_rich_output_for(
+        stdout_is_tty && stdin_is_tty,
+        !no_color,
+        term.as_deref(),
+    );
+    let mut raw_mode = "not attempted (stdin/stdout are not TTYs)".to_owned();
+    let mut alternate_screen = raw_mode.clone();
+    let mut event_polling = raw_mode.clone();
+    let mut restoration = "not needed".to_owned();
+    let mut backend_error = None;
+
+    if json {
+        raw_mode = "not attempted (--json never initializes a terminal)".to_owned();
+        alternate_screen = raw_mode.clone();
+        event_polling = raw_mode.clone();
+    } else if stdin_is_tty && stdout_is_tty {
+        let mut raw_enabled = false;
+        let mut alternate_attempted = false;
+        match enable_raw_mode() {
+            Ok(()) => {
+                raw_enabled = true;
+                raw_mode = "available".to_owned();
+                alternate_attempted = true;
+                match execute!(io::stdout(), EnterAlternateScreen) {
+                    Ok(()) => {
+                        alternate_screen = "available (control sequence accepted)".to_owned();
+                        match event::poll(std::time::Duration::ZERO) {
+                            Ok(_) => event_polling = "available".to_owned(),
+                            Err(error) => {
+                                event_polling = "unavailable".to_owned();
+                                backend_error = Some(format!("event polling: {error}"));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        alternate_screen = "unavailable".to_owned();
+                        backend_error = Some(format!("alternate-screen initialization: {error}"));
+                    }
+                }
+            }
+            Err(error) => {
+                raw_mode = "unavailable".to_owned();
+                backend_error = Some(format!("raw-mode initialization: {error}"));
+            }
+        }
+
+        let mut restore_errors = Vec::new();
+        if alternate_attempted {
+            if let Err(error) = execute!(io::stdout(), LeaveAlternateScreen) {
+                restore_errors.push(format!("leave alternate screen: {error}"));
+            }
+        }
+        if raw_enabled {
+            if let Err(error) = disable_raw_mode() {
+                restore_errors.push(format!("disable raw mode: {error}"));
+            }
+        }
+        restoration = if restore_errors.is_empty() {
+            "successful".to_owned()
+        } else {
+            let error = restore_errors.join("; ");
+            backend_error.get_or_insert_with(|| format!("terminal restoration: {error}"));
+            "failed".to_owned()
+        };
+    }
+
+    let report = serde_json::json!({
+        "stdin_is_tty": stdin_is_tty,
+        "stdout_is_tty": stdout_is_tty,
+        "stderr_is_tty": stderr_is_tty,
+        "term": term,
+        "dimensions": dimensions.map(|(width, height)| format!("{width}x{height}")),
+        "no_color": no_color,
+        "rich_output": rich_output,
+        "raw_mode": raw_mode,
+        "alternate_screen": alternate_screen,
+        "event_polling": event_polling,
+        "restoration": restoration,
+        "running_under_sudo": std::env::var_os("SUDO_UID").is_some()
+            || std::env::var_os("SUDO_USER").is_some(),
+        "backend_error": backend_error,
+    });
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("Jarvis terminal diagnostics (no secrets or configuration values)");
+        for (label, key) in [
+            ("stdin is TTY", "stdin_is_tty"),
+            ("stdout is TTY", "stdout_is_tty"),
+            ("stderr is TTY", "stderr_is_tty"),
+            ("TERM", "term"),
+            ("dimensions", "dimensions"),
+            ("NO_COLOR", "no_color"),
+            ("rich output", "rich_output"),
+            ("raw mode", "raw_mode"),
+            ("alternate screen", "alternate_screen"),
+            ("event polling", "event_polling"),
+            ("restoration", "restoration"),
+            ("running under sudo", "running_under_sudo"),
+            ("backend error", "backend_error"),
+        ] {
+            let value = report[key]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| report[key].to_string());
+            println!("  {label:<19} {value}");
+        }
+    }
+    Ok(())
+}
+
 fn version(presentation: &Presentation) -> Result<()> {
     let report = serde_json::json!({"admin_version": env!("CARGO_PKG_VERSION"), "active_core": active_release()?});
     if presentation.json {
@@ -347,7 +519,7 @@ fn status(presentation: &Presentation) -> Result<()> {
         return Ok(());
     }
     if presentation.interactive && io::stdin().is_terminal() {
-        return status_tui(&report);
+        return status_tui(&report, presentation.tui_trace);
     }
     presentation.intro("Jarvis Home Node");
     println!(
@@ -368,27 +540,171 @@ fn status(presentation: &Presentation) -> Result<()> {
     Ok(())
 }
 
-fn status_tui(report: &StatusReport) -> Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiExitReason {
+    Quit,
+    Escape,
+    CtrlC,
+    ProcessCompleted,
+}
+
+impl std::fmt::Display for TuiExitReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Quit => "q key",
+            Self::Escape => "Escape key",
+            Self::CtrlC => "Ctrl-C",
+            Self::ProcessCompleted => "child process completed",
+        })
+    }
+}
+
+fn close_exit_reason(event: &Event) -> Option<TuiExitReason> {
+    let Event::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('q') => Some(TuiExitReason::Quit),
+        KeyCode::Esc => Some(TuiExitReason::Escape),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(TuiExitReason::CtrlC)
+        }
+        _ => None,
+    }
+}
+
+struct TuiTrace {
+    enabled: bool,
+    started: std::time::Instant,
+    entries: VecDeque<String>,
+    failure: Option<String>,
+}
+
+impl TuiTrace {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            started: std::time::Instant::now(),
+            entries: VecDeque::new(),
+            failure: None,
+        }
+    }
+
+    fn record(&mut self, entry: impl Into<String>) {
+        if !self.enabled {
+            return;
+        }
+        if self.entries.len() == 16 {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry.into());
+    }
+
+    fn io<T>(&mut self, stage: &str, result: io::Result<T>) -> io::Result<T> {
+        if let Err(error) = &result {
+            self.failure = Some(format!("{stage}: {error}"));
+        }
+        result
+    }
+
+    fn record_event(&mut self, event: &Event) {
+        let description = match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if let Some(reason) = close_exit_reason(event) {
+                    format!("event.read: documented close key ({reason})")
+                } else {
+                    "event.read: other key press".to_owned()
+                }
+            }
+            Event::Key(_) => "event.read: non-press key event".to_owned(),
+            Event::Resize(width, height) => format!("event.read: resize {width}x{height}"),
+            Event::Mouse(_) => "event.read: mouse event".to_owned(),
+            Event::FocusGained => "event.read: focus gained".to_owned(),
+            Event::FocusLost => "event.read: focus lost".to_owned(),
+            Event::Paste(_) => "event.read: paste event (contents omitted)".to_owned(),
+        };
+        self.record(description);
+    }
+
+    fn finish<T>(
+        &self,
+        view: &str,
+        result: &io::Result<T>,
+        reason: Option<TuiExitReason>,
+        persistent: bool,
+    ) {
+        let elapsed = self.started.elapsed();
+        let rapid_success =
+            persistent && result.is_ok() && elapsed < std::time::Duration::from_millis(750);
+        if !self.enabled && !rapid_success {
+            return;
+        }
+        if rapid_success && !self.enabled {
+            eprintln!(
+                "Jarvis interactive view closed after {:.2}s.",
+                elapsed.as_secs_f64()
+            );
+            if let Some(reason) = reason {
+                eprintln!("Exit reason: {reason}");
+            } else {
+                eprintln!("Exit reason: missing (unexpected successful return)");
+            }
+            eprintln!("Run `jarvis terminal-diagnostics` and retry with `--tui-trace`.");
+            return;
+        }
+        eprintln!("Jarvis TUI trace ({view}; no input contents recorded)");
+        eprintln!("  lifecycle: ratatui::run returned after terminal restoration");
+        for entry in &self.entries {
+            eprintln!("  {entry}");
+        }
+        if let Some(reason) = reason {
+            eprintln!("  exit reason: {reason}");
+        } else if let Some(failure) = &self.failure {
+            eprintln!("  failure stage: {failure}");
+        } else if let Err(error) = result {
+            eprintln!("  error: {error}");
+        } else {
+            eprintln!("  exit reason: missing (unexpected successful return)");
+        }
+    }
+}
+
+fn status_tui(report: &StatusReport, trace_enabled: bool) -> Result<()> {
     // `ratatui::run` installs restoration/panic handling around the alternate
     // screen.  Business state is computed before this call, so no privileged
     // operation is coupled to terminal widgets or input events.
-    ratatui::run(|terminal| -> io::Result<()> {
+    let mut trace = TuiTrace::new(trace_enabled);
+    let mut first_frame = true;
+    let result = ratatui::run(|terminal| -> io::Result<TuiExitReason> {
+        trace.record("application closure entered");
         loop {
-            terminal.draw(|frame| render_status_dashboard(frame, report))?;
-            if event::poll(std::time::Duration::from_millis(250))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press
-                        && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                            || (key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)))
-                    {
-                        return Ok(());
-                    }
+            let draw = terminal
+                .draw(|frame| render_status_dashboard(frame, report))
+                .map(|_| ());
+            trace.io("terminal.draw", draw)?;
+            if first_frame {
+                trace.record("first frame drawn");
+                first_frame = false;
+            }
+            let ready = trace.io(
+                "event.poll",
+                event::poll(std::time::Duration::from_millis(250)),
+            )?;
+            if ready {
+                let event = trace.io("event.read", event::read())?;
+                trace.record_event(&event);
+                if let Some(reason) = close_exit_reason(&event) {
+                    return Ok(reason);
                 }
             }
         }
-    })
-    .map_err(Into::into)
+    });
+    let reason = result.as_ref().ok().copied();
+    trace.finish("status", &result, reason, true);
+    result.map(|_| ()).map_err(Into::into)
 }
 
 fn render_status_dashboard(frame: &mut ratatui::Frame, report: &StatusReport) {
@@ -476,10 +792,18 @@ fn render_compact_status(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn table_tui(title: &str, headers: Vec<String>, rows: Vec<Vec<String>>) -> Result<()> {
-    ratatui::run(|terminal| -> io::Result<()> {
+fn table_tui(
+    title: &str,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    trace_enabled: bool,
+) -> Result<()> {
+    let mut trace = TuiTrace::new(trace_enabled);
+    let mut first_frame = true;
+    let result = ratatui::run(|terminal| -> io::Result<TuiExitReason> {
+        trace.record("application closure entered");
         loop {
-            terminal.draw(|frame| {
+            let draw = terminal.draw(|frame| {
                 let area = frame.area();
                 let column_count = headers.len().max(1) as u16;
                 let widths = vec![Constraint::Ratio(1, column_count.into()); headers.len()];
@@ -495,21 +819,149 @@ fn table_tui(title: &str, headers: Vec<String>, rows: Vec<Vec<String>>) -> Resul
                         .block(block),
                     area,
                 );
-            })?;
-            if event::poll(std::time::Duration::from_millis(250))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press
-                        && (matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                            || (key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)))
-                    {
-                        return Ok(());
-                    }
+            });
+            trace.io("terminal.draw", draw.map(|_| ()))?;
+            if first_frame {
+                trace.record("first frame drawn");
+                first_frame = false;
+            }
+            let ready = trace.io(
+                "event.poll",
+                event::poll(std::time::Duration::from_millis(250)),
+            )?;
+            if ready {
+                let event = trace.io("event.read", event::read())?;
+                trace.record_event(&event);
+                if let Some(reason) = close_exit_reason(&event) {
+                    return Ok(reason);
                 }
             }
         }
-    })
-    .map_err(Into::into)
+    });
+    let reason = result.as_ref().ok().copied();
+    trace.finish(title, &result, reason, true);
+    result.map(|_| ()).map_err(Into::into)
+}
+
+#[cfg(feature = "tui-preview")]
+fn tui_preview(scenario: &TuiPreviewScenario, trace_enabled: bool) -> Result<()> {
+    let healthy_status = || StatusReport {
+        release: Some("v0.0.14-fixture".to_owned()),
+        services: BTreeMap::from([
+            ("Core", "active".to_owned()),
+            ("SurrealDB", "active".to_owned()),
+            ("Config broker", "active".to_owned()),
+            ("Codex broker", "active".to_owned()),
+            ("OpenSandbox", "active".to_owned()),
+        ]),
+        updater_enabled: "enabled".to_owned(),
+        agent_bundle: Some(AgentBundle {
+            id: "fixture-bundle-2026-08-29".to_owned(),
+            agent_count: 7,
+        }),
+    };
+    match scenario {
+        TuiPreviewScenario::HealthyStatus => status_tui(&healthy_status(), trace_enabled),
+        TuiPreviewScenario::DegradedStatus => {
+            let mut report = healthy_status();
+            report
+                .services
+                .insert("Core", "activating (degraded fixture)".to_owned());
+            report.services.insert("OpenSandbox", "inactive".to_owned());
+            status_tui(&report, trace_enabled)
+        }
+        TuiPreviewScenario::Models => table_tui(
+            "Jarvis Models · fixture",
+            ["Provider", "Model", "Enabled", "Source"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            vec![
+                vec!["openai-api", "gpt-fixture", "yes", "catalog fixture"],
+                vec!["anthropic-api", "claude-fixture", "no", "policy fixture"],
+                vec!["ollama", "local-fixture:latest", "yes", "local fixture"],
+            ]
+            .into_iter()
+            .map(|row| row.into_iter().map(str::to_owned).collect())
+            .collect(),
+            trace_enabled,
+        ),
+        TuiPreviewScenario::Credentials => table_tui(
+            "Jarvis Credentials · fixture (status only)",
+            vec!["Provider".to_owned(), "Status".to_owned()],
+            vec![
+                vec!["openai".to_owned(), "configured".to_owned()],
+                vec!["anthropic".to_owned(), "not configured".to_owned()],
+                vec![
+                    "ollama-local".to_owned(),
+                    "no credential required".to_owned(),
+                ],
+            ],
+            trace_enabled,
+        ),
+        TuiPreviewScenario::Agents => table_tui(
+            "Jarvis Agents · fixture",
+            vec!["Bundle".to_owned(), "Agents".to_owned()],
+            vec![vec!["fixture-bundle-2026-08-29".to_owned(), "7".to_owned()]],
+            trace_enabled,
+        ),
+        TuiPreviewScenario::UpdateRunning => table_tui(
+            "Jarvis Update · running fixture",
+            vec!["State".to_owned(), "Latest safe event".to_owned()],
+            vec![vec![
+                "running".to_owned(),
+                "Verifying downloaded artifact checksum…".to_owned(),
+            ]],
+            trace_enabled,
+        ),
+        TuiPreviewScenario::UpdateSuccess => table_tui(
+            "Jarvis Update · success fixture",
+            vec!["State".to_owned(), "Result".to_owned()],
+            vec![vec![
+                "success".to_owned(),
+                "Verified fixture release is ready".to_owned(),
+            ]],
+            trace_enabled,
+        ),
+        TuiPreviewScenario::UpdateFailureRollback => table_tui(
+            "Jarvis Update · rollback fixture",
+            vec!["State".to_owned(), "Result".to_owned()],
+            vec![
+                vec![
+                    "failed".to_owned(),
+                    "Fixture readiness probe failed".to_owned(),
+                ],
+                vec![
+                    "rolled back".to_owned(),
+                    "Previous fixture release restored".to_owned(),
+                ],
+            ],
+            trace_enabled,
+        ),
+        TuiPreviewScenario::Logs => table_tui(
+            "Jarvis Logs · fixture",
+            vec!["jarvis-core.service".to_owned()],
+            (1..=40)
+                .map(|line| {
+                    vec![format!(
+                        "fixture log line {line:02}: non-secret status event"
+                    )]
+                })
+                .collect(),
+            trace_enabled,
+        ),
+        TuiPreviewScenario::NarrowLong => {
+            let mut report = healthy_status();
+            report.release = Some(
+                "v0.0.14-fixture-with-a-deliberately-long-non-secret-display-value".to_owned(),
+            );
+            report.services.insert(
+                "Codex broker",
+                "active with a deliberately long fixture-only state".to_owned(),
+            );
+            status_tui(&report, trace_enabled)
+        }
+    }
 }
 
 fn status_report() -> Result<StatusReport> {
@@ -605,6 +1057,7 @@ fn health(presentation: &Presentation, verbose: bool) -> Result<()> {
             "Jarvis Health",
             vec!["Check".to_owned(), "Result".to_owned()],
             rows,
+            presentation.tui_trace,
         );
     }
     presentation.outro("Health verification passed");
@@ -647,6 +1100,7 @@ fn logs(args: LogsArgs, presentation: &Presentation) -> Result<()> {
                 &mut command,
                 "Jarvis Logs",
                 format!("Following {}…", args.target.unit()),
+                presentation.tui_trace,
             )
         } else {
             let output = command.output().context("read allowlisted Jarvis logs")?;
@@ -655,7 +1109,12 @@ fn logs(args: LogsArgs, presentation: &Presentation) -> Result<()> {
                 .lines()
                 .map(|line| vec![line.to_owned()])
                 .collect();
-            table_tui("Jarvis Logs", vec![args.target.unit().to_owned()], rows)
+            table_tui(
+                "Jarvis Logs",
+                vec![args.target.unit().to_owned()],
+                rows,
+                presentation.tui_trace,
+            )
         }
     } else {
         run_command(&mut command, SubprocessMode::InheritedInteractive)
@@ -703,13 +1162,19 @@ fn update(args: UpdateArgs, presentation: &Presentation, verbose: bool) -> Resul
             &mut command,
             "Jarvis Update",
             "Starting verified update transaction…".to_owned(),
+            presentation.tui_trace,
         )
     } else {
         run_command(&mut command, SubprocessMode::from_verbose(verbose))
     }
 }
 
-fn run_process_tui(command: &mut ProcessCommand, title: &str, initial: String) -> Result<()> {
+fn run_process_tui(
+    command: &mut ProcessCommand,
+    title: &str,
+    initial: String,
+    trace_enabled: bool,
+) -> Result<()> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -724,7 +1189,10 @@ fn run_process_tui(command: &mut ProcessCommand, title: &str, initial: String) -
         forward_update_lines(stderr, sender.clone());
     }
     drop(sender);
-    let terminal_result = ratatui::run(|terminal| -> io::Result<ExitStatus> {
+    let mut trace = TuiTrace::new(trace_enabled);
+    let mut first_frame = true;
+    let terminal_result = ratatui::run(|terminal| -> io::Result<(ExitStatus, TuiExitReason)> {
+        trace.record("application closure entered; child started");
         let mut messages = VecDeque::from([initial]);
         let spinner = ["◐", "◓", "◑", "◒"];
         let mut tick = 0usize;
@@ -735,7 +1203,7 @@ fn run_process_tui(command: &mut ProcessCommand, title: &str, initial: String) -
                 }
                 messages.push_back(message);
             }
-            terminal.draw(|frame| {
+            let draw = terminal.draw(|frame| {
                 let block = Block::default()
                     .title(format!(
                         " {title} {} · Esc/Ctrl-C to stop ",
@@ -749,31 +1217,42 @@ fn run_process_tui(command: &mut ProcessCommand, title: &str, initial: String) -
                         .block(block),
                     frame.area(),
                 );
-            })?;
-            if let Some(status) = child.try_wait()? {
-                return Ok(status);
+            });
+            trace.io("terminal.draw", draw.map(|_| ()))?;
+            if first_frame {
+                trace.record("first frame drawn");
+                first_frame = false;
             }
-            if event::poll(std::time::Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press
-                        && (key.code == KeyCode::Esc
-                            || (key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)))
-                    {
-                        child.kill()?;
-                        let _ = child.wait();
-                        return Err(io::Error::new(
-                            io::ErrorKind::Interrupted,
-                            "operation cancelled by owner",
-                        ));
-                    }
+            if let Some(status) = trace.io("child.try_wait", child.try_wait())? {
+                trace.record(format!("child completed with {status}"));
+                return Ok((status, TuiExitReason::ProcessCompleted));
+            }
+            let ready = trace.io(
+                "event.poll",
+                event::poll(std::time::Duration::from_millis(100)),
+            )?;
+            if ready {
+                let event = trace.io("event.read", event::read())?;
+                trace.record_event(&event);
+                if let Some(reason @ (TuiExitReason::Escape | TuiExitReason::CtrlC)) =
+                    close_exit_reason(&event)
+                {
+                    trace.record(format!("owner cancellation requested by {reason}"));
+                    child.kill()?;
+                    let _ = child.wait();
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "operation cancelled by owner",
+                    ));
                 }
             }
             tick = tick.wrapping_add(1);
         }
     });
+    let reason = terminal_result.as_ref().ok().map(|(_, reason)| *reason);
+    trace.finish(title, &terminal_result, reason, false);
     let status = match terminal_result {
-        Ok(status) => status,
+        Ok((status, _)) => status,
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -1023,6 +1502,7 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
                     .map(str::to_owned)
                     .collect(),
                 rows,
+                presentation.tui_trace,
             );
         } else {
             println!("{:<16} {:<36} {:<8} SOURCE", "PROVIDER", "MODEL", "ENABLED");
@@ -1127,6 +1607,7 @@ fn credentials(args: CredentialsArgs, presentation: &Presentation, verbose: bool
                 "Jarvis Credentials",
                 vec!["Provider".to_owned(), "Status".to_owned()],
                 rows,
+                presentation.tui_trace,
             );
         } else {
             println!("{:<16} STATUS", "PROVIDER");
@@ -1190,6 +1671,7 @@ fn compatibility_helper(
             &mut command,
             "Jarvis Administration",
             "Executing typed protected operation…".to_owned(),
+            presentation.tui_trace,
         )
     } else {
         run_command(&mut command, SubprocessMode::from_verbose(verbose))
@@ -1210,6 +1692,7 @@ fn agents(args: AgentsArgs, presentation: &Presentation, verbose: bool) -> Resul
                     "Jarvis Agents",
                     vec!["Bundle".to_owned(), "Agents".to_owned()],
                     vec![vec![bundle.id, bundle.agent_count.to_string()]],
+                    presentation.tui_trace,
                 );
             } else {
                 println!(
@@ -1227,6 +1710,7 @@ fn agents(args: AgentsArgs, presentation: &Presentation, verbose: bool) -> Resul
                     &mut command,
                     "Jarvis Agents",
                     "Checking private agent source and active bundle…".to_owned(),
+                    presentation.tui_trace,
                 )
             } else {
                 run_command(
@@ -1247,6 +1731,7 @@ fn agents(args: AgentsArgs, presentation: &Presentation, verbose: bool) -> Resul
                     &mut command,
                     "Jarvis Agents",
                     "Validating and activating private agent update…".to_owned(),
+                    presentation.tui_trace,
                 )
             } else {
                 run_command(&mut command, SubprocessMode::from_verbose(verbose))
@@ -1542,6 +2027,55 @@ mod tests {
             true,
             Some("xterm-256color")
         ));
+        assert!(!Presentation::new(true, true).interactive);
+    }
+
+    #[test]
+    fn tui_exit_reason_requires_documented_pressed_keys() {
+        use crossterm::event::{KeyEvent, KeyEventState};
+
+        let pressed = |code, modifiers| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            })
+        };
+        assert_eq!(
+            close_exit_reason(&pressed(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(TuiExitReason::Quit)
+        );
+        assert_eq!(
+            close_exit_reason(&pressed(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(TuiExitReason::Escape)
+        );
+        assert_eq!(
+            close_exit_reason(&pressed(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(TuiExitReason::CtrlC)
+        );
+        assert_eq!(
+            close_exit_reason(&pressed(KeyCode::Char('c'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            close_exit_reason(&Event::Key(KeyEvent {
+                code: KeyCode::Char('q'),
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Release,
+                state: KeyEventState::NONE,
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn tui_trace_never_records_pasted_contents() {
+        let mut trace = TuiTrace::new(true);
+        trace.record_event(&Event::Paste("fixture-secret-must-not-appear".to_owned()));
+        let rendered = trace.entries.into_iter().collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("contents omitted"));
+        assert!(!rendered.contains("fixture-secret-must-not-appear"));
     }
 
     #[test]
