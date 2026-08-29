@@ -98,7 +98,8 @@ write_release() {
         --arg schema_sha256 "$schema_sha256" \
         '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256}' \
         > "$root/jarvis-core-$tag/release.json"
-    printf 'verified synthetic artifact\n' > "$root/jarvis-core-$tag/release.verification"
+    printf '%064d  jarvis-core-%s-linux-x86_64.tar.gz\n' 0 "$tag" \
+        > "$root/jarvis-core-$tag/release.verification"
 }
 
 seed_active_release() {
@@ -160,6 +161,17 @@ run_updater() {
 
 same_migrations=$(printf 'a%.0s' {1..64})
 changed_migrations=$(printf 'b%.0s' {1..64})
+
+# Existing markers are validated, not trusted merely because the filename is
+# present. A corrupted marker blocks a privileged mutation.
+seed_active_release v0.9.0 "$same_migrations"
+printf 'forged marker\n' > /opt/jarvis/releases/v0.9.0/release.verification
+prepare_candidate v0.9.1 "$same_migrations"
+if run_updater; then
+    echo "corrupted release marker unexpectedly succeeded" >&2
+    exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v0.9.0 ]]
 
 # A realistic legacy layout has an old shell dispatcher/updater outside the
 # active release. A successful activation must replace both from the already
