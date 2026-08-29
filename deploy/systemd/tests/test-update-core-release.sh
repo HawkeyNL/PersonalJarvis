@@ -80,6 +80,7 @@ write_release() {
     local tag=$2
     local schema_sha256=$3
     mkdir -p "$root/jarvis-core-$tag"
+    chmod 0755 "$root/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
     chmod 0755 "$root/jarvis-core-$tag/jarvis-api"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-config-broker"
@@ -98,7 +99,10 @@ write_release() {
         --arg schema_sha256 "$schema_sha256" \
         '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256}' \
         > "$root/jarvis-core-$tag/release.json"
-    printf 'verified synthetic artifact\n' > "$root/jarvis-core-$tag/release.verification"
+    chmod 0644 "$root/jarvis-core-$tag/release.json"
+    printf '%064d  jarvis-core-%s-linux-x86_64.tar.gz\n' 0 "$tag" \
+        > "$root/jarvis-core-$tag/release.verification"
+    chmod 0644 "$root/jarvis-core-$tag/release.verification"
 }
 
 seed_active_release() {
@@ -160,6 +164,17 @@ run_updater() {
 
 same_migrations=$(printf 'a%.0s' {1..64})
 changed_migrations=$(printf 'b%.0s' {1..64})
+
+# Existing markers are validated, not trusted merely because the filename is
+# present. A corrupted marker blocks a privileged mutation.
+seed_active_release v0.9.0 "$same_migrations"
+printf 'forged marker\n' > /opt/jarvis/releases/v0.9.0/release.verification
+prepare_candidate v0.9.1 "$same_migrations"
+if run_updater; then
+    echo "corrupted release marker unexpectedly succeeded" >&2
+    exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v0.9.0 ]]
 
 # A realistic legacy layout has an old shell dispatcher/updater outside the
 # active release. A successful activation must replace both from the already
@@ -302,6 +317,24 @@ run_updater --rollback
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.1.1 ]]
 cmp /opt/jarvis/releases/v8.1.1/jarvis /usr/local/sbin/jarvis
 cmp /opt/jarvis/releases/v8.1.1/update-core-release /usr/local/libexec/jarvis/update-core-release
+
+# The first updater carrying verification markers must migrate releases that
+# were checksum-verified by the legacy updater but lack its persisted marker.
+# Both the current release and the immediate rollback target are revalidated;
+# arbitrary older directories are never promoted by this compatibility path.
+seed_active_release v8.2.1 "$same_migrations"
+write_release /opt/jarvis/releases v8.2.0 "$same_migrations"
+mv /opt/jarvis/releases/jarvis-core-v8.2.0 /opt/jarvis/releases/v8.2.0
+rm -f -- /opt/jarvis/releases/v8.2.1/release.verification \
+    /opt/jarvis/releases/v8.2.0/release.verification
+run_updater --rollback
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.2.0 ]]
+grep -Eq '^legacy-active-release-manifest [0-9a-f]{64}$' \
+    /opt/jarvis/releases/v8.2.1/release.verification
+grep -Eq '^legacy-active-release-manifest [0-9a-f]{64}$' \
+    /opt/jarvis/releases/v8.2.0/release.verification
+cmp /opt/jarvis/releases/v8.2.0/jarvis /usr/local/sbin/jarvis
+cmp /opt/jarvis/releases/v8.2.0/update-core-release /usr/local/libexec/jarvis/update-core-release
 
 # Drafts and prereleases are never update targets even when their tag/assets
 # appear structurally valid.

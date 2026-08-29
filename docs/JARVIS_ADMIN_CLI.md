@@ -65,6 +65,15 @@ activates the historical Core, Rust CLI and updater helper as one unit. If
 readiness or tooling activation fails, the previous symlink, Core and tooling
 are restored before the operation reports failure.
 
+Releases installed by an updater older than v0.0.14 may lack that persisted
+marker even though the legacy updater verified the published checksum. On the
+first later mutating update or rollback, the current and immediately previous
+release are migrated once: the updater revalidates their exact manifests,
+required executables, root ownership and non-writable immutable layout, then
+atomically records a manifest-bound legacy marker. Read-only check/status
+commands never mutate this state, and unrelated historical directories are
+never promoted by this compatibility path.
+
 ### Legacy v0.0.10 mixed-tooling recovery
 
 Old installers could activate a new Core while leaving the old shell admin
