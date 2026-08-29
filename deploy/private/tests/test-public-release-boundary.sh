@@ -54,6 +54,9 @@ require_literal "$publish_workflow" \
 require_literal "$publish_workflow" \
     '--verify-tag' \
     "publish workflow must refuse to create a release for a missing tag"
+require_literal "$publish_workflow" \
+    'GH_REPO: ${{ github.repository }}' \
+    "publish workflow must give GitHub CLI explicit repository context"
 
 # These files build, transfer or publish the public release artifact. None may
 # acquire a private checkout, persona, or agent-content path.
