@@ -34,11 +34,22 @@ packaged:
 bash scripts/release/build-linux.sh package vMAJOR.MINOR.PATCH "$(git rev-parse HEAD)"
 ```
 
-The GitHub workflow uploads those candidate bytes but its publish job is gated
-by the `home-node-release-acceptance` environment. That environment must have
-required reviewers and its `HOME_NODE_ACCEPTED_REVISION` variable must equal
-the exact 40-character candidate revision. A missing or stale value fails the
-publish job closed.
+The tag-triggered GitHub workflow stops after uploading those candidate bytes.
+It does not publish a release. After the exact artifact passes Home Node
+acceptance, run the separate `Publish accepted Jarvis Core candidate` workflow
+manually with:
+
+- the existing candidate tag;
+- its exact 40-character revision;
+- the workflow run ID that built and tested the candidate;
+- explicit confirmation that those exact bytes passed Home Node acceptance.
+
+The publication job downloads the immutable artifact from that exact run,
+checks the originating tag, revision and successful candidate job, validates
+the checksum and packaged manifest, and only then creates the release. It is
+also gated by the `home-node-release-acceptance` environment. Configure that
+environment with required reviewers so publication needs a distinct human
+approval. Invalid, missing or stale inputs fail closed.
 
 ## Real Home Node acceptance
 
@@ -68,5 +79,6 @@ verify echo, canonical input, cursor and screen state are restored.
 
 Do not run a real update through `jarvis-dev` during read-only acceptance.
 Exercise long-running progress and cancellation with safe fixtures first. Do
-not set `HOME_NODE_ACCEPTED_REVISION` or approve publication until the exact
-candidate passes the local terminal, SSH, fallback and restoration matrix.
+not confirm the manual publication input or approve its protected environment
+until the exact candidate passes the local terminal, SSH, fallback and
+restoration matrix.

@@ -100,28 +100,3 @@ jobs:
             dist/jarvis-core-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
           if-no-files-found: error
           retention-days: 7
-
-  publish:
-    name: Publish accepted Home Node bytes
-    needs: release
-    runs-on: ubuntu-26.04
-    environment: home-node-release-acceptance
-    permissions:
-      contents: write
-    steps:
-      - name: Require acceptance of this exact revision
-        env:
-          ACCEPTED_REVISION: ${{ vars.HOME_NODE_ACCEPTED_REVISION }}
-        run: test "$ACCEPTED_REVISION" = "$GITHUB_SHA"
-      - uses: actions/download-artifact@v7
-        with:
-          name: jarvis-home-node-candidate-${{ github.ref_name }}
-          path: dist
-      - name: Verify candidate checksum
-        run: cd dist && sha256sum --check "jarvis-core-${GITHUB_REF_NAME}-linux-x86_64.tar.gz.sha256"
-      - name: Publish GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          gh release create "$RELEASE_TAG" "dist/jarvis-core-$RELEASE_TAG-linux-x86_64.tar.gz" "dist/jarvis-core-$RELEASE_TAG-linux-x86_64.tar.gz.sha256" --target "$GITHUB_SHA" --title "Jarvis Core $RELEASE_TAG" --generate-notes

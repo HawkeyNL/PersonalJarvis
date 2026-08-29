@@ -1,0 +1,163 @@
+name: Publish accepted Jarvis Core candidate
+
+run-name: Publish ${{ inputs.tag }} from candidate run ${{ inputs.candidate_run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact existing release-candidate tag (for example v0.0.15)
+        required: true
+        type: string
+      revision:
+        description: Exact 40-character commit accepted on the Home Node
+        required: true
+        type: string
+      candidate_run_id:
+        description: Workflow run ID that built and tested the accepted bytes
+        required: true
+        type: string
+      home_node_accepted:
+        description: Exact candidate passed the documented Home Node and SSH matrix
+        required: true
+        type: boolean
+
+concurrency:
+  group: publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    name: Publish accepted Home Node bytes
+    runs-on: ubuntu-26.04
+    environment: home-node-release-acceptance
+    steps:
+      - name: Validate publication request
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REVISION: ${{ inputs.revision }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          HOME_NODE_ACCEPTED: ${{ inputs.home_node_accepted }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          }
+          [[ "$RELEASE_REVISION" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Revision must be an exact 40-character lowercase commit SHA" >&2
+            exit 1
+          }
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo "Candidate run ID must be a positive integer" >&2
+            exit 1
+          }
+          test "$HOME_NODE_ACCEPTED" = true || {
+            echo "Home Node acceptance was not explicitly confirmed" >&2
+            exit 1
+          }
+
+      - name: Verify tag and originating candidate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REVISION: ${{ inputs.revision }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          tag_revision=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
+          test "$tag_revision" = "$RELEASE_REVISION" || {
+            echo "Tag $RELEASE_TAG points to $tag_revision, not accepted revision $RELEASE_REVISION" >&2
+            exit 1
+          }
+
+          run_data=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")
+          test "$(jq -r .name <<<"$run_data")" = "Release Jarvis Core" || {
+            echo "Run $CANDIDATE_RUN_ID is not a Release Jarvis Core run" >&2
+            exit 1
+          }
+          test "$(jq -r .event <<<"$run_data")" = push || {
+            echo "Candidate run was not triggered by a tag push" >&2
+            exit 1
+          }
+          test "$(jq -r .head_branch <<<"$run_data")" = "$RELEASE_TAG" || {
+            echo "Candidate run tag does not match $RELEASE_TAG" >&2
+            exit 1
+          }
+          test "$(jq -r .head_sha <<<"$run_data")" = "$RELEASE_REVISION" || {
+            echo "Candidate run revision does not match $RELEASE_REVISION" >&2
+            exit 1
+          }
+
+          jobs_data=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/jobs?per_page=100")
+          jq -e '.jobs[] | select(.name == "Build and test Linux release candidate" and .conclusion == "success")' \
+            <<<"$jobs_data" >/dev/null || {
+              echo "Candidate build/test job did not complete successfully" >&2
+              exit 1
+            }
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: jarvis-home-node-candidate-${{ inputs.tag }}
+          path: dist
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+
+      - name: Verify exact candidate bytes and provenance
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REVISION: ${{ inputs.revision }}
+        run: |
+          archive="jarvis-core-$RELEASE_TAG-linux-x86_64.tar.gz"
+          checksum="$archive.sha256"
+          test -f "dist/$archive" && test ! -L "dist/$archive" || {
+            echo "Candidate archive is missing or is not a regular file" >&2
+            exit 1
+          }
+          test -f "dist/$checksum" && test ! -L "dist/$checksum" || {
+            echo "Candidate checksum is missing or is not a regular file" >&2
+            exit 1
+          }
+          test "$(wc -l <"dist/$checksum")" -eq 1 || {
+            echo "Candidate checksum must contain exactly one entry" >&2
+            exit 1
+          }
+          grep -Eq "^[0-9a-f]{64}  $archive$" "dist/$checksum" || {
+            echo "Candidate checksum does not name the exact expected archive" >&2
+            exit 1
+          }
+          (cd dist && sha256sum --check --strict "$checksum")
+
+          release_json=$(tar -xOf "dist/$archive" "jarvis-core-$RELEASE_TAG/release.json")
+          test "$(jq -r .tag <<<"$release_json")" = "$RELEASE_TAG" || {
+            echo "Packaged release tag does not match $RELEASE_TAG" >&2
+            exit 1
+          }
+          test "$(jq -r .revision <<<"$release_json")" = "$RELEASE_REVISION" || {
+            echo "Packaged release revision does not match $RELEASE_REVISION" >&2
+            exit 1
+          }
+          jq -e '.schema_sha256 | test("^[0-9a-f]{64}$")' <<<"$release_json" >/dev/null || {
+            echo "Packaged release manifest has an invalid schema digest" >&2
+            exit 1
+          }
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REVISION: ${{ inputs.revision }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          archive="dist/jarvis-core-$RELEASE_TAG-linux-x86_64.tar.gz"
+          gh release create "$RELEASE_TAG" "$archive" "$archive.sha256" \
+            --verify-tag \
+            --target "$RELEASE_REVISION" \
+            --title "Jarvis Core $RELEASE_TAG" \
+            --generate-notes

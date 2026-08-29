@@ -5,6 +5,7 @@ set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 release_workflow="$repo_dir/.github/workflows/release.yml"
+publish_workflow="$repo_dir/.github/workflows/publish-release.yml"
 release_builder="$repo_dir/scripts/release/build-linux.sh"
 stage_release="$repo_dir/deploy/systemd/stage-core-release.sh"
 update_release="$repo_dir/deploy/systemd/update-core-release.sh"
@@ -39,10 +40,24 @@ require_literal "$release_workflow" \
 require_literal "$release_builder" \
     'install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update-core-release"' \
     "canonical release builder must stage update-core-release.sh as update-core-release"
+reject_pattern "$release_workflow" 'gh release create' \
+    "candidate workflow must not publish before real Home Node acceptance"
+require_literal "$publish_workflow" \
+    'run-id: ${{ inputs.candidate_run_id }}' \
+    "publish workflow must download from the explicitly accepted candidate run"
+require_literal "$publish_workflow" \
+    'github-token: ${{ github.token }}' \
+    "cross-run artifact download must be authenticated and immutable"
+require_literal "$publish_workflow" \
+    'sha256sum --check --strict "$checksum"' \
+    "publish workflow must strictly verify the accepted candidate checksum"
+require_literal "$publish_workflow" \
+    '--verify-tag' \
+    "publish workflow must refuse to create a release for a missing tag"
 
-# These two files define what enters the public release artifact. Neither may
+# These files build, transfer or publish the public release artifact. None may
 # acquire a private checkout, persona, or agent-content path.
-for packaging_file in "$release_workflow" "$release_builder"; do
+for packaging_file in "$release_workflow" "$publish_workflow" "$release_builder"; do
     reject_pattern "$packaging_file" 'Jarvis\.md' \
         "$packaging_file must not package the protected Jarvis.md persona"
     reject_pattern "$packaging_file" 'PersonalJarvisAgents' \
