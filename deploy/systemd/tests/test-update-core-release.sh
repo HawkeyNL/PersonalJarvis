@@ -100,6 +100,7 @@ write_release() {
         > "$root/jarvis-core-$tag/release.json"
     printf '%064d  jarvis-core-%s-linux-x86_64.tar.gz\n' 0 "$tag" \
         > "$root/jarvis-core-$tag/release.verification"
+    chmod 0644 "$root/jarvis-core-$tag/release.verification"
 }
 
 seed_active_release() {
