@@ -5,13 +5,61 @@ set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 release_workflow="$repo_dir/.github/workflows/release.yml"
-if grep -q 'jarvis-core/Jarvis.md' "$release_workflow" || \
-    grep -q 'PersonalJarvisAgents' "$release_workflow" || \
-    grep -q 'actions/checkout.*PersonalJarvisAgents' "$release_workflow"; then
-    echo "public release workflow must not reference private content" >&2
+release_builder="$repo_dir/scripts/release/build-linux.sh"
+stage_release="$repo_dir/deploy/systemd/stage-core-release.sh"
+update_release="$repo_dir/deploy/systemd/update-core-release.sh"
+
+fail() {
+    echo "public release boundary: $*" >&2
     exit 1
-fi
-grep -Fq "update-core-release.sh \"\$release_dir/update-core-release\"" "$release_workflow"
-grep -q 'release contains protected private configuration' "$repo_dir/deploy/systemd/stage-core-release.sh"
-grep -q 'release contains protected private configuration' "$repo_dir/deploy/systemd/update-core-release.sh"
+}
+
+require_literal() {
+    local file=$1
+    local literal=$2
+    local reason=$3
+    grep -Fq -- "$literal" "$file" || fail "$reason"
+}
+
+reject_pattern() {
+    local file=$1
+    local pattern=$2
+    local reason=$3
+    if grep -Eq -- "$pattern" "$file"; then
+        fail "$reason"
+    fi
+}
+
+require_literal "$release_workflow" \
+    'bash scripts/release/build-linux.sh stage "$RELEASE_TAG" "$RELEASE_REVISION"' \
+    "release workflow must stage through scripts/release/build-linux.sh"
+require_literal "$release_workflow" \
+    'bash scripts/release/build-linux.sh package "$RELEASE_TAG" "$RELEASE_REVISION"' \
+    "release workflow must package through scripts/release/build-linux.sh"
+require_literal "$release_builder" \
+    'install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update-core-release"' \
+    "canonical release builder must stage update-core-release.sh as update-core-release"
+
+# These two files define what enters the public release artifact. Neither may
+# acquire a private checkout, persona, or agent-content path.
+for packaging_file in "$release_workflow" "$release_builder"; do
+    reject_pattern "$packaging_file" 'Jarvis\.md' \
+        "$packaging_file must not package the protected Jarvis.md persona"
+    reject_pattern "$packaging_file" 'PersonalJarvisAgents' \
+        "$packaging_file must not access the private PersonalJarvisAgents repository"
+    reject_pattern "$packaging_file" 'agents/' \
+        "$packaging_file must not package private agent definitions"
+done
+
+# Both trusted installation paths must independently reject protected content,
+# even if a malformed archive somehow passes the static packaging boundary.
+for release_guard in "$stage_release" "$update_release"; do
+    require_literal "$release_guard" "-name 'Jarvis.md'" \
+        "$release_guard must reject packaged Jarvis.md files"
+    require_literal "$release_guard" "-path '*/agents/*'" \
+        "$release_guard must reject packaged private agent files"
+    require_literal "$release_guard" 'release contains protected private configuration' \
+        "$release_guard must report protected private release content"
+done
+
 echo "Public release boundary fixture tests passed"
