@@ -104,7 +104,7 @@ cleanup() {
     esac
 }
 
-for command in awk curl flock jq sha256sum tar systemctl readlink mv ln mktemp install; do
+for command in awk curl find flock jq sha256sum stat tar systemctl readlink mv ln mktemp install; do
     require_command "$command"
 done
 
@@ -154,6 +154,62 @@ restart_brokers() {
     systemctl try-restart jarvis-codex-broker.service >/dev/null 2>&1 || true
 }
 
+verification_marker_valid() {
+    local release=$1 expected_tag=$2 marker line manifest_sha256
+    marker=$release/release.verification
+    [[ -f $marker && ! -L $marker ]] || return 1
+    [[ $(stat -c '%U:%G:%a' "$marker") == root:root:644 ]] || return 1
+    IFS= read -r line < "$marker" || return 1
+    if [[ $line =~ ^[0-9a-f]{64}[[:space:]][[:space:]]jarvis-core-${expected_tag}-linux-x86_64\.tar\.gz$ ]]; then
+        return 0
+    fi
+    if [[ $line =~ ^legacy-active-release-manifest[[:space:]]([0-9a-f]{64})$ ]]; then
+        manifest_sha256=$(sha256sum "$release/release.json" | awk '{print $1}')
+        [[ ${BASH_REMATCH[1]} == "$manifest_sha256" ]]
+        return
+    fi
+    return 1
+}
+
+migrate_legacy_release_verification() {
+    local release=$1 expected_tag=$2 temporary manifest_sha256
+    if [[ -e $release/release.verification ]]; then
+        verification_marker_valid "$release" "$expected_tag" || \
+            fail "installed release has an invalid verification marker: $expected_tag"
+        return
+    fi
+
+    # Releases activated by the pre-v0.0.14 updater passed the published
+    # archive checksum, but that updater did not persist the installation
+    # marker. Qualify only the current/immediately previous root-controlled
+    # release, after revalidating its immutable layout and exact manifest.
+    [[ -d $release && ! -L $release ]] || fail "legacy release directory is unsafe: $expected_tag"
+    [[ -f $release/release.json && ! -L $release/release.json ]] || \
+        fail "legacy release manifest is unsafe: $expected_tag"
+    jq -e --arg tag "$expected_tag" \
+        '.tag == $tag and (.schema_sha256 | strings | test("^[0-9a-f]{64}$"))' \
+        "$release/release.json" >/dev/null || fail "legacy release manifest is invalid: $expected_tag"
+    for executable in jarvis-api jarvis-agent-bundle jarvis-config-broker jarvis-codex-broker jarvis update-core-release; do
+        [[ -f $release/$executable && ! -L $release/$executable && -x $release/$executable ]] || \
+            fail "legacy release tooling is invalid: $expected_tag"
+    done
+    if find "$release" -xdev \( -type l -o ! -user root -o ! -group root -o -perm /022 \) -print -quit | grep -q .; then
+        fail "legacy release permissions are unsafe: $expected_tag"
+    fi
+
+    manifest_sha256=$(sha256sum "$release/release.json" | awk '{print $1}')
+    temporary=$(mktemp "$release/.release.verification.XXXXXX")
+    trap 'rm -f -- "$temporary"' RETURN
+    printf 'legacy-active-release-manifest %s\n' "$manifest_sha256" > "$temporary"
+    chown root:root "$temporary"
+    chmod 0644 "$temporary"
+    mv -Tf "$temporary" "$release/release.verification"
+    trap - RETURN
+    verification_marker_valid "$release" "$expected_tag" || \
+        fail "legacy release verification migration failed: $expected_tag"
+    echo "jarvis updater: migrated verification state for legacy release $expected_tag"
+}
+
 install_versioned_tooling() {
     local release=$1 admin_tmp updater_tmp admin_previous updater_previous
     admin_tmp=/usr/local/sbin/.jarvis.new
@@ -187,7 +243,8 @@ rollback() {
     local previous temporary_link
     previous=$(find "$releases_dir" -mindepth 1 -maxdepth 1 -type d -name 'v*' ! -samefile "$current_target" -printf '%f\n' | LC_ALL=C sort -V | tail -n 1)
     [[ -n $previous && -d $releases_dir/$previous && ! -L $releases_dir/$previous ]] || fail "no known verified historical release is available"
-    [[ -f $releases_dir/$previous/release.json && -f $releases_dir/$previous/release.verification ]] || fail "historical release is not verified"
+    [[ -f $releases_dir/$previous/release.json ]] || fail "historical release is not verified"
+    verification_marker_valid "$releases_dir/$previous" "$previous" || fail "historical release is not verified"
     jq -e --arg tag "$previous" '.tag == $tag and (.schema_sha256 | strings | test("^[0-9a-f]{64}$"))' "$releases_dir/$previous/release.json" >/dev/null || fail "historical release manifest is invalid"
     temporary_link=/opt/jarvis/.current.new
     rm -f -- "$temporary_link"
@@ -206,6 +263,11 @@ rollback() {
     restart_brokers
     fail "rollback target or its tooling failed activation; restored $current_tag"
 }
+
+if [[ $mode == latest || $mode == version || $mode == rollback ]]; then
+    [[ -z $current_tag ]] || migrate_legacy_release_verification "$current_target" "$current_tag"
+    [[ -z $previous_tag ]] || migrate_legacy_release_verification "$releases_dir/$previous_tag" "$previous_tag"
+fi
 
 [[ $mode != rollback ]] || rollback
 

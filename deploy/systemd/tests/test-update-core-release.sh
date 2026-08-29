@@ -303,6 +303,24 @@ run_updater --rollback
 cmp /opt/jarvis/releases/v8.1.1/jarvis /usr/local/sbin/jarvis
 cmp /opt/jarvis/releases/v8.1.1/update-core-release /usr/local/libexec/jarvis/update-core-release
 
+# The first updater carrying verification markers must migrate releases that
+# were checksum-verified by the legacy updater but lack its persisted marker.
+# Both the current release and the immediate rollback target are revalidated;
+# arbitrary older directories are never promoted by this compatibility path.
+seed_active_release v8.2.1 "$same_migrations"
+write_release /opt/jarvis/releases v8.2.0 "$same_migrations"
+mv /opt/jarvis/releases/jarvis-core-v8.2.0 /opt/jarvis/releases/v8.2.0
+rm -f -- /opt/jarvis/releases/v8.2.1/release.verification \
+    /opt/jarvis/releases/v8.2.0/release.verification
+run_updater --rollback
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.2.0 ]]
+grep -Eq '^legacy-active-release-manifest [0-9a-f]{64}$' \
+    /opt/jarvis/releases/v8.2.1/release.verification
+grep -Eq '^legacy-active-release-manifest [0-9a-f]{64}$' \
+    /opt/jarvis/releases/v8.2.0/release.verification
+cmp /opt/jarvis/releases/v8.2.0/jarvis /usr/local/sbin/jarvis
+cmp /opt/jarvis/releases/v8.2.0/update-core-release /usr/local/libexec/jarvis/update-core-release
+
 # Drafts and prereleases are never update targets even when their tag/assets
 # appear structurally valid.
 seed_active_release v9.0.0 "$same_migrations"
