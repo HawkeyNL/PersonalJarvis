@@ -57,6 +57,8 @@ require_literal "$publish_workflow" \
 require_literal "$publish_workflow" \
     'GH_REPO: ${{ github.repository }}' \
     "publish workflow must give GitHub CLI explicit repository context"
+reject_pattern "$publish_workflow" '^[[:space:]]+--target ' \
+    "publish workflow must not re-target the already verified existing tag"
 
 # These files build, transfer or publish the public release artifact. None may
 # acquire a private checkout, persona, or agent-content path.

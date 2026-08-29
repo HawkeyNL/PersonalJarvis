@@ -150,15 +150,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
-          RELEASE_REVISION: ${{ inputs.revision }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG already exists; refusing to overwrite it" >&2
             exit 1
           fi
           archive="dist/jarvis-core-$RELEASE_TAG-linux-x86_64.tar.gz"
+          # The existing tag was resolved to the accepted revision above.
+          # Supplying --target here would invoke GitHub's workflow-file write
+          # guard for an older commit even though no tag is being created.
           gh release create "$RELEASE_TAG" "$archive" "$archive.sha256" \
             --verify-tag \
-            --target "$RELEASE_REVISION" \
             --title "Jarvis Core $RELEASE_TAG" \
             --generate-notes
