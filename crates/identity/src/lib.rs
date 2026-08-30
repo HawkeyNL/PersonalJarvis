@@ -177,18 +177,15 @@ pub fn pairing_approval_message(
     approver_device_id: Uuid,
     expires_at: OffsetDateTime,
 ) -> Result<Vec<u8>, IdentityError> {
-    if nonce.len() != 32 || candidate_public_key.len() != 32 {
-        return Err(IdentityError::AuthFailed);
-    }
-    let mut message = Vec::with_capacity(26 + 16 + 32 + 32 + 16 + 16 + 8);
-    message.extend_from_slice(b"jarvis-device-pairing-v1\0");
-    message.extend_from_slice(request_id.as_bytes());
-    message.extend_from_slice(nonce);
-    message.extend_from_slice(candidate_public_key);
-    message.extend_from_slice(user_id.as_bytes());
-    message.extend_from_slice(approver_device_id.as_bytes());
-    message.extend_from_slice(&expires_at.unix_timestamp().to_be_bytes());
-    Ok(message)
+    jarvis_client_core::pairing_approval_message(
+        request_id,
+        nonce,
+        candidate_public_key,
+        user_id,
+        approver_device_id,
+        expires_at,
+    )
+    .map_err(|_| IdentityError::AuthFailed)
 }
 
 /// Canonical, domain-separated bytes for a privileged Home Node configuration

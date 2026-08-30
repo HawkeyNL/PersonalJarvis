@@ -2306,6 +2306,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "jarvis-agent",
+ "jarvis-client-core",
  "jarvis-codex",
  "jarvis-config",
  "jarvis-core",
@@ -2335,6 +2336,18 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "jarvis-client-core"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "time",
  "uuid",
 ]
 
@@ -2401,6 +2414,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
+ "jarvis-client-core",
  "jarvis-store",
  "rand 0.8.7",
  "serde",
