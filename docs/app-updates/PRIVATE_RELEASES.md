@@ -65,6 +65,8 @@ Repository variables:
 
 - `PRIVATE_RELEASE_REPO`, for example `HawkeyNL/PersonalJarvisReleases`
 - `TAURI_SIGNING_PUBLIC_KEY`, the public half of the Tauri updater key
+- `ANDROID_SIGNING_CERTIFICATE_SHA256`, the lowercase SHA-256 identity of the
+  one stable Android release certificate
 
 Never add Home Node hosts, IP addresses, DNS names, SSH users, SSH keys or
 private artifact tokens to GitHub Actions. Ordinary PR and `App CI` workflows
@@ -74,6 +76,11 @@ Generate the Tauri keypair and Android keystore outside the repository. Keep
 both private keys in owner-controlled backup storage. Losing either key blocks
 updates to installed clients; replacing the Android key also prevents Android
 from installing an APK over the existing application.
+The workflow verifies every generated updater signature against the configured
+Tauri public key and every APK against the independently pinned Android
+certificate before uploading it. Release actions are commit-SHA pinned, and
+private signing credentials are scoped to individual signing/upload steps;
+dependency installation and frontend builds do not receive them.
 
 ## Trusted release procedure
 
@@ -88,8 +95,10 @@ from installing an APK over the existing application.
    builds all platforms with locked Cargo/npm dependency state, signs them,
    Developer ID-signs/notarizes/staples the macOS output, uploads the iOS archive
    to App Store Connect and stages every other artifact in the private draft.
-5. Only after all platform jobs succeed does the final job create
-   `latest.json`, publish the draft and mark it as the private latest release.
+5. Only after all platform jobs succeed does the final job reject missing or
+   unexpected draft assets, create `latest.json`, redownload and re-hash the
+   final asset set, re-check the source-bound draft, publish it and mark it as
+   the private latest release.
 
 No job calls SSH, knows a Home Node address or publishes to the public source
 repository. A failed platform job leaves an inactive private draft and cannot
@@ -158,12 +167,18 @@ Every pull validates the complete manifest, pinned Android identity, every
 mirrored file's exact size and SHA-256, path safety and allowed targets in a
 temporary staging directory. It atomically replaces `current` only after all
 checks succeed, then retains the active version and one previous verified
-version. Failure leaves `current` unchanged.
+version—the actual generation that was active before promotion. Manifest,
+verification metadata and directory/symlink changes are flushed before
+activation; retention runs before the atomic `current` switch, so a cleanup
+failure leaves `current` unchanged.
 
 Authenticated source redirects are restricted as well: only HTTPS targets are
 accepted, Authorization remains attached only for the exact same
 scheme/hostname/effective-port origin, and a redirect chain never restores a
 credential after an origin change.
+The generic HTTP-template source additionally requires manifest and artifact
+templates to share one exact HTTPS origin, preventing a local configuration
+mistake from sending the same private-storage token to a second host.
 
 ## Authenticated client delivery
 
@@ -185,7 +200,9 @@ The desktop stores the enrolled Home Node origin at runtime as ordinary local
 metadata. Production accepts credential-free HTTPS only; loopback HTTP is an
 explicit debug-build option. There is no `VITE_JARVIS_API_BASE` release input
 or implicit production localhost fallback. All API requests resolve the active
-origin at call time.
+origin at call time. Changing that origin clears the old Home Node session and
+server-specific device id before the new value is stored, forcing enrollment
+and login instead of forwarding an old bearer to a different host.
 
 After authentication, Rust calls `GET /v1/app-updates/capability` with the
 OS-stored bearer token. Core returns a credential-free Tauri check template and
@@ -194,7 +211,9 @@ protocol is `1`; newer requirements are shown as incompatible and are never
 offered. Capability, artifact and redirect origins are bound to the exact
 enrolled origin before native Authorization is used. Vue receives only version,
 state, notes and progress; it does not receive the updater endpoint, signature
-or bearer token. A single delayed check runs after authenticated startup without
+or bearer token. Ordinary authenticated desktop API traffic also runs through
+the native Rust client; Vue receives only non-secret authentication status and
+never receives or constructs the session bearer. A single delayed check runs after authenticated startup without
 blocking the app; download, installation and restart remain manual.
 
 Android does not use Tauri updater semantics. An enrolled device calls
@@ -207,6 +226,8 @@ checks size/SHA-256/package/version and requires the APK certificate to equal
 both the installed Jarvis signer and the manifest signer before opening the
 Android package installer. Unknown-app installation permission is explained
 and opened explicitly; Jarvis never enables it silently.
+Release builds accept HTTPS Home Node origins only and disable cleartext
+traffic. Local HTTP exists solely in explicit debug builds.
 
 Offline, stale, corrupt, incompatible and bad-signature failures leave the
 currently installed desktop or Android app usable. iOS remains TestFlight-only

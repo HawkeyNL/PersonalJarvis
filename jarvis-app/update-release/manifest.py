@@ -154,7 +154,11 @@ def validate_manifest(document: Any, *, require_complete: bool = True) -> dict[s
                     raise ManifestError(f"{label}.metadata is required")
                 _exact_keys(metadata, {"version_code"}, set(), f"{label}.metadata")
                 version_code = metadata["version_code"]
-                if not isinstance(version_code, int) or isinstance(version_code, bool) or version_code < 1:
+                if (
+                    not isinstance(version_code, int)
+                    or isinstance(version_code, bool)
+                    or not 1 <= version_code <= 2_100_000_000
+                ):
                     raise ManifestError(f"{label}.metadata.version_code is invalid")
             elif "metadata" in entry:
                 raise ManifestError(f"{label}.metadata is not allowed")

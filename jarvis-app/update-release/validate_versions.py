@@ -14,7 +14,7 @@ from manifest import SEMVER_RE
 
 
 def validate(repository: Path, version: str, android_code: int, ios_build: int) -> None:
-    if not SEMVER_RE.fullmatch(version) or android_code < 1 or ios_build < 1:
+    if not SEMVER_RE.fullmatch(version) or not 1 <= android_code <= 2_100_000_000 or ios_build < 1:
         raise ValueError("release versions are invalid")
     tauri = json.loads((repository / "jarvis-app/src-tauri/tauri.conf.json").read_text())
     cargo = tomllib.loads((repository / "jarvis-app/src-tauri/Cargo.toml").read_text())
