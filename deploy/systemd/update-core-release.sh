@@ -282,7 +282,7 @@ inspect_release() {
     unsafe_entry=$(find "$release" -xdev \( -type l -o ! -user root -o ! -group root -o -perm /022 \) \
         -printf '%P (%y %u:%g %m)\n' -quit)
     [[ -z $unsafe_entry ]] || {
-        inspected_reason="unsafe ownership, permissions, or link"
+        inspected_reason="unsafe ownership, permissions, or link: $unsafe_entry"
         return 0
     }
     [[ -f $release/release.json && ! -L $release/release.json ]] || {
