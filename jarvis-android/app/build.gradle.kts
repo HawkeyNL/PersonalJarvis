@@ -9,7 +9,9 @@ require(Regex("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-
     "JARVIS_APP_VERSION must be a semantic version"
 }
 val releaseVersionCode = providers.environmentVariable("JARVIS_ANDROID_VERSION_CODE").orNull?.toIntOrNull() ?: 1
-require(releaseVersionCode > 0) { "JARVIS_ANDROID_VERSION_CODE must be positive" }
+require(releaseVersionCode in 1..2_100_000_000) {
+    "JARVIS_ANDROID_VERSION_CODE must be between 1 and 2100000000"
+}
 
 val releaseKeystorePath = providers.environmentVariable("JARVIS_ANDROID_KEYSTORE_PATH").orNull
 val releaseKeyAlias = providers.environmentVariable("JARVIS_ANDROID_KEY_ALIAS").orNull
@@ -36,6 +38,7 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
+        manifestPlaceholders["usesCleartextTraffic"] = "false"
     }
 
     signingConfigs {
@@ -50,6 +53,9 @@ android {
     }
 
     buildTypes {
+        debug {
+            manifestPlaceholders["usesCleartextTraffic"] = "true"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true

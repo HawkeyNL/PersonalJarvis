@@ -129,7 +129,10 @@ fn validate_capability(
     {
         return Err("update capability endpoint contains credentials");
     }
-    Ok(capability.check_endpoint)
+    Ok(format!(
+        "{}?client_protocol={CURRENT_DESKTOP_UPDATE_PROTOCOL}",
+        capability.check_endpoint
+    ))
 }
 
 async fn discover_endpoint(
@@ -353,7 +356,7 @@ mod tests {
             "https://home.invalid/v1/app-updates/stable/{{target}}/{{arch}}/{{current_version}}";
         assert_eq!(
             validate_capability(capability(1, endpoint), "https://home.invalid", false).unwrap(),
-            endpoint
+            format!("{endpoint}?client_protocol=1")
         );
         assert_eq!(
             validate_capability(capability(2, endpoint), "https://home.invalid", false),

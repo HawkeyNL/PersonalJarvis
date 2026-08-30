@@ -73,12 +73,11 @@ The APK is written below `app/build/outputs/apk/debug/`.
 
 ## Connection policy
 
-HTTPS endpoints are accepted for local and remote Home Nodes. Cleartext HTTP is
-accepted only for loopback, RFC1918 IPv4, IPv6 local addresses, or `.local`
-hostnames. Android's manifest must permit cleartext globally because the endpoint
-is configured at runtime; `HomeNodeEndpoint` enforces the narrower application
-policy before any request is sent. HTTPS remains strongly preferred, including
-on a LAN.
+Release builds accept HTTPS endpoints only and set
+`usesCleartextTraffic=false`, including on a LAN. Explicit debug builds may use
+cleartext HTTP for loopback, RFC1918 IPv4, IPv6 local addresses, or `.local`
+hostnames; both the manifest placeholder and `HomeNodeEndpoint` enforce that
+debug-only exception before any bearer-authenticated request is sent.
 
 The endpoint is ordinary metadata and is stored in Preferences DataStore. It is
 never placed in a URL query together with credentials. Requests have bounded

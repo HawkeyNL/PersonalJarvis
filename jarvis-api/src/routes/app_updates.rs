@@ -22,6 +22,7 @@ use tokio_util::io::ReaderStream;
 use crate::{AppState, AppUpdateMirror, Authed};
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_ANDROID_VERSION_CODE: u32 = 2_100_000_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,11 +99,21 @@ pub(crate) struct AndroidUpdateQuery {
     client_protocol: u32,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesktopUpdateQuery {
+    client_protocol: u32,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum AndroidOffer {
     Available,
     Current,
     Incompatible,
+}
+
+fn protocol_is_compatible(client_protocol: u32, minimum_client_protocol: u32) -> bool {
+    client_protocol > 0 && minimum_client_protocol > 0 && minimum_client_protocol <= client_protocol
 }
 
 fn android_offer(
@@ -111,7 +122,7 @@ fn android_offer(
     release_version_code: u32,
     minimum_client_protocol: u32,
 ) -> AndroidOffer {
-    if minimum_client_protocol > client_protocol {
+    if !protocol_is_compatible(client_protocol, minimum_client_protocol) {
         AndroidOffer::Incompatible
     } else if release_version_code <= installed_version_code {
         AndroidOffer::Current
@@ -325,7 +336,7 @@ async fn active_android_release(
         .get("version_code")
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| *value > 0)
+        .filter(|value| (1..=MAX_ANDROID_VERSION_CODE).contains(value))
         .ok_or_else(|| opaque(StatusCode::SERVICE_UNAVAILABLE, "update mirror invalid"))?;
     if entry.distribution != "home-node-apk"
         || entry.external.is_some()
@@ -530,9 +541,13 @@ pub(crate) async fn app_update_check(
     _authed: Authed,
     State(state): State<AppState>,
     Path((channel, target, arch, current_version)): Path<(String, String, String, String)>,
+    Query(query): Query<DesktopUpdateQuery>,
 ) -> Response {
     if channel != "stable" {
         return opaque(StatusCode::NOT_FOUND, "update channel unavailable");
+    }
+    if query.client_protocol == 0 {
+        return opaque(StatusCode::BAD_REQUEST, "invalid desktop client protocol");
     }
     let current = match Version::parse(current_version.trim_start_matches('v')) {
         Ok(version) => version,
@@ -548,6 +563,15 @@ pub(crate) async fn app_update_check(
         Ok(selected) => selected,
         Err(response) => return response,
     };
+    // Re-check the protocol on the same active generation that supplies the
+    // update. This closes the capability/check race when mirror activation
+    // occurs between the two requests.
+    if !protocol_is_compatible(query.client_protocol, selected.minimum_client_protocol) {
+        return opaque(
+            StatusCode::CONFLICT,
+            "desktop client protocol is incompatible with this release",
+        );
+    }
     if selected.version <= current {
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -642,6 +666,15 @@ mod tests {
         assert_eq!(android_offer(42, 1, 42, 1), AndroidOffer::Current);
         assert_eq!(android_offer(43, 1, 42, 1), AndroidOffer::Current);
         assert_eq!(android_offer(41, 1, 42, 2), AndroidOffer::Incompatible);
+    }
+
+    #[test]
+    fn desktop_protocol_compatibility_is_explicit() {
+        assert!(protocol_is_compatible(1, 1));
+        assert!(protocol_is_compatible(2, 1));
+        assert!(!protocol_is_compatible(1, 2));
+        assert!(!protocol_is_compatible(0, 1));
+        assert!(!protocol_is_compatible(1, 0));
     }
 
     #[test]

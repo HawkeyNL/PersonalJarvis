@@ -13,6 +13,8 @@ import com.hawkeynl.jarvis.network.JarvisApi
 import com.hawkeynl.jarvis.storage.SessionRepository
 import java.io.File
 import java.security.MessageDigest
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 sealed interface AndroidUpdateCheck {
     data object Unauthorized : AndroidUpdateCheck
@@ -83,7 +85,9 @@ class AndroidUpdateService(
             metadata.artifact.size,
         )) {
             is ApiResult.Success -> {
-                val error = verifyDownloadedApk(temporary, metadata)
+                val error = withContext(Dispatchers.IO) {
+                    verifyDownloadedApk(temporary, metadata)
+                }
                 if (error != null) {
                     temporary.delete()
                     AndroidUpdateDownload.Failed(error)
@@ -107,13 +111,17 @@ class AndroidUpdateService(
     fun handOffToPackageInstaller(activity: Activity): InstallerHandoff {
         val update = pending ?: return InstallerHandoff.Failed("Download en controleer eerst de update.")
         if (!application.packageManager.canRequestPackageInstalls()) {
-            activity.startActivity(
-                Intent(
-                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                    Uri.parse("package:${application.packageName}"),
-                ),
-            )
-            return InstallerHandoff.PermissionRequired
+            return try {
+                activity.startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:${application.packageName}"),
+                    ),
+                )
+                InstallerHandoff.PermissionRequired
+            } catch (_: RuntimeException) {
+                InstallerHandoff.Failed("Android kon de installatietoestemming niet openen.")
+            }
         }
         return try {
             val uri = FileProvider.getUriForFile(
