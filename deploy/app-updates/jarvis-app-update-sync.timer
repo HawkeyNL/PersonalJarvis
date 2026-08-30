@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically pull private Jarvis application releases
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=15m
+RandomizedDelaySec=2m
+Persistent=true
+Unit=jarvis-app-update-sync.service
+
+[Install]
+WantedBy=timers.target

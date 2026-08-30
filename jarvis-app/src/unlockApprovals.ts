@@ -4,7 +4,7 @@
 // nonce with its device key — the same Ed25519 key used for login.
 import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { currentSession } from "./auth";
+import { currentAuthStatus } from "./auth";
 import { getJsonAuth, postJsonAuth } from "./api";
 
 export interface UnlockReq {
@@ -25,15 +25,14 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Fetch pending requests. `wait` (secs) long-polls: returns as soon as one
  *  appears, or after the timeout empty. Returns whether the fetch succeeded. */
 async function fetchPending(wait: number): Promise<boolean> {
-  const session = await currentSession();
-  if (!session.token) {
+  const status = await currentAuthStatus();
+  if (!status.authenticated) {
     pending.value = [];
     return false;
   }
   try {
     const res = await getJsonAuth<{ requests: UnlockReq[] }>(
       `/v1/auth/unlock/pending?wait=${wait}`,
-      session.token,
     );
     pending.value = res.requests;
     return true;
@@ -51,8 +50,8 @@ export async function approve(req: UnlockReq): Promise<void> {
   approvalError.value = null;
   approving.value = req.id;
   try {
-    const session = await currentSession();
-    if (!session.token) throw new Error("niet ingelogd");
+    const status = await currentAuthStatus();
+    if (!status.authenticated) throw new Error("niet ingelogd");
     // Verify locally on the phone: biometrics, falling back to the passcode.
     await invoke("biometric_unlock", {
       reason: `${req.device_name} ontgrendelen`,
@@ -60,7 +59,7 @@ export async function approve(req: UnlockReq): Promise<void> {
     });
     // Prove it with the device key by signing the request nonce.
     const signature = await invoke<string>("auth_sign", { nonceHex: req.nonce });
-    await postJsonAuth(`/v1/auth/unlock/${req.id}/approve`, session.token, { signature });
+    await postJsonAuth(`/v1/auth/unlock/${req.id}/approve`, { signature });
     pending.value = pending.value.filter((r) => r.id !== req.id);
   } catch (e) {
     approvalError.value = e instanceof Error ? e.message : String(e);
@@ -72,9 +71,9 @@ export async function approve(req: UnlockReq): Promise<void> {
 export async function deny(req: UnlockReq): Promise<void> {
   approvalError.value = null;
   try {
-    const session = await currentSession();
-    if (!session.token) throw new Error("niet ingelogd");
-    await postJsonAuth(`/v1/auth/unlock/${req.id}/deny`, session.token, {});
+    const status = await currentAuthStatus();
+    if (!status.authenticated) throw new Error("niet ingelogd");
+    await postJsonAuth(`/v1/auth/unlock/${req.id}/deny`, {});
     pending.value = pending.value.filter((r) => r.id !== req.id);
   } catch (e) {
     approvalError.value = e instanceof Error ? e.message : String(e);

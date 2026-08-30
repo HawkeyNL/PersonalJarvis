@@ -24,6 +24,28 @@ The current client provides:
 Voice, wake word, notifications, background sync and Home Node discovery are not
 part of this milestone.
 
+## Private releases
+
+Release APK/AAB builds require the stable owner-managed keystore through the
+`JARVIS_ANDROID_KEYSTORE_PATH`, `JARVIS_ANDROID_KEY_ALIAS`,
+`JARVIS_ANDROID_STORE_PASSWORD` and `JARVIS_ANDROID_KEY_PASSWORD` environment
+variables. `JARVIS_APP_VERSION` supplies `versionName` and
+`JARVIS_ANDROID_VERSION_CODE` must increase for each release. Gradle refuses
+`assembleRelease` and `bundleRelease` when signing is not configured.
+
+The protected release workflow publishes the signed APK only to private
+storage. See
+[`docs/app-updates/PRIVATE_RELEASES.md`](../docs/app-updates/PRIVATE_RELEASES.md).
+
+An authenticated app checks the active Home Node mirror with its installed
+`versionCode` and client protocol. A newer APK is streamed to app-private cache
+with redirects disabled, then checked for exact size, SHA-256, package id,
+`versionCode`, `versionName`, and the same signing certificate as the installed
+Jarvis app. Only then is it handed to Android's package installer. The user may
+need to grant Jarvis the per-app "install unknown apps" permission; Jarvis opens
+that system setting explicitly and never enables it automatically. iOS uses
+TestFlight and desktop uses Tauri updater signing; neither flow is reused here.
+
 ## Prerequisites
 
 - Android Studio Quail 2026.1.1 or newer;
@@ -51,12 +73,11 @@ The APK is written below `app/build/outputs/apk/debug/`.
 
 ## Connection policy
 
-HTTPS endpoints are accepted for local and remote Home Nodes. Cleartext HTTP is
-accepted only for loopback, RFC1918 IPv4, IPv6 local addresses, or `.local`
-hostnames. Android's manifest must permit cleartext globally because the endpoint
-is configured at runtime; `HomeNodeEndpoint` enforces the narrower application
-policy before any request is sent. HTTPS remains strongly preferred, including
-on a LAN.
+Release builds accept HTTPS endpoints only and set
+`usesCleartextTraffic=false`, including on a LAN. Explicit debug builds may use
+cleartext HTTP for loopback, RFC1918 IPv4, IPv6 local addresses, or `.local`
+hostnames; both the manifest placeholder and `HomeNodeEndpoint` enforce that
+debug-only exception before any bearer-authenticated request is sent.
 
 The endpoint is ordinary metadata and is stored in Preferences DataStore. It is
 never placed in a URL query together with credentials. Requests have bounded

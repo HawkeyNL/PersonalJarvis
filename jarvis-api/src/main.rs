@@ -284,6 +284,22 @@ async fn main() -> anyhow::Result<()> {
 
     let trusted_proxy_ips = config.trusted_proxy_ips().map_err(anyhow::Error::msg)?;
     let bootstrap_enrollment = config.bootstrap_enrollment().map_err(anyhow::Error::msg)?;
+    let update_mirror_root = std::env::var("JARVIS_APP_UPDATE_MIRROR_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let update_public_base = std::env::var("JARVIS_APP_UPDATE_PUBLIC_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let app_update_mirror = match (update_mirror_root, update_public_base) {
+        (None, None) => None,
+        (Some(root), Some(public_base)) => Some(
+            jarvis_api::AppUpdateMirror::new(root, &public_base)
+                .map_err(anyhow::Error::msg)?,
+        ),
+        _ => anyhow::bail!(
+            "JARVIS_APP_UPDATE_MIRROR_ROOT and JARVIS_APP_UPDATE_PUBLIC_BASE_URL must be configured together"
+        ),
+    };
 
     let state = AppState {
         db,
@@ -322,6 +338,7 @@ async fn main() -> anyhow::Result<()> {
         trusted_proxy_hops: config.trusted_proxy_hops,
         trusted_proxy_ips: Arc::new(trusted_proxy_ips),
         bootstrap_enrollment,
+        app_update_mirror,
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

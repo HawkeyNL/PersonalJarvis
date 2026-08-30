@@ -10,7 +10,7 @@
 // development isn't interrupted by prompts.
 import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { currentSession } from "./auth";
+import { currentAuthStatus } from "./auth";
 import { getJsonAuth, postJsonAuth } from "./api";
 import {
   initPlatformCapabilities,
@@ -97,16 +97,14 @@ export async function biometricUnlock(): Promise<boolean> {
 /** Ask a trusted phone to approve the unlock; long-poll until it resolves. */
 export async function requestPhoneApproval(): Promise<void> {
   phoneError.value = null;
-  const session = await currentSession();
-  const token = session.token;
-  if (!token) {
+  const status = await currentAuthStatus();
+  if (!status.authenticated) {
     phoneError.value = "niet ingelogd";
     return;
   }
   try {
     const { request_id } = await postJsonAuth<{ request_id: string; nonce: string }>(
       "/v1/auth/unlock/request",
-      token,
       {},
     );
     phoneWaiting.value = true;
@@ -118,7 +116,6 @@ export async function requestPhoneApproval(): Promise<void> {
       try {
         const { status } = await getJsonAuth<{ status: string }>(
           `/v1/auth/unlock/${request_id}?wait=20`,
-          token,
         );
         if (!pollActive) return; // cancelled while the request was open
         if (status === "approved") {

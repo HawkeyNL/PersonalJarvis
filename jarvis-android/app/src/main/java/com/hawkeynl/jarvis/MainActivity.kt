@@ -33,6 +33,7 @@ class MainActivity : FragmentActivity() {
                     state = state,
                     actions = viewModel,
                     onRequestBiometric = ::requestBiometricUnlock,
+                    onInstallUpdate = ::installVerifiedUpdate,
                 )
             }
         }
@@ -53,5 +54,9 @@ class MainActivity : FragmentActivity() {
             biometricPromptActive = false
             viewModel.retryUnlockResult(result)
         }
+    }
+
+    private fun installVerifiedUpdate() {
+        viewModel.installerHandoff(container.appUpdates.handOffToPackageInstaller(this))
     }
 }

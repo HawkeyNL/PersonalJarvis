@@ -7,7 +7,7 @@
 // may open the console or kick off biometrics — it never replaces them.
 
 import { ref } from "vue";
-import { currentSession } from "./auth";
+import { currentAuthStatus } from "./auth";
 import { getJsonAuth, postJsonAuth } from "./api";
 import { recordPcm, captureSupported } from "./voiceCapture";
 
@@ -33,10 +33,9 @@ export interface VerifyResult {
 /** Result of the most recent verify(), or null. */
 export const lastVerify = ref<VerifyResult | null>(null);
 
-async function token(): Promise<string> {
-  const s = await currentSession();
-  if (!s.token) throw new Error("niet ingelogd");
-  return s.token;
+async function requireAuth(): Promise<void> {
+  const status = await currentAuthStatus();
+  if (!status.authenticated) throw new Error("niet ingelogd");
 }
 
 /** i16 PCM → plain number[] so JSON.stringify emits a real array. */
@@ -47,10 +46,9 @@ function pcmArray(pcm: Int16Array): number[] {
 /** Refresh the enrolled/engine state from the server. Silent on failure. */
 export async function refreshVoiceStatus(): Promise<void> {
   try {
-    const t = await token();
+    await requireAuth();
     const res = await getJsonAuth<{ enrolled: boolean; engine: string }>(
       "/v1/voice/status",
-      t,
     );
     enrolled.value = res.enrolled;
     engine.value = res.engine;
@@ -73,10 +71,9 @@ export async function enroll(seconds = 4): Promise<void> {
   try {
     const rec = await recordPcm(seconds * 1000);
     voiceStatus.value = "versturen…";
-    const t = await token();
+    await requireAuth();
     const res = await postJsonAuth<{ status: string; dims: number }>(
       "/v1/voice/enroll",
-      t,
       { sample_rate: rec.sampleRate, pcm: pcmArray(rec.pcm) },
     );
     voiceStatus.value = `stemprofiel opgeslagen ✓ (${res.dims}-dim)`;
@@ -107,8 +104,8 @@ export async function verify(seconds = 3): Promise<VerifyResult | null> {
   try {
     const rec = await recordPcm(seconds * 1000);
     voiceStatus.value = "controleren…";
-    const t = await token();
-    const res = await postJsonAuth<VerifyResult>("/v1/voice/verify", t, {
+    await requireAuth();
+    const res = await postJsonAuth<VerifyResult>("/v1/voice/verify", {
       sample_rate: rec.sampleRate,
       pcm: pcmArray(rec.pcm),
     });

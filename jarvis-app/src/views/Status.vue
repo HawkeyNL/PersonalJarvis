@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from "vue";
-import { API_BASE, getJson, getJsonAuth, postJsonAuth } from "../api";
-import { currentSession } from "../auth";
+import { getJson, getJsonAuth, postJsonAuth } from "../api";
+import { currentAuthStatus } from "../auth";
+import { homeNodeConfig, loadHomeNodeConfig } from "../homeNode";
 
 type Health = { status: string; environment?: string };
 type Check = "checking" | "ok" | "fout";
@@ -109,15 +110,15 @@ async function loadRegistry(refresh = false) {
   regBusy.value = true;
   regError.value = null;
   try {
-    const s = await currentSession();
-    if (!s.token) {
+    const status = await currentAuthStatus();
+    if (!status.authenticated) {
       regError.value = "niet ingelogd";
       return;
     }
     reg.value = refresh
-      ? await postJsonAuth<Registry>("/v1/system/registry/refresh", s.token, {})
-      : await getJsonAuth<Registry>("/v1/system/registry", s.token);
-    usage.value = await getJsonAuth<Usage>("/v1/system/usage", s.token);
+      ? await postJsonAuth<Registry>("/v1/system/registry/refresh", {})
+      : await getJsonAuth<Registry>("/v1/system/registry");
+    usage.value = await getJsonAuth<Usage>("/v1/system/usage");
   } catch (e) {
     regError.value = String(e);
   } finally {
@@ -143,8 +144,7 @@ const advice = ref<SelfDev | null>(null);
 const adviceBusy = ref(false);
 const adviceError = ref<string | null>(null);
 const adviceCancelled = ref(false);
-// Held while a request is in flight so the user can abort it — aborting also
-// stops the server-side LLM call, so a cancel doesn't keep burning tokens.
+// Held while a request is in flight so the UI can stop waiting immediately.
 const adviceCtrl = ref<AbortController | null>(null);
 // Live elapsed seconds so the status shows real progress, not just a spinner.
 const adviceElapsed = ref(0);
@@ -165,14 +165,13 @@ async function askSelfImprove() {
   const ctrl = new AbortController();
   adviceCtrl.value = ctrl;
   try {
-    const s = await currentSession();
-    if (!s.token) {
+    const status = await currentAuthStatus();
+    if (!status.authenticated) {
       adviceError.value = "niet ingelogd";
       return;
     }
     advice.value = await postJsonAuth<SelfDev>(
       "/v1/system/self-improve",
-      s.token,
       {},
       ctrl.signal,
     );
@@ -194,7 +193,8 @@ function cancelSelfImprove() {
   adviceCtrl.value?.abort();
 }
 
-onMounted(() => {
+onMounted(async () => {
+  await loadHomeNodeConfig();
   check();
   loadRegistry();
 });
@@ -205,7 +205,7 @@ onMounted(() => {
     <h1>Status</h1>
     <p class="muted">
       Live-verbinding met de backend <code>jarvis-api</code> op
-      <code>{{ API_BASE }}</code> (via de Tauri HTTP-plugin).
+      <code>{{ homeNodeConfig.origin ?? "niet geconfigureerd" }}</code> (via de Tauri HTTP-plugin).
     </p>
 
     <ul class="status-list">

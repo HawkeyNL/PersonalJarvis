@@ -5,9 +5,12 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/app-ci.yml"
+      - ".github/workflows/private-app-release.yml"
+      - "docs/app-updates/**"
       - "jarvis-app/**"
       - "jarvis-ios/**"
       - "jarvis-android/**"
+      - "deploy/app-updates/**"
       - "crates/client-core/**"
       - "crates/identity/**"
       - "jarvis-api/**"
@@ -16,9 +19,12 @@ on:
   pull_request:
     paths:
       - ".github/workflows/app-ci.yml"
+      - ".github/workflows/private-app-release.yml"
+      - "docs/app-updates/**"
       - "jarvis-app/**"
       - "jarvis-ios/**"
       - "jarvis-android/**"
+      - "deploy/app-updates/**"
       - "crates/client-core/**"
       - "crates/identity/**"
       - "jarvis-api/**"
@@ -71,6 +77,13 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run test:unit
+      - name: Test private release manifest and mirror logic
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 -m unittest discover -s update-release/tests -v
+          python3 -m unittest discover -s update-mirror/tests -v
+          bash ../deploy/app-updates/tests/test-app-update-assets.sh
 
   desktop-native:
     name: Desktop Tauri — ${{ matrix.name }}

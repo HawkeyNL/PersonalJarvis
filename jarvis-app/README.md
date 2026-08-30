@@ -9,6 +9,10 @@ The Home Node remains authoritative for identity enrollment, policy, chat, and
 device revocation. The desktop app owns only its device key, session, local
 preferences, and presentation.
 
+Private signed desktop releases, the authenticated Home Node mirror and updater
+operations are documented in
+[`docs/app-updates/PRIVATE_RELEASES.md`](../docs/app-updates/PRIVATE_RELEASES.md).
+
 ## Common commands
 
 Run these commands from this directory:
@@ -95,7 +99,11 @@ fails, migration fails closed and leaves the legacy data untouched for manual
 recovery. A new plaintext fallback is never created.
 
 The private Ed25519 seed is generated and used only by Rust. Tauri commands
-return a public key or a bounded signature, never private key bytes.
+return a public key or a bounded signature, never private key bytes. Login and
+all authenticated API calls are completed by Rust using the credential-store
+session; Vue receives only authentication status, device id and key presence,
+never the bearer token. Changing the configured Home Node origin clears the old
+session/device binding before the new origin is persisted.
 
 ## Current capability matrix
 
@@ -121,6 +129,11 @@ belong to separate native/mobile milestones.
   Secret Service provider, then retry. Jarvis intentionally does not fall back
   to `auth.json`.
 - Wake detector reports model assets missing: run `npm run setup-wakeword`.
-- Home Node is unreachable: verify the configured `VITE_JARVIS_API_BASE` build
-  value, DNS/IP, TLS, and the app's Tauri HTTP capability allowlist. A runtime
-  connection-profile UI remains future work.
+- Home Node is unreachable: verify the per-device Home Node origin in Settings,
+  DNS/IP, and TLS. Release builds accept only credential-free HTTPS origins;
+  loopback HTTP is available solely in debug builds for explicit local testing.
+  The origin is ordinary local metadata and is reused after restart and device
+  re-enrollment; no Home Node address is embedded during the build.
+- Updates show incompatible: the active release requires a newer updater
+  protocol than this client understands. Keep using the installed app and use
+  an owner-reviewed compatible upgrade path.

@@ -5,6 +5,7 @@
 //! so Axum can hand a clone to each request.
 
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
@@ -14,6 +15,46 @@ use jarvis_registry as registry;
 use jarvis_speech as speech;
 
 use crate::rate_limit;
+
+/// Runtime-only location and public origin for the authenticated application
+/// update mirror. Neither value is compiled into a client or release manifest.
+#[derive(Clone, Debug)]
+pub struct AppUpdateMirror {
+    root: Arc<PathBuf>,
+    public_base_url: Arc<str>,
+}
+
+impl AppUpdateMirror {
+    pub fn new(root: impl Into<PathBuf>, public_base_url: &str) -> Result<Self, &'static str> {
+        let root = root.into();
+        if !root.is_absolute() || root == Path::new("/") {
+            return Err("application update mirror root must be a bounded absolute path");
+        }
+        let parsed = url::Url::parse(public_base_url)
+            .map_err(|_| "application update public base URL is invalid")?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err("application update public base URL must be credential-free HTTPS");
+        }
+        Ok(Self {
+            root: Arc::new(root),
+            public_base_url: Arc::from(public_base_url.trim_end_matches('/')),
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        self.root.as_path()
+    }
+
+    pub fn public_base_url(&self) -> &str {
+        &self.public_base_url
+    }
+}
 
 /// Shared, cheaply-cloneable application state.
 #[derive(Clone)]
@@ -79,4 +120,7 @@ pub struct AppState {
     /// LAN-only, one-time first-owner bootstrap verifier. `None` means no
     /// bootstrap route is usable; it is intentionally not a general secret bag.
     pub bootstrap_enrollment: Option<jarvis_config::BootstrapEnrollment>,
+    /// Disabled unless the root-operated mirror and its private HTTPS origin
+    /// are explicitly configured together.
+    pub app_update_mirror: Option<AppUpdateMirror>,
 }

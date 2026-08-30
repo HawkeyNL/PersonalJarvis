@@ -5,7 +5,7 @@
 // `assistant.ts` (which imports from here — this module must not import it back,
 // to avoid a cycle).
 import { ref } from "vue";
-import { currentSession } from "./auth";
+import { currentAuthStatus } from "./auth";
 import { getJsonAuth, deleteAuth } from "./api";
 
 export interface ConversationSummary {
@@ -32,11 +32,10 @@ export function savedCurrentId(): string | null {
 
 /** Refresh the tab list from the server (newest-active first). */
 export async function loadConversations(): Promise<void> {
-  const session = await currentSession();
-  if (!session.token) return;
+  const status = await currentAuthStatus();
+  if (!status.authenticated) return;
   const res = await getJsonAuth<{ conversations: ConversationSummary[] }>(
     "/v1/conversations",
-    session.token,
   );
   conversations.value = res.conversations;
 }
@@ -44,9 +43,9 @@ export async function loadConversations(): Promise<void> {
 /** Delete a conversation and drop it from the list. Returns the id that should
  *  become current afterward (first remaining, or null), for the caller to open. */
 export async function deleteConversation(id: string): Promise<string | null> {
-  const session = await currentSession();
-  if (!session.token) return currentId.value;
-  await deleteAuth(`/v1/conversations/${id}`, session.token);
+  const status = await currentAuthStatus();
+  if (!status.authenticated) return currentId.value;
+  await deleteAuth(`/v1/conversations/${id}`);
   conversations.value = conversations.value.filter((c) => c.id !== id);
   if (currentId.value === id) {
     const next = conversations.value[0]?.id ?? null;

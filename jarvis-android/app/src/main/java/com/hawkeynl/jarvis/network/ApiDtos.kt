@@ -103,3 +103,24 @@ data class ChatResponse(
     val new_topic: Boolean,
     val routing_mode: String? = null,
 )
+
+@Serializable
+data class AndroidUpdateArtifact(
+    val size: Long,
+    val sha256: String,
+    val signing_certificate_sha256: String,
+)
+
+@Serializable
+data class AndroidUpdateMetadata(
+    val schema_version: Int,
+    val platform: String,
+    val package_name: String,
+    val version_code: Int,
+    val version_name: String,
+    val minimum_client_protocol: Int,
+    val released_at: String,
+    val notes: String,
+    val artifact: AndroidUpdateArtifact,
+    val download_url: String,
+)

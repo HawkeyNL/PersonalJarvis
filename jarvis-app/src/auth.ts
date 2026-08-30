@@ -2,15 +2,10 @@
 //
 // The private key and signing live in Rust (Tauri commands); this module only
 // orchestrates the HTTP flow (enroll -> challenge -> login) and reads back the
-// session state. The private key never enters JS.
+// non-secret session state. The private key and bearer token never enter JS.
 import { invoke } from "@tauri-apps/api/core";
 import { deleteAuth, getJsonAuth, getJsonWithHeaders, postAuth, postJson, postJsonWithHeaders } from "./api";
-
-export type Session = {
-  device_id: string | null;
-  token: string | null;
-  has_key: boolean;
-};
+import { scheduleAutomaticUpdateCheck } from "./updates";
 
 export type AuthStatus = {
   device_id: string | null;
@@ -25,10 +20,6 @@ export type DeviceItem = {
   status: string;
 };
 
-export function currentSession(): Promise<Session> {
-  return invoke<Session>("auth_session");
-}
-
 export function currentAuthStatus(): Promise<AuthStatus> {
   return invoke<AuthStatus>("auth_status");
 }
@@ -41,12 +32,12 @@ export class PairingPending extends Error {
 
 /// Log in with the local device key. An unknown device creates one bounded
 /// pairing request and waits; it can never self-enrol through a session token.
-export async function login(): Promise<void> {
+export async function login(enrolledDeviceId?: string): Promise<void> {
   const publicKey = await invoke<string>("auth_public_key");
   const info = await invoke<{ platform: string; name: string }>("device_info");
 
-  let session = await currentSession();
-  let deviceId = session.device_id;
+  const status = await currentAuthStatus();
+  let deviceId = enrolledDeviceId ?? status.device_id;
 
   if (!deviceId) {
     const stored = sessionStorage.getItem(PAIRING_WAIT_KEY);
@@ -81,13 +72,12 @@ export async function login(): Promise<void> {
   const signature = await invoke<string>("auth_sign", {
     nonceHex: challenge.nonce,
   });
-  const result = await postJson<{ token: string }>("/v1/auth/login", {
-    device_id: deviceId,
-    challenge_id: challenge.challenge_id,
+  await invoke("auth_complete_login", {
+    deviceId,
+    challengeId: challenge.challenge_id,
     signature,
   });
-
-  await invoke("auth_save", { deviceId, token: result.token });
+  scheduleAutomaticUpdateCheck(true, true);
 }
 
 /** Local-LAN first-owner bootstrap. The secret is used once, never persisted,
@@ -98,8 +88,7 @@ export async function bootstrapFirstDevice(secret: string): Promise<void> {
   const enrolled = await postJsonWithHeaders<{ device_id: string }>("/v1/auth/bootstrap", {
     name: info.name, platform: info.platform, public_key: publicKey,
   }, { "X-Jarvis-Bootstrap-Secret": secret });
-  await invoke("auth_save", { deviceId: enrolled.device_id, token: "" });
-  await login();
+  await login(enrolled.device_id);
 }
 
 /** Drop the locally stored session token (keeps the enrolled device + key), so
@@ -110,11 +99,11 @@ export async function clearSession(): Promise<void> {
 }
 
 export async function logout(): Promise<void> {
-  const session = await currentSession();
-  if (session.token) {
+  const status = await currentAuthStatus();
+  if (status.authenticated) {
     // Best-effort server-side revocation; clear locally regardless.
     try {
-      await postAuth("/v1/auth/logout", session.token);
+      await postAuth("/v1/auth/logout");
     } catch {
       /* ignore */
     }
@@ -126,10 +115,10 @@ export async function logout(): Promise<void> {
  *  and wipe the local key/id/token. Destructive — the next login() enrolls a
  *  brand-new device. Best-effort on the server call; always clears locally. */
 export async function deregisterDevice(): Promise<void> {
-  const session = await currentSession();
-  if (session.token && session.device_id) {
+  const status = await currentAuthStatus();
+  if (status.authenticated && status.device_id) {
     try {
-      await deleteAuth(`/v1/devices/${session.device_id}`, session.token);
+      await deleteAuth(`/v1/devices/${status.device_id}`);
     } catch {
       /* revoke best-effort; still wipe locally so this device is detached */
     }
@@ -137,7 +126,7 @@ export async function deregisterDevice(): Promise<void> {
   await invoke("auth_reset");
 }
 
-export async function listDevices(token: string): Promise<DeviceItem[]> {
-  const res = await getJsonAuth<{ devices: DeviceItem[] }>("/v1/devices", token);
+export async function listDevices(): Promise<DeviceItem[]> {
+  const res = await getJsonAuth<{ devices: DeviceItem[] }>("/v1/devices");
   return res.devices;
 }

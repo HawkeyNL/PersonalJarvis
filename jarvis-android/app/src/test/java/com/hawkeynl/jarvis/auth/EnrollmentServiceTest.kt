@@ -1,5 +1,6 @@
 package com.hawkeynl.jarvis.auth
 
+import com.hawkeynl.jarvis.network.AndroidUpdateMetadata
 import com.hawkeynl.jarvis.network.ApiResult
 import com.hawkeynl.jarvis.network.ChallengeRequest
 import com.hawkeynl.jarvis.network.ChallengeResponse
@@ -19,6 +20,7 @@ import com.hawkeynl.jarvis.network.PairingTicket
 import com.hawkeynl.jarvis.security.DeviceIdentity
 import com.hawkeynl.jarvis.storage.SessionRepository
 import com.hawkeynl.jarvis.testing.InMemorySecureValueStore
+import java.io.File
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -76,4 +78,16 @@ private class FakeApi : JarvisApi {
     override suspend fun conversations(endpoint: HomeNodeEndpoint, token: String): ApiResult<ConversationListResponse> = error("unused")
     override suspend fun conversation(endpoint: HomeNodeEndpoint, token: String, id: String): ApiResult<ConversationDetailResponse> = error("unused")
     override suspend fun chat(endpoint: HomeNodeEndpoint, token: String, request: ChatRequest): ApiResult<ChatResponse> = error("unused")
+    override suspend fun androidUpdate(
+        endpoint: HomeNodeEndpoint,
+        token: String,
+        currentVersionCode: Int,
+        clientProtocol: Int,
+    ): ApiResult<AndroidUpdateMetadata?> = error("unused")
+    override suspend fun downloadAndroidUpdate(
+        endpoint: HomeNodeEndpoint,
+        token: String,
+        destination: File,
+        expectedSize: Long,
+    ): ApiResult<Unit> = error("unused")
 }

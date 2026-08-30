@@ -1,11 +1,12 @@
 package com.hawkeynl.jarvis.network
 
+import com.hawkeynl.jarvis.BuildConfig
 import java.net.URI
 
 @JvmInline
 value class HomeNodeEndpoint private constructor(val baseUrl: String) {
     companion object {
-        fun parse(raw: String): EndpointValidation {
+        fun parse(raw: String, allowInsecureLocal: Boolean = BuildConfig.DEBUG): EndpointValidation {
             val input = raw.trim().trimEnd('/')
             if (input.isEmpty()) return EndpointValidation.Invalid("Voer het adres van je Home Node in.")
 
@@ -23,8 +24,8 @@ value class HomeNodeEndpoint private constructor(val baseUrl: String) {
             if (uri.path.orEmpty().let { it.isNotEmpty() && it != "/" }) {
                 return EndpointValidation.Invalid("Het Home Node-adres mag geen pad bevatten.")
             }
-            if (scheme == "http" && !isLocalHost(host)) {
-                return EndpointValidation.Invalid("Onversleutelde HTTP is alleen toegestaan voor lokale netwerkadressen.")
+            if (scheme == "http" && (!allowInsecureLocal || !isLocalHost(host))) {
+                return EndpointValidation.Invalid("HTTP is alleen toegestaan voor lokale Home Nodes in een debug-build.")
             }
             val displayHost = if (host.contains(':')) "[$host]" else host
             val authority = if (uri.port == -1) displayHost else "$displayHost:${uri.port}"
