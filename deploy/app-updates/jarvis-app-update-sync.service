@@ -1,0 +1,26 @@
+[Unit]
+Description=Pull and verify private Jarvis application releases
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0027
+ExecStart=/usr/lib/jarvis/app-updates/sync.py --config /etc/jarvis/app-updates/config.json
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/etc/jarvis/app-updates
+ReadWritePaths=/var/lib/jarvis/app-updates
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+

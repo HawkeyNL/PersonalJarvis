@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "source": {
+    "manifest_url": "https://private-artifacts.example.invalid/channels/stable/latest.json",
+    "artifact_base_url": "https://private-artifacts.example.invalid/",
+    "bearer_token_file": "/etc/jarvis/app-updates/private-release-token"
+  },
+  "mirror_root": "/var/lib/jarvis/app-updates",
+  "channel": "stable",
+  "retention_previous": 1,
+  "timeout_seconds": 60,
+  "max_artifact_bytes": 2147483648
+}
