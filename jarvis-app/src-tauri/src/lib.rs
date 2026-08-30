@@ -198,6 +198,9 @@ fn auth_sign(app: AppHandle, nonce_hex: String) -> Result<String, String> {
 /// separate from generic challenge signing prevents a UI bug from turning an
 /// arbitrary server string into a privileged enrollment approval.
 #[tauri::command]
+// Tauri exposes these as separately named IPC fields; wrapping them would
+// silently change the command contract used by the Vue approval flow.
+#[allow(clippy::too_many_arguments)]
 fn auth_sign_pairing_approval(
     app: AppHandle,
     candidate_name: String,
