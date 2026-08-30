@@ -50,6 +50,7 @@ struct ArtifactEntry {
     distribution: String,
     artifact: Option<Artifact>,
     external: Option<serde_json::Value>,
+    metadata: Option<serde_json::Value>,
     signature: Signature,
 }
 
@@ -152,6 +153,7 @@ async fn active_release(
         .ok_or_else(|| opaque(StatusCode::NOT_FOUND, "update target unavailable"))?;
     if entry.distribution != "home-node-updater"
         || entry.external.is_some()
+        || entry.metadata.is_some()
         || entry.signature.scheme != "tauri-minisign"
         || entry.signature.value.is_empty()
         || entry.signature.value.len() > 16 * 1024

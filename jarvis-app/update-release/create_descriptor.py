@@ -18,7 +18,7 @@ DESKTOP = (
 )
 
 
-def descriptor(assets: Path, version: str, released_at: str, ios_build_number: str) -> dict:
+def descriptor(assets: Path, version: str, released_at: str, android_version_code: int, ios_build_number: str) -> dict:
     if not SEMVER_RE.fullmatch(version):
         raise ValueError("version is not SemVer")
     artifacts = []
@@ -46,6 +46,7 @@ def descriptor(assets: Path, version: str, released_at: str, ios_build_number: s
         "distribution": "home-node-apk",
         "source": android,
         "published_path": f"releases/v{version}/android-universal/{android}",
+        "metadata": {"version_code": android_version_code},
         "signature": {"scheme": "android-apk-signing-certificate-sha256", "value": fingerprint},
     })
     artifacts.append({
@@ -73,10 +74,17 @@ def main() -> int:
     parser.add_argument("--version", required=True)
     parser.add_argument("--released-at", required=True)
     parser.add_argument("--ios-build-number", required=True)
+    parser.add_argument("--android-version-code", required=True, type=int)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     try:
-        value = descriptor(args.assets, args.version, args.released_at, args.ios_build_number)
+        value = descriptor(
+            args.assets,
+            args.version,
+            args.released_at,
+            args.android_version_code,
+            args.ios_build_number,
+        )
         args.output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     except (OSError, ValueError) as error:
         print(f"release descriptor failed: {error}", file=sys.stderr)
@@ -86,4 +94,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

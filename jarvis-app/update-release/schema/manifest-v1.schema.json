@@ -50,6 +50,14 @@
               "build_number": { "type": "string", "pattern": "^[1-9][0-9]*$" }
             }
           },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["version_code"],
+            "properties": {
+              "version_code": { "type": "integer", "minimum": 1 }
+            }
+          },
           "signature": {
             "type": "object",
             "additionalProperties": false,

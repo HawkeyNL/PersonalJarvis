@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 from build_manifest import build
 from manifest import ManifestError, validate_manifest
+from validate_previous_release import validate_progression
 
 
 def manifest(version: str = "1.2.3") -> dict:
@@ -39,6 +40,7 @@ def manifest(version: str = "1.2.3") -> dict:
             "size": 456,
         },
         "signature": {"scheme": "android-apk-signing-certificate-sha256", "value": "c" * 64},
+        "metadata": {"version_code": 12},
     })
     artifacts.append({
         "platform": "ios",
@@ -76,6 +78,23 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaises(ManifestError):
             validate_manifest(value)
 
+    def test_stable_channel_rejects_prerelease_versions(self) -> None:
+        with self.assertRaises(ManifestError):
+            validate_manifest(manifest("1.2.4-beta.1"))
+
+    def test_release_versions_must_all_advance(self) -> None:
+        previous = manifest()
+        validate_progression(previous, "1.2.4", 13, 18)
+        for version, android_code, ios_build in (
+            ("1.2.3", 13, 18),
+            ("1.2.4", 12, 18),
+            ("1.2.4", 13, 17),
+            ("1.2.4-beta.1", 13, 18),
+        ):
+            with self.subTest(version=version, android_code=android_code, ios_build=ios_build):
+                with self.assertRaises(ValueError):
+                    validate_progression(previous, version, android_code, ios_build)
+
     def test_builder_hashes_local_artifacts_and_inlines_signature(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -107,4 +126,3 @@ class ManifestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -84,6 +84,8 @@ def validate_manifest(document: Any, *, require_complete: bool = True) -> dict[s
         raise ManifestError("release.version is not SemVer")
     if release["channel"] not in ("stable", "beta", "development"):
         raise ManifestError("release.channel is invalid")
+    if release["channel"] == "stable" and ("-" in version or "+" in version):
+        raise ManifestError("stable release.version must be plain SemVer")
     released_at = _string(release["released_at"], "release.released_at", 64)
     try:
         parsed_time = datetime.fromisoformat(released_at.replace("Z", "+00:00"))
@@ -108,7 +110,7 @@ def validate_manifest(document: Any, *, require_complete: bool = True) -> dict[s
         _exact_keys(
             entry,
             {"platform", "architecture", "distribution", "signature"},
-            {"artifact", "external"},
+            {"artifact", "external", "metadata"},
             label,
         )
         platform = _string(entry["platform"], f"{label}.platform", 32)
@@ -146,7 +148,19 @@ def validate_manifest(document: Any, *, require_complete: bool = True) -> dict[s
                 raise ManifestError(f"{label}.artifact.sha256 is invalid")
             if not isinstance(artifact["size"], int) or isinstance(artifact["size"], bool) or artifact["size"] <= 0:
                 raise ManifestError(f"{label}.artifact.size is invalid")
+            if platform == "android":
+                metadata = entry.get("metadata")
+                if not isinstance(metadata, dict):
+                    raise ManifestError(f"{label}.metadata is required")
+                _exact_keys(metadata, {"version_code"}, set(), f"{label}.metadata")
+                version_code = metadata["version_code"]
+                if not isinstance(version_code, int) or isinstance(version_code, bool) or version_code < 1:
+                    raise ManifestError(f"{label}.metadata.version_code is invalid")
+            elif "metadata" in entry:
+                raise ManifestError(f"{label}.metadata is not allowed")
         else:
+            if "metadata" in entry:
+                raise ManifestError(f"{label}.metadata is not allowed")
             if "artifact" in entry or "external" not in entry:
                 raise ManifestError(f"{label} must use external distribution")
             external = entry["external"]
@@ -172,4 +186,3 @@ def mirrored_artifacts(document: dict[str, Any]) -> list[dict[str, Any]]:
 
     validate_manifest(document)
     return [entry for entry in document["artifacts"] if "artifact" in entry]
-

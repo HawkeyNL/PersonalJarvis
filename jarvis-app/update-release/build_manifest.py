@@ -48,6 +48,8 @@ def build(descriptor: dict[str, Any], base_dir: Path) -> dict[str, Any]:
         if "source" in signature:
             signature_value = (base_dir / signature["source"]).read_text(encoding="utf-8").strip()
         entry["signature"] = {"scheme": signature["scheme"], "value": signature_value}
+        if "metadata" in item:
+            entry["metadata"] = item["metadata"]
         if "source" in item:
             source = (base_dir / item["source"]).resolve()
             if not source.is_file():
@@ -86,4 +88,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

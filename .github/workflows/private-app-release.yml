@@ -67,9 +67,36 @@ jobs:
     timeout-minutes: 10
     environment: private-app-release
     env:
+      ANDROID_VERSION_CODE: ${{ inputs.android_version_code }}
+      APP_VERSION: ${{ inputs.version }}
       GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_REPO_TOKEN }}
+      IOS_BUILD_NUMBER: ${{ inputs.ios_build_number }}
       RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
     steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Enforce monotonic private release versions
+        run: |
+          test -n "$GH_TOKEN" || { echo "PRIVATE_RELEASE_REPO_TOKEN is required" >&2; exit 2; }
+          mkdir -p "$RUNNER_TEMP/previous"
+          previous_tag=$(gh release list \
+            --repo "$PRIVATE_RELEASE_REPO" \
+            --exclude-drafts \
+            --limit 1 \
+            --json tagName \
+            --jq '.[0].tagName // empty')
+          if [[ -n "$previous_tag" ]]; then
+            gh release download "$previous_tag" \
+              --repo "$PRIVATE_RELEASE_REPO" \
+              --pattern latest.json \
+              --dir "$RUNNER_TEMP/previous"
+            python3 jarvis-app/update-release/validate_previous_release.py \
+              --manifest "$RUNNER_TEMP/previous/latest.json" \
+              --version "$APP_VERSION" \
+              --android-version-code "$ANDROID_VERSION_CODE" \
+              --ios-build-number "$IOS_BUILD_NUMBER"
+          fi
       - name: Create or resume matching private draft
         env:
           SOURCE_REVISION: ${{ github.sha }}
@@ -334,8 +361,8 @@ jobs:
           plutil -insert signingStyle -string manual "$EXPORT_OPTIONS"
           plutil -insert teamID -string "$APPLE_TEAM_ID" "$EXPORT_OPTIONS"
           plutil -insert manageAppVersionAndBuildNumber -bool false "$EXPORT_OPTIONS"
-          plutil -insert provisioningProfiles -xml '<dict/>' "$EXPORT_OPTIONS"
-          plutil -insert provisioningProfiles.com.hawkeynl.jarvis -string "$JARVIS_PROFILE_NAME" "$EXPORT_OPTIONS"
+          /usr/libexec/PlistBuddy -c 'Add :provisioningProfiles dict' "$EXPORT_OPTIONS"
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:com.hawkeynl.jarvis string $JARVIS_PROFILE_NAME" "$EXPORT_OPTIONS"
           xcodebuild \
             -exportArchive \
             -archivePath "$RUNNER_TEMP/Jarvis.xcarchive" \
@@ -365,6 +392,7 @@ jobs:
     timeout-minutes: 15
     environment: private-app-release
     env:
+      ANDROID_VERSION_CODE: ${{ inputs.android_version_code }}
       APP_VERSION: ${{ inputs.version }}
       GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_REPO_TOKEN }}
       IOS_BUILD_NUMBER: ${{ inputs.ios_build_number }}
@@ -382,6 +410,7 @@ jobs:
             --assets "$RUNNER_TEMP/private-assets" \
             --version "$APP_VERSION" \
             --released-at "$RELEASED_AT" \
+            --android-version-code "$ANDROID_VERSION_CODE" \
             --ios-build-number "$IOS_BUILD_NUMBER" \
             --output "$RUNNER_TEMP/private-assets/descriptor.json"
           python3 jarvis-app/update-release/build_manifest.py \
