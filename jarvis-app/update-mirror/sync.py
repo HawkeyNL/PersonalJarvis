@@ -218,6 +218,8 @@ def _safe_config(path: Path) -> dict[str, Any]:
         scrubbed = template.replace("{{version}}", "version").replace("{{filename}}", "artifact").replace("{{path}}", "path")
         if "{{" in scrubbed or "}}" in scrubbed:
             raise SyncError("source.artifact_url_template contains an unsupported placeholder")
+        if _origin(source["manifest_url"]) != _origin(scrubbed):
+            raise SyncError("HTTP manifest and artifact URLs must use the same origin")
     else:
         raise SyncError("source.kind is unsupported")
     if document["channel"] != "stable":
@@ -292,6 +294,19 @@ def _download(response: BinaryIO, destination: Path, expected_hash: str, expecte
         raise SyncError("artifact hash or size does not match the manifest")
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as source:
+        os.fsync(source.fileno())
+
+
 def _version_key(name: str) -> tuple[int, int, int, str] | None:
     if not name.startswith("v"):
         return None
@@ -352,14 +367,26 @@ def _ensure_latest_manifest_link(root: Path) -> None:
     os.symlink(expected, temporary)
     try:
         os.replace(temporary, latest)
+        _fsync_directory(manifests)
     finally:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
 
 
+def _active_release_path(root: Path, releases: Path) -> Path | None:
+    try:
+        current = (root / "current").resolve(strict=True)
+    except OSError:
+        return None
+    if current.parent != releases.resolve() or not current.is_dir():
+        raise SyncError("the active release link is invalid")
+    return current
+
+
 def _activate(root: Path, version: str, staged_release: Path, manifest_bytes: bytes) -> None:
     releases = root / "releases"
     releases.mkdir(parents=True, exist_ok=True)
+    previous = _active_release_path(root, releases)
     destination = releases / f"v{version}"
     if destination.exists():
         existing_manifest = destination / "manifest.json"
@@ -368,18 +395,24 @@ def _activate(root: Path, version: str, staged_release: Path, manifest_bytes: by
         shutil.rmtree(staged_release)
     else:
         os.replace(staged_release, destination)
+        _fsync_directory(releases)
 
-    _ensure_latest_manifest_link(root)
+    # Retention happens while the previous generation is still active. A
+    # cleanup failure therefore cannot report failure after switching clients
+    # to the new release, and the retained rollback is the actual old current.
+    _apply_retention(root, destination, previous)
     temporary_link = root / f".current.{uuid.uuid4().hex}"
     os.symlink(PurePosixPath("releases", f"v{version}"), temporary_link)
     try:
         os.replace(temporary_link, root / "current")
+        _fsync_directory(root)
     finally:
         with contextlib.suppress(FileNotFoundError):
             temporary_link.unlink()
+    _ensure_latest_manifest_link(root)
 
 
-def _apply_retention(root: Path, current_version: str) -> None:
+def _apply_retention(root: Path, current: Path, previous: Path | None) -> None:
     releases = root / "releases"
     candidates: list[tuple[tuple[int, int, int, str], Path]] = []
     for child in releases.iterdir():
@@ -388,15 +421,30 @@ def _apply_retention(root: Path, current_version: str) -> None:
         key = _version_key(child.name)
         if key is not None and (child / "verified.json").is_file() and (child / "manifest.json").is_file():
             candidates.append((key, child))
-    candidates.sort(reverse=True)
-    current = releases / f"v{current_version}"
     keep = {current}
-    previous = next((path for _, path in candidates if path != current), None)
-    if previous is not None:
+    if previous is not None and previous != current:
         keep.add(previous)
+    elif previous == current:
+        # An idempotent sync of the active version must not discard its
+        # rollback generation. Under the retention invariant, the actual
+        # predecessor is the greatest verified version below current; a
+        # dormant newer generation from an earlier failed activation is never
+        # promoted to rollback status.
+        current_key = _version_key(current.name)
+        rollback = max(
+            (
+                (key, path)
+                for key, path in candidates
+                if path != current and current_key is not None and key < current_key
+            ),
+            default=None,
+        )
+        if rollback is not None:
+            keep.add(rollback[1])
     for _, path in candidates:
         if path not in keep:
             shutil.rmtree(path)
+    _fsync_directory(releases)
 
 
 def sync_release(
@@ -447,15 +495,19 @@ def sync_release(
             config["timeout_seconds"],
         )
         canonical = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-        (staged_release / "manifest.json").write_bytes(canonical)
+        manifest_path = staged_release / "manifest.json"
+        manifest_path.write_bytes(canonical)
         verification = {
             "schema_version": 1,
             "version": version,
             "manifest_sha256": hashlib.sha256(canonical).hexdigest(),
         }
-        (staged_release / "verified.json").write_text(json.dumps(verification, sort_keys=True) + "\n", encoding="utf-8")
+        verified_path = staged_release / "verified.json"
+        verified_path.write_text(json.dumps(verification, sort_keys=True) + "\n", encoding="utf-8")
+        _fsync_file(manifest_path)
+        _fsync_file(verified_path)
+        _fsync_directory(staged_release)
         _activate(root, version, staged_release, canonical)
-        _apply_retention(root, version)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return version

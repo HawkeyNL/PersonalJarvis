@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.request import Request
 
 MIRROR_ROOT = Path(__file__).resolve().parents[1]
@@ -14,7 +15,7 @@ RELEASE_ROOT = MIRROR_ROOT.parent / "update-release"
 sys.path.insert(0, str(MIRROR_ROOT))
 sys.path.insert(0, str(RELEASE_ROOT / "tests"))
 
-from sync import GitHubReleaseSource, SyncError, _SafeRedirectHandler, _verify_android_apk, sync_release
+from sync import GitHubReleaseSource, SyncError, _SafeRedirectHandler, _safe_config, _verify_android_apk, sync_release
 from test_manifest import manifest
 
 
@@ -155,6 +156,17 @@ class SafeRedirectTests(unittest.TestCase):
 
 
 class SyncTests(unittest.TestCase):
+    def test_http_template_uses_one_credential_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            value = config(root)
+            value["source"]["artifact_url_template"] = "https://cdn.invalid/{{path}}"
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(value), encoding="utf-8")
+            config_path.chmod(0o600)
+            with self.assertRaisesRegex(SyncError, "same origin"):
+                _safe_config(config_path)
+
     def test_private_github_adapter_resolves_assets_through_the_api(self) -> None:
         source = FakeGitHubSource()
         with source.open_manifest() as response:
@@ -195,6 +207,43 @@ class SyncTests(unittest.TestCase):
                 sync_release(config(root), source, accept_apk)
             releases = sorted(path.name for path in (root / "releases").iterdir())
             self.assertEqual(releases, ["v1.1.0", "v1.2.0"])
+
+    def test_retention_keeps_the_actual_previous_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, first = release_source("1.0.0")
+            sync_release(config(root), first, accept_apk)
+            dormant = root / "releases" / "v9.0.0"
+            dormant.mkdir()
+            (dormant / "manifest.json").write_text("{}", encoding="utf-8")
+            (dormant / "verified.json").write_text("{}", encoding="utf-8")
+            _, second = release_source("1.1.0")
+            sync_release(config(root), second, accept_apk)
+            releases = sorted(path.name for path in (root / "releases").iterdir())
+            self.assertEqual(releases, ["v1.0.0", "v1.1.0"])
+
+    def test_idempotent_sync_preserves_the_rollback_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, first = release_source("1.0.0")
+            sync_release(config(root), first, accept_apk)
+            _, second = release_source("1.1.0")
+            sync_release(config(root), second, accept_apk)
+            _, repeated = release_source("1.1.0")
+            sync_release(config(root), repeated, accept_apk)
+            releases = sorted(path.name for path in (root / "releases").iterdir())
+            self.assertEqual(releases, ["v1.0.0", "v1.1.0"])
+
+    def test_retention_failure_does_not_switch_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, first = release_source("1.0.0")
+            sync_release(config(root), first, accept_apk)
+            _, second = release_source("1.1.0")
+            with patch("sync._apply_retention", side_effect=OSError("cleanup failed")):
+                with self.assertRaises(OSError):
+                    sync_release(config(root), second, accept_apk)
+            self.assertEqual((root / "current").resolve(), root / "releases" / "v1.0.0")
 
     def test_android_signing_identity_change_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
