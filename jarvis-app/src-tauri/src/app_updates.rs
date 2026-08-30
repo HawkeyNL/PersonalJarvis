@@ -419,10 +419,7 @@ mod tests {
             "http://home.invalid/update.tar.gz",
         ] {
             let url = url::Url::parse(value).unwrap();
-            let candidate = normalize_home_node_origin(
-                &url.origin().ascii_serialization(),
-                false,
-            );
+            let candidate = normalize_home_node_origin(&url.origin().ascii_serialization(), false);
             assert!(candidate.is_err() || candidate.unwrap() != enrolled);
         }
     }
