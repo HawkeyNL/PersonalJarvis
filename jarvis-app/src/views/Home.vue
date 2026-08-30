@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from "vue";
-import { getJson, ApiError } from "../api";
+import { API_BASE, getJson, ApiError } from "../api";
 import { currentSession, login, clearSession, listDevices, PairingPending } from "../auth";
 import ReactorCore from "../components/ReactorCore.vue";
 import JarvisConsole from "../components/JarvisConsole.vue";
@@ -86,6 +86,9 @@ onBeforeUnmount(() => clearInterval(pollTimer));
     <p v-if="auth === 'wachten'" class="pairing-wait">
       Wacht op goedkeuring vanaf een vertrouwd Jarvis-apparaat.
     </p>
+    <p v-else-if="backend === 'fout'" class="connection-error" role="status">
+      Home Node niet bereikbaar op {{ API_BASE }}. Controleer het netwerk en probeer opnieuw.
+    </p>
     <!-- Floating conversation + hover-reveal input. -->
     <JarvisConsole />
   </section>
@@ -102,6 +105,18 @@ onBeforeUnmount(() => clearInterval(pollTimer));
   z-index: 1;
   margin: 2rem auto;
   max-width: 28rem;
+  text-align: center;
+}
+.connection-error {
+  position: relative;
+  z-index: 3;
+  width: min(34rem, calc(100% - 2rem));
+  margin: 1rem auto;
+  padding: 0.75rem 1rem;
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  border-radius: 0.75rem;
+  background: rgba(30, 8, 8, 0.78);
+  color: #fecaca;
   text-align: center;
 }
 

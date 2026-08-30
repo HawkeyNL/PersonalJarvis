@@ -4,12 +4,16 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "predev": "bash scripts/setup-wakeword.sh || true",
     "dev": "vite",
-    "prebuild": "bash scripts/setup-wakeword.sh || true",
-    "build": "vue-tsc --noEmit && vite build",
+    "check": "vue-tsc --noEmit && vite build",
+    "build": "npm run check",
     "preview": "vite preview",
     "setup-wakeword": "bash scripts/setup-wakeword.sh",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build",
+    "desktop:check:native": "cargo check --manifest-path src-tauri/Cargo.toml --locked",
+    "desktop:test:native": "cargo test --manifest-path src-tauri/Cargo.toml --locked",
+    "test:unit": "node --test tests/*.test.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

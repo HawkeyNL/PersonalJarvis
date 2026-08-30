@@ -41,10 +41,10 @@ function tick() {
   const p = (n: number) => String(n).padStart(2, "0");
   clock.value = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
-onMounted(() => {
+onMounted(async () => {
   tick();
   timer = window.setInterval(tick, 1000);
-  initLock();
+  await initLock();
   startApprovalPolling(); // this device can approve other devices' unlocks
   startPairingPolling();
   maybeStartWake(); // resume "Hey Jarvis" if it was enabled

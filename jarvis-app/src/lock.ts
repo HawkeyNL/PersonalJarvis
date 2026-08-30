@@ -8,15 +8,23 @@
 //
 // The lock is opt-in via a Settings toggle (off by default) so day-to-day
 // development isn't interrupted by prompts.
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { currentSession } from "./auth";
 import { getJsonAuth, postJsonAuth } from "./api";
+import {
+  initPlatformCapabilities,
+  isDesktop,
+  platformCapabilities,
+} from "./platform";
 
 export const locked = ref(false); // resolved by initLock()
 export const unlocking = ref(false);
 export const lockError = ref<string | null>(null);
-export const isDesktop = ref(false);
+export { isDesktop };
+export const supportsBiometrics = computed(
+  () => platformCapabilities.value.supportsBiometrics,
+);
 
 // Phone-approval state, for the lock screen to reflect.
 export const phoneWaiting = ref(false);
@@ -41,12 +49,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Decide whether this platform locks in-app (desktop yes, phone no). */
 export async function initLock(): Promise<void> {
-  try {
-    const info = await invoke<{ platform: string }>("device_info");
-    isDesktop.value = ["macos", "windows", "linux"].includes(info.platform);
-  } catch {
-    isDesktop.value = false;
-  }
+  await initPlatformCapabilities();
   const alreadyUnlocked = sessionStorage.getItem(SESSION_UNLOCKED) === "1";
   locked.value = isDesktop.value && lockEnabled.value && !alreadyUnlocked;
 }

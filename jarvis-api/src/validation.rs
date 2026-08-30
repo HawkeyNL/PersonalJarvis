@@ -1,9 +1,9 @@
 //! Request validation helpers for security-sensitive API inputs.
 
-pub const MAX_DEVICE_NAME_LEN: usize = 128;
-pub const MAX_PLATFORM_LEN: usize = 32;
-pub const ED25519_PUBLIC_KEY_HEX_LEN: usize = 64;
-pub const ED25519_SIGNATURE_HEX_LEN: usize = 128;
+pub use jarvis_client_core::{
+    ED25519_PUBLIC_KEY_HEX_LEN, ED25519_SIGNATURE_HEX_LEN, MAX_CHAT_CONTENT_LEN, MAX_CHAT_TURNS,
+    MAX_DEVICE_NAME_LEN, MAX_PLATFORM_LEN,
+};
 
 // Generous upper bounds on free-text inputs so a single request cannot ship an
 // unbounded string into the DB or an LLM prompt. Sized well above real use.
@@ -13,16 +13,13 @@ pub const MAX_FOCUS_LEN: usize = 500;
 pub const MAX_TASK_LEN: usize = 8_000;
 // Chat is the primary feature, so these are deliberately generous: they cap
 // abuse (and runaway token spend) without touching real conversations.
-pub const MAX_CHAT_TURNS: usize = 500;
-pub const MAX_CHAT_CONTENT_LEN: usize = 24_000;
 
 pub fn bounded_text(value: &str, max_len: usize) -> bool {
-    let trimmed = value.trim();
-    !trimmed.is_empty() && trimmed.len() <= max_len
+    jarvis_client_core::bounded_text(value, max_len)
 }
 
 pub fn is_hex_of_len(value: &str, len: usize) -> bool {
-    value.len() == len && value.bytes().all(|b| b.is_ascii_hexdigit())
+    jarvis_client_core::is_hex_of_len(value, len)
 }
 
 #[cfg(test)]

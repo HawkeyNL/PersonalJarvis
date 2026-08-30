@@ -35,8 +35,8 @@ export async function approvePairing(request: PairingRequest): Promise<void> {
   if (!session.token || !session.device_id) throw new Error("niet ingelogd");
   pairingError.value = null;
   try {
-    await invoke("biometric_unlock", { reason: `${request.device_name} koppelen`, allowPassword: true });
     const signature = await invoke<string>("auth_sign_pairing_approval", {
+      candidateName: request.device_name,
       requestId: request.id, nonceHex: request.nonce,
       candidatePublicKeyHex: request.candidate_public_key,
       userId: await ownerId(), approverDeviceId: session.device_id, expiresAt: request.expires_at,

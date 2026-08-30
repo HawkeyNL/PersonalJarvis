@@ -11,25 +11,20 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+pub(crate) use jarvis_client_core::ApprovalRequest as ApproveReq;
+use jarvis_client_core::{
+    ChallengeRequest as ChallengeReq, EnrollmentRequest as EnrollReq, LoginRequest as LoginReq,
+    PairingApproveRequest as PairingApproveReq,
+};
 use jarvis_identity as identity;
 
 use crate::audit::record_security_event;
 use crate::error::{bad_request, internal, unauthorized};
 use crate::validation;
 use crate::{AppState, Authed};
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct EnrollReq {
-    name: String,
-    platform: String,
-    /// Hex-encoded Ed25519 public key.
-    public_key: String,
-}
 
 /// Dev-only device enrollment: create the single user if needed and register
 /// the calling device with its public key. Disabled in production.
@@ -259,12 +254,6 @@ pub(crate) async fn pairing_status(
     Ok(Json(json!({ "status": status, "device_id": device_id })))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PairingApproveReq {
-    signature: String,
-}
-
 pub(crate) async fn pairing_approve(
     authed: Authed,
     State(state): State<AppState>,
@@ -328,12 +317,6 @@ pub(crate) async fn pairing_deny(
     Ok(Json(json!({ "status": "denied" })))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ChallengeReq {
-    device_id: Uuid,
-}
-
 /// Issue a login challenge (nonce) for a device.
 pub(crate) async fn auth_challenge(
     State(state): State<AppState>,
@@ -346,15 +329,6 @@ pub(crate) async fn auth_challenge(
         "challenge_id": challenge.id,
         "nonce": hex::encode(challenge.nonce),
     })))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct LoginReq {
-    device_id: Uuid,
-    challenge_id: Uuid,
-    /// Hex-encoded Ed25519 signature over the challenge nonce.
-    signature: String,
 }
 
 /// Verify a signed challenge and issue a session token.
@@ -524,13 +498,6 @@ pub(crate) async fn unlock_pending(
 
 /// A device-signed approval: a hex Ed25519 signature over a pending nonce. Shared
 /// by the unlock flow and the agent pending-action approval.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ApproveReq {
-    /// Hex-encoded Ed25519 signature over the request nonce.
-    pub(crate) signature: String,
-}
-
 /// Approve an unlock request by signing its nonce with this device's key.
 pub(crate) async fn unlock_approve(
     authed: Authed,

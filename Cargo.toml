@@ -4,6 +4,7 @@ members = [
     "jarvis-api",
     "jarvis-core",
     "crates/config",
+    "crates/client-core",
     "crates/observability",
     "crates/identity",
     "crates/portfolio",
@@ -85,6 +86,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"]
 
 # internal crates
 jarvis-config = { path = "crates/config" }
+jarvis-client-core = { path = "crates/client-core" }
 jarvis-observability = { path = "crates/observability" }
 jarvis-identity = { path = "crates/identity" }
 jarvis-portfolio = { path = "crates/portfolio" }

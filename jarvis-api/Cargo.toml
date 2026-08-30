@@ -32,6 +32,7 @@ hex.workspace = true
 uuid.workspace = true
 tracing.workspace = true
 jarvis-config.workspace = true
+jarvis-client-core.workspace = true
 jarvis-observability.workspace = true
 jarvis-identity.workspace = true
 jarvis-portfolio.workspace = true

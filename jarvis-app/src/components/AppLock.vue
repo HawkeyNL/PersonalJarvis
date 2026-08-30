@@ -8,13 +8,14 @@ import {
   phoneError,
   requestPhoneApproval,
   cancelPhoneApproval,
+  supportsBiometrics,
 } from "../lock";
 
 // Offer Touch ID immediately. If it fails or the machine has no biometric
 // hardware (e.g. a Mac without Touch ID), fall straight through to the phone
 // route rather than the desktop password.
 onMounted(async () => {
-  const ok = await biometricUnlock();
+  const ok = supportsBiometrics.value ? await biometricUnlock() : false;
   if (!ok) requestPhoneApproval();
 });
 </script>
@@ -29,7 +30,12 @@ onMounted(async () => {
       <h1>Jarvis is vergrendeld</h1>
       <p class="sub">Verifieer jezelf om verder te gaan.</p>
 
-      <button class="primary" :disabled="unlocking || phoneWaiting" @click="biometricUnlock">
+      <button
+        v-if="supportsBiometrics"
+        class="primary"
+        :disabled="unlocking || phoneWaiting"
+        @click="biometricUnlock"
+      >
         {{ unlocking ? "Even verifiëren…" : "Ontgrendel met Touch ID / Face ID" }}
       </button>
 
