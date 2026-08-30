@@ -35,7 +35,7 @@ mod state;
 mod validation;
 
 pub use extract::Authed;
-pub use state::AppState;
+pub use state::{AppState, AppUpdateMirror};
 // Compatibility re-export: persona ownership is in `jarvis-core`, while the
 // transport crate keeps this public helper available to existing callers.
 pub use jarvis_core::{load_persona, JARVIS_SYSTEM_FALLBACK};
@@ -45,6 +45,7 @@ use mcp::mcp_endpoint;
 use rate_limit::rate_limit_mw;
 pub use rate_limit::{AuthLimits, RateLimiter};
 use routes::agent::{agent_action, agent_pending, agent_pending_approve, agent_pending_deny};
+use routes::app_updates::{app_update_artifact, app_update_capability, app_update_check};
 use routes::auth::{
     auth_bootstrap, auth_challenge, auth_enroll, auth_login, auth_logout, auth_me, delete_device,
     list_devices, pairing_approve, pairing_create, pairing_deny, pairing_pending, pairing_status,
@@ -96,6 +97,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/unlock/{id}/deny", post(unlock_deny))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{id}", delete(delete_device))
+        .route("/v1/app-updates/capability", get(app_update_capability))
+        .route(
+            "/v1/app-updates/{channel}/{target}/{arch}/{current_version}",
+            get(app_update_check),
+        )
+        .route(
+            "/v1/app-updates/artifacts/{version}/{target}/{arch}/{filename}",
+            get(app_update_artifact),
+        )
         .route("/v1/holdings", get(get_holdings).post(add_holding))
         .route("/v1/holdings/{id}", delete(remove_holding))
         .route("/v1/broker/ibkr/status", get(ibkr_status))

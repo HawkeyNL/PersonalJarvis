@@ -4,6 +4,7 @@
 //! router can name them while keeping them off the public crate API.
 
 pub(crate) mod agent;
+pub(crate) mod app_updates;
 pub(crate) mod auth;
 pub(crate) mod broker;
 pub(crate) mod chat;
