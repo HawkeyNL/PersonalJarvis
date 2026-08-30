@@ -73,6 +73,8 @@ jobs:
       - name: Check dependency-exception expiry
         run: test "$(date -u +%F)" \< "2026-10-01"
       - run: cargo audit
+      - name: Audit desktop Tauri dependencies
+        run: cargo audit --file jarvis-app/src-tauri/Cargo.lock
 
   frontend:
     name: Jarvis app — typecheck and build
