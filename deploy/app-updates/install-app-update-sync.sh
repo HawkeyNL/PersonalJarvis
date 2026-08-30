@@ -36,4 +36,3 @@ fi
 systemctl daemon-reload
 echo "Application update sync installed but not enabled."
 echo "Review /etc/jarvis/app-updates/config.json.example, provision the private token separately, then enable the timer manually."
-
