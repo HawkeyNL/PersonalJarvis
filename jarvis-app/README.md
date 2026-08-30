@@ -125,6 +125,11 @@ belong to separate native/mobile milestones.
   Secret Service provider, then retry. Jarvis intentionally does not fall back
   to `auth.json`.
 - Wake detector reports model assets missing: run `npm run setup-wakeword`.
-- Home Node is unreachable: verify the configured `VITE_JARVIS_API_BASE` build
-  value, DNS/IP, TLS, and the app's Tauri HTTP capability allowlist. A runtime
-  connection-profile UI remains future work.
+- Home Node is unreachable: verify the per-device Home Node origin in Settings,
+  DNS/IP, and TLS. Release builds accept only credential-free HTTPS origins;
+  loopback HTTP is available solely in debug builds for explicit local testing.
+  The origin is ordinary local metadata and is reused after restart and device
+  re-enrollment; no Home Node address is embedded during the build.
+- Updates show incompatible: the active release requires a newer updater
+  protocol than this client understands. Keep using the installed app and use
+  an owner-reviewed compatible upgrade path.

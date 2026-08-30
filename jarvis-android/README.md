@@ -37,6 +37,15 @@ The protected release workflow publishes the signed APK only to private
 storage. See
 [`docs/app-updates/PRIVATE_RELEASES.md`](../docs/app-updates/PRIVATE_RELEASES.md).
 
+An authenticated app checks the active Home Node mirror with its installed
+`versionCode` and client protocol. A newer APK is streamed to app-private cache
+with redirects disabled, then checked for exact size, SHA-256, package id,
+`versionCode`, `versionName`, and the same signing certificate as the installed
+Jarvis app. Only then is it handed to Android's package installer. The user may
+need to grant Jarvis the per-app "install unknown apps" permission; Jarvis opens
+that system setting explicitly and never enables it automatically. iOS uses
+TestFlight and desktop uses Tauri updater signing; neither flow is reused here.
+
 ## Prerequisites
 
 - Android Studio Quail 2026.1.1 or newer;

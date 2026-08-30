@@ -10,8 +10,8 @@ Home Node.
 
 | Target | Build | Distribution | Update authority |
 | --- | --- | --- | --- |
-| Windows x86_64 | Tauri NSIS plus updater bundle | Home Node mirror | Tauri updater signature |
-| macOS arm64 | Tauri app/DMG plus updater bundle | Home Node mirror | Tauri updater signature |
+| Windows x86_64 | Tauri NSIS plus updater bundle | Home Node mirror | Tauri updater signature; Authenticode not yet configured |
+| macOS arm64 | Developer ID signed/notarized Tauri app/DMG plus updater bundle | Home Node mirror | Apple OS trust plus Tauri updater signature |
 | Ubuntu x86_64 | Tauri AppImage plus updater bundle | Home Node mirror | Tauri updater signature |
 | Android | Native signed APK and optional AAB | Home Node APK mirror | pinned Android signing certificate |
 | iOS arm64 | Native signed Xcode archive | App Store Connect/TestFlight | Apple code signing |
@@ -28,12 +28,27 @@ before installation. A compromised mirror therefore cannot replace a desktop
 package with an unsigned package. Android requires the same long-lived signing
 key on every release; the Home Node additionally pins its certificate SHA-256.
 
+macOS has two independent trust layers. Developer ID Application signing,
+hardened runtime, Apple notarization and stapling establish operating-system
+trust. The Tauri updater signature separately establishes that Jarvis approved
+the update payload. Notarization failure aborts the platform job before any
+macOS artifact is uploaded to the private draft. Windows artifacts currently
+have mandatory Tauri updater signatures but are not claimed to have
+Authenticode signatures; a future certificate provider can be added to the
+isolated Windows matrix leg without changing the manifest or Home Node flow.
+
 The protected GitHub environment `private-app-release` must require owner
 approval and contain only these release secrets:
 
 - `TAURI_SIGNING_PRIVATE_KEY`
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
 - `PRIVATE_RELEASE_REPO_TOKEN`, scoped to release contents in the private repo
+- `MACOS_DEVELOPER_ID_CERTIFICATE_P12_BASE64`
+- `MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD`
+- `MACOS_DEVELOPER_ID_APPLICATION`
+- `MACOS_NOTARY_API_ISSUER_ID`
+- `MACOS_NOTARY_API_KEY_ID`
+- `MACOS_NOTARY_API_PRIVATE_KEY_BASE64`
 - `ANDROID_RELEASE_KEYSTORE_BASE64`
 - `ANDROID_RELEASE_KEY_ALIAS`
 - `ANDROID_RELEASE_STORE_PASSWORD`
@@ -71,8 +86,8 @@ from installing an APK over the existing application.
 3. Approve the protected `private-app-release` environment.
 4. The workflow creates or resumes a source-revision-bound private draft,
    builds all platforms with locked Cargo/npm dependency state, signs them,
-   uploads the iOS archive to App Store Connect and stages every other artifact
-   in the private draft.
+   Developer ID-signs/notarizes/staples the macOS output, uploads the iOS archive
+   to App Store Connect and stages every other artifact in the private draft.
 5. Only after all platform jobs succeed does the final job create
    `latest.json`, publish the draft and mark it as the private latest release.
 
@@ -145,6 +160,11 @@ temporary staging directory. It atomically replaces `current` only after all
 checks succeed, then retains the active version and one previous verified
 version. Failure leaves `current` unchanged.
 
+Authenticated source redirects are restricted as well: only HTTPS targets are
+accepted, Authorization remains attached only for the exact same
+scheme/hostname/effective-port origin, and a redirect chain never restores a
+credential after an origin change.
+
 ## Authenticated client delivery
 
 Enable Core serving only after the mirror exists by setting both root-operated
@@ -161,11 +181,36 @@ HTTPS. `/v1/app-updates/**` requires the same enrolled-device bearer session as
 other protected Jarvis APIs. Artifact routes expose identifiers, never raw
 filesystem paths.
 
-After desktop authentication, the Tauri native layer derives and stores the
-update endpoint from the configured/enrolled Core origin. Checks and downloads
-attach the token in Rust. Vue receives only version, state and progress; it
-does not receive the update signature, endpoint or token. Offline, stale,
-corrupt and bad-signature failures leave the currently installed app usable.
+The desktop stores the enrolled Home Node origin at runtime as ordinary local
+metadata. Production accepts credential-free HTTPS only; loopback HTTP is an
+explicit debug-build option. There is no `VITE_JARVIS_API_BASE` release input
+or implicit production localhost fallback. All API requests resolve the active
+origin at call time.
+
+After authentication, Rust calls `GET /v1/app-updates/capability` with the
+OS-stored bearer token. Core returns a credential-free Tauri check template and
+the active release's `minimum_client_protocol`. The current desktop updater
+protocol is `1`; newer requirements are shown as incompatible and are never
+offered. Capability, artifact and redirect origins are bound to the exact
+enrolled origin before native Authorization is used. Vue receives only version,
+state, notes and progress; it does not receive the updater endpoint, signature
+or bearer token. A single delayed check runs after authenticated startup without
+blocking the app; download, installation and restart remain manual.
+
+Android does not use Tauri updater semantics. An enrolled device calls
+`GET /v1/app-updates/android/{versionCode}?client_protocol=1`; Core returns
+metadata only for a newer APK in the atomically active mirror generation.
+`GET /v1/app-updates/android/download` is authenticated and parameterless, so
+no filename or filesystem path can be selected by the client. The native app
+disables redirects, binds the URL to its enrolled origin, bounds the download,
+checks size/SHA-256/package/version and requires the APK certificate to equal
+both the installed Jarvis signer and the manifest signer before opening the
+Android package installer. Unknown-app installation permission is explained
+and opened explicitly; Jarvis never enables it silently.
+
+Offline, stale, corrupt, incompatible and bad-signature failures leave the
+currently installed desktop or Android app usable. iOS remains TestFlight-only
+and has no custom update endpoint or installer.
 
 ## Verification
 
