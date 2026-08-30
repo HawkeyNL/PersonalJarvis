@@ -8,6 +8,7 @@ on:
       - "jarvis-app/**"
       - "jarvis-ios/**"
       - "jarvis-android/**"
+      - "deploy/app-updates/**"
       - "crates/client-core/**"
       - "crates/identity/**"
       - "jarvis-api/**"
@@ -19,6 +20,7 @@ on:
       - "jarvis-app/**"
       - "jarvis-ios/**"
       - "jarvis-android/**"
+      - "deploy/app-updates/**"
       - "crates/client-core/**"
       - "crates/identity/**"
       - "jarvis-api/**"
@@ -77,6 +79,7 @@ jobs:
         run: |
           python3 -m unittest discover -s update-release/tests -v
           python3 -m unittest discover -s update-mirror/tests -v
+          bash ../deploy/app-updates/tests/test-app-update-assets.sh
 
   desktop-native:
     name: Desktop Tauri — ${{ matrix.name }}

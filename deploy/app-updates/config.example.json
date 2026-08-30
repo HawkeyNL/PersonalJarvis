@@ -1,14 +1,15 @@
 {
   "schema_version": 1,
   "source": {
-    "manifest_url": "https://private-artifacts.example.invalid/channels/stable/latest.json",
-    "artifact_url_template": "https://private-artifacts.example.invalid/releases/app-v{{version}}/{{filename}}",
+    "kind": "github-releases",
+    "repository": "OWNER/PRIVATE_REPO",
     "bearer_token_file": "/etc/jarvis/app-updates/private-release-token"
   },
   "mirror_root": "/var/lib/jarvis/app-updates",
   "channel": "stable",
   "retention_previous": 1,
   "android_signing_certificate_sha256": "replace-with-the-pinned-lowercase-APK-certificate-sha256",
+  "android_apksigner_path": "/usr/bin/apksigner",
   "timeout_seconds": 60,
   "max_artifact_bytes": 2147483648
 }
