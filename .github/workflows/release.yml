@@ -68,7 +68,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.20.0
+          cache: npm
+          cache-dependency-path: jarvis-core-admin/package-lock.json
       - uses: Swatinem/rust-cache@v2
+      - name: Install Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libayatana-appindicator3-dev libdbus-1-dev libssl-dev librsvg2-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev pkg-config
       - name: Record canonical builder
         run: |
           cat /etc/os-release
@@ -85,6 +96,13 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: sudo -n python3 scripts/ci/test-admin-tui-pty.py "dist/candidate/jarvis-core-$RELEASE_TAG/jarvis"
+      - name: Smoke test exact staged Core Admin App binary
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          candidate="dist/candidate/jarvis-core-$RELEASE_TAG"
+          test "$("$candidate/jarvis-core-admin" --component-version)" = \
+            "$(jq -r .components.core_admin "$candidate/release.json")"
       - name: Package tested candidate bytes
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -98,5 +116,7 @@ jobs:
           path: |
             dist/jarvis-core-${{ github.ref_name }}-linux-x86_64.tar.gz
             dist/jarvis-core-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
+            dist/jarvis-core-${{ github.ref_name }}-components.json
+            dist/jarvis-core-${{ github.ref_name }}-components.json.sha256
           if-no-files-found: error
           retention-days: 7

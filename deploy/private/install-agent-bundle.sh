@@ -52,8 +52,18 @@ done < <(find "$source_agents" -maxdepth 1 -type f -name '*.md' -print0 | LC_ALL
 
 manifest_entries=$(for file in "$stage"/agents/*.json; do
     hash=$(sha256sum "$file" | awk '{print $1}')
+    safe_metadata=$(jq -ec '
+        . as $agent
+        | ($agent.name | strings | select(length > 0 and length <= 80)) as $name
+        | ($agent.model_policy | strings | select(test("^(fast|utility|default|standard|strong|frontier|coding|trading|research)$"; "i"))) as $model_policy
+        | (($agent.group // null) | if . == null then null else strings | select(length > 0 and length <= 80) end) as $group
+        | {name:$name,group:$group,model_policy:$model_policy}
+    ' "$file") || fail "validated agent has unsafe presentation metadata"
     jq -n --arg id "${file##*/}" --arg path "agents/${file##*/}" --arg sha256 "$hash" \
-        '{id:($id | rtrimstr(".json")),path:$path,sha256:$sha256}'
+        --argjson metadata "$safe_metadata" \
+        '{id:($id | rtrimstr(".json")),path:$path,sha256:$sha256}
+         + $metadata
+         | with_entries(select(.value != null))'
 done | jq -s '.')
 bundle_hash=$(printf '%s' "$manifest_entries" | sha256sum | awk '{print $1}')
 bundle_id="bundle-${bundle_hash:0:16}"

@@ -113,6 +113,7 @@ jobs:
         run: |
           archive="jarvis-core-$RELEASE_TAG-linux-x86_64.tar.gz"
           checksum="$archive.sha256"
+          components="jarvis-core-$RELEASE_TAG-components.json"
           test -f "dist/$archive" && test ! -L "dist/$archive" || {
             echo "Candidate archive is missing or is not a regular file" >&2
             exit 1
@@ -130,6 +131,23 @@ jobs:
             exit 1
           }
           (cd dist && sha256sum --check --strict "$checksum")
+          test -f "dist/$components" && test ! -L "dist/$components" || {
+            echo "Candidate component manifest is missing or is not a regular file" >&2
+            exit 1
+          }
+          test -f "dist/$components.sha256" && test ! -L "dist/$components.sha256" || {
+            echo "Candidate component checksum is missing or is not a regular file" >&2
+            exit 1
+          }
+          test "$(wc -l <"dist/$components.sha256")" -eq 1 || {
+            echo "Candidate component checksum must contain exactly one entry" >&2
+            exit 1
+          }
+          grep -Eq "^[0-9a-f]{64}  $components$" "dist/$components.sha256" || {
+            echo "Candidate component checksum does not name the exact manifest" >&2
+            exit 1
+          }
+          (cd dist && sha256sum --check --strict "$components.sha256")
 
           release_json=$(tar -xOf "dist/$archive" "jarvis-core-$RELEASE_TAG/release.json")
           test "$(jq -r .tag <<<"$release_json")" = "$RELEASE_TAG" || {
@@ -142,6 +160,15 @@ jobs:
           }
           jq -e '.schema_sha256 | test("^[0-9a-f]{64}$")' <<<"$release_json" >/dev/null || {
             echo "Packaged release manifest has an invalid schema digest" >&2
+            exit 1
+          }
+          jq -e '.components | [.core, .cli, .core_admin] | all(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
+            <<<"$release_json" >/dev/null || {
+            echo "Packaged release manifest has invalid component versions" >&2
+            exit 1
+          }
+          cmp -s "dist/$components" <(jq '{tag, revision, components}' <<<"$release_json") || {
+            echo "Published component manifest does not match the accepted archive" >&2
             exit 1
           }
 
@@ -159,7 +186,9 @@ jobs:
           # The existing tag was resolved to the accepted revision above.
           # Supplying --target here would invoke GitHub's workflow-file write
           # guard for an older commit even though no tag is being created.
+          components="dist/jarvis-core-$RELEASE_TAG-components.json"
           gh release create "$RELEASE_TAG" "$archive" "$archive.sha256" \
+            "$components" "$components.sha256" \
             --verify-tag \
             --title "Jarvis Core $RELEASE_TAG" \
             --generate-notes

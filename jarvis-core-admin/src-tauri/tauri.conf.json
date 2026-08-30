@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Jarvis Core Administration",
+  "version": "0.1.0",
+  "identifier": "com.hawkeynl.jarvis.core.admin",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1430",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Jarvis Core Administration",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 900,
+        "minHeight": 620,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb"],
+    "category": "Utility",
+    "shortDescription": "Jarvis Home Node administration",
+    "longDescription": "A local graphical companion to the canonical Jarvis administration CLI.",
+    "icon": ["../../jarvis-app/src-tauri/icons/32x32.png", "../../jarvis-app/src-tauri/icons/128x128.png", "../../jarvis-app/src-tauri/icons/128x128@2x.png"]
+  }
+}

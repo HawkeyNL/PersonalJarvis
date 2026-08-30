@@ -75,6 +75,23 @@ jq -e --arg tag "$tag" '
     (.revision | strings | test("^[0-9a-f]{40}$")) and
     (.schema_sha256 | strings | test("^[0-9a-f]{64}$"))
 ' "$release_dir/release.json" >/dev/null || fail "release manifest does not bind this tag, revision and schema"
+if jq -e '.components? != null' "$release_dir/release.json" >/dev/null; then
+    jq -e '.components | [.core, .cli, .core_admin] | all(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
+        "$release_dir/release.json" >/dev/null || fail "release component versions are invalid"
+    [[ -x $release_dir/jarvis-core-admin && ! -L $release_dir/jarvis-core-admin ]] || \
+        fail "graphical administrator binary is invalid"
+    for app_file in jarvis-core-admin.desktop jarvis-core-admin.png jarvis-core-admin.version; do
+        [[ -f $release_dir/$app_file && ! -L $release_dir/$app_file ]] || \
+            fail "graphical administrator packaging is incomplete"
+    done
+    read -r packaged_app_version extra < "$release_dir/jarvis-core-admin.version" || \
+        fail "graphical administrator version file is invalid"
+    [[ -z ${extra:-} && $packaged_app_version == \
+        "$(jq -r '.components.core_admin' "$release_dir/release.json")" ]] || \
+        fail "graphical administrator version does not match release manifest"
+    [[ $("$release_dir/jarvis-core-admin" --component-version) == "$packaged_app_version" ]] || \
+        fail "graphical administrator executable version does not match release manifest"
+fi
 find "$release_dir" -xdev -type l -print -quit | grep -q . && fail "release contains a symlink"
 sha256sum "$staging/$artifact" > "$release_dir/release.verification"
 chown root:root "$release_dir/release.verification"

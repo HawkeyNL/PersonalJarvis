@@ -44,10 +44,20 @@ write_asset() {
     chmod 0755 "$asset/jarvis-core-$tag/jarvis-agent-bundle"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$asset/jarvis-core-$tag/jarvis"
     chmod 0755 "$asset/jarvis-core-$tag/jarvis"
+    printf '#!/usr/bin/env bash\n[[ ${1:-} == --component-version ]] && { printf "1.2.3\\n"; exit 0; }\nexit 0\n' \
+      > "$asset/jarvis-core-$tag/jarvis-core-admin"
+    chmod 0755 "$asset/jarvis-core-$tag/jarvis-core-admin"
+    printf '[Desktop Entry]\nType=Application\nName=Jarvis Core Administration\nExec=/usr/bin/jarvis-core-admin\n' \
+      > "$asset/jarvis-core-$tag/jarvis-core-admin.desktop"
+    printf 'synthetic png fixture\n' > "$asset/jarvis-core-$tag/jarvis-core-admin.png"
+    printf '1.2.3\n' > "$asset/jarvis-core-$tag/jarvis-core-admin.version"
+    chmod 0644 "$asset/jarvis-core-$tag/jarvis-core-admin.desktop" \
+      "$asset/jarvis-core-$tag/jarvis-core-admin.png" \
+      "$asset/jarvis-core-$tag/jarvis-core-admin.version"
     cp "$repo_dir/deploy/systemd/update-core-release.sh" "$asset/jarvis-core-$tag/update-core-release"
     chmod 0755 "$asset/jarvis-core-$tag/update-core-release"
     jq -n --arg tag "$manifest_tag" \
-      '{tag:$tag,revision:"0123456789abcdef0123456789abcdef01234567",schema_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
+      '{tag:$tag,revision:"0123456789abcdef0123456789abcdef01234567",schema_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",components:{core:"1.2.3",cli:"1.2.3",core_admin:"1.2.3"}}' \
       > "$asset/jarvis-core-$tag/release.json"
     tar -C "$asset" -czf "$fixture/$artifact" "jarvis-core-$tag"
     (cd "$fixture" && sha256sum "$artifact" > "$artifact.sha256")
@@ -62,6 +72,8 @@ write_asset v1.2.3 v1.2.3
 run_stage v1.2.3
 [[ -x /opt/jarvis/releases/v1.2.3/jarvis-api ]]
 [[ -x /opt/jarvis/releases/v1.2.3/jarvis ]]
+[[ -x /opt/jarvis/releases/v1.2.3/jarvis-core-admin ]]
+grep -qx '1.2.3' /opt/jarvis/releases/v1.2.3/jarvis-core-admin.version
 [[ -f /opt/jarvis/releases/v1.2.3/release.verification ]]
 [[ $(stat -c '%U:%G:%a' /opt/jarvis/releases/v1.2.3) == root:root:755 ]]
 

@@ -26,6 +26,8 @@ ALT_SCREEN_ENTER = b"\x1b[?1049h"
 ALT_SCREEN_LEAVE = b"\x1b[?1049l"
 CURSOR_SHOW = b"\x1b[?25h"
 PREVIEW_SCENARIOS = (
+    "home",
+    "home-degraded",
     "healthy-status",
     "degraded-status",
     "models",
@@ -196,6 +198,38 @@ def json_never_uses_tui(binary: Path, include_status: bool) -> None:
                 f"JSON {label} emitted alternate-screen control sequences"
             )
 
+    bare = subprocess.run(
+        [str(binary), "--json"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TERM": "xterm-256color"},
+    )
+    combined = bare.stdout + bare.stderr
+    if bare.returncode == 0 or b"explicit read-only Jarvis command" not in combined:
+        raise AssertionError(f"bare JSON did not fail safely: {combined!r}")
+    if ALT_SCREEN_ENTER in combined or ALT_SCREEN_LEAVE in combined:
+        raise AssertionError("bare JSON initialized an alternate-screen TUI")
+
+
+def bare_noninteractive_never_starts_tui(binary: Path) -> None:
+    result = subprocess.run(
+        [str(binary)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TERM": "xterm-256color"},
+    )
+    combined = result.stdout + result.stderr
+    if result.returncode == 0 or b"requires an explicit Jarvis command" not in combined:
+        raise AssertionError(f"bare non-interactive invocation did not fail safely: {combined!r}")
+    if ALT_SCREEN_ENTER in combined or ALT_SCREEN_LEAVE in combined:
+        raise AssertionError("bare non-interactive invocation initialized a TUI")
+
 
 def fixture_update_center_flow(binary: Path, fail_update: bool) -> None:
     master, slave = pty.openpty()
@@ -214,7 +248,7 @@ def fixture_update_center_flow(binary: Path, fail_update: bool) -> None:
     os.close(slave)
     output = bytearray()
     try:
-        wait_for_marker(master, process, output, b"Jarvis Update Center", "Update Center frame")
+        wait_for_marker(master, process, output, b"Update Center", "Update Center frame")
         if ALT_SCREEN_ENTER not in output:
             raise AssertionError("Update Center did not enter the alternate screen")
 
@@ -225,7 +259,7 @@ def fixture_update_center_flow(binary: Path, fail_update: bool) -> None:
                 master,
                 process,
                 output,
-                b"> Check for updates",
+                b"-check-complete",
                 "completed in-place update check",
             )
             if process.poll() is not None:
@@ -258,6 +292,252 @@ def fixture_update_center_flow(binary: Path, fail_update: bool) -> None:
             raise AssertionError("Update Center did not restore canonical input and echo")
         if ALT_SCREEN_LEAVE not in output or CURSOR_SHOW not in output:
             raise AssertionError("Update Center did not fully restore terminal state")
+    finally:
+        terminate_process_group(process)
+        os.close(master)
+
+
+def fixture_home_console_flow(binary: Path) -> None:
+    master, slave = pty.openpty()
+    set_size(master, 26, 100)
+    before = termios.tcgetattr(master)
+    process = subprocess.Popen(
+        [str(binary), "tui-preview", "home"],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+        start_new_session=True,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TERM": "xterm-256color"},
+    )
+    os.close(slave)
+    output = bytearray()
+    try:
+        wait_for_marker(master, process, output, b"Jarvis Home Node", "home console")
+        if output.count(ALT_SCREEN_ENTER) != 1:
+            raise AssertionError("home console did not start exactly one terminal lifecycle")
+
+        output.clear()
+        os.write(master, b"j\r")
+        wait_for_marker(master, process, output, b"Update Center", "embedded Update view")
+        if ALT_SCREEN_ENTER in output or ALT_SCREEN_LEAVE in output:
+            raise AssertionError("opening Update created a nested alternate-screen session")
+
+        output.clear()
+        os.write(master, b"\r")
+        wait_for_marker(
+            master,
+            process,
+            output,
+            b"-check-complete",
+            "embedded in-place update check",
+        )
+        if process.poll() is not None:
+            raise AssertionError("embedded update check closed the unified application")
+
+        output.clear()
+        os.write(master, b"\x1b")
+        wait_for_marker(master, process, output, b"fixture-bundle-2026-08-30", "return to Overview")
+
+        output.clear()
+        os.write(master, b"jj\r")
+        wait_for_marker(master, process, output, b"Run full verification", "Health view")
+        os.write(master, b"j\r")
+        wait_for_marker(master, process, output, b"completed", "quick persistent result")
+        if process.poll() is not None:
+            raise AssertionError("quick child completion closed the unified application")
+        time.sleep(0.5)
+        if process.poll() is not None:
+            raise AssertionError("result screen did not remain visible")
+        os.write(master, b"\r")
+
+        set_size(master, 18, 54)
+        time.sleep(0.2)
+        if process.poll() is not None:
+            raise AssertionError("unified application exited during resize")
+        output.clear()
+        os.write(master, b"\x1b")
+        wait_for_marker(master, process, output, b"fixture-bundle-2026-08-30", "resize return to Overview")
+        os.write(master, b"q")
+        process.wait(timeout=5)
+        output.extend(read_available(master, 0.5))
+        if process.returncode != 0:
+            raise AssertionError(f"home console failed to close: {bytes(output)!r}")
+        if output.count(ALT_SCREEN_ENTER) != 0 or output.count(ALT_SCREEN_LEAVE) != 1:
+            raise AssertionError("home console used an unexpected nested terminal lifecycle")
+        if CURSOR_SHOW not in output:
+            raise AssertionError("home console did not restore the cursor")
+        after = termios.tcgetattr(master)
+        restored_flags = termios.ICANON | termios.ECHO
+        if before[3] & restored_flags != after[3] & restored_flags:
+            raise AssertionError("home console did not restore canonical input and echo")
+    finally:
+        terminate_process_group(process)
+        os.close(master)
+
+
+def fixture_logs_flow(binary: Path) -> None:
+    master, slave = pty.openpty()
+    set_size(master, 22, 100)
+    before = termios.tcgetattr(master)
+    process = subprocess.Popen(
+        [str(binary), "tui-preview", "home"],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+        start_new_session=True,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TERM": "xterm-256color"},
+    )
+    os.close(slave)
+    output = bytearray()
+    try:
+        wait_for_marker(master, process, output, b"Jarvis Home Node", "home console")
+        output.clear()
+        os.write(master, b"jjjjjjj\r")
+        wait_for_marker(master, process, output, b"12:08:11", "compact JSON timestamp")
+        wait_for_marker(master, process, output, b"starting jarvis-api", "compact JSON message")
+        wait_for_marker(master, process, output, b"13:07:31", "systemd timestamp")
+        wait_for_marker(master, process, output, b"stopping jarvis-core.service", "systemd log")
+        wait_for_marker(master, process, output, b"WRAPPED-LOG-END", "wide wrapped log tail")
+        if b"jarvis-home-fixture" in output:
+            raise AssertionError("Logs view repeated the local hostname")
+        if b"fixture-must-never-render" in output:
+            raise AssertionError("Logs view rendered a non-whitelisted structured field")
+
+        output.clear()
+        os.write(master, b"\x1b[F")
+        time.sleep(0.2)
+        output.extend(read_available(master, 0.3))
+        if not output:
+            raise AssertionError("Logs view did not redraw after End")
+        if process.poll() is not None:
+            raise AssertionError("Logs view exited while scrolling to End")
+
+        output.clear()
+        os.write(master, b"\x1b[H")
+        time.sleep(0.2)
+        output.extend(read_available(master, 0.3))
+        if not output or process.poll() is not None:
+            raise AssertionError("Logs view failed while scrolling to Home")
+        set_size(master, 18, 54)
+        output.clear()
+        time.sleep(0.3)
+        output.extend(read_available(master, 0.3))
+        if not output:
+            raise AssertionError("Logs view did not redraw after narrow resize")
+        if process.poll() is not None:
+            raise AssertionError("Logs view exited during narrow resize/reflow")
+
+        os.write(master, b"\x1b[6~\x1b[A\x1b[B")
+        time.sleep(0.2)
+        if process.poll() is not None:
+            raise AssertionError("Logs view exited during visual-row scrolling")
+
+        output.clear()
+        os.write(master, b"f")
+        time.sleep(0.2)
+        output.extend(read_available(master, 0.2))
+        if not output or process.poll() is not None:
+            raise AssertionError("Logs fixture follow mode did not remain active")
+        output.clear()
+        os.write(master, b"f")
+        time.sleep(0.2)
+        output.extend(read_available(master, 0.2))
+        if not output or process.poll() is not None:
+            raise AssertionError("Logs fixture follow mode did not stop safely")
+        output.clear()
+        os.write(master, b"r")
+        time.sleep(0.2)
+        output.extend(read_available(master, 0.3))
+        if not output or process.poll() is not None:
+            raise AssertionError("Logs fixture refresh did not redraw safely")
+
+        output.clear()
+        os.write(master, b"\x1b")
+        wait_for_marker(master, process, output, b"fixture-bundle-2026-08-30", "Logs back")
+        output.clear()
+        os.write(master, b"q")
+        process.wait(timeout=5)
+        output.extend(read_available(master, 0.5))
+        if process.returncode != 0:
+            raise AssertionError(f"Logs view failed to close: {bytes(output)!r}")
+        if ALT_SCREEN_LEAVE not in output or CURSOR_SHOW not in output:
+            raise AssertionError("Logs view did not fully restore terminal state")
+        after = termios.tcgetattr(master)
+        restored_flags = termios.ICANON | termios.ECHO
+        if before[3] & restored_flags != after[3] & restored_flags:
+            raise AssertionError("Logs view did not restore canonical input and echo")
+    finally:
+        terminate_process_group(process)
+        os.close(master)
+
+
+def fixture_agents_flow(binary: Path) -> None:
+    master, slave = pty.openpty()
+    set_size(master, 22, 100)
+    before = termios.tcgetattr(master)
+    process = subprocess.Popen(
+        [str(binary), "tui-preview", "home"],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+        start_new_session=True,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TERM": "xterm-256color"},
+    )
+    os.close(slave)
+    output = bytearray()
+    try:
+        wait_for_marker(master, process, output, b"Jarvis Home Node", "home console")
+        output.clear()
+        os.write(master, b"jjjj\r")
+        wait_for_marker(master, process, output, b"Active bundle tree", "Agents tree")
+        wait_for_marker(master, process, output, b"Trading", "agent group")
+        wait_for_marker(master, process, output, b"Crypto", "safe agent metadata")
+
+        os.write(master, b"c")
+        time.sleep(0.2)
+        if process.poll() is not None:
+            raise AssertionError("Agents view exited while collapsing the tree")
+        os.write(master, b"e\x1b[F")
+        time.sleep(0.2)
+        if process.poll() is not None:
+            raise AssertionError("Agents view exited during large-tree scrolling")
+
+        set_size(master, 18, 50)
+        time.sleep(0.25)
+        if process.poll() is not None:
+            raise AssertionError("Agents view exited during narrow resize")
+
+        output.clear()
+        os.write(master, b"c\x1b[H\rj\r")
+        wait_for_marker(master, process, output, b"Fixture Agent", "safe agent detail")
+        if b"Jarvis.md" in output or b"instructions" in output or b"credential" in output:
+            raise AssertionError("Agents view exposed protected or secret-bearing content")
+        os.write(master, b"\r")
+
+        output.clear()
+        os.write(master, b"r")
+        time.sleep(0.2)
+        output.extend(read_available(master, 0.3))
+        if not output or process.poll() is not None:
+            raise AssertionError("Agents refresh did not preserve the persistent view")
+
+        output.clear()
+        os.write(master, b"\x1b")
+        wait_for_marker(master, process, output, b"fixture-bundle-2026-08-30", "Agents back")
+        os.write(master, b"q")
+        process.wait(timeout=5)
+        output.extend(read_available(master, 0.5))
+        if process.returncode != 0:
+            raise AssertionError(f"Agents view failed to close: {bytes(output)!r}")
+        if ALT_SCREEN_LEAVE not in output or CURSOR_SHOW not in output:
+            raise AssertionError("Agents view did not fully restore terminal state")
+        after = termios.tcgetattr(master)
+        restored_flags = termios.ICANON | termios.ECHO
+        if before[3] & restored_flags != after[3] & restored_flags:
+            raise AssertionError("Agents view did not restore canonical input and echo")
     finally:
         terminate_process_group(process)
         os.close(master)
@@ -320,9 +600,14 @@ def main() -> int:
             exit_bytes,
         )
     if args.fixture_preview:
+        fixture_home_console_flow(binary)
+        fixture_logs_flow(binary)
+        fixture_agents_flow(binary)
         fixture_update_center_flow(binary, fail_update=False)
         fixture_update_center_flow(binary, fail_update=True)
         fixture_inline_check_never_uses_tui(binary)
+    else:
+        bare_noninteractive_never_starts_tui(binary)
     json_never_uses_tui(binary, include_status=not args.fixture_preview)
     print(f"Jarvis PTY smoke passed for exact binary: {binary}")
     return 0

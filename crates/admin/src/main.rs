@@ -4,7 +4,7 @@
 //! evaluates owner input as a shell command and it is not exposed by the API.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, IsTerminal, Read, Write},
@@ -34,6 +34,8 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 
+mod tui_app;
+
 const RELEASES_ROOT: &str = "/opt/jarvis/releases";
 const CURRENT_RELEASE: &str = "/opt/jarvis/current";
 const LIBEXEC: &str = "/usr/local/libexec/jarvis";
@@ -53,7 +55,7 @@ struct Cli {
     #[arg(long, global = true)]
     tui_trace: bool,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -82,13 +84,15 @@ enum Commands {
 #[cfg(feature = "tui-preview")]
 #[derive(Debug, Args)]
 struct TuiPreviewArgs {
-    #[arg(value_enum, default_value_t = TuiPreviewScenario::HealthyStatus)]
+    #[arg(value_enum, default_value_t = TuiPreviewScenario::Home)]
     scenario: TuiPreviewScenario,
 }
 
 #[cfg(feature = "tui-preview")]
 #[derive(Clone, Debug, ValueEnum)]
 enum TuiPreviewScenario {
+    Home,
+    HomeDegraded,
     HealthyStatus,
     DegradedStatus,
     Models,
@@ -113,7 +117,7 @@ struct LogsArgs {
     follow: bool,
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum LogTarget {
     Core,
     Surrealdb,
@@ -271,7 +275,7 @@ enum ServicesCommand {
     Status,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct StatusReport {
     release: Option<String>,
     services: BTreeMap<&'static str, String>,
@@ -279,10 +283,44 @@ struct StatusReport {
     agent_bundle: Option<AgentBundle>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct AgentBundle {
     id: String,
     agent_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentTreeSnapshot {
+    bundle_id: String,
+    agents: Vec<AgentTreeAgent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentTreeAgent {
+    id: String,
+    name: String,
+    group: Option<String>,
+    model_policy: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SafeAgentManifest {
+    version: u32,
+    bundle_id: String,
+    agents: Vec<SafeAgentManifestEntry>,
+}
+
+#[derive(Deserialize)]
+struct SafeAgentManifestEntry {
+    id: String,
+    path: String,
+    sha256: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    model_policy: Option<String>,
 }
 
 fn main() {
@@ -294,11 +332,11 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    if matches!(cli.command, Commands::TerminalDiagnostics) {
+    if matches!(cli.command, Some(Commands::TerminalDiagnostics)) {
         return terminal_diagnostics(cli.json);
     }
     #[cfg(feature = "tui-preview")]
-    if let Commands::TuiPreview(args) = &cli.command {
+    if let Some(Commands::TuiPreview(args)) = &cli.command {
         if cli.json {
             bail!("fixture TUI preview does not support --json");
         }
@@ -307,9 +345,18 @@ fn run() -> Result<()> {
         }
         return tui_preview(&args.scenario, cli.tui_trace);
     }
+    if cli.command.is_none() && cli.json {
+        bail!("bare --json requires an explicit read-only Jarvis command");
+    }
     require_root()?;
     let presentation = Presentation::new(cli.json, cli.tui_trace);
-    match cli.command {
+    let Some(command) = cli.command else {
+        if presentation.interactive && io::stdin().is_terminal() {
+            return tui_app::run_live(tui_app::AppView::Overview, presentation.tui_trace);
+        }
+        bail!("non-interactive use requires an explicit Jarvis command");
+    };
+    match command {
         Commands::Version => version(&presentation),
         Commands::TerminalDiagnostics => unreachable!("handled before root-only commands"),
         Commands::Status => status(&presentation),
@@ -503,27 +550,86 @@ fn terminal_diagnostics(json: bool) -> Result<()> {
 }
 
 fn version(presentation: &Presentation) -> Result<()> {
-    let report = serde_json::json!({"admin_version": env!("CARGO_PKG_VERSION"), "active_core": active_release()?});
+    let (core_version, manifest_cli_version, manifest_app_version) = active_component_versions()?;
+    let installed_app_version = fs::read_to_string("/usr/share/jarvis-core-admin/version")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| valid_component_version(value));
+    let active_release = active_release()?;
+    let report = serde_json::json!({
+        "admin_version": env!("CARGO_PKG_VERSION"),
+        "active_core": active_release,
+        "active_release": active_release,
+        "core_version": core_version,
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        "manifest_cli_version": manifest_cli_version,
+        "core_admin_app_version": installed_app_version,
+        "manifest_core_admin_app_version": manifest_app_version,
+    });
     if presentation.json {
         println!("{}", serde_json::to_string(&report)?);
     } else {
-        println!("Jarvis admin CLI: {}", env!("CARGO_PKG_VERSION"));
         println!(
-            "Active Core:      {}",
-            report["active_core"].as_str().unwrap_or("unavailable")
+            "Jarvis Core:      {}",
+            report["core_version"].as_str().unwrap_or("unavailable")
+        );
+        println!(
+            "Jarvis admin CLI: {}",
+            report["cli_version"].as_str().unwrap_or("unavailable")
+        );
+        println!(
+            "Core Admin App:   {}",
+            report["core_admin_app_version"]
+                .as_str()
+                .unwrap_or("not installed")
+        );
+        println!(
+            "Active release:   {}",
+            report["active_release"].as_str().unwrap_or("unavailable")
         );
     }
     Ok(())
 }
 
+fn active_component_versions() -> Result<(Option<String>, Option<String>, Option<String>)> {
+    let target = fs::canonicalize(CURRENT_RELEASE).ok();
+    let Some(target) = target else {
+        return Ok((None, None, None));
+    };
+    if !target.starts_with(RELEASES_ROOT) {
+        bail!("active release is outside the managed release root");
+    }
+    let data = fs::read_to_string(target.join("release.json"))
+        .context("read active release component versions")?;
+    let manifest = serde_json::from_str::<serde_json::Value>(&data)?;
+    let component = |name: &str| {
+        manifest
+            .get("components")
+            .and_then(|components| components.get(name))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| valid_component_version(value))
+            .map(str::to_owned)
+    };
+    Ok((component("core"), component("cli"), component("core_admin")))
+}
+
+fn valid_component_version(value: &str) -> bool {
+    let mut parts = value.split('.');
+    (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && parts.next().is_none()
+}
+
 fn status(presentation: &Presentation) -> Result<()> {
+    if !presentation.json && presentation.interactive && io::stdin().is_terminal() {
+        return tui_app::run_live(tui_app::AppView::Overview, presentation.tui_trace);
+    }
     let report = status_report()?;
     if presentation.json {
         println!("{}", serde_json::to_string(&report)?);
         return Ok(());
-    }
-    if presentation.interactive && io::stdin().is_terminal() {
-        return status_tui(&report, presentation.tui_trace);
     }
     presentation.intro("Jarvis Home Node");
     println!(
@@ -678,6 +784,7 @@ impl TuiTrace {
     }
 }
 
+#[cfg(feature = "tui-preview")]
 fn status_tui(report: &StatusReport, trace_enabled: bool) -> Result<()> {
     // `ratatui::run` installs restoration/panic handling around the alternate
     // screen.  Business state is computed before this call, so no privileged
@@ -713,6 +820,7 @@ fn status_tui(report: &StatusReport, trace_enabled: bool) -> Result<()> {
     result.map(|_| ()).map_err(Into::into)
 }
 
+#[cfg(any(feature = "tui-preview", test))]
 fn render_status_dashboard(frame: &mut ratatui::Frame, report: &StatusReport) {
     let area = frame.area();
     let outer = Block::default()
@@ -779,6 +887,7 @@ fn render_status_dashboard(frame: &mut ratatui::Frame, report: &StatusReport) {
     );
 }
 
+#[cfg(any(feature = "tui-preview", test))]
 fn render_compact_status(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
@@ -867,6 +976,12 @@ fn tui_preview(scenario: &TuiPreviewScenario, trace_enabled: bool) -> Result<()>
         }),
     };
     match scenario {
+        TuiPreviewScenario::Home => {
+            tui_app::run_fixture(tui_app::AppView::Overview, trace_enabled, false)
+        }
+        TuiPreviewScenario::HomeDegraded => {
+            tui_app::run_fixture(tui_app::AppView::Overview, trace_enabled, true)
+        }
         TuiPreviewScenario::HealthyStatus => status_tui(&healthy_status(), trace_enabled),
         TuiPreviewScenario::DegradedStatus => {
             let mut report = healthy_status();
@@ -911,18 +1026,12 @@ fn tui_preview(scenario: &TuiPreviewScenario, trace_enabled: bool) -> Result<()>
             vec![vec!["fixture-bundle-2026-08-29".to_owned(), "7".to_owned()]],
             trace_enabled,
         ),
-        TuiPreviewScenario::UpdateCenter => update_center_tui(
-            trace_enabled,
-            Some(FixtureUpdateMode {
-                fail_mutations: false,
-            }),
-        ),
-        TuiPreviewScenario::UpdateCenterFailure => update_center_tui(
-            trace_enabled,
-            Some(FixtureUpdateMode {
-                fail_mutations: true,
-            }),
-        ),
+        TuiPreviewScenario::UpdateCenter => {
+            tui_app::run_fixture(tui_app::AppView::Update, trace_enabled, false)
+        }
+        TuiPreviewScenario::UpdateCenterFailure => {
+            tui_app::run_fixture(tui_app::AppView::Update, trace_enabled, true)
+        }
         TuiPreviewScenario::UpdateCheckInline => {
             println!("Current:  v0.0.15");
             println!("Latest:   v0.0.16");
@@ -1048,7 +1157,110 @@ fn active_bundle() -> Result<Option<AgentBundle>> {
     }))
 }
 
+/// Read only the bounded, non-secret manifest projection used by the Agents
+/// view. Agent JSON files are deliberately never opened here because they
+/// contain private instructions.
+fn active_agent_tree() -> Result<Option<AgentTreeSnapshot>> {
+    let target = fs::canonicalize("/var/lib/jarvis/agents/current").ok();
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let releases = Path::new("/var/lib/jarvis/agents/releases");
+    if !target.starts_with(releases) {
+        bail!("active agent bundle is outside the managed release root");
+    }
+    let manifest_path = target.join("manifest.json");
+    let metadata = fs::symlink_metadata(&manifest_path).context("inspect active agent manifest")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1_048_576 {
+        bail!("active agent manifest is unsafe or too large");
+    }
+    let data = fs::read(&manifest_path).context("read active agent manifest")?;
+    let expected_bundle = target
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("active agent bundle name is invalid")?;
+    Ok(Some(parse_safe_agent_manifest(&data, expected_bundle)?))
+}
+
+fn parse_safe_agent_manifest(data: &[u8], expected_bundle: &str) -> Result<AgentTreeSnapshot> {
+    let manifest: SafeAgentManifest =
+        serde_json::from_slice(data).context("parse active agent manifest")?;
+    if manifest.version != 1
+        || !safe_agent_id(&manifest.bundle_id)
+        || manifest.bundle_id != expected_bundle
+        || manifest.agents.is_empty()
+        || manifest.agents.len() > 512
+    {
+        bail!("active agent manifest metadata is invalid");
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut agents = Vec::with_capacity(manifest.agents.len());
+    for entry in manifest.agents {
+        if !safe_agent_id(&entry.id)
+            || !seen.insert(entry.id.clone())
+            || entry.path != format!("agents/{}.json", entry.id)
+            || entry.sha256.len() != 64
+            || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || entry
+                .name
+                .as_deref()
+                .is_some_and(|value| !safe_agent_label(value))
+            || entry
+                .group
+                .as_deref()
+                .is_some_and(|value| !safe_agent_label(value))
+            || entry.model_policy.as_deref().is_some_and(|value| {
+                !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "fast"
+                        | "utility"
+                        | "default"
+                        | "standard"
+                        | "strong"
+                        | "frontier"
+                        | "coding"
+                        | "trading"
+                        | "research"
+                )
+            })
+        {
+            bail!("active agent manifest contains unsafe presentation metadata");
+        }
+        agents.push(AgentTreeAgent {
+            name: entry.name.unwrap_or_else(|| entry.id.clone()),
+            id: entry.id,
+            group: entry.group,
+            model_policy: entry.model_policy,
+        });
+    }
+    Ok(AgentTreeSnapshot {
+        bundle_id: manifest.bundle_id,
+        agents,
+    })
+}
+
+fn safe_agent_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn safe_agent_label(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.chars().count() <= 80
+        && value
+            .chars()
+            .all(|character| !character.is_control() && character != '\u{1b}')
+}
+
 fn health(presentation: &Presentation, verbose: bool) -> Result<()> {
+    if !presentation.json && presentation.interactive && io::stdin().is_terminal() && !verbose {
+        return tui_app::run_live(tui_app::AppView::Health, presentation.tui_trace);
+    }
     if presentation.json {
         let mut command = trusted_command(Path::new(LIBEXEC).join("verify-home-node"));
         let output = command
@@ -1089,7 +1301,11 @@ fn health(presentation: &Presentation, verbose: bool) -> Result<()> {
 }
 
 fn services(presentation: &Presentation) -> Result<()> {
-    status(presentation)
+    if !presentation.json && presentation.interactive && io::stdin().is_terminal() {
+        tui_app::run_live(tui_app::AppView::Services, presentation.tui_trace)
+    } else {
+        status(presentation)
+    }
 }
 
 fn logs(args: LogsArgs, presentation: &Presentation) -> Result<()> {
@@ -1152,7 +1368,7 @@ fn update(args: UpdateArgs, presentation: &Presentation, verbose: bool) -> Resul
             bail!("--json update requires an explicit read-only --check or --status operation");
         }
         if presentation.interactive && io::stdin().is_terminal() {
-            return update_center_tui(presentation.tui_trace, None);
+            return tui_app::run_live(tui_app::AppView::Update, presentation.tui_trace);
         }
         bail!(
             "non-interactive update requires --check, --status, --latest, --version, or --rollback"
@@ -1269,6 +1485,12 @@ struct UpdateSummary {
     previous: Option<String>,
     updater: Option<String>,
     update_available: Option<bool>,
+    core_current: Option<String>,
+    core_latest: Option<String>,
+    cli_current: Option<String>,
+    cli_latest: Option<String>,
+    core_app_current: Option<String>,
+    core_app_latest: Option<String>,
 }
 
 impl UpdateSummary {
@@ -1279,6 +1501,12 @@ impl UpdateSummary {
             ("latest", &mut self.latest),
             ("previous", &mut self.previous),
             ("updater", &mut self.updater),
+            ("core_current", &mut self.core_current),
+            ("core_latest", &mut self.core_latest),
+            ("cli_current", &mut self.cli_current),
+            ("cli_latest", &mut self.cli_latest),
+            ("core_app_current", &mut self.core_app_current),
+            ("core_app_latest", &mut self.core_app_latest),
         ] {
             if let Some(value) = values.get(key) {
                 *destination = (value != "unavailable").then(|| value.clone());
@@ -1499,7 +1727,7 @@ fn forward_child_lines<R: Read + Send + 'static>(
     })
 }
 
-fn push_bounded(lines: &mut VecDeque<String>, line: String, capacity: usize) {
+fn push_bounded<T>(lines: &mut VecDeque<T>, line: T, capacity: usize) {
     if lines.len() == capacity {
         lines.pop_front();
     }
@@ -1560,7 +1788,7 @@ impl UpdateCenter {
         Ok(center)
     }
 
-    #[cfg(feature = "tui-preview")]
+    #[cfg(any(feature = "tui-preview", test))]
     fn fixture(fail_mutations: bool) -> Self {
         let mut center = Self::base(Some(FixtureUpdateMode { fail_mutations }));
         center.summary = UpdateSummary {
@@ -1569,6 +1797,12 @@ impl UpdateCenter {
             previous: Some("v0.0.14".to_owned()),
             updater: Some("enabled".to_owned()),
             update_available: Some(true),
+            core_current: Some("0.1.0".to_owned()),
+            core_latest: Some("0.1.0".to_owned()),
+            cli_current: Some("0.1.0".to_owned()),
+            cli_latest: Some("0.1.0".to_owned()),
+            core_app_current: Some("0.1.0".to_owned()),
+            core_app_latest: Some("0.2.0".to_owned()),
         };
         center.last_result = Some("Fixture data only · no administrative capability".to_owned());
         center
@@ -1755,7 +1989,8 @@ impl UpdateCenter {
                 self.screen = UpdateScreen::Overview;
             }
             UpdateOperation::Check => {
-                self.last_result = Some("Update available: v0.0.16".to_owned());
+                self.last_result =
+                    Some("Fixture-check-complete · update available: v0.0.16".to_owned());
                 self.screen = UpdateScreen::Overview;
             }
             UpdateOperation::Candidates => {
@@ -1980,133 +2215,6 @@ impl UpdateCenter {
         }
         Ok(None)
     }
-}
-
-fn update_center_tui(trace_enabled: bool, fixture: Option<FixtureUpdateMode>) -> Result<()> {
-    let mut center = if let Some(fixture) = fixture {
-        #[cfg(feature = "tui-preview")]
-        {
-            UpdateCenter::fixture(fixture.fail_mutations)
-        }
-        #[cfg(not(feature = "tui-preview"))]
-        {
-            let _ = fixture;
-            unreachable!("fixture Update Center is unavailable in production")
-        }
-    } else {
-        UpdateCenter::live()?
-    };
-    let mut trace = TuiTrace::new(trace_enabled);
-    let mut first_frame = true;
-    let mut last_screen = None;
-    let result = ratatui::run(|terminal| -> io::Result<TuiExitReason> {
-        trace.record("Update Center application closure entered");
-        loop {
-            center
-                .tick()
-                .map_err(|error| io::Error::other(format!("Update Center state: {error:#}")))?;
-            if last_screen != Some(center.screen) {
-                let size = trace.io("terminal.size", terminal.size())?;
-                trace.io("terminal.resize", terminal.resize(size.into()))?;
-                last_screen = Some(center.screen);
-            }
-            let draw = terminal
-                .draw(|frame| render_update_center(frame, &center))
-                .map(|_| ());
-            trace.io("terminal.draw", draw)?;
-            if first_frame {
-                trace.record("first Update Center frame drawn");
-                first_frame = false;
-            }
-            let ready = trace.io("event.poll", event::poll(Duration::from_millis(100)))?;
-            if ready {
-                let event = trace.io("event.read", event::read())?;
-                trace.record_event(&event);
-                if let Some(reason) = center
-                    .handle_event(event)
-                    .map_err(|error| io::Error::other(format!("Update Center input: {error:#}")))?
-                {
-                    return Ok(reason);
-                }
-            }
-        }
-    });
-    center.terminate_active();
-    let reason = result.as_ref().ok().copied();
-    trace.finish("update-center", &result, reason, true);
-    result.map(|_| ()).map_err(Into::into)
-}
-
-fn render_update_center(frame: &mut ratatui::Frame, center: &UpdateCenter) {
-    let area = frame.area();
-    let outer = Block::default()
-        .title(" Jarvis Update Center · ↑/↓ or j/k · Enter · q/Esc ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-
-    let summary_lines = vec![
-        Line::from(format!(
-            "Current active release: {}",
-            center.summary.current.as_deref().unwrap_or("loading…")
-        )),
-        Line::from(format!(
-            "Latest stable release: {}",
-            center.summary.latest.as_deref().unwrap_or("loading…")
-        )),
-        Line::from(format!(
-            "Update available: {}",
-            match center.summary.update_available {
-                Some(true) => "yes",
-                Some(false) => "no",
-                None => "unknown",
-            }
-        )),
-        Line::from(format!(
-            "Updater timer: {}",
-            center.summary.updater.as_deref().unwrap_or("loading…")
-        )),
-        Line::from(format!(
-            "Rollback release: {}",
-            center.summary.previous.as_deref().unwrap_or("unavailable")
-        )),
-        Line::from(format!(
-            "Last result: {}",
-            center
-                .last_result
-                .as_deref()
-                .unwrap_or("none in this session")
-        )),
-    ];
-    if inner.height < 15 || inner.width < 48 {
-        let mut lines = summary_lines;
-        lines.push(Line::from(""));
-        lines.extend(update_screen_lines(center));
-        frame.render_widget(Paragraph::new(lines), inner);
-        return;
-    }
-    let sections = Layout::vertical([
-        Constraint::Length(7),
-        Constraint::Min(5),
-        Constraint::Length(2),
-    ])
-    .split(inner);
-    frame.render_widget(
-        Paragraph::new(summary_lines).block(Block::default().borders(Borders::BOTTOM)),
-        sections[0],
-    );
-    frame.render_widget(Paragraph::new(update_screen_lines(center)), sections[1]);
-    let footer = if center.running_mutation() {
-        "Trusted mutation running · cancellation disabled during transactional activation"
-    } else {
-        "Esc: back/close · q: close · Ctrl-C: close"
-    };
-    frame.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
-        sections[2],
-    );
 }
 
 fn update_screen_lines(center: &UpdateCenter) -> Vec<Line<'static>> {
@@ -2500,7 +2608,7 @@ struct ModelPolicy {
     models: Vec<ModelRecord>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ModelRecord {
     provider: String,
     model: String,
@@ -3062,6 +3170,16 @@ mod tests {
         assert!(Cli::try_parse_from(["jarvis", "shell"]).is_err());
     }
     #[test]
+    fn bare_cli_and_bare_json_have_no_implicit_command() {
+        let bare = Cli::try_parse_from(["jarvis"]).unwrap();
+        assert!(bare.command.is_none());
+        assert!(!bare.json);
+
+        let json = Cli::try_parse_from(["jarvis", "--json"]).unwrap();
+        assert!(json.command.is_none());
+        assert!(json.json);
+    }
+    #[test]
     fn clap_bounds_log_lines() {
         assert!(Cli::try_parse_from(["jarvis", "logs", "core", "--lines", "0"]).is_err());
     }
@@ -3073,19 +3191,19 @@ mod tests {
     #[test]
     fn bare_update_is_a_center_but_explicit_modes_are_not() {
         let bare = Cli::try_parse_from(["jarvis", "update"]).unwrap();
-        let Commands::Update(bare) = bare.command else {
+        let Some(Commands::Update(bare)) = bare.command else {
             panic!("expected update command");
         };
         assert_eq!(UpdateInvocation::from_args(&bare), UpdateInvocation::Center);
 
         let check = Cli::try_parse_from(["jarvis", "update", "--check"]).unwrap();
-        let Commands::Update(check) = check.command else {
+        let Some(Commands::Update(check)) = check.command else {
             panic!("expected update command");
         };
         assert_eq!(UpdateInvocation::from_args(&check), UpdateInvocation::Check);
 
         let latest = Cli::try_parse_from(["jarvis", "update", "--latest"]).unwrap();
-        let Commands::Update(latest) = latest.command else {
+        let Some(Commands::Update(latest)) = latest.command else {
             panic!("expected update command");
         };
         assert_eq!(
@@ -3281,11 +3399,15 @@ mod tests {
     #[test]
     fn updater_plain_status_has_strict_json_conversion() {
         let values = parse_key_value_output(
-            "Current:  v0.0.13\nPrevious: v0.0.12\nLatest: v0.0.14\nUpdater: enabled\n",
+            "Current:  v0.0.13\nPrevious: v0.0.12\nLatest: v0.0.14\nCore current: 0.1.0\nCore latest: 0.1.1\nCLI current: 0.1.0\nCLI latest: 0.1.0\nCore app current: 0.1.0\nCore app latest: 0.2.0\nUpdater: enabled\n",
         )
         .unwrap();
         assert_eq!(values.get("current").map(String::as_str), Some("v0.0.13"));
         assert_eq!(values.get("previous").map(String::as_str), Some("v0.0.12"));
+        assert_eq!(
+            values.get("core_app_latest").map(String::as_str),
+            Some("0.2.0")
+        );
         assert!(parse_key_value_output("not structured\n").is_err());
         assert!(parse_key_value_output("Current: one\nCurrent: two\n").is_err());
     }
@@ -3302,6 +3424,13 @@ mod tests {
         assert_eq!(summary.previous.as_deref(), Some("v0.0.14"));
         assert_eq!(summary.update_available, Some(true));
         summary
+            .merge_helper_output(
+                "Current: v0.0.15\nLatest: v0.0.16\nCore current: 0.1.0\nCore latest: 0.1.0\nCLI current: 0.1.0\nCLI latest: 0.1.0\nCore app current: 0.1.0\nCore app latest: 0.2.0\nUpdate: available\n",
+            )
+            .unwrap();
+        assert_eq!(summary.core_app_current.as_deref(), Some("0.1.0"));
+        assert_eq!(summary.core_app_latest.as_deref(), Some("0.2.0"));
+        summary
             .merge_helper_output("Current: v0.0.16\nLatest: v0.0.16\nUpdate: not available\n")
             .unwrap();
         assert_eq!(summary.update_available, Some(false));
@@ -3310,6 +3439,9 @@ mod tests {
 
     #[test]
     fn release_version_comparison_is_strict() {
+        assert!(valid_component_version("0.1.0"));
+        assert!(!valid_component_version("v0.1.0"));
+        assert!(!valid_component_version("0.1.0;id"));
         assert!(release_is_newer("v0.0.16", "v0.0.15"));
         assert!(release_is_newer("v1.0.0", "v0.99.99"));
         assert!(!release_is_newer("v0.0.15", "v0.0.15"));
@@ -3336,7 +3468,9 @@ mod tests {
         let backend = TestBackend::new(44, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_update_center(frame, &center))
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(update_screen_lines(&center)), frame.area());
+            })
             .unwrap();
         let rendered = terminal
             .backend()
@@ -3345,7 +3479,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Current active release"));
+        assert!(rendered.contains("Rollback candidates"));
         assert!(rendered.contains("v0.0.10"));
         assert!(!rendered.contains("credential"));
         assert!(!rendered.contains("api_key"));
@@ -3419,6 +3553,43 @@ mod tests {
         let output = serde_json::to_string(&policy).unwrap();
         assert!(!output.contains("credential"));
         assert!(!output.contains("api_key"));
+    }
+
+    #[test]
+    fn agent_tree_manifest_projection_ignores_private_or_unknown_fields() {
+        let manifest = br#"{
+            "version":1,
+            "bundle_id":"bundle-fixture",
+            "agents":[{
+                "id":"research",
+                "path":"agents/research.json",
+                "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "name":"Research",
+                "group":"Development",
+                "model_policy":"research",
+                "instructions":"fixture-must-never-render",
+                "api_key":"fixture-secret"
+            }]
+        }"#;
+        let tree = parse_safe_agent_manifest(manifest, "bundle-fixture").unwrap();
+        assert_eq!(tree.agents[0].group.as_deref(), Some("Development"));
+        assert_eq!(tree.agents[0].name, "Research");
+        let retained = format!("{tree:?}");
+        assert!(!retained.contains("fixture-must-never-render"));
+        assert!(!retained.contains("fixture-secret"));
+
+        let legacy = br#"{
+            "version":1,
+            "bundle_id":"bundle-fixture",
+            "agents":[{
+                "id":"research",
+                "path":"agents/research.json",
+                "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        }"#;
+        let legacy_tree = parse_safe_agent_manifest(legacy, "bundle-fixture").unwrap();
+        assert_eq!(legacy_tree.agents[0].name, "research");
+        assert_eq!(legacy_tree.agents[0].group, None);
     }
 
     #[test]

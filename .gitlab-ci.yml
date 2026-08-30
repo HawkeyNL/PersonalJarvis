@@ -1,0 +1,85 @@
+stages:
+  - validate
+  - package
+
+variables:
+  DEBIAN_FRONTEND: noninteractive
+  NODE_VERSION: "24.20.0"
+  NODE_ARCHIVE_SHA256: "2f2c0da162318f0de47665410c7c8c2ed3d36c8f3105de4bbc61176c70a7cbf2"
+  RUST_VERSION: "1.97.1"
+  CARGO_HOME: "$CI_PROJECT_DIR/.gitlab-cargo"
+  npm_config_cache: "$CI_PROJECT_DIR/.gitlab-npm"
+
+.core-admin-ubuntu:
+  image: ubuntu:26.04
+  before_script:
+    - apt-get update
+    - >-
+      apt-get install -y --no-install-recommends
+      build-essential ca-certificates curl file jq libayatana-appindicator3-dev
+      libdbus-1-dev libssl-dev librsvg2-dev libwebkit2gtk-4.1-dev libxdo-dev
+      pkg-config wget xz-utils
+    - curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.tar.xz
+    - echo "${NODE_ARCHIVE_SHA256}  /tmp/node.tar.xz" | sha256sum --check --strict
+    - tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
+    - curl --fail --silent --show-error --proto '=https' --tlsv1.2 https://sh.rustup.rs -o /tmp/rustup-init.sh
+    - sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "$RUST_VERSION"
+    - export PATH="$CARGO_HOME/bin:/usr/local/bin:/usr/bin:/bin"
+    - rustc --version
+    - cargo --version
+    - node --version
+    - npm --version
+  cache:
+    key:
+      files:
+        - jarvis-core-admin/package-lock.json
+        - jarvis-core-admin/src-tauri/Cargo.lock
+    paths:
+      - .gitlab-cargo/registry/
+      - .gitlab-cargo/git/
+      - .gitlab-npm/
+
+core-admin-validate:
+  extends: .core-admin-ubuntu
+  stage: validate
+  script:
+    - export PATH="$CARGO_HOME/bin:/usr/local/bin:/usr/bin:/bin"
+    - bash jarvis-core-admin/scripts/verify-versions.sh
+    - npm ci --prefix jarvis-core-admin
+    - npm run build --prefix jarvis-core-admin
+    - cargo fmt --manifest-path jarvis-core-admin/src-tauri/Cargo.toml --all -- --check
+    - cargo clippy --manifest-path jarvis-core-admin/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+    - cargo test --manifest-path jarvis-core-admin/src-tauri/Cargo.toml --all-features
+    - npm audit --prefix jarvis-core-admin --audit-level=high
+    - cargo install cargo-audit --locked
+    - cargo audit --file jarvis-core-admin/src-tauri/Cargo.lock
+    - bash deploy/private/tests/test-public-release-boundary.sh
+  rules:
+    - changes:
+        - .gitlab-ci.yml
+        - jarvis-core-admin/**/*
+        - scripts/release/build-linux.sh
+        - deploy/systemd/update-core-release.sh
+
+core-admin-deb:
+  extends: .core-admin-ubuntu
+  stage: package
+  needs: [core-admin-validate]
+  script:
+    - export PATH="$CARGO_HOME/bin:/usr/local/bin:/usr/bin:/bin"
+    - npm ci --prefix jarvis-core-admin
+    - npm run tauri:build --prefix jarvis-core-admin
+    - package=$(find jarvis-core-admin/src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print -quit)
+    - test -n "$package"
+    - test "$(dpkg-deb --field "$package" Version)" = "$(jq -r .version jarvis-core-admin/package.json)"
+  artifacts:
+    name: "jarvis-core-admin-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - jarvis-core-admin/src-tauri/target/release/bundle/deb/*.deb
+    expire_in: 14 days
+  rules:
+    - changes:
+        - .gitlab-ci.yml
+        - jarvis-core-admin/**/*
+        - scripts/release/build-linux.sh
+        - deploy/systemd/update-core-release.sh

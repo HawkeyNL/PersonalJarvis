@@ -9,6 +9,7 @@ publish_workflow="$repo_dir/.github/workflows/publish-release.yml"
 release_builder="$repo_dir/scripts/release/build-linux.sh"
 stage_release="$repo_dir/deploy/systemd/stage-core-release.sh"
 update_release="$repo_dir/deploy/systemd/update-core-release.sh"
+gitlab_ci="$repo_dir/.gitlab-ci.yml"
 
 fail() {
     echo "public release boundary: $*" >&2
@@ -40,6 +41,15 @@ require_literal "$release_workflow" \
 require_literal "$release_builder" \
     'install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update-core-release"' \
     "canonical release builder must stage update-core-release.sh as update-core-release"
+require_literal "$release_builder" \
+    'install -m 0755 "$release_target_dir/release/jarvis-core-admin" "$temporary_release/jarvis-core-admin"' \
+    "canonical release builder must stage the exact Core Admin App binary"
+require_literal "$release_builder" \
+    'components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}' \
+    "release manifest must expose separate Core, CLI, and Core Admin App versions"
+require_literal "$gitlab_ci" \
+    'npm run tauri:build --prefix jarvis-core-admin' \
+    "GitLab CI must build the Ubuntu Core Admin App package"
 reject_pattern "$release_workflow" 'gh release create' \
     "candidate workflow must not publish before real Home Node acceptance"
 require_literal "$publish_workflow" \
@@ -62,7 +72,7 @@ reject_pattern "$publish_workflow" '^[[:space:]]+--target ' \
 
 # These files build, transfer or publish the public release artifact. None may
 # acquire a private checkout, persona, or agent-content path.
-for packaging_file in "$release_workflow" "$publish_workflow" "$release_builder"; do
+for packaging_file in "$release_workflow" "$publish_workflow" "$release_builder" "$gitlab_ci"; do
     reject_pattern "$packaging_file" 'Jarvis\.md' \
         "$packaging_file must not package the protected Jarvis.md persona"
     reject_pattern "$packaging_file" 'PersonalJarvisAgents' \
