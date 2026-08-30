@@ -9,6 +9,10 @@ The Home Node remains authoritative for identity enrollment, policy, chat, and
 device revocation. The desktop app owns only its device key, session, local
 preferences, and presentation.
 
+Private signed desktop releases, the authenticated Home Node mirror and updater
+operations are documented in
+[`docs/app-updates/PRIVATE_RELEASES.md`](../docs/app-updates/PRIVATE_RELEASES.md).
+
 ## Common commands
 
 Run these commands from this directory:

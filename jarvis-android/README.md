@@ -24,6 +24,19 @@ The current client provides:
 Voice, wake word, notifications, background sync and Home Node discovery are not
 part of this milestone.
 
+## Private releases
+
+Release APK/AAB builds require the stable owner-managed keystore through the
+`JARVIS_ANDROID_KEYSTORE_PATH`, `JARVIS_ANDROID_KEY_ALIAS`,
+`JARVIS_ANDROID_STORE_PASSWORD` and `JARVIS_ANDROID_KEY_PASSWORD` environment
+variables. `JARVIS_APP_VERSION` supplies `versionName` and
+`JARVIS_ANDROID_VERSION_CODE` must increase for each release. Gradle refuses
+`assembleRelease` and `bundleRelease` when signing is not configured.
+
+The protected release workflow publishes the signed APK only to private
+storage. See
+[`docs/app-updates/PRIVATE_RELEASES.md`](../docs/app-updates/PRIVATE_RELEASES.md).
+
 ## Prerequisites
 
 - Android Studio Quail 2026.1.1 or newer;

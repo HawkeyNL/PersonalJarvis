@@ -20,6 +20,18 @@ testing the app lock. A real device must have biometrics or a device passcode
 configured. Use a Home Node certificate trusted by the device for HTTPS. Local
 `http` is intended only for LAN development; ATS is not globally disabled.
 
+## TestFlight releases
+
+Jarvis iOS uses Apple's native signing and App Store Connect/TestFlight. It has
+no Home Node self-updater. The protected release workflow imports an ephemeral
+distribution certificate and provisioning profile, archives with the requested
+marketing/build versions, uploads with an App Store Connect API key and removes
+the signing material afterward. Certificates, profiles and API credentials are
+never stored in this repository.
+
+See [`docs/app-updates/PRIVATE_RELEASES.md`](../docs/app-updates/PRIVATE_RELEASES.md)
+for the complete private release boundary.
+
 Command-line simulator validation on macOS:
 
 ```sh
