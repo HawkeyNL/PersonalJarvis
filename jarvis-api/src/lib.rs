@@ -45,7 +45,10 @@ use mcp::mcp_endpoint;
 use rate_limit::rate_limit_mw;
 pub use rate_limit::{AuthLimits, RateLimiter};
 use routes::agent::{agent_action, agent_pending, agent_pending_approve, agent_pending_deny};
-use routes::app_updates::{app_update_artifact, app_update_capability, app_update_check};
+use routes::app_updates::{
+    android_update_check, android_update_download, app_update_artifact, app_update_capability,
+    app_update_check,
+};
 use routes::auth::{
     auth_bootstrap, auth_challenge, auth_enroll, auth_login, auth_logout, auth_me, delete_device,
     list_devices, pairing_approve, pairing_create, pairing_deny, pairing_pending, pairing_status,
@@ -98,6 +101,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{id}", delete(delete_device))
         .route("/v1/app-updates/capability", get(app_update_capability))
+        .route(
+            "/v1/app-updates/android/{current_version_code}",
+            get(android_update_check),
+        )
+        .route(
+            "/v1/app-updates/android/download",
+            get(android_update_download),
+        )
         .route(
             "/v1/app-updates/{channel}/{target}/{arch}/{current_version}",
             get(app_update_check),

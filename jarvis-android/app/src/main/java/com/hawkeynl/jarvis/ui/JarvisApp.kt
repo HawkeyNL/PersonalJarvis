@@ -45,6 +45,7 @@ fun JarvisApp(
     state: JarvisUiState,
     actions: JarvisViewModel,
     onRequestBiometric: () -> Unit,
+    onInstallUpdate: () -> Unit,
 ) {
     when {
         state.locked -> AppLockScreen(
@@ -53,7 +54,7 @@ fun JarvisApp(
             onReset = actions::resetDevice,
         )
         state.endpoint == null || !state.authenticated -> OnboardingScreen(state, actions)
-        else -> AuthenticatedShell(state, actions)
+        else -> AuthenticatedShell(state, actions, onInstallUpdate)
     }
 }
 
@@ -141,7 +142,11 @@ private fun OnboardingScreen(state: JarvisUiState, actions: JarvisViewModel) {
 }
 
 @Composable
-private fun AuthenticatedShell(state: JarvisUiState, actions: JarvisViewModel) {
+private fun AuthenticatedShell(
+    state: JarvisUiState,
+    actions: JarvisViewModel,
+    onInstallUpdate: () -> Unit,
+) {
     Scaffold(
         bottomBar = {
             NavigationBar(modifier = Modifier.testTag("bottom-navigation")) {
@@ -166,7 +171,7 @@ private fun AuthenticatedShell(state: JarvisUiState, actions: JarvisViewModel) {
             when (state.selectedTab) {
                 AppTab.CHAT -> ChatScreen(state, actions)
                 AppTab.CONVERSATIONS -> ConversationsScreen(state, actions)
-                AppTab.SETTINGS -> SettingsScreen(state, actions)
+                AppTab.SETTINGS -> SettingsScreen(state, actions, onInstallUpdate)
             }
         }
     }
@@ -285,7 +290,11 @@ private fun ConversationsScreen(state: JarvisUiState, actions: JarvisViewModel) 
 }
 
 @Composable
-private fun SettingsScreen(state: JarvisUiState, actions: JarvisViewModel) {
+private fun SettingsScreen(
+    state: JarvisUiState,
+    actions: JarvisViewModel,
+    onInstallUpdate: () -> Unit,
+) {
     LazyColumn(
         modifier = Modifier.fillMaxSize().imePadding().testTag("settings"),
         contentPadding = PaddingValues(16.dp),
@@ -308,6 +317,43 @@ private fun SettingsScreen(state: JarvisUiState, actions: JarvisViewModel) {
             }
         }
         item { ConnectionLine(state.connection) }
+        item {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Jarvis Android", style = MaterialTheme.typography.titleMedium)
+                    when (val update = state.appUpdate) {
+                        AndroidUpdateUiState.Idle -> Text("Update nog niet gecontroleerd")
+                        AndroidUpdateUiState.Checking -> Text("Update controleren…")
+                        AndroidUpdateUiState.Current -> Text("App is bijgewerkt")
+                        is AndroidUpdateUiState.Available -> {
+                            Text("Versie ${update.metadata.version_name} is beschikbaar")
+                            Button(onClick = actions::downloadUpdate) { Text("Download update") }
+                        }
+                        AndroidUpdateUiState.Downloading -> Text("APK downloaden en controleren…")
+                        is AndroidUpdateUiState.Ready -> {
+                            Text("Versie ${update.versionName} is gecontroleerd en klaar voor installatie")
+                            Button(onClick = onInstallUpdate) { Text("Open Android-installatie") }
+                        }
+                        AndroidUpdateUiState.PermissionRequired -> Text(
+                            "Geef Jarvis in Android-instellingen toestemming om deze gecontroleerde APK te installeren en probeer opnieuw.",
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        is AndroidUpdateUiState.Failed -> Text(
+                            update.message,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = actions::checkForUpdate,
+                        enabled = state.appUpdate !is AndroidUpdateUiState.Checking &&
+                        state.appUpdate !is AndroidUpdateUiState.Downloading,
+                    ) { Text("Opnieuw controleren") }
+                    if (state.appUpdate is AndroidUpdateUiState.PermissionRequired) {
+                        Button(onClick = onInstallUpdate) { Text("Installatie opnieuw openen") }
+                    }
+                }
+            }
+        }
         item { Spacer(Modifier.height(8.dp)) }
         item { OutlinedButton(onClick = actions::logout) { Text("Uitloggen") } }
         item { OutlinedButton(onClick = actions::resetDevice) { Text("Apparaat wissen en opnieuw koppelen") } }

@@ -9,6 +9,7 @@ import com.hawkeynl.jarvis.security.KeystoreBackedEd25519Identity
 import com.hawkeynl.jarvis.storage.AndroidKeystoreSecureValueStore
 import com.hawkeynl.jarvis.storage.EndpointSettingsRepository
 import com.hawkeynl.jarvis.storage.SessionRepository
+import com.hawkeynl.jarvis.update.AndroidUpdateService
 
 class JarvisApplication : Application() {
     val container: AppContainer by lazy { AppContainer(this) }
@@ -22,5 +23,6 @@ class AppContainer(application: Application) {
     val api = KtorJarvisApi()
     val enrollment = EnrollmentService(api, identity, sessions)
     val conversations = ConversationService(api, sessions)
+    val appUpdates = AndroidUpdateService(application, api, sessions)
     val biometricGate = BiometricGate()
 }

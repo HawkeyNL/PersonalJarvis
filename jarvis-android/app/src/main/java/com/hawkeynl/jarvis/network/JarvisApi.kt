@@ -1,5 +1,7 @@
 package com.hawkeynl.jarvis.network
 
+import java.io.File
+
 interface JarvisApi {
     suspend fun ready(endpoint: HomeNodeEndpoint): ApiResult<HealthResponse>
     suspend fun createPairing(
@@ -45,4 +47,18 @@ interface JarvisApi {
         token: String,
         request: ChatRequest,
     ): ApiResult<ChatResponse>
+
+    suspend fun androidUpdate(
+        endpoint: HomeNodeEndpoint,
+        token: String,
+        currentVersionCode: Int,
+        clientProtocol: Int,
+    ): ApiResult<AndroidUpdateMetadata?>
+
+    suspend fun downloadAndroidUpdate(
+        endpoint: HomeNodeEndpoint,
+        token: String,
+        destination: File,
+        expectedSize: Long,
+    ): ApiResult<Unit>
 }

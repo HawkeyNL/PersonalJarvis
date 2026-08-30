@@ -15,6 +15,9 @@ import com.hawkeynl.jarvis.network.HomeNodeEndpoint
 import com.hawkeynl.jarvis.network.UnreachableReason
 import com.hawkeynl.jarvis.security.BiometricAvailability
 import com.hawkeynl.jarvis.security.BiometricResult
+import com.hawkeynl.jarvis.update.AndroidUpdateCheck
+import com.hawkeynl.jarvis.update.AndroidUpdateDownload
+import com.hawkeynl.jarvis.update.InstallerHandoff
 import java.time.Instant
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,6 +27,17 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 enum class AppTab { CHAT, CONVERSATIONS, SETTINGS }
+
+sealed interface AndroidUpdateUiState {
+    data object Idle : AndroidUpdateUiState
+    data object Checking : AndroidUpdateUiState
+    data object Current : AndroidUpdateUiState
+    data class Available(val metadata: com.hawkeynl.jarvis.network.AndroidUpdateMetadata) : AndroidUpdateUiState
+    data object Downloading : AndroidUpdateUiState
+    data class Ready(val versionName: String) : AndroidUpdateUiState
+    data object PermissionRequired : AndroidUpdateUiState
+    data class Failed(val message: String) : AndroidUpdateUiState
+}
 
 data class JarvisUiState(
     val selectedTab: AppTab = AppTab.CHAT,
@@ -40,6 +54,7 @@ data class JarvisUiState(
     val conversationTitle: String = "Nieuw gesprek",
     val messages: List<ConversationMessage> = emptyList(),
     val busy: Boolean = false,
+    val appUpdate: AndroidUpdateUiState = AndroidUpdateUiState.Idle,
     val error: String? = null,
 )
 
@@ -79,6 +94,44 @@ class JarvisViewModel(private val container: AppContainer) : ViewModel() {
     fun checkConnection() {
         val endpoint = _state.value.endpoint ?: return
         viewModelScope.launch { checkConnection(endpoint) }
+    }
+
+    fun checkForUpdate() {
+        val endpoint = _state.value.endpoint ?: return
+        viewModelScope.launch { checkForUpdate(endpoint) }
+    }
+
+    fun downloadUpdate() {
+        val endpoint = _state.value.endpoint ?: return
+        val available = _state.value.appUpdate as? AndroidUpdateUiState.Available ?: return
+        viewModelScope.launch {
+            _state.update { it.copy(appUpdate = AndroidUpdateUiState.Downloading) }
+            when (val result = container.appUpdates.download(endpoint, available.metadata)) {
+                is AndroidUpdateDownload.Ready -> _state.update {
+                    it.copy(appUpdate = AndroidUpdateUiState.Ready(result.versionName))
+                }
+                AndroidUpdateDownload.Unauthorized -> _state.update {
+                    it.copy(authenticated = false, appUpdate = AndroidUpdateUiState.Failed("Sessie verlopen."))
+                }
+                is AndroidUpdateDownload.Failed -> _state.update {
+                    it.copy(appUpdate = AndroidUpdateUiState.Failed(result.message))
+                }
+            }
+        }
+    }
+
+    fun installerHandoff(result: InstallerHandoff) {
+        _state.update {
+            when (result) {
+                InstallerHandoff.Started -> it
+                InstallerHandoff.PermissionRequired -> it.copy(
+                    appUpdate = AndroidUpdateUiState.PermissionRequired,
+                )
+                is InstallerHandoff.Failed -> it.copy(
+                    appUpdate = AndroidUpdateUiState.Failed(result.message),
+                )
+            }
+        }
     }
 
     fun beginEnrollment() {
@@ -216,6 +269,7 @@ class JarvisViewModel(private val container: AppContainer) : ViewModel() {
             else -> {
                 _state.update { it.copy(authenticated = true) }
                 loadConversations(endpoint)
+                checkForUpdate(endpoint)
             }
         }
     }
@@ -286,6 +340,24 @@ class JarvisViewModel(private val container: AppContainer) : ViewModel() {
         when (val result = container.conversations.list(endpoint)) {
             is ApiResult.Success -> _state.update { it.copy(conversations = result.value.conversations) }
             else -> handleApiFailure(result)
+        }
+    }
+
+    private suspend fun checkForUpdate(endpoint: HomeNodeEndpoint) {
+        _state.update { it.copy(appUpdate = AndroidUpdateUiState.Checking) }
+        when (val result = container.appUpdates.check(endpoint)) {
+            AndroidUpdateCheck.Current -> _state.update {
+                it.copy(appUpdate = AndroidUpdateUiState.Current)
+            }
+            is AndroidUpdateCheck.Available -> _state.update {
+                it.copy(appUpdate = AndroidUpdateUiState.Available(result.metadata))
+            }
+            AndroidUpdateCheck.Unauthorized -> _state.update {
+                it.copy(authenticated = false, appUpdate = AndroidUpdateUiState.Failed("Sessie verlopen."))
+            }
+            is AndroidUpdateCheck.Failed -> _state.update {
+                it.copy(appUpdate = AndroidUpdateUiState.Failed(result.message))
+            }
         }
     }
 
