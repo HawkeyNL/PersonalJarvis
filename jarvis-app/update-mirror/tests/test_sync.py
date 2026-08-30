@@ -50,7 +50,7 @@ def config(root: Path) -> dict:
         "schema_version": 1,
         "source": {
             "manifest_url": "https://storage.invalid/channels/stable/latest.json",
-            "artifact_base_url": "https://storage.invalid/",
+            "artifact_url_template": "https://storage.invalid/{{path}}",
             "bearer_token_file": "/unused-in-unit-test",
         },
         "mirror_root": str(root),
@@ -58,6 +58,7 @@ def config(root: Path) -> dict:
         "retention_previous": 1,
         "timeout_seconds": 30,
         "max_artifact_bytes": 1024 * 1024,
+        "android_signing_certificate_sha256": "c" * 64,
     }
 
 
@@ -90,6 +91,16 @@ class SyncTests(unittest.TestCase):
                 sync_release(config(root), source)
             releases = sorted(path.name for path in (root / "releases").iterdir())
             self.assertEqual(releases, ["v1.1.0", "v1.2.0"])
+
+    def test_android_signing_identity_change_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, source = release_source("1.0.0")
+            changed = config(root)
+            changed["android_signing_certificate_sha256"] = "d" * 64
+            with self.assertRaises(SyncError):
+                sync_release(changed, source)
+            self.assertFalse((root / "current").exists())
 
 
 if __name__ == "__main__":

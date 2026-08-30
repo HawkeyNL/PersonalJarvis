@@ -4,6 +4,24 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
+val releaseVersionName = providers.environmentVariable("JARVIS_APP_VERSION").orNull ?: "0.1.0"
+require(Regex("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$").matches(releaseVersionName)) {
+    "JARVIS_APP_VERSION must be a semantic version"
+}
+val releaseVersionCode = providers.environmentVariable("JARVIS_ANDROID_VERSION_CODE").orNull?.toIntOrNull() ?: 1
+require(releaseVersionCode > 0) { "JARVIS_ANDROID_VERSION_CODE must be positive" }
+
+val releaseKeystorePath = providers.environmentVariable("JARVIS_ANDROID_KEYSTORE_PATH").orNull
+val releaseKeyAlias = providers.environmentVariable("JARVIS_ANDROID_KEY_ALIAS").orNull
+val releaseStorePassword = providers.environmentVariable("JARVIS_ANDROID_STORE_PASSWORD").orNull
+val releaseKeyPassword = providers.environmentVariable("JARVIS_ANDROID_KEY_PASSWORD").orNull
+val releaseSigningConfigured = listOf(
+    releaseKeystorePath,
+    releaseKeyAlias,
+    releaseStorePassword,
+    releaseKeyPassword,
+).all { !it.isNullOrBlank() }
+
 android {
     namespace = "com.hawkeynl.jarvis"
     compileSdk = 37
@@ -13,11 +31,22 @@ android {
         applicationId = "com.hawkeynl.jarvis"
         minSdk = 28
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = releaseVersionCode
+        versionName = releaseVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
+    }
+
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            create("jarvisRelease") {
+                storeFile = file(requireNotNull(releaseKeystorePath))
+                keyAlias = releaseKeyAlias
+                storePassword = releaseStorePassword
+                keyPassword = releaseKeyPassword
+            }
+        }
     }
 
     buildTypes {
@@ -28,6 +57,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            if (releaseSigningConfigured) {
+                signingConfig = signingConfigs.getByName("jarvisRelease")
+            }
         }
     }
 
@@ -43,6 +75,14 @@ android {
 
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+    }
+}
+
+tasks.matching { it.name == "assembleRelease" || it.name == "bundleRelease" }.configureEach {
+    doFirst {
+        check(releaseSigningConfigured) {
+            "Release APK/AAB signing is not configured; refusing to create a distributable mobile release"
+        }
     }
 }
 

@@ -15,7 +15,7 @@ import stat
 import sys
 import tempfile
 from typing import Any, BinaryIO, Protocol
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 import uuid
 
@@ -39,7 +39,14 @@ class HttpSource:
         self._timeout = timeout_seconds
 
     def open(self, url: str) -> BinaryIO:
-        request = Request(url, headers={"Authorization": f"Bearer {self._token}", "User-Agent": "jarvis-app-update-sync/1"})
+        request = Request(
+            url,
+            headers={
+                "Accept": "application/octet-stream",
+                "Authorization": f"Bearer {self._token}",
+                "User-Agent": "jarvis-app-update-sync/1",
+            },
+        )
         return urlopen(request, timeout=self._timeout)
 
 
@@ -59,20 +66,38 @@ def _safe_config(path: Path) -> dict[str, Any]:
     document = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(document, dict):
         raise SyncError("configuration must be an object")
-    expected = {"schema_version", "source", "mirror_root", "channel", "retention_previous", "timeout_seconds", "max_artifact_bytes"}
+    expected = {
+        "schema_version",
+        "source",
+        "mirror_root",
+        "channel",
+        "retention_previous",
+        "timeout_seconds",
+        "max_artifact_bytes",
+        "android_signing_certificate_sha256",
+    }
     if set(document) != expected or document["schema_version"] != 1:
         raise SyncError("configuration fields are invalid")
     source = document["source"]
-    if not isinstance(source, dict) or set(source) != {"manifest_url", "artifact_base_url", "bearer_token_file"}:
+    if not isinstance(source, dict) or set(source) != {"manifest_url", "artifact_url_template", "bearer_token_file"}:
         raise SyncError("source configuration is invalid")
-    for field in ("manifest_url", "artifact_base_url"):
+    for field in ("manifest_url", "artifact_url_template"):
         parsed = urlparse(source[field])
         if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.fragment:
             raise SyncError(f"source.{field} must be a credential-free HTTPS URL")
+    template = source["artifact_url_template"]
+    if "{{filename}}" not in template and "{{path}}" not in template:
+        raise SyncError("source.artifact_url_template must identify an artifact")
+    scrubbed = template.replace("{{version}}", "version").replace("{{filename}}", "artifact").replace("{{path}}", "path")
+    if "{{" in scrubbed or "}}" in scrubbed:
+        raise SyncError("source.artifact_url_template contains an unsupported placeholder")
     if document["channel"] not in ("stable", "beta", "development"):
         raise SyncError("channel is invalid")
     if document["retention_previous"] != 1:
         raise SyncError("retention_previous must be exactly 1")
+    fingerprint = document["android_signing_certificate_sha256"]
+    if not isinstance(fingerprint, str) or len(fingerprint) != 64 or any(character not in "0123456789abcdef" for character in fingerprint):
+        raise SyncError("android_signing_certificate_sha256 is invalid")
     if not isinstance(document["timeout_seconds"], int) or not 1 <= document["timeout_seconds"] <= 600:
         raise SyncError("timeout_seconds is invalid")
     if not isinstance(document["max_artifact_bytes"], int) or not 1 <= document["max_artifact_bytes"] <= 8 * 1024**3:
@@ -203,6 +228,9 @@ def sync_release(config: dict[str, Any], source: Source) -> str:
     if release["channel"] != config["channel"]:
         raise SyncError("release channel does not match the configured channel")
     version = release["version"]
+    android = next(entry for entry in manifest["artifacts"] if entry["platform"] == "android")
+    if android["signature"]["value"] != config["android_signing_certificate_sha256"]:
+        raise SyncError("Android signing certificate does not match the pinned release identity")
 
     staging = root / ".staging" / uuid.uuid4().hex
     staged_release = staging / f"v{version}"
@@ -212,7 +240,10 @@ def sync_release(config: dict[str, Any], source: Source) -> str:
             artifact = entry["artifact"]
             filename = PurePosixPath(artifact["path"]).name
             relative = Path(f"{entry['platform']}-{entry['architecture']}") / filename
-            url = urljoin(config["source"]["artifact_base_url"].rstrip("/") + "/", artifact["path"])
+            url = config["source"]["artifact_url_template"]
+            url = url.replace("{{version}}", version)
+            url = url.replace("{{filename}}", filename)
+            url = url.replace("{{path}}", artifact["path"])
             _download(source, url, staged_release / relative, artifact["sha256"], artifact["size"], config["max_artifact_bytes"])
         canonical = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
         (staged_release / "manifest.json").write_bytes(canonical)
