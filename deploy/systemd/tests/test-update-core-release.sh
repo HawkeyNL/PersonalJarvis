@@ -354,6 +354,12 @@ run_updater --version v7.0.1
 seed_active_release v8.0.1 "$same_migrations"
 write_release /opt/jarvis/releases v8.0.0 "$same_migrations"
 mv /opt/jarvis/releases/jarvis-core-v8.0.0 /opt/jarvis/releases/v8.0.0
+rollback_candidates=$(run_updater --rollback-candidates)
+jq -e '.[] | select(.version == "v8.0.0" and .verified == true and .rollback_capable == true)' \
+    <<< "$rollback_candidates" >/dev/null || {
+    echo "expected v8.0.0 rollback candidate is unavailable: $rollback_candidates" >&2
+    exit 1
+}
 run_updater --rollback
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.0.0 ]]
 cmp /opt/jarvis/releases/v8.0.0/jarvis /usr/local/sbin/jarvis
