@@ -99,8 +99,8 @@ let automaticCheckScheduled = false;
 
 /** Run at most one gentle, non-blocking check after an authenticated startup.
  * Installation and restart always remain explicit user actions. */
-export function scheduleAutomaticUpdateCheck(authenticated: boolean): void {
-  if (!shouldScheduleAutomaticUpdateCheck(authenticated, automaticCheckScheduled)) return;
+export function scheduleAutomaticUpdateCheck(configured: boolean, authenticated: boolean): void {
+  if (!shouldScheduleAutomaticUpdateCheck(configured, authenticated, automaticCheckScheduled)) return;
   automaticCheckScheduled = true;
   window.setTimeout(() => {
     void (async () => {

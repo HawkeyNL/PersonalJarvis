@@ -8,7 +8,7 @@
 // messages; the tab list lives in `conversations.ts`.
 import { ref } from "vue";
 import { speak } from "./voice";
-import { currentSession } from "./auth";
+import { currentAuthStatus } from "./auth";
 import { postJsonAuth, getJsonAuth } from "./api";
 import {
   currentId,
@@ -55,13 +55,13 @@ interface ChatReply {
 const MAX_TURNS = 20;
 
 async function ask(): Promise<ChatReply> {
-  const session = await currentSession();
-  if (!session.token) throw new Error("niet ingelogd");
+  const status = await currentAuthStatus();
+  if (!status.authenticated) throw new Error("niet ingelogd");
   const history = messages.value.slice(-MAX_TURNS).map((m) => ({
     role: m.role === "jarvis" ? "assistant" : "user",
     content: m.text,
   }));
-  return await postJsonAuth<ChatReply>("/v1/assistant/chat", session.token, {
+  return await postJsonAuth<ChatReply>("/v1/assistant/chat", {
     messages: history,
     conversation_id: currentId.value,
   });
@@ -70,13 +70,13 @@ async function ask(): Promise<ChatReply> {
 /** Load a conversation's history into the view and make it the current tab. */
 export async function openConversation(id: string): Promise<void> {
   setCurrent(id);
-  const session = await currentSession();
-  if (!session.token) return;
+  const status = await currentAuthStatus();
+  if (!status.authenticated) return;
   const res = await getJsonAuth<{
     id: string;
     title: string;
     messages: { role: string; content: string; model: string | null; at: string }[];
-  }>(`/v1/conversations/${id}`, session.token);
+  }>(`/v1/conversations/${id}`);
   messages.value = res.messages.map((m) => ({
     id: idc++,
     role: m.role === "assistant" ? "jarvis" : "user",

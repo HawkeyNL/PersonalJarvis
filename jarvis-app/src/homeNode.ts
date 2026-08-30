@@ -39,7 +39,9 @@ export async function loadHomeNodeConfig(): Promise<HomeNodeConfig> {
 /** Validate and persist the origin before enrollment starts. Credentials are
  * rejected native-side and are never accepted as part of this metadata. */
 export async function configureHomeNode(origin: string): Promise<HomeNodeConfig> {
+  const previousOrigin = config.value.origin;
   const value = await invoke<HomeNodeConfig>("home_node_configure", { origin });
+  if (previousOrigin !== value.origin) sessionStorage.removeItem("jarvis.pairing.wait");
   config.value = value;
   loaded = true;
   return value;

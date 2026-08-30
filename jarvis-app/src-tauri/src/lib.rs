@@ -8,6 +8,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
 #[cfg(desktop)]
@@ -62,16 +63,24 @@ fn metadata_bytes(metadata: &AuthMetadata) -> Result<Vec<u8>, String> {
 
 fn load_metadata(app: &AppHandle) -> Result<AuthMetadata, String> {
     let legacy = load_legacy_store(app)?;
-    let home_node_origin = legacy.home_node_origin.or_else(|| {
-        legacy
-            .update_endpoint
-            .as_deref()
-            .and_then(origin_from_legacy_update_endpoint)
-    });
+    let home_node_origin = validated_stored_origin(&legacy);
     Ok(AuthMetadata {
         device_id: legacy.device_id,
         home_node_origin,
     })
+}
+
+fn validated_stored_origin(legacy: &LegacyAuthStore) -> Option<String> {
+    legacy
+        .home_node_origin
+        .as_deref()
+        .and_then(|origin| normalize_home_node_origin(origin, cfg!(debug_assertions)).ok())
+        .or_else(|| {
+            legacy
+                .update_endpoint
+                .as_deref()
+                .and_then(origin_from_legacy_update_endpoint)
+        })
 }
 
 fn save_metadata(app: &AppHandle, metadata: &AuthMetadata) -> Result<(), String> {
@@ -126,12 +135,7 @@ struct SecureAuth {
 /// so a partial migration can never discard the device identity.
 fn load_secure_auth(app: &AppHandle) -> Result<SecureAuth, String> {
     let legacy = load_legacy_store(app)?;
-    let home_node_origin = legacy.home_node_origin.clone().or_else(|| {
-        legacy
-            .update_endpoint
-            .as_deref()
-            .and_then(origin_from_legacy_update_endpoint)
-    });
+    let home_node_origin = validated_stored_origin(&legacy);
     let metadata = AuthMetadata {
         device_id: legacy.device_id.clone(),
         home_node_origin,
@@ -278,31 +282,208 @@ fn auth_sign_pairing_approval(
 }
 
 /// Persist the device id and session token after a successful login.
-#[tauri::command]
-fn auth_save(app: AppHandle, device_id: String, token: String) -> Result<(), String> {
-    load_secure_auth(&app)?;
-    save_credential(TOKEN_ACCOUNT, &token)?;
-    let current = load_metadata(&app)?;
+fn save_auth(app: &AppHandle, device_id: String, token: &str) -> Result<(), String> {
+    load_secure_auth(app)?;
+    save_credential(TOKEN_ACCOUNT, token)?;
+    let current = load_metadata(app)?;
     let metadata = AuthMetadata {
         device_id: Some(device_id),
         home_node_origin: current.home_node_origin,
     };
-    if let Err(error) = save_metadata(&app, &metadata) {
+    if let Err(error) = save_metadata(app, &metadata) {
         let _ = delete_credential(TOKEN_ACCOUNT);
         return Err(error);
     }
     Ok(())
 }
 
-/// Report the current auth state (without exposing the private key).
+fn native_http_client() -> Result<reqwest::Client, String> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|_| "native HTTP client is unavailable".to_string())
+}
+
+fn authenticated_api_path(path: &str) -> bool {
+    if path.len() > 2048
+        || !path.starts_with("/v1/")
+        || path.starts_with("//")
+        || path.contains(['\\', '#'])
+        || path.split('/').any(|part| part == "..")
+    {
+        return false;
+    }
+    let route = path.split('?').next().unwrap_or(path);
+    [
+        "/v1/assistant",
+        "/v1/conversations",
+        "/v1/devices",
+        "/v1/auth/logout",
+        "/v1/auth/me",
+        "/v1/auth/pairing/requests",
+        "/v1/auth/unlock",
+        "/v1/system",
+        "/v1/holdings",
+        "/v1/broker",
+        "/v1/voice",
+    ]
+    .iter()
+    .any(|prefix| {
+        route == *prefix
+            || route
+                .strip_prefix(prefix)
+                .is_some_and(|remainder| remainder.starts_with('/'))
+    })
+}
+
+fn api_url(app: &AppHandle, path: &str) -> Result<String, String> {
+    if !authenticated_api_path(path) {
+        return Err("authenticated API path is invalid".to_string());
+    }
+    let origin = load_metadata(app)?
+        .home_node_origin
+        .ok_or_else(|| "Home Node is not configured".to_string())?;
+    Ok(format!("{origin}{path}"))
+}
+
+fn contains_secret_response_field(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+            matches!(
+                key.to_ascii_lowercase().as_str(),
+                "token" | "access_token" | "refresh_token" | "private_key"
+            ) || contains_secret_response_field(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(contains_secret_response_field),
+        _ => false,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginResponse {
+    token: String,
+}
+
+/// Complete device login and persist the returned bearer without ever
+/// serializing it through Tauri IPC or the webview.
 #[tauri::command]
-fn auth_session(app: AppHandle) -> Result<serde_json::Value, String> {
+async fn auth_complete_login(
+    app: AppHandle,
+    device_id: String,
+    challenge_id: String,
+    signature: String,
+) -> Result<(), String> {
+    uuid::Uuid::parse_str(&device_id).map_err(|_| "login device id is invalid".to_string())?;
+    uuid::Uuid::parse_str(&challenge_id)
+        .map_err(|_| "login challenge id is invalid".to_string())?;
+    if signature.len() != 128 || !signature.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("login signature is invalid".to_string());
+    }
+    let origin = load_metadata(&app)?
+        .home_node_origin
+        .ok_or_else(|| "Home Node is not configured".to_string())?;
+    let response = native_http_client()?
+        .post(format!("{origin}/v1/auth/login"))
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "challenge_id": challenge_id,
+            "signature": signature,
+        }))
+        .send()
+        .await
+        .map_err(|_| "Home Node login is unavailable".to_string())?;
+    if !response.status().is_success() {
+        return Err("Home Node rejected the device login".to_string());
+    }
+    if response.content_length().is_some_and(|length| length > 16 * 1024) {
+        return Err("Home Node login response is invalid".to_string());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| "Home Node login response is invalid".to_string())?;
+    if bytes.len() > 16 * 1024 {
+        return Err("Home Node login response is invalid".to_string());
+    }
+    let result: LoginResponse = serde_json::from_slice(&bytes)
+        .map_err(|_| "Home Node login response is invalid".to_string())?;
+    if result.token.is_empty()
+        || result.token.len() > 4096
+        || result.token.chars().any(char::is_whitespace)
+    {
+        return Err("Home Node login response is invalid".to_string());
+    }
+    save_auth(&app, device_id, &result.token)
+}
+
+#[derive(Serialize)]
+struct NativeApiResponse {
+    status: u16,
+    body: Option<serde_json::Value>,
+}
+
+/// Proxy authenticated JSON calls through Rust so the webview never receives
+/// or constructs a bearer credential. Only relative Jarvis API paths and the
+/// small method set used by the desktop client are accepted.
+#[tauri::command]
+async fn auth_request(
+    app: AppHandle,
+    method: String,
+    path: String,
+    body: Option<serde_json::Value>,
+) -> Result<NativeApiResponse, String> {
     let auth = load_secure_auth(&app)?;
-    Ok(serde_json::json!({
-        "device_id": auth.metadata.device_id,
-        "token": auth.token,
-        "has_key": auth.private_key.is_some(),
-    }))
+    let token = auth
+        .token
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "device is not authenticated".to_string())?;
+    let method = match method.as_str() {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "DELETE" => reqwest::Method::DELETE,
+        _ => return Err("authenticated API method is invalid".to_string()),
+    };
+    if method != reqwest::Method::POST && body.is_some() {
+        return Err("authenticated API body is invalid".to_string());
+    }
+    let mut request = native_http_client()?
+        .request(method.clone(), api_url(&app, &path)?)
+        .bearer_auth(token)
+        .header(reqwest::header::ACCEPT, "application/json");
+    if method == reqwest::Method::POST {
+        request = request.json(&body.unwrap_or_else(|| serde_json::json!({})));
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| "Home Node is unreachable".to_string())?;
+    let status = response.status().as_u16();
+    if response.content_length().is_some_and(|length| length > 16 * 1024 * 1024) {
+        return Err("Home Node response is too large".to_string());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| "Home Node response is invalid".to_string())?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err("Home Node response is too large".to_string());
+    }
+    let body = if bytes.is_empty() {
+        None
+    } else {
+        let value = serde_json::from_slice(&bytes)
+            .map_err(|_| "Home Node response is not valid JSON".to_string())?;
+        if contains_secret_response_field(&value) {
+            return Err("Home Node response contains a forbidden secret field".to_string());
+        }
+        Some(value)
+    };
+    Ok(NativeApiResponse { status, body })
 }
 
 /// Non-secret auth metadata for reactive UI. Use this instead of retaining a
@@ -358,12 +539,23 @@ fn home_node_config(app: AppHandle) -> Result<HomeNodeConfig, String> {
 fn home_node_configure(app: AppHandle, origin: String) -> Result<HomeNodeConfig, String> {
     let origin = normalize_home_node_origin(&origin, cfg!(debug_assertions))?;
     let mut metadata = load_metadata(&app)?;
+    if origin_changed(metadata.home_node_origin.as_deref(), &origin) {
+        // A bearer is scoped to the Home Node that minted it. Clear both the
+        // token and server-side device id before persisting a different origin
+        // so the old credential can never be sent to a newly entered host.
+        delete_credential(TOKEN_ACCOUNT)?;
+        metadata.device_id = None;
+    }
     metadata.home_node_origin = Some(origin.clone());
     save_metadata(&app, &metadata)?;
     Ok(HomeNodeConfig {
         origin: Some(origin),
         configured: true,
     })
+}
+
+fn origin_changed(current: Option<&str>, requested: &str) -> bool {
+    current != Some(requested)
 }
 
 fn normalize_home_node_origin(value: &str, allow_local_http: bool) -> Result<String, String> {
@@ -488,8 +680,8 @@ pub fn run() {
             auth_public_key,
             auth_sign,
             auth_sign_pairing_approval,
-            auth_save,
-            auth_session,
+            auth_complete_login,
+            auth_request,
             auth_status,
             auth_logout,
             auth_reset,
@@ -577,5 +769,50 @@ mod tests {
             origin_from_legacy_update_endpoint("https://home.example/not-updates"),
             None
         );
+    }
+
+    #[test]
+    fn changing_home_node_requires_a_fresh_server_binding() {
+        assert!(!origin_changed(
+            Some("https://home.example"),
+            "https://home.example"
+        ));
+        assert!(origin_changed(
+            Some("https://old.example"),
+            "https://new.example"
+        ));
+        assert!(origin_changed(None, "https://home.example"));
+    }
+
+    #[test]
+    fn stored_home_node_origin_is_revalidated_before_native_use() {
+        let legacy = LegacyAuthStore {
+            home_node_origin: Some("https://token@home.example".to_string()),
+            ..LegacyAuthStore::default()
+        };
+        assert_eq!(validated_stored_origin(&legacy), None);
+    }
+
+    #[test]
+    fn native_authenticated_proxy_is_bounded_and_excludes_updater_routes() {
+        assert!(authenticated_api_path("/v1/conversations"));
+        assert!(authenticated_api_path("/v1/auth/unlock/pending?wait=20"));
+        assert!(!authenticated_api_path("/v1/auth/login"));
+        assert!(!authenticated_api_path("/v1/app-updates/capability"));
+        assert!(!authenticated_api_path("https://other.example/v1/devices"));
+        assert!(!authenticated_api_path("/v1/devices/../auth/login"));
+    }
+
+    #[test]
+    fn native_proxy_refuses_secret_response_fields() {
+        assert!(contains_secret_response_field(
+            &serde_json::json!({"token": "secret"})
+        ));
+        assert!(contains_secret_response_field(
+            &serde_json::json!({"nested": [{"private_key": "secret"}]})
+        ));
+        assert!(!contains_secret_response_field(
+            &serde_json::json!({"authenticated": true, "device_id": "id"})
+        ));
     }
 }

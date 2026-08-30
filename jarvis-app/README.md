@@ -99,7 +99,11 @@ fails, migration fails closed and leaves the legacy data untouched for manual
 recovery. A new plaintext fallback is never created.
 
 The private Ed25519 seed is generated and used only by Rust. Tauri commands
-return a public key or a bounded signature, never private key bytes.
+return a public key or a bounded signature, never private key bytes. Login and
+all authenticated API calls are completed by Rust using the credential-store
+session; Vue receives only authentication status, device id and key presence,
+never the bearer token. Changing the configured Home Node origin clears the old
+session/device binding before the new origin is persisted.
 
 ## Current capability matrix
 

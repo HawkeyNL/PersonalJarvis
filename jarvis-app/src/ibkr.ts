@@ -1,5 +1,5 @@
 // IBKR (read-only): connection status + positions via the authenticated API.
-import { currentSession } from "./auth";
+import { currentAuthStatus } from "./auth";
 import { getJsonAuth } from "./api";
 
 export type IbkrStatus = {
@@ -19,21 +19,22 @@ export type IbkrPosition = {
   currency: string;
 };
 
-async function token(): Promise<string> {
-  const session = await currentSession();
-  if (!session.token) {
+async function requireAuth(): Promise<void> {
+  const status = await currentAuthStatus();
+  if (!status.authenticated) {
     throw new Error("niet ingelogd");
   }
-  return session.token;
 }
 
 export async function ibkrStatus(): Promise<IbkrStatus> {
-  return getJsonAuth<IbkrStatus>("/v1/broker/ibkr/status", await token());
+  await requireAuth();
+  return getJsonAuth<IbkrStatus>("/v1/broker/ibkr/status");
 }
 
 export async function ibkrPositions(): Promise<{
   account: string;
   positions: IbkrPosition[];
 }> {
-  return getJsonAuth("/v1/broker/ibkr/positions", await token());
+  await requireAuth();
+  return getJsonAuth("/v1/broker/ibkr/positions");
 }

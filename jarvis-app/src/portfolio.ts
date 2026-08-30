@@ -1,5 +1,6 @@
-// Portfolio (holdings) API — all calls are authenticated with the session token.
-import { currentSession } from "./auth";
+// Portfolio calls are authenticated by the native layer; Vue never receives
+// the session bearer.
+import { currentAuthStatus } from "./auth";
 import { deleteAuth, getJsonAuth, postJsonAuth } from "./api";
 
 export type Holding = {
@@ -17,16 +18,16 @@ export type Holdings = {
   total_cost: string;
 };
 
-async function token(): Promise<string> {
-  const session = await currentSession();
-  if (!session.token) {
+async function requireAuth(): Promise<void> {
+  const status = await currentAuthStatus();
+  if (!status.authenticated) {
     throw new Error("niet ingelogd");
   }
-  return session.token;
 }
 
 export async function listHoldings(): Promise<Holdings> {
-  return getJsonAuth<Holdings>("/v1/holdings", await token());
+  await requireAuth();
+  return getJsonAuth<Holdings>("/v1/holdings");
 }
 
 export async function addHolding(input: {
@@ -35,9 +36,11 @@ export async function addHolding(input: {
   avg_cost: string;
   currency?: string;
 }): Promise<void> {
-  await postJsonAuth("/v1/holdings", await token(), input);
+  await requireAuth();
+  await postJsonAuth("/v1/holdings", input);
 }
 
 export async function deleteHolding(id: string): Promise<void> {
-  await deleteAuth(`/v1/holdings/${id}`, await token());
+  await requireAuth();
+  await deleteAuth(`/v1/holdings/${id}`);
 }

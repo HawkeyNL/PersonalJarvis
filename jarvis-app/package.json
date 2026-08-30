@@ -9,7 +9,7 @@
     "build": "npm run check",
     "preview": "vite preview",
     "setup-wakeword": "bash scripts/setup-wakeword.sh",
-    "desktop:dev": "tauri dev",
+    "desktop:dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
     "desktop:build": "tauri build",
     "desktop:check:native": "cargo check --manifest-path src-tauri/Cargo.toml --locked",
     "desktop:test:native": "cargo test --manifest-path src-tauri/Cargo.toml --locked",

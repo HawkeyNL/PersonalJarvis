@@ -51,9 +51,9 @@ onMounted(async () => {
   // is deliberately detached so startup and ordinary Jarvis use never wait.
   void (async () => {
     try {
-      await loadHomeNodeConfig();
+      const config = await loadHomeNodeConfig();
       const auth = await currentAuthStatus();
-      scheduleAutomaticUpdateCheck(auth.authenticated);
+      scheduleAutomaticUpdateCheck(config.configured, auth.authenticated);
     } catch {
       // Missing/corrupt local update state is surfaced passively in Settings.
     }

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from "vue";
 import { getJson, ApiError } from "../api";
-import { currentSession, login, clearSession, listDevices, PairingPending } from "../auth";
+import { currentAuthStatus, login, clearSession, listDevices, PairingPending } from "../auth";
 import { configureHomeNode, homeNodeConfig, loadHomeNodeConfig } from "../homeNode";
 import ReactorCore from "../components/ReactorCore.vue";
 import JarvisConsole from "../components/JarvisConsole.vue";
@@ -54,38 +54,38 @@ async function saveHomeNode() {
   }
 }
 
-// Return a usable session token, logging in (enroll if needed) when absent.
-async function ensureSession(): Promise<string | null> {
-  let session = await currentSession();
-  if (!session.token) {
+// Ensure a usable native session exists, logging in (enroll if needed) when absent.
+async function ensureSession(): Promise<boolean> {
+  let status = await currentAuthStatus();
+  if (!status.authenticated) {
     await login();
-    session = await currentSession();
+    status = await currentAuthStatus();
   }
-  return session.token;
+  return status.authenticated;
 }
 
 async function refreshAuth() {
   if (authTrying) return;
   authTrying = true;
   try {
-    let token = await ensureSession();
-    if (!token) {
+    let authenticated = await ensureSession();
+    if (!authenticated) {
       auth.value = "uit";
       return;
     }
     // Listing devices validates the token; a stale one (backend restarted) 401s
     // — drop it and log in fresh once, instead of looping on a dead token.
     try {
-      await listDevices(token);
+      await listDevices();
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
         await clearSession();
-        token = await ensureSession();
-        if (!token) {
+        authenticated = await ensureSession();
+        if (!authenticated) {
           auth.value = "uit";
           return;
         }
-        await listDevices(token);
+        await listDevices();
       } else {
         throw e;
       }

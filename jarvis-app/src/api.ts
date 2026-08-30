@@ -1,6 +1,8 @@
-// Small API client. Uses the Tauri HTTP plugin so requests are routed through
-// Rust (no webview CORS restrictions). The enrolled Home Node origin is
-// resolved at request time; production builds contain no infrastructure URL.
+// Small API client. Public enrollment calls use the Tauri HTTP plugin; calls
+// that need a bearer go through the native auth_request command. The enrolled
+// Home Node origin is resolved at request time, and production builds contain
+// no infrastructure URL.
+import { invoke } from "@tauri-apps/api/core";
 import { fetch } from "@tauri-apps/plugin-http";
 import { homeNodeOrigin } from "./homeNode";
 
@@ -86,53 +88,58 @@ export async function postJsonWithHeaders<T>(path: string, body: unknown, header
   return (await res.json()) as T;
 }
 
-export async function getJsonAuth<T>(path: string, token: string): Promise<T> {
-  const res = await request(path, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) {
-    throw new ApiError(res.status, path);
+type NativeApiResponse = {
+  status: number;
+  body: unknown | null;
+};
+
+async function authenticatedRequest<T>(
+  method: "GET" | "POST" | "DELETE",
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
+  let response: NativeApiResponse;
+  try {
+    const pending = invoke<NativeApiResponse>("auth_request", {
+      method,
+      path,
+      body: body ?? null,
+    });
+    response = signal
+      ? await Promise.race([
+          pending,
+          new Promise<never>((_, reject) => {
+            if (signal.aborted) reject(new DOMException("Aborted", "AbortError"));
+            else signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+          }),
+        ])
+      : await pending;
+  } catch {
+    throw new NetworkError("unreachable", path);
   }
-  return (await res.json()) as T;
+  if (response.status < 200 || response.status >= 300) {
+    throw new ApiError(response.status, path);
+  }
+  return response.body as T;
 }
 
-export async function postAuth(path: string, token: string): Promise<void> {
-  const res = await request(path, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) {
-    throw new ApiError(res.status, path);
-  }
+export function getJsonAuth<T>(path: string): Promise<T> {
+  return authenticatedRequest<T>("GET", path);
+}
+
+export async function postAuth(path: string): Promise<void> {
+  await authenticatedRequest<void>("POST", path, {});
 }
 
 export async function postJsonAuth<T>(
   path: string,
-  token: string,
   body: unknown,
   signal?: AbortSignal,
 ): Promise<T> {
-  const res = await request(path, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-    signal,
-  });
-  if (!res.ok) {
-    throw new ApiError(res.status, path);
-  }
-  return (await res.json()) as T;
+  return authenticatedRequest<T>("POST", path, body, signal);
 }
 
-export async function deleteAuth(path: string, token: string): Promise<void> {
-  const res = await request(path, {
-    method: "DELETE",
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) {
-    throw new ApiError(res.status, path);
-  }
+export async function deleteAuth(path: string): Promise<void> {
+  await authenticatedRequest<void>("DELETE", path);
 }

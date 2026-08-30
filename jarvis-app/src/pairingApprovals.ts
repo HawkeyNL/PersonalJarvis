@@ -2,7 +2,7 @@
 // the native layer signs the narrowly-scoped pairing protocol.
 import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { currentSession } from "./auth";
+import { currentAuthStatus } from "./auth";
 import { getJsonAuth, postJsonAuth } from "./api";
 
 export type PairingRequest = {
@@ -21,27 +21,27 @@ let polling = false;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function refresh(): Promise<boolean> {
-  const session = await currentSession();
-  if (!session.token) return false;
+  const status = await currentAuthStatus();
+  if (!status.authenticated) return false;
   try {
-    const response = await getJsonAuth<{ requests: PairingRequest[] }>("/v1/auth/pairing/requests", session.token);
+    const response = await getJsonAuth<{ requests: PairingRequest[] }>("/v1/auth/pairing/requests");
     pairingRequests.value = response.requests;
     return true;
   } catch { return false; }
 }
 
 export async function approvePairing(request: PairingRequest): Promise<void> {
-  const session = await currentSession();
-  if (!session.token || !session.device_id) throw new Error("niet ingelogd");
+  const status = await currentAuthStatus();
+  if (!status.authenticated || !status.device_id) throw new Error("niet ingelogd");
   pairingError.value = null;
   try {
     const signature = await invoke<string>("auth_sign_pairing_approval", {
       candidateName: request.device_name,
       requestId: request.id, nonceHex: request.nonce,
       candidatePublicKeyHex: request.candidate_public_key,
-      userId: await ownerId(), approverDeviceId: session.device_id, expiresAt: request.expires_at,
+      userId: await ownerId(), approverDeviceId: status.device_id, expiresAt: request.expires_at,
     });
-    await postJsonAuth(`/v1/auth/pairing/requests/${request.id}/approve`, session.token, { signature });
+    await postJsonAuth(`/v1/auth/pairing/requests/${request.id}/approve`, { signature });
     pairingRequests.value = pairingRequests.value.filter((item) => item.id !== request.id);
   } catch (error) { pairingError.value = error instanceof Error ? error.message : String(error); }
 }
@@ -49,15 +49,14 @@ export async function approvePairing(request: PairingRequest): Promise<void> {
 // The API intentionally owns the user binding. Devices learn it from the
 // authenticated session endpoint rather than a candidate-supplied field.
 async function ownerId(): Promise<string> {
-  const session = await currentSession();
-  const response = await getJsonAuth<{ user_id: string }>("/v1/auth/me", session.token!);
+  const response = await getJsonAuth<{ user_id: string }>("/v1/auth/me");
   return response.user_id;
 }
 
 export async function denyPairing(request: PairingRequest): Promise<void> {
-  const session = await currentSession();
-  if (!session.token) throw new Error("niet ingelogd");
-  await postJsonAuth(`/v1/auth/pairing/requests/${request.id}/deny`, session.token, {});
+  const status = await currentAuthStatus();
+  if (!status.authenticated) throw new Error("niet ingelogd");
+  await postJsonAuth(`/v1/auth/pairing/requests/${request.id}/deny`, {});
   pairingRequests.value = pairingRequests.value.filter((item) => item.id !== request.id);
 }
 
