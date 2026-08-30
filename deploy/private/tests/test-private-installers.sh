@@ -69,8 +69,16 @@ bundle=$(readlink -f /var/lib/jarvis/agents/current)
 [[ $(jq -r '.agents[0].name' "$bundle/manifest.json") == 'Test Agent' ]]
 [[ $(jq -r '.agents[0].model_policy' "$bundle/manifest.json") == default ]]
 [[ $(jq -r '.agents[0].group // "Ungrouped"' "$bundle/manifest.json") == Ungrouped ]]
-[[ $(jq -r '.agents[0].profile_lines' "$bundle/manifest.json") == 13 ]]
-[[ $(jq -r '.agents[0].source_updated_at' "$bundle/manifest.json") == '2026-08-29T12:32:00+00:00' ]]
+profile_lines=$(jq -r '.agents[0].profile_lines' "$bundle/manifest.json")
+[[ $profile_lines == 13 ]] || {
+    echo "safe manifest profile line count mismatch: $profile_lines" >&2
+    exit 1
+}
+source_updated_at=$(jq -r '.agents[0].source_updated_at' "$bundle/manifest.json")
+[[ $source_updated_at == '2026-08-29T12:32:00Z' ]] || {
+    echo "safe manifest source timestamp mismatch: $source_updated_at" >&2
+    exit 1
+}
 [[ $(stat -c '%U:%G:%a' /var/lib/jarvis/agents) == root:jarvis:750 ]]
 [[ $(stat -c '%U:%G:%a' /var/lib/jarvis/agents/releases) == root:jarvis:750 ]]
 [[ $(stat -c '%U:%G:%a' "$bundle") == root:jarvis:750 ]]
