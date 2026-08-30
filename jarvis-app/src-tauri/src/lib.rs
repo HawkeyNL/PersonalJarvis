@@ -10,18 +10,25 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
+#[cfg(desktop)]
+mod app_updates;
+
 /// Legacy desktop auth file. It is read only to migrate existing installs.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct LegacyAuthStore {
     private_key: Option<String>,
     device_id: Option<String>,
     token: Option<String>,
+    #[serde(default)]
+    update_endpoint: Option<String>,
 }
 
 /// Ordinary, non-secret metadata that may remain in the app data directory.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct AuthMetadata {
     device_id: Option<String>,
+    #[serde(default)]
+    update_endpoint: Option<String>,
 }
 
 fn store_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -49,6 +56,7 @@ fn load_metadata(app: &AppHandle) -> Result<AuthMetadata, String> {
     let legacy = load_legacy_store(app)?;
     Ok(AuthMetadata {
         device_id: legacy.device_id,
+        update_endpoint: legacy.update_endpoint,
     })
 }
 
@@ -106,6 +114,7 @@ fn load_secure_auth(app: &AppHandle) -> Result<SecureAuth, String> {
     let legacy = load_legacy_store(app)?;
     let metadata = AuthMetadata {
         device_id: legacy.device_id,
+        update_endpoint: legacy.update_endpoint,
     };
     let had_legacy_secrets = legacy.private_key.is_some() || legacy.token.is_some();
     let mut private_key = load_credential(KEY_ACCOUNT)?;
@@ -255,6 +264,7 @@ fn auth_save(app: AppHandle, device_id: String, token: String) -> Result<(), Str
     save_credential(TOKEN_ACCOUNT, &token)?;
     let metadata = AuthMetadata {
         device_id: Some(device_id),
+        update_endpoint: load_metadata(&app)?.update_endpoint,
     };
     if let Err(error) = save_metadata(&app, &metadata) {
         let _ = delete_credential(TOKEN_ACCOUNT);
@@ -302,6 +312,38 @@ fn auth_reset(app: AppHandle) -> Result<(), String> {
     delete_credential(KEY_ACCOUNT)?;
     delete_credential(TOKEN_ACCOUNT)?;
     save_metadata(&app, &AuthMetadata::default())
+}
+
+/// Store a credential-free updater URL derived from the enrolled Home Node.
+/// The host remains local device configuration and is never compiled into the
+/// application or release manifest.
+#[cfg(desktop)]
+#[tauri::command]
+fn app_update_configure(app: AppHandle, core_base_url: String) -> Result<(), String> {
+    let endpoint = update_endpoint(&core_base_url)?;
+    let mut metadata = load_metadata(&app)?;
+    metadata.update_endpoint = Some(endpoint);
+    save_metadata(&app, &metadata)
+}
+
+#[cfg(desktop)]
+fn update_endpoint(core_base_url: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(core_base_url.trim())
+        .map_err(|_| "Home Node update endpoint is invalid".to_string())?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        return Err("Home Node updates require a credential-free HTTPS origin".to_string());
+    }
+    Ok(format!(
+        "{}/v1/app-updates/stable/{{{{target}}}}/{{{{arch}}}}/{{{{current_version}}}}",
+        core_base_url.trim().trim_end_matches('/')
+    ))
 }
 
 /// Prompt the OS for local verification (Touch ID / Face ID).
@@ -364,6 +406,24 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_http::init())
+        .setup(|app| {
+            #[cfg(desktop)]
+            {
+                use std::sync::Mutex;
+
+                app.manage(app_updates::PendingUpdate(Mutex::new(None)));
+                let enabled = app_updates::updater_public_key().is_some();
+                app.manage(app_updates::UpdateRuntime { enabled });
+                if let Some(public_key) = app_updates::updater_public_key() {
+                    app.handle().plugin(
+                        tauri_plugin_updater::Builder::new()
+                            .pubkey(public_key)
+                            .build(),
+                    )?;
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             device_info,
             auth_public_key,
@@ -375,6 +435,16 @@ pub fn run() {
             auth_logout,
             auth_reset,
             biometric_unlock,
+            #[cfg(desktop)]
+            app_update_configure,
+            #[cfg(desktop)]
+            app_updates::app_update_status,
+            #[cfg(desktop)]
+            app_updates::app_update_check,
+            #[cfg(desktop)]
+            app_updates::app_update_install,
+            #[cfg(desktop)]
+            app_updates::app_update_restart,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -392,6 +462,7 @@ mod tests {
         .unwrap();
         let metadata = AuthMetadata {
             device_id: legacy.device_id,
+            update_endpoint: None,
         };
         let encoded = String::from_utf8(metadata_bytes(&metadata).unwrap()).unwrap();
         assert!(encoded.contains("device"));
@@ -408,5 +479,18 @@ mod tests {
             .verifying_key()
             .verify_strict(&[9_u8; 32], &signature)
             .is_ok());
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn update_endpoint_requires_a_credential_free_https_origin() {
+        let endpoint = update_endpoint("https://home.example").unwrap();
+        assert_eq!(
+            endpoint,
+            "https://home.example/v1/app-updates/stable/{{target}}/{{arch}}/{{current_version}}"
+        );
+        assert!(update_endpoint("http://home.example").is_err());
+        assert!(update_endpoint("https://token@home.example").is_err());
+        assert!(update_endpoint("https://home.example/other").is_err());
     }
 }

@@ -24,6 +24,19 @@ import {
   setWakeEnabled,
 } from "../voicewake";
 import { mics, selectedMic, setMic, listMics } from "../micDevices";
+import {
+  availableAppVersion,
+  checkForUpdate,
+  configureHomeNodeUpdates,
+  currentAppVersion,
+  installAvailableUpdate,
+  loadUpdateStatus,
+  restartAfterUpdate,
+  updateBusy,
+  updateError,
+  updateProgress,
+  updateState,
+} from "../updates";
 
 async function onEnroll() {
   await enroll();
@@ -61,6 +74,8 @@ async function doUnlink() {
 
 onMounted(async () => {
   session.value = await currentAuthStatus();
+  await configureHomeNodeUpdates(API_BASE);
+  await loadUpdateStatus();
   await initLock(); // resolves isDesktop for the lock toggle
   await refreshVoiceStatus();
   await listMics();
@@ -221,6 +236,49 @@ onMounted(async () => {
     </div>
 
     <div class="panel glass">
+      <div class="panel-head">JARVIS APP <span class="hint">private updates</span></div>
+      <ul class="kv">
+        <li><span class="k">Versie</span><span class="v mono">v{{ currentAppVersion }}</span></li>
+        <li>
+          <span class="k">Status</span>
+          <span class="v">
+            <span class="dot" :class="updateState === 'error' ? 'dot-err' : updateState === 'available' ? 'dot-todo' : 'dot-ok'"></span>
+            <template v-if="updateState === 'checking'">controleren…</template>
+            <template v-else-if="updateState === 'downloading'">downloaden{{ updateProgress === null ? '…' : ` · ${updateProgress}%` }}</template>
+            <template v-else-if="updateState === 'installing'">installeren…</template>
+            <template v-else-if="updateState === 'available'">v{{ availableAppVersion }} beschikbaar</template>
+            <template v-else-if="updateState === 'installed'">installatie gereed</template>
+            <template v-else-if="updateState === 'up_to_date'">up-to-date</template>
+            <template v-else-if="updateState === 'ready'">gereed om te controleren</template>
+            <template v-else-if="updateState === 'unauthenticated'">log in om te controleren</template>
+            <template v-else-if="updateState === 'unconfigured'">Home Node niet geconfigureerd</template>
+            <template v-else-if="updateState === 'unsupported'">niet beschikbaar in deze build</template>
+            <template v-else-if="updateState === 'error'">controle mislukt</template>
+            <template v-else>gereed</template>
+          </span>
+        </li>
+      </ul>
+      <div v-if="updateState === 'downloading' || updateState === 'installing'" class="update-progress" aria-live="polite">
+        <span :style="{ width: `${updateProgress ?? 15}%` }"></span>
+      </div>
+      <div class="update-actions">
+        <button v-if="updateState === 'available'" class="ghost" :disabled="updateBusy" @click="installAvailableUpdate">
+          Update nu
+        </button>
+        <button v-else-if="updateState === 'installed'" class="ghost" @click="restartAfterUpdate">
+          Herstart Jarvis
+        </button>
+        <button v-else class="ghost" :disabled="updateBusy || updateState === 'unsupported'" @click="checkForUpdate">
+          Controleer op updates
+        </button>
+      </div>
+      <p v-if="updateError" class="small errc">{{ updateError }}</p>
+      <p v-else class="muted small">
+        Updates komen via je gekoppelde Home Node en worden vóór installatie cryptografisch gecontroleerd.
+      </p>
+    </div>
+
+    <div class="panel glass">
       <div class="panel-head">SYSTEEM <span class="hint">info</span></div>
       <ul class="kv">
         <li><span class="k">Backend</span><span class="v mono">{{ API_BASE }}</span></li>
@@ -358,6 +416,16 @@ onMounted(async () => {
 }
 .micsel:focus { outline: none; border-color: var(--accent); }
 .enroll .ghost { margin-top: 0; }
+.update-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.update-actions .ghost { margin-top: 14px; }
+.update-progress {
+  height: 6px; margin-top: 14px; overflow: hidden; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+}
+.update-progress span {
+  display: block; height: 100%; min-width: 8px; border-radius: inherit;
+  background: var(--accent); transition: width 0.2s ease;
+}
 .okc { color: var(--accent); }
 .errc { color: #f87171; }
 </style>
