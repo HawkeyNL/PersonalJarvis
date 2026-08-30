@@ -23,6 +23,10 @@ cleanup() {
     rm -f -- /etc/jarvis/updater.env
     rm -rf -- /usr/local/sbin/jarvis
     rm -f -- /usr/local/libexec/jarvis/update-core-release
+    rm -f -- /usr/bin/jarvis-core-admin \
+        /usr/share/applications/jarvis-core-admin.desktop \
+        /usr/share/icons/hicolor/128x128/apps/jarvis-core-admin.png
+    rm -rf -- /usr/share/jarvis-core-admin
 }
 trap cleanup EXIT
 
@@ -57,7 +61,7 @@ case "$url" in
     */releases/latest|*/releases/tags/*)
         cat "$JARVIS_UPDATER_FIXTURE/metadata.json"
         ;;
-    *.tar.gz.sha256)
+    *.tar.gz.sha256|*-components.json|*-components.json.sha256)
         cp "$JARVIS_UPDATER_FIXTURE/${url##*/}" "$output"
         ;;
     *.tar.gz)
@@ -79,6 +83,9 @@ write_release() {
     local root=$1
     local tag=$2
     local schema_sha256=$3
+    local core_version=${4:-${tag#v}}
+    local cli_version=${5:-${tag#v}}
+    local app_version=${6:-${tag#v}}
     mkdir -p "$root/jarvis-core-$tag"
     chmod 0755 "$root/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
@@ -91,13 +98,23 @@ write_release() {
     chmod 0755 "$root/jarvis-core-$tag/jarvis-agent-bundle"
     printf '#!/usr/bin/env bash\nprintf "Jarvis admin %s\\n"\n' "$tag" > "$root/jarvis-core-$tag/jarvis"
     chmod 0755 "$root/jarvis-core-$tag/jarvis"
+    printf '#!/usr/bin/env bash\n[[ ${1:-} == --component-version ]] && { printf "%%s\\n" "%s"; exit 0; }\nexit 0\n' \
+        "$app_version" > "$root/jarvis-core-$tag/jarvis-core-admin"
+    chmod 0755 "$root/jarvis-core-$tag/jarvis-core-admin"
+    printf '[Desktop Entry]\nType=Application\nName=Jarvis Core Administration\nExec=/usr/bin/jarvis-core-admin\n' \
+        > "$root/jarvis-core-$tag/jarvis-core-admin.desktop"
+    printf 'synthetic png fixture\n' > "$root/jarvis-core-$tag/jarvis-core-admin.png"
+    printf '%s\n' "$app_version" > "$root/jarvis-core-$tag/jarvis-core-admin.version"
     cp "$updater" "$root/jarvis-core-$tag/update-core-release"
     printf '\n# verified release tooling: %s\n' "$tag" >> "$root/jarvis-core-$tag/update-core-release"
     chmod 0755 "$root/jarvis-core-$tag/update-core-release"
     jq -n \
         --arg tag "$tag" \
         --arg schema_sha256 "$schema_sha256" \
-        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256}' \
+        --arg core_version "$core_version" \
+        --arg cli_version "$cli_version" \
+        --arg app_version "$app_version" \
+        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}}' \
         > "$root/jarvis-core-$tag/release.json"
     chmod 0644 "$root/jarvis-core-$tag/release.json"
     printf '%064d  jarvis-core-%s-linux-x86_64.tar.gz\n' 0 "$tag" \
@@ -117,24 +134,43 @@ seed_active_release() {
     printf 'synthetic protected persona\n' > /etc/jarvis/Jarvis.md
     chown root:root /etc/jarvis/Jarvis.md
     chmod 0600 /etc/jarvis/Jarvis.md
+    install -d -o root -g root -m 0755 /usr/share/jarvis-core-admin \
+        /usr/share/applications /usr/share/icons/hicolor/128x128/apps
+    install -o root -g root -m 0755 "/opt/jarvis/releases/$tag/jarvis-core-admin" /usr/bin/jarvis-core-admin
+    install -o root -g root -m 0644 "/opt/jarvis/releases/$tag/jarvis-core-admin.desktop" \
+        /usr/share/applications/jarvis-core-admin.desktop
+    install -o root -g root -m 0644 "/opt/jarvis/releases/$tag/jarvis-core-admin.png" \
+        /usr/share/icons/hicolor/128x128/apps/jarvis-core-admin.png
+    install -o root -g root -m 0644 "/opt/jarvis/releases/$tag/jarvis-core-admin.version" \
+        /usr/share/jarvis-core-admin/version
 }
 
 prepare_candidate() {
     local tag=$1
     local schema_sha256=$2
+    local core_version=${3:-${tag#v}}
+    local cli_version=${4:-${tag#v}}
+    local app_version=${5:-${tag#v}}
     local asset_root="$fixture_dir/asset"
     local artifact="jarvis-core-$tag-linux-x86_64.tar.gz"
     rm -rf -- "$asset_root"
     mkdir -p "$asset_root"
-    write_release "$asset_root" "$tag" "$schema_sha256"
+    write_release "$asset_root" "$tag" "$schema_sha256" "$core_version" "$cli_version" "$app_version"
     # Published artifacts do not carry an installation marker. The updater
     # must create it only after validating the downloaded archive checksum.
     rm -f -- "$asset_root/jarvis-core-$tag/release.verification"
-    rm -f -- "$fixture_dir"/*.tar.gz "$fixture_dir"/*.tar.gz.sha256
+    rm -f -- "$fixture_dir"/*.tar.gz "$fixture_dir"/*.tar.gz.sha256 \
+        "$fixture_dir"/*-components.json "$fixture_dir"/*-components.json.sha256
     tar -C "$asset_root" -czf "$fixture_dir/$artifact" "jarvis-core-$tag"
     (
         cd "$fixture_dir"
         sha256sum "$artifact" > "$artifact.sha256"
+    )
+    jq '{tag, revision, components}' "$asset_root/jarvis-core-$tag/release.json" \
+        > "$fixture_dir/jarvis-core-$tag-components.json"
+    (
+        cd "$fixture_dir"
+        sha256sum "jarvis-core-$tag-components.json" > "jarvis-core-$tag-components.json.sha256"
     )
     jq -n --arg tag "$tag" '
         {
@@ -149,6 +185,14 @@ prepare_candidate() {
             {
               name: ("jarvis-core-" + $tag + "-linux-x86_64.tar.gz.sha256"),
               browser_download_url: ("https://github.com/HawkeyNL/PersonalJarvis/releases/download/" + $tag + "/jarvis-core-" + $tag + "-linux-x86_64.tar.gz.sha256")
+            },
+            {
+              name: ("jarvis-core-" + $tag + "-components.json"),
+              browser_download_url: ("https://github.com/HawkeyNL/PersonalJarvis/releases/download/" + $tag + "/jarvis-core-" + $tag + "-components.json")
+            },
+            {
+              name: ("jarvis-core-" + $tag + "-components.json.sha256"),
+              browser_download_url: ("https://github.com/HawkeyNL/PersonalJarvis/releases/download/" + $tag + "/jarvis-core-" + $tag + "-components.json.sha256")
             }
           ]
         }
@@ -192,6 +236,8 @@ run_updater
 grep -Eq "^[0-9a-f]{64}  jarvis-core-v1.0.1-linux-x86_64.tar.gz$" /opt/jarvis/releases/v1.0.1/release.verification
 cmp /opt/jarvis/releases/v1.0.1/jarvis /usr/local/sbin/jarvis
 cmp /opt/jarvis/releases/v1.0.1/update-core-release /usr/local/libexec/jarvis/update-core-release
+cmp /opt/jarvis/releases/v1.0.1/jarvis-core-admin /usr/bin/jarvis-core-admin
+cmp /opt/jarvis/releases/v1.0.1/jarvis-core-admin.version /usr/share/jarvis-core-admin/version
 [[ $(stat -c '%U:%G:%a' /etc/jarvis/updater.env) == root:root:600 ]]
 grep -qx 'JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis' /etc/jarvis/updater.env
 grep -qx 'JARVIS_UPDATE_CHANNEL=stable' /etc/jarvis/updater.env
@@ -280,15 +326,22 @@ fi
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v5.0.1 ]]
 
 # A check is strictly non-mutating and uses a useful exit status for scripts.
+# This candidate changes only the graphical administrator component version;
+# it must still be visible as an update for the newer immutable bundle tag.
 seed_active_release v6.0.0 "$same_migrations"
-prepare_candidate v6.0.1 "$same_migrations"
-if run_updater --check; then
-    echo "available update check unexpectedly returned success" >&2
-    exit 1
-else
-    [[ $? == 2 ]]
-fi
+prepare_candidate v6.0.1 "$same_migrations" 6.0.0 6.0.0 6.0.1
+check_status=0
+check_output=$(run_updater --check) || check_status=$?
+[[ $check_status == 2 ]]
+grep -Fq 'Core current: 6.0.0' <<< "$check_output"
+grep -Fq 'Core latest: 6.0.0' <<< "$check_output"
+grep -Fq 'CLI latest: 6.0.0' <<< "$check_output"
+grep -Fq 'Core app latest: 6.0.1' <<< "$check_output"
+grep -Fq 'Update:   available' <<< "$check_output"
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v6.0.0 ]]
+run_updater
+grep -qx '6.0.1' /usr/share/jarvis-core-admin/version
+cmp /opt/jarvis/releases/v6.0.1/jarvis-core-admin /usr/bin/jarvis-core-admin
 
 # Explicit versions still use the same published-release metadata and verified
 # artifact path; they are not raw tags or arbitrary URLs.

@@ -35,7 +35,7 @@ jobs:
         run: |
           cargo build -p jarvis-admin --features tui-preview
           python3 scripts/ci/test-admin-tui-pty.py target/debug/jarvis \
-            --fixture-preview --preview-scenario update-center
+            --fixture-preview --preview-scenario home
       - name: SurrealDB persistence security tests
         run: |
           docker run --detach --rm --name jarvis-surreal-test -p 127.0.0.1:8000:8000 \

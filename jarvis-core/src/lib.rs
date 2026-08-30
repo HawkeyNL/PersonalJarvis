@@ -46,6 +46,10 @@ pub fn load_persona(path: &str) -> (Arc<str>, bool) {
 pub struct AgentDefinition {
     pub id: String,
     pub name: String,
+    /// Optional non-secret presentation category copied into the public
+    /// bundle manifest. It must never be derived from agent instructions.
+    #[serde(default)]
+    pub group: Option<String>,
     pub description: String,
     pub model_policy: String,
     pub instructions: String,
@@ -119,6 +123,14 @@ pub struct AgentBundleEntry {
     pub id: String,
     pub path: String,
     pub sha256: String,
+    /// Safe presentation metadata. These fields are optional so existing
+    /// immutable version-1 manifests remain loadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<String>,
 }
 
 /// Registry loaded from a versioned, immutable private agent bundle.
@@ -211,6 +223,18 @@ impl AgentRegistry {
             }
             if entry.sha256.len() != 64
                 || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || entry
+                    .name
+                    .as_deref()
+                    .is_some_and(|value| !is_safe_label(value))
+                || entry
+                    .group
+                    .as_deref()
+                    .is_some_and(|value| !is_safe_label(value))
+                || entry
+                    .model_policy
+                    .as_deref()
+                    .is_some_and(|value| AgentModelPolicy::parse(value).is_none())
             {
                 return Err(AgentRegistryError::MalformedBundle);
             }
@@ -227,7 +251,17 @@ impl AgentRegistry {
             let agent: AgentDefinition =
                 serde_json::from_slice(&bytes).map_err(|_| AgentRegistryError::MalformedBundle)?;
             validate_definition(&agent)?;
-            if agent.id != entry.id {
+            if agent.id != entry.id
+                || entry.name.as_ref().is_some_and(|name| *name != agent.name)
+                || entry
+                    .group
+                    .as_ref()
+                    .is_some_and(|group| agent.group.as_ref() != Some(group))
+                || entry
+                    .model_policy
+                    .as_ref()
+                    .is_some_and(|policy| *policy != agent.model_policy)
+            {
                 return Err(AgentRegistryError::MalformedBundle);
             }
             agents.push(agent);
@@ -288,6 +322,7 @@ impl AgentLoader {
         let agent = AgentDefinition {
             id: required_frontmatter(&frontmatter, "id")?.to_string(),
             name: required_frontmatter(&frontmatter, "name")?.to_string(),
+            group: frontmatter.get("group").cloned(),
             description: required_frontmatter(&frontmatter, "description")?.to_string(),
             model_policy: required_frontmatter(&frontmatter, "model_policy")?.to_string(),
             instructions: instructions.trim().to_string(),
@@ -349,6 +384,7 @@ fn parse_frontmatter(
         "schema_version",
         "id",
         "name",
+        "group",
         "description",
         "model_policy",
         "requested_capabilities",
@@ -511,6 +547,15 @@ fn is_safe_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+fn is_safe_label(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.chars().count() <= 80
+        && value
+            .chars()
+            .all(|character| !character.is_control() && character != '\u{1b}')
+}
+
 fn is_safe_bundle_path(value: &str) -> bool {
     let path = PathBuf::from(value);
     path.components().count() == 2
@@ -523,7 +568,11 @@ fn is_safe_bundle_path(value: &str) -> bool {
 
 fn validate_definition(agent: &AgentDefinition) -> Result<(), AgentRegistryError> {
     if !is_safe_id(&agent.id)
-        || agent.name.trim().is_empty()
+        || !is_safe_label(&agent.name)
+        || agent
+            .group
+            .as_deref()
+            .is_some_and(|group| !is_safe_label(group))
         || agent.description.trim().is_empty()
         || agent.model_policy.trim().is_empty()
         || agent.instructions.trim().is_empty()
@@ -588,6 +637,7 @@ mod tests {
         let agent = serde_json::json!({
             "id": "research",
             "name": "Research",
+            "group": "Development",
             "description": "Synthetic CI fixture.",
             "model_policy": "default",
             "instructions": "Summarise trusted input.",
@@ -604,7 +654,14 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "version": 1,
                 "bundle_id": "bundle-test",
-                "agents": [{"id": "research", "path": "agents/research.json", "sha256": hash}]
+                "agents": [{
+                    "id": "research",
+                    "path": "agents/research.json",
+                    "sha256": hash,
+                    "name": "Research",
+                    "group": "Development",
+                    "model_policy": "default"
+                }]
             }))
             .unwrap(),
         )
@@ -612,12 +669,13 @@ mod tests {
         (directory, hash)
     }
 
-    const VALID_MARKDOWN_AGENT: &str = "---\nschema_version: 1\nid: research\nname: Research\ndescription: Synthetic fixture\nmodel_policy: research\nrequested_capabilities:\n  - read_data\nmax_runtime_seconds: 30\nmax_context_chars: 1000\nmax_output_chars: 500\nmax_parallel_runs: 1\n---\n\n# Research\n\nSummarise trusted input.\n";
+    const VALID_MARKDOWN_AGENT: &str = "---\nschema_version: 1\nid: research\nname: Research\ngroup: Development\ndescription: Synthetic fixture\nmodel_policy: research\nrequested_capabilities:\n  - read_data\nmax_runtime_seconds: 30\nmax_context_chars: 1000\nmax_output_chars: 500\nmax_parallel_runs: 1\n---\n\n# Research\n\nSummarise trusted input.\n";
 
     #[test]
     fn strict_markdown_loader_accepts_only_versioned_frontmatter() {
         let agent = AgentLoader::parse_markdown(VALID_MARKDOWN_AGENT).unwrap();
         assert_eq!(agent.id, "research");
+        assert_eq!(agent.group.as_deref(), Some("Development"));
         assert_eq!(agent.requested_capabilities, vec![Capability::ReadData]);
         assert!(agent.instructions.contains("Summarise"));
         assert!(matches!(
@@ -676,6 +734,21 @@ mod tests {
         assert!(matches!(
             AgentRegistry::load(&directory),
             Err(AgentRegistryError::UnsafePath)
+        ));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn registry_rejects_manifest_metadata_that_disagrees_with_private_definition() {
+        let (directory, _) = fixture_registry();
+        let manifest = directory.join("manifest.json");
+        let mut parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        parsed["agents"][0]["group"] = serde_json::Value::String("Trading".into());
+        std::fs::write(&manifest, serde_json::to_vec(&parsed).unwrap()).unwrap();
+        assert!(matches!(
+            AgentRegistry::load(&directory),
+            Err(AgentRegistryError::MalformedBundle)
         ));
         let _ = std::fs::remove_dir_all(directory);
     }

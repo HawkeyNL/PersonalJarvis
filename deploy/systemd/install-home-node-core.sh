@@ -76,6 +76,38 @@ jq -e --arg tag "$release_tag" '
     echo "release manifest is invalid or mismatched" >&2
     exit 1
 }
+release_has_core_admin=false
+if jq -e '.components? != null' "$release_dir/release.json" >/dev/null; then
+    jq -e '.components | [.core, .cli, .core_admin] | all(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
+        "$release_dir/release.json" >/dev/null || {
+        echo "release component versions are invalid" >&2
+        exit 1
+    }
+    release_has_core_admin=true
+    [[ -x $release_dir/jarvis-core-admin && ! -L $release_dir/jarvis-core-admin ]] || {
+        echo "missing graphical administrator binary" >&2
+        exit 1
+    }
+    for app_file in jarvis-core-admin.desktop jarvis-core-admin.png jarvis-core-admin.version; do
+        [[ -f $release_dir/$app_file && ! -L $release_dir/$app_file ]] || {
+            echo "graphical administrator packaging is incomplete" >&2
+            exit 1
+        }
+    done
+    read -r packaged_app_version extra < "$release_dir/jarvis-core-admin.version" || {
+        echo "graphical administrator version file is invalid" >&2
+        exit 1
+    }
+    [[ -z ${extra:-} && $packaged_app_version == \
+        "$(jq -r '.components.core_admin' "$release_dir/release.json")" ]] || {
+        echo "graphical administrator version does not match release manifest" >&2
+        exit 1
+    }
+    [[ $("$release_dir/jarvis-core-admin" --component-version) == "$packaged_app_version" ]] || {
+        echo "graphical administrator executable version does not match release manifest" >&2
+        exit 1
+    }
+fi
 [[ -f /etc/jarvis/core.env && ! -L /etc/jarvis/core.env ]] || {
     echo "missing /etc/jarvis/core.env; create it from deploy/systemd/README.md first" >&2
     exit 1
@@ -168,6 +200,17 @@ install -o root -g root -m 0755 \
 install -o root -g root -m 0755 \
     "$release_dir/jarvis" \
     /usr/local/sbin/jarvis
+if [[ $release_has_core_admin == true ]]; then
+    install -d -o root -g root -m 0755 /usr/share/jarvis-core-admin \
+        /usr/share/applications /usr/share/icons/hicolor/128x128/apps
+    install -o root -g root -m 0755 "$release_dir/jarvis-core-admin" /usr/bin/jarvis-core-admin
+    install -o root -g root -m 0644 "$release_dir/jarvis-core-admin.desktop" \
+        /usr/share/applications/jarvis-core-admin.desktop
+    install -o root -g root -m 0644 "$release_dir/jarvis-core-admin.png" \
+        /usr/share/icons/hicolor/128x128/apps/jarvis-core-admin.png
+    install -o root -g root -m 0644 "$release_dir/jarvis-core-admin.version" \
+        /usr/share/jarvis-core-admin/version
+fi
 install -o root -g root -m 0755 \
     "$repo_dir/deploy/systemd/verify-home-node.sh" \
     /usr/local/libexec/jarvis/verify-home-node

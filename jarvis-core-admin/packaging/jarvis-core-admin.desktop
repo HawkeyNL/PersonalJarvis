@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Jarvis Core Administration
+Comment=Administer the local Jarvis Home Node
+Exec=/usr/bin/jarvis-core-admin
+Icon=jarvis-core-admin
+Terminal=false
+Categories=System;Utility;
+Keywords=Jarvis;Home Node;Administration;
+StartupNotify=true
+StartupWMClass=jarvis-core-admin

@@ -27,6 +27,7 @@ release_name="jarvis-core-$release_tag"
 stage_root="$output_root/candidate"
 release_dir="$stage_root/$release_name"
 artifact="$output_root/$release_name-linux-x86_64.tar.gz"
+components_asset="$output_root/$release_name-components.json"
 
 if [[ "$mode" == package ]]; then
   [[ -d "$release_dir" ]] || {
@@ -44,6 +45,8 @@ if [[ "$mode" == package ]]; then
   tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
     -C "$stage_root" -czf "$artifact" "$release_name"
   (cd "$output_root" && sha256sum "$(basename "$artifact")" > "$(basename "$artifact").sha256")
+  jq '{tag, revision, components}' "$release_dir/release.json" > "$components_asset"
+  (cd "$output_root" && sha256sum "$(basename "$components_asset")" > "$(basename "$components_asset").sha256")
   echo "Packaged tested candidate: $artifact"
   exit 0
 fi
@@ -61,6 +64,11 @@ source /etc/os-release
 [[ "$(cargo --version)" == "cargo 1.97.1 (c980f4866 2026-06-30)" ]] || {
   echo "release staging requires cargo 1.97.1 (c980f4866 2026-06-30)" >&2
   cargo -Vv >&2
+  exit 1
+}
+[[ "$(node --version)" == "v24.20.0" ]] || {
+  echo "release staging requires Node.js v24.20.0" >&2
+  node --version >&2
   exit 1
 }
 [[ -z "${RUSTFLAGS:-}" && -z "${CARGO_ENCODED_RUSTFLAGS:-}" ]] || {
@@ -88,12 +96,29 @@ export CARGO_INCREMENTAL=0
 export CARGO_TARGET_DIR=$release_target_dir
 export RUSTFLAGS=$deterministic_rustflags
 
+bash jarvis-core-admin/scripts/verify-versions.sh
+workspace_metadata=$(cargo metadata --locked --no-deps --format-version 1)
+app_metadata=$(cargo metadata --locked --no-deps --format-version 1 \
+  --manifest-path jarvis-core-admin/src-tauri/Cargo.toml)
+core_version=$(jq -er '.packages[] | select(.name == "jarvis-api") | .version' <<<"$workspace_metadata")
+cli_version=$(jq -er '.packages[] | select(.name == "jarvis-admin") | .version' <<<"$workspace_metadata")
+core_admin_version=$(jq -er '.packages[] | select(.name == "jarvis-core-admin") | .version' <<<"$app_metadata")
+
 # One Cargo invocation produces every release executable. Later steps copy and
 # test these exact bytes; nothing recompiles between acceptance and packaging.
 cargo build --locked --release \
   -p jarvis-api --bins \
   -p jarvis-core --bin jarvis-agent-bundle \
   -p jarvis-admin --bin jarvis
+
+# The Linux graphical administrator is a separate Tauri workspace. Its Vue
+# assets and Rust executable are built once here; the exact executable is then
+# staged, acceptance-tested and published with the Core release candidate.
+npm ci --prefix jarvis-core-admin
+npm run build --prefix jarvis-core-admin
+cargo build --locked --release \
+  --manifest-path jarvis-core-admin/src-tauri/Cargo.toml \
+  --bin jarvis-core-admin
 
 mkdir -p "$output_root"
 temporary=$(mktemp -d "$output_root/.candidate.XXXXXX")
@@ -105,6 +130,12 @@ install -m 0755 "$release_target_dir/release/jarvis-config-broker" "$temporary_r
 install -m 0755 "$release_target_dir/release/jarvis-codex-broker" "$temporary_release/jarvis-codex-broker"
 install -m 0755 "$release_target_dir/release/jarvis-agent-bundle" "$temporary_release/jarvis-agent-bundle"
 install -m 0755 "$release_target_dir/release/jarvis" "$temporary_release/jarvis"
+install -m 0755 "$release_target_dir/release/jarvis-core-admin" "$temporary_release/jarvis-core-admin"
+install -m 0644 jarvis-core-admin/packaging/jarvis-core-admin.desktop \
+  "$temporary_release/jarvis-core-admin.desktop"
+install -m 0644 jarvis-app/src-tauri/icons/128x128.png \
+  "$temporary_release/jarvis-core-admin.png"
+printf '%s\n' "$core_admin_version" > "$temporary_release/jarvis-core-admin.version"
 install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update-core-release"
 
 schema_manifest="$temporary/schema.sha256"
@@ -116,12 +147,17 @@ jq -n \
   --arg tag "$release_tag" \
   --arg revision "$release_revision" \
   --arg schema_sha256 "$schema_sha256" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256}' \
+  --arg core_version "$core_version" \
+  --arg cli_version "$cli_version" \
+  --arg core_admin_version "$core_admin_version" \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}}' \
   > "$temporary_release/release.json"
 
 (
   cd "$temporary_release"
-  sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-agent-bundle jarvis update-core-release \
+  sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-agent-bundle \
+    jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
+    jarvis-core-admin.version update-core-release \
     > artifact-binaries.sha256
 )
 rustc_version=$(rustc --version)

@@ -9,6 +9,10 @@ readonly lock_file=/run/jarvis-updater.lock
 readonly updater_config=/etc/jarvis/updater.env
 readonly canonical_repository=HawkeyNL/PersonalJarvis
 readonly api_url=https://api.github.com
+readonly core_admin_binary=/usr/bin/jarvis-core-admin
+readonly core_admin_desktop=/usr/share/applications/jarvis-core-admin.desktop
+readonly core_admin_icon=/usr/share/icons/hicolor/128x128/apps/jarvis-core-admin.png
+readonly core_admin_version_file=/usr/share/jarvis-core-admin/version
 repository=
 github_curl_netrc=
 
@@ -98,6 +102,10 @@ version_is_newer() {
         ((10#$candidate_major == 10#$installed_major && 10#$candidate_minor == 10#$installed_minor && 10#$candidate_patch > 10#$installed_patch))
 }
 
+valid_component_version() {
+    [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
 schema_fingerprint() {
     jq -er '.schema_sha256 | strings | select(test("^[0-9a-f]{64}$"))' "$1"
 }
@@ -110,7 +118,7 @@ cleanup() {
     esac
 }
 
-for command in awk curl find flock jq sha256sum stat tar systemctl readlink mv ln mktemp install; do
+for command in awk curl find flock jq sha256sum stat tar systemctl readlink mv ln mktemp install wc; do
     require_command "$command"
 done
 
@@ -152,11 +160,32 @@ current_target=$(readlink -f -- "$current_link")
 [[ $current_target == "$releases_dir"/* ]] || fail "current release is outside the release directory"
 current_tag=
 current_schema_sha256=
+current_core_version=unavailable
+current_cli_version=unavailable
+current_core_admin_version=not-installed
 if [[ -f $current_target/release.json && ! -L $current_target/release.json ]]; then
     current_tag=$(jq -er '.tag | strings' "$current_target/release.json" 2>/dev/null || true)
     [[ $current_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
         fail "installed release manifest has an unsafe tag"
     current_schema_sha256=$(schema_fingerprint "$current_target/release.json" 2>/dev/null || true)
+    current_core_version=$(jq -er '.components.core // empty | strings' "$current_target/release.json" 2>/dev/null || true)
+    current_cli_version=$(jq -er '.components.cli // empty | strings' "$current_target/release.json" 2>/dev/null || true)
+    valid_component_version "$current_core_version" || current_core_version=${current_tag#v}
+    valid_component_version "$current_cli_version" || current_cli_version=${current_tag#v}
+fi
+if [[ -f $core_admin_version_file && ! -L $core_admin_version_file && \
+    $(stat -c '%U:%G:%a' "$core_admin_version_file") == root:root:644 ]]; then
+    read -r current_core_admin_version extra < "$core_admin_version_file" || true
+    [[ -z ${extra:-} ]] || current_core_admin_version=unavailable
+    valid_component_version "$current_core_admin_version" || current_core_admin_version=unavailable
+    if [[ $current_core_admin_version != unavailable && -x $core_admin_binary && \
+        ! -L $core_admin_binary && $(stat -c '%U:%G' "$core_admin_binary") == root:root ]]; then
+        installed_app_binary_version=$("$core_admin_binary" --component-version 2>/dev/null || true)
+        [[ $installed_app_binary_version == "$current_core_admin_version" ]] || \
+            current_core_admin_version=unavailable
+    else
+        current_core_admin_version=unavailable
+    fi
 fi
 previous_tag=
 
@@ -276,6 +305,29 @@ inspect_release() {
             return 0
         }
     done
+    if jq -e '.components.core_admin? | strings' "$release/release.json" >/dev/null 2>&1; then
+        local inspected_app_version inspected_extra
+        for app_file in jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png jarvis-core-admin.version; do
+            [[ -f $release/$app_file && ! -L $release/$app_file ]] || {
+                inspected_reason="graphical administrator artifact is unavailable"
+                return 0
+            }
+        done
+        [[ -x $release/jarvis-core-admin ]] || {
+            inspected_reason="graphical administrator is not executable"
+            return 0
+        }
+        read -r inspected_app_version inspected_extra < "$release/jarvis-core-admin.version" || {
+            inspected_reason="graphical administrator version is invalid"
+            return 0
+        }
+        [[ -z ${inspected_extra:-} && $inspected_app_version == \
+            "$(jq -r '.components.core_admin' "$release/release.json")" && \
+            "$("$release/jarvis-core-admin" --component-version 2>/dev/null || true)" == "$inspected_app_version" ]] || {
+            inspected_reason="graphical administrator version does not match manifest"
+            return 0
+        }
+    fi
 
     inspected_structurally_valid=true
     inspected_schema=$schema
@@ -359,32 +411,84 @@ find_or_migrate_rollback_target() {
 }
 
 install_versioned_tooling() {
-    local release=$1 admin_tmp updater_tmp admin_previous updater_previous
+    local release=$1 admin_tmp updater_tmp admin_previous updater_previous app_present=false
+    local admin_had_previous=false updater_had_previous=false
+    local app_tmp desktop_tmp icon_tmp version_tmp app_previous desktop_previous icon_previous version_previous
     admin_tmp=/usr/local/sbin/.jarvis.new
     updater_tmp=/usr/local/libexec/jarvis/.update-core-release.new
     admin_previous=/usr/local/sbin/.jarvis.previous
     updater_previous=/usr/local/libexec/jarvis/.update-core-release.previous
-    rm -f -- "$admin_tmp" "$updater_tmp" "$admin_previous" "$updater_previous"
+    app_tmp=/usr/bin/.jarvis-core-admin.new
+    desktop_tmp=/usr/share/applications/.jarvis-core-admin.desktop.new
+    icon_tmp=/usr/share/icons/hicolor/128x128/apps/.jarvis-core-admin.png.new
+    version_tmp=/usr/share/jarvis-core-admin/.version.new
+    app_previous=/usr/bin/.jarvis-core-admin.previous
+    desktop_previous=/usr/share/applications/.jarvis-core-admin.desktop.previous
+    icon_previous=/usr/share/icons/hicolor/128x128/apps/.jarvis-core-admin.png.previous
+    version_previous=/usr/share/jarvis-core-admin/.version.previous
+    if [[ -f $release/jarvis-core-admin && ! -L $release/jarvis-core-admin ]]; then
+        app_present=true
+        [[ ! -e $core_admin_binary && ! -L $core_admin_binary || -f $core_admin_binary && ! -L $core_admin_binary ]] || return 1
+        [[ ! -e $core_admin_desktop && ! -L $core_admin_desktop || -f $core_admin_desktop && ! -L $core_admin_desktop ]] || return 1
+        [[ ! -e $core_admin_icon && ! -L $core_admin_icon || -f $core_admin_icon && ! -L $core_admin_icon ]] || return 1
+        [[ ! -e $core_admin_version_file && ! -L $core_admin_version_file || -f $core_admin_version_file && ! -L $core_admin_version_file ]] || return 1
+    fi
+    rm -f -- "$admin_tmp" "$updater_tmp" "$admin_previous" "$updater_previous" \
+        "$app_tmp" "$desktop_tmp" "$icon_tmp" "$version_tmp" \
+        "$app_previous" "$desktop_previous" "$icon_previous" "$version_previous"
     install -o root -g root -m 0755 "$release/jarvis" "$admin_tmp" || return 1
     install -o root -g root -m 0755 "$release/update-core-release" "$updater_tmp" || return 1
-    [[ -f /usr/local/sbin/jarvis && ! -L /usr/local/sbin/jarvis ]] && \
-        install -o root -g root -m 0755 /usr/local/sbin/jarvis "$admin_previous"
-    [[ -f /usr/local/libexec/jarvis/update-core-release && ! -L /usr/local/libexec/jarvis/update-core-release ]] && \
-        install -o root -g root -m 0755 /usr/local/libexec/jarvis/update-core-release "$updater_previous"
-    if ! mv -Tf "$updater_tmp" /usr/local/libexec/jarvis/update-core-release; then
-        rm -f -- "$admin_tmp" "$updater_tmp" "$admin_previous" "$updater_previous"
-        return 1
+    if [[ $app_present == true ]]; then
+        install -d -o root -g root -m 0755 /usr/share/jarvis-core-admin \
+            /usr/share/applications /usr/share/icons/hicolor/128x128/apps || return 1
+        install -o root -g root -m 0755 "$release/jarvis-core-admin" "$app_tmp" || return 1
+        install -o root -g root -m 0644 "$release/jarvis-core-admin.desktop" "$desktop_tmp" || return 1
+        install -o root -g root -m 0644 "$release/jarvis-core-admin.png" "$icon_tmp" || return 1
+        install -o root -g root -m 0644 "$release/jarvis-core-admin.version" "$version_tmp" || return 1
     fi
-    if ! mv -Tf "$admin_tmp" /usr/local/sbin/jarvis; then
-        if [[ -f $updater_previous ]]; then
-            mv -Tf "$updater_previous" /usr/local/libexec/jarvis/update-core-release || return 1
+    if [[ -f /usr/local/sbin/jarvis && ! -L /usr/local/sbin/jarvis ]]; then
+        install -o root -g root -m 0755 /usr/local/sbin/jarvis "$admin_previous"
+        admin_had_previous=true
+    fi
+    if [[ -f /usr/local/libexec/jarvis/update-core-release && ! -L /usr/local/libexec/jarvis/update-core-release ]]; then
+        install -o root -g root -m 0755 /usr/local/libexec/jarvis/update-core-release "$updater_previous"
+        updater_had_previous=true
+    fi
+    if [[ $app_present == true ]]; then
+        [[ -f $core_admin_binary ]] && install -o root -g root -m 0755 "$core_admin_binary" "$app_previous"
+        [[ -f $core_admin_desktop ]] && install -o root -g root -m 0644 "$core_admin_desktop" "$desktop_previous"
+        [[ -f $core_admin_icon ]] && install -o root -g root -m 0644 "$core_admin_icon" "$icon_previous"
+        [[ -f $core_admin_version_file ]] && install -o root -g root -m 0644 "$core_admin_version_file" "$version_previous"
+    fi
+
+    if ! mv -Tf "$updater_tmp" /usr/local/libexec/jarvis/update-core-release || \
+        ! mv -Tf "$admin_tmp" /usr/local/sbin/jarvis || \
+        { [[ $app_present == true ]] && { \
+            ! mv -Tf "$app_tmp" "$core_admin_binary" || \
+            ! mv -Tf "$desktop_tmp" "$core_admin_desktop" || \
+            ! mv -Tf "$icon_tmp" "$core_admin_icon" || \
+            ! mv -Tf "$version_tmp" "$core_admin_version_file"; }; }; then
+        if [[ $updater_had_previous == true ]]; then
+            mv -Tf "$updater_previous" /usr/local/libexec/jarvis/update-core-release
         else
             rm -f -- /usr/local/libexec/jarvis/update-core-release
         fi
-        rm -f -- "$admin_tmp" "$updater_tmp" "$admin_previous" "$updater_previous"
+        if [[ $admin_had_previous == true ]]; then
+            mv -Tf "$admin_previous" /usr/local/sbin/jarvis
+        else
+            rm -f -- /usr/local/sbin/jarvis
+        fi
+        if [[ $app_present == true ]]; then
+            if [[ -f $app_previous ]]; then mv -Tf "$app_previous" "$core_admin_binary"; else rm -f -- "$core_admin_binary"; fi
+            if [[ -f $desktop_previous ]]; then mv -Tf "$desktop_previous" "$core_admin_desktop"; else rm -f -- "$core_admin_desktop"; fi
+            if [[ -f $icon_previous ]]; then mv -Tf "$icon_previous" "$core_admin_icon"; else rm -f -- "$core_admin_icon"; fi
+            if [[ -f $version_previous ]]; then mv -Tf "$version_previous" "$core_admin_version_file"; else rm -f -- "$core_admin_version_file"; fi
+        fi
+        rm -f -- "$admin_tmp" "$updater_tmp" "$app_tmp" "$desktop_tmp" "$icon_tmp" "$version_tmp"
         return 1
     fi
-    rm -f -- "$admin_previous" "$updater_previous"
+    rm -f -- "$admin_previous" "$updater_previous" "$app_previous" \
+        "$desktop_previous" "$icon_previous" "$version_previous"
 }
 
 rollback() {
@@ -432,8 +536,10 @@ fi
 previous_tag=$(find_verified_previous || true)
 
 metadata=$(mktemp)
+remote_components=$(mktemp)
+remote_components_checksum=$(mktemp)
 staging_dir=
-trap 'rm -f -- "$metadata"; cleanup' EXIT
+trap 'rm -f -- "$metadata" "$remote_components" "$remote_components_checksum"; cleanup' EXIT
 
 metadata_path="/repos/$repository/releases/latest"
 [[ $mode != version ]] || metadata_path="/repos/$repository/releases/tags/$requested_tag"
@@ -449,14 +555,74 @@ prerelease=$(jq -r '.prerelease' "$metadata") || fail "release prerelease state 
 [[ $draft == false && $prerelease == false ]] || fail "latest release is not a stable release"
 [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "release tag must use stable vMAJOR.MINOR.PATCH form"
 echo "jarvis updater: resolved stable release $tag"
+asset_url() {
+    jq -er --arg name "$1" '.assets[] | select(.name == $name) | .browser_download_url' "$metadata"
+}
+latest_core_version=unavailable
+latest_cli_version=unavailable
+latest_core_admin_version=unavailable
+components_asset="jarvis-core-$tag-components.json"
+components_checksum="$components_asset.sha256"
+components_url=$(asset_url "$components_asset" 2>/dev/null || true)
+components_checksum_url=$(asset_url "$components_checksum" 2>/dev/null || true)
+[[ -z $components_url && -z $components_checksum_url || -n $components_url && -n $components_checksum_url ]] || \
+    fail "component manifest assets are incomplete"
+if [[ -n $components_url && -n $components_checksum_url ]]; then
+    [[ $components_url == https://github.com/* && $components_checksum_url == https://github.com/* ]] || \
+        fail "component manifest asset URL is not a GitHub HTTPS URL"
+    curl "${curl_args[@]}" "$components_url" -o "$remote_components"
+    curl "${curl_args[@]}" "$components_checksum_url" -o "$remote_components_checksum"
+    [[ $(wc -l < "$remote_components_checksum") -eq 1 ]] || \
+        fail "component manifest checksum must contain one entry"
+    read -r expected_components_sha expected_components_name extra < "$remote_components_checksum" || \
+        fail "component manifest checksum is invalid"
+    [[ ${#expected_components_sha} -eq 64 && $expected_components_sha != *[!0-9a-f]* && \
+        $expected_components_name == "$components_asset" && -z ${extra:-} ]] || \
+        fail "component manifest checksum is invalid"
+    [[ $(sha256sum "$remote_components" | awk '{print $1}') == "$expected_components_sha" ]] || \
+        fail "component manifest SHA-256 verification failed"
+    jq -e --arg tag "$tag" \
+        '.tag == $tag and (.revision | strings | test("^[0-9a-f]{40}$")) and (.components | [.core, .cli, .core_admin] | all(test("^[0-9]+\\.[0-9]+\\.[0-9]+$")))' \
+        "$remote_components" >/dev/null || fail "component manifest is invalid"
+    latest_core_version=$(jq -r '.components.core' "$remote_components")
+    latest_cli_version=$(jq -r '.components.cli' "$remote_components")
+    latest_core_admin_version=$(jq -r '.components.core_admin' "$remote_components")
+fi
+component_update_available=false
+if valid_component_version "$latest_core_version" && \
+    { ! valid_component_version "$current_core_version" || version_is_newer "v$latest_core_version" "v$current_core_version"; }; then
+    component_update_available=true
+fi
+if valid_component_version "$latest_cli_version" && \
+    { ! valid_component_version "$current_cli_version" || version_is_newer "v$latest_cli_version" "v$current_cli_version"; }; then
+    component_update_available=true
+fi
+if valid_component_version "$latest_core_admin_version" && \
+    { ! valid_component_version "$current_core_admin_version" || version_is_newer "v$latest_core_admin_version" "v$current_core_admin_version"; }; then
+    component_update_available=true
+fi
+# Published release tags and their assets are immutable. Component metadata
+# may explain why a newer bundle matters, but it can never authorize a same-tag
+# replacement or bypass the existing downgrade refusal.
+if [[ -n $current_tag && $current_tag == "$tag" ]] || \
+    { [[ -n $current_tag ]] && ! version_is_newer "$tag" "$current_tag"; }; then
+    component_update_available=false
+fi
 if [[ $mode == status ]]; then
-    printf 'Current:  %s\nPrevious: %s\nLatest:   %s\nUpdater:  %s\n' "${current_tag:-unavailable}" "${previous_tag:-unavailable}" "$tag" "$(systemctl is-enabled jarvis-updater.timer 2>/dev/null || printf unavailable)"
+    printf 'Current:  %s\nPrevious: %s\nLatest:   %s\nCore current: %s\nCore latest: %s\nCLI current: %s\nCLI latest: %s\nCore app current: %s\nCore app latest: %s\nUpdater:  %s\n' \
+        "${current_tag:-unavailable}" "${previous_tag:-unavailable}" "$tag" \
+        "$current_core_version" "$latest_core_version" "$current_cli_version" \
+        "$latest_cli_version" "$current_core_admin_version" "$latest_core_admin_version" \
+        "$(systemctl is-enabled jarvis-updater.timer 2>/dev/null || printf unavailable)"
     exit 0
 fi
 if [[ $mode == check ]]; then
-    printf 'Current:  %s\nLatest:   %s\nUpdate:   ' "${current_tag:-unavailable}" "$tag"
-    if [[ -n $current_tag && $current_tag == "$tag" ]]; then printf 'not available\n'; exit 0; fi
-    if [[ -n $current_tag ]] && ! version_is_newer "$tag" "$current_tag"; then printf 'not available\n'; exit 0; fi
+    printf 'Current:  %s\nLatest:   %s\nCore current: %s\nCore latest: %s\nCLI current: %s\nCLI latest: %s\nCore app current: %s\nCore app latest: %s\nUpdate:   ' \
+        "${current_tag:-unavailable}" "$tag" "$current_core_version" "$latest_core_version" \
+        "$current_cli_version" "$latest_cli_version" "$current_core_admin_version" \
+        "$latest_core_admin_version"
+    if [[ $component_update_available == false && -n $current_tag && $current_tag == "$tag" ]]; then printf 'not available\n'; exit 0; fi
+    if [[ $component_update_available == false && -n $current_tag ]] && ! version_is_newer "$tag" "$current_tag"; then printf 'not available\n'; exit 0; fi
     printf 'available\n'
     exit 2
 fi
@@ -475,9 +641,6 @@ fi
 
 artifact="jarvis-core-$tag-linux-x86_64.tar.gz"
 checksum="$artifact.sha256"
-asset_url() {
-    jq -er --arg name "$1" '.assets[] | select(.name == $name) | .browser_download_url' "$metadata"
-}
 artifact_url=$(asset_url "$artifact") || fail "release is missing $artifact"
 checksum_url=$(asset_url "$checksum") || fail "release is missing $checksum"
 [[ $artifact_url == https://github.com/* && $checksum_url == https://github.com/* ]] || \
@@ -535,6 +698,29 @@ jq -er '.revision | strings | test("^[0-9a-f]{40}$")' "$release_dir/release.json
     fail "release manifest revision is invalid"
 candidate_schema_sha256=$(schema_fingerprint "$release_dir/release.json") || \
     fail "release manifest schema fingerprint is invalid"
+if jq -e '.components? != null' "$release_dir/release.json" >/dev/null; then
+    jq -e '.components | [.core, .cli, .core_admin] | all(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
+        "$release_dir/release.json" >/dev/null || fail "release component versions are invalid"
+    [[ -x $release_dir/jarvis-core-admin && ! -L $release_dir/jarvis-core-admin ]] || \
+        fail "graphical administrator binary is invalid"
+    for app_file in jarvis-core-admin.desktop jarvis-core-admin.png jarvis-core-admin.version; do
+        [[ -f $release_dir/$app_file && ! -L $release_dir/$app_file ]] || \
+            fail "graphical administrator packaging is incomplete"
+    done
+    read -r packaged_app_version extra < "$release_dir/jarvis-core-admin.version" || \
+        fail "graphical administrator version file is invalid"
+    [[ -z ${extra:-} && $packaged_app_version == \
+        "$(jq -r '.components.core_admin' "$release_dir/release.json")" ]] || \
+        fail "graphical administrator version does not match release manifest"
+    [[ $("$release_dir/jarvis-core-admin" --component-version) == "$packaged_app_version" ]] || \
+        fail "graphical administrator executable version does not match release manifest"
+    if [[ -s $remote_components ]]; then
+        jq -e --slurpfile remote "$remote_components" \
+            '.tag == $remote[0].tag and .revision == $remote[0].revision and .components == $remote[0].components' \
+            "$release_dir/release.json" >/dev/null || \
+            fail "archive component versions do not match published component manifest"
+    fi
+fi
 echo "jarvis updater: archive and release manifest validated"
 
 # A failed readiness check can roll the binary back, but it cannot safely

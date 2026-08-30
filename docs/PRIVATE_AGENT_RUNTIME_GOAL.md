@@ -55,6 +55,7 @@ Define a strict versioned format for Markdown agent definitions, preferably YAML
 schema_version: 1
 id: research
 name: Research Agent
+group: Development # optional non-secret presentation category
 model_policy: research
 requested_capabilities:
   - web.search

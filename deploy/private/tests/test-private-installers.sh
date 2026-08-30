@@ -60,6 +60,9 @@ fi
 JARVIS_AGENT_BUNDLE_VALIDATOR="$fixture/validator" bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"
 bundle=$(readlink -f /var/lib/jarvis/agents/current)
 [[ -f $bundle/manifest.json ]]
+[[ $(jq -r '.agents[0].name' "$bundle/manifest.json") == 'Test Agent' ]]
+[[ $(jq -r '.agents[0].model_policy' "$bundle/manifest.json") == default ]]
+[[ $(jq -r '.agents[0].group // "Ungrouped"' "$bundle/manifest.json") == Ungrouped ]]
 [[ $(stat -c '%U:%G:%a' /var/lib/jarvis/agents) == root:jarvis:750 ]]
 [[ $(stat -c '%U:%G:%a' /var/lib/jarvis/agents/releases) == root:jarvis:750 ]]
 [[ $(stat -c '%U:%G:%a' "$bundle") == root:jarvis:750 ]]

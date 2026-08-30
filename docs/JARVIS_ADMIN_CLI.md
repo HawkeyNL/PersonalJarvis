@@ -1,7 +1,16 @@
 # Jarvis Home Node administration
 
-The canonical owner interface on a provisioned Home Node is the root-operated,
-allowlisted command:
+The primary owner interface on a provisioned Home Node is the root-operated,
+persistent administration console:
+
+```bash
+sudo jarvis
+```
+
+It provides Overview, Update, Health, Services, Agents, Models, Credentials,
+Logs and System views in one Ratatui session. Opening a section does not start a
+nested alternate-screen application. Direct commands remain first-class for
+troubleshooting, automation and direct navigation:
 
 ```bash
 sudo jarvis status
@@ -14,11 +23,14 @@ sudo jarvis update
 the idempotent Home Node preparation/install flow. It does not grant Jarvis
 Core, agents, Codex, or OpenSandbox any administrative authority.
 
-On an interactive terminal, `sudo jarvis status` opens a compact Ratatui
-dashboard; press `q`, Esc, or Ctrl-C to leave it. Redirected output,
-`TERM=dumb`, `NO_COLOR`, and `--json` remain plain and script-friendly. For
-example, `sudo jarvis --json status` emits stable JSON without ANSI controls,
-prompts, or an alternate terminal screen.
+On an interactive terminal, `sudo jarvis` opens Overview. `sudo jarvis status`,
+`sudo jarvis health`, and `sudo jarvis update` enter their corresponding views
+directly through the same application architecture. Press Esc to return, and
+`q` or Ctrl-C to close at the root. Redirected output, `TERM=dumb`, `NO_COLOR`,
+and `--json` remain plain and script-friendly. Bare non-interactive `jarvis`
+requires an explicit command and never performs an implicit mutation. Bare
+`jarvis --json` also fails with an explicit-command message rather than opening
+a TUI.
 
 Machine-readable read-only forms also include:
 
@@ -35,6 +47,11 @@ sudo jarvis --json logs core --lines 100
 JSON mode rejects mutating updates and streaming `logs --follow`; it never
 silently prompts or emits terminal control sequences.
 
+`sudo jarvis version` reports the active release plus the independent Core,
+admin CLI and installed Core Admin App component versions. Its `--json` output
+retains the existing `admin_version` and `active_core` keys and adds explicit
+component fields.
+
 ## Updates
 
 ```bash
@@ -49,6 +66,9 @@ sudo jarvis update --rollback       # asks for confirmation
 The Update Center remains open while checks and trusted updater operations run.
 It shows the active and latest stable releases, update availability, updater
 timer state, rollback availability and the last result in the current session.
+The status/check result also shows current and latest Core, CLI and Core Admin
+App versions. A new verified bundle is offered when any of those components is
+updated.
 Use the arrow keys or `j`/`k`, Enter, Esc and `q`. Successful and failed
 operations remain visible until the owner returns to the overview or closes the
 screen. Bare `jarvis update` is rejected outside an interactive rich terminal;
@@ -58,6 +78,11 @@ Explicit `--check` and `--status` never initialize Ratatui or an alternate
 screen. They print stable inline output; their `--json` variants remain
 machine-readable. Explicit `--latest`, `--version` and `--rollback` remain
 available for reviewed automation and SSH workflows.
+
+Inside the main console, Update Center is a view in the shared application
+state machine. Its check, mutation and result states do not create a nested
+Ratatui lifecycle. Transactional activation remains non-cancellable and owned
+by the trusted updater helper.
 
 Only GitHub Releases that are neither draft nor prerelease are accepted. The
 existing verified-release protocol downloads the artifact and checksum over
@@ -129,6 +154,11 @@ helpers. A provider key never enables a model on its own. Credential input is
 accepted only from the controlling TTY and is never accepted in an argument,
 printed, or written to the journal.
 
+The integrated Credentials view intentionally displays configuration status
+only. Set, test and remove remain explicit trusted commands so secret input is
+handled through `/dev/tty`; no credential value is stored in TUI state or
+captured child output.
+
 ## Private agents
 
 ```bash
@@ -172,7 +202,7 @@ mkdir -p ~/dev
 git clone https://github.com/HawkeyNL/PersonalJarvis.git ~/dev/PersonalJarvis
 cd ~/dev/PersonalJarvis
 cargo build -p jarvis-admin --bin jarvis
-cargo run -p jarvis-admin --features tui-preview -- tui-preview healthy-status
+cargo run -p jarvis-admin --features tui-preview -- tui-preview home
 cargo run -p jarvis-admin -- terminal-diagnostics
 ```
 
