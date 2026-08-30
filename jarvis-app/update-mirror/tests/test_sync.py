@@ -7,13 +7,14 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from urllib.request import Request
 
 MIRROR_ROOT = Path(__file__).resolve().parents[1]
 RELEASE_ROOT = MIRROR_ROOT.parent / "update-release"
 sys.path.insert(0, str(MIRROR_ROOT))
 sys.path.insert(0, str(RELEASE_ROOT / "tests"))
 
-from sync import GitHubReleaseSource, SyncError, _verify_android_apk, sync_release
+from sync import GitHubReleaseSource, SyncError, _SafeRedirectHandler, _verify_android_apk, sync_release
 from test_manifest import manifest
 
 
@@ -107,6 +108,50 @@ def accept_apk(path: Path, fingerprint: str, tool: Path, timeout: int) -> None:
     assert fingerprint == "c" * 64
     assert tool == Path("/usr/bin/apksigner")
     assert timeout == 30
+
+
+class SafeRedirectTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.handler = _SafeRedirectHandler()
+
+    def redirect(self, request: Request, url: str) -> Request:
+        redirected = self.handler.redirect_request(request, None, 302, "Found", {}, url)
+        self.assertIsNotNone(redirected)
+        return redirected
+
+    def request(self, url: str) -> Request:
+        return Request(url, headers={"Authorization": "Bearer secret"})
+
+    def test_same_https_origin_preserves_authorization(self) -> None:
+        request = self.request("https://UPDATES.example:443/releases/latest")
+        redirected = self.redirect(request, "https://updates.example/artifacts/app")
+        self.assertEqual(redirected.get_header("Authorization"), "Bearer secret")
+
+    def test_different_host_strips_authorization(self) -> None:
+        request = self.request("https://updates.example/releases/latest")
+        redirected = self.redirect(request, "https://cdn.example/artifacts/app")
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_different_port_strips_authorization(self) -> None:
+        request = self.request("https://updates.example/releases/latest")
+        redirected = self.redirect(request, "https://updates.example:8443/artifacts/app")
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_https_to_http_redirect_is_rejected(self) -> None:
+        request = self.request("https://updates.example/releases/latest")
+        with self.assertRaisesRegex(SyncError, "non-HTTPS redirect"):
+            self.redirect(request, "http://updates.example/artifacts/app")
+
+    def test_redirect_chain_never_restores_stripped_authorization(self) -> None:
+        request = self.request("https://updates.example/releases/latest")
+        same_origin = self.redirect(request, "https://updates.example/releases/next")
+        self.assertEqual(same_origin.get_header("Authorization"), "Bearer secret")
+
+        different_origin = self.redirect(same_origin, "https://cdn.example/artifacts/app")
+        self.assertIsNone(different_origin.get_header("Authorization"))
+
+        back_to_source = self.redirect(different_origin, "https://updates.example/artifacts/app")
+        self.assertIsNone(back_to_source.get_header("Authorization"))
 
 
 class SyncTests(unittest.TestCase):

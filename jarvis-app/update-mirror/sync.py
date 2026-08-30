@@ -36,10 +36,31 @@ class Source(Protocol):
     def open_artifact(self, version: str, path: str) -> BinaryIO: ...
 
 
+def _origin(url: str) -> tuple[str, str, int]:
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise SyncError("redirect URL has an invalid origin") from error
+    if not scheme or hostname is None:
+        raise SyncError("redirect URL has an invalid origin")
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    if port is None:
+        raise SyncError("redirect URL has an invalid origin")
+    return scheme, hostname.lower(), port
+
+
 class _SafeRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, new_url):  # type: ignore[no-untyped-def]
+        source_origin = _origin(request.full_url)
+        target_origin = _origin(new_url)
+        if target_origin[0] != "https":
+            raise SyncError("refusing to follow a non-HTTPS redirect")
         redirected = super().redirect_request(request, fp, code, message, headers, new_url)
-        if redirected is not None and urlparse(request.full_url).netloc != urlparse(new_url).netloc:
+        if redirected is not None and source_origin != target_origin:
             redirected.remove_header("Authorization")
         return redirected
 
