@@ -51,6 +51,9 @@ write_asset() {
       > "$asset/jarvis-core-$tag/jarvis-core-admin.desktop"
     printf 'synthetic png fixture\n' > "$asset/jarvis-core-$tag/jarvis-core-admin.png"
     printf '1.2.3\n' > "$asset/jarvis-core-$tag/jarvis-core-admin.version"
+    chmod 0644 "$asset/jarvis-core-$tag/jarvis-core-admin.desktop" \
+      "$asset/jarvis-core-$tag/jarvis-core-admin.png" \
+      "$asset/jarvis-core-$tag/jarvis-core-admin.version"
     cp "$repo_dir/deploy/systemd/update-core-release.sh" "$asset/jarvis-core-$tag/update-core-release"
     chmod 0755 "$asset/jarvis-core-$tag/update-core-release"
     jq -n --arg tag "$manifest_tag" \

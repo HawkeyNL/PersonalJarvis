@@ -105,6 +105,9 @@ write_release() {
         > "$root/jarvis-core-$tag/jarvis-core-admin.desktop"
     printf 'synthetic png fixture\n' > "$root/jarvis-core-$tag/jarvis-core-admin.png"
     printf '%s\n' "$app_version" > "$root/jarvis-core-$tag/jarvis-core-admin.version"
+    chmod 0644 "$root/jarvis-core-$tag/jarvis-core-admin.desktop" \
+        "$root/jarvis-core-$tag/jarvis-core-admin.png" \
+        "$root/jarvis-core-$tag/jarvis-core-admin.version"
     cp "$updater" "$root/jarvis-core-$tag/update-core-release"
     printf '\n# verified release tooling: %s\n' "$tag" >> "$root/jarvis-core-$tag/update-core-release"
     chmod 0755 "$root/jarvis-core-$tag/update-core-release"
