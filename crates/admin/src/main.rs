@@ -2896,7 +2896,6 @@ fn agents(args: AgentsArgs, presentation: &Presentation, verbose: bool) -> Resul
             }
         }
         AgentsCommand::Update => {
-            let _lock = mutation_lock("/run/jarvis-private-agent-update.lock")?;
             let mut command = trusted_command(Path::new(LIBEXEC).join("private-agent-poll"));
             if presentation.interactive && io::stdin().is_terminal() && !verbose {
                 run_process_tui(

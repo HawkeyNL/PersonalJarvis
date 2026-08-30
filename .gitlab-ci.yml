@@ -72,6 +72,15 @@ core-admin-deb:
     - package=$(find jarvis-core-admin/src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print -quit)
     - test -n "$package"
     - test "$(dpkg-deb --field "$package" Version)" = "$(jq -r .version jarvis-core-admin/package.json)"
+    - package_root=$(mktemp -d /tmp/jarvis-core-admin-package.XXXXXX)
+    - trap 'rm -rf -- "$package_root"' EXIT
+    - dpkg-deb --extract "$package" "$package_root"
+    - test "$("$package_root/usr/bin/jarvis-core-admin" --frontend-mode)" = production
+    - desktop=$(find "$package_root/usr/share/applications" -maxdepth 1 -type f -name '*.desktop' -print -quit)
+    - test -n "$desktop"
+    - grep -Fqx 'Icon=jarvis-core-admin' "$desktop"
+    - grep -Fqx 'StartupWMClass=com.hawkeynl.jarvis.core.admin' "$desktop"
+    - file "$package_root/usr/share/icons/hicolor/128x128/apps/jarvis-core-admin.png" | grep -Fq 'PNG image data, 128 x 128'
   artifacts:
     name: "jarvis-core-admin-${CI_COMMIT_SHORT_SHA}"
     paths:

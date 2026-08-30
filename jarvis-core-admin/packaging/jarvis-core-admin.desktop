@@ -8,4 +8,4 @@ Terminal=false
 Categories=System;Utility;
 Keywords=Jarvis;Home Node;Administration;
 StartupNotify=true
-StartupWMClass=jarvis-core-admin
+StartupWMClass=com.hawkeynl.jarvis.core.admin

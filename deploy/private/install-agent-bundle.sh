@@ -38,6 +38,12 @@ trap 'rm -rf -- "$stage"' EXIT
 mkdir -p "$stage/agents"
 
 count=0
+declare -A profile_lines_by_id=()
+declare -A source_updated_at_by_id=()
+source_is_git=false
+if git -C "$source_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    source_is_git=true
+fi
 while IFS= read -r -d '' source_file; do
     [[ -f $source_file && ! -L $source_file ]] || fail "agent source is unsafe"
     base=${source_file##*/}
@@ -45,12 +51,25 @@ while IFS= read -r -d '' source_file; do
     target="$stage/agents/${base%.md}.json"
     "$validator" validate "$source_file" "$target" || fail "agent definition failed validation"
     id=$(jq -er '.id | strings | select(test("^[A-Za-z0-9_-]{1,64}$"))' "$target") || fail "validated agent has unsafe ID"
+    profile_lines=$(awk 'END { print NR }' "$source_file")
+    [[ $profile_lines =~ ^[0-9]+$ && $profile_lines -gt 0 && $profile_lines -le 100000 ]] \
+        || fail "agent profile has an invalid line count"
+    profile_lines_by_id["$id"]=$profile_lines
+    if [[ $source_is_git == true ]]; then
+        relative_source=${source_file#"$source_root/"}
+        source_updated_at=$(git -C "$source_root" log -1 --format=%cI -- "$relative_source")
+        if [[ -n $source_updated_at ]]; then
+            source_updated_at_by_id["$id"]=$source_updated_at
+        fi
+    fi
     mv -- "$target" "$stage/agents/$id.json"
     ((count += 1))
 done < <(find "$source_agents" -maxdepth 1 -type f -name '*.md' -print0 | LC_ALL=C sort -z)
 ((count > 0)) || fail "no numbered private agent profiles found"
 
 manifest_entries=$(for file in "$stage"/agents/*.json; do
+    id=${file##*/}
+    id=${id%.json}
     hash=$(sha256sum "$file" | awk '{print $1}')
     safe_metadata=$(jq -ec '
         . as $agent
@@ -60,9 +79,13 @@ manifest_entries=$(for file in "$stage"/agents/*.json; do
         | {name:$name,group:$group,model_policy:$model_policy}
     ' "$file") || fail "validated agent has unsafe presentation metadata"
     jq -n --arg id "${file##*/}" --arg path "agents/${file##*/}" --arg sha256 "$hash" \
+        --argjson profile_lines "${profile_lines_by_id[$id]}" \
+        --arg source_updated_at "${source_updated_at_by_id[$id]:-}" \
         --argjson metadata "$safe_metadata" \
         '{id:($id | rtrimstr(".json")),path:$path,sha256:$sha256}
          + $metadata
+         + {profile_lines:$profile_lines}
+         + (if $source_updated_at == "" then {} else {source_updated_at:$source_updated_at} end)
          | with_entries(select(.value != null))'
 done | jq -s '.')
 bundle_hash=$(printf '%s' "$manifest_entries" | sha256sum | awk '{print $1}')

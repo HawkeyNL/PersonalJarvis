@@ -1,15 +1,17 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Jarvis Core Administration",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.hawkeynl.jarvis.core.admin",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1430",
     "beforeBuildCommand": "npm run build",
-    "frontendDist": "../dist"
+    "frontendDist": "../dist",
+    "features": ["desktop"]
   },
   "app": {
+    "enableGTKAppId": true,
     "windows": [
       {
         "label": "main",
@@ -32,6 +34,11 @@
     "category": "Utility",
     "shortDescription": "Jarvis Home Node administration",
     "longDescription": "A local graphical companion to the canonical Jarvis administration CLI.",
-    "icon": ["../../jarvis-app/src-tauri/icons/32x32.png", "../../jarvis-app/src-tauri/icons/128x128.png", "../../jarvis-app/src-tauri/icons/128x128@2x.png"]
+    "icon": ["../../jarvis-app/src-tauri/icons/32x32.png", "../../jarvis-app/src-tauri/icons/128x128.png", "../../jarvis-app/src-tauri/icons/128x128@2x.png"],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "../packaging/jarvis-core-admin.desktop"
+      }
+    }
   }
 }

@@ -22,7 +22,11 @@ cleanup() {
     rm -rf -- "$fixture_dir" /opt/jarvis
     rm -f -- /etc/jarvis/updater.env
     rm -rf -- /usr/local/sbin/jarvis
-    rm -f -- /usr/local/libexec/jarvis/update-core-release
+    rm -f -- /usr/local/sbin/jarvis-private-update \
+        /usr/local/libexec/jarvis/update-core-release \
+        /usr/local/libexec/jarvis/jarvis-agent-bundle \
+        /usr/local/libexec/jarvis/install-agent-bundle \
+        /usr/local/libexec/jarvis/private-agent-poll
     rm -f -- /usr/bin/jarvis-core-admin \
         /usr/share/applications/jarvis-core-admin.desktop \
         /usr/share/icons/hicolor/128x128/apps/jarvis-core-admin.png
@@ -111,13 +115,18 @@ write_release() {
     cp "$updater" "$root/jarvis-core-$tag/update-core-release"
     printf '\n# verified release tooling: %s\n' "$tag" >> "$root/jarvis-core-$tag/update-core-release"
     chmod 0755 "$root/jarvis-core-$tag/update-core-release"
+    for helper in install-agent-bundle private-agent-poll jarvis-private-update; do
+        printf '#!/usr/bin/env bash\n# verified %s tooling: %s\nexit 0\n' "$helper" "$tag" \
+            > "$root/jarvis-core-$tag/$helper"
+        chmod 0755 "$root/jarvis-core-$tag/$helper"
+    done
     jq -n \
         --arg tag "$tag" \
         --arg schema_sha256 "$schema_sha256" \
         --arg core_version "$core_version" \
         --arg cli_version "$cli_version" \
         --arg app_version "$app_version" \
-        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}}' \
+        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}, tooling: {private_agents: 1}}' \
         > "$root/jarvis-core-$tag/release.json"
     chmod 0644 "$root/jarvis-core-$tag/release.json"
     printf '%064d  jarvis-core-%s-linux-x86_64.tar.gz\n' 0 "$tag" \
@@ -146,6 +155,15 @@ seed_active_release() {
         /usr/share/icons/hicolor/128x128/apps/jarvis-core-admin.png
     install -o root -g root -m 0644 "/opt/jarvis/releases/$tag/jarvis-core-admin.version" \
         /usr/share/jarvis-core-admin/version
+    install -d -o root -g root -m 0755 /usr/local/libexec/jarvis /usr/local/sbin
+    install -o root -g root -m 0755 "/opt/jarvis/releases/$tag/jarvis-agent-bundle" \
+        /usr/local/libexec/jarvis/jarvis-agent-bundle
+    install -o root -g root -m 0755 "/opt/jarvis/releases/$tag/install-agent-bundle" \
+        /usr/local/libexec/jarvis/install-agent-bundle
+    install -o root -g root -m 0755 "/opt/jarvis/releases/$tag/private-agent-poll" \
+        /usr/local/libexec/jarvis/private-agent-poll
+    install -o root -g root -m 0755 "/opt/jarvis/releases/$tag/jarvis-private-update" \
+        /usr/local/sbin/jarvis-private-update
 }
 
 prepare_candidate() {
@@ -239,6 +257,10 @@ run_updater
 grep -Eq "^[0-9a-f]{64}  jarvis-core-v1.0.1-linux-x86_64.tar.gz$" /opt/jarvis/releases/v1.0.1/release.verification
 cmp /opt/jarvis/releases/v1.0.1/jarvis /usr/local/sbin/jarvis
 cmp /opt/jarvis/releases/v1.0.1/update-core-release /usr/local/libexec/jarvis/update-core-release
+cmp /opt/jarvis/releases/v1.0.1/jarvis-agent-bundle /usr/local/libexec/jarvis/jarvis-agent-bundle
+cmp /opt/jarvis/releases/v1.0.1/install-agent-bundle /usr/local/libexec/jarvis/install-agent-bundle
+cmp /opt/jarvis/releases/v1.0.1/private-agent-poll /usr/local/libexec/jarvis/private-agent-poll
+cmp /opt/jarvis/releases/v1.0.1/jarvis-private-update /usr/local/sbin/jarvis-private-update
 cmp /opt/jarvis/releases/v1.0.1/jarvis-core-admin /usr/bin/jarvis-core-admin
 cmp /opt/jarvis/releases/v1.0.1/jarvis-core-admin.version /usr/share/jarvis-core-admin/version
 [[ $(stat -c '%U:%G:%a' /etc/jarvis/updater.env) == root:root:600 ]]

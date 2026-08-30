@@ -195,6 +195,10 @@ struct SafeManifestEntry {
     group: Option<String>,
     #[serde(default)]
     model_policy: Option<String>,
+    #[serde(default)]
+    profile_lines: Option<u32>,
+    #[serde(default)]
+    source_updated_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,6 +207,8 @@ pub struct AgentRecord {
     pub name: String,
     pub group: String,
     pub model_policy: Option<String>,
+    pub profile_lines: Option<u32>,
+    pub source_updated_at: Option<String>,
     pub state: String,
 }
 
@@ -313,6 +319,13 @@ pub fn agents(session: &SessionManager) -> AdminResult<AgentsResponse> {
                             .model_policy
                             .as_deref()
                             .is_some_and(|value| !safe_label(value))
+                        || entry
+                            .profile_lines
+                            .is_some_and(|value| value == 0 || value > 100_000)
+                        || entry
+                            .source_updated_at
+                            .as_deref()
+                            .is_some_and(|value| !safe_source_timestamp(value))
                     {
                         return Err(
                             "active agent manifest contains unsafe display metadata".to_owned()
@@ -323,6 +336,8 @@ pub fn agents(session: &SessionManager) -> AdminResult<AgentsResponse> {
                         id: entry.id,
                         group: entry.group.unwrap_or_else(|| "Ungrouped".to_owned()),
                         model_policy: entry.model_policy,
+                        profile_lines: entry.profile_lines,
+                        source_updated_at: entry.source_updated_at,
                         state: "active".to_owned(),
                     })
                 })
@@ -745,6 +760,13 @@ fn safe_label(value: &str) -> bool {
         && value.chars().all(|character| !character.is_control())
 }
 
+fn safe_source_timestamp(value: &str) -> bool {
+    (20..=40).contains(&value.len())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit() || matches!(byte, b'-' | b':' | b'T' | b'Z' | b'+' | b'.')
+        })
+}
+
 fn read_fixed(path: &str, limit: u64) -> AdminResult<String> {
     let metadata =
         fs::symlink_metadata(path).map_err(|_| "system metadata is unavailable".to_owned())?;
@@ -799,8 +821,12 @@ mod tests {
 
     #[test]
     fn manifest_schema_retains_only_safe_projection() {
-        let manifest: SafeManifest = serde_json::from_str(r#"{"version":1,"bundle_id":"bundle-test","agents":[{"id":"research","name":"Research","group":"Development","model_policy":"research","instructions":"never retain"}]}"#).unwrap();
+        let manifest: SafeManifest = serde_json::from_str(r#"{"version":1,"bundle_id":"bundle-test","agents":[{"id":"research","name":"Research","group":"Development","model_policy":"research","profile_lines":142,"source_updated_at":"2026-08-29T14:32:00+02:00","instructions":"never retain"}]}"#).unwrap();
         assert_eq!(manifest.agents[0].name.as_deref(), Some("Research"));
+        assert_eq!(manifest.agents[0].profile_lines, Some(142));
+        assert!(safe_source_timestamp(
+            manifest.agents[0].source_updated_at.as_deref().unwrap()
+        ));
         assert!(!format!("{manifest:?}").contains("never retain"));
     }
 }

@@ -75,6 +75,12 @@ jq -e --arg tag "$tag" '
     (.revision | strings | test("^[0-9a-f]{40}$")) and
     (.schema_sha256 | strings | test("^[0-9a-f]{64}$"))
 ' "$release_dir/release.json" >/dev/null || fail "release manifest does not bind this tag, revision and schema"
+if jq -e '.tooling.private_agents? == 1' "$release_dir/release.json" >/dev/null 2>&1; then
+    for helper in install-agent-bundle private-agent-poll jarvis-private-update; do
+        [[ -x $release_dir/$helper && ! -L $release_dir/$helper ]] || \
+            fail "versioned private-agent tooling is incomplete"
+    done
+fi
 if jq -e '.components? != null' "$release_dir/release.json" >/dev/null; then
     jq -e '.components | [.core, .cli, .core_admin] | all(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
         "$release_dir/release.json" >/dev/null || fail "release component versions are invalid"

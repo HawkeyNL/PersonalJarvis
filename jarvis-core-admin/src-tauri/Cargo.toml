@@ -1,6 +1,6 @@
 [package]
 name = "jarvis-core-admin"
-version = "0.1.0"
+version = "0.1.1"
 description = "Linux graphical administration console for the Jarvis Home Node"
 authors = ["PersonalJarvis contributors"]
 edition = "2021"
@@ -18,6 +18,10 @@ required-features = ["desktop"]
 [features]
 default = ["desktop"]
 desktop = ["dep:tauri"]
+# Tauri uses this feature to select the embedded production assets instead of
+# build.devUrl. Keep it out of the defaults so `tauri dev` continues to use
+# Vite; production builders must opt in and are verified after compilation.
+custom-protocol = ["desktop", "tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

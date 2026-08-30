@@ -207,6 +207,14 @@ pub fn component_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+pub fn frontend_mode() -> &'static str {
+    if cfg!(feature = "custom-protocol") {
+        "production"
+    } else {
+        "development"
+    }
+}
+
 pub fn run_broker() -> Result<(), String> {
     session::run_broker()
 }

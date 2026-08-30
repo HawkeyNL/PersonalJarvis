@@ -118,6 +118,7 @@ npm ci --prefix jarvis-core-admin
 npm run build --prefix jarvis-core-admin
 cargo build --locked --release \
   --manifest-path jarvis-core-admin/src-tauri/Cargo.toml \
+  --features custom-protocol \
   --bin jarvis-core-admin
 
 mkdir -p "$output_root"
@@ -131,12 +132,22 @@ install -m 0755 "$release_target_dir/release/jarvis-codex-broker" "$temporary_re
 install -m 0755 "$release_target_dir/release/jarvis-agent-bundle" "$temporary_release/jarvis-agent-bundle"
 install -m 0755 "$release_target_dir/release/jarvis" "$temporary_release/jarvis"
 install -m 0755 "$release_target_dir/release/jarvis-core-admin" "$temporary_release/jarvis-core-admin"
+# A production Core Admin App must serve its embedded Vue assets through
+# Tauri's custom protocol. Tauri retains the devUrl in compiled configuration,
+# so inspect the compile-time feature selection instead of grepping strings.
+if [[ $("$temporary_release/jarvis-core-admin" --frontend-mode) != production ]]; then
+  echo "Core Admin App release binary was built in development frontend mode" >&2
+  exit 1
+fi
 install -m 0644 jarvis-core-admin/packaging/jarvis-core-admin.desktop \
   "$temporary_release/jarvis-core-admin.desktop"
 install -m 0644 jarvis-app/src-tauri/icons/128x128.png \
   "$temporary_release/jarvis-core-admin.png"
 printf '%s\n' "$core_admin_version" > "$temporary_release/jarvis-core-admin.version"
 install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update-core-release"
+install -m 0755 deploy/private/install-agent-bundle.sh "$temporary_release/install-agent-bundle"
+install -m 0755 deploy/private/jarvis-private-agent-poll.sh "$temporary_release/private-agent-poll"
+install -m 0755 deploy/private/jarvis-private-update.sh "$temporary_release/jarvis-private-update"
 
 schema_manifest="$temporary/schema.sha256"
 while IFS= read -r schema; do
@@ -150,14 +161,15 @@ jq -n \
   --arg core_version "$core_version" \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}}' \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1}}' \
   > "$temporary_release/release.json"
 
 (
   cd "$temporary_release"
   sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-agent-bundle \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
-    jarvis-core-admin.version update-core-release \
+    jarvis-core-admin.version update-core-release install-agent-bundle \
+    private-agent-poll jarvis-private-update \
     > artifact-binaries.sha256
 )
 rustc_version=$(rustc --version)

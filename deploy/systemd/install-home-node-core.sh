@@ -77,6 +77,16 @@ jq -e --arg tag "$release_tag" '
     exit 1
 }
 release_has_core_admin=false
+release_has_private_agent_tooling=false
+if jq -e '.tooling.private_agents? == 1' "$release_dir/release.json" >/dev/null 2>&1; then
+    release_has_private_agent_tooling=true
+    for helper in install-agent-bundle private-agent-poll jarvis-private-update; do
+        [[ -x $release_dir/$helper && ! -L $release_dir/$helper ]] || {
+            echo "versioned private-agent tooling is incomplete" >&2
+            exit 1
+        }
+    done
+fi
 if jq -e '.components? != null' "$release_dir/release.json" >/dev/null; then
     jq -e '.components | [.core, .cli, .core_admin] | all(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
         "$release_dir/release.json" >/dev/null || {
@@ -200,6 +210,14 @@ install -o root -g root -m 0755 \
 install -o root -g root -m 0755 \
     "$release_dir/jarvis" \
     /usr/local/sbin/jarvis
+if [[ $release_has_private_agent_tooling == true ]]; then
+    install -o root -g root -m 0755 "$release_dir/install-agent-bundle" \
+        /usr/local/libexec/jarvis/install-agent-bundle
+    install -o root -g root -m 0755 "$release_dir/private-agent-poll" \
+        /usr/local/libexec/jarvis/private-agent-poll
+    install -o root -g root -m 0755 "$release_dir/jarvis-private-update" \
+        /usr/local/sbin/jarvis-private-update
+fi
 if [[ $release_has_core_admin == true ]]; then
     install -d -o root -g root -m 0755 /usr/share/jarvis-core-admin \
         /usr/share/applications /usr/share/icons/hicolor/128x128/apps

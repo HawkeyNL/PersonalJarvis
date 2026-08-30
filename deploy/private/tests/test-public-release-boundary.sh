@@ -42,14 +42,35 @@ require_literal "$release_builder" \
     'install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update-core-release"' \
     "canonical release builder must stage update-core-release.sh as update-core-release"
 require_literal "$release_builder" \
+    'install -m 0755 deploy/private/install-agent-bundle.sh "$temporary_release/install-agent-bundle"' \
+    "canonical release builder must stage the public private-agent bundler without private content"
+require_literal "$release_builder" \
+    'install -m 0755 deploy/private/jarvis-private-agent-poll.sh "$temporary_release/private-agent-poll"' \
+    "canonical release builder must stage the fixed private-agent poll boundary"
+require_literal "$release_builder" \
+    'install -m 0755 deploy/private/jarvis-private-update.sh "$temporary_release/jarvis-private-update"' \
+    "canonical release builder must stage the fixed private-agent update wrapper"
+require_literal "$release_builder" \
     'install -m 0755 "$release_target_dir/release/jarvis-core-admin" "$temporary_release/jarvis-core-admin"' \
     "canonical release builder must stage the exact Core Admin App binary"
 require_literal "$release_builder" \
+    '--features custom-protocol' \
+    "canonical release builder must embed the Core Admin App frontend instead of its Vite development URL"
+require_literal "$release_builder" \
+    '"$temporary_release/jarvis-core-admin" --frontend-mode' \
+    "canonical release builder must verify the Core Admin App production frontend mode"
+require_literal "$release_builder" \
     'components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}' \
     "release manifest must expose separate Core, CLI, and Core Admin App versions"
+require_literal "$release_builder" \
+    'tooling: {private_agents: 1}' \
+    "release manifest must bind the versioned private-agent administration tooling"
 require_literal "$gitlab_ci" \
     'npm run tauri:build --prefix jarvis-core-admin' \
     "GitLab CI must build the Ubuntu Core Admin App package"
+require_literal "$gitlab_ci" \
+    '"$package_root/usr/bin/jarvis-core-admin" --frontend-mode' \
+    "GitLab CI must verify the packaged Core Admin App production frontend mode"
 reject_pattern "$release_workflow" 'gh release create' \
     "candidate workflow must not publish before real Home Node acceptance"
 require_literal "$publish_workflow" \

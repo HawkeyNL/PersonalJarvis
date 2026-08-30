@@ -38,6 +38,8 @@ export interface AgentRecord {
   name: string;
   group: string;
   model_policy: string | null;
+  profile_lines: number | null;
+  source_updated_at: string | null;
   state: string;
 }
 export interface AgentsResponse {

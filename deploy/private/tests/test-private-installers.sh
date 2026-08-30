@@ -41,6 +41,12 @@ set -euo pipefail
 jq -n --rawfile instructions "$2" '{id:"test-agent",name:"Test Agent",description:"Synthetic fixture",model_policy:"default",instructions:$instructions,requested_capabilities:[],allowed_tools:[],denied_actions:[],limits:{max_runtime_seconds:30,max_context_chars:1000,max_output_chars:500,max_parallel_runs:1}}' > "$3"
 EOF
 chmod 0755 "$fixture/validator"
+git -C "$fixture/private" init --quiet
+git -C "$fixture/private" config user.name "Jarvis CI"
+git -C "$fixture/private" config user.email "jarvis-ci@example.invalid"
+git -C "$fixture/private" add agents/01_TEST_AGENT.md
+GIT_AUTHOR_DATE=2026-08-29T12:32:00Z GIT_COMMITTER_DATE=2026-08-29T12:32:00Z \
+    git -C "$fixture/private" commit --quiet -m "Add synthetic agent"
 
 install -d -o root -g root -m 0750 /etc/jarvis
 bash "$repo_dir/deploy/private/install-private-config.sh" --source "$fixture/private"
@@ -63,6 +69,8 @@ bundle=$(readlink -f /var/lib/jarvis/agents/current)
 [[ $(jq -r '.agents[0].name' "$bundle/manifest.json") == 'Test Agent' ]]
 [[ $(jq -r '.agents[0].model_policy' "$bundle/manifest.json") == default ]]
 [[ $(jq -r '.agents[0].group // "Ungrouped"' "$bundle/manifest.json") == Ungrouped ]]
+[[ $(jq -r '.agents[0].profile_lines' "$bundle/manifest.json") == 13 ]]
+[[ $(jq -r '.agents[0].source_updated_at' "$bundle/manifest.json") == '2026-08-29T12:32:00+00:00' ]]
 [[ $(stat -c '%U:%G:%a' /var/lib/jarvis/agents) == root:jarvis:750 ]]
 [[ $(stat -c '%U:%G:%a' /var/lib/jarvis/agents/releases) == root:jarvis:750 ]]
 [[ $(stat -c '%U:%G:%a' "$bundle") == root:jarvis:750 ]]

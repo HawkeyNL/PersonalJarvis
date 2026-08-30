@@ -56,8 +56,12 @@ write_asset() {
       "$asset/jarvis-core-$tag/jarvis-core-admin.version"
     cp "$repo_dir/deploy/systemd/update-core-release.sh" "$asset/jarvis-core-$tag/update-core-release"
     chmod 0755 "$asset/jarvis-core-$tag/update-core-release"
+    for helper in install-agent-bundle private-agent-poll jarvis-private-update; do
+      printf '#!/usr/bin/env bash\nexit 0\n' > "$asset/jarvis-core-$tag/$helper"
+      chmod 0755 "$asset/jarvis-core-$tag/$helper"
+    done
     jq -n --arg tag "$manifest_tag" \
-      '{tag:$tag,revision:"0123456789abcdef0123456789abcdef01234567",schema_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",components:{core:"1.2.3",cli:"1.2.3",core_admin:"1.2.3"}}' \
+      '{tag:$tag,revision:"0123456789abcdef0123456789abcdef01234567",schema_sha256:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",components:{core:"1.2.3",cli:"1.2.3",core_admin:"1.2.3"},tooling:{private_agents:1}}' \
       > "$asset/jarvis-core-$tag/release.json"
     tar -C "$asset" -czf "$fixture/$artifact" "jarvis-core-$tag"
     (cd "$fixture" && sha256sum "$artifact" > "$artifact.sha256")
@@ -73,6 +77,9 @@ run_stage v1.2.3
 [[ -x /opt/jarvis/releases/v1.2.3/jarvis-api ]]
 [[ -x /opt/jarvis/releases/v1.2.3/jarvis ]]
 [[ -x /opt/jarvis/releases/v1.2.3/jarvis-core-admin ]]
+[[ -x /opt/jarvis/releases/v1.2.3/install-agent-bundle ]]
+[[ -x /opt/jarvis/releases/v1.2.3/private-agent-poll ]]
+[[ -x /opt/jarvis/releases/v1.2.3/jarvis-private-update ]]
 grep -qx '1.2.3' /opt/jarvis/releases/v1.2.3/jarvis-core-admin.version
 [[ -f /opt/jarvis/releases/v1.2.3/release.verification ]]
 [[ $(stat -c '%U:%G:%a' /opt/jarvis/releases/v1.2.3) == root:root:755 ]]
@@ -93,6 +100,18 @@ if run_stage v1.2.5; then
     exit 1
 fi
 [[ ! -e /opt/jarvis/releases/v1.2.5 ]]
+
+rm -rf -- /opt/jarvis
+install -d -o root -g root -m 0755 /opt/jarvis/releases
+write_asset v1.2.7 v1.2.7
+rm -f -- "$fixture/asset/jarvis-core-v1.2.7/private-agent-poll"
+tar -C "$fixture/asset" -czf "$fixture/jarvis-core-v1.2.7-linux-x86_64.tar.gz" jarvis-core-v1.2.7
+(cd "$fixture" && sha256sum jarvis-core-v1.2.7-linux-x86_64.tar.gz > jarvis-core-v1.2.7-linux-x86_64.tar.gz.sha256)
+if run_stage v1.2.7; then
+    echo "incomplete versioned private-agent tooling was accepted" >&2
+    exit 1
+fi
+[[ ! -e /opt/jarvis/releases/v1.2.7 ]]
 
 rm -rf -- /opt/jarvis
 install -d -o root -g root -m 0755 /opt/jarvis/releases

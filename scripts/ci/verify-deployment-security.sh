@@ -13,6 +13,7 @@ sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-stage-core-release.s
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-prepare-codex-worktree.sh
 bash deploy/private/tests/test-public-release-boundary.sh
 sudo env GITHUB_ACTIONS=true bash deploy/private/tests/test-private-installers.sh
+sudo env GITHUB_ACTIONS=true bash deploy/private/tests/test-private-agent-poll.sh
 bash deploy/caddy/tests/test-caddy-template.sh
 bash deploy/opensandbox/tests/test-opensandbox-template.sh
 

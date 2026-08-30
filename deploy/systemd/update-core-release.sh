@@ -236,6 +236,12 @@ migrate_legacy_release_verification() {
         [[ -f $release/$executable && ! -L $release/$executable && -x $release/$executable ]] || \
             fail "legacy release tooling is invalid: $expected_tag"
     done
+    if jq -e '.tooling.private_agents? == 1' "$release/release.json" >/dev/null 2>&1; then
+        for helper in install-agent-bundle private-agent-poll jarvis-private-update; do
+            [[ -f $release/$helper && ! -L $release/$helper && -x $release/$helper ]] || \
+                fail "legacy release private-agent tooling is invalid: $expected_tag"
+        done
+    fi
     unsafe_entry=$(find "$release" -xdev \( -type l -o ! -user root -o ! -group root -o -perm /022 \) \
         -printf '%P (%y %u:%g %m)\n' -quit)
     if [[ -n $unsafe_entry ]]; then
@@ -305,6 +311,14 @@ inspect_release() {
             return 0
         }
     done
+    if jq -e '.tooling.private_agents? == 1' "$release/release.json" >/dev/null 2>&1; then
+        for helper in install-agent-bundle private-agent-poll jarvis-private-update; do
+            [[ -f $release/$helper && ! -L $release/$helper && -x $release/$helper ]] || {
+                inspected_reason="versioned private-agent tooling is unavailable"
+                return 0
+            }
+        done
+    fi
     if jq -e '.components.core_admin? | strings' "$release/release.json" >/dev/null 2>&1; then
         local inspected_app_version inspected_extra
         for app_file in jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png jarvis-core-admin.version; do
@@ -411,13 +425,27 @@ find_or_migrate_rollback_target() {
 }
 
 install_versioned_tooling() {
-    local release=$1 admin_tmp updater_tmp admin_previous updater_previous app_present=false
-    local admin_had_previous=false updater_had_previous=false
+    local release=$1 app_present=false agent_tooling_present=false activation_failed=false
     local app_tmp desktop_tmp icon_tmp version_tmp app_previous desktop_previous icon_previous version_previous
-    admin_tmp=/usr/local/sbin/.jarvis.new
-    updater_tmp=/usr/local/libexec/jarvis/.update-core-release.new
-    admin_previous=/usr/local/sbin/.jarvis.previous
-    updater_previous=/usr/local/libexec/jarvis/.update-core-release.previous
+    local index source target temporary previous
+    local -a tooling_sources=("$release/jarvis" "$release/update-core-release")
+    local -a tooling_targets=(/usr/local/sbin/jarvis /usr/local/libexec/jarvis/update-core-release)
+    local -a tooling_temporaries=() tooling_previous=() tooling_had_previous=()
+    if jq -e '.tooling.private_agents? == 1' "$release/release.json" >/dev/null 2>&1; then
+        agent_tooling_present=true
+        tooling_sources+=(
+            "$release/jarvis-agent-bundle"
+            "$release/install-agent-bundle"
+            "$release/private-agent-poll"
+            "$release/jarvis-private-update"
+        )
+        tooling_targets+=(
+            /usr/local/libexec/jarvis/jarvis-agent-bundle
+            /usr/local/libexec/jarvis/install-agent-bundle
+            /usr/local/libexec/jarvis/private-agent-poll
+            /usr/local/sbin/jarvis-private-update
+        )
+    fi
     app_tmp=/usr/bin/.jarvis-core-admin.new
     desktop_tmp=/usr/share/applications/.jarvis-core-admin.desktop.new
     icon_tmp=/usr/share/icons/hicolor/128x128/apps/.jarvis-core-admin.png.new
@@ -426,6 +454,20 @@ install_versioned_tooling() {
     desktop_previous=/usr/share/applications/.jarvis-core-admin.desktop.previous
     icon_previous=/usr/share/icons/hicolor/128x128/apps/.jarvis-core-admin.png.previous
     version_previous=/usr/share/jarvis-core-admin/.version.previous
+    install -d -o root -g root -m 0755 /usr/local/sbin /usr/local/libexec/jarvis || return 1
+    for index in "${!tooling_sources[@]}"; do
+        source=${tooling_sources[$index]}
+        target=${tooling_targets[$index]}
+        [[ -f $source && ! -L $source && -x $source ]] || return 1
+        if [[ -e $target || -L $target ]]; then
+            [[ -f $target && ! -L $target ]] || return 1
+        fi
+        temporary="${target%/*}/.${target##*/}.new"
+        previous="${target%/*}/.${target##*/}.previous"
+        tooling_temporaries+=("$temporary")
+        tooling_previous+=("$previous")
+        tooling_had_previous+=(false)
+    done
     if [[ -f $release/jarvis-core-admin && ! -L $release/jarvis-core-admin ]]; then
         app_present=true
         [[ ! -e $core_admin_binary && ! -L $core_admin_binary || -f $core_admin_binary && ! -L $core_admin_binary ]] || return 1
@@ -433,62 +475,84 @@ install_versioned_tooling() {
         [[ ! -e $core_admin_icon && ! -L $core_admin_icon || -f $core_admin_icon && ! -L $core_admin_icon ]] || return 1
         [[ ! -e $core_admin_version_file && ! -L $core_admin_version_file || -f $core_admin_version_file && ! -L $core_admin_version_file ]] || return 1
     fi
-    rm -f -- "$admin_tmp" "$updater_tmp" "$admin_previous" "$updater_previous" \
+    rm -f -- "${tooling_temporaries[@]}" "${tooling_previous[@]}" \
         "$app_tmp" "$desktop_tmp" "$icon_tmp" "$version_tmp" \
         "$app_previous" "$desktop_previous" "$icon_previous" "$version_previous"
-    install -o root -g root -m 0755 "$release/jarvis" "$admin_tmp" || return 1
-    install -o root -g root -m 0755 "$release/update-core-release" "$updater_tmp" || return 1
+    for index in "${!tooling_sources[@]}"; do
+        if ! install -o root -g root -m 0755 \
+            "${tooling_sources[$index]}" "${tooling_temporaries[$index]}"; then
+            rm -f -- "${tooling_temporaries[@]}" "${tooling_previous[@]}"
+            return 1
+        fi
+        target=${tooling_targets[$index]}
+        if [[ -f $target && ! -L $target ]]; then
+            if ! install -o root -g root -m 0755 "$target" "${tooling_previous[$index]}"; then
+                rm -f -- "${tooling_temporaries[@]}" "${tooling_previous[@]}"
+                return 1
+            fi
+            tooling_had_previous[$index]=true
+        fi
+    done
     if [[ $app_present == true ]]; then
-        install -d -o root -g root -m 0755 /usr/share/jarvis-core-admin \
-            /usr/share/applications /usr/share/icons/hicolor/128x128/apps || return 1
-        install -o root -g root -m 0755 "$release/jarvis-core-admin" "$app_tmp" || return 1
-        install -o root -g root -m 0644 "$release/jarvis-core-admin.desktop" "$desktop_tmp" || return 1
-        install -o root -g root -m 0644 "$release/jarvis-core-admin.png" "$icon_tmp" || return 1
-        install -o root -g root -m 0644 "$release/jarvis-core-admin.version" "$version_tmp" || return 1
-    fi
-    if [[ -f /usr/local/sbin/jarvis && ! -L /usr/local/sbin/jarvis ]]; then
-        install -o root -g root -m 0755 /usr/local/sbin/jarvis "$admin_previous"
-        admin_had_previous=true
-    fi
-    if [[ -f /usr/local/libexec/jarvis/update-core-release && ! -L /usr/local/libexec/jarvis/update-core-release ]]; then
-        install -o root -g root -m 0755 /usr/local/libexec/jarvis/update-core-release "$updater_previous"
-        updater_had_previous=true
+        if ! install -d -o root -g root -m 0755 /usr/share/jarvis-core-admin \
+            /usr/share/applications /usr/share/icons/hicolor/128x128/apps || \
+            ! install -o root -g root -m 0755 "$release/jarvis-core-admin" "$app_tmp" || \
+            ! install -o root -g root -m 0644 "$release/jarvis-core-admin.desktop" "$desktop_tmp" || \
+            ! install -o root -g root -m 0644 "$release/jarvis-core-admin.png" "$icon_tmp" || \
+            ! install -o root -g root -m 0644 "$release/jarvis-core-admin.version" "$version_tmp"; then
+            rm -f -- "${tooling_temporaries[@]}" "${tooling_previous[@]}" \
+                "$app_tmp" "$desktop_tmp" "$icon_tmp" "$version_tmp"
+            return 1
+        fi
     fi
     if [[ $app_present == true ]]; then
-        [[ -f $core_admin_binary ]] && install -o root -g root -m 0755 "$core_admin_binary" "$app_previous"
-        [[ -f $core_admin_desktop ]] && install -o root -g root -m 0644 "$core_admin_desktop" "$desktop_previous"
-        [[ -f $core_admin_icon ]] && install -o root -g root -m 0644 "$core_admin_icon" "$icon_previous"
-        [[ -f $core_admin_version_file ]] && install -o root -g root -m 0644 "$core_admin_version_file" "$version_previous"
+        if { [[ -f $core_admin_binary ]] && \
+                ! install -o root -g root -m 0755 "$core_admin_binary" "$app_previous"; } || \
+            { [[ -f $core_admin_desktop ]] && \
+                ! install -o root -g root -m 0644 "$core_admin_desktop" "$desktop_previous"; } || \
+            { [[ -f $core_admin_icon ]] && \
+                ! install -o root -g root -m 0644 "$core_admin_icon" "$icon_previous"; } || \
+            { [[ -f $core_admin_version_file ]] && \
+                ! install -o root -g root -m 0644 "$core_admin_version_file" "$version_previous"; }; then
+            rm -f -- "${tooling_temporaries[@]}" "${tooling_previous[@]}" \
+                "$app_tmp" "$desktop_tmp" "$icon_tmp" "$version_tmp" \
+                "$app_previous" "$desktop_previous" "$icon_previous" "$version_previous"
+            return 1
+        fi
     fi
 
-    if ! mv -Tf "$updater_tmp" /usr/local/libexec/jarvis/update-core-release || \
-        ! mv -Tf "$admin_tmp" /usr/local/sbin/jarvis || \
-        { [[ $app_present == true ]] && { \
-            ! mv -Tf "$app_tmp" "$core_admin_binary" || \
-            ! mv -Tf "$desktop_tmp" "$core_admin_desktop" || \
-            ! mv -Tf "$icon_tmp" "$core_admin_icon" || \
-            ! mv -Tf "$version_tmp" "$core_admin_version_file"; }; }; then
-        if [[ $updater_had_previous == true ]]; then
-            mv -Tf "$updater_previous" /usr/local/libexec/jarvis/update-core-release
-        else
-            rm -f -- /usr/local/libexec/jarvis/update-core-release
-        fi
-        if [[ $admin_had_previous == true ]]; then
-            mv -Tf "$admin_previous" /usr/local/sbin/jarvis
-        else
-            rm -f -- /usr/local/sbin/jarvis
-        fi
+    for index in "${!tooling_targets[@]}"; do
+        mv -Tf "${tooling_temporaries[$index]}" "${tooling_targets[$index]}" || {
+            activation_failed=true
+            break
+        }
+    done
+    if [[ $activation_failed == false && $app_present == true ]]; then
+        mv -Tf "$app_tmp" "$core_admin_binary" && \
+            mv -Tf "$desktop_tmp" "$core_admin_desktop" && \
+            mv -Tf "$icon_tmp" "$core_admin_icon" && \
+            mv -Tf "$version_tmp" "$core_admin_version_file" || activation_failed=true
+    fi
+    if [[ $activation_failed == true ]]; then
+        for index in "${!tooling_targets[@]}"; do
+            if [[ ${tooling_had_previous[$index]} == true ]]; then
+                mv -Tf "${tooling_previous[$index]}" "${tooling_targets[$index]}"
+            else
+                rm -f -- "${tooling_targets[$index]}"
+            fi
+        done
         if [[ $app_present == true ]]; then
             if [[ -f $app_previous ]]; then mv -Tf "$app_previous" "$core_admin_binary"; else rm -f -- "$core_admin_binary"; fi
             if [[ -f $desktop_previous ]]; then mv -Tf "$desktop_previous" "$core_admin_desktop"; else rm -f -- "$core_admin_desktop"; fi
             if [[ -f $icon_previous ]]; then mv -Tf "$icon_previous" "$core_admin_icon"; else rm -f -- "$core_admin_icon"; fi
             if [[ -f $version_previous ]]; then mv -Tf "$version_previous" "$core_admin_version_file"; else rm -f -- "$core_admin_version_file"; fi
         fi
-        rm -f -- "$admin_tmp" "$updater_tmp" "$app_tmp" "$desktop_tmp" "$icon_tmp" "$version_tmp"
+        rm -f -- "${tooling_temporaries[@]}" "$app_tmp" "$desktop_tmp" "$icon_tmp" "$version_tmp"
         return 1
     fi
-    rm -f -- "$admin_previous" "$updater_previous" "$app_previous" \
+    rm -f -- "${tooling_previous[@]}" "$app_previous" \
         "$desktop_previous" "$icon_previous" "$version_previous"
+    [[ $agent_tooling_present == false || -x /usr/local/libexec/jarvis/private-agent-poll ]]
 }
 
 rollback() {
@@ -696,6 +760,12 @@ find "$release_dir" -type f \( -name 'Jarvis.md' -o -path '*/agents/*' \) -print
     fail "release manifest tag does not match"
 jq -er '.revision | strings | test("^[0-9a-f]{40}$")' "$release_dir/release.json" >/dev/null || \
     fail "release manifest revision is invalid"
+if jq -e '.tooling.private_agents? == 1' "$release_dir/release.json" >/dev/null 2>&1; then
+    for helper in install-agent-bundle private-agent-poll jarvis-private-update; do
+        [[ -x $release_dir/$helper && ! -L $release_dir/$helper ]] || \
+            fail "versioned private-agent tooling is incomplete"
+    done
+fi
 candidate_schema_sha256=$(schema_fingerprint "$release_dir/release.json") || \
     fail "release manifest schema fingerprint is invalid"
 if jq -e '.components? != null' "$release_dir/release.json" >/dev/null; then

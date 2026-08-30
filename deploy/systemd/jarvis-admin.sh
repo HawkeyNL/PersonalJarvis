@@ -114,7 +114,7 @@ agents_check() {
 agents_update() {
     private_source >/dev/null
     require_helper "$libexec/private-agent-poll"
-    with_lock /run/jarvis-private-agent-update.lock "$libexec/private-agent-poll"
+    "$libexec/private-agent-poll"
 }
 
 agents_rollback() {

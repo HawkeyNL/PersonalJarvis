@@ -103,6 +103,7 @@ jobs:
           candidate="dist/candidate/jarvis-core-$RELEASE_TAG"
           test "$("$candidate/jarvis-core-admin" --component-version)" = \
             "$(jq -r .components.core_admin "$candidate/release.json")"
+          test "$("$candidate/jarvis-core-admin" --frontend-mode)" = production
       - name: Package tested candidate bytes
         env:
           RELEASE_TAG: ${{ github.ref_name }}
