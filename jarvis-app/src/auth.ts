@@ -12,6 +12,12 @@ export type Session = {
   has_key: boolean;
 };
 
+export type AuthStatus = {
+  device_id: string | null;
+  authenticated: boolean;
+  has_key: boolean;
+};
+
 export type DeviceItem = {
   id: string;
   name: string;
@@ -21,6 +27,10 @@ export type DeviceItem = {
 
 export function currentSession(): Promise<Session> {
   return invoke<Session>("auth_session");
+}
+
+export function currentAuthStatus(): Promise<AuthStatus> {
+  return invoke<AuthStatus>("auth_status");
 }
 
 const PAIRING_WAIT_KEY = "jarvis.pairing.wait";

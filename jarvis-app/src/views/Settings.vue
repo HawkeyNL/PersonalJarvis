@@ -2,7 +2,7 @@
 import { ref, onMounted } from "vue";
 import { API_BASE } from "../api";
 import { ACCENTS, PRESETS, currentAccent, applyAccent, type Accent } from "../theme";
-import { currentSession, deregisterDevice, type Session } from "../auth";
+import { currentAuthStatus, deregisterDevice, type AuthStatus } from "../auth";
 import { lockEnabled, isDesktop, setLockEnabled, initLock } from "../lock";
 import {
   voiceSupported,
@@ -31,7 +31,7 @@ async function onEnroll() {
 }
 
 const accent = ref<Accent>(currentAccent());
-const session = ref<Session | null>(null);
+const session = ref<AuthStatus | null>(null);
 
 const labels: Record<Accent, string> = {
   green: "Jarvis-groen",
@@ -52,7 +52,7 @@ async function doUnlink() {
   unlinking.value = true;
   try {
     await deregisterDevice();
-    session.value = await currentSession();
+    session.value = await currentAuthStatus();
   } finally {
     unlinking.value = false;
     confirmUnlink.value = false;
@@ -60,7 +60,7 @@ async function doUnlink() {
 }
 
 onMounted(async () => {
-  session.value = await currentSession();
+  session.value = await currentAuthStatus();
   await initLock(); // resolves isDesktop for the lock toggle
   await refreshVoiceStatus();
   await listMics();
@@ -95,8 +95,8 @@ onMounted(async () => {
         <li>
           <span class="k">Status</span>
           <span class="v">
-            <span class="dot" :class="session?.token ? 'dot-ok' : 'dot-todo'"></span>
-            {{ session?.token ? "ingelogd" : "uitgelogd" }}
+            <span class="dot" :class="session?.authenticated ? 'dot-ok' : 'dot-todo'"></span>
+            {{ session?.authenticated ? "ingelogd" : "uitgelogd" }}
           </span>
         </li>
         <li>
@@ -109,7 +109,7 @@ onMounted(async () => {
         </li>
       </ul>
       <button
-        v-if="session?.token"
+        v-if="session?.authenticated"
         class="ghost danger"
         @click="confirmUnlink = true"
       >

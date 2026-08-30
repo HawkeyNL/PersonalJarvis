@@ -1,8 +1,8 @@
 //! Jarvis client — native (Rust) side.
 //!
-//! Holds the device key material and does the signing. The private key is
-//! generated here and stored in the app's private data directory; it is never
-//! exposed to the webview/JS. (A follow-up will move it into the OS keychain.)
+//! Holds device key material and does the signing. Private keys and session
+//! tokens live in the operating system credential store and never enter the
+//! app's ordinary metadata file. The private key is never exposed to JS.
 
 use ed25519_dalek::{Signer, SigningKey};
 use rand::{rngs::OsRng, RngCore};
@@ -10,15 +10,18 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
-/// Locally persisted auth material. Private to the app sandbox.
+/// Legacy desktop auth file. It is read only to migrate existing installs.
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct AuthStore {
-    /// Hex-encoded 32-byte Ed25519 seed (the device private key).
+struct LegacyAuthStore {
     private_key: Option<String>,
-    /// The device id assigned by the server at enrollment.
     device_id: Option<String>,
-    /// The current session token.
     token: Option<String>,
+}
+
+/// Ordinary, non-secret metadata that may remain in the app data directory.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AuthMetadata {
+    device_id: Option<String>,
 }
 
 fn store_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -26,58 +29,121 @@ fn store_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("auth.json"))
 }
 
-fn load_store(app: &AppHandle) -> AuthStore {
-    store_path(app)
-        .ok()
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+fn load_legacy_store(app: &AppHandle) -> Result<LegacyAuthStore, String> {
+    let path = store_path(app)?;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LegacyAuthStore::default())
+        }
+        Err(_) => return Err("authentication metadata is unreadable".to_string()),
+    };
+    serde_json::from_slice(&bytes).map_err(|_| "authentication metadata is corrupt".to_string())
 }
 
-fn save_store(app: &AppHandle, store: &AuthStore) -> Result<(), String> {
+fn metadata_bytes(metadata: &AuthMetadata) -> Result<Vec<u8>, String> {
+    serde_json::to_vec_pretty(metadata).map_err(|e| e.to_string())
+}
+
+fn load_metadata(app: &AppHandle) -> Result<AuthMetadata, String> {
+    let legacy = load_legacy_store(app)?;
+    Ok(AuthMetadata {
+        device_id: legacy.device_id,
+    })
+}
+
+fn save_metadata(app: &AppHandle, metadata: &AuthMetadata) -> Result<(), String> {
     let path = store_path(app)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let bytes = serde_json::to_vec_pretty(store).map_err(|e| e.to_string())?;
-    std::fs::write(path, bytes).map_err(|e| e.to_string())
+    let bytes = metadata_bytes(metadata)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(temporary, path).map_err(|e| e.to_string())
 }
 
 const KEY_SERVICE: &str = "com.hawkeynl.jarvis";
 const KEY_ACCOUNT: &str = "device-private-key";
+const TOKEN_ACCOUNT: &str = "session-token";
 
-/// Read the device private key (hex), preferring the OS keychain and falling
-/// back to the app-private file (also used to migrate older installs).
-fn load_private_key(app: &AppHandle) -> Option<String> {
-    if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT) {
-        if let Ok(key) = entry.get_password() {
-            return Some(key);
-        }
-    }
-    load_store(app).private_key
+fn credential(account: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEY_SERVICE, account)
+        .map_err(|_| "secure credential storage is unavailable".to_string())
 }
 
-/// Persist the device private key, preferring the OS keychain. Falls back to
-/// the app-private file when the keychain is unavailable.
-fn save_private_key(app: &AppHandle, key_hex: &str) -> Result<(), String> {
-    if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT) {
-        if entry.set_password(key_hex).is_ok() {
-            // Now in the keychain: drop any copy left in the file.
-            let mut store = load_store(app);
-            if store.private_key.take().is_some() {
-                let _ = save_store(app, &store);
-            }
-            return Ok(());
+fn load_credential(account: &str) -> Result<Option<String>, String> {
+    match credential(account)?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(_) => Err("secure credential storage is unavailable".to_string()),
+    }
+}
+
+fn save_credential(account: &str, value: &str) -> Result<(), String> {
+    credential(account)?
+        .set_password(value)
+        .map_err(|_| "secure credential storage is unavailable".to_string())
+}
+
+fn delete_credential(account: &str) -> Result<(), String> {
+    match credential(account)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err("secure credential storage is unavailable".to_string()),
+    }
+}
+
+struct SecureAuth {
+    metadata: AuthMetadata,
+    private_key: Option<String>,
+    token: Option<String>,
+}
+
+/// Migrate both legacy secrets as one operation. The plaintext file is only
+/// rewritten after every present secret is safely in the OS credential store,
+/// so a partial migration can never discard the device identity.
+fn load_secure_auth(app: &AppHandle) -> Result<SecureAuth, String> {
+    let legacy = load_legacy_store(app)?;
+    let metadata = AuthMetadata {
+        device_id: legacy.device_id,
+    };
+    let had_legacy_secrets = legacy.private_key.is_some() || legacy.token.is_some();
+    let mut private_key = load_credential(KEY_ACCOUNT)?;
+    let mut token = load_credential(TOKEN_ACCOUNT)?;
+    if private_key.is_none() {
+        if let Some(value) = legacy.private_key {
+            save_credential(KEY_ACCOUNT, &value)?;
+            private_key = Some(value);
         }
     }
-    let mut store = load_store(app);
-    store.private_key = Some(key_hex.to_string());
-    save_store(app, &store)
+    if token.is_none() {
+        if let Some(value) = legacy.token {
+            save_credential(TOKEN_ACCOUNT, &value)?;
+            token = Some(value);
+        }
+    }
+    if had_legacy_secrets {
+        save_metadata(app, &metadata)?;
+    }
+    Ok(SecureAuth {
+        metadata,
+        private_key,
+        token,
+    })
+}
+
+fn load_private_key(app: &AppHandle) -> Result<Option<String>, String> {
+    Ok(load_secure_auth(app)?.private_key)
+}
+
+fn save_private_key(app: &AppHandle, key_hex: &str) -> Result<(), String> {
+    save_credential(KEY_ACCOUNT, key_hex)?;
+    save_metadata(app, &load_metadata(app)?)
 }
 
 /// Load the device signing key, generating and persisting one on first use.
 fn get_or_create_signing_key(app: &AppHandle) -> Result<SigningKey, String> {
-    let key_hex = match load_private_key(app) {
+    let key_hex = match load_private_key(app)? {
         Some(key) => key,
         None => {
             let mut seed = [0u8; 32];
@@ -88,7 +154,9 @@ fn get_or_create_signing_key(app: &AppHandle) -> Result<SigningKey, String> {
         }
     };
     let seed = hex::decode(&key_hex).map_err(|e| e.to_string())?;
-    let seed: [u8; 32] = seed.try_into().map_err(|_| "invalid stored key".to_string())?;
+    let seed: [u8; 32] = seed
+        .try_into()
+        .map_err(|_| "invalid stored key".to_string())?;
     Ok(SigningKey::from_bytes(&seed))
 }
 
@@ -120,6 +188,9 @@ fn auth_public_key(app: AppHandle) -> Result<String, String> {
 fn auth_sign(app: AppHandle, nonce_hex: String) -> Result<String, String> {
     let key = get_or_create_signing_key(&app)?;
     let nonce = hex::decode(nonce_hex).map_err(|e| e.to_string())?;
+    if nonce.len() != 32 {
+        return Err("invalid challenge".to_string());
+    }
     Ok(hex::encode(key.sign(&nonce).to_bytes()))
 }
 
@@ -129,6 +200,7 @@ fn auth_sign(app: AppHandle, nonce_hex: String) -> Result<String, String> {
 #[tauri::command]
 fn auth_sign_pairing_approval(
     app: AppHandle,
+    candidate_name: String,
     request_id: String,
     nonce_hex: String,
     candidate_public_key_hex: String,
@@ -136,20 +208,39 @@ fn auth_sign_pairing_approval(
     approver_device_id: String,
     expires_at: i64,
 ) -> Result<String, String> {
+    if candidate_name.trim().is_empty() || candidate_name.len() > 128 {
+        return Err("invalid device name".to_string());
+    }
     let request_id = uuid::Uuid::parse_str(&request_id).map_err(|e| e.to_string())?;
     let user_id = uuid::Uuid::parse_str(&user_id).map_err(|e| e.to_string())?;
-    let approver_device_id = uuid::Uuid::parse_str(&approver_device_id).map_err(|e| e.to_string())?;
+    let approver_device_id =
+        uuid::Uuid::parse_str(&approver_device_id).map_err(|e| e.to_string())?;
     let nonce = hex::decode(nonce_hex).map_err(|e| e.to_string())?;
     let public_key = hex::decode(candidate_public_key_hex).map_err(|e| e.to_string())?;
-    if nonce.len() != 32 || public_key.len() != 32 { return Err("invalid pairing payload".to_string()); }
-    let mut message = Vec::with_capacity(26 + 16 + 32 + 32 + 16 + 16 + 8);
-    message.extend_from_slice(b"jarvis-device-pairing-v1\0");
-    message.extend_from_slice(request_id.as_bytes());
-    message.extend_from_slice(&nonce);
-    message.extend_from_slice(&public_key);
-    message.extend_from_slice(user_id.as_bytes());
-    message.extend_from_slice(approver_device_id.as_bytes());
-    message.extend_from_slice(&expires_at.to_be_bytes());
+    if nonce.len() != 32 || public_key.len() != 32 {
+        return Err("invalid pairing payload".to_string());
+    }
+    if expires_at <= time::OffsetDateTime::now_utc().unix_timestamp() {
+        return Err("pairing request expired".to_string());
+    }
+    let local_device_id = load_metadata(&app)?
+        .device_id
+        .ok_or_else(|| "device is not enrolled".to_string())?;
+    if local_device_id != approver_device_id.to_string() {
+        return Err("pairing approver does not match this device".to_string());
+    }
+    authenticate_owner(&format!("{} koppelen", candidate_name.trim()), true)?;
+    let expires_at = time::OffsetDateTime::from_unix_timestamp(expires_at)
+        .map_err(|_| "invalid pairing expiry".to_string())?;
+    let message = jarvis_client_core::pairing_approval_message(
+        request_id,
+        &nonce,
+        &public_key,
+        user_id,
+        approver_device_id,
+        expires_at,
+    )
+    .map_err(|_| "invalid pairing payload".to_string())?;
     let key = get_or_create_signing_key(&app)?;
     Ok(hex::encode(key.sign(&message).to_bytes()))
 }
@@ -157,29 +248,47 @@ fn auth_sign_pairing_approval(
 /// Persist the device id and session token after a successful login.
 #[tauri::command]
 fn auth_save(app: AppHandle, device_id: String, token: String) -> Result<(), String> {
-    let mut store = load_store(&app);
-    store.device_id = Some(device_id);
-    store.token = Some(token);
-    save_store(&app, &store)
+    load_secure_auth(&app)?;
+    save_credential(TOKEN_ACCOUNT, &token)?;
+    let metadata = AuthMetadata {
+        device_id: Some(device_id),
+    };
+    if let Err(error) = save_metadata(&app, &metadata) {
+        let _ = delete_credential(TOKEN_ACCOUNT);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Report the current auth state (without exposing the private key).
 #[tauri::command]
-fn auth_session(app: AppHandle) -> serde_json::Value {
-    let store = load_store(&app);
-    serde_json::json!({
-        "device_id": store.device_id,
-        "token": store.token,
-        "has_key": load_private_key(&app).is_some(),
-    })
+fn auth_session(app: AppHandle) -> Result<serde_json::Value, String> {
+    let auth = load_secure_auth(&app)?;
+    Ok(serde_json::json!({
+        "device_id": auth.metadata.device_id,
+        "token": auth.token,
+        "has_key": auth.private_key.is_some(),
+    }))
+}
+
+/// Non-secret auth metadata for reactive UI. Use this instead of retaining a
+/// bearer token in Vue state.
+#[tauri::command]
+fn auth_status(app: AppHandle) -> Result<serde_json::Value, String> {
+    let auth = load_secure_auth(&app)?;
+    Ok(serde_json::json!({
+        "device_id": auth.metadata.device_id,
+        "authenticated": auth.token.is_some(),
+        "has_key": auth.private_key.is_some(),
+    }))
 }
 
 /// Clear the session token (keeps the device key and id).
 #[tauri::command]
 fn auth_logout(app: AppHandle) -> Result<(), String> {
-    let mut store = load_store(&app);
-    store.token = None;
-    save_store(&app, &store)
+    let auth = load_secure_auth(&app)?;
+    delete_credential(TOKEN_ACCOUNT)?;
+    save_metadata(&app, &auth.metadata)
 }
 
 /// Fully deregister this device locally: wipe the device key (keychain + file),
@@ -187,10 +296,9 @@ fn auth_logout(app: AppHandle) -> Result<(), String> {
 /// device. Pair with a server-side `DELETE /v1/devices/{id}`.
 #[tauri::command]
 fn auth_reset(app: AppHandle) -> Result<(), String> {
-    if let Ok(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT) {
-        let _ = entry.delete_credential(); // ignore "not found"
-    }
-    save_store(&app, &AuthStore::default())
+    delete_credential(KEY_ACCOUNT)?;
+    delete_credential(TOKEN_ACCOUNT)?;
+    save_metadata(&app, &AuthMetadata::default())
 }
 
 /// Prompt the OS for local verification (Touch ID / Face ID).
@@ -203,6 +311,10 @@ fn auth_reset(app: AppHandle) -> Result<(), String> {
 /// cancellation, or lack of hardware is an `Err`.
 #[tauri::command]
 fn biometric_unlock(reason: String, allow_password: bool) -> Result<(), String> {
+    authenticate_owner(&reason, allow_password)
+}
+
+fn authenticate_owner(reason: &str, allow_password: bool) -> Result<(), String> {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -223,8 +335,8 @@ fn biometric_unlock(reason: String, allow_password: bool) -> Result<(), String> 
             subtitle: None,
             description: None,
         },
-        apple: reason.as_str(),
-        windows: WindowsText::new("Jarvis", &reason)
+        apple: reason,
+        windows: WindowsText::new("Jarvis", reason)
             .ok_or_else(|| "invalid prompt text".to_string())?,
     };
 
@@ -256,10 +368,42 @@ pub fn run() {
             auth_sign_pairing_approval,
             auth_save,
             auth_session,
+            auth_status,
             auth_logout,
             auth_reset,
             biometric_unlock,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_serialization_never_contains_legacy_secrets() {
+        let legacy: LegacyAuthStore = serde_json::from_str(
+            r#"{"private_key":"private","device_id":"device","token":"token"}"#,
+        )
+        .unwrap();
+        let metadata = AuthMetadata {
+            device_id: legacy.device_id,
+        };
+        let encoded = String::from_utf8(metadata_bytes(&metadata).unwrap()).unwrap();
+        assert!(encoded.contains("device"));
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("token"));
+    }
+
+    #[test]
+    fn signing_key_round_trip_signs_without_exposing_seed() {
+        let seed = [7_u8; 32];
+        let signing_key = SigningKey::from_bytes(&seed);
+        let signature = signing_key.sign(&[9_u8; 32]);
+        assert!(signing_key
+            .verifying_key()
+            .verify_strict(&[9_u8; 32], &signature)
+            .is_ok());
+    }
 }

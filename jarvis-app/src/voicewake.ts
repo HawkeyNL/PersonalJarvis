@@ -1,7 +1,6 @@
 // "Hey Jarvis" wake-word controller.
 //
-// Cross-device by construction: this lives in the shared Tauri webview, so one
-// implementation covers macOS and iOS (see ADR-026). The always-on detector
+// Desktop-only foreground capability. The always-on detector
 // (openWakeWord "hey_jarvis" via onnxruntime-web) plugs in behind `triggerWake`
 // — every detection, manual or automatic, runs the same path.
 //
@@ -10,6 +9,7 @@
 // app is locked, downstream flows still require Touch ID / phone approval.
 import { ref, computed } from "vue";
 import { enrolled, verify, refreshVoiceStatus, voiceSupported } from "./voiceServer";
+import { initPlatformCapabilities, platformCapabilities } from "./platform";
 
 const WAKE_KEY = "jarvis.wake.enabled";
 
@@ -24,8 +24,9 @@ export const lastScore = ref(0);
 /** Bumped on a verified wake; the console watches this to reveal + listen. */
 export const wakePulse = ref(0);
 
-/** The feature is usable on any device; the speaker-gate needs a mic. */
-export const wakeReady = computed(() => true);
+export const wakeReady = computed(
+  () => platformCapabilities.value.supportsWakeWord,
+);
 
 let verifying = false;
 let keyHandler: ((e: KeyboardEvent) => void) | null = null;
@@ -70,6 +71,11 @@ export async function triggerWake(): Promise<void> {
 
 export async function startWake(): Promise<void> {
   if (wakeRunning.value) return;
+  await initPlatformCapabilities();
+  if (!wakeReady.value) {
+    wakeError.value = "Wake-word is niet beschikbaar op dit platform.";
+    return;
+  }
 
   keyHandler = (e) => {
     if (matchesHotkey(e)) {
