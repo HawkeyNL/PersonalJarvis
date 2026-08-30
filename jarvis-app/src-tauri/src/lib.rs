@@ -400,7 +400,10 @@ async fn auth_complete_login(
     if !response.status().is_success() {
         return Err("Home Node rejected the device login".to_string());
     }
-    if response.content_length().is_some_and(|length| length > 16 * 1024) {
+    if response
+        .content_length()
+        .is_some_and(|length| length > 16 * 1024)
+    {
         return Err("Home Node login response is invalid".to_string());
     }
     let bytes = response
@@ -463,7 +466,10 @@ async fn auth_request(
         .await
         .map_err(|_| "Home Node is unreachable".to_string())?;
     let status = response.status().as_u16();
-    if response.content_length().is_some_and(|length| length > 16 * 1024 * 1024) {
+    if response
+        .content_length()
+        .is_some_and(|length| length > 16 * 1024 * 1024)
+    {
         return Err("Home Node response is too large".to_string());
     }
     let bytes = response
