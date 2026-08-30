@@ -1,0 +1,242 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A00000000000000000000001 /* JarvisApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000001 /* JarvisApp.swift */; };
+		A00000000000000000000002 /* JarvisAppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000002 /* JarvisAppModel.swift */; };
+		A00000000000000000000003 /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000003 /* AppState.swift */; };
+		A00000000000000000000004 /* ClientDTOs.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000004 /* ClientDTOs.swift */; };
+		A00000000000000000000005 /* EndpointStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000005 /* EndpointStore.swift */; };
+		A00000000000000000000006 /* JarvisAPIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000006 /* JarvisAPIClient.swift */; };
+		A00000000000000000000007 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000007 /* KeychainStore.swift */; };
+		A00000000000000000000008 /* DeviceIdentityStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000008 /* DeviceIdentityStore.swift */; };
+		A00000000000000000000009 /* SecureCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000009 /* SecureCredentialStore.swift */; };
+		A0000000000000000000000A /* BiometricLock.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000A /* BiometricLock.swift */; };
+		A0000000000000000000000B /* AuthService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000B /* AuthService.swift */; };
+		A0000000000000000000000C /* ChatService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000C /* ChatService.swift */; };
+		A0000000000000000000000D /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000D /* RootView.swift */; };
+		A0000000000000000000000E /* LockView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000E /* LockView.swift */; };
+		A0000000000000000000000F /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000F /* ChatView.swift */; };
+		A00000000000000000000010 /* EnrollmentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000010 /* EnrollmentView.swift */; };
+		A00000000000000000000011 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000011 /* SettingsView.swift */; };
+		A00000000000000000000012 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000012 /* Assets.xcassets */; };
+		A00000000000000000000013 /* EndpointNormalizerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000014 /* EndpointNormalizerTests.swift */; };
+		A00000000000000000000014 /* ClientDTOTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000015 /* ClientDTOTests.swift */; };
+		A00000000000000000000015 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000016 /* PrivacyInfo.xcprivacy */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		C00000000000000000000010 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = G00000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E00000000000000000000001;
+			remoteInfo = Jarvis;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		B00000000000000000000001 /* JarvisApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/JarvisApp.swift; sourceTree = "<group>"; };
+		B00000000000000000000002 /* JarvisAppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App/JarvisAppModel.swift; sourceTree = "<group>"; };
+		B00000000000000000000003 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Domain/AppState.swift; sourceTree = "<group>"; };
+		B00000000000000000000004 /* ClientDTOs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Domain/ClientDTOs.swift; sourceTree = "<group>"; };
+		B00000000000000000000005 /* EndpointStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Networking/EndpointStore.swift; sourceTree = "<group>"; };
+		B00000000000000000000006 /* JarvisAPIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Networking/JarvisAPIClient.swift; sourceTree = "<group>"; };
+		B00000000000000000000007 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Security/KeychainStore.swift; sourceTree = "<group>"; };
+		B00000000000000000000008 /* DeviceIdentityStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Security/DeviceIdentityStore.swift; sourceTree = "<group>"; };
+		B00000000000000000000009 /* SecureCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Security/SecureCredentialStore.swift; sourceTree = "<group>"; };
+		B0000000000000000000000A /* BiometricLock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Security/BiometricLock.swift; sourceTree = "<group>"; };
+		B0000000000000000000000B /* AuthService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Services/AuthService.swift; sourceTree = "<group>"; };
+		B0000000000000000000000C /* ChatService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Services/ChatService.swift; sourceTree = "<group>"; };
+		B0000000000000000000000D /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views/RootView.swift; sourceTree = "<group>"; };
+		B0000000000000000000000E /* LockView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views/LockView.swift; sourceTree = "<group>"; };
+		B0000000000000000000000F /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views/ChatView.swift; sourceTree = "<group>"; };
+		B00000000000000000000010 /* EnrollmentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views/EnrollmentView.swift; sourceTree = "<group>"; };
+		B00000000000000000000011 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views/SettingsView.swift; sourceTree = "<group>"; };
+		B00000000000000000000012 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B00000000000000000000013 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B00000000000000000000014 /* EndpointNormalizerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointNormalizerTests.swift; sourceTree = "<group>"; };
+		B00000000000000000000015 /* ClientDTOTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientDTOTests.swift; sourceTree = "<group>"; };
+		B00000000000000000000016 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		B00000000000000000000020 /* Jarvis.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Jarvis.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B00000000000000000000021 /* JarvisTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = JarvisTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		D00000000000000000000001 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		D00000000000000000000004 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		C00000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				C00000000000000000000002 /* Jarvis */,
+				C00000000000000000000003 /* JarvisTests */,
+				C00000000000000000000004 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		C00000000000000000000002 /* Jarvis */ = {
+			isa = PBXGroup;
+			children = (
+				B00000000000000000000001 /* JarvisApp.swift */,
+				B00000000000000000000002 /* JarvisAppModel.swift */,
+				B00000000000000000000003 /* AppState.swift */,
+				B00000000000000000000004 /* ClientDTOs.swift */,
+				B00000000000000000000005 /* EndpointStore.swift */,
+				B00000000000000000000006 /* JarvisAPIClient.swift */,
+				B00000000000000000000007 /* KeychainStore.swift */,
+				B00000000000000000000008 /* DeviceIdentityStore.swift */,
+				B00000000000000000000009 /* SecureCredentialStore.swift */,
+				B0000000000000000000000A /* BiometricLock.swift */,
+				B0000000000000000000000B /* AuthService.swift */,
+				B0000000000000000000000C /* ChatService.swift */,
+				B0000000000000000000000D /* RootView.swift */,
+				B0000000000000000000000E /* LockView.swift */,
+				B0000000000000000000000F /* ChatView.swift */,
+				B00000000000000000000010 /* EnrollmentView.swift */,
+				B00000000000000000000011 /* SettingsView.swift */,
+				B00000000000000000000012 /* Assets.xcassets */,
+				B00000000000000000000013 /* Info.plist */,
+				B00000000000000000000016 /* PrivacyInfo.xcprivacy */,
+			);
+			path = Jarvis;
+			sourceTree = "<group>";
+		};
+		C00000000000000000000003 /* JarvisTests */ = {
+			isa = PBXGroup;
+			children = (
+				B00000000000000000000014 /* EndpointNormalizerTests.swift */,
+				B00000000000000000000015 /* ClientDTOTests.swift */,
+			);
+			path = JarvisTests;
+			sourceTree = "<group>";
+		};
+		C00000000000000000000004 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				B00000000000000000000020 /* Jarvis.app */,
+				B00000000000000000000021 /* JarvisTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		E00000000000000000000001 /* Jarvis */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F00000000000000000000002 /* Build configuration list for PBXNativeTarget "Jarvis" */;
+			buildPhases = (
+				D00000000000000000000000 /* Sources */,
+				D00000000000000000000001 /* Frameworks */,
+				D00000000000000000000002 /* Resources */,
+			);
+			buildRules = ();
+			dependencies = ();
+			name = Jarvis;
+			productName = Jarvis;
+			productReference = B00000000000000000000020 /* Jarvis.app */;
+			productType = "com.apple.product-type.application";
+		};
+		E00000000000000000000002 /* JarvisTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F00000000000000000000003 /* Build configuration list for PBXNativeTarget "JarvisTests" */;
+			buildPhases = (
+				D00000000000000000000003 /* Sources */,
+				D00000000000000000000004 /* Frameworks */,
+				D00000000000000000000005 /* Resources */,
+			);
+			buildRules = ();
+			dependencies = (C00000000000000000000011 /* PBXTargetDependency */);
+			name = JarvisTests;
+			productName = JarvisTests;
+			productReference = B00000000000000000000021 /* JarvisTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		G00000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					E00000000000000000000001 = { CreatedOnToolsVersion = 16.0; };
+					E00000000000000000000002 = { CreatedOnToolsVersion = 16.0; TestTargetID = E00000000000000000000001; };
+				};
+			};
+			buildConfigurationList = F00000000000000000000001 /* Build configuration list for PBXProject "Jarvis" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base);
+			mainGroup = C00000000000000000000001;
+			productRefGroup = C00000000000000000000004 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (E00000000000000000000001 /* Jarvis */, E00000000000000000000002 /* JarvisTests */);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		D00000000000000000000002 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000012 /* Assets.xcassets in Resources */, A00000000000000000000015 /* PrivacyInfo.xcprivacy in Resources */); runOnlyForDeploymentPostprocessing = 0; };
+		D00000000000000000000005 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		D00000000000000000000000 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000001 /* JarvisApp.swift in Sources */,
+				A00000000000000000000002 /* JarvisAppModel.swift in Sources */,
+				A00000000000000000000003 /* AppState.swift in Sources */,
+				A00000000000000000000004 /* ClientDTOs.swift in Sources */,
+				A00000000000000000000005 /* EndpointStore.swift in Sources */,
+				A00000000000000000000006 /* JarvisAPIClient.swift in Sources */,
+				A00000000000000000000007 /* KeychainStore.swift in Sources */,
+				A00000000000000000000008 /* DeviceIdentityStore.swift in Sources */,
+				A00000000000000000000009 /* SecureCredentialStore.swift in Sources */,
+				A0000000000000000000000A /* BiometricLock.swift in Sources */,
+				A0000000000000000000000B /* AuthService.swift in Sources */,
+				A0000000000000000000000C /* ChatService.swift in Sources */,
+				A0000000000000000000000D /* RootView.swift in Sources */,
+				A0000000000000000000000E /* LockView.swift in Sources */,
+				A0000000000000000000000F /* ChatView.swift in Sources */,
+				A00000000000000000000010 /* EnrollmentView.swift in Sources */,
+				A00000000000000000000011 /* SettingsView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D00000000000000000000003 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000013 /* EndpointNormalizerTests.swift in Sources */, A00000000000000000000014 /* ClientDTOTests.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		C00000000000000000000011 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = E00000000000000000000001 /* Jarvis */; targetProxy = C00000000000000000000010 /* PBXContainerItemProxy */; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		F00000000000000000000010 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_PREPROCESSOR_DEFINITIONS = ("DEBUG=1", "$(inherited)"); IPHONEOS_DEPLOYMENT_TARGET = 17.0; MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE; ONLY_ACTIVE_ARCH = YES; SDKROOT = iphoneos; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_VERSION = 5.0; }; name = Debug; };
+		F00000000000000000000011 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; GCC_C_LANGUAGE_STANDARD = gnu17; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MTL_ENABLE_DEBUG_INFO = NO; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; SWIFT_VERSION = 5.0; VALIDATE_PRODUCT = YES; }; name = Release; };
+		F00000000000000000000020 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Jarvis/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.hawkeynl.jarvis; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		F00000000000000000000021 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Jarvis/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 17.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.hawkeynl.jarvis; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		F00000000000000000000030 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.hawkeynl.jarvis.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Jarvis.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Jarvis"; }; name = Debug; };
+		F00000000000000000000031 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.hawkeynl.jarvis.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Jarvis.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Jarvis"; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		F00000000000000000000001 /* Build configuration list for PBXProject "Jarvis" */ = {isa = XCConfigurationList; buildConfigurations = (F00000000000000000000010 /* Debug */, F00000000000000000000011 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		F00000000000000000000002 /* Build configuration list for PBXNativeTarget "Jarvis" */ = {isa = XCConfigurationList; buildConfigurations = (F00000000000000000000020 /* Debug */, F00000000000000000000021 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		F00000000000000000000003 /* Build configuration list for PBXNativeTarget "JarvisTests" */ = {isa = XCConfigurationList; buildConfigurations = (F00000000000000000000030 /* Debug */, F00000000000000000000031 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+	};
+	rootObject = G00000000000000000000001 /* Project object */;
+}
