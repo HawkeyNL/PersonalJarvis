@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from "vue";
-import { API_BASE, getJson, ApiError } from "../api";
+import { getJson, ApiError } from "../api";
 import { currentSession, login, clearSession, listDevices, PairingPending } from "../auth";
+import { configureHomeNode, homeNodeConfig, loadHomeNodeConfig } from "../homeNode";
 import ReactorCore from "../components/ReactorCore.vue";
 import JarvisConsole from "../components/JarvisConsole.vue";
 
@@ -9,20 +10,47 @@ import JarvisConsole from "../components/JarvisConsole.vue";
 // Backend health and device-bound login run silently in the background so the
 // chat always has a valid session; there is no telemetry UI here anymore
 // (System/Trading tabs own that).
-const backend = ref<"checking" | "ok" | "fout">("checking");
+const backend = ref<"unconfigured" | "checking" | "ok" | "fout">("checking");
 const auth = ref<"checking" | "in" | "uit" | "wachten" | "fout">("checking");
 const online = computed(() => backend.value === "ok");
 
 let pollTimer: number | undefined;
 let authTrying = false;
+const originInput = ref("");
+const configBusy = ref(false);
+const configError = ref<string | null>(null);
 
 async function pollBackend() {
+  if (!homeNodeConfig.value.configured) {
+    backend.value = "unconfigured";
+    return;
+  }
   try {
     await getJson("/readyz");
     backend.value = "ok";
     if (auth.value !== "in") await refreshAuth(); // retry login once the backend is up
   } catch {
     backend.value = "fout";
+  }
+}
+
+function startBackendPolling() {
+  if (pollTimer !== undefined) return;
+  pollTimer = window.setInterval(pollBackend, 5000);
+}
+
+async function saveHomeNode() {
+  configBusy.value = true;
+  configError.value = null;
+  try {
+    await configureHomeNode(originInput.value);
+    backend.value = "checking";
+    await pollBackend();
+    startBackendPolling();
+  } catch (error) {
+    configError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    configBusy.value = false;
   }
 }
 
@@ -70,9 +98,15 @@ async function refreshAuth() {
   }
 }
 
-onMounted(() => {
-  pollBackend();
-  pollTimer = window.setInterval(pollBackend, 5000);
+onMounted(async () => {
+  const config = await loadHomeNodeConfig();
+  originInput.value = config.origin ?? "";
+  if (config.configured) {
+    await pollBackend();
+    startBackendPolling();
+  } else {
+    backend.value = "unconfigured";
+  }
 });
 onBeforeUnmount(() => clearInterval(pollTimer));
 </script>
@@ -83,11 +117,30 @@ onBeforeUnmount(() => clearInterval(pollTimer));
     <div class="backdrop">
       <ReactorCore name="Jarvis" :active="online" />
     </div>
+    <form v-if="backend === 'unconfigured'" class="connection-setup glass" @submit.prevent="saveHomeNode">
+      <h2>Verbind met je Home Node</h2>
+      <p>Voer de HTTPS-origin van je Home Node in. Jarvis bewaart alleen dit adres lokaal; geen credentials.</p>
+      <label for="home-node-origin">Home Node-origin</label>
+      <input
+        id="home-node-origin"
+        v-model.trim="originInput"
+        type="url"
+        inputmode="url"
+        autocomplete="url"
+        placeholder="https://jarvis.home.example"
+        required
+      />
+      <button type="submit" :disabled="configBusy">
+        {{ configBusy ? "Verbinden…" : "Verbinden en koppelen" }}
+      </button>
+      <p v-if="configError" class="config-error" role="alert">{{ configError }}</p>
+      <p class="setup-hint">Lokale HTTP op localhost is uitsluitend toegestaan in een development-build.</p>
+    </form>
     <p v-if="auth === 'wachten'" class="pairing-wait">
       Wacht op goedkeuring vanaf een vertrouwd Jarvis-apparaat.
     </p>
     <p v-else-if="backend === 'fout'" class="connection-error" role="status">
-      Home Node niet bereikbaar op {{ API_BASE }}. Controleer het netwerk en probeer opnieuw.
+      Home Node niet bereikbaar op {{ homeNodeConfig.origin }}. Controleer het netwerk en probeer opnieuw.
     </p>
     <!-- Floating conversation + hover-reveal input. -->
     <JarvisConsole />
@@ -119,6 +172,18 @@ onBeforeUnmount(() => clearInterval(pollTimer));
   color: #fecaca;
   text-align: center;
 }
+.connection-setup {
+  position: relative;
+  z-index: 4;
+  width: min(32rem, calc(100% - 2rem));
+  margin: 3rem auto;
+  padding: 1.25rem;
+}
+.connection-setup h2 { margin-top: 0; }
+.connection-setup label { display: block; margin: 1rem 0 0.4rem; }
+.connection-setup input { width: 100%; box-sizing: border-box; margin-bottom: 0.8rem; }
+.config-error { color: #fecaca; }
+.setup-hint { color: var(--muted); font-size: 0.82rem; }
 
 /* The core sits fixed behind everything (under the translucent top bar/dock),
    so the whole screen reads as one living surface. */

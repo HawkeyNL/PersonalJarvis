@@ -9,6 +9,9 @@ import { locked, initLock, noteActivity } from "./lock";
 import { startApprovalPolling, stopApprovalPolling } from "./unlockApprovals";
 import { startPairingPolling, stopPairingPolling } from "./pairingApprovals";
 import { maybeStartWake, stopWake } from "./voicewake";
+import { currentAuthStatus } from "./auth";
+import { loadHomeNodeConfig } from "./homeNode";
+import { availableAppVersion, scheduleAutomaticUpdateCheck, updateState } from "./updates";
 
 const route = useRoute();
 const mode = computed<"system" | "trading">(() =>
@@ -44,6 +47,17 @@ function tick() {
 onMounted(async () => {
   tick();
   timer = window.setInterval(tick, 1000);
+  // Configuration/auth reads are local, and the delayed network update check
+  // is deliberately detached so startup and ordinary Jarvis use never wait.
+  void (async () => {
+    try {
+      await loadHomeNodeConfig();
+      const auth = await currentAuthStatus();
+      scheduleAutomaticUpdateCheck(auth.authenticated);
+    } catch {
+      // Missing/corrupt local update state is surfaced passively in Settings.
+    }
+  })();
   await initLock();
   startApprovalPolling(); // this device can approve other devices' unlocks
   startPairingPolling();
@@ -75,6 +89,14 @@ onBeforeUnmount(() => {
           {{ m.label }}
         </RouterLink>
       </nav>
+      <RouterLink
+        v-if="updateState === 'available'"
+        to="/settings"
+        class="update-badge"
+        aria-label="Jarvis app-update beschikbaar"
+      >
+        Update v{{ availableAppVersion }}
+      </RouterLink>
       <span class="topclock">{{ clock }}</span>
     </header>
 

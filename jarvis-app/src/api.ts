@@ -1,10 +1,8 @@
 // Small API client. Uses the Tauri HTTP plugin so requests are routed through
-// Rust (no webview CORS restrictions). Configure a release with
-// VITE_JARVIS_API_BASE=https://api.example.com; development remains local.
+// Rust (no webview CORS restrictions). The enrolled Home Node origin is
+// resolved at request time; production builds contain no infrastructure URL.
 import { fetch } from "@tauri-apps/plugin-http";
-
-const configuredApiBase = import.meta.env.VITE_JARVIS_API_BASE?.trim();
-export const API_BASE = (configuredApiBase || "http://localhost:8080").replace(/\/$/, "");
+import { homeNodeOrigin } from "./homeNode";
 
 /** An HTTP error carrying the status code, so callers can react to e.g. 401. */
 export class ApiError extends Error {
@@ -32,6 +30,7 @@ export class NetworkError extends Error {
 const REQUEST_TIMEOUT_MS = 10_000;
 
 async function request(path: string, init: RequestInit = {}): Promise<Response> {
+  const origin = await homeNodeOrigin();
   const controller = new AbortController();
   let timedOut = false;
   const timeout = window.setTimeout(() => {
@@ -41,7 +40,7 @@ async function request(path: string, init: RequestInit = {}): Promise<Response> 
   const abort = () => controller.abort();
   init.signal?.addEventListener("abort", abort, { once: true });
   try {
-    return await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
+    return await fetch(`${origin}${path}`, { ...init, signal: controller.signal });
   } catch (error) {
     if (init.signal?.aborted) throw error;
     if (timedOut) throw new NetworkError("timeout", path);

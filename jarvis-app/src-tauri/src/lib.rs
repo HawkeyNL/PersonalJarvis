@@ -21,6 +21,8 @@ struct LegacyAuthStore {
     token: Option<String>,
     #[serde(default)]
     update_endpoint: Option<String>,
+    #[serde(default)]
+    home_node_origin: Option<String>,
 }
 
 /// Ordinary, non-secret metadata that may remain in the app data directory.
@@ -28,7 +30,13 @@ struct LegacyAuthStore {
 struct AuthMetadata {
     device_id: Option<String>,
     #[serde(default)]
-    update_endpoint: Option<String>,
+    home_node_origin: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HomeNodeConfig {
+    origin: Option<String>,
+    configured: bool,
 }
 
 fn store_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -54,9 +62,15 @@ fn metadata_bytes(metadata: &AuthMetadata) -> Result<Vec<u8>, String> {
 
 fn load_metadata(app: &AppHandle) -> Result<AuthMetadata, String> {
     let legacy = load_legacy_store(app)?;
+    let home_node_origin = legacy.home_node_origin.or_else(|| {
+        legacy
+            .update_endpoint
+            .as_deref()
+            .and_then(origin_from_legacy_update_endpoint)
+    });
     Ok(AuthMetadata {
         device_id: legacy.device_id,
-        update_endpoint: legacy.update_endpoint,
+        home_node_origin,
     })
 }
 
@@ -112,9 +126,15 @@ struct SecureAuth {
 /// so a partial migration can never discard the device identity.
 fn load_secure_auth(app: &AppHandle) -> Result<SecureAuth, String> {
     let legacy = load_legacy_store(app)?;
+    let home_node_origin = legacy.home_node_origin.clone().or_else(|| {
+        legacy
+            .update_endpoint
+            .as_deref()
+            .and_then(origin_from_legacy_update_endpoint)
+    });
     let metadata = AuthMetadata {
-        device_id: legacy.device_id,
-        update_endpoint: legacy.update_endpoint,
+        device_id: legacy.device_id.clone(),
+        home_node_origin,
     };
     let had_legacy_secrets = legacy.private_key.is_some() || legacy.token.is_some();
     let mut private_key = load_credential(KEY_ACCOUNT)?;
@@ -262,9 +282,10 @@ fn auth_sign_pairing_approval(
 fn auth_save(app: AppHandle, device_id: String, token: String) -> Result<(), String> {
     load_secure_auth(&app)?;
     save_credential(TOKEN_ACCOUNT, &token)?;
+    let current = load_metadata(&app)?;
     let metadata = AuthMetadata {
         device_id: Some(device_id),
-        update_endpoint: load_metadata(&app)?.update_endpoint,
+        home_node_origin: current.home_node_origin,
     };
     if let Err(error) = save_metadata(&app, &metadata) {
         let _ = delete_credential(TOKEN_ACCOUNT);
@@ -309,28 +330,54 @@ fn auth_logout(app: AppHandle) -> Result<(), String> {
 /// device. Pair with a server-side `DELETE /v1/devices/{id}`.
 #[tauri::command]
 fn auth_reset(app: AppHandle) -> Result<(), String> {
+    let home_node_origin = load_metadata(&app)?.home_node_origin;
     delete_credential(KEY_ACCOUNT)?;
     delete_credential(TOKEN_ACCOUNT)?;
-    save_metadata(&app, &AuthMetadata::default())
+    save_metadata(
+        &app,
+        &AuthMetadata {
+            device_id: None,
+            home_node_origin,
+        },
+    )
 }
 
-/// Store a credential-free updater URL derived from the enrolled Home Node.
-/// The host remains local device configuration and is never compiled into the
-/// application or release manifest.
-#[cfg(desktop)]
+/// Return only ordinary, non-secret Home Node connection metadata.
 #[tauri::command]
-fn app_update_configure(app: AppHandle, core_base_url: String) -> Result<(), String> {
-    let endpoint = update_endpoint(&core_base_url)?;
-    let mut metadata = load_metadata(&app)?;
-    metadata.update_endpoint = Some(endpoint);
-    save_metadata(&app, &metadata)
+fn home_node_config(app: AppHandle) -> Result<HomeNodeConfig, String> {
+    let origin = load_metadata(&app)?.home_node_origin;
+    Ok(HomeNodeConfig {
+        configured: origin.is_some(),
+        origin,
+    })
 }
 
-#[cfg(desktop)]
-fn update_endpoint(core_base_url: &str) -> Result<String, String> {
-    let parsed = url::Url::parse(core_base_url.trim())
-        .map_err(|_| "Home Node update endpoint is invalid".to_string())?;
-    if parsed.scheme() != "https"
+/// Persist a credential-free origin before enrollment. Release builds require
+/// HTTPS; loopback HTTP is accepted only by debug builds for local development.
+#[tauri::command]
+fn home_node_configure(app: AppHandle, origin: String) -> Result<HomeNodeConfig, String> {
+    let origin = normalize_home_node_origin(&origin, cfg!(debug_assertions))?;
+    let mut metadata = load_metadata(&app)?;
+    metadata.home_node_origin = Some(origin.clone());
+    save_metadata(&app, &metadata)?;
+    Ok(HomeNodeConfig {
+        origin: Some(origin),
+        configured: true,
+    })
+}
+
+fn normalize_home_node_origin(value: &str, allow_local_http: bool) -> Result<String, String> {
+    let parsed =
+        url::Url::parse(value.trim()).map_err(|_| "Home Node origin is ongeldig".to_string())?;
+    let is_loopback = match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    let secure_scheme = parsed.scheme() == "https"
+        || (allow_local_http && parsed.scheme() == "http" && is_loopback);
+    if !secure_scheme
         || parsed.host_str().is_none()
         || !parsed.username().is_empty()
         || parsed.password().is_some()
@@ -338,12 +385,24 @@ fn update_endpoint(core_base_url: &str) -> Result<String, String> {
         || parsed.fragment().is_some()
         || !matches!(parsed.path(), "" | "/")
     {
-        return Err("Home Node updates require a credential-free HTTPS origin".to_string());
+        return Err(
+            "Home Node vereist een credential-vrije HTTPS-origin (lokale HTTP alleen in development)"
+                .to_string(),
+        );
     }
-    Ok(format!(
-        "{}/v1/app-updates/stable/{{{{target}}}}/{{{{arch}}}}/{{{{current_version}}}}",
-        core_base_url.trim().trim_end_matches('/')
-    ))
+    Ok(parsed.origin().ascii_serialization())
+}
+
+fn origin_from_legacy_update_endpoint(value: &str) -> Option<String> {
+    let parsed = url::Url::parse(value).ok()?;
+    if !parsed.path().starts_with("/v1/app-updates/") {
+        return None;
+    }
+    normalize_home_node_origin(
+        &parsed.origin().ascii_serialization(),
+        cfg!(debug_assertions),
+    )
+    .ok()
 }
 
 /// Prompt the OS for local verification (Touch ID / Face ID).
@@ -434,9 +493,9 @@ pub fn run() {
             auth_status,
             auth_logout,
             auth_reset,
+            home_node_config,
+            home_node_configure,
             biometric_unlock,
-            #[cfg(desktop)]
-            app_update_configure,
             #[cfg(desktop)]
             app_updates::app_update_status,
             #[cfg(desktop)]
@@ -462,7 +521,7 @@ mod tests {
         .unwrap();
         let metadata = AuthMetadata {
             device_id: legacy.device_id,
-            update_endpoint: None,
+            home_node_origin: None,
         };
         let encoded = String::from_utf8(metadata_bytes(&metadata).unwrap()).unwrap();
         assert!(encoded.contains("device"));
@@ -481,16 +540,42 @@ mod tests {
             .is_ok());
     }
 
-    #[cfg(desktop)]
     #[test]
-    fn update_endpoint_requires_a_credential_free_https_origin() {
-        let endpoint = update_endpoint("https://home.example").unwrap();
+    fn home_node_origin_has_no_production_localhost_fallback_or_credentials() {
         assert_eq!(
-            endpoint,
-            "https://home.example/v1/app-updates/stable/{{target}}/{{arch}}/{{current_version}}"
+            normalize_home_node_origin("https://home.example/", false).unwrap(),
+            "https://home.example"
         );
-        assert!(update_endpoint("http://home.example").is_err());
-        assert!(update_endpoint("https://token@home.example").is_err());
-        assert!(update_endpoint("https://home.example/other").is_err());
+        assert!(normalize_home_node_origin("http://localhost:8080", false).is_err());
+        assert!(normalize_home_node_origin("http://home.example", true).is_err());
+        assert!(normalize_home_node_origin("https://token@home.example", false).is_err());
+        assert!(normalize_home_node_origin("https://home.example/other", false).is_err());
+        assert!(normalize_home_node_origin("https://home.example?token=x", false).is_err());
+    }
+
+    #[test]
+    fn local_http_is_an_explicit_debug_only_option() {
+        assert_eq!(
+            normalize_home_node_origin("http://127.0.0.1:8080", true).unwrap(),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            normalize_home_node_origin("http://[::1]:8080", true).unwrap(),
+            "http://[::1]:8080"
+        );
+    }
+
+    #[test]
+    fn legacy_updater_endpoint_migrates_only_its_origin() {
+        assert_eq!(
+            origin_from_legacy_update_endpoint(
+                "https://home.example/v1/app-updates/stable/{{target}}/{{arch}}/{{current_version}}"
+            ),
+            Some("https://home.example".to_string())
+        );
+        assert_eq!(
+            origin_from_legacy_update_endpoint("https://home.example/not-updates"),
+            None
+        );
     }
 }

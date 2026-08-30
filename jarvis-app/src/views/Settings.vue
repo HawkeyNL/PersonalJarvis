@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
-import { API_BASE } from "../api";
 import { ACCENTS, PRESETS, currentAccent, applyAccent, type Accent } from "../theme";
 import { currentAuthStatus, deregisterDevice, type AuthStatus } from "../auth";
+import { configureHomeNode, homeNodeConfig, loadHomeNodeConfig } from "../homeNode";
 import { lockEnabled, isDesktop, setLockEnabled, initLock } from "../lock";
 import {
   voiceSupported,
@@ -27,13 +27,13 @@ import { mics, selectedMic, setMic, listMics } from "../micDevices";
 import {
   availableAppVersion,
   checkForUpdate,
-  configureHomeNodeUpdates,
   currentAppVersion,
   installAvailableUpdate,
   loadUpdateStatus,
   restartAfterUpdate,
   updateBusy,
   updateError,
+  updateNotes,
   updateProgress,
   updateState,
 } from "../updates";
@@ -45,6 +45,9 @@ async function onEnroll() {
 
 const accent = ref<Accent>(currentAccent());
 const session = ref<AuthStatus | null>(null);
+const homeNodeOriginInput = ref("");
+const homeNodeSaving = ref(false);
+const homeNodeMessage = ref<string | null>(null);
 
 const labels: Record<Accent, string> = {
   green: "Jarvis-groen",
@@ -72,9 +75,25 @@ async function doUnlink() {
   }
 }
 
+async function saveHomeNodeOrigin() {
+  homeNodeSaving.value = true;
+  homeNodeMessage.value = null;
+  try {
+    const value = await configureHomeNode(homeNodeOriginInput.value);
+    homeNodeOriginInput.value = value.origin ?? "";
+    homeNodeMessage.value = "Home Node-origin opgeslagen.";
+    await loadUpdateStatus();
+  } catch (error) {
+    homeNodeMessage.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    homeNodeSaving.value = false;
+  }
+}
+
 onMounted(async () => {
   session.value = await currentAuthStatus();
-  await configureHomeNodeUpdates(API_BASE);
+  const homeNode = await loadHomeNodeConfig();
+  homeNodeOriginInput.value = homeNode.origin ?? "";
   await loadUpdateStatus();
   await initLock(); // resolves isDesktop for the lock toggle
   await refreshVoiceStatus();
@@ -85,6 +104,28 @@ onMounted(async () => {
 <template>
   <section class="view settings">
     <h1>Settings</h1>
+
+    <div class="panel glass">
+      <div class="panel-head">HOME NODE <span class="hint">apparaatconfiguratie</span></div>
+      <p class="muted small">
+        Dit credential-vrije adres wordt lokaal bewaard en gebruikt voor alle API-aanvragen en updater-discovery.
+      </p>
+      <label class="field-label" for="settings-home-node-origin">HTTPS-origin</label>
+      <div class="origin-row">
+        <input
+          id="settings-home-node-origin"
+          v-model.trim="homeNodeOriginInput"
+          type="url"
+          inputmode="url"
+          autocomplete="url"
+          placeholder="https://jarvis.home.example"
+        />
+        <button class="ghost" :disabled="homeNodeSaving" @click="saveHomeNodeOrigin">
+          {{ homeNodeSaving ? "Opslaan…" : "Opslaan" }}
+        </button>
+      </div>
+      <p v-if="homeNodeMessage" class="small muted" role="status">{{ homeNodeMessage }}</p>
+    </div>
 
     <div class="panel glass">
       <div class="panel-head">WEERGAVE <span class="hint">accentkleur</span></div>
@@ -253,6 +294,8 @@ onMounted(async () => {
             <template v-else-if="updateState === 'unauthenticated'">log in om te controleren</template>
             <template v-else-if="updateState === 'unconfigured'">Home Node niet geconfigureerd</template>
             <template v-else-if="updateState === 'unsupported'">niet beschikbaar in deze build</template>
+            <template v-else-if="updateState === 'incompatible'">updateprotocol niet compatibel</template>
+            <template v-else-if="updateState === 'unavailable'">updateservice niet bereikbaar</template>
             <template v-else-if="updateState === 'error'">controle mislukt</template>
             <template v-else>gereed</template>
           </span>
@@ -273,6 +316,9 @@ onMounted(async () => {
         </button>
       </div>
       <p v-if="updateError" class="small errc">{{ updateError }}</p>
+      <p v-else-if="updateNotes && (updateState === 'incompatible' || updateState === 'unavailable')" class="small muted">
+        {{ updateNotes }}
+      </p>
       <p v-else class="muted small">
         Updates komen via je gekoppelde Home Node en worden vóór installatie cryptografisch gecontroleerd.
       </p>
@@ -281,7 +327,7 @@ onMounted(async () => {
     <div class="panel glass">
       <div class="panel-head">SYSTEEM <span class="hint">info</span></div>
       <ul class="kv">
-        <li><span class="k">Backend</span><span class="v mono">{{ API_BASE }}</span></li>
+        <li><span class="k">Backend</span><span class="v mono">{{ homeNodeConfig.origin ?? "niet geconfigureerd" }}</span></li>
         <li><span class="k">Client</span><span class="v mono">Jarvis MK I · v0.1.0</span></li>
         <li><span class="k">Broker</span><span class="v">IBKR read-only</span></li>
       </ul>
@@ -417,6 +463,10 @@ onMounted(async () => {
 .micsel:focus { outline: none; border-color: var(--accent); }
 .enroll .ghost { margin-top: 0; }
 .update-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.origin-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.origin-row input { flex: 1 1 20rem; min-width: 0; }
+.origin-row .ghost { margin: 0; }
+.field-label { display: block; margin: 0.75rem 0 0.4rem; }
 .update-actions .ghost { margin-top: 14px; }
 .update-progress {
   height: 6px; margin-top: 14px; overflow: hidden; border-radius: 999px;

@@ -1,11 +1,14 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { computed, ref } from "vue";
+import { AUTOMATIC_UPDATE_DELAY_MS, shouldScheduleAutomaticUpdateCheck } from "./updatePolicy.js";
 
 type NativeUpdateState =
   | "ready"
   | "unconfigured"
   | "unauthenticated"
   | "unsupported"
+  | "incompatible"
+  | "unavailable"
   | "up_to_date"
   | "available"
   | "installed";
@@ -40,15 +43,6 @@ function apply(status: NativeUpdateStatus) {
   currentAppVersion.value = status.current_version;
   availableAppVersion.value = status.version;
   updateNotes.value = status.notes;
-}
-
-export async function configureHomeNodeUpdates(coreBaseUrl: string): Promise<void> {
-  try {
-    await invoke("app_update_configure", { coreBaseUrl });
-  } catch {
-    // Development may intentionally use HTTP. A check reports this as
-    // unconfigured/unsupported without weakening production HTTPS policy.
-  }
 }
 
 export async function loadUpdateStatus(): Promise<void> {
@@ -99,4 +93,19 @@ export async function installAvailableUpdate(): Promise<void> {
 
 export function restartAfterUpdate(): Promise<void> {
   return invoke("app_update_restart");
+}
+
+let automaticCheckScheduled = false;
+
+/** Run at most one gentle, non-blocking check after an authenticated startup.
+ * Installation and restart always remain explicit user actions. */
+export function scheduleAutomaticUpdateCheck(authenticated: boolean): void {
+  if (!shouldScheduleAutomaticUpdateCheck(authenticated, automaticCheckScheduled)) return;
+  automaticCheckScheduled = true;
+  window.setTimeout(() => {
+    void (async () => {
+      await loadUpdateStatus();
+      if (updateState.value === "ready") await checkForUpdate();
+    })();
+  }, AUTOMATIC_UPDATE_DELAY_MS);
 }

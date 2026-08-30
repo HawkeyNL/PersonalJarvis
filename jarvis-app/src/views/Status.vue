@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from "vue";
-import { API_BASE, getJson, getJsonAuth, postJsonAuth } from "../api";
+import { getJson, getJsonAuth, postJsonAuth } from "../api";
 import { currentSession } from "../auth";
+import { homeNodeConfig, loadHomeNodeConfig } from "../homeNode";
 
 type Health = { status: string; environment?: string };
 type Check = "checking" | "ok" | "fout";
@@ -194,7 +195,8 @@ function cancelSelfImprove() {
   adviceCtrl.value?.abort();
 }
 
-onMounted(() => {
+onMounted(async () => {
+  await loadHomeNodeConfig();
   check();
   loadRegistry();
 });
@@ -205,7 +207,7 @@ onMounted(() => {
     <h1>Status</h1>
     <p class="muted">
       Live-verbinding met de backend <code>jarvis-api</code> op
-      <code>{{ API_BASE }}</code> (via de Tauri HTTP-plugin).
+      <code>{{ homeNodeConfig.origin ?? "niet geconfigureerd" }}</code> (via de Tauri HTTP-plugin).
     </p>
 
     <ul class="status-list">

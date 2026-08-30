@@ -4,8 +4,8 @@
 // orchestrates the HTTP flow (enroll -> challenge -> login) and reads back the
 // session state. The private key never enters JS.
 import { invoke } from "@tauri-apps/api/core";
-import { API_BASE, deleteAuth, getJsonAuth, getJsonWithHeaders, postAuth, postJson, postJsonWithHeaders } from "./api";
-import { configureHomeNodeUpdates } from "./updates";
+import { deleteAuth, getJsonAuth, getJsonWithHeaders, postAuth, postJson, postJsonWithHeaders } from "./api";
+import { scheduleAutomaticUpdateCheck } from "./updates";
 
 export type Session = {
   device_id: string | null;
@@ -89,7 +89,7 @@ export async function login(): Promise<void> {
   });
 
   await invoke("auth_save", { deviceId, token: result.token });
-  await configureHomeNodeUpdates(API_BASE);
+  scheduleAutomaticUpdateCheck(true);
 }
 
 /** Local-LAN first-owner bootstrap. The secret is used once, never persisted,
