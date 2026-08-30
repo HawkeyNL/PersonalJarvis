@@ -196,7 +196,46 @@ jobs:
         run: |
           npm ci
           cargo fetch --manifest-path src-tauri/Cargo.toml --locked --target "${{ matrix.target }}"
+      - name: Install ephemeral macOS Developer ID material
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          MACOS_NOTARY_API_ISSUER_ID: ${{ secrets.MACOS_NOTARY_API_ISSUER_ID }}
+          MACOS_NOTARY_API_KEY_ID: ${{ secrets.MACOS_NOTARY_API_KEY_ID }}
+          MACOS_NOTARY_API_PRIVATE_KEY_BASE64: ${{ secrets.MACOS_NOTARY_API_PRIVATE_KEY_BASE64 }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION }}
+        run: |
+          for value in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD MACOS_NOTARY_API_ISSUER_ID MACOS_NOTARY_API_KEY_ID MACOS_NOTARY_API_PRIVATE_KEY_BASE64 MACOS_SIGNING_IDENTITY; do
+            test -n "${!value}" || { echo "$value is required" >&2; exit 2; }
+          done
+          keychain="$RUNNER_TEMP/jarvis-macos-release.keychain-db"
+          keychain_password=$(uuidgen)
+          certificate="$RUNNER_TEMP/jarvis-developer-id.p12"
+          api_key="$RUNNER_TEMP/AuthKey_${MACOS_NOTARY_API_KEY_ID}.p8"
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 -D > "$certificate"
+          printf '%s' "$MACOS_NOTARY_API_PRIVATE_KEY_BASE64" | base64 -D > "$api_key"
+          chmod 600 "$certificate" "$api_key"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security find-identity -v -p codesigning "$keychain" | grep -Fq "$MACOS_SIGNING_IDENTITY"
+          echo "JARVIS_MACOS_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY_PATH=$api_key" >> "$GITHUB_ENV"
       - name: Build signed updater and installer
+        if: matrix.platform != 'macos'
         working-directory: jarvis-app
         shell: bash
         run: >-
@@ -206,6 +245,50 @@ jobs:
           --ci
           --
           --locked
+      - name: Build Developer ID signed and notarized macOS release
+        if: matrix.platform == 'macos'
+        working-directory: jarvis-app
+        shell: bash
+        env:
+          APPLE_API_ISSUER: ${{ secrets.MACOS_NOTARY_API_ISSUER_ID }}
+          APPLE_API_KEY: ${{ secrets.MACOS_NOTARY_API_KEY_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION }}
+        run: >-
+          npm run desktop:build --
+          --target "${{ matrix.target }}"
+          --bundles "${{ matrix.bundles }}"
+          --ci
+          --
+          --locked
+      - name: Notarize and staple macOS disk image
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          MACOS_NOTARY_API_ISSUER_ID: ${{ secrets.MACOS_NOTARY_API_ISSUER_ID }}
+          MACOS_NOTARY_API_KEY_ID: ${{ secrets.MACOS_NOTARY_API_KEY_ID }}
+        run: |
+          dmg=$(find "jarvis-app/src-tauri/target/${{ matrix.target }}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg')
+          test -n "$dmg" && test "$(printf '%s\n' "$dmg" | wc -l)" -eq 1 || { echo "expected exactly one macOS DMG" >&2; exit 2; }
+          xcrun notarytool submit "$dmg" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$MACOS_NOTARY_API_KEY_ID" \
+            --issuer "$MACOS_NOTARY_API_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "$dmg"
+      - name: Verify macOS OS trust and stapled notarization
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          app=$(find "jarvis-app/src-tauri/target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -type d -name '*.app')
+          dmg=$(find "jarvis-app/src-tauri/target/${{ matrix.target }}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg')
+          test -n "$app" && test "$(printf '%s\n' "$app" | wc -l)" -eq 1 || { echo "expected exactly one macOS app bundle" >&2; exit 2; }
+          test -n "$dmg" && test "$(printf '%s\n' "$dmg" | wc -l)" -eq 1 || { echo "expected exactly one macOS DMG" >&2; exit 2; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          signing_details=$(codesign -d --verbose=4 "$app" 2>&1)
+          grep -Fq 'Authority=Developer ID Application:' <<< "$signing_details"
+          grep -Eq 'flags=.*runtime' <<< "$signing_details"
+          xcrun stapler validate "$app"
+          xcrun stapler validate "$dmg"
       - name: Collect canonical private assets
         shell: bash
         run: |
@@ -217,6 +300,12 @@ jobs:
       - name: Upload only to private draft release
         shell: bash
         run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/private-assets"/* --repo "$PRIVATE_RELEASE_REPO" --clobber
+      - name: Remove ephemeral macOS signing material
+        if: always() && matrix.platform == 'macos'
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/jarvis-macos-release.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/jarvis-developer-id.p12" "$RUNNER_TEMP"/AuthKey_*.p8
 
   android:
     name: Signed native Android APK and AAB

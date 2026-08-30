@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/app-ci.yml"
+      - ".github/workflows/private-app-release.yml"
+      - "docs/app-updates/**"
       - "jarvis-app/**"
       - "jarvis-ios/**"
       - "jarvis-android/**"
@@ -17,6 +19,8 @@ on:
   pull_request:
     paths:
       - ".github/workflows/app-ci.yml"
+      - ".github/workflows/private-app-release.yml"
+      - "docs/app-updates/**"
       - "jarvis-app/**"
       - "jarvis-ios/**"
       - "jarvis-android/**"
