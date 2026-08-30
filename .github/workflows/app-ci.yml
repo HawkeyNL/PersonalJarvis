@@ -71,6 +71,12 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run test:unit
+      - name: Test private release manifest and mirror logic
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 -m unittest discover -s update-release/tests -v
+          python3 -m unittest discover -s update-mirror/tests -v
 
   desktop-native:
     name: Desktop Tauri — ${{ matrix.name }}
