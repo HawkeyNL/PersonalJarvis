@@ -7,6 +7,7 @@ set -euo pipefail
 readonly secret_dir=/etc/jarvis/secrets
 readonly core_env=/etc/jarvis/core.env
 readonly ollama_cloud_default_base_url=https://ollama.com/v1
+readonly ollama_cloud_tags_url=https://ollama.com/api/tags
 
 fail() { echo "jarvis-credentials: $*" >&2; exit 1; }
 [[ ${EUID} -eq 0 ]] || fail "must run as root"
@@ -177,11 +178,11 @@ test_credential() {
     echo "jarvis-credentials: $provider credential probe and Core health check succeeded; no generation request was made."
 }
 
-# Authenticated, read-only provider probe.  The key is written only into an
+# Authenticated, read-only provider probe. The key is written only into an
 # ephemeral mode-0600 curl config in /run, never onto curl's argv or stdout.
 # Every endpoint below is metadata-only and must not create a paid generation.
 probe_provider() {
-    local provider=$1 file=$2 variable key escaped_key base config http_code
+    local provider=$1 file=$2 variable key escaped_key base config http_code url
     command -v curl >/dev/null 2>&1 || fail "curl is required for credential testing"
     variable=$(provider_var "$provider") || return 1
     set -a
@@ -205,7 +206,13 @@ probe_provider() {
             [[ $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 1
             printf 'url = "%s/v1/models?limit=1"\nheader = "x-api-key: %s"\nheader = "anthropic-version: 2023-06-01"\n' "${base%/}" "$escaped_key" > "$config"
             ;;
-        openai|deepseek|xai|zai|ollama-cloud)
+        ollama-cloud)
+            # Ollama Cloud chat is OpenAI-compatible at /v1, but authenticated
+            # account/model metadata is served through the native /api/tags route.
+            url=$ollama_cloud_tags_url
+            printf 'url = "%s"\nheader = "Authorization: Bearer %s"\n' "$url" "$escaped_key" > "$config"
+            ;;
+        openai|deepseek|xai|zai)
             base=$(openai_compatible_base_url "$provider") || return 1
             [[ $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 1
             printf 'url = "%s/models"\nheader = "Authorization: Bearer %s"\n' "${base%/}" "$escaped_key" > "$config"
