@@ -8,6 +8,7 @@ set -euo pipefail
 readonly policy_file=/etc/jarvis/model-policy.json
 readonly policy_dir=/etc/jarvis
 readonly core_env=/etc/jarvis/core.env
+readonly ollama_cloud_default_base_url=https://ollama.com/v1
 
 fail() { echo "jarvis-models: $*" >&2; exit 1; }
 [[ ${EUID} -eq 0 ]] || fail "must run as root"
@@ -34,8 +35,41 @@ valid_provider() {
     [[ $1 =~ ^(anthropic-api|openai-api|deepseek-api|xai-api|zai-api|ollama|ollama-cloud|claude-cli)$ ]]
 }
 
+# Older pre-release installs could leave /etc/jarvis or model-policy.json with
+# the more restrictive root:root ownership.  That is not an escalation, but it
+# prevents Core/Admin from traversing/reading the policy. Normalize only this
+# exact known-safe legacy state. Symlinks, non-root ownership, writable modes,
+# malformed policy data or any other surprising state still fail closed.
+normalize_model_policy_boundary() {
+    local dir_state policy_state
+    [[ -d $policy_dir && ! -L $policy_dir ]] || fail "policy directory is unavailable or unsafe"
+    dir_state=$(stat -c '%U:%G:%a' "$policy_dir")
+    case $dir_state in
+        root:jarvis:750) ;;
+        root:root:750)
+            chown root:jarvis "$policy_dir"
+            ;;
+        *) fail "policy directory permissions are unsafe" ;;
+    esac
+
+    [[ -e $policy_file || -L $policy_file ]] || return 0
+    [[ -f $policy_file && ! -L $policy_file ]] || fail "policy file is not a safe regular file"
+    policy_state=$(stat -c '%U:%G:%a' "$policy_file")
+    case $policy_state in
+        root:jarvis:640) ;;
+        root:root:600|root:root:640|root:jarvis:600)
+            jq -e '.version == 1 and (.models | type == "array")' "$policy_file" >/dev/null ||
+                fail "legacy policy is malformed; refusing permission migration"
+            chown root:jarvis "$policy_file"
+            chmod 0640 "$policy_file"
+            ;;
+        *) fail "policy permissions are unsafe" ;;
+    esac
+}
+
 atomic_write() {
     local content=$1 tmp
+    normalize_model_policy_boundary
     tmp=$(mktemp "$policy_dir/.model-policy.XXXXXX")
     trap 'rm -f -- "$tmp"' RETURN
     umask 077
@@ -50,6 +84,7 @@ atomic_write() {
 empty_policy() { printf '%s\n' '{"version":1,"models":[]}'; }
 
 require_policy() {
+    normalize_model_policy_boundary
     [[ -f $policy_file && ! -L $policy_file ]] || fail "no policy; run 'sudo jarvis-models refresh' first"
     [[ $(stat -c '%U:%G:%a' "$policy_file") == root:jarvis:640 ]] || fail "policy permissions are unsafe"
     jq -e '.version == 1 and (.models | type == "array")' "$policy_file" >/dev/null || fail "policy is malformed"
@@ -112,7 +147,7 @@ provider_base_url() {
         deepseek-api) printf '%s\n' "${JARVIS_LLM_DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}" ;;
         xai-api) printf '%s\n' "${JARVIS_LLM_XAI_BASE_URL:-https://api.x.ai/v1}" ;;
         zai-api) printf '%s\n' "${JARVIS_LLM_ZAI_BASE_URL:-https://api.z.ai/api/paas/v4}" ;;
-        ollama-cloud) printf '%s\n' "${JARVIS_LLM_OLLAMA_CLOUD_BASE_URL:-}" ;;
+        ollama-cloud) printf '%s\n' "${JARVIS_LLM_OLLAMA_CLOUD_BASE_URL:-$ollama_cloud_default_base_url}" ;;
         *) return 1 ;;
     esac
 }
@@ -147,6 +182,7 @@ discover_remote_models() {
 refresh() {
     local provider=${1:-} old known discovered merged
     [[ -z $provider ]] || valid_provider "$provider" || fail "unknown provider"
+    normalize_model_policy_boundary
     old=$(if [[ -f $policy_file ]]; then cat "$policy_file"; else empty_policy; fi)
     jq -e '.version == 1 and (.models | type == "array")' <<<"$old" >/dev/null || fail "existing policy is malformed"
     known=$(configured_models)
