@@ -8,9 +8,10 @@ credentials="$repo_dir/deploy/systemd/jarvis-credentials.sh"
 models="$repo_dir/deploy/systemd/jarvis-models.sh"
 unit="$repo_dir/deploy/systemd/jarvis-core.service"
 prepare="$repo_dir/deploy/systemd/prepare-home-node.sh"
+generator="$repo_dir/deploy/systemd/generate-core-env.sh"
 pricing="$repo_dir/deploy/systemd/pricing-registry.json"
 
-for file in "$credentials" "$models" "$unit" "$prepare"; do
+for file in "$credentials" "$models" "$unit" "$prepare" "$generator"; do
     [[ -f $file ]] || { echo "missing model security asset: $file" >&2; exit 1; }
 done
 broker="$repo_dir/deploy/systemd/jarvis-config-broker.service"
@@ -23,7 +24,7 @@ if grep -Eq 'ExecStart=.*(sh|bash)|/bin/(sh|bash)' "$broker"; then
     exit 1
 fi
 [[ -f $pricing ]] || { echo "missing pricing registry fixture" >&2; exit 1; }
-bash -n "$credentials" "$models" "$prepare"
+bash -n "$credentials" "$models" "$prepare" "$generator"
 jq -e '
   .version == 1
   and (.source | type == "string" and length > 0)
@@ -53,6 +54,18 @@ grep -Fq 'mktemp /run/jarvis-credential-test' "$credentials"
 grep -Fq 'curl --config "$config"' "$credentials"
 grep -Fq 'no generation request was made' "$credentials"
 
+# Ollama Cloud is a first-class remote provider. A fresh Home Node and an
+# existing one configured through `credentials set/test ollama-cloud` both get
+# the canonical OpenAI-compatible endpoint without exposing the credential.
+grep -Fq 'ollama_cloud_default_base_url=https://ollama.com/v1' "$credentials"
+grep -Fq 'ensure_provider_defaults "$provider"' "$credentials"
+grep -Fq 'JARVIS_LLM_OLLAMA_CLOUD_BASE_URL "$ollama_cloud_default_base_url"' "$credentials"
+grep -Fq 'JARVIS_LLM_OLLAMA_CLOUD_BASE_URL=https://ollama.com/v1' "$generator"
+# Normal restart races must stay quiet instead of printing transient connection
+# refused diagnostics while systemd is still bringing Core back up.
+grep -Fq 'systemctl is-active --quiet jarvis-core.service' "$credentials"
+grep -Fq 'curl --fail --silent --output /dev/null' "$credentials"
+
 # Provider access policy is exact, starts remote models disabled, and uses an
 # atomic replacement.  Local Ollama is distinguished from ollama-cloud.
 grep -Fq 'new remote models remain disabled' "$models"
@@ -64,6 +77,13 @@ grep -Fq "curl --config \"\$config\"" "$models"
 grep -Fq 'mktemp /run/jarvis-model-discovery' "$models"
 grep -Fq 'provider_api' "$models"
 grep -Fq 'return 0; }' "$models"
+grep -Fq 'ollama_cloud_default_base_url=https://ollama.com/v1' "$models"
+# Only the known restrictive legacy ownership/mode may be normalized; unsafe
+# writable/symlink/non-root states still fail closed.
+grep -Fq 'normalize_model_policy_boundary' "$models"
+grep -Fq 'root:root:600|root:root:640|root:jarvis:600' "$models"
+grep -Fq 'policy directory permissions are unsafe' "$models"
+grep -Fq 'policy permissions are unsafe' "$models"
 if grep -Eq 'curl[[:space:]].*-H[[:space:]]+.*Authorization' "$models"; then
     echo "model discovery exposes an authorization header in argv" >&2
     exit 1
