@@ -56,28 +56,32 @@ grep -Fq 'no generation request was made' "$credentials"
 
 # Ollama Cloud is a first-class remote provider. A fresh Home Node and an
 # existing one configured through `credentials set/test ollama-cloud` both get
-# the canonical OpenAI-compatible endpoint without exposing the credential.
+# the canonical OpenAI-compatible chat endpoint without exposing the credential.
 grep -Fq 'ollama_cloud_default_base_url=https://ollama.com/v1' "$credentials"
 grep -Fq 'ensure_provider_defaults "$provider"' "$credentials"
 grep -Fq 'JARVIS_LLM_OLLAMA_CLOUD_BASE_URL "$ollama_cloud_default_base_url"' "$credentials"
 grep -Fq 'JARVIS_LLM_OLLAMA_CLOUD_BASE_URL=https://ollama.com/v1' "$generator"
+# Ollama Cloud account/model metadata is native `/api/tags`, not `/v1/models`.
+grep -Fq 'ollama_cloud_tags_url=https://ollama.com/api/tags' "$credentials"
+grep -Fq 'url=$ollama_cloud_tags_url' "$credentials"
 # Normal restart races must stay quiet instead of printing transient connection
 # refused diagnostics while systemd is still bringing Core back up.
 grep -Fq 'systemctl is-active --quiet jarvis-core.service' "$credentials"
 grep -Fq 'curl --fail --silent --output /dev/null' "$credentials"
 
 # Provider access policy is exact, starts remote models disabled, and uses an
-# atomic replacement.  Local Ollama is distinguished from ollama-cloud.
+# atomic replacement. Local Ollama is distinguished from ollama-cloud.
 grep -Fq 'new remote models remain disabled' "$models"
 grep -Fq 'atomic_write' "$models"
 grep -Fq 'ollama-cloud' "$models"
 grep -Fq "provider == \$item[0] and .model == \$item[1]" "$models"
-grep -Fq "Official OpenAI-compatible \`/models\` discovery" "$models"
 grep -Fq "curl --config \"\$config\"" "$models"
 grep -Fq 'mktemp /run/jarvis-model-discovery' "$models"
 grep -Fq 'provider_api' "$models"
-grep -Fq 'return 0; }' "$models"
 grep -Fq 'ollama_cloud_default_base_url=https://ollama.com/v1' "$models"
+grep -Fq 'ollama_cloud_tags_url=https://ollama.com/api/tags' "$models"
+grep -Fq "jq_filter='.models[]?.name?'" "$models"
+grep -Fq 'model discovery returned no models' "$models"
 # Only the known restrictive legacy ownership/mode may be normalized; unsafe
 # writable/symlink/non-root states still fail closed.
 grep -Fq 'normalize_model_policy_boundary' "$models"
