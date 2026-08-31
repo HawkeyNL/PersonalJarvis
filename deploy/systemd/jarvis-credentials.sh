@@ -6,6 +6,8 @@ set -euo pipefail
 
 readonly secret_dir=/etc/jarvis/secrets
 readonly core_env=/etc/jarvis/core.env
+readonly ollama_cloud_default_base_url=https://ollama.com/v1
+readonly ollama_cloud_tags_url=https://ollama.com/api/tags
 
 fail() { echo "jarvis-credentials: $*" >&2; exit 1; }
 [[ ${EUID} -eq 0 ]] || fail "must run as root"
@@ -42,11 +44,56 @@ require_tty() {
         fail "requires a controlling TTY; secrets are never accepted through argv/stdin"
 }
 
+ensure_core_env_setting() {
+    local key=$1 value=$2 count existing tmp
+    [[ $key =~ ^JARVIS_[A-Z0-9_]+$ && -n $value && $value != *$'\n'* ]] ||
+        fail "refusing malformed protected Core configuration default"
+    [[ -f $core_env && ! -L $core_env ]] || fail "missing protected Core configuration"
+    [[ $(stat -c '%U:%G:%a' "$core_env") == root:jarvis:640 ]] ||
+        fail "protected Core configuration permissions are unsafe"
+    count=$(grep -c "^${key}=" "$core_env" || true)
+    ((count <= 1)) || fail "protected Core configuration contains duplicate $key"
+    if ((count == 1)); then
+        existing=$(sed -n "s/^${key}=//p" "$core_env")
+        [[ -n $existing ]] && return 0
+    fi
+    tmp=$(mktemp /etc/jarvis/.core.env.provider.XXXXXX)
+    trap 'rm -f -- "$tmp"' RETURN
+    umask 077
+    awk -v key="$key" -v value="$value" '
+        BEGIN { replaced = 0 }
+        index($0, key "=") == 1 {
+            if (!replaced) {
+                print key "=" value
+                replaced = 1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!replaced) print key "=" value
+        }
+    ' "$core_env" > "$tmp"
+    chown root:jarvis "$tmp"
+    chmod 0640 "$tmp"
+    mv -f -- "$tmp" "$core_env"
+    trap - RETURN
+}
+
+ensure_provider_defaults() {
+    case $1 in
+        ollama-cloud)
+            ensure_core_env_setting JARVIS_LLM_OLLAMA_CLOUD_BASE_URL "$ollama_cloud_default_base_url"
+            ;;
+    esac
+}
+
 wait_healthy() {
     local _attempt
-    for _attempt in {1..12}; do
-        if curl --fail --silent --show-error --max-time 2 http://127.0.0.1:8080/livez >/dev/null \
-            && curl --fail --silent --show-error --max-time 2 http://127.0.0.1:8080/readyz >/dev/null; then
+    for _attempt in {1..20}; do
+        if systemctl is-active --quiet jarvis-core.service \
+            && curl --fail --silent --output /dev/null --max-time 2 http://127.0.0.1:8080/livez 2>/dev/null \
+            && curl --fail --silent --output /dev/null --max-time 2 http://127.0.0.1:8080/readyz 2>/dev/null; then
             return 0
         fi
         sleep 1
@@ -75,6 +122,7 @@ set_credential() {
     [[ $provider != ollama ]] || fail "local Ollama has no credential; use ollama-cloud only for a remote API"
     var=$(provider_var "$provider") || fail "unknown provider"
     require_tty
+    ensure_provider_defaults "$provider"
     install -d -o root -g jarvis -m 0750 "$secret_dir"
     file=$(credential_file "$provider")
     printf 'Enter %s credential (input hidden): ' "$provider" >/dev/tty
@@ -118,6 +166,7 @@ test_credential() {
     local provider=$1 file
     [[ $provider != ollama ]] || fail "local Ollama has no credential; check its loopback service instead"
     provider_var "$provider" >/dev/null || fail "unknown provider"
+    ensure_provider_defaults "$provider"
     file=$(credential_file "$provider")
     [[ -f $file && ! -L $file && $(stat -c '%U:%G:%a' "$file") == root:jarvis:640 ]] || fail "not configured or unsafe permissions"
     if ! probe_provider "$provider" "$file"; then
@@ -129,11 +178,11 @@ test_credential() {
     echo "jarvis-credentials: $provider credential probe and Core health check succeeded; no generation request was made."
 }
 
-# Authenticated, read-only provider probe.  The key is written only into an
+# Authenticated, read-only provider probe. The key is written only into an
 # ephemeral mode-0600 curl config in /run, never onto curl's argv or stdout.
 # Every endpoint below is metadata-only and must not create a paid generation.
 probe_provider() {
-    local provider=$1 file=$2 variable key escaped_key base config http_code
+    local provider=$1 file=$2 variable key escaped_key base config http_code url
     command -v curl >/dev/null 2>&1 || fail "curl is required for credential testing"
     variable=$(provider_var "$provider") || return 1
     set -a
@@ -157,7 +206,13 @@ probe_provider() {
             [[ $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 1
             printf 'url = "%s/v1/models?limit=1"\nheader = "x-api-key: %s"\nheader = "anthropic-version: 2023-06-01"\n' "${base%/}" "$escaped_key" > "$config"
             ;;
-        openai|deepseek|xai|zai|ollama-cloud)
+        ollama-cloud)
+            # Ollama Cloud chat is OpenAI-compatible at /v1, but authenticated
+            # account/model metadata is served through the native /api/tags route.
+            url=$ollama_cloud_tags_url
+            printf 'url = "%s"\nheader = "Authorization: Bearer %s"\n' "$url" "$escaped_key" > "$config"
+            ;;
+        openai|deepseek|xai|zai)
             base=$(openai_compatible_base_url "$provider") || return 1
             [[ $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 1
             printf 'url = "%s/models"\nheader = "Authorization: Bearer %s"\n' "${base%/}" "$escaped_key" > "$config"
@@ -190,7 +245,7 @@ openai_compatible_base_url() {
         deepseek) printf '%s\n' "${JARVIS_LLM_DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}" ;;
         xai) printf '%s\n' "${JARVIS_LLM_XAI_BASE_URL:-https://api.x.ai/v1}" ;;
         zai) printf '%s\n' "${JARVIS_LLM_ZAI_BASE_URL:-https://api.z.ai/api/paas/v4}" ;;
-        ollama-cloud) printf '%s\n' "${JARVIS_LLM_OLLAMA_CLOUD_BASE_URL:-}" ;;
+        ollama-cloud) printf '%s\n' "${JARVIS_LLM_OLLAMA_CLOUD_BASE_URL:-$ollama_cloud_default_base_url}" ;;
         *) return 1 ;;
     esac
 }
