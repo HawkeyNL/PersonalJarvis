@@ -76,6 +76,7 @@ JARVIS_LLM_PERSONA_PATH=/etc/jarvis/Jarvis.md
 JARVIS_PRIVILEGED_BROKER_SOCKET=/run/jarvis-config-broker/broker.sock
 JARVIS_AGENT_BUNDLE_PATH=/var/lib/jarvis/agents/current
 JARVIS_LLM_PROVIDER=router
+JARVIS_LLM_OLLAMA_CLOUD_BASE_URL=https://ollama.com/v1
 JARVIS_LLM_MODEL=claude-sonnet-5
 JARVIS_LLM_MODEL_HARD=claude-opus-5
 JARVIS_LLM_MODEL_CHEAP=claude-haiku-4-5
