@@ -9,6 +9,7 @@ readonly policy_file=/etc/jarvis/model-policy.json
 readonly policy_dir=/etc/jarvis
 readonly core_env=/etc/jarvis/core.env
 readonly ollama_cloud_default_base_url=https://ollama.com/v1
+readonly ollama_cloud_tags_url=https://ollama.com/api/tags
 
 fail() { echo "jarvis-models: $*" >&2; exit 1; }
 [[ ${EUID} -eq 0 ]] || fail "must run as root"
@@ -152,10 +153,12 @@ provider_base_url() {
     esac
 }
 
-# Official OpenAI-compatible `/models` discovery. The key exists only in an
-# ephemeral mode-0600 curl config, never in curl argv, output, or policy JSON.
+# Discover models through provider metadata only. Credentials live only in an
+# ephemeral mode-0600 curl config, never in argv/output/policy. OpenAI-compatible
+# providers expose `data[].id`; Ollama Cloud exposes its native authenticated
+# `/api/tags` metadata as `models[].name` even though chat uses `/v1`.
 discover_remote_models() {
-    local provider=$1 variable credential_file key base config response
+    local provider=$1 variable credential_file key config response url jq_filter
     variable=$(provider_secret_var "$provider") || return 0
     credential_file="/etc/jarvis/secrets/${provider%-api}.env"
     [[ $provider != ollama-cloud ]] || credential_file=/etc/jarvis/secrets/ollama-cloud.env
@@ -166,17 +169,29 @@ discover_remote_models() {
     set +a
     key=${!variable:-}
     [[ -n $key ]] || return 0
-    base=$(provider_base_url "$provider")
-    [[ -n $base && $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 0
     config=$(mktemp /run/jarvis-model-discovery.XXXXXX)
     trap 'rm -f -- "$config"; unset key' RETURN
     umask 077
-    printf 'url = "%s/models"\nheader = "Authorization: Bearer %s"\n' "${base%/}" "$key" > "$config"
+    if [[ $provider == ollama-cloud ]]; then
+        url=$ollama_cloud_tags_url
+        jq_filter='.models[]?.name?'
+    else
+        local base
+        base=$(provider_base_url "$provider")
+        [[ -n $base && $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 0
+        url="${base%/}/models"
+        jq_filter='.data[]?.id?'
+    fi
+    printf 'url = "%s"\nheader = "Authorization: Bearer %s"\n' "$url" "$key" > "$config"
     unset key
-    response=$(curl --config "$config" --fail --silent --show-error --max-time 10 2>/dev/null) || { trap - RETURN; rm -f -- "$config"; return 0; }
+    response=$(curl --config "$config" --fail --silent --show-error --max-time 10 2>/dev/null) || {
+        trap - RETURN
+        rm -f -- "$config"
+        return 0
+    }
     trap - RETURN
     rm -f -- "$config"
-    jq -r --arg provider "$provider" '.data[]?.id? | select(type == "string" and length > 0 and length <= 256) | [$provider, .] | @json' <<<"$response" || true
+    jq -r --arg provider "$provider" "$jq_filter | select(type == \"string\" and length > 0 and length <= 256) | [\$provider, .] | @json" <<<"$response" || true
 }
 
 refresh() {
@@ -193,11 +208,14 @@ refresh() {
     for candidate in openai-api deepseek-api xai-api zai-api ollama-cloud; do
         [[ -z $provider || $provider == "$candidate" ]] || continue
         discovered=$(jq -s 'map(fromjson?) | map(select(. != null) + ["provider_api"])' <(discover_remote_models "$candidate") 2>/dev/null || printf '[]')
-        [[ $discovered != '[]' ]] && known=$(jq -n --argjson known "$known" --argjson discovered "$discovered" '$known + $discovered | unique' )
+        if [[ -n $provider && $provider == "$candidate" && $discovered == '[]' ]]; then
+            fail "$candidate model discovery returned no models; credential or provider metadata endpoint is unavailable"
+        fi
+        [[ $discovered != '[]' ]] && known=$(jq -n --argjson known "$known" --argjson discovered "$discovered" '$known + $discovered | unique')
     done
     # Retain all existing records (including disabled discovered models) across
-    # refresh failures.  New remote entries are disabled.  Local Ollama is the
-    # explicit offline default, not an accidental cloud authorization.
+    # best-effort all-provider refresh failures. New remote entries are disabled.
+    # Explicit remote-provider refreshes above fail instead of reporting false success.
     merged=$(jq -n --argjson old "$old" --argjson known "$known" '
       reduce $known[] as $item ($old;
         if any(.models[]; .provider == $item[0] and .model == $item[1]) then .
