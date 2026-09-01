@@ -80,7 +80,12 @@ grep -Fq 'mktemp /run/jarvis-model-discovery' "$models"
 grep -Fq 'provider_api' "$models"
 grep -Fq 'ollama_cloud_default_base_url=https://ollama.com/v1' "$models"
 grep -Fq 'ollama_cloud_tags_url=https://ollama.com/api/tags' "$models"
-grep -Fq "jq_filter='.models[]?.name?'" "$models"
+grep -Fq "ollama-cloud) jq_filter='.models[]?.name?'" "$models"
+grep -Fq 'aggregate_discovered_models' "$models"
+if grep -Fq 'map(fromjson?)' "$models"; then
+    echo "model discovery reparses JSON values as strings" >&2
+    exit 1
+fi
 grep -Fq 'model discovery returned no models' "$models"
 # Only the known restrictive legacy ownership/mode may be normalized; unsafe
 # writable/symlink/non-root states still fail closed.

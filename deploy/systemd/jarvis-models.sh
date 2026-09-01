@@ -12,9 +12,6 @@ readonly ollama_cloud_default_base_url=https://ollama.com/v1
 readonly ollama_cloud_tags_url=https://ollama.com/api/tags
 
 fail() { echo "jarvis-models: $*" >&2; exit 1; }
-[[ ${EUID} -eq 0 ]] || fail "must run as root"
-command -v jq >/dev/null 2>&1 || fail "jq is required"
-command -v curl >/dev/null 2>&1 || fail "curl is required"
 
 usage() {
     cat >&2 <<'EOF'
@@ -153,12 +150,48 @@ provider_base_url() {
     esac
 }
 
+# Convert the provider response to newline-delimited JSON arrays. Keep this
+# transformation separate from network access so the exact parser/aggregation
+# pipeline can be exercised without credentials or a live provider.
+parse_remote_model_response() {
+    local provider=$1 response=$2 jq_filter
+    case $provider in
+        ollama-cloud) jq_filter='.models[]?.name?' ;;
+        openai-api|deepseek-api|xai-api|zai-api) jq_filter='.data[]?.id?' ;;
+        *) return 1 ;;
+    esac
+    jq -c --arg provider "$provider" \
+        "$jq_filter | select(type == \"string\" and length > 0 and length <= 256) | [\$provider, .]" \
+        <<<"$response" || true
+}
+
+aggregate_discovered_models() {
+    jq -s '
+      map(select(
+        type == "array"
+        and length == 2
+        and all(.[]; type == "string" and length > 0)
+      ))
+      | map(. + ["provider_api"])'
+}
+
+merge_model_policy() {
+    local old=$1 known=$2
+    jq -n --argjson old "$old" --argjson known "$known" '
+      reduce $known[] as $item ($old;
+        if any(.models[]; .provider == $item[0] and .model == $item[1]) then .
+        else .models += [{provider:$item[0], model:$item[1], enabled:($item[0] == "ollama"), source:($item[2] // "configured")}]
+        end)
+      | .version = 1
+      | .models |= sort_by(.provider, .model)'
+}
+
 # Discover models through provider metadata only. Credentials live only in an
 # ephemeral mode-0600 curl config, never in argv/output/policy. OpenAI-compatible
 # providers expose `data[].id`; Ollama Cloud exposes its native authenticated
 # `/api/tags` metadata as `models[].name` even though chat uses `/v1`.
 discover_remote_models() {
-    local provider=$1 variable credential_file key config response url jq_filter
+    local provider=$1 variable credential_file key config response url
     variable=$(provider_secret_var "$provider") || return 0
     credential_file="/etc/jarvis/secrets/${provider%-api}.env"
     [[ $provider != ollama-cloud ]] || credential_file=/etc/jarvis/secrets/ollama-cloud.env
@@ -174,13 +207,11 @@ discover_remote_models() {
     umask 077
     if [[ $provider == ollama-cloud ]]; then
         url=$ollama_cloud_tags_url
-        jq_filter='.models[]?.name?'
     else
         local base
         base=$(provider_base_url "$provider")
         [[ -n $base && $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 0
         url="${base%/}/models"
-        jq_filter='.data[]?.id?'
     fi
     printf 'url = "%s"\nheader = "Authorization: Bearer %s"\n' "$url" "$key" > "$config"
     unset key
@@ -191,7 +222,7 @@ discover_remote_models() {
     }
     trap - RETURN
     rm -f -- "$config"
-    jq -r --arg provider "$provider" "$jq_filter | select(type == \"string\" and length > 0 and length <= 256) | [\$provider, .] | @json" <<<"$response" || true
+    parse_remote_model_response "$provider" "$response"
 }
 
 refresh() {
@@ -207,7 +238,7 @@ refresh() {
     discovered='[]'
     for candidate in openai-api deepseek-api xai-api zai-api ollama-cloud; do
         [[ -z $provider || $provider == "$candidate" ]] || continue
-        discovered=$(jq -s 'map(fromjson?) | map(select(. != null) + ["provider_api"])' <(discover_remote_models "$candidate") 2>/dev/null || printf '[]')
+        discovered=$(discover_remote_models "$candidate" | aggregate_discovered_models 2>/dev/null || printf '[]')
         if [[ -n $provider && $provider == "$candidate" && $discovered == '[]' ]]; then
             fail "$candidate model discovery returned no models; credential or provider metadata endpoint is unavailable"
         fi
@@ -216,13 +247,7 @@ refresh() {
     # Retain all existing records (including disabled discovered models) across
     # best-effort all-provider refresh failures. New remote entries are disabled.
     # Explicit remote-provider refreshes above fail instead of reporting false success.
-    merged=$(jq -n --argjson old "$old" --argjson known "$known" '
-      reduce $known[] as $item ($old;
-        if any(.models[]; .provider == $item[0] and .model == $item[1]) then .
-        else .models += [{provider:$item[0], model:$item[1], enabled:($item[0] == "ollama"), source:($item[2] // "configured")}]
-        end)
-      | .version = 1
-      | .models |= sort_by(.provider, .model)')
+    merged=$(merge_model_policy "$old" "$known")
     atomic_write "$merged"
     echo "jarvis-models: refreshed policy; new remote models remain disabled."
 }
@@ -263,11 +288,21 @@ show_model() {
         '.models[] | select(.provider == $provider and .model == $model)' "$policy_file"
 }
 
-case ${1:-} in
-    refresh) (($# == 1 || $# == 2)) || usage; refresh "${2:-}" ;;
-    list) (($# == 1 || $# == 2)) || usage; list_models "${2:-}" ;;
-    enable) (($# == 3)) || usage; set_state "$2" "$3" true ;;
-    disable) (($# == 3)) || usage; set_state "$2" "$3" false ;;
-    show) (($# == 3)) || usage; show_model "$2" "$3" ;;
-    *) usage ;;
-esac
+main() {
+    [[ ${EUID} -eq 0 ]] || fail "must run as root"
+    command -v jq >/dev/null 2>&1 || fail "jq is required"
+    command -v curl >/dev/null 2>&1 || fail "curl is required"
+
+    case ${1:-} in
+        refresh) (($# == 1 || $# == 2)) || usage; refresh "${2:-}" ;;
+        list) (($# == 1 || $# == 2)) || usage; list_models "${2:-}" ;;
+        enable) (($# == 3)) || usage; set_state "$2" "$3" true ;;
+        disable) (($# == 3)) || usage; set_state "$2" "$3" false ;;
+        show) (($# == 3)) || usage; show_model "$2" "$3" ;;
+        *) usage ;;
+    esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
