@@ -3,6 +3,7 @@
 //! Loads config, opens SurrealDB, applies the versioned baseline, and serves the
 //! router from `jarvis_api::build_router`.
 
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
@@ -190,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
             jarvis_llm::ModelAccessPolicy::deny_by_default()
         }
     };
-    let pricing_registry = match jarvis_usage::PricingRegistry::load(
+    let pricing_registry = match jarvis_usage::PricingRegistry::load_with_builtin(
         &config.llm_pricing_registry_path,
     ) {
         Ok(registry) => registry,
@@ -315,6 +316,9 @@ async fn main() -> anyhow::Result<()> {
         registry_input: Arc::new(registry_input),
         model_policy: Arc::new(model_policy),
         pricing_registry: Arc::new(pricing_registry),
+        usage_snapshot_path: Some(Arc::new(PathBuf::from(
+            "/var/lib/jarvis/usage-summary.json",
+        ))),
         privileged_broker_socket: (!config.privileged_broker_socket.trim().is_empty())
             .then(|| Arc::<str>::from(config.privileged_broker_socket.trim())),
         codex_broker_socket: (!config.codex_broker_socket.trim().is_empty())
@@ -341,6 +345,7 @@ async fn main() -> anyhow::Result<()> {
         app_update_mirror,
     };
 
+    jarvis_api::refresh_usage_snapshot(&state).await;
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "jarvis-api listening");
     // `into_make_service_with_connect_info` exposes the peer address so the

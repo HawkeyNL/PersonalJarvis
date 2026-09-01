@@ -229,16 +229,63 @@ async fn forward_to_broker(
 }
 
 /// This month's LLM spend vs. the budget, with a per-backend breakdown (ADR-027).
-pub(crate) async fn system_usage(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
+pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store::StoreError> {
     let spent_eur = state.spent_cents.load(Ordering::Relaxed) as f64 / 100.0;
     let budget_eur = state.budget_cents as f64 / 100.0;
     let reservation = state.budget_book.snapshot();
-    let breakdown = usage::month_breakdown(&state.db).await.unwrap_or_default();
-    let by_backend: Vec<Value> = breakdown
+    let mut statistics = usage::month_statistics(&state.db).await?;
+    statistics.by_model.truncate(250);
+    let by_backend: Vec<Value> = statistics
+        .by_backend
         .into_iter()
-        .map(|(backend, eur)| json!({ "backend": backend, "spent_eur": eur }))
+        .map(|row| {
+            json!({
+                "backend": row.backend,
+                "spent_eur": row.totals.cost_eur,
+                "requests": row.totals.requests,
+                "input_tokens": row.totals.input_tokens,
+                "output_tokens": row.totals.output_tokens,
+                "cache_read_tokens": row.totals.cache_read_tokens,
+                "cache_write_tokens": row.totals.cache_write_tokens,
+                "total_tokens": row.totals.total_tokens,
+            })
+        })
         .collect();
-    Json(json!({
+    let by_model: Vec<Value> = statistics
+        .by_model
+        .into_iter()
+        .map(|row| {
+            json!({
+                "backend": row.backend,
+                "model": row.model,
+                "spent_eur": row.totals.cost_eur,
+                "requests": row.totals.requests,
+                "input_tokens": row.totals.input_tokens,
+                "output_tokens": row.totals.output_tokens,
+                "cache_read_tokens": row.totals.cache_read_tokens,
+                "cache_write_tokens": row.totals.cache_write_tokens,
+                "total_tokens": row.totals.total_tokens,
+            })
+        })
+        .collect();
+    let daily: Vec<Value> = statistics
+        .daily
+        .into_iter()
+        .map(|row| {
+            json!({
+                "day": row.day,
+                "spent_eur": row.totals.cost_eur,
+                "requests": row.totals.requests,
+                "input_tokens": row.totals.input_tokens,
+                "output_tokens": row.totals.output_tokens,
+                "cache_read_tokens": row.totals.cache_read_tokens,
+                "cache_write_tokens": row.totals.cache_write_tokens,
+                "total_tokens": row.totals.total_tokens,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "period": "current_calendar_month",
         "budget_eur": budget_eur,
         "spent_eur": spent_eur,
         "remaining_eur": (budget_eur - spent_eur).max(0.0),
@@ -246,8 +293,30 @@ pub(crate) async fn system_usage(_authed: Authed, State(state): State<AppState>)
         "reserved_eur": reservation.reserved_cents as f64 / 100.0,
         "remaining_hard_eur": reservation.remaining_hard_cents as f64 / 100.0,
         "above_soft_budget": reservation.above_soft_limit,
+        "requests": statistics.totals.requests,
+        "input_tokens": statistics.totals.input_tokens,
+        "output_tokens": statistics.totals.output_tokens,
+        "cache_read_tokens": statistics.totals.cache_read_tokens,
+        "cache_write_tokens": statistics.totals.cache_write_tokens,
+        "total_tokens": statistics.totals.total_tokens,
         "by_backend": by_backend,
+        "by_model": by_model,
+        "daily": daily,
+        "pricing": {
+            "source": state.pricing_registry.source,
+            "updated_at": state.pricing_registry.updated_at,
+        },
     }))
+}
+
+pub(crate) async fn system_usage(
+    _authed: Authed,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    usage_value(&state)
+        .await
+        .map(Json)
+        .map_err(|_| internal_error())
 }
 
 /// Jarvis' resource/agent registry — available brains + cost + the host it runs

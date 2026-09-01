@@ -32,6 +32,11 @@ jq -e '
   and (.models | type == "array" and length > 0)
   and all(.models[]; (.provider | type == "string" and length > 0) and (.model | type == "string" and length > 0) and (.input_per_million_usd >= 0) and (.output_per_million_usd >= 0))
 ' "$pricing" >/dev/null
+jq -e '
+  ([.models[] | select(.provider == "ollama-cloud")] | length >= 15)
+  and any(.models[]; .provider == "ollama-cloud" and .model == "gpt-oss:20b"
+      and .input_per_million_usd == 0.07 and .output_per_million_usd == 0.3)
+' "$pricing" >/dev/null
 
 # Credentials require a TTY, use hidden input, and are never accepted through
 # argv/stdin.  The secret variable must not be printed or passed to curl.

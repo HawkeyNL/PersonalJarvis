@@ -39,6 +39,7 @@ sudo jarvis --json health
 sudo jarvis --json update --check
 sudo jarvis --json update --status
 sudo jarvis --json models list
+sudo jarvis --json usage
 sudo jarvis --json credentials list
 sudo jarvis --json agents status
 sudo jarvis --json logs core --lines 100
@@ -148,6 +149,25 @@ sudo jarvis models enable openai-api gpt-4o-mini
 sudo jarvis credentials list
 sudo jarvis credentials set openai
 ```
+
+JSON model listings include exact reviewed input, cached-input and output
+prices per million tokens when known. Unknown remote model IDs are labelled
+`unknown`; local models are labelled `local`. Owner pricing entries take
+precedence over reviewed coverage shipped in the active verified release.
+
+Monthly aggregate telemetry is available through:
+
+```bash
+sudo jarvis usage
+sudo jarvis --json usage
+```
+
+It includes request and token totals, daily/provider/model breakdowns and
+estimated spend. The snapshot is bounded, root-controlled and contains no
+prompts, replies, credentials or request identifiers. Provider invoices remain
+authoritative. Calls made before token collection was introduced cannot be
+reconstructed, and a provider that reports no token metrics contributes no
+invented token count.
 
 The command delegates to the existing root-managed policy and credential
 helpers. A provider key never enables a model on its own. Credential input is

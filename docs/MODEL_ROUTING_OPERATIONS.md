@@ -91,11 +91,20 @@ with a soft threshold for cost-aware selection and a per-request hard cap.
 
 `/etc/jarvis/pricing-registry.json` is a root-owned, Core-readable (`0640`)
 versioned registry with a source note and update date. Entries are exact
-provider/model pairs. It is initialized once during setup and is deliberately
-not changed by release updates. An owner can stage a reviewed replacement
-atomically, retain the ownership/mode, then restart Core; malformed or missing
+provider/model pairs. It is initialized once during setup and an explicit owner
+entry is never overwritten by a release. Verified releases may add reviewed
+exact-model coverage for pairs that are absent from the owner registry; the
+effective source/date reports both layers. An owner can stage a reviewed
+replacement atomically, retain the ownership/mode, then restart Core. Malformed
 input falls back to the built-in conservative registry and is logged without
-affecting availability.
+affecting availability. Unknown remote models remain explicitly unknown and
+use conservative accounting rather than a fabricated zero price.
+
+Core persists bounded monthly aggregates for requests, input/output/cache
+tokens and estimated spend. The aggregate contains no prompts, replies,
+credentials or request identifiers. Core Admin exposes it in **Usage & Costs**;
+the regular Jarvis app shows a compact summary on Status. Provider invoices
+remain authoritative because pricing and provider token reporting can change.
 
 The current in-process reservation gate prevents concurrent requests from
 oversubscribing the Home Node's configured monthly ceiling and reconciles with

@@ -1,18 +1,23 @@
-//! LLM cost metering (ADR-027). Records each metered reply's spend and keeps the
-//! monthly-spend counter fresh so the router's budget gate stays correct. Shared
-//! by the chat and self-dev paths. Billing must never break a request, so DB
-//! errors are logged, not surfaced; free backends (plan/Ollama) are skipped.
+//! LLM usage and cost metering (ADR-027). Provider-reported token counts are
+//! recorded for paid and zero-cost backends; only paid backends accrue spend.
+//! Metering must never break a request, so database errors are logged rather
+//! than surfaced to the assistant caller.
 
-use std::sync::atomic::Ordering;
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    sync::atomic::Ordering,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use jarvis_llm as llm;
 use jarvis_usage as usage;
 
-use crate::AppState;
+use crate::{routes::system::usage_value, AppState};
 
-/// Record a reply's cost and refresh the monthly spend counter (ADR-027). Free
-/// backends (plan/Ollama) cost nothing and are skipped. Billing must never break
-/// a chat, so DB errors are logged, not surfaced.
+/// Record a reply's token use and cost, then refresh the monthly spend counter.
+/// Billing/telemetry must never break a chat, so errors are logged, not surfaced.
 pub(crate) async fn record_usage(state: &AppState, reply: &llm::ChatReply) {
     record_usage_with_metadata(state, reply, usage::UsageMetadata::default()).await;
 }
@@ -38,9 +43,6 @@ pub(crate) async fn record_usage_with_metadata(
         %backend, model = %reply.model, input = u.input_tokens, output = u.output_tokens,
         cache_read = u.cache_read_tokens, cost_eur = cost, "assistant chat usage",
     );
-    if !usage::is_metered(backend) {
-        return; // plan/local: nothing to bill or count
-    }
     let entry = usage::UsageEntry {
         request_id: metadata.request_id,
         backend: backend.to_string(),
@@ -69,5 +71,49 @@ pub(crate) async fn record_usage_with_metadata(
             state.budget_book.reconcile_actual(cents);
         }
         Err(e) => tracing::warn!(error = %e, "failed to refresh monthly spend"),
+    }
+    refresh_usage_snapshot(state).await;
+}
+
+/// Refresh the bounded non-secret aggregate consumed by the local admin GUI.
+/// Failure is observability-only and must never break an assistant response.
+pub async fn refresh_usage_snapshot(state: &AppState) {
+    let Some(path) = state.usage_snapshot_path.as_deref() else {
+        return;
+    };
+    let Ok(mut value) = usage_value(state).await else {
+        tracing::warn!("failed to query non-secret usage aggregates");
+        return;
+    };
+    value["generated_at_unix"] = serde_json::json!(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs());
+    let Ok(bytes) = serde_json::to_vec(&value) else {
+        return;
+    };
+    if bytes.len() > 512 * 1024 {
+        tracing::warn!("usage summary exceeded its safe size bound");
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let temporary = parent.join(format!(".usage-summary.{}.tmp", uuid::Uuid::now_v7()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        tracing::warn!(%error, "failed to refresh non-secret usage summary");
     }
 }

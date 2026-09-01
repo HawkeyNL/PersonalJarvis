@@ -35,6 +35,7 @@ mod state;
 mod validation;
 
 pub use extract::Authed;
+pub use metering::refresh_usage_snapshot;
 pub use state::{AppState, AppUpdateMirror};
 // Compatibility re-export: persona ownership is in `jarvis-core`, while the
 // transport crate keeps this public helper available to existing callers.

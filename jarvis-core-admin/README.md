@@ -103,8 +103,13 @@ an update when Core, CLI, the graphical app, or multiple components changed.
 
 ## Scope
 
-The initial navigation contains Overview, Health, Services, Update, Agents,
-Models, Credentials, Logs and System/About. Credential values are never shown
-or entered. Logs are bounded, control-sequence sanitized, structured where
-possible, searchable/filterable, selectable, wrapped and optionally followed
-through bounded polling of the allowlisted direct CLI operation.
+The navigation contains Overview, Health, Services, Update, Agents, Models,
+Credentials, Logs, Usage & Costs and System/About. The Models view can filter
+and sort exact reviewed per-million-token prices; unknown remote prices remain
+visibly unknown. Usage & Costs shows bounded current-month request, token and
+estimated-cost aggregates by day, provider and model. No prompt, reply,
+credential or request identifier enters either view. Credential values are
+never shown or entered. Logs are bounded, control-sequence sanitized,
+structured where possible, searchable/filterable, selectable, wrapped and
+optionally followed through bounded polling of the allowlisted direct CLI
+operation.

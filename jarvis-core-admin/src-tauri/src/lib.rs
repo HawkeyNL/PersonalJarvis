@@ -131,6 +131,14 @@ async fn models(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+async fn usage(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+) -> Result<admin::UsageReport, String> {
+    with_session(session, |session| admin::usage(&session)).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 async fn model_mutation(
     session: tauri::State<'_, Arc<session::SessionManager>>,
     request: admin::ModelMutation,
@@ -190,6 +198,7 @@ pub fn run() {
             agents,
             agent_action,
             models,
+            usage,
             model_mutation,
             credentials,
             logs,

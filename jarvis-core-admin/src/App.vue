@@ -7,6 +7,7 @@ import CredentialsView from "./views/CredentialsView.vue";
 import HealthView from "./views/HealthView.vue";
 import LogsView from "./views/LogsView.vue";
 import ModelsView from "./views/ModelsView.vue";
+import UsageView from "./views/UsageView.vue";
 import OverviewView from "./views/OverviewView.vue";
 import ServicesView from "./views/ServicesView.vue";
 import SystemView from "./views/SystemView.vue";
@@ -16,10 +17,11 @@ const items: { id: ViewName; label: string }[] = [
   { id: "overview", label: "Overview" }, { id: "health", label: "Health" },
   { id: "services", label: "Services" }, { id: "update", label: "Update" },
   { id: "agents", label: "Agents" }, { id: "models", label: "Models" },
+  { id: "usage", label: "Usage & Costs" },
   { id: "credentials", label: "Credentials" }, { id: "logs", label: "Logs" },
   { id: "system", label: "System" },
 ];
-const views = { overview: OverviewView, health: HealthView, services: ServicesView, update: UpdateView, agents: AgentsView, models: ModelsView, credentials: CredentialsView, logs: LogsView, system: SystemView };
+const views = { overview: OverviewView, health: HealthView, services: ServicesView, update: UpdateView, agents: AgentsView, models: ModelsView, usage: UsageView, credentials: CredentialsView, logs: LogsView, system: SystemView };
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const TOUCH_INTERVAL_MS = 5 * 1000;
 const active = ref<ViewName>("overview");

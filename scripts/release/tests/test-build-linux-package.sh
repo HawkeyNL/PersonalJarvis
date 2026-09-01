@@ -18,12 +18,14 @@ write_candidate() {
         printf '#!/usr/bin/env bash\nprintf "%s fixture\\n"\n' "$helper" > "$release/$helper"
         chmod 0755 "$release/$helper"
     done
+    printf '%s\n' '{"version":1,"source":"fixture","updated_at":"2026-09-01","models":[]}' \
+        > "$release/pricing-registry.json"
     jq -n --arg tag "$tag" --arg revision "$revision" \
         '{tag:$tag,revision:$revision,components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1}}' \
         > "$release/release.json"
     (
         cd "$release"
-        sha256sum jarvis-models jarvis-credentials > artifact-binaries.sha256
+        sha256sum jarvis-models jarvis-credentials pricing-registry.json > artifact-binaries.sha256
     )
 }
 
@@ -34,6 +36,7 @@ archive="$fixture/jarvis-core-$tag-linux-x86_64.tar.gz"
 [[ -f $archive ]]
 tar -tzf "$archive" | grep -qx "jarvis-core-$tag/jarvis-models"
 tar -tzf "$archive" | grep -qx "jarvis-core-$tag/jarvis-credentials"
+tar -tzf "$archive" | grep -qx "jarvis-core-$tag/pricing-registry.json"
 extracted="$fixture/extracted"
 mkdir -p "$extracted"
 tar -xzf "$archive" -C "$extracted"

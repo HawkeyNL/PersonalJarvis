@@ -29,6 +29,21 @@ verify_admin_helper_candidate() {
       exit 1
     }
   done
+  [[ -f "$release/pricing-registry.json" && ! -L "$release/pricing-registry.json" ]] || {
+    echo "release candidate is missing the reviewed pricing registry" >&2
+    exit 1
+  }
+  jq -e '.version == 1 and (.models | type == "array")' \
+    "$release/pricing-registry.json" >/dev/null || {
+    echo "release candidate pricing registry is malformed" >&2
+    exit 1
+  }
+  matches=$(awk '$2 == "pricing-registry.json" { count++ } END { print count + 0 }' \
+    "$release/artifact-binaries.sha256")
+  [[ $matches == 1 ]] || {
+    echo "release candidate does not uniquely checksum-bind pricing-registry.json" >&2
+    exit 1
+  }
 }
 
 [[ $# -ge 3 && $# -le 4 ]] || usage
@@ -173,6 +188,7 @@ printf '%s\n' "$core_admin_version" > "$temporary_release/jarvis-core-admin.vers
 install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update-core-release"
 install -m 0755 deploy/systemd/jarvis-models.sh "$temporary_release/jarvis-models"
 install -m 0755 deploy/systemd/jarvis-credentials.sh "$temporary_release/jarvis-credentials"
+install -m 0644 deploy/systemd/pricing-registry.json "$temporary_release/pricing-registry.json"
 install -m 0755 deploy/private/install-agent-bundle.sh "$temporary_release/install-agent-bundle"
 install -m 0755 deploy/private/jarvis-private-agent-poll.sh "$temporary_release/private-agent-poll"
 install -m 0755 deploy/private/jarvis-private-update.sh "$temporary_release/jarvis-private-update"
@@ -197,6 +213,7 @@ jq -n \
   sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-agent-bundle \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
     jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials \
+    pricing-registry.json \
     install-agent-bundle \
     private-agent-poll jarvis-private-update \
     > artifact-binaries.sha256

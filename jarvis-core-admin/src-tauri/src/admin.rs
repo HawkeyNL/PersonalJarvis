@@ -155,11 +155,81 @@ pub struct ModelRecord {
     pub model: String,
     pub enabled: bool,
     pub source: String,
+    #[serde(default = "unknown_price_status")]
+    pub price_status: String,
+    #[serde(default)]
+    pub input_per_million_usd: Option<f64>,
+    #[serde(default)]
+    pub cache_read_per_million_usd: Option<f64>,
+    #[serde(default)]
+    pub output_per_million_usd: Option<f64>,
+    #[serde(default)]
+    pub pricing_source: String,
+    #[serde(default)]
+    pub pricing_updated_at: String,
+}
+
+fn unknown_price_status() -> String {
+    "unknown".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
 struct ModelPolicy {
     models: Vec<ModelRecord>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UsageReport {
+    pub period: String,
+    pub generated_at_unix: u64,
+    pub budget_eur: f64,
+    pub spent_eur: f64,
+    pub remaining_eur: f64,
+    pub over_budget: bool,
+    pub reserved_eur: f64,
+    pub remaining_hard_eur: f64,
+    pub above_soft_budget: bool,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens: u64,
+    pub by_backend: Vec<UsageRow>,
+    pub by_model: Vec<UsageRow>,
+    pub daily: Vec<DailyUsageRow>,
+    pub pricing: PricingSummary,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UsageRow {
+    pub backend: String,
+    pub model: Option<String>,
+    pub spent_eur: f64,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DailyUsageRow {
+    pub day: String,
+    pub spent_eur: f64,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PricingSummary {
+    pub source: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -366,6 +436,10 @@ pub fn agent_action(session: &SessionManager, update: bool) -> AdminResult<Opera
 
 pub fn models(session: &SessionManager) -> AdminResult<Vec<ModelRecord>> {
     Ok(parse_json::<ModelPolicy>(&session.run(BrokerRequest::Models)?.stdout)?.models)
+}
+
+pub fn usage(session: &SessionManager) -> AdminResult<UsageReport> {
+    parse_json(&session.run(BrokerRequest::Usage)?.stdout)
 }
 
 pub fn model_mutation(
@@ -598,6 +672,11 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
             vec!["--json".to_owned(), "models".to_owned(), "list".to_owned()],
             Duration::from_secs(120),
         ),
+        BrokerRequest::Usage => (
+            ADMIN,
+            vec!["--json".to_owned(), "usage".to_owned()],
+            Duration::from_secs(120),
+        ),
         BrokerRequest::ModelMutation { request } => {
             let args = match request {
                 ModelMutation::Refresh => vec!["models".to_owned(), "refresh".to_owned()],
@@ -828,5 +907,24 @@ mod tests {
             manifest.agents[0].source_updated_at.as_deref().unwrap()
         ));
         assert!(!format!("{manifest:?}").contains("never retain"));
+    }
+
+    #[test]
+    fn legacy_model_json_remains_readable_with_unknown_pricing() {
+        let policy: ModelPolicy = serde_json::from_str(
+            r#"{"models":[{"provider":"ollama-cloud","model":"future-model","enabled":false,"source":"provider_api"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(policy.models[0].price_status, "unknown");
+        assert_eq!(policy.models[0].input_per_million_usd, None);
+    }
+
+    #[test]
+    fn usage_report_contains_aggregates_only() {
+        let report: UsageReport = serde_json::from_str(
+            r#"{"period":"current_calendar_month","generated_at_unix":1,"budget_eur":50.0,"spent_eur":1.0,"remaining_eur":49.0,"over_budget":false,"reserved_eur":0.0,"remaining_hard_eur":49.0,"above_soft_budget":false,"requests":2,"input_tokens":10,"output_tokens":5,"cache_read_tokens":3,"cache_write_tokens":0,"total_tokens":18,"by_backend":[],"by_model":[],"daily":[],"pricing":{"source":"fixture","updated_at":"2026-09-01"}}"#,
+        )
+        .unwrap();
+        assert_eq!(report.total_tokens, 18);
     }
 }

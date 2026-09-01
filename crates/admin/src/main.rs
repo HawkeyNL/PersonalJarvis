@@ -35,6 +35,7 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 
 mod tui_app;
+mod usage_insights;
 
 const RELEASES_ROOT: &str = "/opt/jarvis/releases";
 const CURRENT_RELEASE: &str = "/opt/jarvis/current";
@@ -94,6 +95,8 @@ enum Commands {
     /// One-time migration for installations activated by a legacy updater.
     MigrateInstalledTooling,
     Models(ModelsArgs),
+    /// Show bounded, non-secret monthly LLM token and cost statistics.
+    Usage,
     Credentials(CredentialsArgs),
     Agents(AgentsArgs),
     Services {
@@ -389,6 +392,7 @@ fn run() -> Result<()> {
         Commands::Update(args) => update(args, &presentation, cli.verbose),
         Commands::MigrateInstalledTooling => migrate_installed_tooling(),
         Commands::Models(args) => models(args, &presentation, cli.verbose),
+        Commands::Usage => usage_insights::usage(presentation.json),
         Commands::Credentials(args) => credentials(args, &presentation, cli.verbose),
         Commands::Agents(args) => agents(args, &presentation, cli.verbose),
         Commands::Services {
@@ -2677,7 +2681,7 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
                 .retain(|model| model.provider == provider.as_str());
         }
         if presentation.json {
-            println!("{}", serde_json::to_string(&policy)?);
+            println!("{}", usage_insights::priced_model_policy_json(policy)?);
         } else if presentation.interactive && io::stdin().is_terminal() {
             let rows = policy
                 .models

@@ -86,6 +86,9 @@ pub struct AppState {
     /// Root-owned/versioned provider pricing. Missing or malformed deployment
     /// input is replaced with conservative built-in pricing at startup.
     pub pricing_registry: Arc<jarvis_usage::PricingRegistry>,
+    /// Optional non-secret aggregate snapshot consumed by the local root-only
+    /// administration boundary. It never contains prompts, responses or IDs.
+    pub usage_snapshot_path: Option<Arc<PathBuf>>,
     /// Optional local root-broker socket. This is not a credential and a
     /// request is still independently signature-verified by the broker.
     pub privileged_broker_socket: Option<Arc<str>>,

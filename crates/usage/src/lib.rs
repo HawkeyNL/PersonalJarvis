@@ -1,9 +1,9 @@
 //! LLM usage & cost tracking — the money side of the cost-aware router (ADR-027).
 //!
 //! Only *metered* API backends cost money; the Claude plan (`claude-cli`) and
-//! local Ollama are free and never counted. Each call's cost is estimated from
-//! its model's per-token price and recorded to Postgres; the monthly total feeds
-//! a hard EUR budget the router enforces by refusing paid calls once reached.
+//! local Ollama remain zero-cost. Provider-reported token counts are recorded
+//! for every backend, while paid calls additionally receive an estimated cost.
+//! Monthly spend feeds a hard EUR budget the router enforces before paid calls.
 //!
 //! Prices are best-effort estimates in USD per 1M tokens (providers bill in USD);
 //! they can drift, so treat the budget as a safety cap, not an exact invoice.
@@ -64,8 +64,8 @@ impl PricingRegistry {
     pub fn builtin() -> Self {
         Self {
             version: 1,
-            source: "built-in-conservative-baseline".into(),
-            updated_at: "2026-08-27".into(),
+            source: "owner-reviewed-baseline-2026-09-01".into(),
+            updated_at: "2026-09-01".into(),
             models: vec![
                 entry("anthropic-api", "claude-opus-5", 5.0, 25.0),
                 entry("anthropic-api", "claude-sonnet-5", 3.0, 15.0),
@@ -76,6 +76,25 @@ impl PricingRegistry {
                 entry("openai-api", "gpt-4.1-mini", 0.15, 0.60),
                 entry("deepseek-api", "deepseek-chat", 0.27, 1.10),
                 entry("deepseek-api", "deepseek-reasoner", 0.55, 2.19),
+                entry_cached("ollama-cloud", "deepseek-v4-flash:0731", 0.44, 0.014, 1.32),
+                entry_cached("ollama-cloud", "deepseek-v4-pro:0813", 1.32, 0.044, 3.96),
+                entry_cached("ollama-cloud", "gemma4:31b", 0.14, 0.05, 0.40),
+                entry_cached("ollama-cloud", "glm-5.3", 1.40, 0.26, 4.40),
+                entry_cached("ollama-cloud", "glm-5.3-flash", 0.15, 0.03, 0.50),
+                entry_cached("ollama-cloud", "glm-5.2", 1.40, 0.26, 4.40),
+                entry_cached("ollama-cloud", "glm-5.1", 1.00, 0.20, 3.20),
+                entry_cached("ollama-cloud", "gpt-oss:120b", 0.15, 0.014, 0.60),
+                entry_cached("ollama-cloud", "gpt-oss:20b", 0.07, 0.035, 0.30),
+                entry_cached("ollama-cloud", "kimi-k3", 3.00, 0.30, 15.00),
+                entry_cached("ollama-cloud", "kimi-k2.7-code", 0.95, 0.19, 4.00),
+                entry_cached("ollama-cloud", "kimi-k2.6", 0.95, 0.16, 4.00),
+                entry_cached("ollama-cloud", "minimax-m3", 0.60, 0.12, 2.40),
+                entry_cached("ollama-cloud", "minimax-m2.7", 0.30, 0.06, 1.20),
+                entry_cached("ollama-cloud", "mistral-large-3:675b", 0.50, 0.50, 1.50),
+                entry_cached("ollama-cloud", "nemotron-3-nano:30b", 0.06, 0.06, 0.24),
+                entry_cached("ollama-cloud", "nemotron-3-super", 0.015, 0.015, 0.60),
+                entry_cached("ollama-cloud", "nemotron-3-ultra", 0.10, 0.10, 3.00),
+                entry_cached("ollama-cloud", "qwen3.5:397b", 0.60, 0.60, 3.60),
             ],
         }
     }
@@ -85,6 +104,33 @@ impl PricingRegistry {
             .map_err(|error| format!("pricing registry is unavailable: {error}"))?;
         let registry: Self = serde_json::from_str(&raw)
             .map_err(|error| format!("pricing registry is malformed: {error}"))?;
+        registry.validate()?;
+        Ok(registry)
+    }
+
+    /// Load owner-managed prices and fill only missing exact model pairs from
+    /// the release-reviewed baseline. Owner entries always win; a release can
+    /// therefore add safe coverage without overwriting an explicit override.
+    pub fn load_with_builtin(path: impl AsRef<Path>) -> Result<Self, String> {
+        let mut registry = Self::load(path)?;
+        let builtin = Self::builtin();
+        let mut added = false;
+        for entry in builtin.models {
+            if !registry
+                .models
+                .iter()
+                .any(|current| current.provider == entry.provider && current.model == entry.model)
+            {
+                registry.models.push(entry);
+                added = true;
+            }
+        }
+        if added {
+            registry.source = format!("{} + {}", registry.source, builtin.source);
+            if builtin.updated_at > registry.updated_at {
+                registry.updated_at = builtin.updated_at;
+            }
+        }
         registry.validate()?;
         Ok(registry)
     }
@@ -114,7 +160,7 @@ impl PricingRegistry {
         Ok(())
     }
 
-    fn price_for(&self, backend: &str, model: &str) -> (Price, PriceStatus) {
+    pub fn price_for(&self, backend: &str, model: &str) -> (Price, PriceStatus) {
         if !is_metered(backend) {
             return (Price::new(0.0, 0.0), PriceStatus::Local);
         }
@@ -145,6 +191,22 @@ fn entry(provider: &str, model: &str, input: f64, output: f64) -> PricingEntry {
         input_per_million_usd: input,
         output_per_million_usd: output,
         cache_read_per_million_usd: None,
+    }
+}
+
+fn entry_cached(
+    provider: &str,
+    model: &str,
+    input: f64,
+    cache_read: f64,
+    output: f64,
+) -> PricingEntry {
+    PricingEntry {
+        provider: provider.into(),
+        model: model.into(),
+        input_per_million_usd: input,
+        output_per_million_usd: output,
+        cache_read_per_million_usd: Some(cache_read),
     }
 }
 
@@ -337,7 +399,44 @@ pub fn estimate_task_cost_with_registry(
 
 /// SurrealDB persistence functions. Failures remain best-effort at the caller,
 /// so metering cannot break an assistant reply.
-pub use surreal::{month_breakdown, month_total_eur, record, release_task, reserve_task};
+pub use surreal::{
+    month_breakdown, month_statistics, month_total_eur, record, release_task, reserve_task,
+};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageTotals {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_eur: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageDimension {
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(flatten)]
+    pub totals: UsageTotals,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyUsage {
+    pub day: String,
+    #[serde(flatten)]
+    pub totals: UsageTotals,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageStatistics {
+    pub totals: UsageTotals,
+    pub by_backend: Vec<UsageDimension>,
+    pub by_model: Vec<UsageDimension>,
+    pub daily: Vec<DailyUsage>,
+}
 
 /// EUR-cent limits for the current calendar month.  Zero is a real hard stop,
 /// never an implicit unlimited budget.
@@ -599,5 +698,41 @@ mod tests {
         let mut registry = PricingRegistry::builtin();
         registry.models[0].input_per_million_usd = -1.0;
         assert!(registry.validate().is_err());
+    }
+
+    #[test]
+    fn reviewed_ollama_cloud_prices_use_exact_discovered_ids() {
+        let registry = PricingRegistry::builtin();
+        let (price, status) = registry.price_for("ollama-cloud", "gpt-oss:20b");
+        assert_eq!(status, PriceStatus::Known);
+        assert_eq!(price.input, 0.07);
+        assert_eq!(price.cache_read, 0.035);
+        assert_eq!(price.output, 0.30);
+        assert_eq!(
+            registry.price_for("ollama-cloud", "gpt-oss").1,
+            PriceStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn owner_pricing_wins_while_builtin_fills_missing_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pricing.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"source":"owner","updated_at":"2026-09-01","models":[{"provider":"ollama-cloud","model":"gpt-oss:20b","input_per_million_usd":9.0,"output_per_million_usd":10.0}]}"#,
+        )
+        .unwrap();
+        let registry = PricingRegistry::load_with_builtin(path).unwrap();
+        assert_eq!(
+            registry.price_for("ollama-cloud", "gpt-oss:20b").0.input,
+            9.0
+        );
+        assert_eq!(
+            registry.price_for("ollama-cloud", "glm-5.3").1,
+            PriceStatus::Known
+        );
+        assert!(registry.source.contains("owner-reviewed-baseline"));
+        assert_eq!(registry.updated_at, "2026-09-01");
     }
 }

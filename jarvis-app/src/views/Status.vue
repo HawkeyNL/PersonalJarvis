@@ -84,7 +84,13 @@ interface Usage {
   spent_eur: number;
   remaining_eur: number;
   over_budget: boolean;
-  by_backend: { backend: string; spent_eur: number }[];
+  requests?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  total_tokens?: number;
+  by_backend: { backend: string; spent_eur: number; total_tokens?: number }[];
+  daily?: { day: string; spent_eur: number; total_tokens: number }[];
 }
 
 const reg = ref<Registry | null>(null);
@@ -94,6 +100,9 @@ const regBusy = ref(false);
 
 function eur(n: number): string {
   return "€" + n.toFixed(2);
+}
+function tokens(n: number): string {
+  return new Intl.NumberFormat("nl-NL", { notation: "compact", maximumFractionDigits: 1 }).format(n);
 }
 const budgetPct = computed(() => {
   const u = usage.value;
@@ -248,9 +257,16 @@ onMounted(async () => {
               :style="{ width: budgetPct + '%' }"
             ></div>
           </div>
+          <div class="token-summary">
+            <span><strong>{{ tokens(usage.total_tokens ?? 0) }}</strong> tokens</span>
+            <span>{{ tokens(usage.input_tokens ?? 0) }} input</span>
+            <span>{{ tokens(usage.output_tokens ?? 0) }} output</span>
+            <span>{{ tokens(usage.cache_read_tokens ?? 0) }} cached</span>
+            <span>{{ usage.requests ?? 0 }} calls</span>
+          </div>
           <div v-if="usage.by_backend.length" class="bk">
             <span v-for="b in usage.by_backend" :key="b.backend" class="bkchip">
-              {{ b.backend }} {{ eur(b.spent_eur) }}
+              {{ b.backend }} · {{ tokens(b.total_tokens ?? 0) }} · {{ eur(b.spent_eur) }}
             </span>
           </div>
         </div>
@@ -417,6 +433,15 @@ onMounted(async () => {
 .bar .fill.over {
   background: #f87171;
 }
+.token-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  margin-top: 8px;
+  color: var(--muted);
+  font: 10px var(--mono);
+}
+.token-summary strong { color: var(--text); }
 .bk {
   display: flex;
   flex-wrap: wrap;

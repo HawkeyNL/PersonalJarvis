@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use jarvis_store::Database;
 
-use super::UsageEntry;
+use super::{DailyUsage, UsageDimension, UsageEntry, UsageStatistics, UsageTotals};
 
 pub async fn record(db: &Database, entry: &UsageEntry) -> Result<(), jarvis_store::StoreError> {
     db.query(
@@ -64,6 +64,107 @@ pub async fn month_breakdown(
         .collect())
 }
 
+#[derive(serde::Deserialize)]
+struct AggregateRow {
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    day: Option<String>,
+    #[serde(default)]
+    requests: Option<i64>,
+    #[serde(default)]
+    input_tokens: Option<i64>,
+    #[serde(default)]
+    output_tokens: Option<i64>,
+    #[serde(default)]
+    cache_read_tokens: Option<i64>,
+    #[serde(default)]
+    cache_write_tokens: Option<i64>,
+    #[serde(default)]
+    cost_eur: Option<f64>,
+}
+
+fn totals(row: &AggregateRow) -> UsageTotals {
+    let input_tokens = row.input_tokens.unwrap_or_default().max(0) as u64;
+    let output_tokens = row.output_tokens.unwrap_or_default().max(0) as u64;
+    let cache_read_tokens = row.cache_read_tokens.unwrap_or_default().max(0) as u64;
+    let cache_write_tokens = row.cache_write_tokens.unwrap_or_default().max(0) as u64;
+    UsageTotals {
+        requests: row.requests.unwrap_or_default().max(0) as u64,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        total_tokens: input_tokens
+            .saturating_add(output_tokens)
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_write_tokens),
+        cost_eur: row.cost_eur.unwrap_or_default().max(0.0),
+    }
+}
+
+/// Bounded monthly aggregates only. Prompts, responses and request identifiers
+/// never leave the database through this statistics boundary.
+fn month_statistics_query() -> String {
+    const FIELDS: &str = "count() AS requests, math::sum(input_tokens) AS input_tokens, math::sum(output_tokens) AS output_tokens, math::sum(cache_read_tokens) AS cache_read_tokens, math::sum(cache_write_tokens) AS cache_write_tokens, math::sum(cost_eur) AS cost_eur";
+    let since = "ts >= time::floor(time::now(), 1mo)";
+    format!(
+        "SELECT {FIELDS} FROM llm_usage WHERE {since}; \
+         SELECT backend, {FIELDS} FROM llm_usage WHERE {since} GROUP BY backend ORDER BY cost_eur DESC; \
+         SELECT backend, model, {FIELDS} FROM llm_usage WHERE {since} GROUP BY backend, model ORDER BY cost_eur DESC; \
+         SELECT time::format(ts, '%Y-%m-%d') AS day, {FIELDS} FROM llm_usage WHERE {since} GROUP BY day ORDER BY day ASC"
+    )
+}
+
+pub async fn month_statistics(db: &Database) -> Result<UsageStatistics, jarvis_store::StoreError> {
+    let mut response = db
+        .query(month_statistics_query())
+        .await
+        .map_err(jarvis_store::StoreError::schema)?;
+    let total_rows: Vec<AggregateRow> =
+        response.take(0).map_err(jarvis_store::StoreError::schema)?;
+    let backend_rows: Vec<AggregateRow> =
+        response.take(1).map_err(jarvis_store::StoreError::schema)?;
+    let model_rows: Vec<AggregateRow> =
+        response.take(2).map_err(jarvis_store::StoreError::schema)?;
+    let daily_rows: Vec<AggregateRow> =
+        response.take(3).map_err(jarvis_store::StoreError::schema)?;
+    Ok(UsageStatistics {
+        totals: total_rows.first().map(totals).unwrap_or_default(),
+        by_backend: backend_rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(UsageDimension {
+                    backend: row.backend.clone()?,
+                    model: None,
+                    totals: totals(&row),
+                })
+            })
+            .collect(),
+        by_model: model_rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(UsageDimension {
+                    backend: row.backend.clone()?,
+                    model: row.model.clone(),
+                    totals: totals(&row),
+                })
+            })
+            .collect(),
+        daily: daily_rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(DailyUsage {
+                    day: row.day.clone()?,
+                    totals: totals(&row),
+                })
+            })
+            .collect(),
+    })
+}
+
 /// Persist a bounded long-task projection.  The Home Node's process-local gate
 /// rejects concurrent oversubscription during execution; this durable record
 /// makes crash recovery and stale-reservation cleanup observable.
@@ -103,4 +204,26 @@ pub async fn release_task(db: &Database, task_id: &str) -> Result<(), jarvis_sto
     .check()
     .map_err(jarvis_store::StoreError::schema)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_query_selects_only_bounded_non_secret_dimensions() {
+        let query = month_statistics_query();
+        for forbidden in [
+            "request_id",
+            "agent_id",
+            "routing_mode",
+            "failure_category",
+            "prompt",
+            "response",
+        ] {
+            assert!(!query.contains(forbidden));
+        }
+        assert!(query.contains("GROUP BY backend, model"));
+        assert!(query.contains("GROUP BY day"));
+    }
 }
