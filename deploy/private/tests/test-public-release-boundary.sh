@@ -42,6 +42,12 @@ require_literal "$release_builder" \
     'install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update-core-release"' \
     "canonical release builder must stage update-core-release.sh as update-core-release"
 require_literal "$release_builder" \
+    'install -m 0755 deploy/systemd/jarvis-models.sh "$temporary_release/jarvis-models"' \
+    "canonical release builder must stage the reviewed model helper as jarvis-models"
+require_literal "$release_builder" \
+    'install -m 0755 deploy/systemd/jarvis-credentials.sh "$temporary_release/jarvis-credentials"' \
+    "canonical release builder must stage the reviewed credential helper as jarvis-credentials"
+require_literal "$release_builder" \
     'install -m 0755 deploy/private/install-agent-bundle.sh "$temporary_release/install-agent-bundle"' \
     "canonical release builder must stage the public private-agent bundler without private content"
 require_literal "$release_builder" \
@@ -63,8 +69,11 @@ require_literal "$release_builder" \
     'components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}' \
     "release manifest must expose separate Core, CLI, and Core Admin App versions"
 require_literal "$release_builder" \
-    'tooling: {private_agents: 1}' \
-    "release manifest must bind the versioned private-agent administration tooling"
+    'tooling: {private_agents: 1, admin_helpers: 1}' \
+    "release manifest must bind private-agent and admin-helper tooling capabilities"
+require_literal "$release_builder" \
+    'jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials' \
+    "artifact checksum manifest must bind both versioned admin helpers"
 require_literal "$gitlab_ci" \
     'npm run tauri:build --prefix jarvis-core-admin' \
     "GitLab CI must build the Ubuntu Core Admin App package"

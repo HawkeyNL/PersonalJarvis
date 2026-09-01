@@ -13,6 +13,56 @@ usage() {
     exit 64
 }
 
+validate_admin_helper_tooling() {
+    local release=$1 helper metadata mode matches
+    if ! jq -e '((.tooling? | type) == "object") and (.tooling | has("admin_helpers"))' \
+        "$release/release.json" >/dev/null 2>&1; then
+        return 0
+    fi
+    jq -e '(.tooling.admin_helpers | type) == "number" and .tooling.admin_helpers == 1' \
+        "$release/release.json" >/dev/null 2>&1 || {
+        echo "unsupported admin-helper tooling capability" >&2
+        exit 1
+    }
+    [[ -f $release/artifact-binaries.sha256 && ! -L $release/artifact-binaries.sha256 ]] || {
+        echo "admin-helper artifact checksum manifest is missing or unsafe" >&2
+        exit 1
+    }
+    LC_ALL=C awk '
+        NF != 2 || $1 !~ /^[0-9a-f]{64}$/ || $2 !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ { exit 1 }
+        END { if (NR == 0) exit 1 }
+    ' "$release/artifact-binaries.sha256" || {
+        echo "artifact checksum manifest is malformed" >&2
+        exit 1
+    }
+    for helper in jarvis-models jarvis-credentials; do
+        [[ -f $release/$helper && ! -L $release/$helper ]] || {
+            echo "versioned admin helper is missing or unsafe: $helper" >&2
+            exit 1
+        }
+        metadata=$(stat -c '%u:%g:%a' "$release/$helper")
+        [[ $metadata == 0:0:* ]] || {
+            echo "versioned admin helper is not root-owned: $helper" >&2
+            exit 1
+        }
+        mode=${metadata##*:}
+        (( (8#$mode & 0022) == 0 && (8#$mode & 0111) != 0 )) || {
+            echo "versioned admin helper permissions are unsafe: $helper" >&2
+            exit 1
+        }
+        matches=$(awk -v helper="$helper" '$2 == helper { count++ } END { print count + 0 }' \
+            "$release/artifact-binaries.sha256")
+        [[ $matches == 1 ]] || {
+            echo "versioned admin helper is not uniquely checksum-bound: $helper" >&2
+            exit 1
+        }
+    done
+    (cd "$release" && sha256sum --check --strict artifact-binaries.sha256 >/dev/null) || {
+        echo "release artifact checksum verification failed" >&2
+        exit 1
+    }
+}
+
 [[ ${EUID} -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
 [[ $# -eq 1 ]] || usage
 
@@ -87,6 +137,7 @@ if jq -e '.tooling.private_agents? == 1' "$release_dir/release.json" >/dev/null 
         }
     done
 fi
+validate_admin_helper_tooling "$release_dir"
 if jq -e '.components? != null' "$release_dir/release.json" >/dev/null; then
     jq -e '.components | [.core, .cli, .core_admin] | all(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
         "$release_dir/release.json" >/dev/null || {

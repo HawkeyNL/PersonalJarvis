@@ -42,6 +42,30 @@ const LIBEXEC: &str = "/usr/local/libexec/jarvis";
 const SBIN: &str = "/usr/local/sbin";
 const CONFIG_LOCK: &str = "/run/jarvis-admin-config.lock";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdminHelper {
+    Models,
+    Credentials,
+}
+
+impl AdminHelper {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Models => "jarvis-models",
+            Self::Credentials => "jarvis-credentials",
+        }
+    }
+
+    #[cfg(test)]
+    fn from_name(name: &str) -> Result<Self> {
+        match name {
+            "jarvis-models" => Ok(Self::Models),
+            "jarvis-credentials" => Ok(Self::Credentials),
+            _ => bail!("unsupported internal helper"),
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "jarvis", about = "Jarvis Home Node administration", version)]
 struct Cli {
@@ -2709,7 +2733,7 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
             vec!["show".to_owned(), provider.as_str().to_owned(), model.0]
         }
     };
-    compatibility_helper("jarvis-models", arguments, presentation, verbose, true)
+    compatibility_helper(AdminHelper::Models, arguments, verbose)
 }
 
 #[derive(Debug, Serialize)]
@@ -2801,7 +2825,6 @@ fn credentials(args: CredentialsArgs, presentation: &Presentation, verbose: bool
     // Compatibility boundary: the helper owns only protected file mechanics and
     // reads secrets directly from /dev/tty. Rust deliberately inherits that
     // controlling TTY; it never captures, receives, or logs a credential.
-    let tui_safe = matches!(&args.command, CredentialsCommand::Test { .. });
     let arguments = match args.command {
         CredentialsCommand::List => vec!["list".to_owned()],
         CredentialsCommand::Set { provider } => {
@@ -2814,40 +2837,157 @@ fn credentials(args: CredentialsArgs, presentation: &Presentation, verbose: bool
             vec!["remove".to_owned(), provider.as_str().to_owned()]
         }
     };
-    compatibility_helper(
-        "jarvis-credentials",
-        arguments,
-        presentation,
-        verbose,
-        tui_safe,
-    )
+    compatibility_helper(AdminHelper::Credentials, arguments, verbose)
 }
 
-fn compatibility_helper(
-    name: &str,
-    args: Vec<String>,
-    presentation: &Presentation,
-    verbose: bool,
-    tui_safe: bool,
-) -> Result<()> {
-    let allowed = matches!(name, "jarvis-models" | "jarvis-credentials");
-    if !allowed {
-        bail!("unsupported internal helper");
-    }
+fn compatibility_helper(helper: AdminHelper, args: Vec<String>, verbose: bool) -> Result<()> {
     let lock = mutation_lock(CONFIG_LOCK)?;
     let _lock = lock;
-    let mut command = trusted_command(Path::new(SBIN).join(name));
+    let mut command = trusted_admin_helper_command(helper)?;
     command.args(args);
-    if tui_safe && presentation.interactive && io::stdin().is_terminal() && !verbose {
-        run_process_tui(
-            &mut command,
-            "Jarvis Administration",
-            "Executing typed protected operation…".to_owned(),
-            presentation.tui_trace,
-        )
-    } else {
-        run_command(&mut command, SubprocessMode::from_verbose(verbose))
+    // Explicit CLI operations are one-shot commands. Inheriting/capturing the
+    // normal terminal keeps their result visible and lets the credential
+    // helper use /dev/tty directly without ever entering Ratatui state.
+    run_command(&mut command, explicit_helper_subprocess_mode(verbose))
+}
+
+fn explicit_helper_subprocess_mode(verbose: bool) -> SubprocessMode {
+    SubprocessMode::from_verbose(verbose)
+}
+
+fn trusted_admin_helper_command(helper: AdminHelper) -> Result<ProcessCommand> {
+    let helper = resolve_admin_helper(
+        Path::new(CURRENT_RELEASE),
+        Path::new(RELEASES_ROOT),
+        Path::new(SBIN),
+        helper,
+        0,
+        0,
+    )?;
+    Ok(trusted_command(helper))
+}
+
+fn resolve_admin_helper(
+    current: &Path,
+    releases: &Path,
+    legacy_sbin: &Path,
+    helper: AdminHelper,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<PathBuf> {
+    validate_owned_path(releases, expected_uid, expected_gid, false)
+        .context("managed release root is unsafe")?;
+    if !fs::metadata(releases)
+        .context("inspect managed release root")?
+        .is_dir()
+    {
+        bail!("managed release root is not a directory");
     }
+    let canonical_releases = fs::canonicalize(releases).context("resolve managed release root")?;
+    if canonical_releases != releases {
+        bail!("managed release root must not traverse links");
+    }
+    let current_metadata = fs::symlink_metadata(current).context("inspect active release link")?;
+    if !current_metadata.file_type().is_symlink()
+        || current_metadata.uid() != expected_uid
+        || current_metadata.gid() != expected_gid
+    {
+        bail!("active release link is unsafe");
+    }
+    let active = fs::canonicalize(current).context("resolve active release")?;
+    let relative = active
+        .strip_prefix(&canonical_releases)
+        .context("active release is outside the managed release root")?;
+    let tag = relative
+        .to_str()
+        .filter(|value| !value.contains('/'))
+        .context("active release path is not a direct managed release")?;
+    if !valid_release_tag(tag) || active.parent() != Some(canonical_releases.as_path()) {
+        bail!("active release path is not a stable managed release");
+    }
+    validate_owned_path(&active, expected_uid, expected_gid, false)
+        .context("active release directory is unsafe")?;
+    if !fs::metadata(&active)
+        .context("inspect active release directory")?
+        .is_dir()
+    {
+        bail!("active release is not a directory");
+    }
+
+    let manifest = active.join("release.json");
+    validate_owned_path(&manifest, expected_uid, expected_gid, false)
+        .context("active release manifest is unsafe")?;
+    let manifest_metadata = fs::metadata(&manifest).context("inspect active release manifest")?;
+    if !manifest_metadata.is_file() {
+        bail!("active release manifest is not a regular file");
+    }
+    if manifest_metadata.len() > 64 * 1024 {
+        bail!("active release manifest is unexpectedly large");
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest).context("read active release manifest")?)
+            .context("parse active release manifest")?;
+    if manifest.get("tag").and_then(serde_json::Value::as_str) != Some(tag) {
+        bail!("active release manifest tag does not match its managed directory");
+    }
+    let versioned = match manifest.pointer("/tooling/admin_helpers") {
+        None => false,
+        Some(value) if value.as_u64() == Some(1) => true,
+        Some(_) => bail!("active release declares an unsupported admin-helper capability"),
+    };
+
+    let path = if versioned {
+        active.join(helper.name())
+    } else {
+        legacy_sbin.join(helper.name())
+    };
+    validate_owned_path(&path, expected_uid, expected_gid, true)
+        .with_context(|| format!("trusted admin helper is unsafe: {}", helper.name()))?;
+    if versioned {
+        let canonical = fs::canonicalize(&path).context("resolve versioned admin helper")?;
+        if canonical.parent() != Some(active.as_path())
+            || canonical.file_name() != Some(OsStr::new(helper.name()))
+        {
+            bail!("versioned admin helper escapes the active release");
+        }
+    } else {
+        validate_owned_path(legacy_sbin, expected_uid, expected_gid, false)
+            .context("legacy helper directory is unsafe")?;
+        let canonical_legacy =
+            fs::canonicalize(legacy_sbin).context("resolve legacy helper directory")?;
+        let canonical = fs::canonicalize(&path).context("resolve legacy admin helper")?;
+        if canonical_legacy != legacy_sbin
+            || canonical.parent() != Some(canonical_legacy.as_path())
+            || canonical.file_name() != Some(OsStr::new(helper.name()))
+        {
+            bail!("legacy admin helper escapes its fixed compatibility directory");
+        }
+    }
+    Ok(path)
+}
+
+fn validate_owned_path(
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    executable: bool,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).context("inspect trusted path")?;
+    if metadata.file_type().is_symlink()
+        || metadata.uid() != expected_uid
+        || metadata.gid() != expected_gid
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        bail!("ownership, permissions, or file type is unsafe");
+    }
+    if executable {
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            bail!("helper is not a regular executable file");
+        }
+    } else if !metadata.is_dir() && !metadata.is_file() {
+        bail!("trusted path is not a regular file or directory");
+    }
+    Ok(())
 }
 
 fn agents(args: AgentsArgs, presentation: &Presentation, verbose: bool) -> Result<()> {
@@ -2960,7 +3100,7 @@ fn mutation_lock(path: impl AsRef<Path>) -> Result<File> {
     Ok(file)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SubprocessMode {
     InheritedInteractive,
     Captured,
@@ -3286,6 +3426,139 @@ mod tests {
     #[test]
     fn typed_model_input_rejects_newline_injection() {
         assert!(Cli::try_parse_from(["jarvis", "models", "enable", "openai-api", "x\ny"]).is_err());
+    }
+
+    fn admin_helper_layout(
+        admin_helpers: bool,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, u32, u32) {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = fs::metadata(directory.path()).unwrap();
+        let releases = directory.path().join("releases");
+        let tag = if admin_helpers { "v0.0.20" } else { "v0.0.19" };
+        let release = releases.join(tag);
+        let current = directory.path().join("current");
+        let legacy = directory.path().join("legacy-sbin");
+        fs::create_dir_all(&release).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::set_permissions(&releases, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o755)).unwrap();
+        let manifest = if admin_helpers {
+            r#"{"tag":"v0.0.20","tooling":{"admin_helpers":1}}"#
+        } else {
+            r#"{"tag":"v0.0.19","tooling":{"private_agents":1}}"#
+        };
+        fs::write(release.join("release.json"), manifest).unwrap();
+        fs::set_permissions(
+            release.join("release.json"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        for name in ["jarvis-models", "jarvis-credentials"] {
+            fs::write(release.join(name), format!("versioned {name}\n")).unwrap();
+            fs::set_permissions(release.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(legacy.join(name), format!("legacy {name}\n")).unwrap();
+            fs::set_permissions(legacy.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::os::unix::fs::symlink(&release, &current).unwrap();
+        (
+            directory,
+            current,
+            releases,
+            legacy,
+            owner.uid(),
+            owner.gid(),
+        )
+    }
+
+    #[test]
+    fn versioned_admin_helpers_come_from_the_active_release() {
+        let (_directory, current, releases, legacy, uid, gid) = admin_helper_layout(true);
+        let models =
+            resolve_admin_helper(&current, &releases, &legacy, AdminHelper::Models, uid, gid)
+                .unwrap();
+        let credentials = resolve_admin_helper(
+            &current,
+            &releases,
+            &legacy,
+            AdminHelper::Credentials,
+            uid,
+            gid,
+        )
+        .unwrap();
+        assert_eq!(models, releases.join("v0.0.20/jarvis-models"));
+        assert_eq!(credentials, releases.join("v0.0.20/jarvis-credentials"));
+        assert!(fs::read_to_string(models).unwrap().starts_with("versioned"));
+        assert!(fs::read_to_string(credentials)
+            .unwrap()
+            .starts_with("versioned"));
+    }
+
+    #[test]
+    fn legacy_release_without_capability_uses_fixed_compatibility_paths() {
+        let (_directory, current, releases, legacy, uid, gid) = admin_helper_layout(false);
+        let helper =
+            resolve_admin_helper(&current, &releases, &legacy, AdminHelper::Models, uid, gid)
+                .unwrap();
+        assert_eq!(helper, legacy.join("jarvis-models"));
+    }
+
+    #[test]
+    fn admin_helper_resolution_rejects_escape_symlink_and_unsafe_mode() {
+        let (directory, current, releases, legacy, uid, gid) = admin_helper_layout(true);
+        let active = releases.join("v0.0.20");
+        let helper = active.join("jarvis-models");
+
+        fs::remove_file(&helper).unwrap();
+        std::os::unix::fs::symlink(legacy.join("jarvis-models"), &helper).unwrap();
+        assert!(
+            resolve_admin_helper(&current, &releases, &legacy, AdminHelper::Models, uid, gid)
+                .is_err()
+        );
+
+        fs::remove_file(&helper).unwrap();
+        fs::write(&helper, "unsafe\n").unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            resolve_admin_helper(&current, &releases, &legacy, AdminHelper::Models, uid, gid)
+                .is_err()
+        );
+
+        let outside = directory.path().join("v0.0.20-outside");
+        fs::create_dir(&outside).unwrap();
+        fs::remove_file(&current).unwrap();
+        std::os::unix::fs::symlink(outside, &current).unwrap();
+        assert!(resolve_admin_helper(
+            &current,
+            &releases,
+            &legacy,
+            AdminHelper::Credentials,
+            uid,
+            gid
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn arbitrary_admin_helper_name_is_rejected() {
+        assert_eq!(
+            AdminHelper::from_name("jarvis-models").unwrap(),
+            AdminHelper::Models
+        );
+        assert!(AdminHelper::from_name("../../bin/sh").is_err());
+        assert!(AdminHelper::from_name("arbitrary-helper").is_err());
+    }
+
+    #[test]
+    fn explicit_credential_and_model_helpers_use_normal_terminal_output() {
+        assert_eq!(
+            explicit_helper_subprocess_mode(false),
+            SubprocessMode::InheritedInteractive
+        );
+        assert_eq!(
+            explicit_helper_subprocess_mode(true),
+            SubprocessMode::Streamed
+        );
     }
 
     #[test]

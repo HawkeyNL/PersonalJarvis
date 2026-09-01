@@ -17,12 +17,21 @@ updater="$repo_dir/deploy/systemd/update-core-release.sh"
 fixture_dir=$(mktemp -d)
 fake_bin="$fixture_dir/bin"
 mkdir -p "$fake_bin"
+v019_revision=223358a47b84075e301d124cb6dc9c8aa27ae987
+v019_updater="$fixture_dir/update-core-release-v0.0.19"
+git -C "$repo_dir" cat-file -e "$v019_revision^{commit}" 2>/dev/null || {
+    echo "v0.0.19 updater commit is unavailable; deployment CI requires full Git history" >&2
+    exit 1
+}
+git -C "$repo_dir" show "$v019_revision:deploy/systemd/update-core-release.sh" > "$v019_updater"
+chmod 0755 "$v019_updater"
 
 cleanup() {
     rm -rf -- "$fixture_dir" /opt/jarvis
     rm -f -- /etc/jarvis/updater.env
     rm -rf -- /usr/local/sbin/jarvis
     rm -f -- /usr/local/sbin/jarvis-private-update \
+        /usr/local/sbin/jarvis-models /usr/local/sbin/jarvis-credentials \
         /usr/local/libexec/jarvis/update-core-release \
         /usr/local/libexec/jarvis/jarvis-agent-bundle \
         /usr/local/libexec/jarvis/install-agent-bundle \
@@ -90,6 +99,7 @@ write_release() {
     local core_version=${4:-${tag#v}}
     local cli_version=${5:-${tag#v}}
     local app_version=${6:-${tag#v}}
+    local admin_helpers=${7:-true}
     mkdir -p "$root/jarvis-core-$tag"
     chmod 0755 "$root/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
@@ -120,15 +130,37 @@ write_release() {
             > "$root/jarvis-core-$tag/$helper"
         chmod 0755 "$root/jarvis-core-$tag/$helper"
     done
+    if [[ $admin_helpers == true ]]; then
+        for helper in jarvis-models jarvis-credentials; do
+            printf '#!/usr/bin/env bash\nprintf "versioned %s tooling: %s\\n"\n' "$helper" "$tag" \
+                > "$root/jarvis-core-$tag/$helper"
+            chmod 0755 "$root/jarvis-core-$tag/$helper"
+        done
+    fi
     jq -n \
         --arg tag "$tag" \
         --arg schema_sha256 "$schema_sha256" \
         --arg core_version "$core_version" \
         --arg cli_version "$cli_version" \
         --arg app_version "$app_version" \
-        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}, tooling: {private_agents: 1}}' \
+        --argjson admin_helpers "$admin_helpers" \
+        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}, tooling: ({private_agents: 1} + if $admin_helpers then {admin_helpers: 1} else {} end)}' \
         > "$root/jarvis-core-$tag/release.json"
     chmod 0644 "$root/jarvis-core-$tag/release.json"
+    local -a checksummed=(
+        jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-agent-bundle
+        jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png
+        jarvis-core-admin.version update-core-release install-agent-bundle
+        private-agent-poll jarvis-private-update
+    )
+    if [[ $admin_helpers == true ]]; then
+        checksummed+=(jarvis-models jarvis-credentials)
+    fi
+    (
+        cd "$root/jarvis-core-$tag"
+        sha256sum "${checksummed[@]}" > artifact-binaries.sha256
+    )
+    chmod 0644 "$root/jarvis-core-$tag/artifact-binaries.sha256"
     printf '%064d  jarvis-core-%s-linux-x86_64.tar.gz\n' 0 "$tag" \
         > "$root/jarvis-core-$tag/release.verification"
     chmod 0644 "$root/jarvis-core-$tag/release.verification"
@@ -137,9 +169,11 @@ write_release() {
 seed_active_release() {
     local tag=$1
     local schema_sha256=$2
+    local admin_helpers=${3:-true}
     rm -rf -- /opt/jarvis
     install -d -o root -g root -m 0755 /opt/jarvis/releases
-    write_release /opt/jarvis/releases "$tag" "$schema_sha256"
+    write_release /opt/jarvis/releases "$tag" "$schema_sha256" \
+        "${tag#v}" "${tag#v}" "${tag#v}" "$admin_helpers"
     mv "/opt/jarvis/releases/jarvis-core-$tag" "/opt/jarvis/releases/$tag"
     ln -s "/opt/jarvis/releases/$tag" /opt/jarvis/current
     install -d -o root -g root -m 0750 /etc/jarvis
@@ -172,11 +206,17 @@ prepare_candidate() {
     local core_version=${3:-${tag#v}}
     local cli_version=${4:-${tag#v}}
     local app_version=${5:-${tag#v}}
+    local admin_helpers=${6:-true}
+    local omitted_helper=${7:-}
     local asset_root="$fixture_dir/asset"
     local artifact="jarvis-core-$tag-linux-x86_64.tar.gz"
     rm -rf -- "$asset_root"
     mkdir -p "$asset_root"
-    write_release "$asset_root" "$tag" "$schema_sha256" "$core_version" "$cli_version" "$app_version"
+    write_release "$asset_root" "$tag" "$schema_sha256" "$core_version" "$cli_version" \
+        "$app_version" "$admin_helpers"
+    if [[ -n $omitted_helper ]]; then
+        rm -f -- "$asset_root/jarvis-core-$tag/$omitted_helper"
+    fi
     # Published artifacts do not carry an installation marker. The updater
     # must create it only after validating the downloaded archive checksum.
     rm -f -- "$asset_root/jarvis-core-$tag/release.verification"
@@ -224,7 +264,7 @@ run_updater() {
     PATH="$fake_bin:$PATH" \
         JARVIS_UPDATER_FIXTURE="$fixture_dir" \
         JARVIS_UPDATER_READYZ_FAIL="${JARVIS_UPDATER_READYZ_FAIL:-false}" \
-        bash "$updater" "$@"
+        bash "${JARVIS_UPDATER_UNDER_TEST:-$updater}" "$@"
 }
 
 same_migrations=$(printf 'a%.0s' {1..64})
@@ -263,9 +303,46 @@ cmp /opt/jarvis/releases/v1.0.1/private-agent-poll /usr/local/libexec/jarvis/pri
 cmp /opt/jarvis/releases/v1.0.1/jarvis-private-update /usr/local/sbin/jarvis-private-update
 cmp /opt/jarvis/releases/v1.0.1/jarvis-core-admin /usr/bin/jarvis-core-admin
 cmp /opt/jarvis/releases/v1.0.1/jarvis-core-admin.version /usr/share/jarvis-core-admin/version
+[[ -x /opt/jarvis/releases/v1.0.1/jarvis-models ]]
+[[ -x /opt/jarvis/releases/v1.0.1/jarvis-credentials ]]
+[[ $(stat -c '%U:%G:%a' /opt/jarvis/releases/v1.0.1/jarvis-models) == root:root:755 ]]
+[[ $(stat -c '%U:%G:%a' /opt/jarvis/releases/v1.0.1/jarvis-credentials) == root:root:755 ]]
+jq -e '.tooling.admin_helpers == 1' /opt/jarvis/releases/v1.0.1/release.json >/dev/null
+grep -Eq '^[0-9a-f]{64}  jarvis-models$' /opt/jarvis/releases/v1.0.1/artifact-binaries.sha256
+grep -Eq '^[0-9a-f]{64}  jarvis-credentials$' /opt/jarvis/releases/v1.0.1/artifact-binaries.sha256
 [[ $(stat -c '%U:%G:%a' /etc/jarvis/updater.env) == root:root:600 ]]
 grep -qx 'JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis' /etc/jarvis/updater.env
 grep -qx 'JARVIS_UPDATE_CHANNEL=stable' /etc/jarvis/updater.env
+
+# A pre-admin-helper active release reaches the self-contained architecture
+# through the normal update path. The deliberately stale global compatibility
+# copies remain untouched: the activated CLI must use /opt/jarvis/current.
+seed_active_release v0.0.19 "$same_migrations" false
+printf '#!/usr/bin/env bash\necho stale global model helper\n' > /usr/local/sbin/jarvis-models
+printf '#!/usr/bin/env bash\necho stale global credential helper\n' > /usr/local/sbin/jarvis-credentials
+chmod 0755 /usr/local/sbin/jarvis-models /usr/local/sbin/jarvis-credentials
+prepare_candidate v0.0.20 "$same_migrations"
+JARVIS_UPDATER_UNDER_TEST="$v019_updater" run_updater --version v0.0.20
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v0.0.20 ]]
+grep -Fq 'versioned jarvis-models tooling: v0.0.20' /opt/jarvis/current/jarvis-models
+grep -Fq 'versioned jarvis-credentials tooling: v0.0.20' /opt/jarvis/current/jarvis-credentials
+grep -Fq 'stale global model helper' /usr/local/sbin/jarvis-models
+grep -Fq 'stale global credential helper' /usr/local/sbin/jarvis-credentials
+
+# Declaring the capability is fail-closed: either helper being absent rejects
+# the candidate before activation and leaves the prior release selected.
+seed_active_release v1.0.2 "$same_migrations"
+for missing_case in 'v1.0.3 jarvis-models' 'v1.0.4 jarvis-credentials'; do
+    read -r missing_tag missing_helper <<< "$missing_case"
+    prepare_candidate "$missing_tag" "$same_migrations" "${missing_tag#v}" \
+        "${missing_tag#v}" "${missing_tag#v}" true "$missing_helper"
+    if run_updater --version "$missing_tag"; then
+        echo "release missing $missing_helper unexpectedly succeeded" >&2
+        exit 1
+    fi
+    [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v1.0.2 ]]
+    [[ ! -e /opt/jarvis/releases/$missing_tag ]]
+done
 
 # A shell-supplied repository must not redirect a configured root update.
 seed_active_release v1.1.0 "$same_migrations"
@@ -446,6 +523,31 @@ run_updater --rollback-version v8.3.1
 prepare_candidate v8.3.3 "$same_migrations"
 run_updater
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.3.3 ]]
+
+# Rollback inspection accepts a legitimate legacy release without the new
+# capability, while rejecting declared-capability history with missing,
+# symlinked, or writable helpers.
+seed_active_release v8.4.4 "$same_migrations"
+write_release /opt/jarvis/releases v8.4.0 "$same_migrations" 8.4.0 8.4.0 8.4.0 false
+mv /opt/jarvis/releases/jarvis-core-v8.4.0 /opt/jarvis/releases/v8.4.0
+write_release /opt/jarvis/releases v8.4.1 "$same_migrations"
+mv /opt/jarvis/releases/jarvis-core-v8.4.1 /opt/jarvis/releases/v8.4.1
+rm -f -- /opt/jarvis/releases/v8.4.1/jarvis-credentials
+write_release /opt/jarvis/releases v8.4.2 "$same_migrations"
+mv /opt/jarvis/releases/jarvis-core-v8.4.2 /opt/jarvis/releases/v8.4.2
+chmod 0775 /opt/jarvis/releases/v8.4.2/jarvis-models
+write_release /opt/jarvis/releases v8.4.3 "$same_migrations"
+mv /opt/jarvis/releases/jarvis-core-v8.4.3 /opt/jarvis/releases/v8.4.3
+rm -f -- /opt/jarvis/releases/v8.4.3/jarvis-models
+ln -s /usr/local/sbin/jarvis-models /opt/jarvis/releases/v8.4.3/jarvis-models
+candidates=$(run_updater --rollback-candidates)
+jq -e '.[] | select(.version == "v8.4.0" and .verified == true and .rollback_capable == true)' \
+    <<< "$candidates" >/dev/null
+for invalid in v8.4.1 v8.4.2 v8.4.3; do
+    jq -e --arg invalid "$invalid" \
+        '.[] | select(.version == $invalid and .rollback_capable == false and (.reason | length > 0))' \
+        <<< "$candidates" >/dev/null
+done
 
 # Drafts and prereleases are never update targets even when their tag/assets
 # appear structurally valid.

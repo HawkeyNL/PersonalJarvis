@@ -6,6 +6,31 @@ usage() {
   exit 2
 }
 
+verify_admin_helper_candidate() {
+  local release=$1 helper matches
+  jq -e '.tooling.admin_helpers == 1 and (.tooling.admin_helpers | type) == "number"' \
+    "$release/release.json" >/dev/null || {
+    echo "release candidate does not declare admin-helper tooling capability 1" >&2
+    exit 1
+  }
+  [[ -f "$release/artifact-binaries.sha256" && ! -L "$release/artifact-binaries.sha256" ]] || {
+    echo "release candidate artifact checksum manifest is missing or unsafe" >&2
+    exit 1
+  }
+  for helper in jarvis-models jarvis-credentials; do
+    [[ -f "$release/$helper" && ! -L "$release/$helper" && -x "$release/$helper" ]] || {
+      echo "release candidate is missing executable $helper" >&2
+      exit 1
+    }
+    matches=$(awk -v helper="$helper" '$2 == helper { count++ } END { print count + 0 }' \
+      "$release/artifact-binaries.sha256")
+    [[ $matches == 1 ]] || {
+      echo "release candidate does not uniquely checksum-bind $helper" >&2
+      exit 1
+    }
+  done
+}
+
 [[ $# -ge 3 && $# -le 4 ]] || usage
 mode=$1
 release_tag=$2
@@ -40,6 +65,7 @@ if [[ "$mode" == package ]]; then
     echo "staged release manifest does not match requested tag/revision" >&2
     exit 1
   }
+  verify_admin_helper_candidate "$release_dir"
   (cd "$release_dir" && sha256sum --check --strict artifact-binaries.sha256)
   mkdir -p "$output_root"
   tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
@@ -145,6 +171,8 @@ install -m 0644 jarvis-app/src-tauri/icons/128x128.png \
   "$temporary_release/jarvis-core-admin.png"
 printf '%s\n' "$core_admin_version" > "$temporary_release/jarvis-core-admin.version"
 install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update-core-release"
+install -m 0755 deploy/systemd/jarvis-models.sh "$temporary_release/jarvis-models"
+install -m 0755 deploy/systemd/jarvis-credentials.sh "$temporary_release/jarvis-credentials"
 install -m 0755 deploy/private/install-agent-bundle.sh "$temporary_release/install-agent-bundle"
 install -m 0755 deploy/private/jarvis-private-agent-poll.sh "$temporary_release/private-agent-poll"
 install -m 0755 deploy/private/jarvis-private-update.sh "$temporary_release/jarvis-private-update"
@@ -161,17 +189,19 @@ jq -n \
   --arg core_version "$core_version" \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1}}' \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1}}' \
   > "$temporary_release/release.json"
 
 (
   cd "$temporary_release"
   sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-agent-bundle \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
-    jarvis-core-admin.version update-core-release install-agent-bundle \
+    jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials \
+    install-agent-bundle \
     private-agent-poll jarvis-private-update \
     > artifact-binaries.sha256
 )
+verify_admin_helper_candidate "$temporary_release"
 rustc_version=$(rustc --version)
 cargo_version=$(cargo --version)
 llvm_version=$(rustc -Vv | awk -F': ' '/^LLVM version:/ {print $2}')

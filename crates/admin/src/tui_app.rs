@@ -2490,17 +2490,17 @@ fn operation_command(
             lock = Some(mutation_lock("/run/jarvis-private-agent-update.lock")?);
         }
         AppOperation::ModelRefresh => {
-            command = trusted_command(Path::new(SBIN).join("jarvis-models"));
+            command = trusted_admin_helper_command(AdminHelper::Models)?;
             command.arg("refresh");
             lock = Some(mutation_lock(CONFIG_LOCK)?);
         }
         AppOperation::ModelEnable { provider, model } => {
-            command = trusted_command(Path::new(SBIN).join("jarvis-models"));
+            command = trusted_admin_helper_command(AdminHelper::Models)?;
             command.args(["enable", provider, model]);
             lock = Some(mutation_lock(CONFIG_LOCK)?);
         }
         AppOperation::ModelDisable { provider, model } => {
-            command = trusted_command(Path::new(SBIN).join("jarvis-models"));
+            command = trusted_admin_helper_command(AdminHelper::Models)?;
             command.args(["disable", provider, model]);
             lock = Some(mutation_lock(CONFIG_LOCK)?);
         }

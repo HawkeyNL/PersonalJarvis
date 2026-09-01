@@ -110,6 +110,62 @@ schema_fingerprint() {
     jq -er '.schema_sha256 | strings | select(test("^[0-9a-f]{64}$"))' "$1"
 }
 
+# Releases before the admin_helpers capability legitimately used the global
+# compatibility scripts. Once capability version 1 is declared, both helpers
+# are immutable release contents and their inner artifact checksums are
+# mandatory. Callers decide whether an invalid release is fatal or merely an
+# unavailable rollback candidate by inspecting admin_helper_tooling_reason.
+admin_helper_tooling_valid() {
+    local release=$1 helper metadata mode matches
+    admin_helper_tooling_reason=
+    if ! jq -e '((.tooling? | type) == "object") and (.tooling | has("admin_helpers"))' \
+        "$release/release.json" >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! jq -e '(.tooling.admin_helpers | type) == "number" and .tooling.admin_helpers == 1' \
+        "$release/release.json" >/dev/null 2>&1; then
+        admin_helper_tooling_reason="unsupported admin-helper tooling capability"
+        return 1
+    fi
+    if [[ ! -f $release/artifact-binaries.sha256 || -L $release/artifact-binaries.sha256 ]]; then
+        admin_helper_tooling_reason="admin-helper artifact checksum manifest is missing or unsafe"
+        return 1
+    fi
+    if ! LC_ALL=C awk '
+        NF != 2 || $1 !~ /^[0-9a-f]{64}$/ || $2 !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ { exit 1 }
+        END { if (NR == 0) exit 1 }
+    ' "$release/artifact-binaries.sha256"; then
+        admin_helper_tooling_reason="admin-helper artifact checksum manifest is malformed"
+        return 1
+    fi
+    for helper in jarvis-models jarvis-credentials; do
+        if [[ ! -f $release/$helper || -L $release/$helper ]]; then
+            admin_helper_tooling_reason="versioned admin helper is missing or unsafe: $helper"
+            return 1
+        fi
+        metadata=$(stat -c '%u:%g:%a' "$release/$helper" 2>/dev/null || true)
+        if [[ $metadata != 0:0:* ]]; then
+            admin_helper_tooling_reason="versioned admin helper is not root-owned: $helper"
+            return 1
+        fi
+        mode=${metadata##*:}
+        if (( (8#$mode & 0022) != 0 || (8#$mode & 0111) == 0 )); then
+            admin_helper_tooling_reason="versioned admin helper permissions are unsafe: $helper"
+            return 1
+        fi
+        matches=$(awk -v helper="$helper" '$2 == helper { count++ } END { print count + 0 }' \
+            "$release/artifact-binaries.sha256")
+        if [[ $matches != 1 ]]; then
+            admin_helper_tooling_reason="versioned admin helper is not uniquely checksum-bound: $helper"
+            return 1
+        fi
+    done
+    if ! (cd "$release" && sha256sum --check --strict artifact-binaries.sha256 >/dev/null); then
+        admin_helper_tooling_reason="release artifact checksum verification failed"
+        return 1
+    fi
+}
+
 cleanup() {
     [[ -n ${staging_dir:-} && -d ${staging_dir:-} ]] || return 0
     case "$staging_dir" in
@@ -242,6 +298,8 @@ migrate_legacy_release_verification() {
                 fail "legacy release private-agent tooling is invalid: $expected_tag"
         done
     fi
+    admin_helper_tooling_valid "$release" || \
+        fail "legacy release admin-helper tooling is invalid: $expected_tag: $admin_helper_tooling_reason"
     unsafe_entry=$(find "$release" -xdev \( -type l -o ! -user root -o ! -group root -o -perm /022 \) \
         -printf '%P (%y %u:%g %m)\n' -quit)
     if [[ -n $unsafe_entry ]]; then
@@ -318,6 +376,10 @@ inspect_release() {
                 return 0
             }
         done
+    fi
+    if ! admin_helper_tooling_valid "$release"; then
+        inspected_reason=$admin_helper_tooling_reason
+        return 0
     fi
     if jq -e '.components.core_admin? | strings' "$release/release.json" >/dev/null 2>&1; then
         local inspected_app_version inspected_extra
@@ -766,6 +828,7 @@ if jq -e '.tooling.private_agents? == 1' "$release_dir/release.json" >/dev/null 
             fail "versioned private-agent tooling is incomplete"
     done
 fi
+admin_helper_tooling_valid "$release_dir" || fail "$admin_helper_tooling_reason"
 candidate_schema_sha256=$(schema_fingerprint "$release_dir/release.json") || \
     fail "release manifest schema fingerprint is invalid"
 if jq -e '.components? != null' "$release_dir/release.json" >/dev/null; then
