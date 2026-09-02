@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { api, errorText, type UsageReport } from "../admin";
+import DailyUsageChart from "../components/DailyUsageChart.vue";
 import ErrorPanel from "../components/ErrorPanel.vue";
 import PageHeader from "../components/PageHeader.vue";
 
 const data = ref<UsageReport | null>(null);
 const busy = ref(false);
 const error = ref("");
-const maxDaily = computed(() => Math.max(1, ...(data.value?.daily.map((row) => row.total_tokens) ?? [1])));
 const maxBackend = computed(() => Math.max(1, ...(data.value?.by_backend.map((row) => row.total_tokens) ?? [1])));
 const budgetPercent = computed(() => {
   if (!data.value || data.value.budget_eur <= 0) return 0;
@@ -16,7 +16,6 @@ const budgetPercent = computed(() => {
 
 function integer(value: number): string { return new Intl.NumberFormat().format(value); }
 function eur(value: number): string { return new Intl.NumberFormat(undefined, { style: "currency", currency: "EUR" }).format(value); }
-function shortDay(value: string): string { return value.slice(8); }
 async function load() {
   busy.value = true;
   error.value = "";
@@ -49,11 +48,7 @@ onMounted(load);
     <section class="usage-grid">
       <article class="detail-card">
         <span class="card-label">TOKENS BY DAY</span>
-        <div v-if="data.daily.length" class="usage-chart" aria-label="Daily token usage chart">
-          <div v-for="row in data.daily" :key="row.day" class="usage-column" :title="`${row.day}: ${integer(row.total_tokens)} tokens · ${eur(row.spent_eur)}`">
-            <div class="usage-bar"><i :style="{ height: `${Math.max(3, row.total_tokens / maxDaily * 100)}%` }" /></div><small>{{ shortDay(row.day) }}</small>
-          </div>
-        </div>
+        <DailyUsageChart v-if="data.daily.length" :rows="data.daily" />
         <div v-else class="empty-state">No recorded model calls this month.</div>
       </article>
       <article class="detail-card">

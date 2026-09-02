@@ -51,6 +51,22 @@ async fn session_lock(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+fn runtime_status() -> admin::RuntimeStatus {
+    admin::runtime_status()
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn restart_app(
+    app: tauri::AppHandle,
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+) -> Result<(), String> {
+    with_session(session, |session| session.lock().map(|_| ())).await?;
+    app.restart()
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 async fn overview(
     session: tauri::State<'_, Arc<session::SessionManager>>,
 ) -> Result<admin::OverviewResponse, String> {
@@ -190,6 +206,8 @@ pub fn run() {
             session_authenticate,
             session_touch,
             session_lock,
+            runtime_status,
+            restart_app,
             overview,
             health,
             services,

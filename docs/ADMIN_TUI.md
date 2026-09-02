@@ -37,8 +37,11 @@ release resolver, SHA-256 verifier, archive validator, immutable stager,
 readiness probe and tooling activator complete their real step. Read-only child
 operations can be cancelled and reaped. Transactional mutations deliberately
 remain non-cancellable while the trusted helper may be activating or
-recovering a release; their final success, failure or rollback state stays on
-screen. Explicit fast `update --check` and `update --status` commands retain
+recovering a release. Failures remain visible in the current screen. After a
+successful update or rollback replaces the running CLI, the shared TUI restores
+the terminal, exits, and prints a persistent completion message. Start
+`sudo jarvis` again to guarantee that the active release's CLI and views are in
+memory. Explicit fast `update --check` and `update --status` commands retain
 plain output where a full-screen interface adds no value.
 
 The Services and Logs views use fixed Jarvis-owned unit/target allowlists. The

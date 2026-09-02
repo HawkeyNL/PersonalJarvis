@@ -37,6 +37,14 @@ frontend hides all administration views and the backend terminates the root
 broker. Unlocking always creates a new system-authenticated broker. Closing the
 application also terminates it.
 
+After a trusted Core update or rollback succeeds, the running GUI is treated as
+stale because its installed executable may have been replaced. A mandatory
+`Restart now` dialog prevents further administration through the old process;
+restarting first closes the privileged broker. The production app also compares
+its running executable with the fixed root-owned installed executable every 15
+seconds, so an update completed from `sudo jarvis` is detected. Development mode
+does not compare itself with the installed production binary.
+
 The canonical `sudo jarvis` TUI already has one sudo authentication for its
 whole process and does not use the graphical broker.
 
@@ -88,6 +96,12 @@ bundle includes the normal desktop entry and application metadata. Install the
 reviewed package with the operating-system package manager; the application
 itself remains unprivileged after installation.
 
+The visible desktop entry is installed as
+`com.hawkeynl.jarvis.core.admin.desktop`, matching the GTK/Wayland application
+ID. Its icon remains the fixed `jarvis-core-admin` hicolor asset. This exact
+identity lets GNOME Shell associate search results and running dock windows
+with the same application instead of displaying its generic fallback icon.
+
 ## Component versions and Core releases
 
 Core (`jarvis-api`), the admin CLI (`jarvis-admin`) and this Core Admin App have
@@ -107,9 +121,18 @@ The navigation contains Overview, Health, Services, Update, Agents, Models,
 Credentials, Logs, Usage & Costs and System/About. The Models view can filter
 and sort exact reviewed per-million-token prices; unknown remote prices remain
 visibly unknown. Usage & Costs shows bounded current-month request, token and
-estimated-cost aggregates by day, provider and model. No prompt, reply,
+estimated-cost aggregates by day, provider and model. Its responsive stacked
+daily token chart uses a narrowly registered Chart.js build; budget and provider
+progress indicators remain native application UI. No prompt, reply,
 credential or request identifier enters either view. Credential values are
 never shown or entered. Logs are bounded, control-sequence sanitized,
 structured where possible, searchable/filterable, selectable, wrapped and
 optionally followed through bounded polling of the allowlisted direct CLI
 operation.
+
+The Agents page obtains its tree through the canonical protected admin CLI's
+bounded safe projection. It never reads the private checkout, agent JSON files,
+or Markdown prompt bodies. **Check** compares the configured, allowlisted
+`HawkeyNL/PersonalJarvisAgents` checkout with `origin/main`; **Update bundle**
+uses the existing trusted validator and transactional Core-readiness rollback
+path before the refreshed safe tree is displayed.

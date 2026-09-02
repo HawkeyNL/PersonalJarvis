@@ -6,9 +6,10 @@ import ErrorPanel from "../components/ErrorPanel.vue";
 import PageHeader from "../components/PageHeader.vue";
 import ResultPanel from "../components/ResultPanel.vue";
 import StatusBadge from "../components/StatusBadge.vue";
+const emit = defineEmits<{ restartRequired: [] }>();
 const status = ref<Record<string, string>>({}); const busy = ref(false); const error = ref(""); const result = ref<OperationResult | null>(null); const version = ref(""); const pending = ref<"latest" | "version" | "rollback" | null>(null);
 async function load(check = false) { busy.value = true; error.value = ""; try { status.value = await api.updateStatus(check); } catch (e) { error.value = errorText(e); } finally { busy.value = false; } }
-async function execute() { const action = pending.value; pending.value = null; if (!action) return; busy.value = true; error.value = ""; result.value = null; try { const request: Record<string, string> = { action: action === "version" ? "install_version" : action }; if (action === "version") request.version = version.value; result.value = await api.updateMutation(request); await load(false); } catch (e) { error.value = errorText(e); } finally { busy.value = false; } }
+async function execute() { const action = pending.value; pending.value = null; if (!action) return; busy.value = true; error.value = ""; result.value = null; try { const request: Record<string, string> = { action: action === "version" ? "install_version" : action }; if (action === "version") request.version = version.value; result.value = await api.updateMutation(request); if (result.value.success) emit("restartRequired"); } catch (e) { error.value = errorText(e); } finally { busy.value = false; } }
 onMounted(() => load(false));
 </script>
 <template>

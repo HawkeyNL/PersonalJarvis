@@ -274,11 +274,18 @@ if [[ $release_has_core_admin == true ]]; then
         /usr/share/applications /usr/share/icons/hicolor/128x128/apps
     install -o root -g root -m 0755 "$release_dir/jarvis-core-admin" /usr/bin/jarvis-core-admin
     install -o root -g root -m 0644 "$release_dir/jarvis-core-admin.desktop" \
-        /usr/share/applications/jarvis-core-admin.desktop
+        /usr/share/applications/com.hawkeynl.jarvis.core.admin.desktop
     install -o root -g root -m 0644 "$release_dir/jarvis-core-admin.png" \
         /usr/share/icons/hicolor/128x128/apps/jarvis-core-admin.png
     install -o root -g root -m 0644 "$release_dir/jarvis-core-admin.version" \
         /usr/share/jarvis-core-admin/version
+    if [[ -f /usr/share/applications/jarvis-core-admin.desktop && \
+        ! -L /usr/share/applications/jarvis-core-admin.desktop ]]; then
+        rm -f -- /usr/share/applications/jarvis-core-admin.desktop
+    fi
+    /usr/bin/update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+    /usr/bin/gtk-update-icon-cache --force --ignore-theme-index \
+        /usr/share/icons/hicolor >/dev/null 2>&1 || true
 fi
 install -o root -g root -m 0755 \
     "$repo_dir/deploy/systemd/verify-home-node.sh" \

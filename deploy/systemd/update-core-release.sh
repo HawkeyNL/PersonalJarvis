@@ -10,7 +10,8 @@ readonly updater_config=/etc/jarvis/updater.env
 readonly canonical_repository=HawkeyNL/PersonalJarvis
 readonly api_url=https://api.github.com
 readonly core_admin_binary=/usr/bin/jarvis-core-admin
-readonly core_admin_desktop=/usr/share/applications/jarvis-core-admin.desktop
+readonly core_admin_desktop=/usr/share/applications/com.hawkeynl.jarvis.core.admin.desktop
+readonly legacy_core_admin_desktop=/usr/share/applications/jarvis-core-admin.desktop
 readonly core_admin_icon=/usr/share/icons/hicolor/128x128/apps/jarvis-core-admin.png
 readonly core_admin_version_file=/usr/share/jarvis-core-admin/version
 repository=
@@ -614,6 +615,14 @@ install_versioned_tooling() {
     fi
     rm -f -- "${tooling_previous[@]}" "$app_previous" \
         "$desktop_previous" "$icon_previous" "$version_previous"
+    if [[ $app_present == true ]]; then
+        if [[ -f $legacy_core_admin_desktop && ! -L $legacy_core_admin_desktop ]]; then
+            rm -f -- "$legacy_core_admin_desktop"
+        fi
+        /usr/bin/update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+        /usr/bin/gtk-update-icon-cache --force --ignore-theme-index \
+            /usr/share/icons/hicolor >/dev/null 2>&1 || true
+    fi
     [[ $agent_tooling_present == false || -x /usr/local/libexec/jarvis/private-agent-poll ]]
 }
 

@@ -37,6 +37,7 @@ cleanup() {
         /usr/local/libexec/jarvis/install-agent-bundle \
         /usr/local/libexec/jarvis/private-agent-poll
     rm -f -- /usr/bin/jarvis-core-admin \
+        /usr/share/applications/com.hawkeynl.jarvis.core.admin.desktop \
         /usr/share/applications/jarvis-core-admin.desktop \
         /usr/share/icons/hicolor/128x128/apps/jarvis-core-admin.png
     rm -rf -- /usr/share/jarvis-core-admin
@@ -302,6 +303,9 @@ cmp /opt/jarvis/releases/v1.0.1/install-agent-bundle /usr/local/libexec/jarvis/i
 cmp /opt/jarvis/releases/v1.0.1/private-agent-poll /usr/local/libexec/jarvis/private-agent-poll
 cmp /opt/jarvis/releases/v1.0.1/jarvis-private-update /usr/local/sbin/jarvis-private-update
 cmp /opt/jarvis/releases/v1.0.1/jarvis-core-admin /usr/bin/jarvis-core-admin
+cmp /opt/jarvis/releases/v1.0.1/jarvis-core-admin.desktop \
+    /usr/share/applications/com.hawkeynl.jarvis.core.admin.desktop
+[[ ! -e /usr/share/applications/jarvis-core-admin.desktop ]]
 cmp /opt/jarvis/releases/v1.0.1/jarvis-core-admin.version /usr/share/jarvis-core-admin/version
 [[ -x /opt/jarvis/releases/v1.0.1/jarvis-models ]]
 [[ -x /opt/jarvis/releases/v1.0.1/jarvis-credentials ]]

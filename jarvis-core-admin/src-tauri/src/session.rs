@@ -35,7 +35,7 @@ pub(crate) enum BrokerRequest {
     UpdateStatus { check: bool },
     UpdateMutation { request: UpdateMutation },
     AgentsStatus,
-    AgentManifest,
+    AgentTree,
     AgentAction { update: bool },
     Models,
     Usage,

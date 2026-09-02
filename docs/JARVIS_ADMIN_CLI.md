@@ -1,5 +1,14 @@
 # Jarvis Home Node administration
 
+## Source layout
+
+The Rust administrator keeps command dispatch in `crates/admin/src/main.rs`.
+Terminal capability/lifecycle support, the persistent Update Center, safe
+agent-tree projection, versioned compatibility-helper resolution and tests live
+in dedicated sibling modules. This keeps presentation state separate from the
+trusted filesystem and process boundaries without introducing a second TUI
+lifecycle.
+
 The primary owner interface on a provisioned Home Node is the root-operated,
 persistent administration console:
 
@@ -70,10 +79,13 @@ timer state, rollback availability and the last result in the current session.
 The status/check result also shows current and latest Core, CLI and Core Admin
 App versions. A new verified bundle is offered when any of those components is
 updated.
-Use the arrow keys or `j`/`k`, Enter, Esc and `q`. Successful and failed
-operations remain visible until the owner returns to the overview or closes the
-screen. Bare `jarvis update` is rejected outside an interactive rich terminal;
-automation must select an explicit operation.
+Use the arrow keys or `j`/`k`, Enter, Esc and `q`. Failed operations remain
+visible until the owner returns to the overview or closes the screen. A
+successful update or rollback replaces the CLI executable, so the TUI restores
+the terminal, exits immediately, and prints the result in normal terminal
+output. Run `sudo jarvis` again to use the newly active client. Bare
+`jarvis update` is rejected outside an interactive rich terminal; automation
+must select an explicit operation.
 
 Explicit `--check` and `--status` never initialize Ratatui or an alternate
 screen. They print stable inline output; their `--json` variants remain

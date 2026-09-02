@@ -76,10 +76,11 @@ core-admin-deb:
     - trap 'rm -rf -- "$package_root"' EXIT
     - dpkg-deb --extract "$package" "$package_root"
     - test "$("$package_root/usr/bin/jarvis-core-admin" --frontend-mode)" = production
-    - desktop=$(find "$package_root/usr/share/applications" -maxdepth 1 -type f -name '*.desktop' -print -quit)
-    - test -n "$desktop"
+    - desktop="$package_root/usr/share/applications/com.hawkeynl.jarvis.core.admin.desktop"
+    - test -f "$desktop"
     - grep -Fqx 'Icon=jarvis-core-admin' "$desktop"
     - grep -Fqx 'StartupWMClass=com.hawkeynl.jarvis.core.admin' "$desktop"
+    - grep -Fqx 'NoDisplay=true' "$package_root/usr/share/applications/Jarvis Core Administration.desktop"
     - file "$package_root/usr/share/icons/hicolor/128x128/apps/jarvis-core-admin.png" | grep -Fq 'PNG image data, 128 x 128'
   artifacts:
     name: "jarvis-core-admin-${CI_COMMIT_SHORT_SHA}"

@@ -30,9 +30,13 @@ const locked = ref(true);
 const authBusy = ref(false);
 const authError = ref("");
 const idleSeconds = ref(300);
+const restartRequired = ref(false);
+const restartBusy = ref(false);
+const restartError = ref("");
 const current = computed(() => views[active.value]);
 let clockTimer: number | undefined;
 let idleTimer: number | undefined;
+let runtimeTimer: number | undefined;
 let lastActivity = Date.now();
 let lastBrokerTouch = 0;
 let touchPending = false;
@@ -47,11 +51,32 @@ async function unlock() {
     lastActivity = Date.now();
     lastBrokerTouch = lastActivity;
     idleSeconds.value = 300;
+    await checkRuntime();
   } catch (error) {
     locked.value = true;
     authError.value = errorText(error);
   } finally {
     authBusy.value = false;
+  }
+}
+async function checkRuntime() {
+  if (locked.value || restartRequired.value) return;
+  try {
+    const status = await api.runtimeStatus();
+    if (status.restart_required) restartRequired.value = true;
+  } catch {
+    // Update operations still raise the mandatory restart state directly.
+  }
+}
+async function restartNow() {
+  if (restartBusy.value) return;
+  restartBusy.value = true;
+  restartError.value = "";
+  try {
+    await api.restartApp();
+  } catch (error) {
+    restartError.value = errorText(error);
+    restartBusy.value = false;
   }
 }
 function lock(reason = "Locked after five minutes without activity.") {
@@ -87,11 +112,13 @@ onMounted(() => {
   tick();
   clockTimer = window.setInterval(tick, 1000);
   idleTimer = window.setInterval(checkIdle, 1000);
+  runtimeTimer = window.setInterval(() => void checkRuntime(), 15_000);
   void unlock();
 });
 onBeforeUnmount(() => {
   clearInterval(clockTimer);
   clearInterval(idleTimer);
+  clearInterval(runtimeTimer);
   if (!locked.value) void api.sessionLock().catch(() => undefined);
 });
 </script>
@@ -105,7 +132,7 @@ onBeforeUnmount(() => {
     <div class="main-shell">
       <header class="topbar"><div><span class="topbar-kicker">JARVIS HOME NODE</span><strong>{{ locked ? "Locked" : items.find((item) => item.id === active)?.label }}</strong></div><div class="topbar-actions"><button v-if="!locked" class="small secondary" @click="lock('Locked by owner.')">Lock</button><time>{{ clock }}</time></div></header>
       <main :class="['page', { 'logs-active': active === 'logs', 'locked-page': locked }]">
-        <component :is="current" v-if="!locked" />
+        <component :is="current" v-if="!locked" @restart-required="restartRequired = true" />
         <section v-else class="lock-screen" aria-live="polite">
           <div class="lock-mark"><i /></div>
           <span class="topbar-kicker">PRIVILEGED ADMINISTRATION</span>
@@ -116,6 +143,15 @@ onBeforeUnmount(() => {
           <small>The session locks after five minutes without pointer or keyboard activity.</small>
         </section>
       </main>
+    </div>
+    <div v-if="restartRequired" class="dialog-backdrop restart-backdrop">
+      <section class="dialog restart-dialog" role="alertdialog" aria-modal="true" aria-labelledby="restart-title">
+        <span class="eyebrow">UPDATE INSTALLED</span>
+        <h2 id="restart-title">Restart Jarvis Core Administration</h2>
+        <p>The trusted update completed and replaced administration components. This older application process cannot continue safely.</p>
+        <p v-if="restartError" class="restart-error">{{ restartError }}</p>
+        <div class="dialog-actions"><button :disabled="restartBusy" @click="restartNow">{{ restartBusy ? "Restarting…" : "Restart now" }}</button></div>
+      </section>
     </div>
   </div>
 </template>

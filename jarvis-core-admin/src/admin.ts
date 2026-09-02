@@ -17,6 +17,12 @@ export interface SessionStatus {
   expires_in_seconds: number;
 }
 
+export interface RuntimeStatus {
+  running_version: string;
+  installed_version: string | null;
+  restart_required: boolean;
+}
+
 export interface AgentBundle { id: string; agent_count: number }
 export interface StatusReport {
   release: string | null;
@@ -118,6 +124,8 @@ export const api = {
     invoke<SessionStatus>("session_authenticate"),
   sessionTouch: () => invoke<SessionStatus>("session_touch"),
   sessionLock: () => invoke<SessionStatus>("session_lock"),
+  runtimeStatus: () => invoke<RuntimeStatus>("runtime_status"),
+  restartApp: () => invoke<void>("restart_app"),
   overview: () => invoke<OverviewResponse>("overview"),
   health: (runVerification = false) =>
     invoke<HealthResponse>("health", { runVerification }),

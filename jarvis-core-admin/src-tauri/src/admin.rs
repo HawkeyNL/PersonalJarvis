@@ -15,7 +15,8 @@ use crate::logs::{parse_lines, sanitize, LogRecord};
 use crate::session::{BrokerRequest, SessionManager};
 
 const ADMIN: &str = "/usr/local/sbin/jarvis";
-const AGENT_MANIFEST: &str = "/var/lib/jarvis/agents/current/manifest.json";
+const CORE_ADMIN_BINARY: &str = "/usr/bin/jarvis-core-admin";
+const CORE_ADMIN_VERSION: &str = "/usr/share/jarvis-core-admin/version";
 const OUTPUT_LIMIT: usize = 1_048_576;
 
 type AdminResult<T> = Result<T, String>;
@@ -56,6 +57,13 @@ pub struct LogQuery {
 pub struct LogResponse {
     pub unit: String,
     pub records: Vec<LogRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeStatus {
+    pub running_version: String,
+    pub installed_version: Option<String>,
+    pub restart_required: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -361,66 +369,65 @@ pub fn update_mutation(
 
 pub fn agents(session: &SessionManager) -> AdminResult<AgentsResponse> {
     let bundle: AgentBundle = parse_json(&session.run(BrokerRequest::AgentsStatus)?.stdout)?;
-    let manifest_output = session.run(BrokerRequest::AgentManifest);
-    let (manifest_bundle, agents) = match manifest_output {
-        Ok(output) => {
-            let manifest: SafeManifest = parse_json(&output.stdout)?;
-            if manifest.version != 1 || manifest.agents.len() > 512 || !safe_id(&manifest.bundle_id)
-            {
-                return Err("active agent manifest metadata is invalid".to_owned());
-            }
-            if manifest.bundle_id != bundle.id {
-                return Err("active agent manifest does not match the active bundle".to_owned());
-            }
-            let records = manifest
-                .agents
-                .into_iter()
-                .map(|entry| {
-                    if !safe_id(&entry.id)
-                        || entry
-                            .name
-                            .as_deref()
-                            .is_some_and(|value| !safe_label(value))
-                        || entry
-                            .group
-                            .as_deref()
-                            .is_some_and(|value| !safe_label(value))
-                        || entry
-                            .model_policy
-                            .as_deref()
-                            .is_some_and(|value| !safe_label(value))
-                        || entry
-                            .profile_lines
-                            .is_some_and(|value| value == 0 || value > 100_000)
-                        || entry
-                            .source_updated_at
-                            .as_deref()
-                            .is_some_and(|value| !safe_source_timestamp(value))
-                    {
-                        return Err(
-                            "active agent manifest contains unsafe display metadata".to_owned()
-                        );
-                    }
-                    Ok(AgentRecord {
-                        name: entry.name.unwrap_or_else(|| entry.id.clone()),
-                        id: entry.id,
-                        group: entry.group.unwrap_or_else(|| "Ungrouped".to_owned()),
-                        model_policy: entry.model_policy,
-                        profile_lines: entry.profile_lines,
-                        source_updated_at: entry.source_updated_at,
-                        state: "active".to_owned(),
-                    })
-                })
-                .collect::<AdminResult<Vec<_>>>()?;
-            (Some(manifest.bundle_id), records)
-        }
-        Err(_) => (None, Vec::new()),
-    };
+    let output = session.run(BrokerRequest::AgentTree)?;
+    let manifest: SafeManifest = parse_json(&output.stdout)?;
+    let (manifest_bundle, agents) = safe_agent_records(&bundle, manifest)?;
     Ok(AgentsResponse {
         bundle,
-        manifest_bundle,
+        manifest_bundle: Some(manifest_bundle),
         agents,
     })
+}
+
+fn safe_agent_records(
+    bundle: &AgentBundle,
+    manifest: SafeManifest,
+) -> AdminResult<(String, Vec<AgentRecord>)> {
+    if manifest.version != 1 || manifest.agents.len() > 512 || !safe_id(&manifest.bundle_id) {
+        return Err("active agent manifest metadata is invalid".to_owned());
+    }
+    if manifest.bundle_id != bundle.id {
+        return Err("active agent manifest does not match the active bundle".to_owned());
+    }
+    let agents = manifest
+        .agents
+        .into_iter()
+        .map(|entry| {
+            if !safe_id(&entry.id)
+                || entry
+                    .name
+                    .as_deref()
+                    .is_some_and(|value| !safe_label(value))
+                || entry
+                    .group
+                    .as_deref()
+                    .is_some_and(|value| !safe_label(value))
+                || entry
+                    .model_policy
+                    .as_deref()
+                    .is_some_and(|value| !safe_label(value))
+                || entry
+                    .profile_lines
+                    .is_some_and(|value| value == 0 || value > 100_000)
+                || entry
+                    .source_updated_at
+                    .as_deref()
+                    .is_some_and(|value| !safe_source_timestamp(value))
+            {
+                return Err("active agent manifest contains unsafe display metadata".to_owned());
+            }
+            Ok(AgentRecord {
+                name: entry.name.unwrap_or_else(|| entry.id.clone()),
+                id: entry.id,
+                group: entry.group.unwrap_or_else(|| "Ungrouped".to_owned()),
+                model_policy: entry.model_policy,
+                profile_lines: entry.profile_lines,
+                source_updated_at: entry.source_updated_at,
+                state: "active".to_owned(),
+            })
+        })
+        .collect::<AdminResult<Vec<_>>>()?;
+    Ok((manifest.bundle_id, agents))
 }
 
 pub fn agent_action(session: &SessionManager, update: bool) -> AdminResult<OperationResult> {
@@ -474,7 +481,7 @@ pub fn system() -> AdminResult<SystemResponse> {
     let provenance = read_fixed("/opt/jarvis/current/build-provenance.json", 64 * 1024)
         .ok()
         .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
-    let installed_app_version = read_fixed("/usr/share/jarvis-core-admin/version", 128)
+    let installed_app_version = read_fixed(CORE_ADMIN_VERSION, 128)
         .ok()
         .map(|value| sanitize(value.trim(), 64))
         .unwrap_or_else(|| "not installed".to_owned());
@@ -520,6 +527,24 @@ pub fn system() -> AdminResult<SystemResponse> {
         ),
     ];
     Ok(SystemResponse { values })
+}
+
+pub fn runtime_status() -> RuntimeStatus {
+    let running_version = env!("CARGO_PKG_VERSION").to_owned();
+    let installed_version = trusted_installed_version();
+    let version_changed = installed_version
+        .as_deref()
+        .is_some_and(|installed| installed != running_version);
+    let executable_replaced = active_executable_was_replaced().unwrap_or(false);
+    RuntimeStatus {
+        running_version,
+        installed_version,
+        restart_required: restart_required(
+            cfg!(feature = "custom-protocol"),
+            version_changed,
+            executable_replaced,
+        ),
+    }
 }
 
 fn status(session: &SessionManager) -> AdminResult<StatusReport> {
@@ -654,9 +679,13 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
             ],
             Duration::from_secs(120),
         ),
-        BrokerRequest::AgentManifest => (
-            "/usr/bin/cat",
-            vec![AGENT_MANIFEST.to_owned()],
+        BrokerRequest::AgentTree => (
+            ADMIN,
+            vec![
+                "--json".to_owned(),
+                "agents".to_owned(),
+                "tree".to_owned(),
+            ],
             Duration::from_secs(120),
         ),
         BrokerRequest::AgentAction { update } => (
@@ -855,6 +884,47 @@ fn read_fixed(path: &str, limit: u64) -> AdminResult<String> {
     fs::read_to_string(path).map_err(|_| "system metadata could not be read".to_owned())
 }
 
+fn trusted_installed_version() -> Option<String> {
+    let metadata = fs::symlink_metadata(CORE_ADMIN_VERSION).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.len() > 128
+    {
+        return None;
+    }
+    let version = fs::read_to_string(CORE_ADMIN_VERSION).ok()?;
+    let version = version.trim();
+    valid_component_version(version).then(|| version.to_owned())
+}
+
+fn active_executable_was_replaced() -> Option<bool> {
+    let installed = fs::symlink_metadata(CORE_ADMIN_BINARY).ok()?;
+    if installed.file_type().is_symlink()
+        || !installed.is_file()
+        || installed.uid() != 0
+        || installed.permissions().mode() & 0o022 != 0
+    {
+        return None;
+    }
+    let running = fs::metadata("/proc/self/exe").ok()?;
+    Some(installed.dev() != running.dev() || installed.ino() != running.ino())
+}
+
+fn valid_component_version(value: &str) -> bool {
+    let mut parts = value.split('.');
+    (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && parts.next().is_none()
+}
+
+fn restart_required(production: bool, version_changed: bool, executable_replaced: bool) -> bool {
+    production && (version_changed || executable_replaced)
+}
+
 fn local_command(program: &str, args: &[&str]) -> String {
     Command::new(program)
         .args(args)
@@ -899,6 +969,16 @@ mod tests {
     }
 
     #[test]
+    fn restart_detection_is_enabled_only_for_replaced_production_clients() {
+        assert!(valid_component_version("0.1.2"));
+        assert!(!valid_component_version("v0.1.2"));
+        assert!(restart_required(true, true, false));
+        assert!(restart_required(true, false, true));
+        assert!(!restart_required(true, false, false));
+        assert!(!restart_required(false, true, true));
+    }
+
+    #[test]
     fn manifest_schema_retains_only_safe_projection() {
         let manifest: SafeManifest = serde_json::from_str(r#"{"version":1,"bundle_id":"bundle-test","agents":[{"id":"research","name":"Research","group":"Development","model_policy":"research","profile_lines":142,"source_updated_at":"2026-08-29T14:32:00+02:00","instructions":"never retain"}]}"#).unwrap();
         assert_eq!(manifest.agents[0].name.as_deref(), Some("Research"));
@@ -907,6 +987,25 @@ mod tests {
             manifest.agents[0].source_updated_at.as_deref().unwrap()
         ));
         assert!(!format!("{manifest:?}").contains("never retain"));
+    }
+
+    #[test]
+    fn agent_records_require_the_active_bundle_and_preserve_safe_tree_metadata() {
+        let bundle = AgentBundle {
+            id: "bundle-test".to_owned(),
+            agent_count: 1,
+        };
+        let manifest: SafeManifest = serde_json::from_str(r#"{"version":1,"bundle_id":"bundle-test","agents":[{"id":"research","name":"Research","group":"Development","model_policy":"research","profile_lines":142,"source_updated_at":"2026-08-29T14:32:00+02:00"}]}"#).unwrap();
+        let (manifest_bundle, records) = safe_agent_records(&bundle, manifest).unwrap();
+        assert_eq!(manifest_bundle, bundle.id);
+        assert_eq!(records[0].group, "Development");
+        assert_eq!(records[0].profile_lines, Some(142));
+
+        let stale: SafeManifest = serde_json::from_str(
+            r#"{"version":1,"bundle_id":"bundle-old","agents":[]}"#,
+        )
+        .unwrap();
+        assert!(safe_agent_records(&bundle, stale).is_err());
     }
 
     #[test]

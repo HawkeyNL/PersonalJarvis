@@ -1,7 +1,7 @@
 //! Single-lifecycle owner console for the Jarvis Home Node.
 //!
 //! This module owns presentation state only. Every privileged operation still
-//! crosses an existing typed helper boundary from `main.rs`.
+//! crosses an existing typed helper boundary from the surrounding admin crate.
 
 use super::*;
 
@@ -1451,12 +1451,21 @@ pub(super) fn run_fixture(initial: AppView, trace_enabled: bool, failure: bool) 
 fn run(mut app: JarvisApp, trace_enabled: bool) -> Result<()> {
     let mut trace = TuiTrace::new(trace_enabled);
     let mut first_frame = true;
+    let mut replacement_summary = None;
     let result = ratatui::run(|terminal| -> io::Result<TuiExitReason> {
         trace.record("unified Jarvis application closure entered");
         loop {
             app.tick().map_err(|error| {
                 io::Error::other(format!("Jarvis application state: {error:#}"))
             })?;
+            if let Some(summary) = app
+                .update
+                .as_mut()
+                .and_then(UpdateCenter::take_client_replacement)
+            {
+                replacement_summary = Some(summary);
+                return Ok(TuiExitReason::ClientReplaced);
+            }
             let draw = terminal.draw(|frame| render(frame, &mut app)).map(|_| ());
             trace.io("terminal.draw", draw)?;
             if first_frame {
@@ -1480,13 +1489,21 @@ fn run(mut app: JarvisApp, trace_enabled: bool) -> Result<()> {
         .clone()
         .unwrap_or_else(|| "terminal lifecycle initialization or cleanup".to_owned());
     trace.finish("home", &result, reason, true);
-    result.map(|_| ()).map_err(|error| {
-        anyhow::Error::new(error).context(format!(
+    match result {
+        Ok(TuiExitReason::ClientReplaced) => {
+            println!(
+                "{}\nThe Jarvis administration TUI closed because its executable was replaced.\nRun `sudo jarvis` again to start the active CLI.",
+                replacement_summary.unwrap_or_else(|| "Jarvis update completed successfully.".to_owned())
+            );
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
             "Jarvis interactive terminal UI could not continue after terminal restoration; \
              stage: {failure_stage}; run `jarvis terminal-diagnostics` or use an explicit \
              command with plain/JSON output"
-        ))
-    })
+        ))),
+    }
 }
 
 fn render(frame: &mut ratatui::Frame, app: &mut JarvisApp) {
@@ -2606,6 +2623,8 @@ fn fixture_agent_tree() -> AgentTreeSnapshot {
         name: name.to_owned(),
         group: Some(group.to_owned()),
         model_policy: Some(policy.to_owned()),
+        profile_lines: Some(80),
+        source_updated_at: Some("2026-08-30T08:00:00Z".to_owned()),
     })
     .collect::<Vec<_>>();
     for index in 0..44 {
@@ -2622,6 +2641,8 @@ fn fixture_agent_tree() -> AgentTreeSnapshot {
                 }
                 .to_owned(),
             ),
+            profile_lines: Some(100 + index as u32),
+            source_updated_at: Some("2026-08-30T08:00:00Z".to_owned()),
         });
     }
     AgentTreeSnapshot {
