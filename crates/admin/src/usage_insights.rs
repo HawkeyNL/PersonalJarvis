@@ -15,7 +15,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::{ModelPolicy, ModelRecord, CURRENT_RELEASE, RELEASES_ROOT};
+use super::{ModelPolicy, CURRENT_RELEASE, RELEASES_ROOT};
 
 const OWNER_PRICING_REGISTRY: &str = "/etc/jarvis/pricing-registry.json";
 const RELEASE_PRICING_REGISTRY: &str = "pricing-registry.json";
@@ -40,83 +40,85 @@ struct PricingEntry {
     cache_read_per_million_usd: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
-struct PricedModelRecord {
-    #[serde(flatten)]
-    model: ModelRecord,
-    price_status: &'static str,
-    input_per_million_usd: Option<f64>,
-    cache_read_per_million_usd: Option<f64>,
-    output_per_million_usd: Option<f64>,
-    pricing_source: String,
-    pricing_updated_at: String,
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct PricedModelRecord {
+    pub(super) provider: String,
+    pub(super) model: String,
+    pub(super) enabled: bool,
+    pub(super) source: String,
+    pub(super) price_status: &'static str,
+    pub(super) input_per_million_usd: Option<f64>,
+    pub(super) cache_read_per_million_usd: Option<f64>,
+    pub(super) output_per_million_usd: Option<f64>,
+    pub(super) pricing_source: String,
+    pub(super) pricing_updated_at: String,
 }
 
 #[derive(Debug, Serialize)]
-struct PricedModelPolicy {
+pub(super) struct PricedModelPolicy {
     version: u8,
-    models: Vec<PricedModelRecord>,
+    pub(super) models: Vec<PricedModelRecord>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct UsageReport {
-    period: String,
-    generated_at_unix: u64,
-    budget_eur: f64,
-    spent_eur: f64,
-    remaining_eur: f64,
-    over_budget: bool,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct UsageReport {
+    pub(super) period: String,
+    pub(super) generated_at_unix: u64,
+    pub(super) budget_eur: f64,
+    pub(super) spent_eur: f64,
+    pub(super) remaining_eur: f64,
+    pub(super) over_budget: bool,
     #[serde(default)]
-    reserved_eur: f64,
+    pub(super) reserved_eur: f64,
     #[serde(default)]
-    remaining_hard_eur: f64,
+    pub(super) remaining_hard_eur: f64,
     #[serde(default)]
-    above_soft_budget: bool,
-    requests: u64,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    total_tokens: u64,
+    pub(super) above_soft_budget: bool,
+    pub(super) requests: u64,
+    pub(super) input_tokens: u64,
+    pub(super) output_tokens: u64,
+    pub(super) cache_read_tokens: u64,
+    pub(super) cache_write_tokens: u64,
+    pub(super) total_tokens: u64,
     #[serde(default)]
-    by_backend: Vec<UsageRow>,
+    pub(super) by_backend: Vec<UsageRow>,
     #[serde(default)]
-    by_model: Vec<UsageRow>,
+    pub(super) by_model: Vec<UsageRow>,
     #[serde(default)]
-    daily: Vec<DailyUsageRow>,
-    pricing: PricingSummary,
+    pub(super) daily: Vec<DailyUsageRow>,
+    pub(super) pricing: PricingSummary,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct UsageRow {
-    backend: String,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct UsageRow {
+    pub(super) backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    spent_eur: f64,
-    requests: u64,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    total_tokens: u64,
+    pub(super) model: Option<String>,
+    pub(super) spent_eur: f64,
+    pub(super) requests: u64,
+    pub(super) input_tokens: u64,
+    pub(super) output_tokens: u64,
+    pub(super) cache_read_tokens: u64,
+    pub(super) cache_write_tokens: u64,
+    pub(super) total_tokens: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct DailyUsageRow {
-    day: String,
-    spent_eur: f64,
-    requests: u64,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    total_tokens: u64,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct DailyUsageRow {
+    pub(super) day: String,
+    pub(super) spent_eur: f64,
+    pub(super) requests: u64,
+    pub(super) input_tokens: u64,
+    pub(super) output_tokens: u64,
+    pub(super) cache_read_tokens: u64,
+    pub(super) cache_write_tokens: u64,
+    pub(super) total_tokens: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct PricingSummary {
-    source: String,
-    updated_at: String,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct PricingSummary {
+    pub(super) source: String,
+    pub(super) updated_at: String,
 }
 
 fn validate_pricing_registry(registry: &PricingRegistry) -> Result<()> {
@@ -256,8 +258,15 @@ fn read_layered_pricing_registry() -> Result<PricingRegistry> {
     Ok(owner)
 }
 
-pub(super) fn priced_model_policy_json(policy: ModelPolicy) -> Result<String> {
+pub(super) fn priced_model_policy(policy: ModelPolicy) -> Result<PricedModelPolicy> {
     let pricing = read_layered_pricing_registry()?;
+    Ok(priced_model_policy_with_registry(policy, &pricing))
+}
+
+fn priced_model_policy_with_registry(
+    policy: ModelPolicy,
+    pricing: &PricingRegistry,
+) -> PricedModelPolicy {
     let models = policy
         .models
         .into_iter()
@@ -276,7 +285,10 @@ pub(super) fn priced_model_policy_json(policy: ModelPolicy) -> Result<String> {
                 .iter()
                 .find(|entry| entry.provider == model.provider && entry.model == model.model);
             PricedModelRecord {
-                model,
+                provider: model.provider,
+                model: model.model,
+                enabled: model.enabled,
+                source: model.source,
                 price_status: if local {
                     "local"
                 } else if entry.is_some() {
@@ -296,13 +308,21 @@ pub(super) fn priced_model_policy_json(policy: ModelPolicy) -> Result<String> {
             }
         })
         .collect();
-    Ok(serde_json::to_string(&PricedModelPolicy {
+    PricedModelPolicy {
         version: policy.version,
         models,
-    })?)
+    }
 }
 
-fn read_usage_report() -> Result<UsageReport> {
+pub(super) fn display_model_price(value: Option<f64>, status: &str) -> String {
+    match (value, status) {
+        (_, "local") => "included".to_owned(),
+        (Some(price), _) => format!("${price:.4}"),
+        (None, _) => "unknown".to_owned(),
+    }
+}
+
+pub(super) fn read_usage_report() -> Result<UsageReport> {
     let path = Path::new(USAGE_SUMMARY);
     let directory = fs::symlink_metadata("/var/lib/jarvis").context("inspect Jarvis state")?;
     let metadata = fs::symlink_metadata(path)
@@ -361,6 +381,26 @@ mod tests {
         )
         .unwrap();
         assert!(validate_pricing_registry(&registry).is_err());
+    }
+
+    #[test]
+    fn every_presentation_receives_the_same_exact_price_projection() {
+        let registry: PricingRegistry = serde_json::from_str(
+            r#"{"version":1,"source":"fixture","updated_at":"2026-09-01","models":[{"provider":"ollama-cloud","model":"exact","input_per_million_usd":0.07,"cache_read_per_million_usd":0.035,"output_per_million_usd":0.3}]}"#,
+        )
+        .unwrap();
+        let policy: ModelPolicy = serde_json::from_str(
+            r#"{"version":1,"models":[{"provider":"ollama-cloud","model":"exact","enabled":false,"source":"discovered"}]}"#,
+        )
+        .unwrap();
+        let projected = priced_model_policy_with_registry(policy, &registry);
+        assert_eq!(projected.models.len(), 1);
+        let model = &projected.models[0];
+        assert_eq!(model.price_status, "known");
+        assert_eq!(model.input_per_million_usd, Some(0.07));
+        assert_eq!(model.cache_read_per_million_usd, Some(0.035));
+        assert_eq!(model.output_per_million_usd, Some(0.3));
+        assert!(!model.enabled);
     }
 
     #[test]

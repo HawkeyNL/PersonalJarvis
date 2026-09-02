@@ -681,11 +681,7 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
         ),
         BrokerRequest::AgentTree => (
             ADMIN,
-            vec![
-                "--json".to_owned(),
-                "agents".to_owned(),
-                "tree".to_owned(),
-            ],
+            vec!["--json".to_owned(), "agents".to_owned(), "tree".to_owned()],
             Duration::from_secs(120),
         ),
         BrokerRequest::AgentAction { update } => (
@@ -1001,10 +997,8 @@ mod tests {
         assert_eq!(records[0].group, "Development");
         assert_eq!(records[0].profile_lines, Some(142));
 
-        let stale: SafeManifest = serde_json::from_str(
-            r#"{"version":1,"bundle_id":"bundle-old","agents":[]}"#,
-        )
-        .unwrap();
+        let stale: SafeManifest =
+            serde_json::from_str(r#"{"version":1,"bundle_id":"bundle-old","agents":[]}"#).unwrap();
         assert!(safe_agent_records(&bundle, stale).is_err());
     }
 

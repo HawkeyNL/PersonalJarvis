@@ -8,6 +8,7 @@ import PageHeader from "../components/PageHeader.vue";
 const data = ref<UsageReport | null>(null);
 const busy = ref(false);
 const error = ref("");
+const initializing = computed(() => !data.value && error.value.includes("usage statistics are unavailable"));
 const maxBackend = computed(() => Math.max(1, ...(data.value?.by_backend.map((row) => row.total_tokens) ?? [1])));
 const budgetPercent = computed(() => {
   if (!data.value || data.value.budget_eur <= 0) return 0;
@@ -30,7 +31,10 @@ onMounted(load);
   <PageHeader title="Usage & Costs" description="Bounded monthly token and cost telemetry. Prompts, replies, credentials and request identifiers never enter this view." :busy="busy">
     <button class="secondary" @click="load">Refresh</button>
   </PageHeader>
-  <ErrorPanel v-if="error" :message="error" />
+  <ErrorPanel v-if="error && !initializing" :message="error" />
+  <section v-if="initializing" class="detail-card empty-state">
+    Usage statistics are initializing. Core retries the safe aggregate automatically; refresh this view in a moment.
+  </section>
   <template v-if="data">
     <section class="usage-metrics">
       <article class="metric-card"><span class="card-label">TOTAL TOKENS</span><strong>{{ integer(data.total_tokens) }}</strong><small>{{ integer(data.requests) }} model calls</small></article>

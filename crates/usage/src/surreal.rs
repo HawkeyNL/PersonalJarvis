@@ -5,6 +5,19 @@ use jarvis_store::Database;
 
 use super::{DailyUsage, UsageDimension, UsageEntry, UsageStatistics, UsageTotals};
 
+const CURRENT_MONTH_START: &str = "time::group(time::now(), 'month')";
+
+fn month_total_query() -> String {
+    format!("SELECT math::sum(cost_eur) AS total FROM llm_usage WHERE ts >= {CURRENT_MONTH_START}")
+}
+
+fn month_breakdown_query() -> String {
+    format!(
+        "SELECT backend, math::sum(cost_eur) AS total FROM llm_usage \
+         WHERE ts >= {CURRENT_MONTH_START} GROUP BY backend ORDER BY total DESC"
+    )
+}
+
 pub async fn record(db: &Database, entry: &UsageEntry) -> Result<(), jarvis_store::StoreError> {
     db.query(
         "CREATE llm_usage SET id = $id, ts = time::now(), request_id = $request_id, backend = $backend, model = $model, \
@@ -31,7 +44,7 @@ pub async fn record(db: &Database, entry: &UsageEntry) -> Result<(), jarvis_stor
 
 pub async fn month_total_eur(db: &Database) -> Result<f64, jarvis_store::StoreError> {
     let mut response = db
-        .query("SELECT math::sum(cost_eur) AS total FROM llm_usage WHERE ts >= time::floor(time::now(), 1mo)")
+        .query(month_total_query())
         .await
         .map_err(jarvis_store::StoreError::schema)?;
     #[derive(serde::Deserialize)]
@@ -51,10 +64,7 @@ pub async fn month_breakdown(
         total: Option<f64>,
     }
     let mut response = db
-        .query(
-            "SELECT backend, math::sum(cost_eur) AS total FROM llm_usage \
-         WHERE ts >= time::floor(time::now(), 1mo) GROUP BY backend ORDER BY total DESC",
-        )
+        .query(month_breakdown_query())
         .await
         .map_err(jarvis_store::StoreError::schema)?;
     let rows: Vec<Row> = response.take(0).map_err(jarvis_store::StoreError::schema)?;
@@ -109,7 +119,7 @@ fn totals(row: &AggregateRow) -> UsageTotals {
 /// never leave the database through this statistics boundary.
 fn month_statistics_query() -> String {
     const FIELDS: &str = "count() AS requests, math::sum(input_tokens) AS input_tokens, math::sum(output_tokens) AS output_tokens, math::sum(cache_read_tokens) AS cache_read_tokens, math::sum(cache_write_tokens) AS cache_write_tokens, math::sum(cost_eur) AS cost_eur";
-    let since = "ts >= time::floor(time::now(), 1mo)";
+    let since = format!("ts >= {CURRENT_MONTH_START}");
     format!(
         "SELECT {FIELDS} FROM llm_usage WHERE {since}; \
          SELECT backend, {FIELDS} FROM llm_usage WHERE {since} GROUP BY backend ORDER BY cost_eur DESC; \
@@ -225,5 +235,19 @@ mod tests {
         }
         assert!(query.contains("GROUP BY backend, model"));
         assert!(query.contains("GROUP BY day"));
+        assert!(query.contains("time::group(time::now(), 'month')"));
+        assert!(!query.contains("1mo"));
+    }
+
+    #[test]
+    fn every_month_query_uses_calendar_month_grouping() {
+        for query in [
+            month_total_query(),
+            month_breakdown_query(),
+            month_statistics_query(),
+        ] {
+            assert!(query.contains(CURRENT_MONTH_START));
+            assert!(!query.contains("1mo"));
+        }
     }
 }

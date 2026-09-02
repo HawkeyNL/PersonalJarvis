@@ -16,9 +16,9 @@ persistent administration console:
 sudo jarvis
 ```
 
-It provides Overview, Update, Health, Services, Agents, Models, Credentials,
-Logs and System views in one Ratatui session. Opening a section does not start a
-nested alternate-screen application. Direct commands remain first-class for
+It provides Overview, Update, Health, Services, Agents, Models, Costs,
+Credentials, Logs and System views in one Ratatui session. Opening a section
+does not start a nested alternate-screen application. Direct commands remain first-class for
 troubleshooting, automation and direct navigation:
 
 ```bash
@@ -162,10 +162,12 @@ sudo jarvis credentials list
 sudo jarvis credentials set openai
 ```
 
-JSON model listings include exact reviewed input, cached-input and output
-prices per million tokens when known. Unknown remote model IDs are labelled
-`unknown`; local models are labelled `local`. Owner pricing entries take
-precedence over reviewed coverage shipped in the active verified release.
+Plain, interactive and JSON model listings all include exact reviewed input,
+cached-input and output prices per million tokens when known. Unknown remote
+model IDs are labelled `unknown`; local models are labelled `local`. All three
+presentations use the same typed pricing projection consumed by Core Admin.
+Owner pricing entries take precedence over reviewed coverage shipped in the
+active verified release.
 
 Monthly aggregate telemetry is available through:
 
@@ -175,7 +177,10 @@ sudo jarvis --json usage
 ```
 
 It includes request and token totals, daily/provider/model breakdowns and
-estimated spend. The snapshot is bounded, root-controlled and contains no
+estimated spend. The same data is available as the persistent Costs view in
+`sudo jarvis`. Core refreshes the snapshot at startup, after metered requests
+and periodically so a temporary database failure can recover without an extra
+model call. The snapshot is bounded, root-controlled and contains no
 prompts, replies, credentials or request identifiers. Provider invoices remain
 authoritative. Calls made before token collection was introduced cannot be
 reconstructed, and a provider that reports no token metrics contributes no

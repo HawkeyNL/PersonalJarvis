@@ -81,9 +81,12 @@ pub async fn refresh_usage_snapshot(state: &AppState) {
     let Some(path) = state.usage_snapshot_path.as_deref() else {
         return;
     };
-    let Ok(mut value) = usage_value(state).await else {
-        tracing::warn!("failed to query non-secret usage aggregates");
-        return;
+    let mut value = match usage_value(state).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "failed to query non-secret usage aggregates");
+            return;
+        }
     };
     value["generated_at_unix"] = serde_json::json!(SystemTime::now()
         .duration_since(UNIX_EPOCH)

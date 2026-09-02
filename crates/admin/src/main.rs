@@ -114,6 +114,7 @@ enum TuiPreviewScenario {
     HealthyStatus,
     DegradedStatus,
     Models,
+    Costs,
     Credentials,
     Agents,
     UpdateCenter,
@@ -506,22 +507,12 @@ fn tui_preview(scenario: &TuiPreviewScenario, trace_enabled: bool) -> Result<()>
             report.services.insert("OpenSandbox", "inactive".to_owned());
             status_tui(&report, trace_enabled)
         }
-        TuiPreviewScenario::Models => table_tui(
-            "Jarvis Models · fixture",
-            ["Provider", "Model", "Enabled", "Source"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            vec![
-                vec!["openai-api", "gpt-fixture", "yes", "catalog fixture"],
-                vec!["anthropic-api", "claude-fixture", "no", "policy fixture"],
-                vec!["ollama", "local-fixture:latest", "yes", "local fixture"],
-            ]
-            .into_iter()
-            .map(|row| row.into_iter().map(str::to_owned).collect())
-            .collect(),
-            trace_enabled,
-        ),
+        TuiPreviewScenario::Models => {
+            tui_app::run_fixture(tui_app::AppView::Models, trace_enabled, false)
+        }
+        TuiPreviewScenario::Costs => {
+            tui_app::run_fixture(tui_app::AppView::Usage, trace_enabled, false)
+        }
         TuiPreviewScenario::Credentials => table_tui(
             "Jarvis Credentials · fixture (status only)",
             vec!["Provider".to_owned(), "Status".to_owned()],
@@ -1146,10 +1137,11 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
                 .models
                 .retain(|model| model.provider == provider.as_str());
         }
+        let priced = usage_insights::priced_model_policy(policy)?;
         if presentation.json {
-            println!("{}", usage_insights::priced_model_policy_json(policy)?);
+            println!("{}", serde_json::to_string(&priced)?);
         } else if presentation.interactive && io::stdin().is_terminal() {
-            let rows = policy
+            let rows = priced
                 .models
                 .into_iter()
                 .map(|model| {
@@ -1157,27 +1149,71 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
                         model.provider,
                         model.model,
                         if model.enabled { "yes" } else { "no" }.to_owned(),
+                        usage_insights::display_model_price(
+                            model.input_per_million_usd,
+                            model.price_status,
+                        ),
+                        usage_insights::display_model_price(
+                            model.cache_read_per_million_usd,
+                            model.price_status,
+                        ),
+                        usage_insights::display_model_price(
+                            model.output_per_million_usd,
+                            model.price_status,
+                        ),
+                        model.price_status.to_owned(),
                         model.source,
                     ]
                 })
                 .collect();
             return table_tui(
                 "Jarvis Models",
-                ["Provider", "Model", "Enabled", "Source"]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
+                [
+                    "Provider",
+                    "Model",
+                    "Enabled",
+                    "Input $/1M",
+                    "Cached $/1M",
+                    "Output $/1M",
+                    "Pricing",
+                    "Source",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
                 rows,
                 presentation.tui_trace,
             );
         } else {
-            println!("{:<16} {:<36} {:<8} SOURCE", "PROVIDER", "MODEL", "ENABLED");
-            for model in policy.models {
+            println!(
+                "{:<16} {:<36} {:<8} {:<12} {:<12} {:<12} {:<9} SOURCE",
+                "PROVIDER",
+                "MODEL",
+                "ENABLED",
+                "INPUT $/1M",
+                "CACHED $/1M",
+                "OUTPUT $/1M",
+                "PRICING"
+            );
+            for model in priced.models {
                 println!(
-                    "{:<16} {:<36} {:<8} {}",
+                    "{:<16} {:<36} {:<8} {:<12} {:<12} {:<12} {:<9} {}",
                     model.provider,
                     model.model,
                     if model.enabled { "yes" } else { "no" },
+                    usage_insights::display_model_price(
+                        model.input_per_million_usd,
+                        model.price_status,
+                    ),
+                    usage_insights::display_model_price(
+                        model.cache_read_per_million_usd,
+                        model.price_status,
+                    ),
+                    usage_insights::display_model_price(
+                        model.output_per_million_usd,
+                        model.price_status,
+                    ),
+                    model.price_status,
                     model.source
                 );
             }

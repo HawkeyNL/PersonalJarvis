@@ -346,6 +346,17 @@ async fn main() -> anyhow::Result<()> {
     };
 
     jarvis_api::refresh_usage_snapshot(&state).await;
+    let usage_snapshot_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        );
+        loop {
+            interval.tick().await;
+            jarvis_api::refresh_usage_snapshot(&usage_snapshot_state).await;
+        }
+    });
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "jarvis-api listening");
     // `into_make_service_with_connect_info` exposes the peer address so the

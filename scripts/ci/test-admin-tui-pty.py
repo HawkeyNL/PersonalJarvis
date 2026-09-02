@@ -31,6 +31,7 @@ PREVIEW_SCENARIOS = (
     "healthy-status",
     "degraded-status",
     "models",
+    "costs",
     "credentials",
     "agents",
     "update-center",
@@ -394,7 +395,7 @@ def fixture_logs_flow(binary: Path) -> None:
     try:
         wait_for_marker(master, process, output, b"Jarvis Home Node", "home console")
         output.clear()
-        os.write(master, b"jjjjjjj\r")
+        os.write(master, b"jjjjjjjj\r")
         wait_for_marker(master, process, output, b"12:08:11", "compact JSON timestamp")
         wait_for_marker(master, process, output, b"starting jarvis-api", "compact JSON message")
         wait_for_marker(master, process, output, b"13:07:31", "systemd timestamp")
@@ -468,6 +469,56 @@ def fixture_logs_flow(binary: Path) -> None:
         restored_flags = termios.ICANON | termios.ECHO
         if before[3] & restored_flags != after[3] & restored_flags:
             raise AssertionError("Logs view did not restore canonical input and echo")
+    finally:
+        terminate_process_group(process)
+        os.close(master)
+
+
+def fixture_costs_flow(binary: Path) -> None:
+    master, slave = pty.openpty()
+    set_size(master, 22, 100)
+    before = termios.tcgetattr(master)
+    process = subprocess.Popen(
+        [str(binary), "tui-preview", "home"],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+        start_new_session=True,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "TERM": "xterm-256color"},
+    )
+    os.close(slave)
+    output = bytearray()
+    try:
+        wait_for_marker(master, process, output, b"Jarvis Home Node", "home console")
+        output.clear()
+        os.write(master, b"jjjjjj\r")
+        wait_for_marker(master, process, output, b"Month spend", "Costs monthly summary")
+        wait_for_marker(master, process, output, b"gpt-oss:20b", "per-model usage")
+        if process.poll() is not None:
+            raise AssertionError("Costs view exited after rendering its snapshot")
+
+        set_size(master, 18, 54)
+        output.clear()
+        time.sleep(0.3)
+        output.extend(read_available(master, 0.3))
+        if not output or process.poll() is not None:
+            raise AssertionError("Costs view failed during narrow resize")
+
+        output.clear()
+        os.write(master, b"\x1b")
+        wait_for_marker(master, process, output, b"fixture-bundle-2026-08-30", "Costs back")
+        os.write(master, b"q")
+        process.wait(timeout=5)
+        output.extend(read_available(master, 0.5))
+        if process.returncode != 0:
+            raise AssertionError(f"Costs view failed to close: {bytes(output)!r}")
+        if ALT_SCREEN_LEAVE not in output or CURSOR_SHOW not in output:
+            raise AssertionError("Costs view did not fully restore terminal state")
+        after = termios.tcgetattr(master)
+        restored_flags = termios.ICANON | termios.ECHO
+        if before[3] & restored_flags != after[3] & restored_flags:
+            raise AssertionError("Costs view did not restore canonical input and echo")
     finally:
         terminate_process_group(process)
         os.close(master)
@@ -601,6 +652,7 @@ def main() -> int:
         )
     if args.fixture_preview:
         fixture_home_console_flow(binary)
+        fixture_costs_flow(binary)
         fixture_logs_flow(binary)
         fixture_agents_flow(binary)
         fixture_update_center_flow(binary, fail_update=False)

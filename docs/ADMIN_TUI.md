@@ -13,7 +13,7 @@ capabilities or executes shell input.
 
 - Interactive TTY: `sudo jarvis` opens the persistent Jarvis Home Node console.
   Its shared shell routes between Overview, Update, Health, Services, Agents,
-  Models, Credentials, Logs and System without entering another alternate
+  Models, Costs, Credentials, Logs and System without entering another alternate
   screen. Local state renders first; bounded background operations refresh the
   active view without blocking resize or navigation.
 - Interactive `sudo jarvis status`, `sudo jarvis health` and `sudo jarvis
@@ -45,8 +45,10 @@ memory. Explicit fast `update --check` and `update --status` commands retain
 plain output where a full-screen interface adds no value.
 
 The Services and Logs views use fixed Jarvis-owned unit/target allowlists. The
-Models view passes only typed provider/model values from the validated policy
-to trusted helpers. Credentials displays configuration status only: credential
+Models view shows the same reviewed input/cache/output pricing projection as
+Core Admin and passes only typed provider/model values from the validated
+policy to trusted helpers. The Costs view reads only the bounded non-secret
+monthly aggregate written by Core. Credentials displays configuration status only: credential
 values never enter TUI state, child output, command arguments or trace data.
 Secret setting and removal remain explicit direct commands using the trusted
 controlling-TTY path.
@@ -86,6 +88,7 @@ cargo run -p jarvis-admin --features tui-preview -- tui-preview home-degraded
 cargo run -p jarvis-admin --features tui-preview -- tui-preview healthy-status
 cargo run -p jarvis-admin --features tui-preview -- tui-preview degraded-status
 cargo run -p jarvis-admin --features tui-preview -- tui-preview models
+cargo run -p jarvis-admin --features tui-preview -- tui-preview costs
 cargo run -p jarvis-admin --features tui-preview -- tui-preview credentials
 cargo run -p jarvis-admin --features tui-preview -- tui-preview agents
 cargo run -p jarvis-admin --features tui-preview -- tui-preview update-center

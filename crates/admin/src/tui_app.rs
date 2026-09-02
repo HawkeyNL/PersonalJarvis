@@ -5,13 +5,14 @@
 
 use super::*;
 
-const VIEWS: [AppView; 9] = [
+const VIEWS: [AppView; 10] = [
     AppView::Overview,
     AppView::Update,
     AppView::Health,
     AppView::Services,
     AppView::Agents,
     AppView::Models,
+    AppView::Usage,
     AppView::Credentials,
     AppView::Logs,
     AppView::System,
@@ -43,6 +44,7 @@ pub(super) enum AppView {
     Services,
     Agents,
     Models,
+    Usage,
     Credentials,
     Logs,
     System,
@@ -57,6 +59,7 @@ impl AppView {
             Self::Services => "Services",
             Self::Agents => "Agents",
             Self::Models => "Models",
+            Self::Usage => "Costs",
             Self::Credentials => "Credentials",
             Self::Logs => "Logs",
             Self::System => "System",
@@ -90,7 +93,8 @@ struct LogEntry {
 enum Snapshot {
     Status(std::result::Result<StatusReport, String>),
     Agents(std::result::Result<Option<AgentTreeSnapshot>, String>),
-    Models(std::result::Result<Vec<ModelRecord>, String>),
+    Models(std::result::Result<Vec<usage_insights::PricedModelRecord>, String>),
+    Usage(std::result::Result<usage_insights::UsageReport, String>),
     Credentials(Vec<CredentialView>),
     Services(Vec<ServiceView>),
     System(Vec<(String, String)>),
@@ -287,8 +291,9 @@ struct JarvisApp {
     navigation: usize,
     selected: usize,
     status: Option<StatusReport>,
-    models: Vec<ModelRecord>,
+    models: Vec<usage_insights::PricedModelRecord>,
     model_filter: Option<String>,
+    usage: Option<usage_insights::UsageReport>,
     credentials: Vec<CredentialView>,
     services: Vec<ServiceView>,
     agent_tree: Option<AgentTreeSnapshot>,
@@ -333,6 +338,7 @@ impl JarvisApp {
             status: None,
             models: Vec::new(),
             model_filter: None,
+            usage: None,
             credentials: Vec::new(),
             services: Vec::new(),
             agent_tree: None,
@@ -398,20 +404,33 @@ impl JarvisApp {
             selected: 0,
             status: Some(status),
             models: vec![
-                ModelRecord {
+                usage_insights::PricedModelRecord {
                     provider: "openai-api".to_owned(),
                     model: "gpt-fixture".to_owned(),
                     enabled: true,
                     source: "catalog fixture".to_owned(),
+                    price_status: "known",
+                    input_per_million_usd: Some(2.5),
+                    cache_read_per_million_usd: Some(1.25),
+                    output_per_million_usd: Some(10.0),
+                    pricing_source: "fixture".to_owned(),
+                    pricing_updated_at: "2026-09-01".to_owned(),
                 },
-                ModelRecord {
+                usage_insights::PricedModelRecord {
                     provider: "anthropic-api".to_owned(),
                     model: "claude-fixture-with-a-long-safe-name".to_owned(),
                     enabled: false,
                     source: "policy fixture".to_owned(),
+                    price_status: "unknown",
+                    input_per_million_usd: None,
+                    cache_read_per_million_usd: None,
+                    output_per_million_usd: None,
+                    pricing_source: "fixture".to_owned(),
+                    pricing_updated_at: "2026-09-01".to_owned(),
                 },
             ],
             model_filter: None,
+            usage: Some(fixture_usage_report()),
             credentials: fixture_credentials(),
             services: fixture_services(failure),
             agent_tree: Some(agent_tree),
@@ -497,6 +516,11 @@ impl JarvisApp {
                     self.refresh_models();
                 }
             }
+            AppView::Usage => {
+                if self.usage.is_none() && !self.fixture {
+                    self.refresh_usage();
+                }
+            }
             AppView::Credentials => {
                 if self.credentials.is_empty() && !self.fixture {
                     self.refresh_credentials();
@@ -536,9 +560,22 @@ impl JarvisApp {
         let sender = self.sender.clone();
         thread::spawn(move || {
             let result = read_model_policy()
+                .and_then(usage_insights::priced_model_policy)
                 .map(|policy| policy.models)
                 .map_err(|error| format!("{error:#}"));
             let _ = sender.send(Snapshot::Models(result));
+        });
+    }
+
+    fn refresh_usage(&mut self) {
+        if self.fixture || self.loading.contains(&AppView::Usage) {
+            return;
+        }
+        self.loading.push(AppView::Usage);
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let result = usage_insights::read_usage_report().map_err(|error| format!("{error:#}"));
+            let _ = sender.send(Snapshot::Usage(result));
         });
     }
 
@@ -635,6 +672,13 @@ impl JarvisApp {
                     self.loading.retain(|view| *view != AppView::Models);
                     match result {
                         Ok(models) => self.models = models,
+                        Err(error) => self.error = Some(safe_error(&error)),
+                    }
+                }
+                Snapshot::Usage(result) => {
+                    self.loading.retain(|view| *view != AppView::Usage);
+                    match result {
+                        Ok(usage) => self.usage = Some(usage),
                         Err(error) => self.error = Some(safe_error(&error)),
                     }
                 }
@@ -888,6 +932,10 @@ impl JarvisApp {
             AppView::Services => self.handle_table_navigation(key.code, self.services.len()),
             AppView::Agents => self.handle_agents(key.code)?,
             AppView::Models => self.handle_models(key.code)?,
+            AppView::Usage => self.handle_table_navigation(
+                key.code,
+                self.usage.as_ref().map_or(0, |usage| usage.by_model.len()),
+            ),
             AppView::Credentials => self.handle_table_navigation(key.code, self.credentials.len()),
             AppView::Logs => self.handle_logs(key.code)?,
             AppView::System => self.handle_table_navigation(key.code, self.system.len()),
@@ -1112,7 +1160,24 @@ impl JarvisApp {
                     self.modal = Some(Modal::Result {
                         success: true,
                         title: format!("{}/{}", model.provider, model.model),
-                        detail: format!("Enabled: {} · Source: {}", model.enabled, model.source),
+                        detail: format!(
+                            "Enabled: {} · Input: {} / 1M · Cached: {} / 1M · Output: {} / 1M · Pricing: {} · Source: {}",
+                            model.enabled,
+                            usage_insights::display_model_price(
+                                model.input_per_million_usd,
+                                model.price_status,
+                            ),
+                            usage_insights::display_model_price(
+                                model.cache_read_per_million_usd,
+                                model.price_status,
+                            ),
+                            usage_insights::display_model_price(
+                                model.output_per_million_usd,
+                                model.price_status,
+                            ),
+                            model.price_status,
+                            model.source,
+                        ),
                     });
                 }
             }
@@ -1221,6 +1286,7 @@ impl JarvisApp {
                 }
             }
             AppView::Models => self.start_operation(AppOperation::ModelRefresh)?,
+            AppView::Usage => self.refresh_usage(),
             AppView::Credentials => self.refresh_credentials(),
             AppView::Logs => {
                 self.stop_read_only_child();
@@ -1280,7 +1346,7 @@ impl JarvisApp {
             .collect()
     }
 
-    fn selected_model(&self) -> Option<&ModelRecord> {
+    fn selected_model(&self) -> Option<&usage_insights::PricedModelRecord> {
         let index = *self.visible_model_indices().get(self.selected)?;
         self.models.get(index)
     }
@@ -1582,6 +1648,7 @@ fn render_view(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mu
         AppView::Services => render_services(frame, area, app),
         AppView::Agents => render_agents(frame, area, app),
         AppView::Models => render_models(frame, area, app),
+        AppView::Usage => render_usage(frame, area, app),
         AppView::Credentials => render_credentials(frame, area, app),
         AppView::Logs => render_logs(frame, area, app),
         AppView::System => render_system(frame, area, app),
@@ -1931,7 +1998,19 @@ fn render_models(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
                     model.provider.clone(),
                     model.model.clone(),
                     if model.enabled { "yes" } else { "no" }.to_owned(),
-                    model.source.clone(),
+                    usage_insights::display_model_price(
+                        model.input_per_million_usd,
+                        model.price_status,
+                    ),
+                    usage_insights::display_model_price(
+                        model.cache_read_per_million_usd,
+                        model.price_status,
+                    ),
+                    usage_insights::display_model_price(
+                        model.output_per_million_usd,
+                        model.price_status,
+                    ),
+                    model.price_status.to_owned(),
                 ])
                 .style(row_style(visible_index == app.selected, model.enabled))
             })
@@ -1944,18 +2023,126 @@ fn render_models(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         Table::new(
             rows,
             [
-                Constraint::Percentage(23),
-                Constraint::Percentage(37),
+                Constraint::Percentage(18),
+                Constraint::Min(22),
                 Constraint::Length(9),
-                Constraint::Percentage(40),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(9),
             ],
         )
         .header(
-            Row::new(["Provider", "Model", "Enabled", "Source"])
-                .style(Style::default().fg(Color::Cyan)),
+            Row::new([
+                "Provider",
+                "Model",
+                "Enabled",
+                "Input $/1M",
+                "Cached $/1M",
+                "Output $/1M",
+                "Pricing",
+            ])
+            .style(Style::default().fg(Color::Cyan)),
         )
         .block(Block::default().title(title)),
         area,
+    );
+}
+
+fn render_usage(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &JarvisApp) {
+    let block = Block::default()
+        .title(" Usage & Costs · current calendar month · r refresh ")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let Some(usage) = &app.usage else {
+        frame.render_widget(
+            Paragraph::new(if app.loading.contains(&AppView::Usage) {
+                "Loading bounded usage statistics…"
+            } else {
+                "Usage statistics are not available yet."
+            }),
+            inner,
+        );
+        return;
+    };
+
+    let sections = Layout::vertical([
+        Constraint::Length(7),
+        Constraint::Min(4),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+    let summary = vec![
+        Line::from(format!(
+            "Month spend  €{:.2} / €{:.2}    Remaining  €{:.2}",
+            usage.spent_eur, usage.budget_eur, usage.remaining_eur
+        )),
+        Line::from(format!(
+            "Requests     {}    Total tokens  {}",
+            usage.requests, usage.total_tokens
+        )),
+        Line::from(format!(
+            "Input        {}    Output        {}",
+            usage.input_tokens, usage.output_tokens
+        )),
+        Line::from(format!(
+            "Cache read   {}    Cache write   {}",
+            usage.cache_read_tokens, usage.cache_write_tokens
+        )),
+        Line::styled(
+            if usage.over_budget {
+                "Budget state  over hard budget"
+            } else if usage.above_soft_budget {
+                "Budget state  above soft budget"
+            } else {
+                "Budget state  within budget"
+            },
+            Style::default().fg(if usage.over_budget {
+                Color::Red
+            } else if usage.above_soft_budget {
+                Color::Yellow
+            } else {
+                Color::Green
+            }),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(summary), sections[0]);
+
+    let rows = usage.by_model.iter().enumerate().map(|(index, row)| {
+        Row::new(vec![
+            row.backend.clone(),
+            row.model.clone().unwrap_or_else(|| "—".to_owned()),
+            row.requests.to_string(),
+            row.total_tokens.to_string(),
+            format!("€{:.4}", row.spent_eur),
+        ])
+        .style(row_style(index == app.selected, true))
+    });
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Percentage(20),
+                Constraint::Min(24),
+                Constraint::Length(9),
+                Constraint::Length(14),
+                Constraint::Length(12),
+            ],
+        )
+        .header(
+            Row::new(["Provider", "Model", "Calls", "Tokens", "Spend"])
+                .style(Style::default().fg(Color::Cyan)),
+        ),
+        sections[1],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Pricing: {} · updated {} · provider invoices remain authoritative",
+            usage.pricing.source, usage.pricing.updated_at
+        ))
+        .style(Style::default().fg(Color::DarkGray)),
+        sections[2],
     );
 }
 
@@ -2586,6 +2773,63 @@ fn system_information() -> Vec<(String, String)> {
 }
 
 #[cfg(any(feature = "tui-preview", test))]
+fn fixture_usage_report() -> usage_insights::UsageReport {
+    usage_insights::UsageReport {
+        period: "current_calendar_month".to_owned(),
+        generated_at_unix: 1_788_300_000,
+        budget_eur: 50.0,
+        spent_eur: 3.42,
+        remaining_eur: 46.58,
+        over_budget: false,
+        reserved_eur: 0.25,
+        remaining_hard_eur: 46.33,
+        above_soft_budget: false,
+        requests: 18,
+        input_tokens: 42_000,
+        output_tokens: 9_500,
+        cache_read_tokens: 12_000,
+        cache_write_tokens: 500,
+        total_tokens: 64_000,
+        by_backend: vec![usage_insights::UsageRow {
+            backend: "ollama-cloud".to_owned(),
+            model: None,
+            spent_eur: 3.42,
+            requests: 18,
+            input_tokens: 42_000,
+            output_tokens: 9_500,
+            cache_read_tokens: 12_000,
+            cache_write_tokens: 500,
+            total_tokens: 64_000,
+        }],
+        by_model: vec![usage_insights::UsageRow {
+            backend: "ollama-cloud".to_owned(),
+            model: Some("gpt-oss:20b".to_owned()),
+            spent_eur: 3.42,
+            requests: 18,
+            input_tokens: 42_000,
+            output_tokens: 9_500,
+            cache_read_tokens: 12_000,
+            cache_write_tokens: 500,
+            total_tokens: 64_000,
+        }],
+        daily: vec![usage_insights::DailyUsageRow {
+            day: "2026-09-02".to_owned(),
+            spent_eur: 3.42,
+            requests: 18,
+            input_tokens: 42_000,
+            output_tokens: 9_500,
+            cache_read_tokens: 12_000,
+            cache_write_tokens: 500,
+            total_tokens: 64_000,
+        }],
+        pricing: usage_insights::PricingSummary {
+            source: "fixture pricing".to_owned(),
+            updated_at: "2026-09-01".to_owned(),
+        },
+    }
+}
+
+#[cfg(any(feature = "tui-preview", test))]
 fn fixture_credentials() -> Vec<CredentialView> {
     [
         ("anthropic", "configured"),
@@ -2818,7 +3062,7 @@ mod tests {
     #[test]
     fn fixture_contains_every_view_without_secrets() {
         let app = JarvisApp::fixture(AppView::Overview, false);
-        assert_eq!(VIEWS.len(), 9);
+        assert_eq!(VIEWS.len(), 10);
         assert!(app.credentials.iter().all(|credential| {
             !credential.status.contains("key") && !credential.status.contains("token")
         }));
@@ -2833,6 +3077,38 @@ mod tests {
                 .map(String::as_str),
             Some("failed")
         );
+    }
+
+    #[test]
+    fn models_and_costs_views_share_priced_fixture_data() {
+        let mut models = JarvisApp::fixture(AppView::Models, false);
+        let mut terminal = Terminal::new(TestBackend::new(150, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut models)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Input $/1M"));
+        assert!(rendered.contains("$2.5000"));
+        assert!(rendered.contains("$10.0000"));
+
+        let mut costs = JarvisApp::fixture(AppView::Usage, false);
+        terminal.draw(|frame| render(frame, &mut costs)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Usage & Costs"));
+        assert!(rendered.contains("64,000") || rendered.contains("64000"));
+        assert!(rendered.contains("gpt-oss:20b"));
+        assert!(!rendered.contains("prompt"));
+        assert!(!rendered.contains("api_key"));
     }
 
     #[test]

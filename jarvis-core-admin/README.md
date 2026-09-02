@@ -130,6 +130,11 @@ structured where possible, searchable/filterable, selectable, wrapped and
 optionally followed through bounded polling of the allowlisted direct CLI
 operation.
 
+Core writes the bounded Usage & Costs aggregate at startup, after metered
+model calls and on a periodic recovery interval. A not-yet-created snapshot is
+shown as an initializing empty state instead of a generic failed-operation
+panel.
+
 The Agents page obtains its tree through the canonical protected admin CLI's
 bounded safe projection. It never reads the private checkout, agent JSON files,
 or Markdown prompt bodies. **Check** compares the configured, allowlisted

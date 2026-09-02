@@ -191,3 +191,63 @@ async fn signed_agent_approval_is_single_use_and_core_stays_denied(
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn current_month_usage_aggregates_work_before_and_after_first_call(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_usage_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+
+    let empty = jarvis_usage::month_statistics(&db).await?;
+    assert_eq!(empty.totals.requests, 0);
+    assert!(empty.by_backend.is_empty());
+    assert!(empty.by_model.is_empty());
+    assert!(empty.daily.is_empty());
+
+    jarvis_usage::record(
+        &db,
+        &jarvis_usage::UsageEntry {
+            request_id: uuid::Uuid::now_v7().to_string(),
+            backend: "ollama-cloud".to_owned(),
+            model: "fixture-model".to_owned(),
+            routing_mode: "test".to_owned(),
+            quality_tier: "test".to_owned(),
+            agent_id: None,
+            latency_ms: 25,
+            status: "succeeded".to_owned(),
+            failure_category: None,
+            fallback_count: 0,
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 10,
+            cache_write_tokens: 5,
+            cost_eur: 0.01,
+        },
+    )
+    .await?;
+
+    let populated = jarvis_usage::month_statistics(&db).await?;
+    assert_eq!(populated.totals.requests, 1);
+    assert_eq!(populated.totals.total_tokens, 135);
+    assert_eq!(populated.by_backend.len(), 1);
+    assert_eq!(populated.by_backend[0].backend, "ollama-cloud");
+    assert_eq!(populated.by_model.len(), 1);
+    assert_eq!(
+        populated.by_model[0].model.as_deref(),
+        Some("fixture-model")
+    );
+    assert_eq!(populated.daily.len(), 1);
+    Ok(())
+}
