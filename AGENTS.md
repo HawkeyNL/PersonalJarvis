@@ -11,9 +11,15 @@ configuration. Keep changes narrow and avoid speculative infrastructure.
 ## Security boundaries
 
 - `jarvis-policy` remains the authoritative capability and risk decision layer.
-- Mutating or high-risk actions require real device-signed, action-bound,
-  unexpired approval; a Boolean approval flag or ordinary session is never
-  sufficient.
+- Jarvis runtime, system-administration and other security-sensitive product
+  actions require real device-signed, action-bound, unexpired approval; a
+  Boolean approval flag or ordinary session is never sufficient.
+- Normal source-control and release-engineering operations in this repository
+  (including editing, committing, pushing, tagging and dispatching CI/release
+  workflows) are outside the Jarvis device-signing protocol. They still require
+  explicit owner authorization proportional to their external impact, must
+  preserve protected-branch/environment review, and never implicitly authorize
+  a Home Node or production runtime mutation.
 - Never expose secrets, private keys, tokens, credentials, full inherited
   environments or protected Core paths to an agent or sandbox.
 - Preserve the sandbox, Core and `.git` protections, resource bounds, kill
