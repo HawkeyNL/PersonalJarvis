@@ -8,7 +8,10 @@ use super::{DailyUsage, UsageDimension, UsageEntry, UsageStatistics, UsageTotals
 const CURRENT_MONTH_START: &str = "time::group(time::now(), 'month')";
 
 fn month_total_query() -> String {
-    format!("SELECT math::sum(cost_eur) AS total FROM llm_usage WHERE ts >= {CURRENT_MONTH_START}")
+    format!(
+        "SELECT math::sum(cost_eur) AS total FROM llm_usage \
+         WHERE ts >= {CURRENT_MONTH_START} GROUP ALL"
+    )
 }
 
 fn month_breakdown_query() -> String {
@@ -121,7 +124,7 @@ fn month_statistics_query() -> String {
     const FIELDS: &str = "count() AS requests, math::sum(input_tokens) AS input_tokens, math::sum(output_tokens) AS output_tokens, math::sum(cache_read_tokens) AS cache_read_tokens, math::sum(cache_write_tokens) AS cache_write_tokens, math::sum(cost_eur) AS cost_eur";
     let since = format!("ts >= {CURRENT_MONTH_START}");
     format!(
-        "SELECT {FIELDS} FROM llm_usage WHERE {since}; \
+        "SELECT {FIELDS} FROM llm_usage WHERE {since} GROUP ALL; \
          SELECT backend, {FIELDS} FROM llm_usage WHERE {since} GROUP BY backend ORDER BY cost_eur DESC; \
          SELECT backend, model, {FIELDS} FROM llm_usage WHERE {since} GROUP BY backend, model ORDER BY cost_eur DESC; \
          SELECT time::format(ts, '%Y-%m-%d') AS day, {FIELDS} FROM llm_usage WHERE {since} GROUP BY day ORDER BY day ASC"
@@ -241,11 +244,11 @@ mod tests {
 
     #[test]
     fn every_month_query_uses_calendar_month_grouping() {
-        for query in [
-            month_total_query(),
-            month_breakdown_query(),
-            month_statistics_query(),
-        ] {
+        let total = month_total_query();
+        let statistics = month_statistics_query();
+        assert!(total.ends_with("GROUP ALL"));
+        assert!(statistics.contains("GROUP ALL;"));
+        for query in [total, month_breakdown_query(), statistics] {
             assert!(query.contains(CURRENT_MONTH_START));
             assert!(!query.contains("1mo"));
         }
