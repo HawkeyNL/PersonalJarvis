@@ -744,7 +744,8 @@ activate_managed_release() {
 }
 
 repair_active_managed_units() {
-    local release=$1 tag=$2 backup unit_manager="$release/manage-systemd-units"
+    local release=$1 tag=$2 backup unit_manager
+    unit_manager="$release/manage-systemd-units"
     if "$unit_manager" check-installed "$release" >/dev/null 2>&1; then
         echo "jarvis updater: $tag is already active and managed systemd units match"
         return 0
