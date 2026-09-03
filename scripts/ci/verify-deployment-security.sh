@@ -10,6 +10,7 @@ bash deploy/systemd/tests/test-production-bootstrap-assets.sh
 bash deploy/systemd/tests/test-output-presentation.sh
 bash deploy/systemd/tests/test-model-credential-boundaries.sh
 bash deploy/systemd/tests/test-model-discovery-pipeline.sh
+bash deploy/systemd/tests/test-huggingface-credential-probe.sh
 sudo env GITHUB_ACTIONS=true bash deploy/surrealdb/tests/test-provision-core-user-shellless.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-stage-core-release.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-prepare-codex-worktree.sh

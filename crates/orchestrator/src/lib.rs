@@ -236,6 +236,8 @@ mod tests {
                 text,
                 model: model.into(),
                 backend: Some("test".into()),
+                requested_route: None,
+                actual_provider: None,
                 stop_reason: None,
                 usage: None,
             })

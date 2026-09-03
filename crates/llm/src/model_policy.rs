@@ -18,6 +18,11 @@ pub struct ModelAccessEntry {
     /// always uses the explicit `enabled` bit.
     #[serde(default = "default_source")]
     pub source: String,
+    /// Hugging Face execution route. This is deliberately separate from the
+    /// base model identity used by the owner allowlist. Legacy policies omit
+    /// the field and remain valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
 }
 
 fn default_source() -> String {
@@ -68,6 +73,12 @@ impl ModelAccessPolicy {
             if !valid_component(&entry.provider) || entry.model.trim().is_empty() {
                 return Err("model access policy contains an invalid provider or model".into());
             }
+            if entry.route.is_some() && !entry.provider.eq_ignore_ascii_case("huggingface") {
+                return Err("model routes are supported only for huggingface".into());
+            }
+            if let Some(route) = &entry.route {
+                validate_hf_route(route)?;
+            }
             let key = (entry.provider.to_ascii_lowercase(), entry.model.clone());
             if seen.insert(key, ()).is_some() {
                 return Err("model access policy contains duplicate provider/model entries".into());
@@ -93,6 +104,30 @@ impl ModelAccessPolicy {
             .find(|entry| entry.provider.eq_ignore_ascii_case(provider) && entry.model == model)
             .map(|entry| entry.enabled)
     }
+
+    pub fn route(&self, provider: &str, model: &str) -> Option<&str> {
+        self.models
+            .iter()
+            .find(|entry| entry.provider.eq_ignore_ascii_case(provider) && entry.model == model)
+            .and_then(|entry| entry.route.as_deref())
+    }
+}
+
+/// Reserved policies plus discovered infrastructure provider ids. Provider
+/// ids are data, never paths, URLs, shell fragments, or model identifiers.
+pub fn validate_hf_route(value: &str) -> Result<(), String> {
+    if matches!(value, "auto" | "fastest" | "cheapest" | "preferred") {
+        return Ok(());
+    }
+    if value.is_empty()
+        || value.len() > 64
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        })
+    {
+        return Err("invalid Hugging Face inference provider route".into());
+    }
+    Ok(())
 }
 
 fn valid_component(value: &str) -> bool {
@@ -116,6 +151,7 @@ mod tests {
                 model: "gpt-4.1".into(),
                 enabled: true,
                 source: "configured".into(),
+                route: None,
             }],
         };
         assert!(policy.allows("openai-api", "gpt-4.1"));
@@ -132,14 +168,35 @@ mod tests {
                 model: "qwen".into(),
                 enabled: true,
                 source: "local".into(),
+                route: None,
             },
             ModelAccessEntry {
                 provider: "ollama".into(),
                 model: "qwen".into(),
                 enabled: false,
                 source: "local".into(),
+                route: None,
             },
         ];
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn route_is_separate_and_strictly_validated() {
+        assert!(validate_hf_route("fastest").is_ok());
+        assert!(validate_hf_route("deepinfra").is_ok());
+        for unsafe_value in ["Groq", "a/b", "https://route", "a b", "a\n"] {
+            assert!(validate_hf_route(unsafe_value).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_policy_without_route_remains_readable() {
+        let policy: ModelAccessPolicy = serde_json::from_str(
+            r#"{"version":1,"models":[{"provider":"openai-api","model":"gpt","enabled":true,"source":"configured"}]}"#,
+        )
+        .unwrap();
+        assert!(policy.validate().is_ok());
+        assert_eq!(policy.models[0].route, None);
     }
 }

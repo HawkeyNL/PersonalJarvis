@@ -148,6 +148,8 @@ impl LlmProvider for AnthropicProvider {
             text,
             model,
             backend: Some("anthropic-api".into()),
+            requested_route: None,
+            actual_provider: None,
             stop_reason,
             usage,
         })

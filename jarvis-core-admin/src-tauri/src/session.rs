@@ -38,6 +38,7 @@ pub(crate) enum BrokerRequest {
     AgentTree,
     AgentAction { update: bool },
     Models,
+    ModelProviders { model: String },
     Usage,
     ModelMutation { request: ModelMutation },
     Credentials,

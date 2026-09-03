@@ -53,6 +53,12 @@ values never enter TUI state, child output, command arguments or trace data.
 Secret setting and removal remain explicit direct commands using the trusted
 controlling-TTY path.
 
+Hugging Face models appear under the `huggingface` Jarvis provider. Their base
+model allowlist remains independent of the selected HF route. Provider details
+and route mutation are available through the explicit `jarvis models
+providers` and `jarvis models set-route` commands and graphical Core Admin;
+credentials never enter either frontend.
+
 The Agents view builds its expandable tree exclusively from bounded safe fields
 in the active bundle manifest (`id`, optional `name`, optional `group` and
 optional provider-neutral `model_policy`). Older flat manifests appear under

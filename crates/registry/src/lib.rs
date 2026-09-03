@@ -138,6 +138,14 @@ pub struct CollectInput {
     pub ollama_cloud_model: String,
     pub ollama_cloud_model_hard: String,
     pub ollama_cloud_model_cheap: String,
+    pub has_huggingface_key: bool,
+    pub huggingface_model: String,
+    pub huggingface_model_hard: String,
+    pub huggingface_model_cheap: String,
+    /// Root-policy models discovered outside static tier configuration.
+    /// These are data-only identifiers; availability still depends on the
+    /// corresponding credential/backend and router policy.
+    pub policy_models: Vec<(String, String)>,
     pub speech_provider: String,
     pub whisper_model: Option<String>,
     /// The built router's label (e.g. `claude-cli:…→anthropic:…`).
@@ -316,6 +324,41 @@ fn derive_models(
         &input.ollama_cloud_model_hard,
         ModelCost::Mid,
     );
+    add_cloud(
+        "huggingface",
+        input.has_huggingface_key,
+        &input.huggingface_model_cheap,
+        &input.huggingface_model,
+        &input.huggingface_model_hard,
+        ModelCost::Mid,
+    );
+
+    for (backend, id) in &input.policy_models {
+        if id.is_empty()
+            || out
+                .iter()
+                .any(|model| model.backend == *backend && model.id == *id)
+        {
+            continue;
+        }
+        let available = match backend.as_str() {
+            "huggingface" => input.has_huggingface_key,
+            "openai-api" => input.has_openai_key,
+            "deepseek-api" => input.has_deepseek_key,
+            "xai-api" => input.has_xai_key,
+            "zai-api" => input.has_zai_key,
+            "ollama-cloud" => input.has_ollama_cloud_key,
+            "anthropic-api" => input.has_api_key,
+            _ => false,
+        };
+        out.push(ModelEntry {
+            id: id.clone(),
+            backend: backend.clone(),
+            class: class_of(id, ModelClass::Mid),
+            cost: ModelCost::Mid,
+            available,
+        });
+    }
 
     // Local Ollama models actually installed — all free; treat as light by default.
     for id in ollama_models {
@@ -379,6 +422,17 @@ fn derive_brains(
             available: input.has_ollama_cloud_key,
             note: if input.has_ollama_cloud_key {
                 "credentialed remote API".into()
+            } else {
+                "geen API-key gezet".into()
+            },
+        },
+        Brain {
+            id: "huggingface".into(),
+            label: format!("Hugging Face · {}", input.huggingface_model),
+            cost: CostTier::Metered,
+            available: input.has_huggingface_key,
+            note: if input.has_huggingface_key {
+                "Inference Providers router".into()
             } else {
                 "geen API-key gezet".into()
             },
@@ -524,6 +578,11 @@ mod tests {
             ollama_cloud_model: String::new(),
             ollama_cloud_model_hard: String::new(),
             ollama_cloud_model_cheap: String::new(),
+            has_huggingface_key: true,
+            huggingface_model: "org/default".into(),
+            huggingface_model_hard: "org/hard".into(),
+            huggingface_model_cheap: "org/cheap".into(),
+            policy_models: vec![],
             speech_provider: "whisper".into(),
             whisper_model: Some("models/ggml-base.bin".into()),
             active_brain: "claude-cli:…→anthropic:…".into(),
@@ -611,7 +670,8 @@ mod tests {
         let mut i = input();
         i.claude_cli_bin = "definitely-not-a-real-binary-xyz".into();
         let reg = collect(&i).await;
-        assert_eq!(reg.brains.len(), 8);
+        assert_eq!(reg.brains.len(), 9);
+        assert!(reg.brains.iter().any(|brain| brain.id == "huggingface"));
         assert!(reg.host.cpu_cores >= 1);
         assert!(!reg.host.os.is_empty());
     }

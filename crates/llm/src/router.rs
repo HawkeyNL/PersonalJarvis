@@ -156,6 +156,7 @@ impl RouterProvider {
                 "xai-api",
                 "anthropic-api",
                 "ollama-cloud",
+                "huggingface",
             ],
             Tier::Default => &[
                 "claude-cli",
@@ -165,6 +166,7 @@ impl RouterProvider {
                 "xai-api",
                 "zai-api",
                 "ollama-cloud",
+                "huggingface",
                 "ollama",
             ],
             Tier::Hard => &[
@@ -174,6 +176,7 @@ impl RouterProvider {
                 "xai-api",
                 "zai-api",
                 "ollama-cloud",
+                "huggingface",
             ],
         }
     }
@@ -341,6 +344,8 @@ mod tests {
                     text: self.label.clone(),
                     model: self.label.clone(),
                     backend: Some(self.label.clone()),
+                    requested_route: None,
+                    actual_provider: None,
                     stop_reason: None,
                     usage: None,
                 })
@@ -403,6 +408,7 @@ mod tests {
                     model: model.id.clone(),
                     enabled: true,
                     source: "test".into(),
+                    route: None,
                 })
                 .collect(),
         }
@@ -450,6 +456,8 @@ mod tests {
                     text: String::new(),
                     model: req.model.clone().unwrap_or_else(|| "DEFAULT".into()),
                     backend: Some("claude-cli".into()),
+                    requested_route: None,
+                    actual_provider: None,
                     stop_reason: None,
                     usage: None,
                 })
@@ -630,6 +638,7 @@ mod tests {
                 model: "claude-test".into(),
                 enabled: false,
                 source: "test".into(),
+                route: None,
             }],
         };
         let router = RouterProvider::with_policy(cands, always_available(), catalog, policy);

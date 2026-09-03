@@ -97,6 +97,11 @@ if [[ -e /etc/jarvis/model-policy.json ]]; then
     check "Model policy readable by Core" jarvis_reads /etc/jarvis/model-policy.json
     check "Model policy read-only to Core" jarvis_cannot_write /etc/jarvis/model-policy.json
 fi
+if [[ -e /etc/jarvis/huggingface-catalog.json ]]; then
+    check "Hugging Face catalog permissions" expect_mode /etc/jarvis/huggingface-catalog.json root:jarvis:640
+    check "Hugging Face catalog readable by Core" jarvis_reads /etc/jarvis/huggingface-catalog.json
+    check "Hugging Face catalog read-only to Core" jarvis_cannot_write /etc/jarvis/huggingface-catalog.json
+fi
 check "Pricing registry permissions" expect_mode /etc/jarvis/pricing-registry.json root:jarvis:640
 check "Pricing registry readable by Core" jarvis_reads /etc/jarvis/pricing-registry.json
 check "Pricing registry read-only to Core" jarvis_cannot_write /etc/jarvis/pricing-registry.json

@@ -39,14 +39,22 @@ pub(crate) async fn record_usage_with_metadata(
         u.cache_read_tokens,
         state.eur_per_usd,
     );
+    let (_, price_status) = state.pricing_registry.price_for(backend, &reply.model);
     tracing::info!(
         %backend, model = %reply.model, input = u.input_tokens, output = u.output_tokens,
-        cache_read = u.cache_read_tokens, cost_eur = cost, "assistant chat usage",
+        cache_read = u.cache_read_tokens, cost_eur = cost,
+        requested_hf_route = ?reply.requested_route,
+        actual_hf_provider = ?reply.actual_provider,
+        cost_estimate_classification = ?price_status,
+        "assistant chat usage",
     );
     let entry = usage::UsageEntry {
         request_id: metadata.request_id,
         backend: backend.to_string(),
         model: reply.model.clone(),
+        requested_route: reply.requested_route.clone(),
+        actual_provider: reply.actual_provider.clone(),
+        cost_estimate_classification: format!("{price_status:?}").to_ascii_lowercase(),
         routing_mode: metadata.routing_mode,
         quality_tier: metadata.quality_tier,
         agent_id: metadata.agent_id,

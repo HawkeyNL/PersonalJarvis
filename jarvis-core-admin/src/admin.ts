@@ -59,12 +59,29 @@ export interface ModelRecord {
   model: string;
   enabled: boolean;
   source: string;
-  price_status: "known" | "unknown" | "local";
+  route: string | null;
+  price_status: "known" | "estimated" | "conservative" | "unknown" | "local";
   input_per_million_usd: number | null;
   cache_read_per_million_usd: number | null;
   output_per_million_usd: number | null;
   pricing_source: string;
   pricing_updated_at: string;
+}
+export interface HfProviderRecord {
+  provider: string;
+  status: string;
+  context_length: number | null;
+  input_per_million_usd: number | null;
+  output_per_million_usd: number | null;
+  supports_tools: boolean | null;
+  supports_structured_output: boolean | null;
+  first_token_latency_ms: number | null;
+  throughput: number | null;
+}
+export interface HfProvidersResponse {
+  model: string;
+  routes: string[];
+  providers: HfProviderRecord[];
 }
 export interface UsageRow {
   backend: string;
@@ -138,6 +155,8 @@ export const api = {
   agentAction: (update: boolean) =>
     invoke<OperationResult>("agent_action", { update }),
   models: () => invoke<ModelRecord[]>("models"),
+  modelProviders: (model: string) =>
+    invoke<HfProvidersResponse>("model_providers", { model }),
   usage: () => invoke<UsageReport>("usage"),
   modelMutation: (request: Record<string, string>) =>
     invoke<OperationResult>("model_mutation", { request }),

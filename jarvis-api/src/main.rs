@@ -3,7 +3,9 @@
 //! Loads config, opens SurrealDB, applies the versioned baseline, and serves the
 //! router from `jarvis_api::build_router`.
 
-use std::path::PathBuf;
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
@@ -15,6 +17,31 @@ use jarvis_config::AppConfig;
 fn non_empty(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()).then(|| t.to_string())
+}
+
+fn load_huggingface_catalog(
+    path: &str,
+    enforce_production_boundary: bool,
+) -> Result<jarvis_llm::HuggingFaceCatalog, String> {
+    if enforce_production_boundary {
+        let path = Path::new(path);
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("Hugging Face catalog is unavailable: {error}"))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Hugging Face catalog has no trusted parent".to_string())?;
+        let parent_metadata = fs::symlink_metadata(parent)
+            .map_err(|error| format!("Hugging Face catalog parent is unavailable: {error}"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.gid() != parent_metadata.gid()
+            || metadata.permissions().mode() & 0o777 != 0o640
+        {
+            return Err("Hugging Face catalog permissions are unsafe".into());
+        }
+    }
+    jarvis_llm::HuggingFaceCatalog::load(path)
 }
 
 #[tokio::main]
@@ -57,6 +84,42 @@ async fn main() -> anyhow::Result<()> {
     });
     tracing::info!(speech = %speech.label(), "speech engine configured");
 
+    let mut model_policy = match jarvis_llm::ModelAccessPolicy::load(&config.llm_model_policy_path)
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(path = %config.llm_model_policy_path, %error, "model access policy unavailable; remote models disabled");
+            jarvis_llm::ModelAccessPolicy::deny_by_default()
+        }
+    };
+    let hf_catalog = load_huggingface_catalog(
+        &config.llm_huggingface_catalog_path,
+        config.environment.eq_ignore_ascii_case("production"),
+    )
+    .map_err(|error| {
+        tracing::info!(%error, "Hugging Face catalog unavailable");
+        error
+    })
+    .ok();
+    for entry in model_policy
+        .models
+        .iter_mut()
+        .filter(|entry| entry.provider == "huggingface" && entry.enabled)
+    {
+        let route = entry
+            .route
+            .as_deref()
+            .unwrap_or(&config.llm_huggingface_route);
+        if !matches!(route, "auto" | "fastest" | "cheapest" | "preferred")
+            && !hf_catalog
+                .as_ref()
+                .is_some_and(|catalog| catalog.route_available(&entry.model, route))
+        {
+            tracing::warn!(model = %entry.model, requested_hf_route = %route, "disabled unavailable explicit Hugging Face route");
+            entry.enabled = false;
+        }
+    }
+
     // Resource/agent registry — Jarvis' "instant memory" of brains + host
     // (ADR-027). Collected first so the router can consult live availability
     // through it; `active_brain` is filled in once the brain is wired.
@@ -88,6 +151,15 @@ async fn main() -> anyhow::Result<()> {
         ollama_cloud_model: config.llm_ollama_cloud_model.clone(),
         ollama_cloud_model_hard: config.llm_ollama_cloud_model_hard.clone(),
         ollama_cloud_model_cheap: config.llm_ollama_cloud_model_cheap.clone(),
+        has_huggingface_key: !config.llm_huggingface_api_key.trim().is_empty(),
+        huggingface_model: config.llm_huggingface_model.clone(),
+        huggingface_model_hard: config.llm_huggingface_model_hard.clone(),
+        huggingface_model_cheap: config.llm_huggingface_model_cheap.clone(),
+        policy_models: model_policy
+            .models
+            .iter()
+            .map(|entry| (entry.provider.clone(), entry.model.clone()))
+            .collect(),
         speech_provider: config.speech_provider.clone(),
         whisper_model: config.speech_whisper_model.clone(),
         active_brain: String::new(),
@@ -151,6 +223,16 @@ async fn main() -> anyhow::Result<()> {
             model_hard: config.llm_ollama_cloud_model_hard.clone(),
             model_cheap: config.llm_ollama_cloud_model_cheap.clone(),
         },
+        huggingface: jarvis_llm::HuggingFaceBackend {
+            api_key: non_empty(&config.llm_huggingface_api_key),
+            base_url: config.llm_huggingface_base_url.clone(),
+            model_default: config.llm_huggingface_model.clone(),
+            model_hard: config.llm_huggingface_model_hard.clone(),
+            model_cheap: config.llm_huggingface_model_cheap.clone(),
+            route_default: config.llm_huggingface_route.clone(),
+            route_hard: config.llm_huggingface_route_hard.clone(),
+            route_cheap: config.llm_huggingface_route_cheap.clone(),
+        },
     };
     // Cost guardrail (ADR-027): a hard monthly EUR cap on metered API backends.
     // Seed the in-memory spend counter from this month's DB total so the gate is
@@ -184,14 +266,7 @@ async fn main() -> anyhow::Result<()> {
         budget_cents,
     });
     let catalog = jarvis_api::router_catalog(&registry);
-    let model_policy = match jarvis_llm::ModelAccessPolicy::load(&config.llm_model_policy_path) {
-        Ok(policy) => policy,
-        Err(error) => {
-            tracing::warn!(path = %config.llm_model_policy_path, %error, "model access policy unavailable; remote models disabled");
-            jarvis_llm::ModelAccessPolicy::deny_by_default()
-        }
-    };
-    let pricing_registry = match jarvis_usage::PricingRegistry::load_with_builtin(
+    let mut pricing_registry = match jarvis_usage::PricingRegistry::load_with_builtin(
         &config.llm_pricing_registry_path,
     ) {
         Ok(registry) => registry,
@@ -200,6 +275,59 @@ async fn main() -> anyhow::Result<()> {
             jarvis_usage::PricingRegistry::builtin()
         }
     };
+    match hf_catalog.as_ref() {
+        Some(hf_catalog) => {
+            let mut remaining_hf_prices = 2_000_usize.saturating_sub(pricing_registry.models.len());
+            for entry in model_policy
+                .models
+                .iter()
+                .filter(|entry| entry.provider == "huggingface")
+            {
+                let price = entry.route.as_deref().map_or_else(
+                    || {
+                        hf_catalog.conservative_price_for_routes(
+                            &entry.model,
+                            [
+                                config.llm_huggingface_route.as_str(),
+                                config.llm_huggingface_route_cheap.as_str(),
+                                config.llm_huggingface_route_hard.as_str(),
+                            ],
+                        )
+                    },
+                    |route| hf_catalog.conservative_price(&entry.model, route),
+                );
+                if let Some((input, output)) = price {
+                    if !pricing_registry
+                        .models
+                        .iter()
+                        .any(|price| price.provider == "huggingface" && price.model == entry.model)
+                        && remaining_hf_prices > 0
+                    {
+                        pricing_registry.models.push(jarvis_usage::PricingEntry {
+                            provider: "huggingface".into(),
+                            model: entry.model.clone(),
+                            input_per_million_usd: input,
+                            output_per_million_usd: output,
+                            cache_read_per_million_usd: Some(input),
+                            price_status: if entry.route.as_deref().is_some_and(|route| {
+                                !matches!(route, "auto" | "fastest" | "cheapest" | "preferred")
+                            }) {
+                                jarvis_usage::PriceStatus::Estimated
+                            } else {
+                                jarvis_usage::PriceStatus::Conservative
+                            },
+                        });
+                        remaining_hf_prices -= 1;
+                    }
+                }
+            }
+            pricing_registry.source =
+                format!("{} + huggingface-conservative", pricing_registry.source);
+        }
+        None => tracing::info!(
+            "Hugging Face catalog unavailable; conservative unknown pricing remains active"
+        ),
+    }
     let llm = jarvis_llm::build_router_with_policy(
         provider_cfg,
         availability,

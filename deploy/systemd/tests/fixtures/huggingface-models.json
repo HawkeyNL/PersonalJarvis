@@ -1,0 +1,47 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "openai/gpt-oss-fixture",
+      "providers": [
+        {
+          "provider": "groq",
+          "status": "live",
+          "context_length": 131072,
+          "pricing": { "input": 0.04, "output": 0.15 },
+          "supports_tools": true,
+          "supports_structured_output": true,
+          "first_token_latency_ms": 120,
+          "throughput": 220.5
+        },
+        {
+          "provider": "deepinfra",
+          "status": "live",
+          "context_length": 65536,
+          "pricing": { "input": 0.05 },
+          "supports_tools": true,
+          "supports_structured_output": false
+        },
+        {
+          "provider": "novita",
+          "status": "error",
+          "supports_tools": false
+        }
+      ]
+    },
+    {
+      "id": "zai-org/glm-fixture",
+      "providers": [
+        {
+          "provider": "novita",
+          "status": "live",
+          "pricing": { "input": 1.69, "output": 3.38 },
+          "supports_tools": true,
+          "supports_structured_output": false,
+          "first_token_latency_ms": 1490,
+          "throughput": 24.69
+        }
+      ]
+    }
+  ]
+}

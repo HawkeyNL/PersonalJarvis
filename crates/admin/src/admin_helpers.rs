@@ -41,6 +41,27 @@ pub(super) fn compatibility_helper(
     run_command(&mut command, explicit_helper_subprocess_mode(verbose))
 }
 
+pub(super) fn compatibility_helper_output(
+    helper: AdminHelper,
+    args: Vec<String>,
+) -> Result<Vec<u8>> {
+    let lock = mutation_lock(CONFIG_LOCK)?;
+    let _lock = lock;
+    let output = trusted_admin_helper_command(helper)?
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .context("start trusted helper")?;
+    if output.stdout.len() > 2 * 1024 * 1024 || output.stderr.len() > 64 * 1024 {
+        bail!("trusted helper output exceeds the administration limit");
+    }
+    if !output.status.success() {
+        io::stderr().write_all(&output.stderr)?;
+        ensure_success(output.status)?;
+    }
+    Ok(output.stdout)
+}
+
 pub(super) fn explicit_helper_subprocess_mode(verbose: bool) -> SubprocessMode {
     SubprocessMode::from_verbose(verbose)
 }

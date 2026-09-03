@@ -14,13 +14,14 @@ use serde::{Deserialize, Serialize};
 pub mod surreal;
 
 /// The metered backends — the only ones that spend money.
-pub const METERED_BACKENDS: [&str; 6] = [
+pub const METERED_BACKENDS: [&str; 7] = [
     "anthropic-api",
     "openai-api",
     "deepseek-api",
     "xai-api",
     "zai-api",
     "ollama-cloud",
+    "huggingface",
 ];
 
 /// Whether a backend id bills per token (vs. the free plan/local brains).
@@ -58,6 +59,15 @@ pub struct PricingEntry {
     pub output_per_million_usd: f64,
     #[serde(default)]
     pub cache_read_per_million_usd: Option<f64>,
+    /// Classification is explicit so provider-discovered prices are never
+    /// presented as owner-reviewed exact values. Legacy registries default to
+    /// `known`.
+    #[serde(default = "known_price_status")]
+    pub price_status: PriceStatus,
+}
+
+const fn known_price_status() -> PriceStatus {
+    PriceStatus::Known
 }
 
 impl PricingRegistry {
@@ -177,7 +187,21 @@ impl PricingRegistry {
                         .cache_read_per_million_usd
                         .unwrap_or(entry.input_per_million_usd * 0.1),
                 },
-                PriceStatus::Known,
+                entry.price_status,
+            );
+        }
+        // HF routes can move across infrastructure providers. Its catalog
+        // validation accepts no price above this ceiling, so missing/partial
+        // HF pricing reserves against the ceiling rather than inheriting the
+        // much lower generic unknown-model estimate.
+        if backend == "huggingface" {
+            return (
+                Price {
+                    input: 1_000_000.0,
+                    output: 1_000_000.0,
+                    cache_read: 1_000_000.0,
+                },
+                PriceStatus::Unknown,
             );
         }
         (Price::new(3.0, 15.0), PriceStatus::Unknown)
@@ -191,6 +215,7 @@ fn entry(provider: &str, model: &str, input: f64, output: f64) -> PricingEntry {
         input_per_million_usd: input,
         output_per_million_usd: output,
         cache_read_per_million_usd: None,
+        price_status: PriceStatus::Known,
     }
 }
 
@@ -207,16 +232,19 @@ fn entry_cached(
         input_per_million_usd: input,
         output_per_million_usd: output,
         cache_read_per_million_usd: Some(cache_read),
+        price_status: PriceStatus::Known,
     }
 }
 
 /// Price metadata is versioned in source and intentionally distinguishes an
 /// unknown remote price from a free local model.  The conservative fallback is
 /// used for accounting only; the registry/UI can show its `Unknown` state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriceStatus {
     Known,
+    Estimated,
+    Conservative,
     Unknown,
     Local,
 }
@@ -288,6 +316,9 @@ pub struct UsageEntry {
     pub request_id: String,
     pub backend: String,
     pub model: String,
+    pub requested_route: Option<String>,
+    pub actual_provider: Option<String>,
+    pub cost_estimate_classification: String,
     pub routing_mode: String,
     pub quality_tier: String,
     pub agent_id: Option<String>,
@@ -379,15 +410,14 @@ pub fn estimate_task_cost_with_registry(
         eur_per_usd,
     );
     let status = registry.price_for(backend, model).1;
-    let low_factor = if status == PriceStatus::Unknown {
-        1.0
-    } else {
-        0.6
+    let low_factor = match status {
+        PriceStatus::Unknown | PriceStatus::Conservative => 1.0,
+        PriceStatus::Known | PriceStatus::Estimated | PriceStatus::Local => 0.6,
     };
-    let high_factor = if status == PriceStatus::Unknown {
-        2.5
-    } else {
-        1.6
+    let high_factor = match status {
+        PriceStatus::Unknown => 2.5,
+        PriceStatus::Estimated | PriceStatus::Known => 1.6,
+        PriceStatus::Conservative | PriceStatus::Local => 1.0,
     };
     CostEstimate {
         low_eur: likely * low_factor,
@@ -587,6 +617,7 @@ mod tests {
         assert!(is_metered("anthropic-api"));
         assert!(is_metered("openai-api"));
         assert!(is_metered("deepseek-api"));
+        assert!(is_metered("huggingface"));
         // 1M in + 1M out on sonnet = (3 + 15) USD × 0.92 ≈ 16.56 EUR.
         let c = cost_eur(
             "anthropic-api",
@@ -610,6 +641,8 @@ mod tests {
     fn unknown_metered_model_is_not_free() {
         let c = cost_eur("openai-api", "some-future-model", 1000, 1000, 0, 0.92);
         assert!(c > 0.0);
+        let hf = cost_eur("huggingface", "org/future-model", 1_000, 1_000, 0, 0.92);
+        assert!(hf >= 1_000.0);
     }
 
     #[test]

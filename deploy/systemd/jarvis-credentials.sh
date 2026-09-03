@@ -8,15 +8,15 @@ readonly secret_dir=/etc/jarvis/secrets
 readonly core_env=/etc/jarvis/core.env
 readonly ollama_cloud_default_base_url=https://ollama.com/v1
 readonly ollama_cloud_tags_url=https://ollama.com/api/tags
+readonly huggingface_default_base_url=https://router.huggingface.co/v1
 
 fail() { echo "jarvis-credentials: $*" >&2; exit 1; }
-[[ ${EUID} -eq 0 ]] || fail "must run as root"
 
 usage() {
     cat >&2 <<'EOF'
 Usage: sudo jarvis-credentials <set|list|test|remove> [provider]
 
-Providers: anthropic, openai, deepseek, xai, zai, ollama-cloud.
+Providers: anthropic, openai, deepseek, xai, zai, ollama-cloud, huggingface.
 Local Ollama has no credential; configure its loopback URL/model in core.env.
 EOF
     exit 64
@@ -30,6 +30,7 @@ provider_var() {
         xai) printf '%s\n' JARVIS_LLM_XAI_API_KEY ;;
         zai) printf '%s\n' JARVIS_LLM_ZAI_API_KEY ;;
         ollama-cloud) printf '%s\n' JARVIS_LLM_OLLAMA_CLOUD_API_KEY ;;
+        huggingface) printf '%s\n' JARVIS_LLM_HUGGINGFACE_API_KEY ;;
         *) return 1 ;;
     esac
 }
@@ -37,6 +38,14 @@ provider_var() {
 credential_file() {
     provider_var "$1" >/dev/null || return 1
     printf '%s/%s.env\n' "$secret_dir" "$1"
+}
+
+read_credential_value() {
+    local file=$1 variable=$2 line
+    [[ $(wc -l < "$file") -eq 1 ]] || return 1
+    IFS= read -r line < "$file" || [[ -n $line ]] || return 1
+    [[ $line == "$variable="* ]] || return 1
+    printf '%s' "${line#*=}"
 }
 
 require_tty() {
@@ -84,6 +93,9 @@ ensure_provider_defaults() {
     case $1 in
         ollama-cloud)
             ensure_core_env_setting JARVIS_LLM_OLLAMA_CLOUD_BASE_URL "$ollama_cloud_default_base_url"
+            ;;
+        huggingface)
+            ensure_core_env_setting JARVIS_LLM_HUGGINGFACE_BASE_URL "$huggingface_default_base_url"
             ;;
     esac
 }
@@ -152,7 +164,7 @@ set_credential() {
 list_credentials() {
     local provider file configured
     printf '%-16s %-12s %s\n' PROVIDER CONFIGURED STATUS
-    for provider in anthropic openai deepseek xai zai ollama-cloud; do
+    for provider in anthropic openai deepseek xai zai ollama-cloud huggingface; do
         file=$(credential_file "$provider")
         configured=no
         [[ -f $file && ! -L $file && $(stat -c '%U:%G:%a' "$file" 2>/dev/null || true) == root:jarvis:640 ]] && configured=yes
@@ -170,7 +182,7 @@ test_credential() {
     file=$(credential_file "$provider")
     [[ -f $file && ! -L $file && $(stat -c '%U:%G:%a' "$file") == root:jarvis:640 ]] || fail "not configured or unsafe permissions"
     if ! probe_provider "$provider" "$file"; then
-        fail "provider rejected or did not answer the bounded credential probe"
+        fail "$provider credential probe failed; provider rejected or did not answer the bounded metadata request"
     fi
     if ! systemctl is-active --quiet jarvis-core.service || ! wait_healthy; then
         fail "Core is not healthy"
@@ -182,18 +194,14 @@ test_credential() {
 # ephemeral mode-0600 curl config in /run, never onto curl's argv or stdout.
 # Every endpoint below is metadata-only and must not create a paid generation.
 probe_provider() {
-    local provider=$1 file=$2 variable key escaped_key base config http_code url
+    local provider=$1 file=$2 variable key escaped_key base config http_code url response_file=''
     command -v curl >/dev/null 2>&1 || fail "curl is required for credential testing"
     variable=$(provider_var "$provider") || return 1
-    set -a
-    # shellcheck disable=SC1090,SC1091 # root-managed single-provider secret
-    source "$file"
-    set +a
-    key=${!variable:-}
+    key=$(read_credential_value "$file" "$variable") || return 1
     [[ -n $key ]] || return 1
     escaped_key=$(curl_config_escape "$key")
     config=$(mktemp /run/jarvis-credential-test.XXXXXX)
-    trap 'rm -f -- "$config"; unset key' RETURN
+    trap 'rm -f -- "$config"; [[ -z ${response_file:-} ]] || rm -f -- "$response_file"; unset key escaped_key' RETURN
     umask 077
     case $provider in
         anthropic)
@@ -212,18 +220,34 @@ probe_provider() {
             url=$ollama_cloud_tags_url
             printf 'url = "%s"\nheader = "Authorization: Bearer %s"\n' "$url" "$escaped_key" > "$config"
             ;;
-        openai|deepseek|xai|zai)
+        openai|deepseek|xai|zai|huggingface)
             base=$(openai_compatible_base_url "$provider") || return 1
             [[ $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 1
             printf 'url = "%s/models"\nheader = "Authorization: Bearer %s"\n' "${base%/}" "$escaped_key" > "$config"
             ;;
         *) return 1 ;;
     esac
-    unset key
-    http_code=$(curl --config "$config" --output /dev/null --silent --show-error --max-time 10 --write-out '%{http_code}' || true)
+    unset key escaped_key
+    if [[ $provider == huggingface ]]; then
+        response_file=$(mktemp /run/jarvis-credential-response.XXXXXX)
+        chmod 0600 "$response_file"
+    fi
+    http_code=$(curl --config "$config" --output "${response_file:-/dev/null}" --silent --show-error --max-time 10 --max-filesize 8388608 --write-out '%{http_code}' || true)
     trap - RETURN
     rm -f -- "$config"
-    [[ $http_code =~ ^2[0-9]{2}$ ]]
+    [[ $http_code =~ ^2[0-9]{2}$ ]] || { [[ -z $response_file ]] || rm -f -- "$response_file"; return 1; }
+    if [[ $provider == huggingface ]]; then
+        valid_huggingface_model_response "$response_file" || {
+            rm -f -- "$response_file"
+            return 1
+        }
+        rm -f -- "$response_file"
+    fi
+    return 0
+}
+
+valid_huggingface_model_response() {
+    jq -e '(.data | type == "array") and any(.data[]?; (.id | type == "string") and (.id | length > 0) and (.id | length <= 256) and (.id | test("[[:cntrl:]]") | not))' "$1" >/dev/null
 }
 
 # curl config uses quoted values. Escape the only two metacharacters that may
@@ -246,6 +270,7 @@ openai_compatible_base_url() {
         xai) printf '%s\n' "${JARVIS_LLM_XAI_BASE_URL:-https://api.x.ai/v1}" ;;
         zai) printf '%s\n' "${JARVIS_LLM_ZAI_BASE_URL:-https://api.z.ai/api/paas/v4}" ;;
         ollama-cloud) printf '%s\n' "${JARVIS_LLM_OLLAMA_CLOUD_BASE_URL:-$ollama_cloud_default_base_url}" ;;
+        huggingface) printf '%s\n' "${JARVIS_LLM_HUGGINGFACE_BASE_URL:-$huggingface_default_base_url}" ;;
         *) return 1 ;;
     esac
 }
@@ -270,10 +295,17 @@ remove_credential() {
     echo "jarvis-credentials: $provider was removed."
 }
 
-case ${1:-} in
-    set) (($# == 2)) || usage; set_credential "$2" ;;
-    list) (($# == 1)) || usage; list_credentials ;;
-    test) (($# == 2)) || usage; test_credential "$2" ;;
-    remove) (($# == 2)) || usage; remove_credential "$2" ;;
-    *) usage ;;
-esac
+main() {
+    [[ ${EUID} -eq 0 ]] || fail "must run as root"
+    case ${1:-} in
+        set) (($# == 2)) || usage; set_credential "$2" ;;
+        list) (($# == 1)) || usage; list_credentials ;;
+        test) (($# == 2)) || usage; test_credential "$2" ;;
+        remove) (($# == 2)) || usage; remove_credential "$2" ;;
+        *) usage ;;
+    esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

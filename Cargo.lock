@@ -2276,6 +2276,7 @@ dependencies = [
  "clap",
  "crossterm",
  "fs2",
+ "jarvis-llm",
  "ratatui",
  "reqwest",
  "serde",

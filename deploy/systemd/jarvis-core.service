@@ -17,6 +17,7 @@ EnvironmentFile=-/etc/jarvis/secrets/deepseek.env
 EnvironmentFile=-/etc/jarvis/secrets/xai.env
 EnvironmentFile=-/etc/jarvis/secrets/zai.env
 EnvironmentFile=-/etc/jarvis/secrets/ollama-cloud.env
+EnvironmentFile=-/etc/jarvis/secrets/huggingface.env
 ExecStart=/opt/jarvis/current/jarvis-api
 Restart=on-failure
 RestartSec=5s

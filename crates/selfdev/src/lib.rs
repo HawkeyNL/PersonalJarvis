@@ -199,6 +199,8 @@ mod tests {
                 text: self.0.clone(),
                 model: "fake".into(),
                 backend: Some("fake".into()),
+                requested_route: None,
+                actual_provider: None,
                 stop_reason: Some("end_turn".into()),
                 usage: None,
             })

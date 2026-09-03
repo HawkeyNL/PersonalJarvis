@@ -158,6 +158,13 @@ active verified release and writes `/etc/jarvis/updater.env` as `root:root
 sudo jarvis models list
 sudo jarvis models refresh
 sudo jarvis models enable openai-api gpt-4o-mini
+sudo jarvis credentials set huggingface
+sudo jarvis credentials test huggingface
+sudo jarvis models refresh huggingface
+sudo jarvis models list huggingface
+sudo jarvis models providers huggingface openai/gpt-oss-20b
+sudo jarvis models set-route huggingface openai/gpt-oss-20b cheapest
+sudo jarvis models enable huggingface openai/gpt-oss-20b
 sudo jarvis credentials list
 sudo jarvis credentials set openai
 ```
@@ -168,6 +175,28 @@ model IDs are labelled `unknown`; local models are labelled `local`. All three
 presentations use the same typed pricing projection consumed by Core Admin.
 Owner pricing entries take precedence over reviewed coverage shipped in the
 active verified release.
+
+Hugging Face uses `https://router.huggingface.co/v1` for metadata and
+OpenAI-compatible chat. Its base model is the owner-authorized identity; the
+HF inference route (`auto`, `fastest`, `cheapest`, `preferred`, or a currently
+discovered live provider id) is stored separately. Selecting a route does not
+enable a model. Dynamic routes use the highest complete live-provider price as
+a conservative preflight estimate. If any eligible price is unavailable,
+Jarvis reserves against the maximum accepted HF catalog-price ceiling, which
+normally makes the request fail closed under the owner budget rather than
+guessing a cheap price. Provider invoices remain authoritative.
+Usage telemetry retains the non-secret base model, requested HF route and cost
+classification. The actual inference provider remains `unknown` unless the HF
+API reports it through a stable documented field; Jarvis never guesses it.
+
+The bounded rich HF catalog is stored separately at
+`/etc/jarvis/huggingface-catalog.json` as `root:jarvis 0640`. It contains only
+model/provider metadata, never the token. The root model policy remains the
+authorization source. New discoveries always start disabled.
+The opaque token is stored only as
+`JARVIS_LLM_HUGGINGFACE_API_KEY=…` in
+`/etc/jarvis/secrets/huggingface.env`; `credentials test` performs only an
+authenticated bounded `GET /v1/models` probe and never generates tokens.
 
 Monthly aggregate telemetry is available through:
 

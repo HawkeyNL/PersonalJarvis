@@ -101,6 +101,8 @@ impl LlmProvider for OllamaProvider {
             text,
             model,
             backend: Some("ollama".into()),
+            requested_route: None,
+            actual_provider: None,
             stop_reason: v
                 .get("done_reason")
                 .and_then(Value::as_str)

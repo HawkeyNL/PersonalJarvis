@@ -130,6 +130,7 @@ enum AppOperation {
     ModelRefresh,
     ModelEnable { provider: String, model: String },
     ModelDisable { provider: String, model: String },
+    ModelSetRoute { model: String, route: String },
     LogRefresh,
     LogFollow,
 }
@@ -143,6 +144,9 @@ impl AppOperation {
             Self::ModelRefresh => "Refreshing model catalog".to_owned(),
             Self::ModelEnable { provider, model } => format!("Enabling {provider}/{model}"),
             Self::ModelDisable { provider, model } => format!("Disabling {provider}/{model}"),
+            Self::ModelSetRoute { model, route } => {
+                format!("Selecting Hugging Face route {route} for {model}")
+            }
             Self::LogRefresh => "Loading recent logs".to_owned(),
             Self::LogFollow => "Following bounded service logs".to_owned(),
         }
@@ -155,6 +159,7 @@ impl AppOperation {
                 | Self::ModelRefresh
                 | Self::ModelEnable { .. }
                 | Self::ModelDisable { .. }
+                | Self::ModelSetRoute { .. }
         )
     }
 }
@@ -409,6 +414,7 @@ impl JarvisApp {
                     model: "gpt-fixture".to_owned(),
                     enabled: true,
                     source: "catalog fixture".to_owned(),
+                    route: None,
                     price_status: "known",
                     input_per_million_usd: Some(2.5),
                     cache_read_per_million_usd: Some(1.25),
@@ -421,6 +427,7 @@ impl JarvisApp {
                     model: "claude-fixture-with-a-long-safe-name".to_owned(),
                     enabled: false,
                     source: "policy fixture".to_owned(),
+                    route: None,
                     price_status: "unknown",
                     input_per_million_usd: None,
                     cache_read_per_million_usd: None,
@@ -806,6 +813,7 @@ impl JarvisApp {
             AppOperation::ModelRefresh
                 | AppOperation::ModelEnable { .. }
                 | AppOperation::ModelDisable { .. }
+                | AppOperation::ModelSetRoute { .. }
         );
         self.modal = Some(Modal::Result {
             success,
@@ -1155,14 +1163,42 @@ impl JarvisApp {
                     });
                 }
             }
+            KeyCode::Char('p') => {
+                if let Some((model, current_route)) = self
+                    .selected_model()
+                    .filter(|model| model.provider == "huggingface")
+                    .map(|model| (model.model.clone(), model.route.clone()))
+                {
+                    match usage_insights::huggingface_routes_for_model(&model) {
+                        Ok(routes) => {
+                            let next = current_route
+                                .as_deref()
+                                .and_then(|current| {
+                                    routes.iter().position(|route| route == current)
+                                })
+                                .map_or(0, |position| (position + 1) % routes.len());
+                            let route = routes[next].clone();
+                            self.start_operation(AppOperation::ModelSetRoute { model, route })?;
+                        }
+                        Err(error) => {
+                            self.modal = Some(Modal::Result {
+                                success: false,
+                                title: "Hugging Face routes unavailable".to_owned(),
+                                detail: error.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
             KeyCode::Enter => {
                 if let Some(model) = self.selected_model() {
                     self.modal = Some(Modal::Result {
                         success: true,
                         title: format!("{}/{}", model.provider, model.model),
                         detail: format!(
-                            "Enabled: {} · Input: {} / 1M · Cached: {} / 1M · Output: {} / 1M · Pricing: {} · Source: {}",
+                            "Enabled: {} · HF route: {} · Input: {} / 1M · Cached: {} / 1M · Output: {} / 1M · Pricing: {} · Source: {}",
                             model.enabled,
+                            model.route.as_deref().unwrap_or("—"),
                             usage_insights::display_model_price(
                                 model.input_per_million_usd,
                                 model.price_status,
@@ -2011,12 +2047,13 @@ fn render_models(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
                         model.price_status,
                     ),
                     model.price_status.to_owned(),
+                    model.route.clone().unwrap_or_else(|| "—".into()),
                 ])
                 .style(row_style(visible_index == app.selected, model.enabled))
             })
         });
     let title = format!(
-        " Models · filter: {} · f filter · e enable · d disable · Enter details ",
+        " Models · filter: {} · f filter · e enable · d disable · p HF route · Enter details ",
         app.model_filter.as_deref().unwrap_or("all")
     );
     frame.render_widget(
@@ -2030,6 +2067,7 @@ fn render_models(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
                 Constraint::Length(12),
                 Constraint::Length(12),
                 Constraint::Length(9),
+                Constraint::Length(12),
             ],
         )
         .header(
@@ -2041,6 +2079,7 @@ fn render_models(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
                 "Cached $/1M",
                 "Output $/1M",
                 "Pricing",
+                "HF Route",
             ])
             .style(Style::default().fg(Color::Cyan)),
         )
@@ -2706,6 +2745,11 @@ fn operation_command(
         AppOperation::ModelDisable { provider, model } => {
             command = trusted_admin_helper_command(AdminHelper::Models)?;
             command.args(["disable", provider, model]);
+            lock = Some(mutation_lock(CONFIG_LOCK)?);
+        }
+        AppOperation::ModelSetRoute { model, route } => {
+            command = trusted_admin_helper_command(AdminHelper::Models)?;
+            command.args(["set-route", "huggingface", model, route]);
             lock = Some(mutation_lock(CONFIG_LOCK)?);
         }
         AppOperation::LogRefresh | AppOperation::LogFollow => {

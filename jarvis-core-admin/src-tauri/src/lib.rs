@@ -147,6 +147,18 @@ async fn models(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+async fn model_providers(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+    model: String,
+) -> Result<admin::HfProvidersResponse, String> {
+    with_session(session, move |session| {
+        admin::model_providers(&session, model)
+    })
+    .await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 async fn usage(
     session: tauri::State<'_, Arc<session::SessionManager>>,
 ) -> Result<admin::UsageReport, String> {
@@ -216,6 +228,7 @@ pub fn run() {
             agents,
             agent_action,
             models,
+            model_providers,
             usage,
             model_mutation,
             credentials,

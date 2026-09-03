@@ -24,6 +24,7 @@ fn month_breakdown_query() -> String {
 pub async fn record(db: &Database, entry: &UsageEntry) -> Result<(), jarvis_store::StoreError> {
     db.query(
         "CREATE llm_usage SET id = $id, ts = time::now(), request_id = $request_id, backend = $backend, model = $model, \
+         requested_route = $requested_route, actual_provider = $actual_provider, cost_estimate_classification = $cost_estimate_classification, \
          routing_mode = $routing_mode, quality_tier = $quality_tier, agent_id = $agent_id, latency_ms = $latency_ms, \
          status = $status, failure_category = $failure_category, fallback_count = $fallback_count, \
          input_tokens = $input_tokens, output_tokens = $output_tokens, cache_read_tokens = $cache_read_tokens, \
@@ -31,6 +32,8 @@ pub async fn record(db: &Database, entry: &UsageEntry) -> Result<(), jarvis_stor
     )
     .bind(json!({
         "id": Uuid::now_v7().to_string(), "request_id": entry.request_id, "backend": entry.backend, "model": entry.model,
+        "requested_route": entry.requested_route, "actual_provider": entry.actual_provider,
+        "cost_estimate_classification": entry.cost_estimate_classification,
         "routing_mode": entry.routing_mode, "quality_tier": entry.quality_tier, "agent_id": entry.agent_id,
         "latency_ms": entry.latency_ms, "status": entry.status, "failure_category": entry.failure_category,
         "fallback_count": entry.fallback_count,

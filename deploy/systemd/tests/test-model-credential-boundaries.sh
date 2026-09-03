@@ -46,6 +46,13 @@ if grep -Eq "echo.*\\\$secret" "$credentials"; then
     echo "credential manager prints a secret variable" >&2
     exit 1
 fi
+if grep -Fq 'source "$file"' "$credentials" || grep -Fq 'source "$credential_file"' "$models"; then
+    echo "opaque credential file must not be shell-evaluated" >&2
+    exit 1
+fi
+grep -Fq 'read_credential_value' "$credentials"
+grep -Fq 'read_credential_value' "$models"
+grep -Fq 'root:jarvis:640' "$models"
 if grep -Eq 'curl[[:space:]].*-H' "$credentials"; then
     echo "credential manager sends credentials to curl" >&2
     exit 1
@@ -58,6 +65,9 @@ grep -Fq 'probe_provider' "$credentials"
 grep -Fq 'mktemp /run/jarvis-credential-test' "$credentials"
 grep -Fq 'curl --config "$config"' "$credentials"
 grep -Fq 'no generation request was made' "$credentials"
+grep -Fq 'huggingface_default_base_url=https://router.huggingface.co/v1' "$credentials"
+grep -Fq 'JARVIS_LLM_HUGGINGFACE_API_KEY' "$credentials"
+grep -Fq '(.data | type == "array")' "$credentials"
 
 # Ollama Cloud is a first-class remote provider. A fresh Home Node and an
 # existing one configured through `credentials set/test ollama-cloud` both get
@@ -92,6 +102,11 @@ if grep -Fq 'map(fromjson?)' "$models"; then
     exit 1
 fi
 grep -Fq 'model discovery returned no models' "$models"
+grep -Fq 'huggingface_default_base_url=https://router.huggingface.co/v1' "$models"
+grep -Fq 'normalize_huggingface_catalog' "$models"
+grep -Fq 'new remote models remain disabled' "$models"
+grep -Fq 'set_huggingface_route' "$models"
+grep -Fq 'route $route is unavailable' "$models"
 # Only the known restrictive legacy ownership/mode may be normalized; unsafe
 # writable/symlink/non-root states still fail closed.
 grep -Fq 'normalize_model_policy_boundary' "$models"
@@ -106,7 +121,7 @@ grep -Fq '/etc/jarvis/secrets' "$prepare"
 grep -Fq '/etc/jarvis/pricing-registry.json' "$prepare"
 grep -Fq '[[ ! -e /etc/jarvis/pricing-registry.json ]]' "$prepare"
 
-for provider in anthropic openai deepseek xai zai ollama-cloud; do
+for provider in anthropic openai deepseek xai zai ollama-cloud huggingface; do
     grep -Fq "EnvironmentFile=-/etc/jarvis/secrets/$provider.env" "$unit"
 done
 

@@ -147,6 +147,8 @@ impl LlmProvider for OpenAiCompatProvider {
             text,
             model,
             backend: Some(self.backend.clone()),
+            requested_route: None,
+            actual_provider: None,
             stop_reason: finish,
             usage,
         })

@@ -8,6 +8,8 @@
 mod anthropic;
 mod claude_cli;
 mod fallback;
+mod huggingface;
+mod huggingface_catalog;
 mod model_policy;
 mod ollama;
 mod openai_compat;
@@ -21,7 +23,9 @@ use async_trait::async_trait;
 pub use anthropic::AnthropicProvider;
 pub use claude_cli::ClaudeCliProvider;
 pub use fallback::FallbackProvider;
-pub use model_policy::{ModelAccessEntry, ModelAccessPolicy};
+pub use huggingface::{hf_routed_model, HuggingFaceProvider, HuggingFaceRoute};
+pub use huggingface_catalog::{HuggingFaceCatalog, HuggingFaceModel, HuggingFaceProviderMetadata};
+pub use model_policy::{validate_hf_route, ModelAccessEntry, ModelAccessPolicy};
 pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use router::{always_available, Availability, CatalogModel, ModelClass, RouterProvider};
@@ -50,11 +54,23 @@ pub struct OpenAiBackend {
     pub model_cheap: String,
 }
 
+#[derive(Default, Clone)]
+pub struct HuggingFaceBackend {
+    pub api_key: Option<String>,
+    pub base_url: String,
+    pub model_default: String,
+    pub model_hard: String,
+    pub model_cheap: String,
+    pub route_default: String,
+    pub route_hard: String,
+    pub route_cheap: String,
+}
+
 /// Inputs for [`build_provider`]/[`build_router`] — flat so the API service can
 /// map from its `AppConfig` without this crate depending on the config crate.
 pub struct ProviderConfig {
-    /// `router`/`auto` (smart), `anthropic`, `claude-cli`, `openai`, `deepseek`
-    /// or `ollama`.
+    /// `router`/`auto` (smart), `anthropic`, `claude-cli`, `openai`, `deepseek`,
+    /// `huggingface`, or `ollama`.
     pub provider: String,
     /// Anthropic API key; `None`/empty ⇒ Anthropic disabled (used as fallback).
     pub api_key: Option<String>,
@@ -77,6 +93,42 @@ pub struct ProviderConfig {
     /// Credentialed remote Ollama API.  This is intentionally distinct from
     /// the local loopback Ollama provider.
     pub ollama_cloud: OpenAiBackend,
+    pub huggingface: HuggingFaceBackend,
+}
+
+fn build_huggingface(
+    cfg: &HuggingFaceBackend,
+    policy: &ModelAccessPolicy,
+) -> Option<Arc<dyn LlmProvider>> {
+    let routes = policy
+        .models
+        .iter()
+        .filter(|entry| entry.provider == "huggingface")
+        .filter_map(|entry| {
+            entry
+                .route
+                .clone()
+                .map(|route| (entry.model.clone(), route))
+        })
+        .collect();
+    cfg.api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .and_then(|key| {
+            HuggingFaceProvider::new(
+                key,
+                &cfg.base_url,
+                &cfg.model_default,
+                &cfg.model_hard,
+                &cfg.model_cheap,
+                &cfg.route_default,
+                &cfg.route_hard,
+                &cfg.route_cheap,
+                routes,
+            )
+            .ok()
+        })
+        .map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>)
 }
 
 /// Build the local Ollama brain, if the client constructs (no network yet).
@@ -175,6 +227,10 @@ pub fn build_provider(cfg: ProviderConfig) -> Arc<dyn LlmProvider> {
         ),
         "deepseek" => single_or_fallback(
             build_openai_compat("deepseek", "deepseek-api", &cfg.deepseek),
+            ollama,
+        ),
+        "huggingface" => single_or_fallback(
+            build_huggingface(&cfg.huggingface, &ModelAccessPolicy::deny_by_default()),
             ollama,
         ),
         "ollama" => ollama.unwrap_or_else(|| Arc::new(Unconfigured)),
@@ -278,6 +334,12 @@ pub fn build_router_with_policy(
             provider: ollama_cloud,
         });
     }
+    if let Some(huggingface) = build_huggingface(&cfg.huggingface, &model_policy) {
+        candidates.push(router::Candidate {
+            id: "huggingface".into(),
+            provider: huggingface,
+        });
+    }
     if candidates.is_empty() {
         return Arc::new(Unconfigured);
     }
@@ -324,6 +386,8 @@ impl LlmProvider for Echo {
             text: format!("echo: {last}"),
             model: "stub".into(),
             backend: Some("stub".into()),
+            requested_route: None,
+            actual_provider: None,
             stop_reason: Some("end_turn".into()),
             usage: None,
         })
@@ -382,6 +446,7 @@ mod tests {
             xai: OpenAiBackend::default(),
             zai: OpenAiBackend::default(),
             ollama_cloud: OpenAiBackend::default(),
+            huggingface: HuggingFaceBackend::default(),
         });
         // With no API key, this resolves to the Ollama-only brain.
         assert_eq!(brain.label(), "ollama:llama3.2");
@@ -404,6 +469,7 @@ mod tests {
             xai: OpenAiBackend::default(),
             zai: OpenAiBackend::default(),
             ollama_cloud: OpenAiBackend::default(),
+            huggingface: HuggingFaceBackend::default(),
         });
         // CLI primary, API as the fallback ("vangnet als de CLI vol is").
         assert_eq!(
@@ -429,8 +495,24 @@ mod tests {
             xai: OpenAiBackend::default(),
             zai: OpenAiBackend::default(),
             ollama_cloud: OpenAiBackend::default(),
+            huggingface: HuggingFaceBackend::default(),
         });
         // Registry-aware router over local + plan + API, in fixed id order.
         assert_eq!(brain.label(), "router[ollama,claude-cli,anthropic-api]");
+    }
+
+    #[test]
+    fn huggingface_backend_requires_a_credential() {
+        let backend = HuggingFaceBackend {
+            api_key: None,
+            base_url: "https://router.huggingface.co/v1".into(),
+            model_default: "org/model".into(),
+            model_hard: "org/model".into(),
+            model_cheap: "org/model".into(),
+            route_default: "fastest".into(),
+            route_hard: "preferred".into(),
+            route_cheap: "cheapest".into(),
+        };
+        assert!(build_huggingface(&backend, &ModelAccessPolicy::deny_by_default()).is_none());
     }
 }

@@ -86,6 +86,7 @@ pub enum ModelProvider {
     OllamaLocal,
     ClaudeCli,
     CodexCli,
+    Huggingface,
 }
 
 impl ModelProvider {
@@ -100,6 +101,7 @@ impl ModelProvider {
             Self::OllamaLocal => "ollama-local",
             Self::ClaudeCli => "claude-cli",
             Self::CodexCli => "codex-cli",
+            Self::Huggingface => "huggingface",
         }
     }
 }
@@ -107,7 +109,10 @@ impl ModelProvider {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ModelMutation {
-    Refresh,
+    Refresh {
+        #[serde(default)]
+        provider: Option<ModelProvider>,
+    },
     Enable {
         provider: ModelProvider,
         model: String,
@@ -115,6 +120,11 @@ pub enum ModelMutation {
     Disable {
         provider: ModelProvider,
         model: String,
+    },
+    SetRoute {
+        provider: ModelProvider,
+        model: String,
+        route: String,
     },
 }
 
@@ -163,6 +173,8 @@ pub struct ModelRecord {
     pub model: String,
     pub enabled: bool,
     pub source: String,
+    #[serde(default)]
+    pub route: Option<String>,
     #[serde(default = "unknown_price_status")]
     pub price_status: String,
     #[serde(default)]
@@ -445,6 +457,34 @@ pub fn models(session: &SessionManager) -> AdminResult<Vec<ModelRecord>> {
     Ok(parse_json::<ModelPolicy>(&session.run(BrokerRequest::Models)?.stdout)?.models)
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct HfProvidersResponse {
+    pub model: String,
+    pub routes: Vec<String>,
+    pub providers: Vec<HfProviderRecord>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct HfProviderRecord {
+    pub provider: String,
+    pub status: String,
+    pub context_length: Option<u64>,
+    pub input_per_million_usd: Option<f64>,
+    pub output_per_million_usd: Option<f64>,
+    pub supports_tools: Option<bool>,
+    pub supports_structured_output: Option<bool>,
+    pub first_token_latency_ms: Option<f64>,
+    pub throughput: Option<f64>,
+}
+
+pub fn model_providers(
+    session: &SessionManager,
+    model: String,
+) -> AdminResult<HfProvidersResponse> {
+    validate_model(&model)?;
+    parse_json(&session.run(BrokerRequest::ModelProviders { model })?.stdout)
+}
+
 pub fn usage(session: &SessionManager) -> AdminResult<UsageReport> {
     parse_json(&session.run(BrokerRequest::Usage)?.stdout)
 }
@@ -697,6 +737,20 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
             vec!["--json".to_owned(), "models".to_owned(), "list".to_owned()],
             Duration::from_secs(120),
         ),
+        BrokerRequest::ModelProviders { model } => {
+            validate_model(&model)?;
+            (
+                ADMIN,
+                vec![
+                    "--json".to_owned(),
+                    "models".to_owned(),
+                    "providers".to_owned(),
+                    "huggingface".to_owned(),
+                    model,
+                ],
+                Duration::from_secs(120),
+            )
+        }
         BrokerRequest::Usage => (
             ADMIN,
             vec!["--json".to_owned(), "usage".to_owned()],
@@ -704,7 +758,12 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
         ),
         BrokerRequest::ModelMutation { request } => {
             let args = match request {
-                ModelMutation::Refresh => vec!["models".to_owned(), "refresh".to_owned()],
+                ModelMutation::Refresh { provider } => {
+                    vec!["models".to_owned(), "refresh".to_owned()]
+                        .into_iter()
+                        .chain(provider.map(|provider| provider.cli_name().to_owned()))
+                        .collect()
+                }
                 ModelMutation::Enable { provider, model } => {
                     validate_model(&model)?;
                     vec![
@@ -721,6 +780,24 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
                         "disable".to_owned(),
                         provider.cli_name().to_owned(),
                         model,
+                    ]
+                }
+                ModelMutation::SetRoute {
+                    provider,
+                    model,
+                    route,
+                } => {
+                    validate_model(&model)?;
+                    validate_hf_route(&route)?;
+                    if !matches!(provider, ModelProvider::Huggingface) {
+                        return Err("routes are supported only for huggingface".to_owned());
+                    }
+                    vec![
+                        "models".to_owned(),
+                        "set-route".to_owned(),
+                        provider.cli_name().to_owned(),
+                        model,
+                        route,
                     ]
                 }
             };
@@ -850,6 +927,20 @@ fn validate_model(value: &str) -> AdminResult<()> {
     }
 }
 
+fn validate_hf_route(value: &str) -> AdminResult<()> {
+    if matches!(value, "auto" | "fastest" | "cheapest" | "preferred")
+        || (!value.is_empty()
+            && value.len() <= 64
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+            }))
+    {
+        Ok(())
+    } else {
+        Err("invalid Hugging Face route".to_owned())
+    }
+}
+
 fn safe_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -962,6 +1053,8 @@ mod tests {
         assert!(validate_version("latest;sh").is_err());
         assert!(validate_model("gpt-5.1-mini").is_ok());
         assert!(validate_model("model\n--flag").is_err());
+        assert!(validate_hf_route("groq").is_ok());
+        assert!(validate_hf_route("https://evil").is_err());
     }
 
     #[test]
@@ -1010,6 +1103,21 @@ mod tests {
         .unwrap();
         assert_eq!(policy.models[0].price_status, "unknown");
         assert_eq!(policy.models[0].input_per_million_usd, None);
+        assert_eq!(policy.models[0].route, None);
+    }
+
+    #[test]
+    fn model_route_mutation_is_a_typed_frontend_request() {
+        let refresh: ModelMutation = serde_json::from_str(r#"{"action":"refresh"}"#).unwrap();
+        assert!(matches!(refresh, ModelMutation::Refresh { provider: None }));
+        let request: ModelMutation = serde_json::from_str(
+            r#"{"action":"set_route","provider":"huggingface","model":"openai/gpt-oss-20b","route":"groq"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
+            ModelMutation::SetRoute { provider: ModelProvider::Huggingface, route, .. } if route == "groq"
+        ));
     }
 
     #[test]

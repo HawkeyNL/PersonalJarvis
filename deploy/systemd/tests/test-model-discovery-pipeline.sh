@@ -47,6 +47,34 @@ jq -e '
   . == [["openai-api", "gpt-fixture", "provider_api"]]
 ' <<<"$openai_discovered" >/dev/null
 
+huggingface_response=$(<"$repo_dir/deploy/systemd/tests/fixtures/huggingface-models.json")
+huggingface_discovered=$(
+    parse_remote_model_response huggingface "$huggingface_response" |
+        aggregate_discovered_models
+)
+jq -e '
+  length == 2
+  and all(.[]; .[0] == "huggingface" and .[2] == "provider_api")
+' <<<"$huggingface_discovered" >/dev/null
+huggingface_catalog=$(normalize_huggingface_catalog "$huggingface_response")
+jq -e '
+  .version == 1
+  and (.models | length == 2)
+  and (.models[] | select(.id == "openai/gpt-oss-fixture") | .providers | length == 3)
+  and any(.models[] | select(.id == "openai/gpt-oss-fixture") | .providers[];
+    .provider == "groq" and .status == "live" and .input_per_million_usd == 0.04
+    and .output_per_million_usd == 0.15 and .supports_tools == true)
+  and any(.models[] | select(.id == "openai/gpt-oss-fixture") | .providers[];
+    .provider == "deepinfra" and .status == "live" and .input_per_million_usd == 0.05
+    and .output_per_million_usd == null)
+' <<<"$huggingface_catalog" >/dev/null
+valid_huggingface_route_syntax fastest
+valid_huggingface_route_syntax groq
+if valid_huggingface_route_syntax 'groq/../../bad'; then
+    echo "unsafe Hugging Face route syntax accepted" >&2
+    exit 1
+fi
+
 empty_discovered=$(
     parse_remote_model_response ollama-cloud '{"models":[]}' |
         aggregate_discovered_models
@@ -63,5 +91,8 @@ jq -e '
     and .source == "provider_api"
   )
 ' <<<"$merged" >/dev/null
+
+hf_merged=$(merge_model_policy '{"version":1,"models":[]}' "$huggingface_discovered")
+jq -e 'all(.models[]; .provider == "huggingface" and .enabled == false and (.route | not))' <<<"$hf_merged" >/dev/null
 
 echo "Model discovery pipeline tests passed"

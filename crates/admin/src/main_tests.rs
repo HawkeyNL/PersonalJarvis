@@ -131,6 +131,30 @@ fn typed_model_input_rejects_newline_injection() {
     assert!(Cli::try_parse_from(["jarvis", "models", "enable", "openai-api", "x\ny"]).is_err());
 }
 
+#[test]
+fn huggingface_route_cli_is_typed_and_rejects_shell_or_url_input() {
+    assert!(Cli::try_parse_from([
+        "jarvis",
+        "models",
+        "set-route",
+        "huggingface",
+        "openai/gpt-oss-20b",
+        "groq",
+    ])
+    .is_ok());
+    for route in ["https://evil", "groq;sh", "a/b", "line\nbreak"] {
+        assert!(Cli::try_parse_from([
+            "jarvis",
+            "models",
+            "set-route",
+            "huggingface",
+            "openai/gpt-oss-20b",
+            route,
+        ])
+        .is_err());
+    }
+}
+
 fn admin_helper_layout(
     admin_helpers: bool,
 ) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, u32, u32) {

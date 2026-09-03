@@ -41,7 +41,9 @@ mod tui_app;
 mod update_center;
 mod usage_insights;
 
-use admin_helpers::{compatibility_helper, trusted_admin_helper_command, AdminHelper};
+use admin_helpers::{
+    compatibility_helper, compatibility_helper_output, trusted_admin_helper_command, AdminHelper,
+};
 #[cfg(test)]
 use admin_helpers::{explicit_helper_subprocess_mode, resolve_admin_helper};
 #[cfg(test)]
@@ -184,11 +186,33 @@ struct ModelsArgs {
 }
 #[derive(Debug, Subcommand)]
 enum ModelsCommand {
-    Refresh { provider: Option<Provider> },
-    List { provider: Option<Provider> },
-    Enable { provider: Provider, model: ModelId },
-    Disable { provider: Provider, model: ModelId },
-    Show { provider: Provider, model: ModelId },
+    Refresh {
+        provider: Option<Provider>,
+    },
+    List {
+        provider: Option<Provider>,
+    },
+    Enable {
+        provider: Provider,
+        model: ModelId,
+    },
+    Disable {
+        provider: Provider,
+        model: ModelId,
+    },
+    Show {
+        provider: Provider,
+        model: ModelId,
+    },
+    Providers {
+        provider: Provider,
+        model: ModelId,
+    },
+    SetRoute {
+        provider: Provider,
+        model: ModelId,
+        route: HfRoute,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -221,6 +245,7 @@ enum Provider {
     OllamaCloud,
     #[value(name = "claude-cli")]
     ClaudeCli,
+    Huggingface,
 }
 impl Provider {
     fn as_str(&self) -> &'static str {
@@ -233,6 +258,7 @@ impl Provider {
             Self::Ollama => "ollama",
             Self::OllamaCloud => "ollama-cloud",
             Self::ClaudeCli => "claude-cli",
+            Self::Huggingface => "huggingface",
         }
     }
 }
@@ -246,6 +272,7 @@ enum CredentialProvider {
     Zai,
     #[value(name = "ollama-cloud")]
     OllamaCloud,
+    Huggingface,
 }
 impl CredentialProvider {
     fn as_str(&self) -> &'static str {
@@ -256,6 +283,7 @@ impl CredentialProvider {
             Self::Xai => "xai",
             Self::Zai => "zai",
             Self::OllamaCloud => "ollama-cloud",
+            Self::Huggingface => "huggingface",
         }
     }
 }
@@ -269,6 +297,30 @@ impl std::str::FromStr for ModelId {
             return Err("model must be 1..=256 characters without newlines".to_owned());
         }
         Ok(Self(value.to_owned()))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HfRoute(String);
+
+impl std::str::FromStr for HfRoute {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if matches!(value, "auto" | "fastest" | "cheapest" | "preferred")
+            || (!value.is_empty()
+                && value.len() <= 64
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'-'
+                        || byte == b'_'
+                }))
+        {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err("invalid Hugging Face route".into())
+        }
     }
 }
 
@@ -1099,6 +1151,8 @@ struct ModelRecord {
     model: String,
     enabled: bool,
     source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route: Option<String>,
 }
 
 fn read_model_policy() -> Result<ModelPolicy> {
@@ -1125,7 +1179,9 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
     if presentation.json
         && !matches!(
             &args.command,
-            ModelsCommand::List { .. } | ModelsCommand::Show { .. }
+            ModelsCommand::List { .. }
+                | ModelsCommand::Show { .. }
+                | ModelsCommand::Providers { .. }
         )
     {
         bail!("--json is supported only for read-only models list/show");
@@ -1162,6 +1218,7 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
                             model.price_status,
                         ),
                         model.price_status.to_owned(),
+                        model.route.unwrap_or_else(|| "—".into()),
                         model.source,
                     ]
                 })
@@ -1176,6 +1233,7 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
                     "Cached $/1M",
                     "Output $/1M",
                     "Pricing",
+                    "HF Route",
                     "Source",
                 ]
                 .into_iter()
@@ -1186,18 +1244,19 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
             );
         } else {
             println!(
-                "{:<16} {:<36} {:<8} {:<12} {:<12} {:<12} {:<9} SOURCE",
+                "{:<16} {:<36} {:<8} {:<12} {:<12} {:<12} {:<9} {:<12} SOURCE",
                 "PROVIDER",
                 "MODEL",
                 "ENABLED",
                 "INPUT $/1M",
                 "CACHED $/1M",
                 "OUTPUT $/1M",
-                "PRICING"
+                "PRICING",
+                "HF ROUTE"
             );
             for model in priced.models {
                 println!(
-                    "{:<16} {:<36} {:<8} {:<12} {:<12} {:<12} {:<9} {}",
+                    "{:<16} {:<36} {:<8} {:<12} {:<12} {:<12} {:<9} {:<12} {}",
                     model.provider,
                     model.model,
                     if model.enabled { "yes" } else { "no" },
@@ -1214,6 +1273,7 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
                         model.price_status,
                     ),
                     model.price_status,
+                    model.route.unwrap_or_else(|| "—".into()),
                     model.source
                 );
             }
@@ -1238,8 +1298,88 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
         ModelsCommand::Show { provider, model } => {
             vec!["show".to_owned(), provider.as_str().to_owned(), model.0]
         }
+        ModelsCommand::Providers { provider, model } => {
+            return model_providers(provider, model, presentation);
+        }
+        ModelsCommand::SetRoute {
+            provider,
+            model,
+            route,
+        } => {
+            if !matches!(provider, Provider::Huggingface) {
+                bail!("routes are supported only for huggingface");
+            }
+            vec![
+                "set-route".to_owned(),
+                provider.as_str().to_owned(),
+                model.0,
+                route.0,
+            ]
+        }
     };
     compatibility_helper(AdminHelper::Models, arguments, verbose)
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct HfProvidersResponse {
+    model: String,
+    routes: Vec<String>,
+    providers: Vec<HfProviderRecord>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct HfProviderRecord {
+    provider: String,
+    status: String,
+    context_length: Option<u64>,
+    input_per_million_usd: Option<f64>,
+    output_per_million_usd: Option<f64>,
+    supports_tools: Option<bool>,
+    supports_structured_output: Option<bool>,
+    first_token_latency_ms: Option<f64>,
+    throughput: Option<f64>,
+}
+
+fn model_providers(provider: Provider, model: ModelId, presentation: &Presentation) -> Result<()> {
+    if !matches!(provider, Provider::Huggingface) {
+        bail!("inference provider discovery is supported only for huggingface");
+    }
+    let output = compatibility_helper_output(
+        AdminHelper::Models,
+        vec!["providers".into(), provider.as_str().into(), model.0],
+    )?;
+    let response: HfProvidersResponse =
+        serde_json::from_slice(&output).context("parse trusted Hugging Face provider catalog")?;
+    if presentation.json {
+        println!("{}", serde_json::to_string(&response)?);
+        return Ok(());
+    }
+    println!("Model: {}", response.model);
+    println!("Available routes: {}", response.routes.join(", "));
+    println!(
+        "{:<16} {:<10} {:<12} {:<12} {:<10} {:<10} {:<7} STRUCTURED",
+        "ROUTE", "STATUS", "INPUT/M", "OUTPUT/M", "TTFT", "TOK/S", "TOOLS"
+    );
+    for item in response.providers {
+        println!(
+            "{:<16} {:<10} {:<12} {:<12} {:<10} {:<10} {:<7} {}",
+            item.provider,
+            item.status,
+            item.input_per_million_usd
+                .map_or_else(|| "—".into(), |v| format!("${v:.4}")),
+            item.output_per_million_usd
+                .map_or_else(|| "—".into(), |v| format!("${v:.4}")),
+            item.first_token_latency_ms
+                .map_or_else(|| "—".into(), |v| format!("{v:.0}ms")),
+            item.throughput
+                .map_or_else(|| "—".into(), |v| format!("{v:.1}")),
+            item.supports_tools
+                .map_or("—", |v| if v { "yes" } else { "no" }),
+            item.supports_structured_output
+                .map_or("—", |v| if v { "yes" } else { "no" }),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -1259,6 +1399,7 @@ fn credential_statuses() -> Vec<CredentialStatus> {
         "xai",
         "zai",
         "ollama-cloud",
+        "huggingface",
     ]
     .into_iter()
     .map(|provider| {

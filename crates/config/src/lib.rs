@@ -210,6 +210,27 @@ pub struct AppConfig {
     #[serde(default)]
     pub llm_ollama_cloud_model_cheap: String,
 
+    /// Hugging Face Inference Providers. The token is opaque and backend-only;
+    /// model authorization remains in the root-owned model policy.
+    #[serde(default)]
+    pub llm_huggingface_api_key: String,
+    #[serde(default = "default_huggingface_base_url")]
+    pub llm_huggingface_base_url: String,
+    #[serde(default)]
+    pub llm_huggingface_model: String,
+    #[serde(default)]
+    pub llm_huggingface_model_hard: String,
+    #[serde(default)]
+    pub llm_huggingface_model_cheap: String,
+    #[serde(default = "default_huggingface_route")]
+    pub llm_huggingface_route: String,
+    #[serde(default = "default_huggingface_route_cheap")]
+    pub llm_huggingface_route_cheap: String,
+    #[serde(default = "default_huggingface_route_hard")]
+    pub llm_huggingface_route_hard: String,
+    #[serde(default = "default_huggingface_catalog_path")]
+    pub llm_huggingface_catalog_path: String,
+
     /// Hard monthly spend cap (EUR) across all metered API backends. Once
     /// reached, the router refuses paid calls and falls back to the plan/Ollama.
     #[serde(default = "default_llm_monthly_budget_eur")]
@@ -454,6 +475,26 @@ fn default_zai_base_url() -> String {
     "https://api.z.ai/api/paas/v4".to_string()
 }
 
+fn default_huggingface_base_url() -> String {
+    "https://router.huggingface.co/v1".to_string()
+}
+
+fn default_huggingface_route() -> String {
+    "fastest".to_string()
+}
+
+fn default_huggingface_route_cheap() -> String {
+    "cheapest".to_string()
+}
+
+fn default_huggingface_route_hard() -> String {
+    "preferred".to_string()
+}
+
+fn default_huggingface_catalog_path() -> String {
+    "/etc/jarvis/huggingface-catalog.json".to_string()
+}
+
 fn default_llm_monthly_budget_eur() -> f64 {
     50.0
 }
@@ -588,6 +629,26 @@ impl AppConfig {
         {
             return Err("JARVIS_PUBLIC_HOSTNAME must be a bare DNS hostname".to_string());
         }
+        for route in [
+            &self.llm_huggingface_route,
+            &self.llm_huggingface_route_cheap,
+            &self.llm_huggingface_route_hard,
+        ] {
+            if !matches!(
+                route.as_str(),
+                "auto" | "fastest" | "cheapest" | "preferred"
+            ) && (route.is_empty()
+                || route.len() > 64
+                || !route.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'-'
+                        || byte == b'_'
+                }))
+            {
+                return Err("invalid Hugging Face inference provider route".to_string());
+            }
+        }
         Ok(())
     }
 }
@@ -645,6 +706,17 @@ impl fmt::Debug for AppConfig {
             )
             .field("llm_ollama_cloud_base_url", &self.llm_ollama_cloud_base_url)
             .field("llm_ollama_cloud_model", &self.llm_ollama_cloud_model)
+            .field(
+                "llm_huggingface_api_key",
+                &redact(&self.llm_huggingface_api_key),
+            )
+            .field("llm_huggingface_base_url", &self.llm_huggingface_base_url)
+            .field("llm_huggingface_model", &self.llm_huggingface_model)
+            .field("llm_huggingface_route", &self.llm_huggingface_route)
+            .field(
+                "llm_huggingface_catalog_path",
+                &self.llm_huggingface_catalog_path,
+            )
             .field("llm_monthly_budget_eur", &self.llm_monthly_budget_eur)
             .field(
                 "llm_monthly_soft_budget_eur",
@@ -734,6 +806,15 @@ mod tests {
             llm_ollama_cloud_model: String::new(),
             llm_ollama_cloud_model_hard: String::new(),
             llm_ollama_cloud_model_cheap: String::new(),
+            llm_huggingface_api_key: "hf-supersecret".to_string(),
+            llm_huggingface_base_url: default_huggingface_base_url(),
+            llm_huggingface_model: String::new(),
+            llm_huggingface_model_hard: String::new(),
+            llm_huggingface_model_cheap: String::new(),
+            llm_huggingface_route: default_huggingface_route(),
+            llm_huggingface_route_cheap: default_huggingface_route_cheap(),
+            llm_huggingface_route_hard: default_huggingface_route_hard(),
+            llm_huggingface_catalog_path: default_huggingface_catalog_path(),
             llm_monthly_budget_eur: 50.0,
             llm_monthly_soft_budget_eur: 40.0,
             llm_request_hard_cap_eur: 5.0,
@@ -781,11 +862,19 @@ mod tests {
             jail.set_env("JARVIS_SURREAL_PASSWORD", "test-password");
             jail.set_env("JARVIS_BIND_ADDR", "127.0.0.1:9999");
             jail.set_env("JARVIS_LOG_JSON", "true");
+            jail.set_env("JARVIS_LLM_HUGGINGFACE_API_KEY", "hf-fixture-secret");
+            jail.set_env("JARVIS_LLM_HUGGINGFACE_ROUTE", "groq");
 
             let cfg = AppConfig::load()?;
             assert_eq!(cfg.bind_addr, "127.0.0.1:9999");
             assert_eq!(cfg.surreal_endpoint, "127.0.0.1:8000");
             assert!(cfg.log_json);
+            assert_eq!(cfg.llm_huggingface_api_key, "hf-fixture-secret");
+            assert_eq!(
+                cfg.llm_huggingface_base_url,
+                "https://router.huggingface.co/v1"
+            );
+            assert_eq!(cfg.llm_huggingface_route, "groq");
             assert_eq!(cfg.environment, "development"); // default
             Ok(())
         });
@@ -844,6 +933,15 @@ mod tests {
             llm_ollama_cloud_model: String::new(),
             llm_ollama_cloud_model_hard: String::new(),
             llm_ollama_cloud_model_cheap: String::new(),
+            llm_huggingface_api_key: String::new(),
+            llm_huggingface_base_url: default_huggingface_base_url(),
+            llm_huggingface_model: String::new(),
+            llm_huggingface_model_hard: String::new(),
+            llm_huggingface_model_cheap: String::new(),
+            llm_huggingface_route: default_huggingface_route(),
+            llm_huggingface_route_cheap: default_huggingface_route_cheap(),
+            llm_huggingface_route_hard: default_huggingface_route_hard(),
+            llm_huggingface_catalog_path: default_huggingface_catalog_path(),
             llm_monthly_budget_eur: 0.0,
             llm_monthly_soft_budget_eur: 0.0,
             llm_request_hard_cap_eur: 0.0,

@@ -232,10 +232,18 @@ pub struct ChatReply {
     /// The concrete model that produced it.
     pub model: String,
     /// Which backend produced it (`anthropic-api`, `openai-api`, `deepseek-api`,
-    /// `claude-cli`, `ollama`). Drives cost attribution — plan/local are free,
+    /// `huggingface`, `claude-cli`, `ollama`). Drives cost attribution — plan/local are free,
     /// only the metered API backends count against the monthly budget.
     #[serde(default)]
     pub backend: Option<String>,
+    /// Non-secret Hugging Face execution policy requested by the owner. This
+    /// is separate from the base model identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_route: Option<String>,
+    /// Infrastructure provider only when the remote API reports it reliably.
+    /// Automatic HF routing remains `None` rather than being guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_provider: Option<String>,
     /// Provider stop reason, when reported.
     pub stop_reason: Option<String>,
     /// Token usage, when the provider reports it.

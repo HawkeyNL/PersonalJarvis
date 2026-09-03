@@ -10,6 +10,9 @@ readonly policy_dir=/etc/jarvis
 readonly core_env=/etc/jarvis/core.env
 readonly ollama_cloud_default_base_url=https://ollama.com/v1
 readonly ollama_cloud_tags_url=https://ollama.com/api/tags
+readonly huggingface_default_base_url=https://router.huggingface.co/v1
+readonly huggingface_catalog_file=/etc/jarvis/huggingface-catalog.json
+readonly max_huggingface_catalog_bytes=8388608
 
 fail() { echo "jarvis-models: $*" >&2; exit 1; }
 
@@ -21,6 +24,8 @@ Usage:
   sudo jarvis-models enable <provider> <model>
   sudo jarvis-models disable <provider> <model>
   sudo jarvis-models show <provider> <model>
+  sudo jarvis-models providers huggingface <model>
+  sudo jarvis-models set-route huggingface <model> <route>
 
 `refresh` records configured models as discovered but leaves every remote or
 subscription-backed model disabled. Local Ollama remains enabled by default;
@@ -30,7 +35,7 @@ EOF
 }
 
 valid_provider() {
-    [[ $1 =~ ^(anthropic-api|openai-api|deepseek-api|xai-api|zai-api|ollama|ollama-cloud|claude-cli)$ ]]
+    [[ $1 =~ ^(anthropic-api|openai-api|deepseek-api|xai-api|zai-api|ollama|ollama-cloud|claude-cli|huggingface)$ ]]
 }
 
 # Older pre-release installs could leave /etc/jarvis or model-policy.json with
@@ -79,6 +84,21 @@ atomic_write() {
     trap - RETURN
 }
 
+atomic_write_huggingface_catalog() {
+    local content=$1 tmp
+    tmp=$(mktemp "$policy_dir/.huggingface-catalog.XXXXXX")
+    trap 'rm -f -- "$tmp"' RETURN
+    umask 077
+    printf '%s\n' "$content" > "$tmp"
+    [[ $(stat -c %s "$tmp") -le $max_huggingface_catalog_bytes ]] || fail "huggingface catalog exceeds the size limit"
+    jq -e '.version == 1 and (.models | type == "array" and length <= 2000)' "$tmp" >/dev/null ||
+        fail "huggingface catalog normalization failed"
+    chown root:jarvis "$tmp"
+    chmod 0640 "$tmp"
+    mv -f -- "$tmp" "$huggingface_catalog_file"
+    trap - RETURN
+}
+
 empty_policy() { printf '%s\n' '{"version":1,"models":[]}'; }
 
 require_policy() {
@@ -92,11 +112,9 @@ configured_models() {
     # `core.env` may contain database credentials.  It is sourced only by root
     # in this process and none of its values are printed or passed as argv.
     [[ -f $core_env && ! -L $core_env ]] || fail "missing protected Core configuration"
-    set -a
     # shellcheck source=/etc/jarvis/core.env
     # shellcheck disable=SC1091
     source "$core_env"
-    set +a
     jq -n \
         --arg anthropic_default "${JARVIS_LLM_MODEL:-}" \
         --arg anthropic_hard "${JARVIS_LLM_MODEL_HARD:-}" \
@@ -116,6 +134,9 @@ configured_models() {
         --arg ollama_cloud_default "${JARVIS_LLM_OLLAMA_CLOUD_MODEL:-}" \
         --arg ollama_cloud_hard "${JARVIS_LLM_OLLAMA_CLOUD_MODEL_HARD:-}" \
         --arg ollama_cloud_cheap "${JARVIS_LLM_OLLAMA_CLOUD_MODEL_CHEAP:-}" \
+        --arg huggingface_default "${JARVIS_LLM_HUGGINGFACE_MODEL:-}" \
+        --arg huggingface_hard "${JARVIS_LLM_HUGGINGFACE_MODEL_HARD:-}" \
+        --arg huggingface_cheap "${JARVIS_LLM_HUGGINGFACE_MODEL_CHEAP:-}" \
         --arg ollama "${JARVIS_LLM_OLLAMA_MODEL:-}" \
         '[
           ["anthropic-api", $anthropic_default], ["anthropic-api", $anthropic_hard], ["anthropic-api", $anthropic_cheap],
@@ -124,6 +145,7 @@ configured_models() {
           ["xai-api", $xai_default], ["xai-api", $xai_hard], ["xai-api", $xai_cheap],
           ["zai-api", $zai_default], ["zai-api", $zai_hard], ["zai-api", $zai_cheap],
           ["ollama-cloud", $ollama_cloud_default], ["ollama-cloud", $ollama_cloud_hard], ["ollama-cloud", $ollama_cloud_cheap],
+          ["huggingface", $huggingface_default], ["huggingface", $huggingface_hard], ["huggingface", $huggingface_cheap],
           ["ollama", $ollama]
         ] | map(select(.[1] != "")) | unique'
 }
@@ -135,8 +157,24 @@ provider_secret_var() {
         xai-api) printf '%s\n' JARVIS_LLM_XAI_API_KEY ;;
         zai-api) printf '%s\n' JARVIS_LLM_ZAI_API_KEY ;;
         ollama-cloud) printf '%s\n' JARVIS_LLM_OLLAMA_CLOUD_API_KEY ;;
+        huggingface) printf '%s\n' JARVIS_LLM_HUGGINGFACE_API_KEY ;;
         *) return 1 ;;
     esac
+}
+
+read_credential_value() {
+    local file=$1 variable=$2 line
+    [[ $(wc -l < "$file") -eq 1 ]] || return 1
+    IFS= read -r line < "$file" || [[ -n $line ]] || return 1
+    [[ $line == "$variable="* ]] || return 1
+    printf '%s' "${line#*=}"
+}
+
+curl_config_escape() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '%s' "$value"
 }
 
 provider_base_url() {
@@ -146,6 +184,7 @@ provider_base_url() {
         xai-api) printf '%s\n' "${JARVIS_LLM_XAI_BASE_URL:-https://api.x.ai/v1}" ;;
         zai-api) printf '%s\n' "${JARVIS_LLM_ZAI_BASE_URL:-https://api.z.ai/api/paas/v4}" ;;
         ollama-cloud) printf '%s\n' "${JARVIS_LLM_OLLAMA_CLOUD_BASE_URL:-$ollama_cloud_default_base_url}" ;;
+        huggingface) printf '%s\n' "${JARVIS_LLM_HUGGINGFACE_BASE_URL:-$huggingface_default_base_url}" ;;
         *) return 1 ;;
     esac
 }
@@ -157,12 +196,47 @@ parse_remote_model_response() {
     local provider=$1 response=$2 jq_filter
     case $provider in
         ollama-cloud) jq_filter='.models[]?.name?' ;;
-        openai-api|deepseek-api|xai-api|zai-api) jq_filter='.data[]?.id?' ;;
+        openai-api|deepseek-api|xai-api|zai-api|huggingface) jq_filter='.data[]?.id?' ;;
         *) return 1 ;;
     esac
     jq -c --arg provider "$provider" \
-        "$jq_filter | select(type == \"string\" and length > 0 and length <= 256) | [\$provider, .]" \
+        "$jq_filter | select(type == \"string\" and length > 0 and length <= 256 and (test(\"[[:cntrl:]]\") | not)) | [\$provider, .]" \
         <<<"$response" || true
+}
+
+normalize_huggingface_catalog() {
+    local response=$1 discovered_at
+    discovered_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    jq -c --arg discovered_at "$discovered_at" '
+      def safe_text($max): type == "string" and length > 0 and length <= $max and (test("[[:cntrl:]]") | not);
+      def metric($max): if type == "number" and . >= 0 and . <= $max then . else null end;
+      def price: if type == "number" and . > 0 and . <= 1000000 then . else null end;
+      {
+        version: 1,
+        discovered_at: $discovered_at,
+        models: [
+          .data[0:2000][]?
+          | select((.id | safe_text(256)))
+          | {
+              id: .id,
+              providers: ([
+                .providers[0:64][]?
+                | select((.provider | safe_text(64)) and (.provider | test("^[a-z0-9_-]+$")))
+                | {
+                    provider: .provider,
+                    status: (if (.status | safe_text(32)) then .status else "unknown" end),
+                    context_length: (if (.context_length | type) == "number" and .context_length >= 0 and .context_length <= 100000000 then .context_length else null end),
+                    input_per_million_usd: (.pricing.input | price),
+                    output_per_million_usd: (.pricing.output | price),
+                    supports_tools: (if (.supports_tools | type) == "boolean" then .supports_tools else null end),
+                    supports_structured_output: (if (.supports_structured_output | type) == "boolean" then .supports_structured_output else null end),
+                    first_token_latency_ms: (.first_token_latency_ms | metric(1000000000)),
+                    throughput: (.throughput | metric(1000000000))
+                  }
+              ] | unique_by(.provider))
+            }
+        ] | unique_by(.id)
+      }' <<<"$response"
 }
 
 aggregate_discovered_models() {
@@ -191,19 +265,16 @@ merge_model_policy() {
 # providers expose `data[].id`; Ollama Cloud exposes its native authenticated
 # `/api/tags` metadata as `models[].name` even though chat uses `/v1`.
 discover_remote_models() {
-    local provider=$1 variable credential_file key config response url
+    local provider=$1 variable credential_file key escaped_key config response url
     variable=$(provider_secret_var "$provider") || return 0
     credential_file="/etc/jarvis/secrets/${provider%-api}.env"
     [[ $provider != ollama-cloud ]] || credential_file=/etc/jarvis/secrets/ollama-cloud.env
     [[ -f $credential_file && ! -L $credential_file ]] || return 0
-    set -a
-    # shellcheck disable=SC1090,SC1091 # root-managed credential input
-    source "$credential_file"
-    set +a
-    key=${!variable:-}
+    [[ $(stat -c '%U:%G:%a' "$credential_file" 2>/dev/null || true) == root:jarvis:640 ]] || return 0
+    key=$(read_credential_value "$credential_file" "$variable") || return 0
     [[ -n $key ]] || return 0
     config=$(mktemp /run/jarvis-model-discovery.XXXXXX)
-    trap 'rm -f -- "$config"; unset key' RETURN
+    trap 'rm -f -- "$config"; unset key escaped_key' RETURN
     umask 077
     if [[ $provider == ollama-cloud ]]; then
         url=$ollama_cloud_tags_url
@@ -213,15 +284,23 @@ discover_remote_models() {
         [[ -n $base && $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 0
         url="${base%/}/models"
     fi
-    printf 'url = "%s"\nheader = "Authorization: Bearer %s"\n' "$url" "$key" > "$config"
-    unset key
-    response=$(curl --config "$config" --fail --silent --show-error --max-time 10 2>/dev/null) || {
+    escaped_key=$(curl_config_escape "$key")
+    printf 'url = "%s"\nheader = "Authorization: Bearer %s"\n' "$url" "$escaped_key" > "$config"
+    unset key escaped_key
+    response=$(curl --config "$config" --fail --silent --show-error --max-time 10 --max-filesize "$max_huggingface_catalog_bytes" 2>/dev/null) || {
         trap - RETURN
         rm -f -- "$config"
         return 0
     }
     trap - RETURN
     rm -f -- "$config"
+    [[ ${#response} -le $max_huggingface_catalog_bytes ]] || return 0
+    if [[ $provider == huggingface ]]; then
+        local normalized
+        normalized=$(normalize_huggingface_catalog "$response") || return 0
+        [[ $(jq '.models | length' <<<"$normalized") -gt 0 ]] || return 0
+        atomic_write_huggingface_catalog "$normalized"
+    fi
     parse_remote_model_response "$provider" "$response"
 }
 
@@ -236,7 +315,7 @@ refresh() {
         known=$(jq --arg provider "$provider" '[.[] | select(.[0] == $provider)]' <<<"$known")
     fi
     discovered='[]'
-    for candidate in openai-api deepseek-api xai-api zai-api ollama-cloud; do
+    for candidate in openai-api deepseek-api xai-api zai-api ollama-cloud huggingface; do
         [[ -z $provider || $provider == "$candidate" ]] || continue
         discovered=$(discover_remote_models "$candidate" | aggregate_discovered_models 2>/dev/null || printf '[]')
         if [[ -n $provider && $provider == "$candidate" && $discovered == '[]' ]]; then
@@ -250,6 +329,51 @@ refresh() {
     merged=$(merge_model_policy "$old" "$known")
     atomic_write "$merged"
     echo "jarvis-models: refreshed policy; new remote models remain disabled."
+}
+
+require_huggingface_catalog() {
+    [[ -f $huggingface_catalog_file && ! -L $huggingface_catalog_file ]] || fail "huggingface catalog is unavailable; run refresh first"
+    [[ $(stat -c '%U:%G:%a' "$huggingface_catalog_file") == root:jarvis:640 ]] || fail "huggingface catalog permissions are unsafe"
+    [[ $(stat -c %s "$huggingface_catalog_file") -le $max_huggingface_catalog_bytes ]] || fail "huggingface catalog exceeds the size limit"
+    jq -e '.version == 1 and (.models | type == "array" and length <= 2000)' "$huggingface_catalog_file" >/dev/null ||
+        fail "huggingface catalog is malformed"
+}
+
+list_huggingface_providers() {
+    local provider=$1 model=$2
+    [[ $provider == huggingface ]] || fail "inference provider discovery is supported only for huggingface"
+    require_huggingface_catalog
+    jq -e --arg model "$model" '
+      .models[] | select(.id == $model) |
+      {model:.id, routes:(["auto","fastest","cheapest","preferred"] + [.providers[] | select(.status == "live") | .provider] | unique), providers:.providers}' \
+      "$huggingface_catalog_file" || fail "huggingface model is not discovered"
+}
+
+valid_huggingface_route_syntax() {
+    [[ $1 =~ ^(auto|fastest|cheapest|preferred|[a-z0-9][a-z0-9_-]{0,63})$ ]]
+}
+
+set_huggingface_route() {
+    local provider=$1 model=$2 route=$3 updated
+    [[ $provider == huggingface ]] || fail "routes are supported only for huggingface"
+    valid_huggingface_route_syntax "$route" || fail "invalid huggingface inference provider route"
+    require_policy
+    require_huggingface_catalog
+    jq -e --arg model "$model" 'any(.models[]; .id == $model)' "$huggingface_catalog_file" >/dev/null ||
+        fail "huggingface model is not discovered"
+    if [[ ! $route =~ ^(auto|fastest|cheapest|preferred)$ ]]; then
+        jq -e --arg model "$model" --arg route "$route" \
+            'any(.models[] | select(.id == $model) | .providers[]; .provider == $route and .status == "live")' \
+            "$huggingface_catalog_file" >/dev/null ||
+            fail "huggingface/$model route $route is unavailable"
+    fi
+    jq -e --arg model "$model" 'any(.models[]; .provider == "huggingface" and .model == $model)' "$policy_file" >/dev/null ||
+        fail "model is not discovered; run refresh before selecting a route"
+    updated=$(jq --arg model "$model" --arg route "$route" \
+        '(.models[] | select(.provider == "huggingface" and .model == $model) | .route) = $route' "$policy_file")
+    atomic_write "$updated"
+    echo "jarvis-models: huggingface/$model route is now $route; model enablement is unchanged."
+    systemctl try-restart jarvis-core.service >/dev/null 2>&1 || true
 }
 
 list_models() {
@@ -299,6 +423,8 @@ main() {
         enable) (($# == 3)) || usage; set_state "$2" "$3" true ;;
         disable) (($# == 3)) || usage; set_state "$2" "$3" false ;;
         show) (($# == 3)) || usage; show_model "$2" "$3" ;;
+        providers) (($# == 3)) || usage; list_huggingface_providers "$2" "$3" ;;
+        set-route) (($# == 4)) || usage; set_huggingface_route "$2" "$3" "$4" ;;
         *) usage ;;
     esac
 }

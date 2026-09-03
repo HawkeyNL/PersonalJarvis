@@ -20,6 +20,7 @@ use super::{ModelPolicy, CURRENT_RELEASE, RELEASES_ROOT};
 const OWNER_PRICING_REGISTRY: &str = "/etc/jarvis/pricing-registry.json";
 const RELEASE_PRICING_REGISTRY: &str = "pricing-registry.json";
 const USAGE_SUMMARY: &str = "/var/lib/jarvis/usage-summary.json";
+const HUGGINGFACE_CATALOG: &str = "/etc/jarvis/huggingface-catalog.json";
 const MAX_DOCUMENT_SIZE: u64 = 512 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -46,6 +47,7 @@ pub(super) struct PricedModelRecord {
     pub(super) model: String,
     pub(super) enabled: bool,
     pub(super) source: String,
+    pub(super) route: Option<String>,
     pub(super) price_status: &'static str,
     pub(super) input_per_million_usd: Option<f64>,
     pub(super) cache_read_per_million_usd: Option<f64>,
@@ -260,12 +262,67 @@ fn read_layered_pricing_registry() -> Result<PricingRegistry> {
 
 pub(super) fn priced_model_policy(policy: ModelPolicy) -> Result<PricedModelPolicy> {
     let pricing = read_layered_pricing_registry()?;
-    Ok(priced_model_policy_with_registry(policy, &pricing))
+    let hf_catalog = read_huggingface_catalog().ok();
+    Ok(priced_model_policy_with_registry_and_hf(
+        policy,
+        &pricing,
+        hf_catalog.as_ref(),
+    ))
 }
 
+fn read_huggingface_catalog() -> Result<jarvis_llm::HuggingFaceCatalog> {
+    let path = Path::new(HUGGINGFACE_CATALOG);
+    let metadata = fs::symlink_metadata(path).context("inspect Hugging Face catalog")?;
+    let config = fs::symlink_metadata("/etc/jarvis").context("inspect config directory")?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.gid() != config.gid()
+        || metadata.permissions().mode() & 0o777 != 0o640
+    {
+        bail!("Hugging Face catalog permissions are unsafe");
+    }
+    jarvis_llm::HuggingFaceCatalog::load(path).map_err(anyhow::Error::msg)
+}
+
+pub(super) fn huggingface_routes_for_model(model: &str) -> Result<Vec<String>> {
+    let catalog = read_huggingface_catalog()?;
+    Ok(huggingface_routes(&catalog, model))
+}
+
+fn huggingface_routes(catalog: &jarvis_llm::HuggingFaceCatalog, model: &str) -> Vec<String> {
+    let mut routes = vec![
+        "auto".to_owned(),
+        "fastest".to_owned(),
+        "cheapest".to_owned(),
+        "preferred".to_owned(),
+    ];
+    if let Some(model) = catalog.model(model) {
+        routes.extend(
+            model
+                .providers
+                .iter()
+                .filter(|provider| provider.status == "live")
+                .map(|provider| provider.provider.clone()),
+        );
+    }
+    routes.sort();
+    routes.dedup();
+    routes
+}
+
+#[cfg(test)]
 fn priced_model_policy_with_registry(
     policy: ModelPolicy,
     pricing: &PricingRegistry,
+) -> PricedModelPolicy {
+    priced_model_policy_with_registry_and_hf(policy, pricing, None)
+}
+
+fn priced_model_policy_with_registry_and_hf(
+    policy: ModelPolicy,
+    pricing: &PricingRegistry,
+    hf_catalog: Option<&jarvis_llm::HuggingFaceCatalog>,
 ) -> PricedModelPolicy {
     let models = policy
         .models
@@ -279,30 +336,49 @@ fn priced_model_policy_with_registry(
                     | "xai-api"
                     | "zai-api"
                     | "ollama-cloud"
+                    | "huggingface"
             );
             let entry = pricing
                 .models
                 .iter()
                 .find(|entry| entry.provider == model.provider && entry.model == model.model);
+            let hf_price = (model.provider == "huggingface")
+                .then(|| hf_catalog?.conservative_price(&model.model, model.route.as_deref()?))
+                .flatten();
             PricedModelRecord {
                 provider: model.provider,
                 model: model.model,
                 enabled: model.enabled,
                 source: model.source,
+                route: model.route.clone(),
                 price_status: if local {
                     "local"
                 } else if entry.is_some() {
                     "known"
+                } else if hf_price.is_some() {
+                    if model.route.as_deref().is_some_and(|route| {
+                        !matches!(route, "auto" | "fastest" | "cheapest" | "preferred")
+                    }) {
+                        "estimated"
+                    } else {
+                        "conservative"
+                    }
                 } else {
                     "unknown"
                 },
-                input_per_million_usd: entry.map(|value| value.input_per_million_usd),
-                cache_read_per_million_usd: entry.and_then(|value| {
-                    value
-                        .cache_read_per_million_usd
-                        .or(Some(value.input_per_million_usd * 0.1))
-                }),
-                output_per_million_usd: entry.map(|value| value.output_per_million_usd),
+                input_per_million_usd: entry
+                    .map(|value| value.input_per_million_usd)
+                    .or(hf_price.map(|price| price.0)),
+                cache_read_per_million_usd: entry
+                    .and_then(|value| {
+                        value
+                            .cache_read_per_million_usd
+                            .or(Some(value.input_per_million_usd * 0.1))
+                    })
+                    .or(hf_price.map(|price| price.0)),
+                output_per_million_usd: entry
+                    .map(|value| value.output_per_million_usd)
+                    .or(hf_price.map(|price| price.1)),
                 pricing_source: pricing.source.clone(),
                 pricing_updated_at: pricing.updated_at.clone(),
             }
@@ -401,6 +477,40 @@ mod tests {
         assert_eq!(model.cache_read_per_million_usd, Some(0.035));
         assert_eq!(model.output_per_million_usd, Some(0.3));
         assert!(!model.enabled);
+    }
+
+    #[test]
+    fn huggingface_dynamic_route_is_explicitly_conservative() {
+        let registry: PricingRegistry = serde_json::from_str(
+            r#"{"version":1,"source":"fixture","updated_at":"2026-09-01","models":[]}"#,
+        )
+        .unwrap();
+        let policy: ModelPolicy = serde_json::from_str(
+            r#"{"version":1,"models":[{"provider":"huggingface","model":"org/model","enabled":true,"source":"provider_api","route":"fastest"}]}"#,
+        )
+        .unwrap();
+        let catalog = jarvis_llm::HuggingFaceCatalog {
+            version: 1,
+            discovered_at: "fixture".into(),
+            models: vec![jarvis_llm::HuggingFaceModel {
+                id: "org/model".into(),
+                providers: vec![jarvis_llm::HuggingFaceProviderMetadata {
+                    provider: "groq".into(),
+                    status: "live".into(),
+                    context_length: None,
+                    input_per_million_usd: Some(0.1),
+                    output_per_million_usd: Some(0.3),
+                    supports_tools: None,
+                    supports_structured_output: None,
+                    first_token_latency_ms: None,
+                    throughput: None,
+                }],
+            }],
+        };
+        let projected = priced_model_policy_with_registry_and_hf(policy, &registry, Some(&catalog));
+        assert_eq!(projected.models[0].price_status, "conservative");
+        assert_eq!(projected.models[0].output_per_million_usd, Some(0.3));
+        assert!(huggingface_routes(&catalog, "org/model").contains(&"groq".to_owned()));
     }
 
     #[test]
