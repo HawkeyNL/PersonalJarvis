@@ -456,7 +456,7 @@ mod tests {
         let request = captured.await.unwrap();
         assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
         assert!(request.contains("authorization: Bearer hf-fixture-secret"));
-        assert!(request.contains(r#"\"model\":\"openai/gpt-oss-20b:groq\""#));
+        assert!(request.contains(r#""model":"openai/gpt-oss-20b:groq""#));
         assert!(!format!("{reply:?}").contains("hf-fixture-secret"));
     }
 
