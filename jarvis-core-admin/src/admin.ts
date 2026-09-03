@@ -116,7 +116,15 @@ export interface UsageReport {
   daily: DailyUsageRow[];
   pricing: { source: string; updated_at: string };
 }
-export interface CredentialRecord { provider: string; configured: boolean }
+export type CredentialProvider =
+  | "anthropic"
+  | "openai"
+  | "deepseek"
+  | "xai"
+  | "zai"
+  | "ollama-cloud"
+  | "huggingface";
+export interface CredentialRecord { provider: CredentialProvider; configured: boolean }
 export type LogService =
   | "core"
   | "surrealdb"
@@ -161,6 +169,8 @@ export const api = {
   modelMutation: (request: Record<string, string>) =>
     invoke<OperationResult>("model_mutation", { request }),
   credentials: () => invoke<CredentialRecord[]>("credentials"),
+  credentialSet: (provider: CredentialProvider) =>
+    invoke<OperationResult>("credential_set", { provider }),
   logs: (service: LogService, lines = 500) =>
     invoke<LogResponse>("logs", { query: { service, lines } }),
   system: () => invoke<SystemResponse>("system"),

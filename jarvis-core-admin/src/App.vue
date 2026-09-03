@@ -13,14 +13,19 @@ import ServicesView from "./views/ServicesView.vue";
 import SystemView from "./views/SystemView.vue";
 import UpdateView from "./views/UpdateView.vue";
 
-const items: { id: ViewName; label: string }[] = [
-  { id: "overview", label: "Overview" }, { id: "health", label: "Health" },
-  { id: "services", label: "Services" }, { id: "update", label: "Update" },
-  { id: "agents", label: "Agents" }, { id: "models", label: "Models" },
-  { id: "usage", label: "Usage & Costs" },
-  { id: "credentials", label: "Credentials" }, { id: "logs", label: "Logs" },
-  { id: "system", label: "System" },
+const navSections: { label: string; items: { id: ViewName; label: string }[] }[] = [
+  { label: "Home", items: [{ id: "overview", label: "Overview" }] },
+  { label: "Operations", items: [
+    { id: "health", label: "Health" }, { id: "services", label: "Services" }, { id: "logs", label: "Logs" },
+  ] },
+  { label: "Intelligence", items: [
+    { id: "agents", label: "Agents" }, { id: "models", label: "Models" }, { id: "usage", label: "Usage & Costs" },
+  ] },
+  { label: "Administration", items: [
+    { id: "credentials", label: "Credentials" }, { id: "update", label: "Update" }, { id: "system", label: "System" },
+  ] },
 ];
+const items = navSections.flatMap((section) => section.items);
 const views = { overview: OverviewView, health: HealthView, services: ServicesView, update: UpdateView, agents: AgentsView, models: ModelsView, usage: UsageView, credentials: CredentialsView, logs: LogsView, system: SystemView };
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const TOUCH_INTERVAL_MS = 5 * 1000;
@@ -126,7 +131,7 @@ onBeforeUnmount(() => {
   <div class="app-shell" @pointermove="recordActivity" @pointerdown="recordActivity" @mouseenter="recordActivity" @wheel="recordActivity" @touchstart="recordActivity" @keydown="recordActivity" @focusin="recordActivity">
     <aside class="sidebar">
       <div class="brand"><div class="brand-mark"><i /></div><div><strong>JARVIS</strong><span>CORE ADMIN</span></div></div>
-      <nav aria-label="Administration sections"><button v-for="item in items" :key="item.id" :disabled="locked" :class="{ active: active === item.id }" @click="active = item.id"><NavIcon :name="item.id" /><span>{{ item.label }}</span></button></nav>
+      <nav aria-label="Administration sections"><div v-for="section in navSections" :key="section.label" class="nav-section"><span class="nav-category">{{ section.label }}</span><button v-for="item in section.items" :key="item.id" :disabled="locked" :class="{ active: active === item.id }" @click="active = item.id"><NavIcon :name="item.id" /><span>{{ item.label }}</span></button></div></nav>
       <div class="security-boundary"><span :class="['status-light', { locked }]" />{{ locked ? "Administration locked" : "Authenticated session" }}<small>{{ locked ? "Unlock through system authorization" : `Locks after inactivity · ${idleSeconds}s` }}</small></div>
     </aside>
     <div class="main-shell">

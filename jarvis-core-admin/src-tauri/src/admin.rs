@@ -1,8 +1,10 @@
 use std::{
     collections::BTreeMap,
+    ffi::{OsStr, OsString},
     fs,
-    io::Read,
+    io::{self, IsTerminal, Read, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::Duration,
@@ -17,6 +19,9 @@ use crate::session::{BrokerRequest, SessionManager};
 const ADMIN: &str = "/usr/local/sbin/jarvis";
 const CORE_ADMIN_BINARY: &str = "/usr/bin/jarvis-core-admin";
 const CORE_ADMIN_VERSION: &str = "/usr/share/jarvis-core-admin/version";
+const PKEXEC: &str = "/usr/bin/pkexec";
+const PTYXIS: &str = "/usr/bin/ptyxis";
+const GNOME_TERMINAL: &str = "/usr/bin/gnome-terminal";
 const OUTPUT_LIMIT: usize = 1_048_576;
 
 type AdminResult<T> = Result<T, String>;
@@ -256,6 +261,57 @@ pub struct PricingSummary {
 pub struct CredentialRecord {
     pub provider: String,
     pub configured: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialProvider {
+    Anthropic,
+    Openai,
+    Deepseek,
+    Xai,
+    Zai,
+    OllamaCloud,
+    Huggingface,
+}
+
+impl CredentialProvider {
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Openai => "openai",
+            Self::Deepseek => "deepseek",
+            Self::Xai => "xai",
+            Self::Zai => "zai",
+            Self::OllamaCloud => "ollama-cloud",
+            Self::Huggingface => "huggingface",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic",
+            Self::Openai => "OpenAI",
+            Self::Deepseek => "DeepSeek",
+            Self::Xai => "xAI",
+            Self::Zai => "Z.ai",
+            Self::OllamaCloud => "Ollama Cloud",
+            Self::Huggingface => "Hugging Face",
+        }
+    }
+
+    fn from_os(value: &OsStr) -> Option<Self> {
+        match value.to_str()? {
+            "anthropic" => Some(Self::Anthropic),
+            "openai" => Some(Self::Openai),
+            "deepseek" => Some(Self::Deepseek),
+            "xai" => Some(Self::Xai),
+            "zai" => Some(Self::Zai),
+            "ollama-cloud" => Some(Self::OllamaCloud),
+            "huggingface" => Some(Self::Huggingface),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -501,6 +557,161 @@ pub fn model_mutation(
 
 pub fn credentials(session: &SessionManager) -> AdminResult<Vec<CredentialRecord>> {
     parse_json(&session.run(BrokerRequest::Credentials)?.stdout)
+}
+
+pub fn credential_set(
+    session: &SessionManager,
+    provider: CredentialProvider,
+) -> AdminResult<OperationResult> {
+    session.require_active()?;
+    launch_credential_terminal(provider)?;
+    Ok(OperationResult {
+        success: true,
+        summary: format!("{} credential setup finished", provider.label()),
+        detail: "The trusted terminal closed. Credential status has been refreshed.".to_owned(),
+    })
+}
+
+pub fn credential_entry(provider: &OsStr) -> AdminResult<()> {
+    root_guard()?;
+    let provider = CredentialProvider::from_os(provider)
+        .ok_or_else(|| "unsupported credential provider".to_owned())?;
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
+        return Err("credential entry requires an interactive controlling terminal".to_owned());
+    }
+    verify_root_executable(PKEXEC)?;
+    verify_root_executable(ADMIN)?;
+
+    println!("Jarvis credential setup · {}", provider.label());
+    println!("The secret is read invisibly by the trusted Jarvis credential helper.");
+    let status = Command::new(PKEXEC)
+        .arg(ADMIN)
+        .arg("credentials")
+        .arg("set")
+        .arg(provider.cli_name())
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("LANG", "C.UTF-8")
+        .status()
+        .map_err(|_| "could not start the trusted credential operation".to_owned())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("credential setup was cancelled or did not complete".to_owned())
+    }
+}
+
+fn launch_credential_terminal(provider: CredentialProvider) -> AdminResult<()> {
+    let entry_binary = credential_entry_binary()?;
+    let (program, arguments) = credential_terminal_command(provider, &entry_binary)?;
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_desktop_environment(&mut command);
+    let status = command
+        .status()
+        .map_err(|_| "could not open the protected credential terminal".to_owned())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("credential setup was cancelled or did not complete".to_owned())
+    }
+}
+
+fn configure_desktop_environment(command: &mut Command) {
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C.UTF-8");
+    for name in [
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_TYPE",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+}
+
+fn credential_terminal_command(
+    provider: CredentialProvider,
+    entry_binary: &Path,
+) -> AdminResult<(&'static str, Vec<OsString>)> {
+    let common = credential_entry_arguments(provider, entry_binary);
+    if Path::new(PTYXIS).exists() {
+        verify_root_executable(PTYXIS)?;
+        return Ok((
+            PTYXIS,
+            vec![
+                OsString::from("--title=Jarvis credential setup"),
+                OsString::from("--"),
+            ]
+            .into_iter()
+            .chain(common)
+            .collect(),
+        ));
+    }
+    if Path::new(GNOME_TERMINAL).exists() {
+        verify_root_executable(GNOME_TERMINAL)?;
+        return Ok((
+            GNOME_TERMINAL,
+            vec![
+                OsString::from("--wait"),
+                OsString::from("--title=Jarvis credential setup"),
+                OsString::from("--"),
+            ]
+            .into_iter()
+            .chain(common)
+            .collect(),
+        ));
+    }
+    Err("no supported GNOME credential terminal is installed".to_owned())
+}
+
+fn credential_entry_binary() -> AdminResult<PathBuf> {
+    let path = std::env::current_exe()
+        .map_err(|_| "could not resolve the active Core Admin executable".to_owned())?;
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|_| "active Core Admin executable is unavailable".to_owned())?;
+    let owner = metadata.uid();
+    let current_user = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || (owner != 0 && owner != current_user)
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err("active Core Admin executable has unsafe ownership or permissions".to_owned());
+    }
+    Ok(path)
+}
+
+fn credential_entry_arguments(provider: CredentialProvider, entry_binary: &Path) -> Vec<OsString> {
+    vec![
+        entry_binary.as_os_str().to_owned(),
+        OsString::from("--credential-entry"),
+        OsString::from(provider.cli_name()),
+    ]
+}
+
+pub fn wait_for_credential_terminal() {
+    print!("\nPress Enter to close this trusted terminal…");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
 }
 
 pub fn logs(session: &SessionManager, query: LogQuery) -> AdminResult<LogResponse> {
@@ -861,6 +1072,7 @@ pub(crate) fn verify_root_executable(path: &str) -> AdminResult<()> {
         || !metadata.is_file()
         || metadata.uid() != 0
         || metadata.permissions().mode() & 0o022 != 0
+        || metadata.permissions().mode() & 0o111 == 0
     {
         return Err(
             "trusted administration executable has unsafe ownership or permissions".to_owned(),
@@ -1118,6 +1330,22 @@ mod tests {
             request,
             ModelMutation::SetRoute { provider: ModelProvider::Huggingface, route, .. } if route == "groq"
         ));
+    }
+
+    #[test]
+    fn credential_entry_is_typed_and_contains_no_secret_argument() {
+        let provider: CredentialProvider = serde_json::from_str(r#""huggingface""#).unwrap();
+        assert!(serde_json::from_str::<CredentialProvider>(r#""arbitrary""#).is_err());
+        assert!(CredentialProvider::from_os(OsStr::new("openai")).is_some());
+        assert!(CredentialProvider::from_os(OsStr::new("openai;sh")).is_none());
+        assert_eq!(
+            credential_entry_arguments(provider, Path::new(CORE_ADMIN_BINARY)),
+            vec![
+                OsString::from(CORE_ADMIN_BINARY),
+                OsString::from("--credential-entry"),
+                OsString::from("huggingface"),
+            ]
+        );
     }
 
     #[test]

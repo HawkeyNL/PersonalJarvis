@@ -187,6 +187,18 @@ async fn credentials(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+async fn credential_set(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+    provider: admin::CredentialProvider,
+) -> Result<admin::OperationResult, String> {
+    with_session(session, move |session| {
+        admin::credential_set(&session, provider)
+    })
+    .await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 async fn logs(
     session: tauri::State<'_, Arc<session::SessionManager>>,
     query: admin::LogQuery,
@@ -232,6 +244,7 @@ pub fn run() {
             usage,
             model_mutation,
             credentials,
+            credential_set,
             logs,
             system
         ])
@@ -257,4 +270,14 @@ pub fn frontend_mode() -> &'static str {
 
 pub fn run_broker() -> Result<(), String> {
     session::run_broker()
+}
+
+pub fn run_credential_entry(provider: &std::ffi::OsStr) -> ! {
+    let result = admin::credential_entry(provider);
+    match &result {
+        Ok(()) => println!("\nCredential setup completed successfully."),
+        Err(error) => eprintln!("\nJarvis credential setup: {error}"),
+    }
+    admin::wait_for_credential_terminal();
+    std::process::exit(if result.is_ok() { 0 } else { 1 });
 }

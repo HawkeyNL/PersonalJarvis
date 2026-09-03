@@ -16,7 +16,8 @@ surface is the explicitly registered command list in
 
 - read-only status, health, service, update, model, credential and log queries;
 - a fixed read of the root-controlled active agent manifest;
-- explicitly typed Core update, agent update and model-policy mutations.
+- explicitly typed Core update, agent update and model-policy mutations;
+- a typed credential-provider action that opens a separate trusted terminal.
 
 Privileged calls use `/usr/bin/pkexec` and the system's GNOME polkit agent. A
 password is never accepted by Vue, Tauri IPC, command arguments or stdin.
@@ -28,6 +29,16 @@ captured output.
 The existing Jarvis CLI, updater and helpers remain authoritative. GUI
 confirmation is presentation only and never substitutes for authorization or
 trusted helper validation.
+
+Credential **Set** and **Replace** actions never create a secret field in the
+webview. The normal-user application opens the exact active Core Admin binary
+in GNOME Ptyxis (or GNOME Terminal) credential-entry mode. The binary remains
+unprivileged and must be root-owned in production, or owned by the current
+normal user for development, executable and not group/other-writable. It
+invokes only `pkexec /usr/local/sbin/jarvis credentials set <typed-provider>`;
+the active verified credential helper reads hidden input directly from the
+controlling terminal. Only the allowlisted provider name enters argv. The
+secret never enters Vue state, Tauri IPC, captured output or a command line.
 
 At startup the installed application opens one narrow root broker through the
 system authorization dialog. All later requests in that unlocked GUI session
@@ -117,15 +128,17 @@ an update when Core, CLI, the graphical app, or multiple components changed.
 
 ## Scope
 
-The navigation contains Overview, Health, Services, Update, Agents, Models,
-Credentials, Logs, Usage & Costs and System/About. The Models view can filter
-and sort exact reviewed per-million-token prices; unknown remote prices remain
-visibly unknown. Usage & Costs shows bounded current-month request, token and
-estimated-cost aggregates by day, provider and model. Its responsive stacked
-daily token chart uses a narrowly registered Chart.js build; budget and provider
-progress indicators remain native application UI. No prompt, reply,
-credential or request identifier enters either view. Credential values are
-never shown or entered. Logs are bounded, control-sequence sanitized,
+The categorized navigation contains Overview, Health, Services, Logs, Agents,
+Models, Usage & Costs, Credentials, Update and System/About. The Models view
+can filter and sort exact reviewed per-million-token prices, shows at most 25
+rows per page and presents Hugging Face route selection in a focused modal;
+unknown remote prices remain visibly unknown. Usage & Costs shows bounded
+current-month request, token and estimated-cost aggregates by day, provider
+and model. Its responsive stacked daily token chart uses a narrowly registered
+Chart.js build; budget and provider progress indicators remain native
+application UI. No prompt, reply, credential or request identifier enters
+either view. Credential values are never shown or stored by the GUI. Logs are
+bounded, control-sequence sanitized,
 structured where possible, searchable/filterable, selectable, wrapped and
 optionally followed through bounded polling of the allowlisted direct CLI
 operation.

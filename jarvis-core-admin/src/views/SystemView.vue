@@ -10,5 +10,5 @@ onMounted(load);
 <template>
   <PageHeader title="System / About" description="Non-secret Home Node and build provenance. Hardware identifiers and process environment are intentionally omitted." :busy="busy"><button class="secondary" @click="load">Refresh</button></PageHeader>
   <ErrorPanel v-if="error" :message="error" />
-  <section v-if="data" class="system-grid"><article v-for="[key, value] in data.values" :key="key" class="detail-card"><span class="card-label">{{ key }}</span><strong class="wrap-anywhere">{{ value }}</strong></article></section>
+  <section v-if="data" class="system-grid"><article v-for="[key, value] in data.values" :key="key" class="detail-card system-card"><span class="card-label">{{ key }}</span><strong class="wrap-anywhere">{{ value }}</strong></article></section>
 </template>
