@@ -46,6 +46,16 @@ verify_admin_helper_candidate() {
   }
 }
 
+verify_systemd_unit_candidate() {
+  local release=$1
+  jq -e '.tooling.systemd_units == 1 and (.tooling.systemd_units | type) == "number"' \
+    "$release/release.json" >/dev/null || {
+    echo "release candidate does not declare managed-systemd capability 1" >&2
+    exit 1
+  }
+  "$release/manage-systemd-units" validate-artifacts "$release"
+}
+
 [[ $# -ge 3 && $# -le 4 ]] || usage
 mode=$1
 release_tag=$2
@@ -81,6 +91,7 @@ if [[ "$mode" == package ]]; then
     exit 1
   }
   verify_admin_helper_candidate "$release_dir"
+  verify_systemd_unit_candidate "$release_dir"
   (cd "$release_dir" && sha256sum --check --strict artifact-binaries.sha256)
   mkdir -p "$output_root"
   tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
@@ -188,6 +199,23 @@ printf '%s\n' "$core_admin_version" > "$temporary_release/jarvis-core-admin.vers
 install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update-core-release"
 install -m 0755 deploy/systemd/jarvis-models.sh "$temporary_release/jarvis-models"
 install -m 0755 deploy/systemd/jarvis-credentials.sh "$temporary_release/jarvis-credentials"
+install -m 0755 deploy/systemd/manage-systemd-units.sh "$temporary_release/manage-systemd-units"
+install -m 0755 deploy/systemd/verify-home-node.sh "$temporary_release/verify-home-node"
+install -m 0755 deploy/systemd/install-home-node-core.sh "$temporary_release/install-home-node-core"
+install -m 0644 deploy/lib/ui.sh "$temporary_release/ui.sh"
+for unit in \
+  jarvis-core.service \
+  jarvis-config-broker.service \
+  jarvis-codex-broker.service \
+  jarvis-codex.service \
+  jarvis-opensandbox.service \
+  jarvis-surrealdb.service \
+  jarvis-updater.service \
+  jarvis-updater.timer \
+  jarvis-private-agent-updater.service \
+  jarvis-private-agent-updater.timer; do
+  install -m 0644 "deploy/systemd/$unit" "$temporary_release/systemd-$unit"
+done
 install -m 0644 deploy/systemd/pricing-registry.json "$temporary_release/pricing-registry.json"
 install -m 0755 deploy/private/install-agent-bundle.sh "$temporary_release/install-agent-bundle"
 install -m 0755 deploy/private/jarvis-private-agent-poll.sh "$temporary_release/private-agent-poll"
@@ -205,7 +233,7 @@ jq -n \
   --arg core_version "$core_version" \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1}}' \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1}}' \
   > "$temporary_release/release.json"
 
 (
@@ -213,12 +241,14 @@ jq -n \
   sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-agent-bundle \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
     jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials \
+    manage-systemd-units verify-home-node install-home-node-core ui.sh \
     pricing-registry.json \
     install-agent-bundle \
-    private-agent-poll jarvis-private-update \
+    private-agent-poll jarvis-private-update systemd-*.service systemd-*.timer \
     > artifact-binaries.sha256
 )
 verify_admin_helper_candidate "$temporary_release"
+verify_systemd_unit_candidate "$temporary_release"
 rustc_version=$(rustc --version)
 cargo_version=$(cargo --version)
 llvm_version=$(rustc -Vv | awk -F': ' '/^LLVM version:/ {print $2}')

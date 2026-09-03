@@ -32,7 +32,7 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 InaccessiblePaths=/etc/jarvis/Jarvis.md /etc/jarvis/secrets
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/var/lib/jarvis-codex-broker /run/jarvis-codex-broker
+# RuntimeDirectory=/StateDirectory= provide the only writable broker trees.
 
 [Install]
 WantedBy=multi-user.target

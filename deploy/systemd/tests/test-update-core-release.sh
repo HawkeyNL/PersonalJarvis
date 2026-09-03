@@ -16,7 +16,8 @@ repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 updater="$repo_dir/deploy/systemd/update-core-release.sh"
 fixture_dir=$(mktemp -d)
 fake_bin="$fixture_dir/bin"
-mkdir -p "$fake_bin"
+systemd_fixture="$fixture_dir/systemd"
+mkdir -p "$fake_bin" "$systemd_fixture"
 v019_revision=223358a47b84075e301d124cb6dc9c8aa27ae987
 v019_updater="$fixture_dir/update-core-release-v0.0.19"
 git -C "$repo_dir" cat-file -e "$v019_revision^{commit}" 2>/dev/null || {
@@ -35,7 +36,9 @@ cleanup() {
         /usr/local/libexec/jarvis/update-core-release \
         /usr/local/libexec/jarvis/jarvis-agent-bundle \
         /usr/local/libexec/jarvis/install-agent-bundle \
-        /usr/local/libexec/jarvis/private-agent-poll
+        /usr/local/libexec/jarvis/private-agent-poll \
+        /usr/local/libexec/jarvis/manage-systemd-units \
+        /usr/local/libexec/jarvis/verify-home-node
     rm -f -- /usr/bin/jarvis-core-admin \
         /usr/share/applications/com.hawkeynl.jarvis.core.admin.desktop \
         /usr/share/applications/jarvis-core-admin.desktop \
@@ -47,7 +50,16 @@ trap cleanup EXIT
 cat > "$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ ${1:-} == restart && ${2:-} == jarvis-core.service ]] || exit 1
+printf '%s\n' "$*" >> "$JARVIS_UPDATER_FIXTURE/systemctl.log"
+if [[ ${1:-} == restart && ${2:-} == "${JARVIS_UPDATER_SYSTEMCTL_FAIL_ONCE:-}" && \
+    ! -e $JARVIS_UPDATER_FIXTURE/systemctl-failed-once ]]; then
+    : > "$JARVIS_UPDATER_FIXTURE/systemctl-failed-once"
+    exit 1
+fi
+case ${1:-} in
+    daemon-reload|restart|try-restart|is-enabled) exit 0 ;;
+    *) exit 1 ;;
+esac
 EOF
 chmod 0755 "$fake_bin/systemctl"
 
@@ -82,7 +94,11 @@ case "$url" in
         cp "$JARVIS_UPDATER_FIXTURE/${url##*/}" "$output"
         ;;
     http://127.0.0.1:8080/readyz)
-        [[ ${JARVIS_UPDATER_READYZ_FAIL:-false} != true ]] || exit 1
+        if [[ ${JARVIS_UPDATER_READYZ_FAIL:-false} == true && \
+            ! -e $JARVIS_UPDATER_FIXTURE/readyz-failed-once ]]; then
+            : > "$JARVIS_UPDATER_FIXTURE/readyz-failed-once"
+            exit 1
+        fi
         exit 0
         ;;
     *)
@@ -101,6 +117,7 @@ write_release() {
     local cli_version=${5:-${tag#v}}
     local app_version=${6:-${tag#v}}
     local admin_helpers=${7:-true}
+    local systemd_units=${8:-$admin_helpers}
     mkdir -p "$root/jarvis-core-$tag"
     chmod 0755 "$root/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
@@ -138,6 +155,26 @@ write_release() {
             chmod 0755 "$root/jarvis-core-$tag/$helper"
         done
     fi
+    if [[ $systemd_units == true ]]; then
+        cp "$repo_dir/deploy/systemd/manage-systemd-units.sh" \
+            "$root/jarvis-core-$tag/manage-systemd-units"
+        chmod 0755 "$root/jarvis-core-$tag/manage-systemd-units"
+        cp "$repo_dir/deploy/systemd/verify-home-node.sh" \
+            "$root/jarvis-core-$tag/verify-home-node"
+        chmod 0755 "$root/jarvis-core-$tag/verify-home-node"
+        cp "$repo_dir/deploy/systemd/install-home-node-core.sh" \
+            "$root/jarvis-core-$tag/install-home-node-core"
+        chmod 0755 "$root/jarvis-core-$tag/install-home-node-core"
+        cp "$repo_dir/deploy/lib/ui.sh" "$root/jarvis-core-$tag/ui.sh"
+        chmod 0644 "$root/jarvis-core-$tag/ui.sh"
+        for unit in jarvis-core.service jarvis-config-broker.service jarvis-codex-broker.service \
+            jarvis-codex.service jarvis-opensandbox.service jarvis-surrealdb.service \
+            jarvis-updater.service jarvis-updater.timer \
+            jarvis-private-agent-updater.service jarvis-private-agent-updater.timer; do
+            cp "$repo_dir/deploy/systemd/$unit" "$root/jarvis-core-$tag/systemd-$unit"
+            chmod 0644 "$root/jarvis-core-$tag/systemd-$unit"
+        done
+    fi
     jq -n \
         --arg tag "$tag" \
         --arg schema_sha256 "$schema_sha256" \
@@ -145,7 +182,8 @@ write_release() {
         --arg cli_version "$cli_version" \
         --arg app_version "$app_version" \
         --argjson admin_helpers "$admin_helpers" \
-        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}, tooling: ({private_agents: 1} + if $admin_helpers then {admin_helpers: 1} else {} end)}' \
+        --argjson systemd_units "$systemd_units" \
+        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}, tooling: ({private_agents: 1} + if $admin_helpers then {admin_helpers: 1} else {} end + if $systemd_units then {systemd_units: 1} else {} end)}' \
         > "$root/jarvis-core-$tag/release.json"
     chmod 0644 "$root/jarvis-core-$tag/release.json"
     local -a checksummed=(
@@ -156,6 +194,15 @@ write_release() {
     )
     if [[ $admin_helpers == true ]]; then
         checksummed+=(jarvis-models jarvis-credentials)
+    fi
+    if [[ $systemd_units == true ]]; then
+        checksummed+=(manage-systemd-units verify-home-node install-home-node-core ui.sh)
+        for unit in jarvis-core.service jarvis-config-broker.service jarvis-codex-broker.service \
+            jarvis-codex.service jarvis-opensandbox.service jarvis-surrealdb.service \
+            jarvis-updater.service jarvis-updater.timer \
+            jarvis-private-agent-updater.service jarvis-private-agent-updater.timer; do
+            checksummed+=("systemd-$unit")
+        done
     fi
     (
         cd "$root/jarvis-core-$tag"
@@ -174,9 +221,18 @@ seed_active_release() {
     rm -rf -- /opt/jarvis
     install -d -o root -g root -m 0755 /opt/jarvis/releases
     write_release /opt/jarvis/releases "$tag" "$schema_sha256" \
-        "${tag#v}" "${tag#v}" "${tag#v}" "$admin_helpers"
+        "${tag#v}" "${tag#v}" "${tag#v}" "$admin_helpers" "$admin_helpers"
     mv "/opt/jarvis/releases/jarvis-core-$tag" "/opt/jarvis/releases/$tag"
     ln -s "/opt/jarvis/releases/$tag" /opt/jarvis/current
+    rm -f -- "$systemd_fixture"/jarvis-*.service "$systemd_fixture"/jarvis-*.timer
+    if [[ $admin_helpers == true ]]; then
+        cp /opt/jarvis/releases/$tag/systemd-*.service \
+            /opt/jarvis/releases/$tag/systemd-*.timer "$systemd_fixture/"
+        for installed in "$systemd_fixture"/systemd-*; do
+            mv "$installed" "$systemd_fixture/${installed##*/systemd-}"
+        done
+        chmod 0644 "$systemd_fixture"/jarvis-*.service "$systemd_fixture"/jarvis-*.timer
+    fi
     install -d -o root -g root -m 0750 /etc/jarvis
     printf 'synthetic protected persona\n' > /etc/jarvis/Jarvis.md
     chown root:root /etc/jarvis/Jarvis.md
@@ -264,12 +320,31 @@ prepare_candidate() {
 run_updater() {
     PATH="$fake_bin:$PATH" \
         JARVIS_UPDATER_FIXTURE="$fixture_dir" \
+        JARVIS_SYSTEMD_ROOT="$systemd_fixture" \
+        JARVIS_RELEASES_ROOT=/opt/jarvis/releases \
+        JARVIS_SYSTEMD_TEST_MODE=true \
         JARVIS_UPDATER_READYZ_FAIL="${JARVIS_UPDATER_READYZ_FAIL:-false}" \
+        JARVIS_UPDATER_SYSTEMCTL_FAIL_ONCE="${JARVIS_UPDATER_SYSTEMCTL_FAIL_ONCE:-}" \
         bash "${JARVIS_UPDATER_UNDER_TEST:-$updater}" "$@"
 }
 
 same_migrations=$(printf 'a%.0s' {1..64})
 changed_migrations=$(printf 'b%.0s' {1..64})
+
+# First managed-unit activation starts with no canonical Jarvis units (the same
+# relevant condition as a fresh host/legacy install) and installs the complete
+# checksum-bound set before starting services.
+seed_active_release v0.8.0 "$same_migrations" false
+prepare_candidate v0.8.1 "$same_migrations"
+run_updater --version v0.8.1
+for unit in jarvis-core.service jarvis-config-broker.service jarvis-codex-broker.service \
+    jarvis-codex.service jarvis-opensandbox.service jarvis-surrealdb.service \
+    jarvis-updater.service jarvis-updater.timer \
+    jarvis-private-agent-updater.service jarvis-private-agent-updater.timer; do
+    cmp "/opt/jarvis/current/systemd-$unit" "$systemd_fixture/$unit"
+done
+grep -Fq 'RuntimeDirectory=jarvis-config-broker' \
+    "$systemd_fixture/jarvis-config-broker.service"
 
 # Existing markers are validated, not trusted merely because the filename is
 # present. A corrupted marker blocks a privileged mutation.
@@ -318,6 +393,47 @@ grep -Eq '^[0-9a-f]{64}  jarvis-credentials$' /opt/jarvis/releases/v1.0.1/artifa
 grep -qx 'JARVIS_UPDATE_REPOSITORY=HawkeyNL/PersonalJarvis' /etc/jarvis/updater.env
 grep -qx 'JARVIS_UPDATE_CHANNEL=stable' /etc/jarvis/updater.env
 
+# Same-version execution is a repair operation when a canonical unit drifted.
+# The replacement comes only from the already verified active release.
+printf '# stale legacy unit\n' > "$systemd_fixture/jarvis-config-broker.service"
+prepare_candidate v1.0.1 "$same_migrations"
+run_updater --version v1.0.1
+cmp /opt/jarvis/current/systemd-jarvis-config-broker.service \
+    "$systemd_fixture/jarvis-config-broker.service"
+grep -Fq 'RuntimeDirectory=jarvis-config-broker' \
+    "$systemd_fixture/jarvis-config-broker.service"
+
+# Benign administrator-owned tuning remains in place. A drop-in that overrides
+# release-owned execution/sandbox policy blocks activation and is named.
+mkdir -p "$systemd_fixture/jarvis-core.service.d"
+printf '[Service]\nRestartSec=10s\n' > \
+    "$systemd_fixture/jarvis-core.service.d/50-local-tuning.conf"
+chmod 0644 "$systemd_fixture/jarvis-core.service.d/50-local-tuning.conf"
+prepare_candidate v1.0.2 "$same_migrations"
+run_updater --version v1.0.2
+[[ -f $systemd_fixture/jarvis-core.service.d/50-local-tuning.conf ]]
+printf '[Service]\nProtectSystem=false\n' > \
+    "$systemd_fixture/jarvis-core.service.d/90-unsafe.conf"
+chmod 0644 "$systemd_fixture/jarvis-core.service.d/90-unsafe.conf"
+prepare_candidate v1.0.3 "$same_migrations"
+if run_updater --version v1.0.3 2>"$fixture_dir/dropin-error"; then
+    echo "security-breaking systemd drop-in unexpectedly succeeded" >&2
+    exit 1
+fi
+grep -Fq 'ProtectSystem' "$fixture_dir/dropin-error"
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v1.0.2 ]]
+rm -rf -- "$systemd_fixture/jarvis-core.service.d"
+
+seed_active_release v1.0.2 "$same_migrations"
+rm -f -- "$systemd_fixture/jarvis-config-broker.service"
+ln -s /etc/passwd "$systemd_fixture/jarvis-config-broker.service"
+prepare_candidate v1.0.2 "$same_migrations"
+if run_updater --version v1.0.2; then
+    echo "same-version repair accepted a symlinked canonical unit" >&2
+    exit 1
+fi
+[[ -L $systemd_fixture/jarvis-config-broker.service ]]
+
 # A pre-admin-helper active release reaches the self-contained architecture
 # through the normal update path. The deliberately stale global compatibility
 # copies remain untouched: the activated CLI must use /opt/jarvis/current.
@@ -332,6 +448,18 @@ grep -Fq 'versioned jarvis-models tooling: v0.0.20' /opt/jarvis/current/jarvis-m
 grep -Fq 'versioned jarvis-credentials tooling: v0.0.20' /opt/jarvis/current/jarvis-credentials
 grep -Fq 'stale global model helper' /usr/local/sbin/jarvis-models
 grep -Fq 'stale global credential helper' /usr/local/sbin/jarvis-credentials
+# The legacy updater cannot know a future unit capability, but it installs the
+# new updater in the same normal transaction. Repeating the same canonical
+# command is therefore a checksum-bound same-version reconciliation, with no
+# checkout, manual copy, or caller-selected root path.
+JARVIS_UPDATER_UNDER_TEST=/usr/local/libexec/jarvis/update-core-release \
+    run_updater --version v0.0.20
+for unit in jarvis-core.service jarvis-config-broker.service jarvis-codex-broker.service \
+    jarvis-codex.service jarvis-opensandbox.service jarvis-surrealdb.service \
+    jarvis-updater.service jarvis-updater.timer \
+    jarvis-private-agent-updater.service jarvis-private-agent-updater.timer; do
+    cmp "/opt/jarvis/current/systemd-$unit" "$systemd_fixture/$unit"
+done
 
 # Declaring the capability is fail-closed: either helper being absent rejects
 # the candidate before activation and leaves the prior release selected.
@@ -347,6 +475,18 @@ for missing_case in 'v1.0.3 jarvis-models' 'v1.0.4 jarvis-credentials'; do
     [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v1.0.2 ]]
     [[ ! -e /opt/jarvis/releases/$missing_tag ]]
 done
+
+# A release that declares managed units cannot activate with a missing unit,
+# even though the outer archive checksum itself is valid.
+seed_active_release v1.0.4 "$same_migrations"
+prepare_candidate v1.0.5 "$same_migrations" 1.0.5 1.0.5 1.0.5 true \
+    systemd-jarvis-config-broker.service
+if run_updater --version v1.0.5; then
+    echo "release missing a declared managed systemd unit unexpectedly succeeded" >&2
+    exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v1.0.4 ]]
+[[ ! -e /opt/jarvis/releases/v1.0.5 ]]
 
 # A shell-supplied repository must not redirect a configured root update.
 seed_active_release v1.1.0 "$same_migrations"
@@ -391,8 +531,24 @@ fi
 # A readiness failure after activation must restore the previous Core binary.
 seed_active_release v4.0.0 "$same_migrations"
 prepare_candidate v4.0.1 "$same_migrations"
+cp "$systemd_fixture/jarvis-config-broker.service" "$fixture_dir/unit-before-readiness-failure"
+# Make the candidate unit observably different while keeping its inner
+# checksum valid, then rebuild its outer artifact.
+printf '# candidate-only unit change\n' >> \
+    "$fixture_dir/asset/jarvis-core-v4.0.1/systemd-jarvis-config-broker.service"
+(
+    cd "$fixture_dir/asset/jarvis-core-v4.0.1"
+    sha256sum systemd-jarvis-config-broker.service > "$fixture_dir/unit-checksum"
+    awk '$2 != "systemd-jarvis-config-broker.service"' artifact-binaries.sha256 \
+        > "$fixture_dir/artifact-checksums"
+    cat "$fixture_dir/unit-checksum" >> "$fixture_dir/artifact-checksums"
+    mv "$fixture_dir/artifact-checksums" artifact-binaries.sha256
+)
+tar -C "$fixture_dir/asset" -czf "$fixture_dir/jarvis-core-v4.0.1-linux-x86_64.tar.gz" jarvis-core-v4.0.1
+(cd "$fixture_dir" && sha256sum jarvis-core-v4.0.1-linux-x86_64.tar.gz > jarvis-core-v4.0.1-linux-x86_64.tar.gz.sha256)
 cp /usr/local/sbin/jarvis "$fixture_dir/admin-before-readiness-failure"
 cp /usr/local/libexec/jarvis/update-core-release "$fixture_dir/updater-before-readiness-failure"
+rm -f -- "$fixture_dir/readyz-failed-once"
 if JARVIS_UPDATER_READYZ_FAIL=true run_updater; then
     echo "update with failed readiness unexpectedly succeeded" >&2
     exit 1
@@ -401,6 +557,21 @@ fi
 [[ -e /opt/jarvis/releases/v4.0.1 ]]
 cmp "$fixture_dir/admin-before-readiness-failure" /usr/local/sbin/jarvis
 cmp "$fixture_dir/updater-before-readiness-failure" /usr/local/libexec/jarvis/update-core-release
+cmp "$fixture_dir/unit-before-readiness-failure" "$systemd_fixture/jarvis-config-broker.service"
+grep -Fq 'daemon-reload' "$fixture_dir/systemctl.log"
+
+# A config-broker activation failure restores the old link and unit bytes, then
+# successfully restarts the previous service set.
+seed_active_release v4.0.2 "$same_migrations"
+prepare_candidate v4.0.3 "$same_migrations"
+cp "$systemd_fixture/jarvis-config-broker.service" "$fixture_dir/unit-before-broker-failure"
+rm -f -- "$fixture_dir/systemctl-failed-once"
+if JARVIS_UPDATER_SYSTEMCTL_FAIL_ONCE=jarvis-config-broker.service run_updater; then
+    echo "update with failed config broker unexpectedly succeeded" >&2
+    exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v4.0.2 ]]
+cmp "$fixture_dir/unit-before-broker-failure" "$systemd_fixture/jarvis-config-broker.service"
 
 # A tooling activation failure after candidate readiness must restore Core and
 # both canonical tools, never leave a mixed-version installation.
@@ -506,6 +677,16 @@ cmp /opt/jarvis/releases/v8.2.0/update-core-release /usr/local/libexec/jarvis/up
 # block a later unrelated update.
 seed_active_release v8.3.2 "$same_migrations"
 write_release /opt/jarvis/releases v8.3.1 "$same_migrations"
+printf '# rollback policy v8.3.1\n' >> \
+    /opt/jarvis/releases/jarvis-core-v8.3.1/systemd-jarvis-config-broker.service
+(
+    cd /opt/jarvis/releases/jarvis-core-v8.3.1
+    awk '$2 != "systemd-jarvis-config-broker.service"' artifact-binaries.sha256 \
+        > artifact-binaries.updated
+    sha256sum systemd-jarvis-config-broker.service >> artifact-binaries.updated
+    mv artifact-binaries.updated artifact-binaries.sha256
+    chmod 0644 artifact-binaries.sha256
+)
 mv /opt/jarvis/releases/jarvis-core-v8.3.1 /opt/jarvis/releases/v8.3.1
 write_release /opt/jarvis/releases v99.0.0 "$same_migrations"
 mv /opt/jarvis/releases/jarvis-core-v99.0.0 /opt/jarvis/releases/v99.0.0
@@ -524,13 +705,14 @@ if run_updater --rollback-version v99.0.0; then
 fi
 run_updater --rollback-version v8.3.1
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.3.1 ]]
+grep -Fq '# rollback policy v8.3.1' "$systemd_fixture/jarvis-config-broker.service"
 prepare_candidate v8.3.3 "$same_migrations"
 run_updater
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v8.3.3 ]]
 
-# Rollback inspection accepts a legitimate legacy release without the new
-# capability, while rejecting declared-capability history with missing,
-# symlinked, or writable helpers.
+# Rollback inspection keeps a legitimate legacy release verified, but does not
+# claim it can reconstruct exact historical units after managed policy is
+# active. Declared-capability history with unsafe helpers also stays blocked.
 seed_active_release v8.4.4 "$same_migrations"
 write_release /opt/jarvis/releases v8.4.0 "$same_migrations" 8.4.0 8.4.0 8.4.0 false
 mv /opt/jarvis/releases/jarvis-core-v8.4.0 /opt/jarvis/releases/v8.4.0
@@ -545,7 +727,7 @@ mv /opt/jarvis/releases/jarvis-core-v8.4.3 /opt/jarvis/releases/v8.4.3
 rm -f -- /opt/jarvis/releases/v8.4.3/jarvis-models
 ln -s /usr/local/sbin/jarvis-models /opt/jarvis/releases/v8.4.3/jarvis-models
 candidates=$(run_updater --rollback-candidates)
-jq -e '.[] | select(.version == "v8.4.0" and .verified == true and .rollback_capable == true)' \
+jq -e '.[] | select(.version == "v8.4.0" and .verified == true and .rollback_capable == false and (.reason | contains("systemd units")))' \
     <<< "$candidates" >/dev/null
 for invalid in v8.4.1 v8.4.2 v8.4.3; do
     jq -e --arg invalid "$invalid" \

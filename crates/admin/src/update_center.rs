@@ -72,7 +72,7 @@ impl UpdateSummary {
         }
         self.update_available = values
             .get("update")
-            .map(|value| value == "available")
+            .map(|value| matches!(value.as_str(), "available" | "repair required"))
             .or_else(|| match (&self.latest, &self.current) {
                 (Some(latest), Some(current)) => Some(release_is_newer(latest, current)),
                 _ => None,

@@ -105,6 +105,62 @@ activation restores the previous known-good release. Automatic timer updates
 continue to refuse schema-changing releases; perform those manually with a
 backup and recovery plan.
 
+Releases declaring `tooling.systemd_units: 1` also carry the exact ten
+Home Node unit files as immutable `systemd-<unit-name>` artifacts. They and the
+fixed unit manager are listed exactly once in `artifact-binaries.sha256`.
+Activation validates every unit, preserves the installed canonical files,
+atomically installs the candidate set, reloads systemd, restarts required
+services in dependency order, and commits only after Core readiness succeeds.
+Failure restores both `/opt/jarvis/current` and the previous canonical unit
+set. A same-version `sudo jarvis update --version vX.Y.Z` reconciles drift from
+that verified release instead of returning early.
+
+The host ownership boundary is:
+
+```text
+/opt/jarvis/releases/vX.Y.Z/    immutable, verified release artifacts
+/opt/jarvis/current             active release symlink
+/etc/systemd/system/jarvis-*    installed copies of release-owned unit policy
+/etc/systemd/system/*.d/*.conf  administrator-owned overrides (never deleted)
+/etc/jarvis/                    protected configuration and credentials
+/var/lib/jarvis/                persistent state
+/run/jarvis-*                   ephemeral systemd-managed runtime state
+```
+
+Security/lifecycle directives in administrator drop-ins (for example
+`ExecStart=` or `ProtectSystem=`) are incompatible with managed activation and
+fail with the exact drop-in path. Benign tuning is retained. Releases predating
+the capability remain inspectable. Once managed units are active, an old
+release without its own exact unit artifacts is not offered as a normal future
+rollback target; the updater never invents historic unit contents.
+
+The verified release also contains `install-home-node-core`, so the supported
+fresh-install step consumes its own unit artifacts after staging:
+
+```bash
+sudo /opt/jarvis/releases/vX.Y.Z/install-home-node-core \
+  /opt/jarvis/releases/vX.Y.Z
+```
+
+The higher-level setup command may still prepare identities, secrets and
+SurrealDB, but it no longer supplies the production unit bytes. Routine
+upgrades need neither a Git checkout nor files below `deploy/`.
+
+For the one-time transition from a release whose already-installed updater
+predates `systemd_units`, run the normal version command twice. The first
+verified activation installs the new updater; the second recognizes the same
+active version and atomically reconciles its units:
+
+```bash
+sudo jarvis update --version vX.Y.Z
+sudo jarvis update --version vX.Y.Z
+sudo jarvis health
+```
+
+No file is copied from a checkout and no arbitrary repair path is accepted.
+All subsequent releases install binaries and units together in one updater
+transaction; same-version invocation remains the supported drift repair.
+
 The update source is a root-owned `/etc/jarvis/updater.env`; it is created by
 setup and is never taken from the invoking shell environment. A release carries
 the versioned Rust admin binary and updater helper alongside Core. After Core

@@ -167,6 +167,41 @@ admin_helper_tooling_valid() {
     fi
 }
 
+systemd_unit_tooling_valid() {
+    local release=$1 detail
+    systemd_unit_tooling_reason=
+    release_has_managed_units=false
+    if ! jq -e '((.tooling? | type) == "object") and (.tooling | has("systemd_units"))' \
+        "$release/release.json" >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! jq -e '(.tooling.systemd_units | type) == "number" and .tooling.systemd_units == 1' \
+        "$release/release.json" >/dev/null 2>&1; then
+        systemd_unit_tooling_reason="unsupported managed-systemd capability"
+        return 1
+    fi
+    if [[ ! -x $release/manage-systemd-units || -L $release/manage-systemd-units ]]; then
+        systemd_unit_tooling_reason="managed-systemd helper is missing or unsafe"
+        return 1
+    fi
+    if [[ ! -f $release/artifact-binaries.sha256 || -L $release/artifact-binaries.sha256 ]] || \
+        ! LC_ALL=C awk '
+            NF != 2 || $1 !~ /^[0-9a-f]{64}$/ || $2 !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ { exit 1 }
+            seen[$2]++ { if (seen[$2] > 1) exit 1 }
+            END { if (NR == 0) exit 1 }
+        ' "$release/artifact-binaries.sha256" || \
+        ! (cd "$release" && sha256sum --check --strict artifact-binaries.sha256 >/dev/null); then
+        systemd_unit_tooling_reason="managed-systemd checksum manifest is invalid"
+        return 1
+    fi
+    if ! detail=$("$release/manage-systemd-units" validate-artifacts "$release" 2>&1); then
+        detail=${detail#jarvis systemd units: }
+        systemd_unit_tooling_reason="managed systemd unit artifacts are invalid: ${detail:-validation failed}"
+        return 1
+    fi
+    release_has_managed_units=true
+}
+
 cleanup() {
     [[ -n ${staging_dir:-} && -d ${staging_dir:-} ]] || return 0
     case "$staging_dir" in
@@ -175,7 +210,7 @@ cleanup() {
     esac
 }
 
-for command in awk curl find flock jq sha256sum stat tar systemctl readlink mv ln mktemp install wc; do
+for command in awk cmp curl find flock jq sha256sum stat tar systemctl readlink mv ln mktemp install wc; do
     require_command "$command"
 done
 
@@ -220,6 +255,7 @@ current_schema_sha256=
 current_core_version=unavailable
 current_cli_version=unavailable
 current_core_admin_version=not-installed
+current_has_managed_units=false
 if [[ -f $current_target/release.json && ! -L $current_target/release.json ]]; then
     current_tag=$(jq -er '.tag | strings' "$current_target/release.json" 2>/dev/null || true)
     [[ $current_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
@@ -229,6 +265,10 @@ if [[ -f $current_target/release.json && ! -L $current_target/release.json ]]; t
     current_cli_version=$(jq -er '.components.cli // empty | strings' "$current_target/release.json" 2>/dev/null || true)
     valid_component_version "$current_core_version" || current_core_version=${current_tag#v}
     valid_component_version "$current_cli_version" || current_cli_version=${current_tag#v}
+    if ! systemd_unit_tooling_valid "$current_target"; then
+        fail "active release systemd tooling is invalid: $systemd_unit_tooling_reason"
+    fi
+    current_has_managed_units=$release_has_managed_units
 fi
 if [[ -f $core_admin_version_file && ! -L $core_admin_version_file && \
     $(stat -c '%U:%G:%a' "$core_admin_version_file") == root:root:644 ]]; then
@@ -301,6 +341,8 @@ migrate_legacy_release_verification() {
     fi
     admin_helper_tooling_valid "$release" || \
         fail "legacy release admin-helper tooling is invalid: $expected_tag: $admin_helper_tooling_reason"
+    systemd_unit_tooling_valid "$release" || \
+        fail "legacy release managed-systemd tooling is invalid: $expected_tag: $systemd_unit_tooling_reason"
     unsafe_entry=$(find "$release" -xdev \( -type l -o ! -user root -o ! -group root -o -perm /022 \) \
         -printf '%P (%y %u:%g %m)\n' -quit)
     if [[ -n $unsafe_entry ]]; then
@@ -382,6 +424,11 @@ inspect_release() {
         inspected_reason=$admin_helper_tooling_reason
         return 0
     fi
+    if ! systemd_unit_tooling_valid "$release"; then
+        inspected_reason=$systemd_unit_tooling_reason
+        return 0
+    fi
+    local inspected_has_managed_units=$release_has_managed_units
     if jq -e '.components.core_admin? | strings' "$release/release.json" >/dev/null 2>&1; then
         local inspected_app_version inspected_extra
         for app_file in jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png jarvis-core-admin.version; do
@@ -417,6 +464,8 @@ inspect_release() {
     fi
     if [[ $inspected_current == true ]]; then
         inspected_reason="active release"
+    elif [[ $current_has_managed_units == true && $inspected_has_managed_units != true ]]; then
+        inspected_reason="legacy release has no integrity-bound systemd units"
     elif [[ -z $current_schema_sha256 ]]; then
         inspected_reason="active release schema fingerprint is unavailable"
     elif [[ $schema != "$current_schema_sha256" ]]; then
@@ -507,6 +556,13 @@ install_versioned_tooling() {
             /usr/local/libexec/jarvis/install-agent-bundle
             /usr/local/libexec/jarvis/private-agent-poll
             /usr/local/sbin/jarvis-private-update
+        )
+    fi
+    if jq -e '.tooling.systemd_units? == 1' "$release/release.json" >/dev/null 2>&1; then
+        tooling_sources+=("$release/manage-systemd-units" "$release/verify-home-node")
+        tooling_targets+=(
+            /usr/local/libexec/jarvis/manage-systemd-units
+            /usr/local/libexec/jarvis/verify-home-node
         )
     fi
     app_tmp=/usr/bin/.jarvis-core-admin.new
@@ -626,6 +682,89 @@ install_versioned_tooling() {
     [[ $agent_tooling_present == false || -x /usr/local/libexec/jarvis/private-agent-poll ]]
 }
 
+restart_managed_services() {
+    systemctl daemon-reload || return 1
+    systemctl restart jarvis-surrealdb.service || return 1
+    systemctl restart jarvis-config-broker.service || return 1
+    systemctl try-restart jarvis-codex-broker.service >/dev/null 2>&1 || true
+    systemctl try-restart jarvis-codex.service >/dev/null 2>&1 || true
+    systemctl try-restart jarvis-opensandbox.service >/dev/null 2>&1 || true
+    systemctl restart jarvis-core.service || return 1
+    curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+        --retry 11 --retry-delay 5 --retry-connrefused \
+        http://127.0.0.1:8080/readyz >/dev/null || return 1
+    systemctl try-restart jarvis-updater.timer >/dev/null 2>&1 || true
+    systemctl try-restart jarvis-private-agent-updater.timer >/dev/null 2>&1 || true
+}
+
+restore_release_transaction() {
+    local previous=$1 unit_manager=$2 backup=$3 temporary_link=/opt/jarvis/.current.new
+    rm -f -- "$temporary_link"
+    ln -s "$previous" "$temporary_link"
+    mv -Tf "$temporary_link" "$current_link"
+    "$unit_manager" restore "$previous" "$backup" || return 1
+    systemctl daemon-reload || return 1
+    systemctl restart jarvis-surrealdb.service >/dev/null 2>&1 || return 1
+    systemctl restart jarvis-config-broker.service >/dev/null 2>&1 || return 1
+    systemctl try-restart jarvis-codex-broker.service >/dev/null 2>&1 || true
+    systemctl try-restart jarvis-codex.service >/dev/null 2>&1 || true
+    systemctl try-restart jarvis-opensandbox.service >/dev/null 2>&1 || true
+    systemctl restart jarvis-core.service >/dev/null 2>&1 || return 1
+    curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+        --retry 11 --retry-delay 5 --retry-connrefused \
+        http://127.0.0.1:8080/readyz >/dev/null || return 1
+}
+
+activate_managed_release() {
+    local release=$1 previous=$2 backup temporary_link=/opt/jarvis/.current.new
+    local unit_manager="$release/manage-systemd-units"
+    backup=$(mktemp -d /run/jarvis-systemd-rollback.XXXXXXXX)
+    chmod 0700 "$backup"
+    if ! "$unit_manager" validate-release "$release" || \
+        ! "$unit_manager" install "$release" "$backup"; then
+        rm -rf -- "$backup"
+        return 1
+    fi
+    rm -f -- "$temporary_link"
+    ln -s "$release" "$temporary_link"
+    mv -Tf "$temporary_link" "$current_link"
+    if restart_managed_services && install_versioned_tooling "$release"; then
+        rm -rf -- "$backup"
+        echo "jarvis updater: Core readiness and managed-unit integrity passed"
+        return 0
+    fi
+    echo "jarvis updater: activation failed; restoring previous release and unit policy" >&2
+    if ! restore_release_transaction "$previous" "$unit_manager" "$backup"; then
+        echo "jarvis updater: CRITICAL: automatic release/unit restoration failed" >&2
+        rm -rf -- "$backup"
+        return 1
+    fi
+    rm -rf -- "$backup"
+    return 1
+}
+
+repair_active_managed_units() {
+    local release=$1 tag=$2 backup unit_manager="$release/manage-systemd-units"
+    if "$unit_manager" check-installed "$release" >/dev/null 2>&1; then
+        echo "jarvis updater: $tag is already active and managed systemd units match"
+        return 0
+    fi
+    echo "jarvis updater: repairing managed systemd units for active release $tag"
+    backup=$(mktemp -d /run/jarvis-systemd-rollback.XXXXXXXX)
+    chmod 0700 "$backup"
+    if "$unit_manager" install "$release" "$backup" && restart_managed_services && \
+        install_versioned_tooling "$release"; then
+        rm -rf -- "$backup"
+        echo "jarvis updater: repaired managed systemd units for $tag"
+        return 0
+    fi
+    "$unit_manager" restore "$release" "$backup" >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    restart_managed_services >/dev/null 2>&1 || true
+    rm -rf -- "$backup"
+    fail "same-version unit repair failed; previous unit policy restored"
+}
+
 rollback() {
     local previous temporary_link
     if [[ $mode == rollback_version ]]; then
@@ -637,6 +776,16 @@ rollback() {
         previous=$(find_or_migrate_rollback_target || true)
         [[ -n $previous ]] || fail "no known verified historical release is available"
     fi
+    if systemd_unit_tooling_valid "$releases_dir/$previous" && \
+        [[ $release_has_managed_units == true ]]; then
+        if activate_managed_release "$releases_dir/$previous" "$current_target"; then
+            echo "jarvis updater: rolled back binaries and managed units to $previous"
+            exit 0
+        fi
+        fail "rollback target failed activation; restored $current_tag"
+    fi
+    [[ $current_has_managed_units == false ]] || \
+        fail "rollback target has no integrity-bound systemd units"
     temporary_link=/opt/jarvis/.current.new
     rm -f -- "$temporary_link"
     ln -s "$releases_dir/$previous" "$temporary_link"
@@ -743,11 +892,19 @@ if [[ -n $current_tag && $current_tag == "$tag" ]] || \
     { [[ -n $current_tag ]] && ! version_is_newer "$tag" "$current_tag"; }; then
     component_update_available=false
 fi
+installed_unit_state=legacy-release
+if [[ $current_has_managed_units == true ]]; then
+    if "$current_target/manage-systemd-units" check-installed "$current_target" >/dev/null 2>&1; then
+        installed_unit_state=release-matched
+    else
+        installed_unit_state=repair-required
+    fi
+fi
 if [[ $mode == status ]]; then
-    printf 'Current:  %s\nPrevious: %s\nLatest:   %s\nCore current: %s\nCore latest: %s\nCLI current: %s\nCLI latest: %s\nCore app current: %s\nCore app latest: %s\nUpdater:  %s\n' \
+    printf 'Current:  %s\nPrevious: %s\nLatest:   %s\nCore current: %s\nCore latest: %s\nCLI current: %s\nCLI latest: %s\nCore app current: %s\nCore app latest: %s\nSystemd units: %s\nUpdater:  %s\n' \
         "${current_tag:-unavailable}" "${previous_tag:-unavailable}" "$tag" \
         "$current_core_version" "$latest_core_version" "$current_cli_version" \
-        "$latest_cli_version" "$current_core_admin_version" "$latest_core_admin_version" \
+        "$latest_cli_version" "$current_core_admin_version" "$latest_core_admin_version" "$installed_unit_state" \
         "$(systemctl is-enabled jarvis-updater.timer 2>/dev/null || printf unavailable)"
     exit 0
 fi
@@ -756,6 +913,7 @@ if [[ $mode == check ]]; then
         "${current_tag:-unavailable}" "$tag" "$current_core_version" "$latest_core_version" \
         "$current_cli_version" "$latest_cli_version" "$current_core_admin_version" \
         "$latest_core_admin_version"
+    if [[ $installed_unit_state == repair-required ]]; then printf 'repair required\n'; exit 2; fi
     if [[ $component_update_available == false && -n $current_tag && $current_tag == "$tag" ]]; then printf 'not available\n'; exit 0; fi
     if [[ $component_update_available == false && -n $current_tag ]] && ! version_is_newer "$tag" "$current_tag"; then printf 'not available\n'; exit 0; fi
     printf 'available\n'
@@ -763,6 +921,10 @@ if [[ $mode == check ]]; then
 fi
 if [[ -n $current_tag && $current_tag == "$tag" ]]; then
     [[ -n $current_schema_sha256 ]] || fail "active release lacks a schema fingerprint; stage a tagged baseline manually before enabling automatic updates"
+    if [[ $current_has_managed_units == true ]]; then
+        repair_active_managed_units "$current_target" "$tag"
+        exit 0
+    fi
     echo "jarvis updater: $tag is already active"
     exit 0
 fi
@@ -838,6 +1000,7 @@ if jq -e '.tooling.private_agents? == 1' "$release_dir/release.json" >/dev/null 
     done
 fi
 admin_helper_tooling_valid "$release_dir" || fail "$admin_helper_tooling_reason"
+systemd_unit_tooling_valid "$release_dir" || fail "$systemd_unit_tooling_reason"
 candidate_schema_sha256=$(schema_fingerprint "$release_dir/release.json") || \
     fail "release manifest schema fingerprint is invalid"
 if jq -e '.components? != null' "$release_dir/release.json" >/dev/null; then
@@ -883,33 +1046,40 @@ chmod 0644 "$release_dir/release.verification"
 
 chown -R root:root "$release_dir"
 chmod -R go-w "$release_dir"
+if [[ $release_has_managed_units == true ]]; then
+    "$release_dir/manage-systemd-units" validate-release "$release_dir"
+fi
 mv --no-target-directory "$release_dir" "$releases_dir/$tag"
 cleanup
 staging_dir=
 echo "jarvis updater: immutable release staged"
 
 previous_target=$current_target
+if [[ $release_has_managed_units == true ]]; then
+    if activate_managed_release "$releases_dir/$tag" "$previous_target"; then
+        echo "jarvis updater: administrative tooling and managed units activated"
+        echo "jarvis updater: activated $tag"
+        exit 0
+    fi
+    fail "rollback completed after failed managed activation; inspect sudo jarvis logs core"
+fi
+
+# Backwards-compatible path for historical releases that predate managed unit
+# artifacts. New releases built by this source always use the transaction above.
 temporary_link=/opt/jarvis/.current.new
 rm -f -- "$temporary_link"
 ln -s "$releases_dir/$tag" "$temporary_link"
 mv -Tf "$temporary_link" "$current_link"
-
 if systemctl restart jarvis-core.service && \
     curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
-        --retry 11 --retry-delay 5 --retry-connrefused \
-        http://127.0.0.1:8080/readyz >/dev/null; then
-    echo "jarvis updater: Core readiness passed"
-    if install_versioned_tooling "$releases_dir/$tag"; then
-        echo "jarvis updater: administrative tooling activated"
-        restart_brokers
-        echo "jarvis updater: activated $tag"
-        exit 0
-    fi
+        --retry 11 --retry-delay 5 --retry-connrefused http://127.0.0.1:8080/readyz >/dev/null && \
+    install_versioned_tooling "$releases_dir/$tag"; then
+    restart_brokers
+    echo "jarvis updater: activated legacy-format release $tag"
+    exit 0
 fi
-
-echo "jarvis updater: $tag failed readiness or tooling activation; restoring previous release" >&2
 ln -s "$previous_target" "$temporary_link"
 mv -Tf "$temporary_link" "$current_link"
-systemctl restart jarvis-core.service || true
+systemctl restart jarvis-core.service >/dev/null 2>&1 || true
 restart_brokers
-fail "rollback completed after failed activation; inspect journalctl -u jarvis-core"
+fail "rollback completed after failed legacy-format activation; inspect sudo jarvis logs core"

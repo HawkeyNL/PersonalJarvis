@@ -12,20 +12,38 @@ trap 'rm -rf -- "$fixture"' EXIT
 revision=0123456789abcdef0123456789abcdef01234567
 
 write_candidate() {
-    local tag=$1 release="$fixture/candidate/jarvis-core-$1" helper
+    local tag=$1 release="$fixture/candidate/jarvis-core-$1" helper unit
     mkdir -p "$release"
     for helper in jarvis-models jarvis-credentials; do
         printf '#!/usr/bin/env bash\nprintf "%s fixture\\n"\n' "$helper" > "$release/$helper"
         chmod 0755 "$release/$helper"
     done
+    cp "$repo_dir/deploy/systemd/manage-systemd-units.sh" "$release/manage-systemd-units"
+    chmod 0755 "$release/manage-systemd-units"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$release/verify-home-node"
+    chmod 0755 "$release/verify-home-node"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$release/install-home-node-core"
+    chmod 0755 "$release/install-home-node-core"
+    printf '# fixture terminal presentation\n' > "$release/ui.sh"
+    chmod 0644 "$release/ui.sh"
+    for unit in jarvis-core.service jarvis-config-broker.service jarvis-codex-broker.service \
+        jarvis-codex.service jarvis-opensandbox.service jarvis-surrealdb.service \
+        jarvis-updater.service jarvis-updater.timer \
+        jarvis-private-agent-updater.service jarvis-private-agent-updater.timer; do
+        cp "$repo_dir/deploy/systemd/$unit" "$release/systemd-$unit"
+        chmod 0644 "$release/systemd-$unit"
+    done
     printf '%s\n' '{"version":1,"source":"fixture","updated_at":"2026-09-01","models":[]}' \
         > "$release/pricing-registry.json"
     jq -n --arg tag "$tag" --arg revision "$revision" \
-        '{tag:$tag,revision:$revision,components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1}}' \
+        '{tag:$tag,revision:$revision,components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1}}' \
         > "$release/release.json"
     (
         cd "$release"
-        sha256sum jarvis-models jarvis-credentials pricing-registry.json > artifact-binaries.sha256
+        sha256sum jarvis-models jarvis-credentials pricing-registry.json \
+            manage-systemd-units verify-home-node install-home-node-core ui.sh \
+            systemd-*.service systemd-*.timer \
+            > artifact-binaries.sha256
     )
 }
 
@@ -37,6 +55,7 @@ archive="$fixture/jarvis-core-$tag-linux-x86_64.tar.gz"
 tar -tzf "$archive" | grep -qx "jarvis-core-$tag/jarvis-models"
 tar -tzf "$archive" | grep -qx "jarvis-core-$tag/jarvis-credentials"
 tar -tzf "$archive" | grep -qx "jarvis-core-$tag/pricing-registry.json"
+tar -tzf "$archive" | grep -qx "jarvis-core-$tag/systemd-jarvis-config-broker.service"
 extracted="$fixture/extracted"
 mkdir -p "$extracted"
 tar -xzf "$archive" -C "$extracted"
@@ -45,6 +64,8 @@ cmp "$fixture/candidate/jarvis-core-$tag/jarvis-models" \
 cmp "$fixture/candidate/jarvis-core-$tag/jarvis-credentials" \
     "$extracted/jarvis-core-$tag/jarvis-credentials"
 jq -e '.tooling.admin_helpers == 1' \
+    "$extracted/jarvis-core-$tag/release.json" >/dev/null
+jq -e '.tooling.systemd_units == 1' \
     "$extracted/jarvis-core-$tag/release.json" >/dev/null
 
 bad_tag=v9.8.8
@@ -60,5 +81,16 @@ grep -Fq 'release candidate is missing executable jarvis-credentials' "$fixture/
     cat "$fixture/bad.stderr" >&2
     exit 1
 }
+
+bad_unit_tag=v9.8.9
+write_candidate "$bad_unit_tag"
+rm -f -- "$fixture/candidate/jarvis-core-$bad_unit_tag/systemd-jarvis-config-broker.service"
+if bash "$builder" package "$bad_unit_tag" "$revision" "$fixture" \
+    >"$fixture/bad-unit.stdout" 2>"$fixture/bad-unit.stderr"; then
+    echo "release packager accepted a missing declared managed unit" >&2
+    exit 1
+fi
+grep -Fq 'managed unit is missing or unsafe: jarvis-config-broker.service' \
+    "$fixture/bad-unit.stderr"
 
 echo "Canonical release package fixture tests passed"

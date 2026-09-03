@@ -2720,7 +2720,7 @@ fn operation_command(
     let lock;
     match operation {
         AppOperation::HealthVerification => {
-            command = trusted_command(Path::new(LIBEXEC).join("verify-home-node"));
+            command = trusted_health_verifier_command()?;
             lock = None;
         }
         AppOperation::AgentCheck => {

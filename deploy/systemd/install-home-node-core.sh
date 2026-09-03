@@ -4,9 +4,21 @@
 # packages, creates secrets, opens firewall ports, or grants Docker/root access to
 # the Jarvis service account.
 set -euo pipefail
-repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-# shellcheck disable=SC1091 # dynamic repository root
-source "$repo_dir/deploy/lib/ui.sh"
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_dir=$(cd -- "$script_dir/../.." && pwd)
+if [[ -r /usr/local/libexec/jarvis/ui.sh ]]; then
+    # shellcheck disable=SC1091 # installed root-owned helper
+    source /usr/local/libexec/jarvis/ui.sh
+elif [[ -r $script_dir/ui.sh && ! -L $script_dir/ui.sh ]]; then
+    # shellcheck disable=SC1091 # packaged beside the verified installer
+    source "$script_dir/ui.sh"
+elif [[ -r $repo_dir/deploy/lib/ui.sh ]]; then
+    # shellcheck disable=SC1091 # dynamic repository root
+    source "$repo_dir/deploy/lib/ui.sh"
+else
+    echo "missing trusted Jarvis terminal presentation helper" >&2
+    exit 1
+fi
 
 usage() {
     echo "Usage: sudo $0 /opt/jarvis/releases/vMAJOR.MINOR.PATCH" >&2
@@ -128,6 +140,7 @@ jq -e --arg tag "$release_tag" '
 }
 release_has_core_admin=false
 release_has_private_agent_tooling=false
+release_has_managed_systemd=false
 if jq -e '.tooling.private_agents? == 1' "$release_dir/release.json" >/dev/null 2>&1; then
     release_has_private_agent_tooling=true
     for helper in install-agent-bundle private-agent-poll jarvis-private-update; do
@@ -138,6 +151,20 @@ if jq -e '.tooling.private_agents? == 1' "$release_dir/release.json" >/dev/null 
     done
 fi
 validate_admin_helper_tooling "$release_dir"
+if jq -e '((.tooling? | type) == "object") and (.tooling | has("systemd_units"))' \
+    "$release_dir/release.json" >/dev/null 2>&1; then
+    jq -e '(.tooling.systemd_units | type) == "number" and .tooling.systemd_units == 1' \
+        "$release_dir/release.json" >/dev/null || {
+        echo "unsupported managed-systemd capability" >&2
+        exit 1
+    }
+    [[ -x $release_dir/manage-systemd-units && ! -L $release_dir/manage-systemd-units ]] || {
+        echo "managed-systemd helper is missing or unsafe" >&2
+        exit 1
+    }
+    "$release_dir/manage-systemd-units" validate-release "$release_dir"
+    release_has_managed_systemd=true
+fi
 if jq -e '.components? != null' "$release_dir/release.json" >/dev/null; then
     jq -e '.components | [.core, .cli, .core_admin] | all(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
         "$release_dir/release.json" >/dev/null || {
@@ -236,20 +263,27 @@ if [[ ${hops:-0} != 0 && ${hops:-0} != 1 ]]; then
     exit 1
 fi
 
-install -o root -g root -m 0644 \
-    "$repo_dir/deploy/systemd/jarvis-core.service" \
-    /etc/systemd/system/jarvis-core.service
-install -o root -g root -m 0644 \
-    "$repo_dir/deploy/systemd/jarvis-config-broker.service" \
-    /etc/systemd/system/jarvis-config-broker.service
-install -o root -g root -m 0644 \
-    "$repo_dir/deploy/systemd/jarvis-codex-broker.service" \
-    /etc/systemd/system/jarvis-codex-broker.service
-install -o root -g root -m 0644 \
-    "$repo_dir/deploy/systemd/jarvis-surrealdb.service" \
-    /etc/systemd/system/jarvis-surrealdb.service
+unit_backup=
+if [[ $release_has_managed_systemd == true ]]; then
+    unit_backup=$(mktemp -d /run/jarvis-systemd-install-rollback.XXXXXXXX)
+    chmod 0700 "$unit_backup"
+    "$release_dir/manage-systemd-units" install "$release_dir" "$unit_backup"
+else
+    # Compatibility only for verified historical releases. New releases are
+    # self-contained and never source production units from this checkout.
+    for unit in jarvis-core.service jarvis-config-broker.service jarvis-codex-broker.service \
+        jarvis-codex.service jarvis-opensandbox.service jarvis-surrealdb.service \
+        jarvis-updater.service jarvis-updater.timer \
+        jarvis-private-agent-updater.service jarvis-private-agent-updater.timer; do
+        install -o root -g root -m 0644 "$repo_dir/deploy/systemd/$unit" "/etc/systemd/system/$unit"
+    done
+fi
 install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
-install -o root -g root -m 0644 "$repo_dir/deploy/lib/ui.sh" /usr/local/libexec/jarvis/ui.sh
+if [[ $release_has_managed_systemd == true ]]; then
+    install -o root -g root -m 0644 "$release_dir/ui.sh" /usr/local/libexec/jarvis/ui.sh
+else
+    install -o root -g root -m 0644 "$repo_dir/deploy/lib/ui.sh" /usr/local/libexec/jarvis/ui.sh
+fi
 install -o root -g root -m 0755 \
     "$release_dir/jarvis-agent-bundle" \
     /usr/local/libexec/jarvis/jarvis-agent-bundle
@@ -287,21 +321,15 @@ if [[ $release_has_core_admin == true ]]; then
     /usr/bin/gtk-update-icon-cache --force --ignore-theme-index \
         /usr/share/icons/hicolor >/dev/null 2>&1 || true
 fi
-install -o root -g root -m 0755 \
-    "$repo_dir/deploy/systemd/verify-home-node.sh" \
-    /usr/local/libexec/jarvis/verify-home-node
-install -o root -g root -m 0644 \
-    "$repo_dir/deploy/systemd/jarvis-updater.service" \
-    /etc/systemd/system/jarvis-updater.service
-install -o root -g root -m 0644 \
-    "$repo_dir/deploy/systemd/jarvis-updater.timer" \
-    /etc/systemd/system/jarvis-updater.timer
-install -o root -g root -m 0644 \
-    "$repo_dir/deploy/systemd/jarvis-private-agent-updater.service" \
-    /etc/systemd/system/jarvis-private-agent-updater.service
-install -o root -g root -m 0644 \
-    "$repo_dir/deploy/systemd/jarvis-private-agent-updater.timer" \
-    /etc/systemd/system/jarvis-private-agent-updater.timer
+if [[ $release_has_managed_systemd == true ]]; then
+    install -o root -g root -m 0755 "$release_dir/manage-systemd-units" \
+        /usr/local/libexec/jarvis/manage-systemd-units
+    install -o root -g root -m 0755 "$release_dir/verify-home-node" \
+        /usr/local/libexec/jarvis/verify-home-node
+else
+    install -o root -g root -m 0755 "$repo_dir/deploy/systemd/verify-home-node.sh" \
+        /usr/local/libexec/jarvis/verify-home-node
+fi
 
 # A release is immutable: the unprivileged service cannot modify its binary or
 # Core persona even if an application-level control were bypassed.
@@ -323,9 +351,16 @@ activate_release() {
     mv -Tf "$temporary" /opt/jarvis/current
 }
 restore_previous_release() {
-    [[ -n $previous_release ]] || return 0
-    ui_warning "Restoring previous verified release ${previous_release##*/}"
-    activate_release "$previous_release"
+    ui_warning "Restoring previous release and managed unit policy"
+    if [[ -n $previous_release ]]; then
+        activate_release "$previous_release"
+    else
+        rm -f -- /opt/jarvis/current
+    fi
+    if [[ $release_has_managed_systemd == true && -n $unit_backup ]]; then
+        "$release_dir/manage-systemd-units" restore "$release_dir" "$unit_backup"
+        systemctl daemon-reload
+    fi
     systemctl try-restart jarvis-config-broker.service >/dev/null 2>&1 || true
     systemctl try-restart jarvis-core.service >/dev/null 2>&1 || true
 }
@@ -334,12 +369,21 @@ systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/jarvis-core.service
 systemd-analyze verify /etc/systemd/system/jarvis-config-broker.service
 systemd-analyze verify /etc/systemd/system/jarvis-codex-broker.service
+systemd-analyze verify /etc/systemd/system/jarvis-codex.service
+systemd-analyze verify /etc/systemd/system/jarvis-opensandbox.service
 systemd-analyze verify /etc/systemd/system/jarvis-surrealdb.service
 systemd-analyze verify /etc/systemd/system/jarvis-updater.service
 systemd-analyze verify /etc/systemd/system/jarvis-updater.timer
+systemd-analyze verify /etc/systemd/system/jarvis-private-agent-updater.service
+systemd-analyze verify /etc/systemd/system/jarvis-private-agent-updater.timer
 ui_detail "Starting SurrealDB and Jarvis Core …"
 if ! systemctl enable --now jarvis-surrealdb.service; then
     ui_error "SurrealDB could not start; active release was not changed"
+    if [[ $release_has_managed_systemd == true && -n $unit_backup ]]; then
+        "$release_dir/manage-systemd-units" restore "$release_dir" "$unit_backup"
+        systemctl daemon-reload
+        rm -rf -- "$unit_backup"
+    fi
     exit 1
 fi
 
@@ -382,5 +426,9 @@ fi
 ui_success "Jarvis Core active"
 ui_success "/livez ready"
 ui_success "/readyz ready"
+if [[ $release_has_managed_systemd == true ]]; then
+    "$release_dir/manage-systemd-units" check-installed "$release_dir"
+    rm -rf -- "$unit_backup"
+fi
 [[ ${JARVIS_VERBOSE:-0} == 1 ]] && systemctl --no-pager --full status jarvis-core
 ui_detail "Jarvis Core is running from $release_dir"

@@ -26,7 +26,10 @@ ProtectSystem=strict
 ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
-ReadWritePaths=/etc/jarvis/model-policy.json /var/lib/jarvis/config-broker /run/jarvis-config-broker
+# RuntimeDirectory=/StateDirectory= make these two narrowly scoped trees
+# writable even with ProtectSystem=strict; only the policy file needs an
+# explicit host exception.
+ReadWritePaths=/etc/jarvis/model-policy.json
 
 [Install]
 WantedBy=multi-user.target

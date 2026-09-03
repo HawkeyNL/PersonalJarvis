@@ -69,8 +69,17 @@ require_literal "$release_builder" \
     'components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}' \
     "release manifest must expose separate Core, CLI, and Core Admin App versions"
 require_literal "$release_builder" \
-    'tooling: {private_agents: 1, admin_helpers: 1}' \
-    "release manifest must bind private-agent and admin-helper tooling capabilities"
+    'tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1}' \
+    "release manifest must bind private-agent, admin-helper and systemd-unit tooling capabilities"
+require_literal "$release_builder" \
+    'install -m 0755 deploy/systemd/manage-systemd-units.sh "$temporary_release/manage-systemd-units"' \
+    "canonical release builder must stage the fixed managed-systemd boundary"
+require_literal "$release_builder" \
+    'install -m 0755 deploy/systemd/install-home-node-core.sh "$temporary_release/install-home-node-core"' \
+    "canonical release builder must stage the self-contained Home Node installer"
+require_literal "$release_builder" \
+    'install -m 0644 "deploy/systemd/$unit" "$temporary_release/systemd-$unit"' \
+    "canonical release builder must stage reviewed production units from the source tree"
 require_literal "$release_builder" \
     'jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials' \
     "artifact checksum manifest must bind both versioned admin helpers"

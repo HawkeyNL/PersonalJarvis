@@ -229,6 +229,48 @@ fn legacy_release_without_capability_uses_fixed_compatibility_paths() {
 }
 
 #[test]
+fn health_verifier_follows_the_managed_systemd_capability() {
+    let (_directory, current, releases, legacy, uid, gid) = admin_helper_layout(true);
+    let active = releases.join("v0.0.20");
+    fs::write(
+        active.join("release.json"),
+        r#"{"tag":"v0.0.20","tooling":{"admin_helpers":1,"systemd_units":1}}"#,
+    )
+    .unwrap();
+    fs::set_permissions(
+        active.join("release.json"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let versioned = active.join("verify-home-node");
+    let legacy_verifier = legacy.join("verify-home-node");
+    fs::write(&versioned, "versioned verifier\n").unwrap();
+    fs::write(&legacy_verifier, "legacy verifier\n").unwrap();
+    fs::set_permissions(&versioned, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&legacy_verifier, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        resolve_health_verifier(&current, &releases, &legacy_verifier, uid, gid,).unwrap(),
+        versioned
+    );
+
+    fs::remove_file(&versioned).unwrap();
+    std::os::unix::fs::symlink(&legacy_verifier, &versioned).unwrap();
+    assert!(resolve_health_verifier(&current, &releases, &legacy_verifier, uid, gid,).is_err());
+}
+
+#[test]
+fn legacy_release_uses_fixed_health_verifier() {
+    let (_directory, current, releases, legacy, uid, gid) = admin_helper_layout(false);
+    let legacy_verifier = legacy.join("verify-home-node");
+    fs::write(&legacy_verifier, "legacy verifier\n").unwrap();
+    fs::set_permissions(&legacy_verifier, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        resolve_health_verifier(&current, &releases, &legacy_verifier, uid, gid,).unwrap(),
+        legacy_verifier
+    );
+}
+
+#[test]
 fn admin_helper_resolution_rejects_escape_symlink_and_unsafe_mode() {
     let (directory, current, releases, legacy, uid, gid) = admin_helper_layout(true);
     let active = releases.join("v0.0.20");
@@ -430,6 +472,12 @@ fn update_summary_merges_status_and_check_without_ui_side_effects() {
         .unwrap();
     assert_eq!(summary.update_available, Some(false));
     assert_eq!(summary.updater.as_deref(), Some("enabled"));
+    summary
+        .merge_helper_output(
+            "Current: v0.0.16\nLatest: v0.0.16\nSystemd units: repair-required\nUpdate: repair required\n",
+        )
+        .unwrap();
+    assert_eq!(summary.update_available, Some(true));
 }
 
 #[test]

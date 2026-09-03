@@ -113,6 +113,14 @@ if jq -e '.tooling.private_agents? == 1' "$release_dir/release.json" >/dev/null 
     done
 fi
 validate_admin_helper_tooling "$release_dir"
+if jq -e '((.tooling? | type) == "object") and (.tooling | has("systemd_units"))' \
+    "$release_dir/release.json" >/dev/null 2>&1; then
+    jq -e '(.tooling.systemd_units | type) == "number" and .tooling.systemd_units == 1' \
+        "$release_dir/release.json" >/dev/null || fail "unsupported managed-systemd capability"
+    [[ -x $release_dir/manage-systemd-units && ! -L $release_dir/manage-systemd-units ]] || \
+        fail "managed-systemd helper is invalid"
+    "$release_dir/manage-systemd-units" validate-artifacts "$release_dir"
+fi
 if jq -e '.components? != null' "$release_dir/release.json" >/dev/null; then
     jq -e '.components | [.core, .cli, .core_admin] | all(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' \
         "$release_dir/release.json" >/dev/null || fail "release component versions are invalid"

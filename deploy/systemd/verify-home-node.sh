@@ -29,6 +29,50 @@ expect_mode() {
     actual=$(stat -c '%U:%G:%a' "$path" 2>/dev/null || true)
     [[ $actual == "$expected" ]]
 }
+managed_units_match_active_release() {
+    local active manifest capability manager expected actual matches
+    [[ -L /opt/jarvis/current ]] || return 1
+    active=$(readlink -f /opt/jarvis/current) || return 1
+    [[ $active == /opt/jarvis/releases/v* && -d $active && ! -L $active ]] || return 1
+    manifest=$active/release.json
+    [[ -f $manifest && ! -L $manifest ]] || return 1
+    capability=$(jq -er '.tooling.systemd_units // empty' "$manifest" 2>/dev/null || true)
+    if [[ -z $capability ]]; then
+        printf 'legacy release: managed unit integrity is unavailable\n'
+        return 0
+    fi
+    [[ $capability == 1 ]] || return 1
+    manager=$active/manage-systemd-units
+    [[ -x $manager && ! -L $manager ]] || return 1
+    [[ -f $active/artifact-binaries.sha256 && ! -L $active/artifact-binaries.sha256 ]] || return 1
+    LC_ALL=C awk '
+        NF != 2 || $1 !~ /^[0-9a-f]{64}$/ || $2 !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ { exit 1 }
+        seen[$2]++ { if (seen[$2] > 1) exit 1 }
+        END { if (NR == 0) exit 1 }
+    ' "$active/artifact-binaries.sha256" || return 1
+    matches=$(awk '$2 == "manage-systemd-units" { count++ } END { print count + 0 }' \
+        "$active/artifact-binaries.sha256")
+    [[ $matches == 1 ]] || return 1
+    expected=$(awk '$2 == "manage-systemd-units" { print $1 }' \
+        "$active/artifact-binaries.sha256")
+    actual=$(sha256sum "$manager" | awk '{print $1}')
+    [[ $actual == "$expected" ]] || return 1
+    if ! "$manager" check-installed "$active"; then
+        printf 'Hint: sudo jarvis update --version %s\n' "${active##*/}" >&2
+        return 1
+    fi
+}
+config_broker_runtime_valid() {
+    expect_mode /run/jarvis-config-broker root:jarvis:750
+}
+config_broker_state_valid() {
+    expect_mode /var/lib/jarvis/config-broker root:jarvis:700
+}
+config_broker_socket_valid() {
+    local socket=/run/jarvis-config-broker/broker.sock
+    [[ -S $socket && ! -L $socket ]] || return 1
+    expect_mode "$socket" root:jarvis:660
+}
 loopback_only() {
     local port=$1 line local_address
     while IFS= read -r line; do
@@ -81,6 +125,7 @@ check "Provider secret directory permissions" expect_mode /etc/jarvis/secrets ro
 check "Protected persona permissions" expect_mode /etc/jarvis/Jarvis.md root:jarvis:640
 check "Agent bundle is valid and immutable" agent_bundle_valid
 ui_step "Services and network"
+check "Installed Jarvis systemd units match active release" managed_units_match_active_release
 check "Docker active" systemctl is-active --quiet docker.service
 check "SurrealDB service active" systemctl is-active --quiet jarvis-surrealdb.service
 check "Jarvis Core active" systemctl is-active --quiet jarvis-core.service
@@ -112,6 +157,9 @@ ui_step "Secrets and optional services"
 check "Docker socket is unreadable by jarvis" runuser -u jarvis -- test ! -r /var/run/docker.sock
 check "Root SurrealDB credentials are unreadable" runuser -u jarvis -- test ! -r /etc/jarvis/surrealdb.env
 check "Privileged broker service is active" systemctl is-active --quiet jarvis-config-broker.service
+check "Config broker runtime directory is systemd-managed" config_broker_runtime_valid
+check "Config broker persistent state directory is protected" config_broker_state_valid
+check "Config broker Unix socket is present and protected" config_broker_socket_valid
 check "Privileged broker has no public TCP listener" bash -c '! ss -ltnp 2>/dev/null | grep -Fq jarvis-config-broker'
 for provider_secret in /etc/jarvis/secrets/*.env; do
     [[ -e $provider_secret ]] || continue

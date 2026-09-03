@@ -42,10 +42,13 @@ mod update_center;
 mod usage_insights;
 
 use admin_helpers::{
-    compatibility_helper, compatibility_helper_output, trusted_admin_helper_command, AdminHelper,
+    compatibility_helper, compatibility_helper_output, trusted_admin_helper_command,
+    trusted_health_verifier_command, AdminHelper,
 };
 #[cfg(test)]
-use admin_helpers::{explicit_helper_subprocess_mode, resolve_admin_helper};
+use admin_helpers::{
+    explicit_helper_subprocess_mode, resolve_admin_helper, resolve_health_verifier,
+};
 #[cfg(test)]
 use agent_tree::parse_safe_agent_manifest;
 use agent_tree::{
@@ -696,7 +699,7 @@ fn health(presentation: &Presentation, verbose: bool) -> Result<()> {
         return tui_app::run_live(tui_app::AppView::Health, presentation.tui_trace);
     }
     if presentation.json {
-        let mut command = trusted_command(Path::new(LIBEXEC).join("verify-home-node"));
+        let mut command = trusted_health_verifier_command()?;
         let output = command
             .stdin(Stdio::null())
             .output()
@@ -709,11 +712,8 @@ fn health(presentation: &Presentation, verbose: bool) -> Result<()> {
         return Ok(());
     }
     presentation.intro("Jarvis Home Node health");
-    run_program(
-        Path::new(LIBEXEC).join("verify-home-node"),
-        std::iter::empty::<&str>(),
-        SubprocessMode::from_verbose(verbose),
-    )?;
+    let mut command = trusted_health_verifier_command()?;
+    run_command(&mut command, SubprocessMode::from_verbose(verbose))?;
     if presentation.interactive && io::stdin().is_terminal() {
         let report = status_report()?;
         let mut rows: Vec<Vec<String>> = report
@@ -1635,16 +1635,6 @@ impl SubprocessMode {
             Self::InheritedInteractive
         }
     }
-}
-
-fn run_program<I, S>(program: PathBuf, args: I, mode: SubprocessMode) -> Result<()>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let mut command = trusted_command(program);
-    command.args(args);
-    run_command(&mut command, mode)
 }
 
 fn run_command(command: &mut ProcessCommand, mode: SubprocessMode) -> Result<()> {

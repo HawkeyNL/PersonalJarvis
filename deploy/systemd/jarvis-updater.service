@@ -27,4 +27,8 @@ ProtectSystem=strict
 ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
-ReadWritePaths=/opt/jarvis
+# The fixed updater owns immutable releases, the canonical copies of its
+# versioned tooling/application, and the fixed Jarvis unit set. Directory-level
+# write access is required for same-filesystem atomic rename; caller-selected
+# paths and unit names are never accepted.
+ReadWritePaths=/opt/jarvis /etc/systemd/system /usr/local/sbin /usr/local/libexec/jarvis /usr/bin /usr/share/applications /usr/share/icons/hicolor/128x128/apps /usr/share/jarvis-core-admin
