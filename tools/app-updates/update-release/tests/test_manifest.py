@@ -85,6 +85,7 @@ class ManifestTests(unittest.TestCase):
             source_revision="a" * 40,
             client_protocol=1,
         )
+        value["artifacts"] = [entry for entry in value["artifacts"] if entry["platform"] != "ios"]
         value["installers"] = [
             {
                 "platform": "macos",

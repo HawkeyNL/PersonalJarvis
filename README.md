@@ -16,8 +16,9 @@ releases (`app-vX.Y.Z`) are independent.
 The authoritative shared client protocol remains in `crates/client-core`;
 the desktop consumes an exact reviewed Git revision, not a sibling checkout.
 The Home Node mirrors signed public desktop/Android artifacts outbound and
-serves them only to authenticated enrolled clients; iOS uses TestFlight/App
-Store distribution. See [application update deployment](docs/app-updates/CLIENT_RELEASES.md).
+serves them only to authenticated enrolled clients. iOS is validated in client
+CI and installed locally by the owner through Xcode; it has no server-delivered
+artifact. See [application update deployment](docs/app-updates/CLIENT_RELEASES.md).
 
 Home Node model-routing and credential operations are documented in
 [docs/MODEL_ROUTING_OPERATIONS.md](docs/MODEL_ROUTING_OPERATIONS.md).

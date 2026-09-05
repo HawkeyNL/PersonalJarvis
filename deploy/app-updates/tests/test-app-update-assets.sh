@@ -34,7 +34,7 @@ test ! -e "$assets_dir/../../jarvis-android"
 test ! -e "$assets_dir/../../jarvis-ios"
 test ! -e "$assets_dir/../../.github/workflows/mobile-release.yml"
 
-if grep -ER 'TAURI_SIGNING_PRIVATE_KEY|ANDROID_RELEASE_KEYSTORE|APPLE_DISTRIBUTION_CERTIFICATE|APP_STORE_CONNECT_API_PRIVATE_KEY' \
+if grep -ER 'TAURI_SIGNING_PRIVATE_KEY|ANDROID_RELEASE_KEYSTORE|APPLE_DISTRIBUTION_CERTIFICATE|APPLE_APP_STORE_PROVISIONING_PROFILE|APPLE_TEAM_ID|APP_STORE_CONNECT_API_' \
   "$assets_dir/../../.github/workflows"; then
   echo "Core workflows must not reference client production signing secrets" >&2
   exit 1

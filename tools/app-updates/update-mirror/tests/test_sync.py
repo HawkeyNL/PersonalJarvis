@@ -85,6 +85,7 @@ def release_source(
             entry for entry in value["artifacts"] if entry["platform"] in ("linux", "windows", "macos")
         ]
     elif product == "clients":
+        value["artifacts"] = [entry for entry in value["artifacts"] if entry["platform"] != "ios"]
         value["installers"] = [
             {
                 "platform": "macos",

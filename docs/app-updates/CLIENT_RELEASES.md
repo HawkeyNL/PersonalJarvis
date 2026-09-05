@@ -2,8 +2,9 @@
 
 ## Ownership
 
-- `HawkeyNL/PersonalJarvisApp` owns the desktop, Android, and iOS source,
-  coordinated `app-vX.Y.Z` release workflow, and all client signing operations.
+- `HawkeyNL/PersonalJarvisApp` owns the desktop, Android, and iOS source plus
+  the coordinated desktop/Android `app-vX.Y.Z` release workflow. iOS device
+  signing and installation are local owner actions outside GitHub CI/CD.
 - `HawkeyNL/PersonalJarvis` owns Core/Home Node, `crates/client-core`, the
   application mirror, and authenticated `/v1/app-updates/**` delivery.
 
@@ -13,7 +14,7 @@ is required in production.
 
 The public PersonalJarvisApp GitHub Release is untrusted artifact transport.
 The Home Node pulls it outbound and validates the signed `latest.json`, release
-identity, complete client matrix, sizes, hashes, Tauri updater signatures, and
+identity, complete downloadable matrix, sizes, hashes, Tauri updater signatures, and
 pinned Android signing identity before atomic promotion. A public downloader or
 compromised mirror cannot sign a future update. Signing private keys never
 belong on the Home Node.
@@ -22,12 +23,14 @@ The unified manifest contains:
 
 - Linux x86_64, Windows x86_64, and macOS arm64 Tauri updater artifacts;
 - a signed Android universal APK plus its monotonically increasing versionCode;
-- iOS TestFlight distribution metadata and monotonically increasing build;
 - supplemental notarized macOS DMG and Android store AAB metadata.
 
 The Home Node mirrors downloadable desktop assets, the APK, DMG, AAB, and the
-manifest. It never mirrors or serves an IPA. Only the three desktop updater
-targets and Android APK can be selected by the authenticated client API.
+manifest. iOS source is simulator-tested in client CI and installed locally
+from Xcode using the owner's Personal Team or registered-device development
+signing. It has no IPA, manifest target, or Home Node update artifact. Only the
+three desktop updater targets and Android APK can be selected by the
+authenticated client API.
 
 ```text
 /var/lib/jarvis/app-updates/
@@ -116,8 +119,8 @@ is sufficient; no additional port is opened.
 Production clients receive the Home Node origin at runtime and require HTTPS.
 Origin changes clear server-specific session/device binding before use. Desktop
 auth/update requests remain in native Rust, Android validates its package and
-certificate before invoking the system installer, and iOS uses Apple's update
-channel. The Home Node can fetch public GitHub Releases without a token; if an
+certificate before invoking the system installer, and iOS device installation
+remains a local Xcode operation. The Home Node can fetch public GitHub Releases without a token; if an
 optional token is configured later, redirects strip Authorization on origin
 change and logs/URLs never contain it.
 
@@ -136,4 +139,4 @@ cargo test -p jarvis-api -p jarvis-client-core --locked
 ```
 
 Mock tests cannot prove production Tauri signing, APK signing continuity,
-macOS notarization, App Store Connect upload, or an actual published release.
+macOS notarization, local iPhone installation, or an actual published release.

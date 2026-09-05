@@ -197,6 +197,8 @@ def validate_manifest(document: Any, *, require_complete: bool = True) -> dict[s
         required = {key for key in required if key[0] not in ("android", "ios")}
     elif product == "mobile":
         required = {key for key in required if key[0] in ("android", "ios")}
+    elif product == "clients":
+        required = {key for key in required if key[0] != "ios"}
     if require_complete and seen != required:
         missing = required - seen
         rendered = ", ".join(f"{platform}-{architecture}" for platform, architecture in sorted(missing))
