@@ -1,12 +1,12 @@
 [Unit]
-Description=Pull and verify private Jarvis application releases
+Description=Pull and verify signed Jarvis application releases
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 User=root
-Group=root
+Group=jarvis
 UMask=0027
 ExecStart=/usr/lib/jarvis/app-updates/update-mirror/sync.py --config /etc/jarvis/app-updates/config.json
 NoNewPrivileges=yes

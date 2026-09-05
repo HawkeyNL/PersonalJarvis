@@ -429,6 +429,22 @@ async fn main() -> anyhow::Result<()> {
             "JARVIS_APP_UPDATE_MIRROR_ROOT and JARVIS_APP_UPDATE_PUBLIC_BASE_URL must be configured together"
         ),
     };
+    let app_update_mirror = match std::env::var("JARVIS_MOBILE_APP_UPDATE_MIRROR_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(root) => Some(
+            app_update_mirror
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "mobile mirror requires the application update origin configuration"
+                    )
+                })?
+                .with_mobile_root(root)
+                .map_err(anyhow::Error::msg)?,
+        ),
+        None => app_update_mirror,
+    };
 
     let state = AppState {
         db,

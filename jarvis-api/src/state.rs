@@ -21,13 +21,19 @@ use crate::rate_limit;
 #[derive(Clone, Debug)]
 pub struct AppUpdateMirror {
     root: Arc<PathBuf>,
+    mobile_root: Option<Arc<PathBuf>>,
     public_base_url: Arc<str>,
 }
 
 impl AppUpdateMirror {
     pub fn new(root: impl Into<PathBuf>, public_base_url: &str) -> Result<Self, &'static str> {
         let root = root.into();
-        if !root.is_absolute() || root == Path::new("/") {
+        if !root.is_absolute()
+            || root == Path::new("/")
+            || root
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
             return Err("application update mirror root must be a bounded absolute path");
         }
         let parsed = url::Url::parse(public_base_url)
@@ -36,6 +42,7 @@ impl AppUpdateMirror {
             || parsed.host_str().is_none()
             || !parsed.username().is_empty()
             || parsed.password().is_some()
+            || parsed.path() != "/"
             || parsed.query().is_some()
             || parsed.fragment().is_some()
         {
@@ -43,6 +50,7 @@ impl AppUpdateMirror {
         }
         Ok(Self {
             root: Arc::new(root),
+            mobile_root: None,
             public_base_url: Arc::from(public_base_url.trim_end_matches('/')),
         })
     }
@@ -51,8 +59,91 @@ impl AppUpdateMirror {
         self.root.as_path()
     }
 
+    /// Keep an existing private mobile generation independent of desktop sync.
+    /// Without this opt-in, legacy mixed-platform mirrors retain their behavior.
+    pub fn with_mobile_root(mut self, root: impl Into<PathBuf>) -> Result<Self, &'static str> {
+        let root = root.into();
+        if !root.is_absolute()
+            || root == Path::new("/")
+            || root
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            || root.starts_with(self.root())
+            || self.root().starts_with(&root)
+        {
+            return Err("mobile mirror must be a separate bounded absolute path");
+        }
+        self.mobile_root = Some(Arc::new(root));
+        Ok(self)
+    }
+
+    pub fn for_mobile(&self) -> Self {
+        Self {
+            root: self
+                .mobile_root
+                .clone()
+                .unwrap_or_else(|| self.root.clone()),
+            mobile_root: None,
+            public_base_url: self.public_base_url.clone(),
+        }
+    }
+
     pub fn public_base_url(&self) -> &str {
         &self.public_base_url
+    }
+}
+
+/// Tests for runtime-only independent mirror configuration.
+#[cfg(test)]
+mod update_mirror_tests {
+    use super::AppUpdateMirror;
+    use std::path::Path;
+
+    #[test]
+    fn production_update_origin_and_roots_are_bounded() {
+        for origin in [
+            "http://jarvis.example.com",
+            "https://user:pass@jarvis.example.com",
+            "https://jarvis.example.com/path",
+            "https://jarvis.example.com?query=1",
+            "https://jarvis.example.com/#fragment",
+        ] {
+            assert!(AppUpdateMirror::new("/var/lib/jarvis/app-updates", origin).is_err());
+        }
+        for root in ["relative", "/", "/var/lib/../outside"] {
+            assert!(AppUpdateMirror::new(root, "https://jarvis.example.com").is_err());
+        }
+    }
+
+    #[test]
+    fn independent_mobile_root_preserves_origin_and_legacy_fallback() {
+        let legacy =
+            AppUpdateMirror::new("/var/lib/jarvis/app-updates", "https://jarvis.example.com")
+                .unwrap();
+        assert_eq!(legacy.for_mobile().root(), legacy.root());
+        let separate = legacy
+            .clone()
+            .with_mobile_root("/var/lib/jarvis/mobile-updates")
+            .unwrap();
+        assert_eq!(separate.root(), legacy.root());
+        assert_eq!(
+            separate.for_mobile().root(),
+            Path::new("/var/lib/jarvis/mobile-updates")
+        );
+        assert_eq!(
+            separate.for_mobile().public_base_url(),
+            legacy.public_base_url()
+        );
+        for unsafe_root in [
+            "/",
+            "relative",
+            "/var/lib/jarvis/app-updates",
+            "/var/lib/jarvis/app-updates/nested",
+            "/var/lib/jarvis",
+            "/var/lib/../elsewhere",
+        ] {
+            assert!(legacy.clone().with_mobile_root(unsafe_root).is_err());
+        }
     }
 }
 

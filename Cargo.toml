@@ -28,7 +28,6 @@ members = [
 # intentionally excluded so backend CI (clippy -D warnings) stays fast and the
 # heavy tauri/wry deps don't enter the workspace graph.
 exclude = [
-    "jarvis-app/src-tauri",
 ]
 
 [workspace.package]

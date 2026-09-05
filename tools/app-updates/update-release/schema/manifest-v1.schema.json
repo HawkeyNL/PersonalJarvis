@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.jarvis.local/app-release-manifest-v1.json",
+  "title": "Jarvis application release manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "release", "artifacts"],
+  "allOf": [
+    {
+      "if": { "properties": { "release": { "required": ["product"], "properties": { "product": { "const": "desktop" } } } } },
+      "then": { "properties": { "artifacts": { "minItems": 3, "maxItems": 3 } } }
+    },
+    {
+      "if": { "properties": { "release": { "required": ["product"], "properties": { "product": { "const": "mobile" } } } } },
+      "then": { "properties": { "artifacts": { "minItems": 2, "maxItems": 2 } } }
+    },
+    {
+      "if": { "properties": { "release": { "not": { "required": ["product"] } } } },
+      "then": { "properties": { "artifacts": { "minItems": 5, "maxItems": 5 } } }
+    }
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "installers": {
+      "type": "array", "maxItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["platform", "architecture", "distribution", "artifact"],
+        "properties": {
+          "platform": { "const": "macos" },
+          "architecture": { "const": "arm64" },
+          "distribution": { "const": "home-node-installer" },
+          "artifact": { "$ref": "#/properties/artifacts/items/properties/artifact" }
+        }
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "channel", "released_at", "minimum_client_protocol"],
+      "dependentRequired": {
+        "product": ["tag", "source_revision", "client_protocol"],
+        "tag": ["product"],
+        "source_revision": ["product"],
+        "client_protocol": ["product"]
+      },
+      "properties": {
+        "version": { "type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$" },
+        "channel": { "enum": ["stable", "beta", "development"] },
+        "released_at": { "type": "string", "format": "date-time" },
+        "minimum_client_protocol": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "notes": { "type": "string", "minLength": 1, "maxLength": 8192 },
+        "product": { "enum": ["desktop", "mobile"] },
+        "tag": { "type": "string", "pattern": "^app-v[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "source_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "client_protocol": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["platform", "architecture", "distribution", "signature"],
+        "properties": {
+          "platform": { "enum": ["windows", "macos", "linux", "android", "ios"] },
+          "architecture": { "enum": ["x86_64", "arm64", "universal"] },
+          "distribution": { "enum": ["home-node-updater", "home-node-apk", "testflight"] },
+          "artifact": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256", "size"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1, "maxLength": 512 },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+              "size": { "type": "integer", "minimum": 1 }
+            }
+          },
+          "external": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["bundle_id", "build_number"],
+            "properties": {
+              "bundle_id": { "const": "com.hawkeynl.jarvis" },
+              "build_number": { "type": "string", "pattern": "^[1-9][0-9]*$" }
+            }
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["version_code"],
+            "properties": {
+              "version_code": { "type": "integer", "minimum": 1 }
+            }
+          },
+          "signature": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["scheme", "value"],
+            "properties": {
+              "scheme": { "enum": ["tauri-minisign", "android-apk-signing-certificate-sha256", "apple-code-signing"] },
+              "value": { "type": "string", "minLength": 1, "maxLength": 16384 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

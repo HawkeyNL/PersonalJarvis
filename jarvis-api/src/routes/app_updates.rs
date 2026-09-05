@@ -30,6 +30,10 @@ struct Manifest {
     schema_version: u32,
     release: Release,
     artifacts: Vec<ArtifactEntry>,
+    // Supplemental installers are checksum-bound by the signed upstream
+    // manifest, validated/mirrored by sync, and never exposed as updater targets.
+    #[serde(default, rename = "installers")]
+    _installers: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +45,39 @@ struct Release {
     minimum_client_protocol: u32,
     #[serde(default)]
     notes: Option<String>,
+    #[serde(default)]
+    product: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    source_revision: Option<String>,
+    #[serde(default)]
+    client_protocol: Option<u32>,
+}
+
+impl Release {
+    fn identity_valid(&self) -> bool {
+        match self.product.as_deref() {
+            None => {
+                self.tag.is_none()
+                    && self.source_revision.is_none()
+                    && self.client_protocol.is_none()
+            }
+            Some("desktop" | "mobile") => {
+                self.tag.as_deref() == Some(format!("app-v{}", self.version).as_str())
+                    && self.source_revision.as_ref().is_some_and(|revision| {
+                        revision.len() == 40
+                            && revision
+                                .bytes()
+                                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                    })
+                    && self.client_protocol.is_some_and(|value| {
+                        (1..=65535).contains(&value) && self.minimum_client_protocol <= value
+                    })
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +227,7 @@ async fn active_release(
     if manifest.schema_version != 1
         || manifest.release.channel != channel
         || manifest.release.minimum_client_protocol == 0
+        || !manifest.release.identity_valid()
     {
         return Err(opaque(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -308,6 +346,7 @@ async fn active_android_release(
     if manifest.schema_version != 1
         || manifest.release.channel != channel
         || manifest.release.minimum_client_protocol == 0
+        || !manifest.release.identity_valid()
     {
         return Err(opaque(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -425,6 +464,7 @@ pub(crate) async fn android_update_check(
             "application updates unavailable",
         );
     };
+    let mirror = mirror.for_mobile();
     let selected = match active_android_release(&mirror, "stable").await {
         Ok(selected) => selected,
         Err(response) => return response,
@@ -476,6 +516,7 @@ pub(crate) async fn android_update_download(
             "application updates unavailable",
         );
     };
+    let mirror = mirror.for_mobile();
     let selected = match active_android_release(&mirror, "stable").await {
         Ok(selected) => selected,
         Err(response) => return response,
@@ -644,6 +685,46 @@ pub(crate) async fn app_update_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_release_identity_is_independent_and_fail_closed() {
+        let legacy = serde_json::json!({
+            "version": "0.1.0", "channel": "stable",
+            "released_at": "2026-09-01T12:00:00Z", "minimum_client_protocol": 1
+        });
+        assert!(serde_json::from_value::<Release>(legacy.clone())
+            .unwrap()
+            .identity_valid());
+        let mut desktop = legacy.clone();
+        desktop["product"] = "desktop".into();
+        desktop["tag"] = "app-v0.1.0".into();
+        desktop["source_revision"] = "a".repeat(40).into();
+        desktop["client_protocol"] = 1.into();
+        assert!(serde_json::from_value::<Release>(desktop.clone())
+            .unwrap()
+            .identity_valid());
+        for (field, value) in [
+            ("tag", serde_json::json!("v0.1.0")),
+            ("source_revision", serde_json::json!("main")),
+            ("product", serde_json::json!("unknown")),
+            ("client_protocol", serde_json::json!(0)),
+            ("minimum_client_protocol", serde_json::json!(2)),
+        ] {
+            let mut invalid = desktop.clone();
+            invalid[field] = value;
+            assert!(
+                !serde_json::from_value::<Release>(invalid)
+                    .unwrap()
+                    .identity_valid(),
+                "{field}"
+            );
+        }
+        let mut incomplete = legacy;
+        incomplete["source_revision"] = "a".repeat(40).into();
+        assert!(!serde_json::from_value::<Release>(incomplete)
+            .unwrap()
+            .identity_valid());
+    }
 
     #[test]
     fn updater_targets_are_explicit_and_mobile_is_not_installable() {

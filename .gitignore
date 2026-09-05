@@ -3,6 +3,10 @@
 **/target/
 **/*.rs.bk
 
+# Python tooling bytecode
+__pycache__/
+*.pyc
+
 # Environment / secrets — never commit real values
 .env
 .env.*
@@ -15,6 +19,8 @@ dist/
 
 # Tauri build output
 apps/**/src-tauri/target/
+# Leftover generated schema cache after desktop extraction (not source).
+/jarvis-app/src-tauri/gen/schemas/
 
 # SQLx offline data (regenerated)
 /.sqlx

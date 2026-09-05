@@ -35,9 +35,20 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         jarvis_system: Arc::from(JARVIS_SYSTEM_FALLBACK),
         speech: jarvis_speech::stub(),
         speech_verify_threshold: 0.5,
-        registry: Arc::new(RwLock::new(
-            jarvis_registry::collect(&jarvis_registry::CollectInput::default()).await,
-        )),
+        registry: Arc::new(RwLock::new(jarvis_registry::Registry {
+            host: jarvis_registry::HostInfo {
+                os: "fixture".into(),
+                arch: "x86_64".into(),
+                cpu: "fixture".into(),
+                cpu_cores: 1,
+                mem_total_gb: 1.0,
+                gpu: String::new(),
+            },
+            software: vec![],
+            brains: vec![],
+            models: vec![],
+            active_brain: "fixture".into(),
+        })),
         registry_input: Arc::new(jarvis_registry::CollectInput::default()),
         model_policy: Arc::new(jarvis_llm::ModelAccessPolicy::deny_by_default()),
         pricing_registry: Arc::new(jarvis_usage::PricingRegistry::builtin()),
@@ -63,6 +74,37 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         trusted_proxy_ips: Arc::new(Vec::new()),
         bootstrap_enrollment: None,
         app_update_mirror: None,
+    }
+}
+
+#[tokio::test]
+async fn every_application_update_route_requires_authentication_before_storage_access() {
+    // An unconnected database proves missing authentication does not query it.
+    let mut fixture = state(jarvis_store::Database::init(), None).await;
+    fixture.require_https = true;
+    fixture.app_update_mirror = Some(
+        jarvis_api::AppUpdateMirror::new(
+            "/nonexistent-fixture/desktop",
+            "https://jarvis.example.com",
+        )
+        .unwrap()
+        .with_mobile_root("/nonexistent-fixture/mobile")
+        .unwrap(),
+    );
+    let app = build_router(fixture);
+    for path in [
+        "/v1/app-updates/capability",
+        "/v1/app-updates/stable/linux/x86_64/0.1.0?client_protocol=1",
+        "/v1/app-updates/artifacts/0.1.0/linux/x86_64/Jarvis_0.1.0_linux_x86_64.AppImage",
+        "/v1/app-updates/android/1?client_protocol=1",
+        "/v1/app-updates/android/download",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
     }
 }
 

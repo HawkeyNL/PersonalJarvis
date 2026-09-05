@@ -193,7 +193,7 @@ if [[ $("$temporary_release/jarvis-core-admin" --frontend-mode) != production ]]
 fi
 install -m 0644 jarvis-core-admin/packaging/jarvis-core-admin.desktop \
   "$temporary_release/jarvis-core-admin.desktop"
-install -m 0644 jarvis-app/src-tauri/icons/128x128.png \
+install -m 0644 jarvis-core-admin/src-tauri/icons/128x128.png \
   "$temporary_release/jarvis-core-admin.png"
 printf '%s\n' "$core_admin_version" > "$temporary_release/jarvis-core-admin.version"
 install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update-core-release"
