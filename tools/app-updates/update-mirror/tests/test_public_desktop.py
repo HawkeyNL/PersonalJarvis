@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sync import GitHubReleaseSource, SyncError, _safe_config, _prepare_mirror, sync_release
@@ -20,6 +21,28 @@ MINISIGN = os.environ.get("JARVIS_TEST_MINISIGN") or shutil.which("minisign")
 
 
 class PublicSourceTests(unittest.TestCase):
+    def test_draft_prerelease_and_malformed_github_metadata_are_rejected(self):
+        valid = {"draft": False, "prerelease": False, "tag_name": "app-v1.0.0", "assets": []}
+        for invalid in (dict(valid, draft=True), dict(valid, prerelease=True),
+                        dict(valid, assets={}), dict(valid, tag_name=None), [], None):
+            source = GitHubReleaseSource("owner/app", "", 5)
+            source._open = Mock(return_value=BytesIO(json.dumps(invalid).encode()))
+            with self.subTest(invalid=invalid), self.assertRaises(SyncError):
+                source.open_manifest()
+
+    def test_rate_limit_keeps_the_current_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = config(Path(temporary) / "mirror")
+            _, prior = release_source("1.0.0")
+            sync_release(settings, prior, apk_verifier=lambda *args: None)
+            current = (Path(temporary) / "mirror/current").resolve()
+            source = GitHubReleaseSource("owner/app", "", 5)
+            error = HTTPError("https://api.github.com/", 429, "rate limit", {}, None)
+            source._open = Mock(side_effect=error)
+            with self.assertRaises(HTTPError), error:
+                sync_release(settings, source)
+            self.assertEqual((Path(temporary) / "mirror/current").resolve(), current)
+
     def test_lock_symlink_and_parent_symlink_fail_before_opening(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
