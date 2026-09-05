@@ -16,6 +16,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  deployment-privacy:
+    name: Deployment identifier privacy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 scripts/ci/check-deployment-privacy.py
+      - run: python3 scripts/ci/test-deployment-privacy.py
+
   rust-validation:
     name: Rust — fmt, clippy, test
     runs-on: ubuntu-latest
@@ -75,22 +83,5 @@ jobs:
       - name: Check dependency-exception expiry
         run: test "$(date -u +%F)" \< "2026-10-01"
       - run: cargo audit
-      - name: Audit desktop Tauri dependencies
-        run: cargo audit --file jarvis-app/src-tauri/Cargo.lock
 
-  frontend:
-    name: Jarvis app — typecheck and build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: jarvis-app/package-lock.json
-      - name: Install locked client dependencies
-        run: npm ci --prefix jarvis-app
-      - name: Typecheck and build client
-        run: npm run build --prefix jarvis-app
-
-  # TODO (JAR-057): secret scan, SBOM and container scan.
+  # Desktop CI lives in HawkeyNL/PersonalJarvisApp.

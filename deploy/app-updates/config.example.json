@@ -2,14 +2,12 @@
   "schema_version": 1,
   "source": {
     "kind": "github-releases",
-    "repository": "OWNER/PRIVATE_REPO",
-    "bearer_token_file": "/etc/jarvis/app-updates/private-release-token"
+    "repository": "HawkeyNL/PersonalJarvisApp"
   },
   "mirror_root": "/var/lib/jarvis/app-updates",
   "channel": "stable",
   "retention_previous": 1,
-  "android_signing_certificate_sha256": "replace-with-the-pinned-lowercase-APK-certificate-sha256",
-  "android_apksigner_path": "/usr/bin/apksigner",
+  "tauri_signing_public_key": "REPLACE_WITH_TAURI_SIGNING_PUBLIC_KEY",
   "timeout_seconds": 60,
   "max_artifact_bytes": 2147483648
 }

@@ -1,5 +1,5 @@
 [Unit]
-Description=Periodically pull private Jarvis application releases
+Description=Periodically pull signed Jarvis application releases
 
 [Timer]
 OnBootSec=5m
