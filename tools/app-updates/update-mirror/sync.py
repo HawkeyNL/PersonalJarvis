@@ -26,6 +26,7 @@ sys.path.insert(0, str(UPDATE_RELEASE))
 
 from manifest import MAX_MANIFEST_BYTES, ManifestError, mirrored_artifacts, validate_manifest  # noqa: E402
 from signatures import verify as verify_signature  # noqa: E402
+from mobile_import import MobileArchiveSource  # noqa: E402
 
 
 class SyncError(RuntimeError):
@@ -225,6 +226,11 @@ def _safe_config(path: Path) -> dict[str, Any]:
             base64.b64decode(public_key, validate=True)
         except ValueError as error:
             raise SyncError("Tauri signing public key is malformed") from error
+    elif source["kind"] == "owner-import":
+        if set(source) != {"kind"}:
+            raise SyncError("owner import takes its archive only from the explicit CLI option")
+        if not {"android_signing_certificate_sha256", "android_apksigner_path"} <= document.keys():
+            raise SyncError("owner mobile import requires Android signature verification")
     elif source["kind"] == "http-template":
         if set(source) != {"kind", "manifest_url", "artifact_url_template", "bearer_token_file"}:
             raise SyncError("HTTP source configuration is invalid")
@@ -363,7 +369,7 @@ def _verify_android_apk(path: Path, expected_fingerprint: str, apksigner_path: P
         raise SyncError("Android APK signer does not match the pinned release identity")
 
 
-def _reject_stale_release(root: Path, incoming_version: str) -> None:
+def _reject_stale_release(root: Path, incoming_version: str, incoming_manifest: dict | None = None) -> None:
     current_manifest = root / "current" / "manifest.json"
     if not current_manifest.exists():
         return
@@ -377,6 +383,19 @@ def _reject_stale_release(root: Path, incoming_version: str) -> None:
         raise SyncError("stable mirror versions must use comparable SemVer")
     if incoming_key < current_key:
         raise SyncError("refusing to activate a release older than the active release")
+    if incoming_manifest is not None:
+        old_product = current["release"].get("product")
+        if old_product is not None and old_product != incoming_manifest["release"].get("product"):
+            raise SyncError("desktop and mobile products require separate mirror generations")
+        old_android = next((entry for entry in current["artifacts"] if entry["platform"] == "android"), None)
+        new_android = next((entry for entry in incoming_manifest["artifacts"] if entry["platform"] == "android"), None)
+        if old_android is not None:
+            if new_android is None:
+                raise SyncError("desktop-only sync must use a separate mirror; refusing to remove active Android updates")
+            old_code = old_android["metadata"]["version_code"]
+            new_code = new_android["metadata"]["version_code"]
+            if new_code < old_code or (incoming_key > current_key and new_code <= old_code):
+                raise SyncError("Android versionCode must advance for a new mobile release")
 
 
 def _ensure_latest_manifest_link(root: Path) -> None:
@@ -536,7 +555,7 @@ def sync_release(
     version = release["version"]
     if isinstance(source, GitHubReleaseSource):
         source.validate_identity(version)
-    _reject_stale_release(root, version)
+    _reject_stale_release(root, version, manifest)
     android = next((entry for entry in manifest["artifacts"] if entry["platform"] == "android"), None)
     if android is not None:
         if not config.get("android_apksigner_path") or not config.get("android_signing_certificate_sha256"):
@@ -558,7 +577,7 @@ def sync_release(
                 _download(response, destination, artifact["sha256"], artifact["size"], config["max_artifact_bytes"])
             if entry["platform"] == "android":
                 android_path = destination
-            elif isinstance(source, GitHubReleaseSource):
+            elif isinstance(source, GitHubReleaseSource) and entry["distribution"] == "home-node-updater":
                 verify_signature(destination, entry["signature"]["value"], config["tauri_signing_public_key"])
         if android_path is not None:
             apk_verifier(
@@ -591,13 +610,21 @@ def sync_release(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path("/etc/jarvis/app-updates/config.json"))
+    parser.add_argument("--import-mobile", type=Path, help="explicit owner-only import of a decrypted mobile handoff")
     args = parser.parse_args()
+    source = None
     try:
         config = _safe_config(args.config)
         source_config = config["source"]
         token = _read_token(Path(source_config["bearer_token_file"])) if "bearer_token_file" in source_config else ""
-        if source_config["kind"] == "github-releases":
-            source: Source = GitHubReleaseSource(source_config["repository"], token, config["timeout_seconds"])
+        if args.import_mobile is not None and source_config["kind"] != "owner-import":
+            raise SyncError("mobile import requires a separate owner-import mirror configuration")
+        if source_config["kind"] == "owner-import":
+            if args.import_mobile is None:
+                raise SyncError("owner import requires --import-mobile; it cannot run unattended")
+            source = MobileArchiveSource(args.import_mobile)
+        elif source_config["kind"] == "github-releases":
+            source = GitHubReleaseSource(source_config["repository"], token, config["timeout_seconds"])
         else:
             source = HttpTemplateSource(source_config, token, config["timeout_seconds"])
         root = Path(config["mirror_root"])
@@ -616,6 +643,9 @@ def main() -> int:
     except (OSError, ValueError, json.JSONDecodeError, SyncError) as error:
         print(f"application update sync failed: {error}", file=sys.stderr)
         return 2
+    finally:
+        if isinstance(source, MobileArchiveSource):
+            source.close()
     return 0
 
 

@@ -20,6 +20,9 @@ install -o root -g root -m 0755 \
   "$repository_root/tools/app-updates/update-mirror/sync.py" \
   /usr/lib/jarvis/app-updates/update-mirror/sync.py
 install -o root -g root -m 0644 \
+  "$repository_root/tools/app-updates/update-mirror/mobile_import.py" \
+  /usr/lib/jarvis/app-updates/update-mirror/mobile_import.py
+install -o root -g root -m 0644 \
   "$repository_root/tools/app-updates/update-release/manifest.py" \
   /usr/lib/jarvis/app-updates/update-release/manifest.py
 install -o root -g root -m 0644 \

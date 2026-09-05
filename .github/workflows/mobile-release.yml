@@ -42,7 +42,16 @@ jobs:
           ANDROID_VERSION_CODE: ${{ inputs.android_version_code }}
           ANDROID_SIGNING_CERTIFICATE_SHA256: ${{ vars.ANDROID_SIGNING_CERTIFICATE_SHA256 }}
           IOS_BUILD_NUMBER: ${{ inputs.ios_build_number }}
+          MOBILE_ARTIFACT_RECIPIENT: ${{ vars.MOBILE_ARTIFACT_RECIPIENT }}
         run: |
+          [[ "$MOBILE_ARTIFACT_RECIPIENT" =~ ^age1[0-9a-z]{58}$ ]] || {
+            echo "MOBILE_ARTIFACT_RECIPIENT must be the owner's public age recipient" >&2
+            exit 2
+          }
+          sudo apt-get update
+          sudo apt-get install --yes age
+          age --encrypt --recipient "$MOBILE_ARTIFACT_RECIPIENT" \
+            --output "$RUNNER_TEMP/recipient-check.age" /dev/null
           [[ "$ANDROID_SIGNING_CERTIFICATE_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
             echo "ANDROID_SIGNING_CERTIFICATE_SHA256 repository variable must be a lowercase SHA-256 digest" >&2
             exit 2
@@ -61,7 +70,7 @@ jobs:
 
   android:
     name: Signed native Android APK and AAB
-    needs: validate
+    needs: [validate, ios]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     environment: private-app-release
@@ -126,15 +135,31 @@ jobs:
           cp "$apk" "$RUNNER_TEMP/private-assets/${base}.apk"
           cp "$aab" "$RUNNER_TEMP/private-assets/${base}.aab"
           printf '%s\n' "$fingerprint" > "$RUNNER_TEMP/private-assets/${base}.apk.cert-sha256"
+      - name: Encrypt mobile handoff for the owner
+        working-directory: .
+        env:
+          MOBILE_ARTIFACT_RECIPIENT: ${{ vars.MOBILE_ARTIFACT_RECIPIENT }}
+          RELEASED_AT: ${{ needs.validate.outputs.released_at }}
+          IOS_BUILD_NUMBER: ${{ inputs.ios_build_number }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes age
+          umask 077
+          python3 tools/app-updates/update-release/mobile_bundle.py \
+            --assets "$RUNNER_TEMP/private-assets" --output "$RUNNER_TEMP/mobile.tar" \
+            --version "$APP_VERSION" --revision "$GITHUB_SHA" --released-at "$RELEASED_AT" \
+            --android-code "$JARVIS_ANDROID_VERSION_CODE" --ios-build "$IOS_BUILD_NUMBER"
+          age --encrypt --recipient "$MOBILE_ARTIFACT_RECIPIENT" \
+            --output "$RUNNER_TEMP/mobile.tar.age" "$RUNNER_TEMP/mobile.tar"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: signed-android-${{ github.sha }}
-          path: ${{ runner.temp }}/private-assets/*
+          name: encrypted-mobile-${{ github.sha }}
+          path: ${{ runner.temp }}/mobile.tar.age
           if-no-files-found: error
           retention-days: 7
-      - name: Remove ephemeral keystore
+      - name: Remove ephemeral keystore and unencrypted handoff
         if: always()
-        run: rm -f "$RUNNER_TEMP/jarvis-release.jks"
+        run: rm -f "$RUNNER_TEMP/jarvis-release.jks" "$RUNNER_TEMP/mobile.tar"
 
   ios:
     name: Signed native iOS archive to TestFlight

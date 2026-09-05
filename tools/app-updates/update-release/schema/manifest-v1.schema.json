@@ -21,6 +21,19 @@
   ],
   "properties": {
     "schema_version": { "const": 1 },
+    "installers": {
+      "type": "array", "maxItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["platform", "architecture", "distribution", "artifact"],
+        "properties": {
+          "platform": { "const": "macos" },
+          "architecture": { "const": "arm64" },
+          "distribution": { "const": "home-node-installer" },
+          "artifact": { "$ref": "#/properties/artifacts/items/properties/artifact" }
+        }
+      }
+    },
     "release": {
       "type": "object",
       "additionalProperties": false,

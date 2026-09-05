@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "source": { "kind": "owner-import" },
+  "mirror_root": "/var/lib/jarvis/mobile-updates",
+  "channel": "stable",
+  "retention_previous": 1,
+  "android_signing_certificate_sha256": "REPLACE_WITH_REVIEWED_ANDROID_SIGNER_SHA256",
+  "android_apksigner_path": "/usr/bin/apksigner",
+  "timeout_seconds": 60,
+  "max_artifact_bytes": 2147483648
+}

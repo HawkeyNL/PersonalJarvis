@@ -43,6 +43,10 @@ and complete target matrices. Desktop manifests have `product=desktop`,
 `tag=app-v<version>`, a 40-character source revision, client protocol and minimum
 client protocol, and three updater targets: Linux x86_64, Windows x86_64,
 macOS arm64. Legacy five-target manifests remain readable.
+The optional `installers` section binds the macOS DMG size and SHA-256 into
+the signed manifest too. Sync verifies and stores it, but never treats it as
+a Tauri updater target. Apple signing/notarization is checked on the macOS
+release runner; Linux mirror verification checks its signed-manifest digest.
 
 ```text
 /var/lib/jarvis/app-updates/
@@ -62,6 +66,10 @@ existing bytes before reuse.
 
 These are post-review owner actions, not migration steps to execute now.
 First complete PersonalJarvisApp's `docs/GITHUB_RELEASE_SETUP.md`.
+The Home Node must first run a reviewed Core release containing the new manifest
+parser and independent mobile-root support. Installing a newer sync script does
+not replace an old Core binary. Core and App versions remain independent; no
+matching SemVer numbers are required.
 Use a reviewed Core checkout for the one-time installer; routine sync uses
 installed server tooling, not the checkout.
 
@@ -142,9 +150,94 @@ Existing authenticated Android endpoints and legacy manifest parsing remain.
 APK mirroring requires explicit `android_signing_certificate_sha256` and
 `android_apksigner_path`; missing settings cause refusal, not skipped verification.
 iOS uses TestFlight, never a custom IPA updater. Desktop-only manifests do not
-offer Android updates. Mobile distribution integration remains a migration
-acceptance item: do not replace an existing mixed-platform mirror with a
-desktop-only source until its mobile delivery path has been reviewed.
+offer Android updates. `JARVIS_MOBILE_APP_UPDATE_MIRROR_ROOT` optionally selects
+a separate mobile generation, using the same configured public HTTPS origin
+and unchanged authenticated Android endpoints. Without that option, the legacy
+combined mirror still works. The sync refuses to remove Android from an active
+combined generation: it cannot silently replace mobile delivery with desktop-only
+metadata. Android versionCode must also advance for a new mobile release.
+
+### Private Android handoff without another release repository
+
+The mobile workflow waits for successful iOS/TestFlight export, verifies the
+Android signer, creates a mobile-only manifest, and encrypts APK/AAB/manifest
+before uploading its Actions artifact. Only ciphertext is uploaded. This matters
+because an artifact in a public repository is not a confidentiality boundary.
+No mobile GitHub Release or third repository is required. Distribution from CI
+to the owner is explicit; Home Node-to-Android updating remains authenticated.
+
+Configure the repository variable `MOBILE_ARTIFACT_RECIPIENT` in PersonalJarvis
+with an owner-generated **public** age recipient. This is separate from APK,
+Apple and Tauri signing: no signing keys are rotated. The private decryption
+identity stays with the owner, never in GitHub, Core, Vue or a manifest. Example
+owner setup, outside the checkout, using [age's documented CLI](https://github.com/FiloSottile/age#usage):
+
+```bash
+sudo apt install age
+install -d -m 0700 "$HOME/.local/share/jarvis-signing"
+umask 077
+age-keygen -o "$HOME/.local/share/jarvis-signing/mobile.agekey"
+age-keygen -y "$HOME/.local/share/jarvis-signing/mobile.agekey"
+```
+
+Store the printed public recipient as the variable, and back up the private
+identity securely. Do not regenerate over an existing identity. Losing it
+requires a new encrypted handoff; it does not change the installed APK's signer.
+The existing `private-app-release` environment retains Android and Apple signing
+secrets. Desktop `application-release` secrets are not reused for encryption.
+
+On an already provisioned Home Node, install the sync tooling above, then:
+
+```bash
+sudo apt install apksigner
+sudo install -d -o root -g jarvis -m 0750 /var/lib/jarvis/mobile-updates
+sudo install -o root -g root -m 0640 \
+  deploy/app-updates/mobile-config.example.json /etc/jarvis/app-updates/mobile.json
+sudoedit /etc/jarvis/app-updates/mobile.json
+```
+
+Replace the signer placeholder with the reviewed existing Android certificate
+SHA-256, not a value taken on trust from the downloaded archive. Set the actual
+installed apksigner path if different. Do not overwrite an existing config.
+Add `JARVIS_MOBILE_APP_UPDATE_MIRROR_ROOT=/var/lib/jarvis/mobile-updates` to
+protected `core.env`, retaining the desktop mirror root and public origin.
+
+After a successful reviewed mobile workflow, obtain its run ID and exact source
+SHA from Actions. Download/decrypt/import with no inbound Home Node connection:
+
+```bash
+(
+  set -euo pipefail
+  umask 077
+  read -r -p 'Successful mobile workflow run ID: ' mobile_run
+  read -r -p 'Exact reviewed source SHA: ' mobile_sha
+  [[ "$mobile_run" =~ ^[0-9]+$ && "$mobile_sha" =~ ^[0-9a-f]{40}$ ]]
+  mobile_tmp=$(mktemp -d /tmp/jarvis-mobile-import.XXXXXX)
+  trap 'rm -rf -- "$mobile_tmp"' EXIT
+  gh run download "$mobile_run" --repo HawkeyNL/PersonalJarvis \
+    --name "encrypted-mobile-$mobile_sha" --dir "$mobile_tmp"
+  age --decrypt --identity "$HOME/.local/share/jarvis-signing/mobile.agekey" \
+    --output "$mobile_tmp/mobile.tar" "$mobile_tmp/mobile.tar.age"
+  sudo -g jarvis /usr/lib/jarvis/app-updates/update-mirror/sync.py \
+    --config /etc/jarvis/app-updates/mobile.json --import-mobile "$mobile_tmp/mobile.tar"
+)
+sudo systemctl restart jarvis-core.service
+```
+
+Decryption must succeed before import. The importer reads only four bounded
+regular USTAR members, never extracts arbitrary paths, checks the manifest/hash
+and independently invokes APK signer verification. AAB is retained in the
+encrypted owner handoff; only the verified APK is activated for Android delivery.
+Plaintext temporary files are deleted on success or failure. No unattended timer
+is enabled for owner-import mode. Existing private HTTP-template sources remain
+supported for owners already operating that transport.
+
+If an existing combined mirror occupies `/var/lib/jarvis/app-updates`, preserve
+it as the mobile mirror before the first desktop sync. Stop the old sync timer,
+verify that `/var/lib/jarvis/mobile-updates` does not exist, and move the existing
+root there as an owner-reviewed migration. Its internal relative links remain
+valid. Configure Core's mobile root and create a fresh desktop mirror through
+the installer. Never delete the old generation to make the new sync pass.
 
 ## Developer verification
 
@@ -157,7 +250,7 @@ bash deploy/app-updates/tests/test-app-update-assets.sh
 cargo test -p jarvis-api -p jarvis-client-core --locked
 ```
 
-Install `minisign` to run cryptographic fixtures, which create disposable test
+Install `minisign` and `age` to run cryptographic fixtures, which create disposable test
 keys only. CI needs no production signing secrets. Real macOS notarization,
 Windows packaging, published assets and Home Node/device acceptance are separate
 checks; mock tests cannot truthfully prove those outcomes.

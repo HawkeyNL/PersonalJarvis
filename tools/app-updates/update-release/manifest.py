@@ -66,7 +66,7 @@ def _artifact_path(value: Any, version: str, platform: str, architecture: str) -
 def validate_manifest(document: Any, *, require_complete: bool = True) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise ManifestError("manifest must be an object")
-    _exact_keys(document, {"schema_version", "release", "artifacts"}, set(), "manifest")
+    _exact_keys(document, {"schema_version", "release", "artifacts"}, {"installers"}, "manifest")
     if document["schema_version"] != SCHEMA_VERSION:
         raise ManifestError("unsupported schema_version")
 
@@ -201,6 +201,24 @@ def validate_manifest(document: Any, *, require_complete: bool = True) -> dict[s
         missing = required - seen
         rendered = ", ".join(f"{platform}-{architecture}" for platform, architecture in sorted(missing))
         raise ManifestError(f"manifest is missing release targets: {rendered}")
+    installers = document.get("installers", [])
+    if not isinstance(installers, list) or len(installers) > 1:
+        raise ManifestError("installers must be a bounded list")
+    for entry in installers:
+        if product != "desktop" or not isinstance(entry, dict):
+            raise ManifestError("supplemental installers are desktop-only")
+        _exact_keys(entry, {"platform", "architecture", "distribution", "artifact"}, set(), "installer")
+        if (entry["platform"], entry["architecture"], entry["distribution"]) != ("macos", "arm64", "home-node-installer"):
+            raise ManifestError("unsupported installer target")
+        artifact = entry["artifact"]
+        if not isinstance(artifact, dict):
+            raise ManifestError("installer artifact is invalid")
+        _exact_keys(artifact, {"path", "sha256", "size"}, set(), "installer artifact")
+        expected = f"releases/v{version}/macos-arm64/Jarvis_{version}_macos_arm64.dmg"
+        if artifact["path"] != expected or not isinstance(artifact["sha256"], str) or not SHA256_RE.fullmatch(artifact["sha256"]):
+            raise ManifestError("installer identity is invalid")
+        if type(artifact["size"]) is not int or not 0 < artifact["size"] <= 2 * 1024**3:
+            raise ManifestError("installer size is invalid")
     return document
 
 
@@ -208,4 +226,4 @@ def mirrored_artifacts(document: dict[str, Any]) -> list[dict[str, Any]]:
     """Return only artifacts that belong in the Home Node mirror."""
 
     validate_manifest(document)
-    return [entry for entry in document["artifacts"] if "artifact" in entry]
+    return [entry for entry in document["artifacts"] if "artifact" in entry] + document.get("installers", [])

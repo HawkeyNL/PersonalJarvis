@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - run: sudo apt-get update && sudo apt-get install --yes minisign
+      - run: sudo apt-get update && sudo apt-get install --yes minisign age
       - run: |
           python3 -m unittest discover -s tools/app-updates/update-release/tests -v
           python3 -m unittest discover -s tools/app-updates/update-mirror/tests -v

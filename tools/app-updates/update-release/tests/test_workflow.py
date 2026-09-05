@@ -33,3 +33,12 @@ class MobileReleaseWorkflowTests(unittest.TestCase):
             start = workflow.index(f"  {job}:")
             steps = workflow.index("    steps:", start)
             self.assertNotIn("secrets.", workflow[start:steps])
+
+    def test_production_mobile_upload_is_encrypted_and_waits_for_ios(self):
+        workflow = (ROOT / ".github/workflows/mobile-release.yml").read_text()
+        self.assertIn("needs: [validate, ios]", workflow)
+        self.assertIn('age --encrypt --recipient "$MOBILE_ARTIFACT_RECIPIENT"', workflow)
+        self.assertIn("path: ${{ runner.temp }}/mobile.tar.age", workflow)
+        self.assertNotIn("path: ${{ runner.temp }}/private-assets", workflow)
+        self.assertNotIn("gh release create", workflow)
+        self.assertNotIn("AGE-SECRET-KEY", workflow)

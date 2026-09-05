@@ -30,6 +30,10 @@ struct Manifest {
     schema_version: u32,
     release: Release,
     artifacts: Vec<ArtifactEntry>,
+    // Supplemental installers are checksum-bound by the signed upstream
+    // manifest, validated/mirrored by sync, and never exposed as updater targets.
+    #[serde(default, rename = "installers")]
+    _installers: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,6 +464,7 @@ pub(crate) async fn android_update_check(
             "application updates unavailable",
         );
     };
+    let mirror = mirror.for_mobile();
     let selected = match active_android_release(&mirror, "stable").await {
         Ok(selected) => selected,
         Err(response) => return response,
@@ -511,6 +516,7 @@ pub(crate) async fn android_update_download(
             "application updates unavailable",
         );
     };
+    let mirror = mirror.for_mobile();
     let selected = match active_android_release(&mirror, "stable").await {
         Ok(selected) => selected,
         Err(response) => return response,

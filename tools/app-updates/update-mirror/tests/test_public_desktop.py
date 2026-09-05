@@ -148,6 +148,11 @@ class SignedDesktopFlowTests(unittest.TestCase):
                         entry["artifact"]["sha256"] = hashlib.sha256(payload).hexdigest()
                         entry["signature"]["value"] = sign(payload)
                         self.payloads[entry["artifact"]["path"]] = payload
+                    dmg_path = f"releases/v{version}/macos-arm64/Jarvis_{version}_macos_arm64.dmg"
+                    dmg = f"installer fixture {version}".encode()
+                    manifest["installers"] = [{"platform": "macos", "architecture": "arm64", "distribution": "home-node-installer",
+                                               "artifact": {"path": dmg_path, "size": len(dmg), "sha256": hashlib.sha256(dmg).hexdigest()}}]
+                    self.payloads[dmg_path] = dmg
                     self.manifest = json.dumps(manifest).encode()
                     self.signature = sign(self.manifest)
 
@@ -170,7 +175,7 @@ class SignedDesktopFlowTests(unittest.TestCase):
             settings["tauri_signing_public_key"] = public_key
             self.assertEqual(sync_release(settings, SignedSource("1.0.0")), "1.0.0")
             current = (base / "mirror/current").resolve()
-            for failure in ("manifest", "hash", "signature", "identity"):
+            for failure in ("manifest", "hash", "signature", "identity", "installer"):
                 source = SignedSource("1.0.1")
                 if failure == "manifest":
                     source.manifest += b" "
@@ -181,6 +186,8 @@ class SignedDesktopFlowTests(unittest.TestCase):
                     document["artifacts"][0]["signature"]["value"] = sign(b"wrong artifact")
                     source.manifest = json.dumps(document).encode()
                     source.signature = sign(source.manifest)
+                elif failure == "installer":
+                    source.payloads[next(path for path in source.payloads if path.endswith(".dmg"))] = b"corrupt installer"
                 else:
                     source.version = "9.0.0"
                 with self.subTest(failure=failure), self.assertRaises((SyncError, ValueError)):

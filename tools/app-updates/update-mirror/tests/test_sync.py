@@ -69,6 +69,10 @@ class FakeGitHubSource(GitHubReleaseSource):
 
 def release_source(version: str, corrupt: bool = False) -> tuple[dict, FakeSource]:
     value = manifest(version)
+    major, minor, patch = map(int, version.split("."))
+    for entry in value["artifacts"]:
+        if entry["platform"] == "android":
+            entry["metadata"]["version_code"] = major * 1_000_000 + minor * 1_000 + patch
     values: dict[str, bytes] = {}
     for entry in value["artifacts"]:
         artifact = entry.get("artifact")
