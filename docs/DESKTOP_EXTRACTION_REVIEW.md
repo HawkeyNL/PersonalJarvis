@@ -11,10 +11,10 @@ snapshot rather than importing/replacing unrelated existing source.
 | Repository | Review branch | Implementation tip |
 | --- | --- | --- |
 | PersonalJarvis | `refactor/extract-desktop-app` | `1093039cef1dc0060d13addf5e3dcfb93141d9eb` |
-| PersonalJarvisApp | `feat/initial-desktop-app` | `0944a8cbdd99d1cff66041b26f8472bde3a33b34` |
+| PersonalJarvisApp | `feat/initial-desktop-app` | `7ca0b723287f4e8cc293e9f800998b507feac0fa` |
 
 This report is committed separately after the implementation tip above. Earlier
-review commits are Core `e36a884`, `49fec9e`, and App `37d850e`, `6fc5f26`, `7559c33`.
+review commits are Core `e36a884`, `49fec9e`, and App `97a371b`, `9da65da`, `7ea7f8f`.
 All remain local and reviewable; no force-push or public history rewrite occurred.
 
 ## Source ownership and migration
