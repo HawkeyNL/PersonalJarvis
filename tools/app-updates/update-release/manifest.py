@@ -83,7 +83,7 @@ def validate_manifest(document: Any, *, require_complete: bool = True) -> dict[s
     if not SEMVER_RE.fullmatch(version):
         raise ManifestError("release.version is not SemVer")
     product = release.get("product")
-    if product not in (None, "desktop", "mobile"):
+    if product not in (None, "desktop", "mobile", "clients"):
         raise ManifestError("release.product is invalid")
     if product is None and any(field in release for field in ("tag", "source_revision", "client_protocol")):
         raise ManifestError("release provenance requires an explicit product")
@@ -202,23 +202,36 @@ def validate_manifest(document: Any, *, require_complete: bool = True) -> dict[s
         rendered = ", ".join(f"{platform}-{architecture}" for platform, architecture in sorted(missing))
         raise ManifestError(f"manifest is missing release targets: {rendered}")
     installers = document.get("installers", [])
-    if not isinstance(installers, list) or len(installers) > 1:
+    if not isinstance(installers, list) or len(installers) > 2:
         raise ManifestError("installers must be a bounded list")
+    seen_installers: set[tuple[str, str]] = set()
     for entry in installers:
-        if product != "desktop" or not isinstance(entry, dict):
-            raise ManifestError("supplemental installers are desktop-only")
+        if product not in ("desktop", "clients") or not isinstance(entry, dict):
+            raise ManifestError("supplemental installers require a desktop-capable release")
         _exact_keys(entry, {"platform", "architecture", "distribution", "artifact"}, set(), "installer")
-        if (entry["platform"], entry["architecture"], entry["distribution"]) != ("macos", "arm64", "home-node-installer"):
+        identity = (entry["platform"], entry["architecture"])
+        policy = {
+            ("macos", "arm64"): ("home-node-installer", ".dmg"),
+            ("android", "universal"): ("app-store-bundle", ".aab"),
+        }.get(identity)
+        if policy is None or entry["distribution"] != policy[0] or identity in seen_installers:
             raise ManifestError("unsupported installer target")
+        seen_installers.add(identity)
         artifact = entry["artifact"]
         if not isinstance(artifact, dict):
             raise ManifestError("installer artifact is invalid")
         _exact_keys(artifact, {"path", "sha256", "size"}, set(), "installer artifact")
-        expected = f"releases/v{version}/macos-arm64/Jarvis_{version}_macos_arm64.dmg"
+        expected = (
+            f"releases/v{version}/{entry['platform']}-{entry['architecture']}/"
+            f"Jarvis_{version}_{entry['platform']}_{entry['architecture']}{policy[1]}"
+        )
         if artifact["path"] != expected or not isinstance(artifact["sha256"], str) or not SHA256_RE.fullmatch(artifact["sha256"]):
             raise ManifestError("installer identity is invalid")
         if type(artifact["size"]) is not int or not 0 < artifact["size"] <= 2 * 1024**3:
             raise ManifestError("installer size is invalid")
+    required_installers = {("macos", "arm64"), ("android", "universal")}
+    if require_complete and product == "clients" and seen_installers != required_installers:
+        raise ManifestError("manifest is missing required installer artifacts")
     return document
 
 

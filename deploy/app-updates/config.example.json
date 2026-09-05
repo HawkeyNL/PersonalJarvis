@@ -8,6 +8,8 @@
   "channel": "stable",
   "retention_previous": 1,
   "tauri_signing_public_key": "REPLACE_WITH_TAURI_SIGNING_PUBLIC_KEY",
+  "android_signing_certificate_sha256": "REPLACE_WITH_LOWERCASE_ANDROID_CERTIFICATE_SHA256",
+  "android_apksigner_path": "/usr/bin/apksigner",
   "timeout_seconds": 60,
   "max_artifact_bytes": 2147483648
 }

@@ -63,7 +63,7 @@ impl Release {
                     && self.source_revision.is_none()
                     && self.client_protocol.is_none()
             }
-            Some("desktop" | "mobile") => {
+            Some("desktop" | "mobile" | "clients") => {
                 self.tag.as_deref() == Some(format!("app-v{}", self.version).as_str())
                     && self.source_revision.as_ref().is_some_and(|revision| {
                         revision.len() == 40
@@ -687,7 +687,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn desktop_release_identity_is_independent_and_fail_closed() {
+    fn application_release_identity_is_independent_and_fail_closed() {
         let legacy = serde_json::json!({
             "version": "0.1.0", "channel": "stable",
             "released_at": "2026-09-01T12:00:00Z", "minimum_client_protocol": 1
@@ -701,6 +701,11 @@ mod tests {
         desktop["source_revision"] = "a".repeat(40).into();
         desktop["client_protocol"] = 1.into();
         assert!(serde_json::from_value::<Release>(desktop.clone())
+            .unwrap()
+            .identity_valid());
+        let mut clients = desktop.clone();
+        clients["product"] = "clients".into();
+        assert!(serde_json::from_value::<Release>(clients)
             .unwrap()
             .identity_valid());
         for (field, value) in [

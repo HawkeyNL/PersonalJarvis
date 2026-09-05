@@ -385,7 +385,17 @@ def _reject_stale_release(root: Path, incoming_version: str, incoming_manifest: 
         raise SyncError("refusing to activate a release older than the active release")
     if incoming_manifest is not None:
         old_product = current["release"].get("product")
-        if old_product is not None and old_product != incoming_manifest["release"].get("product"):
+        new_product = incoming_manifest["release"].get("product")
+        if old_product == "clients" and new_product != "clients":
+            raise SyncError("a unified client generation cannot be replaced by a partial product")
+        if old_product not in (None, "desktop", "mobile", "clients") or new_product not in (
+            None,
+            "desktop",
+            "mobile",
+            "clients",
+        ):
+            raise SyncError("application release product is unsupported")
+        if old_product not in (None, "clients", new_product) and new_product != "clients":
             raise SyncError("desktop and mobile products require separate mirror generations")
         old_android = next((entry for entry in current["artifacts"] if entry["platform"] == "android"), None)
         new_android = next((entry for entry in incoming_manifest["artifacts"] if entry["platform"] == "android"), None)
@@ -575,7 +585,7 @@ def sync_release(
             destination = staged_release / relative
             with contextlib.closing(source.open_artifact(version, artifact["path"])) as response:
                 _download(response, destination, artifact["sha256"], artifact["size"], config["max_artifact_bytes"])
-            if entry["platform"] == "android":
+            if entry["platform"] == "android" and entry["distribution"] == "home-node-apk":
                 android_path = destination
             elif isinstance(source, GitHubReleaseSource) and entry["distribution"] == "home-node-updater":
                 verify_signature(destination, entry["signature"]["value"], config["tauri_signing_public_key"])

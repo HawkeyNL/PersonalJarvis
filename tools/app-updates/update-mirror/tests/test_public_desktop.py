@@ -118,7 +118,7 @@ class PublicSourceTests(unittest.TestCase):
 
 
 @unittest.skipUnless(MINISIGN, "minisign required for cryptographic fixture")
-class SignedDesktopFlowTests(unittest.TestCase):
+class SignedClientFlowTests(unittest.TestCase):
     def test_signed_public_release_activation_and_failures(self):
         with tempfile.TemporaryDirectory() as temporary, patch.object(signatures, "MINISIGN", MINISIGN):
             base = Path(temporary)
@@ -138,21 +138,22 @@ class SignedDesktopFlowTests(unittest.TestCase):
                 def __init__(self, version):
                     super().__init__("owner/app", "", 5)
                     self.version = version
-                    manifest, _ = release_source(version)
-                    manifest["artifacts"] = manifest["artifacts"][:3]
-                    manifest["release"].update(product="desktop", tag=f"app-v{version}", source_revision="a"*40, client_protocol=1)
+                    manifest, _ = release_source(version, product="clients")
                     self.payloads = {}
                     for entry in manifest["artifacts"]:
+                        if "artifact" not in entry:
+                            continue
                         payload = f"signed fixture {version} {entry['platform']}".encode()
                         entry["artifact"]["size"] = len(payload)
                         entry["artifact"]["sha256"] = hashlib.sha256(payload).hexdigest()
-                        entry["signature"]["value"] = sign(payload)
+                        if entry["distribution"] == "home-node-updater":
+                            entry["signature"]["value"] = sign(payload)
                         self.payloads[entry["artifact"]["path"]] = payload
-                    dmg_path = f"releases/v{version}/macos-arm64/Jarvis_{version}_macos_arm64.dmg"
-                    dmg = f"installer fixture {version}".encode()
-                    manifest["installers"] = [{"platform": "macos", "architecture": "arm64", "distribution": "home-node-installer",
-                                               "artifact": {"path": dmg_path, "size": len(dmg), "sha256": hashlib.sha256(dmg).hexdigest()}}]
-                    self.payloads[dmg_path] = dmg
+                    for installer in manifest["installers"]:
+                        payload = f"installer fixture {version} {installer['platform']}".encode()
+                        installer["artifact"]["size"] = len(payload)
+                        installer["artifact"]["sha256"] = hashlib.sha256(payload).hexdigest()
+                        self.payloads[installer["artifact"]["path"]] = payload
                     self.manifest = json.dumps(manifest).encode()
                     self.signature = sign(self.manifest)
 
@@ -170,10 +171,11 @@ class SignedDesktopFlowTests(unittest.TestCase):
                     return BytesIO(self.payloads[path])
 
             settings = config(base / "mirror")
-            settings.pop("android_signing_certificate_sha256")
-            settings.pop("android_apksigner_path")
             settings["tauri_signing_public_key"] = public_key
-            self.assertEqual(sync_release(settings, SignedSource("1.0.0")), "1.0.0")
+            self.assertEqual(
+                sync_release(settings, SignedSource("1.0.0"), apk_verifier=lambda *args: None),
+                "1.0.0",
+            )
             current = (base / "mirror/current").resolve()
             for failure in ("manifest", "hash", "signature", "identity", "installer"):
                 source = SignedSource("1.0.1")
@@ -191,9 +193,12 @@ class SignedDesktopFlowTests(unittest.TestCase):
                 else:
                     source.version = "9.0.0"
                 with self.subTest(failure=failure), self.assertRaises((SyncError, ValueError)):
-                    sync_release(settings, source)
+                    sync_release(settings, source, apk_verifier=lambda *args: None)
                 self.assertEqual((base / "mirror/current").resolve(), current)
-            self.assertEqual(sync_release(settings, SignedSource("1.0.1")), "1.0.1")
+            self.assertEqual(
+                sync_release(settings, SignedSource("1.0.1"), apk_verifier=lambda *args: None),
+                "1.0.1",
+            )
             self.assertTrue(current.is_dir())
             with self.assertRaises(SyncError):
-                sync_release(settings, SignedSource("1.0.0"))
+                sync_release(settings, SignedSource("1.0.0"), apk_verifier=lambda *args: None)

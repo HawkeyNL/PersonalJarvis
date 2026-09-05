@@ -84,4 +84,4 @@ jobs:
         run: test "$(date -u +%F)" \< "2026-10-01"
       - run: cargo audit
 
-  # Desktop CI lives in HawkeyNL/PersonalJarvisApp.
+  # Desktop, Android, and iOS CI live in HawkeyNL/PersonalJarvisApp.

@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import os
 import shutil
@@ -12,7 +13,6 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sync import sync_release, SyncError
 from mobile_import import MobileArchiveSource
-from mobile_bundle import bundle
 from test_sync import config
 
 
@@ -25,7 +25,52 @@ class MobileHandoffTests(unittest.TestCase):
         (assets / (base + ".aab")).write_bytes(b"signed AAB fixture")
         (assets / (base + ".apk.cert-sha256")).write_text("c" * 64)
         archive = root / (version + ".tar")
-        bundle(assets, archive, version, "a" * 40, "2026-09-01T00:00:00Z", code, "17")
+        apk = assets / (base + ".apk")
+        manifest = {
+            "schema_version": 1,
+            "release": {
+                "version": version,
+                "tag": f"app-v{version}",
+                "product": "mobile",
+                "source_revision": "a" * 40,
+                "client_protocol": 1,
+                "minimum_client_protocol": 1,
+                "released_at": "2026-09-01T00:00:00Z",
+                "channel": "stable",
+            },
+            "artifacts": [
+                {
+                    "platform": "android",
+                    "architecture": "universal",
+                    "distribution": "home-node-apk",
+                    "artifact": {
+                        "path": f"releases/v{version}/android-universal/{apk.name}",
+                        "sha256": hashlib.sha256(apk.read_bytes()).hexdigest(),
+                        "size": apk.stat().st_size,
+                    },
+                    "metadata": {"version_code": code},
+                    "signature": {
+                        "scheme": "android-apk-signing-certificate-sha256",
+                        "value": "c" * 64,
+                    },
+                },
+                {
+                    "platform": "ios",
+                    "architecture": "arm64",
+                    "distribution": "testflight",
+                    "external": {"bundle_id": "com.hawkeynl.jarvis", "build_number": "17"},
+                    "signature": {"scheme": "apple-code-signing", "value": "app-store-connect"},
+                },
+            ],
+        }
+        payload = json.dumps(manifest, sort_keys=True).encode()
+        with tarfile.open(archive, "x:", format=tarfile.USTAR_FORMAT) as output:
+            metadata = tarfile.TarInfo("latest.json")
+            metadata.mode = 0o600
+            metadata.size = len(payload)
+            output.addfile(metadata, io.BytesIO(payload))
+            for name in sorted(path.name for path in assets.iterdir()):
+                output.add(assets / name, arcname=name, recursive=False)
         return archive
 
     def test_private_handoff_reuses_atomic_apk_verification_and_rollback(self):

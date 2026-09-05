@@ -43,4 +43,4 @@ fi
 
 systemctl daemon-reload
 echo "Application update sync installed but not enabled."
-echo "Review /etc/jarvis/app-updates/config.json.example and pin the desktop signing public key; sync once before enabling the timer."
+echo "Review /etc/jarvis/app-updates/config.json.example and pin the Tauri and Android signing identities; sync once before enabling the timer."

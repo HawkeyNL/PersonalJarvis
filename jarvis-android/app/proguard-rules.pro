@@ -1,3 +1,0 @@
--keepattributes RuntimeVisibleAnnotations,AnnotationDefault
--dontwarn org.bouncycastle.jcajce.provider.drbg.DRBG$Default
--dontwarn org.bouncycastle.jcajce.provider.drbg.DRBG$NonceAndIV

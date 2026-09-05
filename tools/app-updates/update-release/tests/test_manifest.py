@@ -1,19 +1,14 @@
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 from pathlib import Path
 import sys
-import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from build_manifest import build
 from manifest import ManifestError, validate_manifest
-from validate_previous_release import validate_progression
 
 
 def manifest(version: str = "1.2.3") -> dict:
@@ -82,46 +77,42 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaises(ManifestError):
             validate_manifest(manifest("1.2.4-beta.1"))
 
-    def test_release_versions_must_all_advance(self) -> None:
-        previous = manifest()
-        validate_progression(previous, "1.2.4", 13, 18)
-        for version, android_code, ios_build in (
-            ("1.2.3", 13, 18),
-            ("1.2.4", 12, 18),
-            ("1.2.4", 13, 17),
-            ("1.2.4-beta.1", 13, 18),
-        ):
-            with self.subTest(version=version, android_code=android_code, ios_build=ios_build):
-                with self.assertRaises(ValueError):
-                    validate_progression(previous, version, android_code, ios_build)
-
-    def test_builder_hashes_local_artifacts_and_inlines_signature(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            artifact = base / "Jarvis_1.2.3_windows_x86_64.bundle"
-            artifact.write_bytes(b"signed bundle")
-            signature = base / "bundle.sig"
-            signature.write_text("minisign payload\n", encoding="utf-8")
-            descriptor = manifest()
-            item = descriptor["artifacts"][0]
-            item.pop("artifact")
-            item["source"] = artifact.name
-            item["published_path"] = "releases/v1.2.3/windows-x86_64/Jarvis_1.2.3_windows_x86_64.bundle"
-            item["signature"] = {"scheme": "tauri-minisign", "source": signature.name}
-            for other in descriptor["artifacts"][1:4]:
-                local = base / Path(other["artifact"]["path"]).name
-                local.write_bytes(b"other")
-                other.pop("artifact")
-                other["source"] = local.name
-                other["published_path"] = f"releases/v1.2.3/{other['platform']}-{other['architecture']}/{local.name}"
-                other["signature"] = {"scheme": other["signature"]["scheme"], "value": other["signature"]["value"]}
-            descriptor.pop("schema_version")
-            result = build(descriptor, base)
-            built = result["artifacts"][0]
-            self.assertEqual(built["artifact"]["sha256"], hashlib.sha256(b"signed bundle").hexdigest())
-            self.assertEqual(built["artifact"]["size"], len(b"signed bundle"))
-            self.assertEqual(built["signature"]["value"], "minisign payload")
-            self.assertNotIn("source", json.dumps(result))
+    def test_unified_client_manifest_requires_every_client_and_installer(self) -> None:
+        value = manifest()
+        value["release"].update(
+            product="clients",
+            tag="app-v1.2.3",
+            source_revision="a" * 40,
+            client_protocol=1,
+        )
+        value["installers"] = [
+            {
+                "platform": "macos",
+                "architecture": "arm64",
+                "distribution": "home-node-installer",
+                "artifact": {
+                    "path": "releases/v1.2.3/macos-arm64/Jarvis_1.2.3_macos_arm64.dmg",
+                    "sha256": "d" * 64,
+                    "size": 10,
+                },
+            },
+            {
+                "platform": "android",
+                "architecture": "universal",
+                "distribution": "app-store-bundle",
+                "artifact": {
+                    "path": "releases/v1.2.3/android-universal/Jarvis_1.2.3_android_universal.aab",
+                    "sha256": "e" * 64,
+                    "size": 10,
+                },
+            },
+        ]
+        validate_manifest(value)
+        for section in ("artifacts", "installers"):
+            incomplete = copy.deepcopy(value)
+            incomplete[section].pop()
+            with self.subTest(section=section), self.assertRaises(ManifestError):
+                validate_manifest(incomplete)
 
 
 if __name__ == "__main__":

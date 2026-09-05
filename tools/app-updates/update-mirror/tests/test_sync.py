@@ -67,14 +67,52 @@ class FakeGitHubSource(GitHubReleaseSource):
         raise OSError(f"unexpected GitHub fixture URL: {url}")
 
 
-def release_source(version: str, corrupt: bool = False) -> tuple[dict, FakeSource]:
+def release_source(
+    version: str,
+    corrupt: bool = False,
+    product: str | None = None,
+) -> tuple[dict, FakeSource]:
     value = manifest(version)
+    if product is not None:
+        value["release"].update(
+            product=product,
+            tag=f"app-v{version}",
+            source_revision="a" * 40,
+            client_protocol=1,
+        )
+    if product == "desktop":
+        value["artifacts"] = [
+            entry for entry in value["artifacts"] if entry["platform"] in ("linux", "windows", "macos")
+        ]
+    elif product == "clients":
+        value["installers"] = [
+            {
+                "platform": "macos",
+                "architecture": "arm64",
+                "distribution": "home-node-installer",
+                "artifact": {
+                    "path": f"releases/v{version}/macos-arm64/Jarvis_{version}_macos_arm64.dmg",
+                    "sha256": "0" * 64,
+                    "size": 1,
+                },
+            },
+            {
+                "platform": "android",
+                "architecture": "universal",
+                "distribution": "app-store-bundle",
+                "artifact": {
+                    "path": f"releases/v{version}/android-universal/Jarvis_{version}_android_universal.aab",
+                    "sha256": "0" * 64,
+                    "size": 1,
+                },
+            },
+        ]
     major, minor, patch = map(int, version.split("."))
     for entry in value["artifacts"]:
         if entry["platform"] == "android":
             entry["metadata"]["version_code"] = major * 1_000_000 + minor * 1_000 + patch
     values: dict[str, bytes] = {}
-    for entry in value["artifacts"]:
+    for entry in value["artifacts"] + value.get("installers", []):
         artifact = entry.get("artifact")
         if artifact is None:
             continue
@@ -191,6 +229,34 @@ class SyncTests(unittest.TestCase):
                 (root / "current" / "manifest.json").resolve(),
             )
             self.assertFalse(any((root / "current").rglob("*.ipa")))
+
+    def test_unified_release_verifies_the_apk_not_the_aab(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            value, source = release_source("1.0.0", product="clients")
+            verified: list[Path] = []
+
+            def record_apk(path: Path, fingerprint: str, tool: Path, timeout: int) -> None:
+                accept_apk(path, fingerprint, tool, timeout)
+                verified.append(path)
+
+            self.assertEqual(sync_release(config(root), source, record_apk), "1.0.0")
+            self.assertEqual(len(verified), 1)
+            self.assertEqual(verified[0].suffix, ".apk")
+            self.assertEqual(value["release"]["product"], "clients")
+            self.assertTrue(any((root / "current").rglob("*.aab")))
+
+    def test_partial_release_can_migrate_to_unified_but_not_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, desktop = release_source("1.0.0", product="desktop")
+            sync_release(config(root), desktop, accept_apk)
+            _, clients = release_source("1.1.0", product="clients")
+            sync_release(config(root), clients, accept_apk)
+            self.assertEqual((root / "current").resolve(), root / "releases" / "v1.1.0")
+            _, partial = release_source("1.2.0", product="desktop")
+            with self.assertRaisesRegex(SyncError, "unified client generation"):
+                sync_release(config(root), partial, accept_apk)
 
     def test_failed_sync_preserves_previous_current_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
