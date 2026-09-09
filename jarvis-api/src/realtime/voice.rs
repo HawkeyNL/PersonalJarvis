@@ -1,6 +1,6 @@
+use super::hub::PlaybackState;
 use crate::{AppState, Authed};
 use axum::{extract::State, http::StatusCode, Json};
-use jarvis_client_core::realtime::Event;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -40,14 +40,6 @@ pub(crate) async fn release(
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PlaybackState {
-    Started,
-    Stopped,
-    Failed,
-}
-
-#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Playback {
     run_id: Uuid,
@@ -63,23 +55,28 @@ pub(crate) async fn playback(
     {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    if state.realtime.voice_owner(auth.user.id) != Some((auth.device.id, Some(req.run_id))) {
+    if !state
+        .realtime
+        .report_playback(auth.user.id, auth.device.id, req.run_id, req.state)
+    {
         return Err(StatusCode::CONFLICT);
     }
-    let event = match req.state {
-        PlaybackState::Started => Event::VoiceStarted {
-            run_id: req.run_id,
-            device_id: auth.device.id,
-        },
-        PlaybackState::Stopped => Event::VoiceStopped {
-            run_id: req.run_id,
-            device_id: auth.device.id,
-        },
-        PlaybackState::Failed => Event::VoiceFailed {
-            run_id: req.run_id,
-            device_id: auth.device.id,
-        },
-    };
-    state.realtime.publish(auth.user.id, event);
     Ok(Json(json!({"status":"ok"})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_request_cannot_supply_an_authoritative_device_or_freeform_status() {
+        let valid = json!({"run_id":Uuid::nil(), "state":"started"});
+        assert!(serde_json::from_value::<Playback>(valid.clone()).is_ok());
+        let mut spoof = valid.clone();
+        spoof["device_id"] = json!(Uuid::nil());
+        assert!(serde_json::from_value::<Playback>(spoof).is_err());
+        let mut arbitrary = valid;
+        arbitrary["state"] = json!("arbitrary output or command");
+        assert!(serde_json::from_value::<Playback>(arbitrary).is_err());
+    }
 }

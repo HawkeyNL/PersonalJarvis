@@ -32,6 +32,15 @@ struct VoiceLease {
     device: Uuid,
     run: Option<Uuid>,
     expires: Instant,
+    playback: Option<PlaybackState>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PlaybackState {
+    Started,
+    Stopped,
+    Failed,
 }
 
 #[derive(Clone)]
@@ -155,6 +164,7 @@ impl Hub {
                 device,
                 run,
                 expires: Instant::now() + Duration::from_secs(90),
+                playback: None,
             },
         );
         inner.publish(
@@ -209,6 +219,53 @@ impl Hub {
                 run_id: None,
             },
         );
+        true
+    }
+
+    /// Check the current lease and publish while holding the same lock. A
+    /// delayed native callback must not pass an ownership check, race a new
+    /// claim, then publish stale playback state for the previous device.
+    pub(crate) fn report_playback(
+        &self,
+        user: Uuid,
+        device: Uuid,
+        run: Uuid,
+        status: PlaybackState,
+    ) -> bool {
+        let Ok(mut inner) = self.0.lock() else {
+            return false;
+        };
+        let Some(lease) = inner.voices.get_mut(&user) else {
+            return false;
+        };
+        if lease.device != device || lease.run != Some(run) || lease.expires <= Instant::now() {
+            return false;
+        }
+        if lease.playback == Some(status) {
+            return true;
+        }
+        if matches!(
+            lease.playback,
+            Some(PlaybackState::Stopped | PlaybackState::Failed)
+        ) {
+            return false;
+        }
+        lease.playback = Some(status);
+        let event = match status {
+            PlaybackState::Started => Event::VoiceStarted {
+                run_id: run,
+                device_id: device,
+            },
+            PlaybackState::Stopped => Event::VoiceStopped {
+                run_id: run,
+                device_id: device,
+            },
+            PlaybackState::Failed => Event::VoiceFailed {
+                run_id: run,
+                device_id: device,
+            },
+        };
+        inner.publish(user, event);
         true
     }
 
@@ -282,6 +339,34 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_is_lease_bound_idempotent_and_terminal() {
+        let hub = Hub::default();
+        let owner = Uuid::now_v7();
+        let device = Uuid::now_v7();
+        let run = Uuid::now_v7();
+        let mut listener = hub.subscribe(owner, device).unwrap();
+        listener.receiver.try_recv().unwrap();
+        assert!(hub.claim_voice(owner, device, Some(run)));
+        listener.receiver.try_recv().unwrap();
+        assert!(!hub.report_playback(owner, Uuid::now_v7(), run, PlaybackState::Started));
+        assert!(!hub.report_playback(owner, device, Uuid::now_v7(), PlaybackState::Started));
+        assert!(hub.report_playback(owner, device, run, PlaybackState::Started));
+        assert!(matches!(
+            listener.receiver.try_recv().unwrap().event,
+            Event::VoiceStarted { .. }
+        ));
+        assert!(hub.report_playback(owner, device, run, PlaybackState::Started));
+        assert!(listener.receiver.try_recv().is_err());
+        assert!(hub.report_playback(owner, device, run, PlaybackState::Stopped));
+        listener.receiver.try_recv().unwrap();
+        assert!(!hub.report_playback(owner, device, run, PlaybackState::Started));
+        assert!(hub.claim_voice(owner, Uuid::now_v7(), Some(Uuid::now_v7())));
+        listener.receiver.try_recv().unwrap();
+        assert!(!hub.report_playback(owner, device, run, PlaybackState::Failed));
+        assert!(listener.receiver.try_recv().is_err());
+    }
 
     fn event() -> Event {
         Event::ConversationDeleted {

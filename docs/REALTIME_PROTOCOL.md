@@ -115,6 +115,9 @@ non-secret current ownership. Leases expire after 90 seconds without renewal;
 authenticated heartbeat responses renew the current owner's lease. A new prompt
 may replace the owner immediately. Playback reports use `/v1/voice/playback`
 and are accepted only for the current owner/run.
+Ownership validation and playback publication occur under one hub lock. Duplicate
+statuses are acknowledged without another event; stopped/failed are terminal for
+that lease/run, so a delayed callback cannot restart it or impersonate a new owner.
 
 Speech is a client preference, default off, independent of text synchronization.
 Local engines consume public assistant content directly with deterministic
