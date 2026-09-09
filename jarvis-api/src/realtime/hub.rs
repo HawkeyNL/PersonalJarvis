@@ -204,11 +204,20 @@ impl Hub {
         }
     }
 
-    pub fn release_voice(&self, user: Uuid, device: Uuid) -> bool {
+    pub(crate) fn release_voice_matching(
+        &self,
+        user: Uuid,
+        device: Uuid,
+        run: Option<Uuid>,
+    ) -> bool {
         let Ok(mut inner) = self.0.lock() else {
             return false;
         };
-        if !inner.voices.get(&user).is_some_and(|v| v.device == device) {
+        if !inner
+            .voices
+            .get(&user)
+            .is_some_and(|v| v.device == device && run.is_none_or(|id| v.run == Some(id)))
+        {
             return false;
         }
         inner.voices.remove(&user);
@@ -341,6 +350,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delayed_release_cannot_clear_a_new_run_on_the_same_device() {
+        let hub = Hub::default();
+        let owner = Uuid::now_v7();
+        let device = Uuid::now_v7();
+        let old = Uuid::now_v7();
+        let new = Uuid::now_v7();
+        assert!(hub.claim_voice(owner, device, Some(old)));
+        assert!(hub.claim_voice(owner, device, Some(new)));
+        assert!(!hub.release_voice_matching(owner, device, Some(old)));
+        assert_eq!(hub.voice_owner(owner), Some((device, Some(new))));
+        assert!(!hub.release_voice_matching(owner, Uuid::now_v7(), Some(new)));
+        assert!(hub.release_voice_matching(owner, device, Some(new)));
+        assert_eq!(hub.voice_owner(owner), None);
+        assert!(hub.claim_voice(owner, device, None));
+        assert!(hub.release_voice_matching(owner, device, None));
+    }
+
+    #[test]
     fn playback_is_lease_bound_idempotent_and_terminal() {
         let hub = Hub::default();
         let owner = Uuid::now_v7();
@@ -434,7 +461,7 @@ mod tests {
         drop(guard);
         assert!(hub.reserve_run(owner, run).is_some());
         assert!(hub.claim_voice(owner, device, Some(run)));
-        assert!(!hub.release_voice(owner, Uuid::now_v7()));
+        assert!(!hub.release_voice_matching(owner, Uuid::now_v7(), None));
         assert!(hub.voice_owner(Uuid::now_v7()).is_none());
         hub.0
             .lock()

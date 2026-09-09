@@ -1,6 +1,6 @@
 use super::hub::PlaybackState;
 use crate::{AppState, Authed};
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{body::Bytes, extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -29,14 +29,38 @@ pub(crate) async fn claim(
 pub(crate) async fn release(
     auth: Authed,
     State(state): State<AppState>,
+    body: Bytes,
 ) -> Result<Json<Value>, StatusCode> {
     if !crate::rate_limit::allow_authenticated_device(&state, auth.device.id, "voice-control", 30) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    if !state.realtime.release_voice(auth.user.id, auth.device.id) {
+    let requested_run = parse_release(&body)?;
+    if !state
+        .realtime
+        .release_voice_matching(auth.user.id, auth.device.id, requested_run)
+    {
         return Err(StatusCode::CONFLICT);
     }
     Ok(Json(json!({"device_id":null})))
+}
+
+/// Optional for older clients; new delayed controls bind to the intended run.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseRequest {
+    run_id: Uuid,
+}
+
+fn parse_release(body: &[u8]) -> Result<Option<Uuid>, StatusCode> {
+    if body.is_empty() {
+        return Ok(None);
+    }
+    if body.len() > 256 {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    serde_json::from_slice::<ReleaseRequest>(body)
+        .map(|request| Some(request.run_id))
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 #[derive(Deserialize)]
@@ -67,6 +91,23 @@ pub(crate) async fn playback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_run_binding_never_becomes_unconditional_release() {
+        assert_eq!(parse_release(b""), Ok(None));
+        let request = serde_json::to_vec(&json!({"run_id": Uuid::nil()})).unwrap();
+        assert_eq!(parse_release(&request), Ok(Some(Uuid::nil())));
+        for invalid in [b"{}".as_slice(), b"null", b"invalid", b"{\"run_id\":null}"] {
+            assert_eq!(parse_release(invalid), Err(StatusCode::BAD_REQUEST));
+        }
+        let spoof =
+            serde_json::to_vec(&json!({"run_id":Uuid::nil(), "device_id":Uuid::nil()})).unwrap();
+        assert_eq!(parse_release(&spoof), Err(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            parse_release(&[b' '; 257]),
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+    }
 
     #[test]
     fn playback_request_cannot_supply_an_authoritative_device_or_freeform_status() {

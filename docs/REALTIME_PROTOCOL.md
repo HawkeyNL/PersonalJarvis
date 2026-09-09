@@ -110,7 +110,12 @@ foreground unlock. Push notifications are outside this protocol.
 
 The originating authenticated device claims voice for its run. Explicit HTTP
 `/v1/voice/claim` and `/v1/voice/release` derive the device from authentication;
-release cannot release another device's ownership. `/v1/voice/owner` returns
+release cannot release another device's ownership. New clients send `{"run_id":"<UUID>"}` when
+releasing a run: the hub atomically checks both authenticated device and run,
+so delayed release cannot clear a newer run on the same device. An empty body
+retains legacy device-wide release. Any nonempty body must be a valid bounded
+run binding (maximum 256 bytes, no unknown fields); malformed data never falls
+back to unconditional release. `/v1/voice/owner` returns
 non-secret current ownership. Leases expire after 90 seconds without renewal;
 authenticated heartbeat responses renew the current owner's lease. A new prompt
 may replace the owner immediately. Playback reports use `/v1/voice/playback`
