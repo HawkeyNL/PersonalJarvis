@@ -68,13 +68,26 @@ impl VoiceGate {
                     && self.owner == Some(self.device)
                     && self.owner_run == Some(run.run_id) =>
             {
+                if self.buffer.run == Some(run.run_id)
+                    && (!message.content.starts_with(&self.buffer.received)
+                        || message.content.len() > MAX_RESPONSE)
+                {
+                    self.buffer.stop();
+                    return vec![SpeechAction::Stop];
+                }
                 self.buffer
                     .complete(run.run_id, &message.content)
                     .into_iter()
                     .map(SpeechAction::Speak)
                     .collect()
             }
-            Event::AssistantFailed { .. } | Event::ConnectionReady { .. } => {
+            Event::AssistantFailed { run, .. } if self.buffer.run == Some(run.run_id) => {
+                self.buffer.stop();
+                vec![SpeechAction::Stop]
+            }
+            Event::ConnectionReady { .. } => {
+                self.owner = None;
+                self.owner_run = None;
                 self.buffer.stop();
                 vec![SpeechAction::Stop]
             }
@@ -90,13 +103,15 @@ pub struct SpeechBuffer {
     run: Option<Uuid>,
     received: String,
     pending: String,
-    fenced: bool,
+    fence: Option<(u8, usize)>,
+    line_start: bool,
 }
 
 impl SpeechBuffer {
     pub fn start(&mut self, run: Uuid) {
         *self = Self {
             run: Some(run),
+            line_start: true,
             ..Self::default()
         };
     }
@@ -132,31 +147,42 @@ impl SpeechBuffer {
     fn flush(&mut self, complete: bool) -> Vec<String> {
         let mut phrases = Vec::new();
         loop {
-            // Preserve fences even when a network chunk splits their markers.
-            if self.pending.starts_with('`') && self.pending.len() < 3 && !complete {
+            if self.pending.is_empty() {
                 break;
             }
-            if self.pending.starts_with("```") {
-                // Consume the language label / fence line without speaking it.
-                let end = self
-                    .pending
-                    .find('\n')
-                    .map(|i| i + 1)
-                    .or_else(|| complete.then_some(self.pending.len()));
-                let Some(end) = end else { break };
+            let line_end = self
+                .pending
+                .find('\n')
+                .map(|i| i + 1)
+                .or_else(|| complete.then_some(self.pending.len()));
+            let line = &self.pending[..line_end.unwrap_or(self.pending.len())];
+            let trimmed = line.trim_start_matches(' ');
+            let indent = line.len() - trimmed.len();
+            let marker = trimmed
+                .as_bytes()
+                .first()
+                .copied()
+                .filter(|c| matches!(c, b'`' | b'~'));
+            let count = marker.map_or(0, |m| trimmed.bytes().take_while(|c| *c == m).count());
+            let opening = self.line_start && indent <= 3 && count >= 3;
+            if self.fence.is_some() || opening {
+                // Fences are line-oriented: embedded backticks in code never
+                // close a block. Partial marker/label lines wait for more data.
+                let Some(end) = line_end else { break };
+                if let Some((expected, minimum)) = self.fence {
+                    if opening
+                        && marker == Some(expected)
+                        && count >= minimum
+                        && trimmed[count..].trim().is_empty()
+                    {
+                        self.fence = None;
+                    }
+                } else if let Some(marker) = marker {
+                    self.fence = Some((marker, count));
+                }
+                self.line_start = line.ends_with('\n');
                 self.pending.drain(..end);
-                self.fenced = !self.fenced;
                 continue;
-            }
-            if self.fenced {
-                if let Some(fence) = self.pending.find("```") {
-                    self.pending.drain(..fence);
-                    continue;
-                }
-                if complete {
-                    self.pending.clear();
-                }
-                break;
             }
             let mut end = None;
             for (count, (index, ch)) in self.pending.char_indices().enumerate() {
@@ -176,6 +202,7 @@ impl SpeechBuffer {
                 break;
             };
             let raw: String = self.pending.drain(..end).collect();
+            self.line_start = raw.ends_with('\n');
             let phrase = sanitize_prose(&raw);
             if !phrase.is_empty() {
                 phrases.push(phrase);
@@ -199,6 +226,97 @@ pub fn sanitize_prose(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::realtime::{CanonicalMessage, MessageRole, RunFailure, RunIdentity};
+
+    fn identity(n: u128) -> RunIdentity {
+        RunIdentity {
+            run_id: Uuid::from_u128(n),
+            request_id: Uuid::from_u128(n + 10),
+            conversation_id: Uuid::from_u128(n + 20),
+        }
+    }
+    fn completed(run: &RunIdentity, content: &str) -> Event {
+        Event::AssistantCompleted {
+            run: run.clone(),
+            message: CanonicalMessage {
+                id: Uuid::from_u128(100),
+                conversation_id: run.conversation_id,
+                role: MessageRole::Assistant,
+                content: content.into(),
+                model: None,
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+        }
+    }
+    fn enabled_gate(run: &RunIdentity) -> VoiceGate {
+        let mut gate = VoiceGate::new(Uuid::nil());
+        gate.set_enabled(true);
+        gate.event(&Event::VoiceOwnerChanged {
+            device_id: Some(Uuid::nil()),
+            run_id: Some(run.run_id),
+        });
+        gate.event(&Event::AssistantStarted(run.clone()));
+        gate
+    }
+
+    #[test]
+    fn unrelated_run_failure_cannot_interrupt_current_speech() {
+        let run = identity(1);
+        let mut gate = enabled_gate(&run);
+        gate.event(&Event::AssistantDelta {
+            run: run.clone(),
+            text: "Current".into(),
+        });
+        assert!(gate
+            .event(&Event::AssistantFailed {
+                run: identity(2),
+                reason: RunFailure::ProviderUnavailable
+            })
+            .is_empty());
+        assert_eq!(
+            gate.event(&completed(&run, "Current answer.")),
+            vec![SpeechAction::Speak("Current answer.".into())]
+        );
+    }
+
+    #[test]
+    fn canonical_mismatch_stops_queued_provisional_speech() {
+        let run = identity(1);
+        let mut gate = enabled_gate(&run);
+        gate.event(&Event::AssistantDelta {
+            run: run.clone(),
+            text: "Provisional. ".into(),
+        });
+        assert_eq!(
+            gate.event(&completed(&run, "Different canonical answer.")),
+            vec![SpeechAction::Stop]
+        );
+        assert!(gate
+            .event(&completed(&run, "Different canonical answer."))
+            .is_empty());
+    }
+
+    #[test]
+    fn fragmented_indented_fences_and_embedded_markers_never_speak_code() {
+        for text in [
+            "Before.\n   ```rust\nlet s = \"```\";\nnot speech\n   ```\nAfter.",
+            "Before.\n  ~~~~text\ncode\n~~~\nstill code\n  ~~~~\nAfter.",
+            "Before.\n```\nunterminated code",
+        ] {
+            let mut streamed = SpeechBuffer::default();
+            let mut final_only = SpeechBuffer::default();
+            streamed.start(Uuid::nil());
+            final_only.start(Uuid::nil());
+            let mut phrases = Vec::new();
+            for ch in text.chars() {
+                phrases.extend(streamed.delta(Uuid::nil(), &ch.to_string()));
+            }
+            phrases.extend(streamed.complete(Uuid::nil(), text));
+            assert_eq!(phrases, final_only.complete(Uuid::nil(), text));
+            assert_eq!(phrases.first().map(String::as_str), Some("Before."));
+            assert!(phrases.iter().all(|p| p == "Before." || p == "After."));
+        }
+    }
     #[test]
     fn streams_phrases_and_never_repeats_completed_response() {
         let run = Uuid::nil();
