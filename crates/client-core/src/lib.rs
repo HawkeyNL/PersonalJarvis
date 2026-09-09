@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod realtime;
+pub mod speech;
+
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const PAIRING_APPROVAL_DOMAIN: &[u8] = b"jarvis-device-pairing-v1\0";
 
