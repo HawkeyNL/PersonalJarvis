@@ -30,6 +30,7 @@ mod extract;
 mod mcp;
 mod metering;
 mod rate_limit;
+pub mod realtime;
 mod routes;
 mod state;
 mod validation;
@@ -78,6 +79,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", get(root))
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
+        .route("/v1/events", get(realtime::websocket::connect))
+        .route(
+            "/v1/events/capability",
+            get(realtime::websocket::capability),
+        )
+        .route("/v1/voice/owner", get(realtime::voice::owner))
+        .route("/v1/voice/claim", post(realtime::voice::claim))
+        .route("/v1/voice/release", post(realtime::voice::release))
+        .route("/v1/voice/playback", post(realtime::voice::playback))
         .route("/v1/auth/enroll", post(auth_enroll))
         .route("/v1/auth/bootstrap", post(auth_bootstrap))
         .route(
@@ -123,6 +133,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/broker/ibkr/status", get(ibkr_status))
         .route("/v1/broker/ibkr/positions", get(ibkr_positions))
         .route("/v1/assistant/chat", post(assistant_chat))
+        .route("/v1/assistant/runs", post(routes::runs::submit))
+        .route("/v1/assistant/runs/{id}", get(routes::runs::status))
         .route("/v1/assistant/orchestrate", post(assistant_orchestrate))
         .route("/v1/coding/sessions", get(coding_list).post(coding_create))
         .route("/v1/coding/sessions/{id}", post(coding_lifecycle))
@@ -166,7 +178,13 @@ pub fn build_router(state: AppState) -> Router {
         // Per-IP rate limiting on auth-sensitive endpoints (enroll/challenge/login).
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit_mw))
         .with_state(state)
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                // Do not log URL queries or Authorization headers, including for
+                // rejected attempts to place a token in a WebSocket URL.
+                tracing::info_span!("http", method = %request.method(), path = request.uri().path())
+            },
+        ))
 }
 
 async fn root() -> Json<Value> {

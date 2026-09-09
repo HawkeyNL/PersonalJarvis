@@ -54,7 +54,11 @@ pub(crate) async fn record_usage_with_metadata(
         model: reply.model.clone(),
         requested_route: reply.requested_route.clone(),
         actual_provider: reply.actual_provider.clone(),
-        cost_estimate_classification: format!("{price_status:?}").to_ascii_lowercase(),
+        cost_estimate_classification: if metadata.status == "succeeded_estimated_usage" {
+            "conservative_usage".into()
+        } else {
+            format!("{price_status:?}").to_ascii_lowercase()
+        },
         routing_mode: metadata.routing_mode,
         quality_tier: metadata.quality_tier,
         agent_id: metadata.agent_id,

@@ -273,6 +273,39 @@ impl LlmProvider for RouterProvider {
         &self.label
     }
 
+    async fn chat_stream(
+        &self,
+        req: &ChatRequest,
+        sink: crate::TextDeltaSink,
+    ) -> Result<ChatReply, LlmError> {
+        for candidate in self.plan(req.tier) {
+            let chosen = match req.model.as_deref() {
+                Some(model) if self.requested_model_is_allowed(&candidate.id, model) => {
+                    Some(model.to_string())
+                }
+                Some(_) => None,
+                None => self.model_for(&candidate.id, req.tier),
+            };
+            let Some(model) = chosen else { continue };
+            let attempt = ChatRequest {
+                model: Some(model),
+                ..req.clone()
+            };
+            // A realtime run makes exactly one attempt. On ambiguous transport
+            // failure, neither replay a paid call nor mix another model's text
+            // with already displayed/spoken deltas.
+            let result = candidate.provider.chat_stream(&attempt, sink).await;
+            match &result {
+                Ok(_) => self.record_success(&candidate.id),
+                Err(error) => self.record_failure(&candidate.id, error.failure_category()),
+            }
+            return result;
+        }
+        Err(LlmError::NotConfigured(
+            "no owner-enabled capable brain".into(),
+        ))
+    }
+
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
         let plan = self.plan(req.tier);
         if plan.is_empty() {

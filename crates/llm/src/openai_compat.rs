@@ -75,6 +75,50 @@ impl LlmProvider for OpenAiCompatProvider {
         &self.label
     }
 
+    async fn chat_stream(
+        &self,
+        req: &ChatRequest,
+        sink: crate::TextDeltaSink,
+    ) -> Result<ChatReply, LlmError> {
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| self.model_for(req.tier).to_string());
+        let mut messages = Vec::new();
+        if let Some(system) = &req.system {
+            messages.push(json!({"role":"system","content":system}));
+        }
+        messages.extend(req.messages.iter().map(|m|json!({"role":match m.role { Role::User=>"user",Role::Assistant=>"assistant" },"content":m.content})));
+        let mut response = self.http.post(format!("{}/chat/completions",self.base_url))
+            .bearer_auth(&self.api_key).json(&json!({"model":model,"messages":messages,"max_tokens":req.max_tokens,"stream":true,"stream_options":{"include_usage":true}}))
+            .send().await?;
+        if !response.status().is_success() {
+            return Err(LlmError::Api {
+                status: response.status().as_u16(),
+                body: "stream request failed".into(),
+            });
+        }
+        let mut parser = crate::stream::OpenAiStream::default();
+        while let Some(chunk) = response.chunk().await? {
+            parser.push(&chunk, &sink)?;
+            if parser.done {
+                break;
+            }
+        }
+        if !parser.done || parser.finish.is_none() || parser.text.is_empty() {
+            return Err(LlmError::Empty);
+        }
+        Ok(ChatReply {
+            text: parser.text,
+            model,
+            backend: Some(self.backend.clone()),
+            requested_route: None,
+            actual_provider: None,
+            stop_reason: parser.finish,
+            usage: parser.usage,
+        })
+    }
+
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
         let model = req
             .model
@@ -178,6 +222,95 @@ pub(crate) fn extract_choice(v: &Value) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn real_http_stream_delivers_delta_before_final_response() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (observed, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (release, finish) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 16_384);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = String::from_utf8(request).unwrap();
+            assert!(header.starts_with("POST /v1/chat/completions "));
+            let size: usize = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            assert!(size < 16_384);
+            let mut body = vec![0; size];
+            socket.read_exact(&mut body).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["model"], "fixture-model");
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"Live.\",\"reasoning_content\":\"not public\"}}]}\n\n").await.unwrap();
+            // The response cannot complete until the caller has received its
+            // first delta: this distinguishes real streaming from splitting a
+            // completed reply for presentation.
+            finish.await.unwrap();
+            socket.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\" Done.\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n").await.unwrap();
+        });
+        let provider = OpenAiCompatProvider::new(
+            "fixture",
+            "openai-api",
+            "fixture-only",
+            format!("http://{address}/v1"),
+            "fixture-model",
+            "fixture-model",
+            "fixture-model",
+        )
+        .unwrap();
+        let generation = tokio::spawn(async move {
+            provider
+                .chat_stream(
+                    &ChatRequest {
+                        system: None,
+                        messages: vec![crate::ChatMessage::user("question")],
+                        tier: Tier::Default,
+                        mode: crate::RoutingMode::Auto,
+                        max_tokens: 64,
+                        model: None,
+                    },
+                    Arc::new(move |text| {
+                        observed.send(text.to_owned()).unwrap();
+                    }),
+                )
+                .await
+                .unwrap()
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), received.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            "Live."
+        );
+        assert!(!generation.is_finished());
+        release.send(()).unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), generation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.text, "Live. Done.");
+        assert_eq!(reply.usage.unwrap().output_tokens, 2);
+        server.await.unwrap();
+    }
 
     #[test]
     fn extracts_message_and_finish_reason() {

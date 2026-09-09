@@ -1,20 +1,22 @@
 //! Chat with the brain + conversation persistence (ADR-030) and multi-step
 //! orchestration (ADR-028). The persona is prepended server-side and the API key
-//! is never exposed. A topic shift auto-splits into a new conversation; every
-//! metered LLM call is billed against the budget via [`record_usage`]. Persistence
-//! is best-effort — it must never break the reply.
+//! is never exposed. Titles are deterministic and do not spend model tokens.
+//! Final presentation events follow confirmed canonical persistence.
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Instant;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use jarvis_client_core::realtime::{
+    CanonicalMessage, ConversationMetadata, Event, MessageRole, RunIdentity,
+};
 use jarvis_llm as llm;
 use jarvis_orchestrator as orchestrator;
 
@@ -25,13 +27,13 @@ use crate::routes::system::{validate_brain_selection, BrainPreferenceReq};
 use crate::validation;
 use crate::{AppState, Authed};
 
-#[derive(Deserialize)]
-struct ChatTurn {
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct ChatTurn {
     role: String,
     content: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ChatReq {
     messages: Vec<ChatTurn>,
     /// Optional tier hint: `default` | `hard` | `cheap`.
@@ -44,20 +46,121 @@ pub(crate) struct ChatReq {
     /// Optional system-prompt override (defaults to the Jarvis persona).
     #[serde(default)]
     system: Option<String>,
-    /// The conversation this turn belongs to (ADR-030). Absent ⇒ start a fresh
-    /// one; present ⇒ append, unless the topic shifted (then Jarvis splits it off
-    /// into a new conversation and returns the new id).
+    /// Absent starts a fresh conversation; present continues the owned one.
     #[serde(default)]
-    conversation_id: Option<Uuid>,
+    pub(super) conversation_id: Option<Uuid>,
 }
 
-/// Chat with the brain (protected). Persists the turn under a conversation and
-/// auto-splits a new topic into its own conversation (ADR-030). The persona is
-/// prepended server-side; the API key is never exposed.
+impl ChatReq {
+    pub(super) fn new_user_content(&self) -> Option<&str> {
+        self.messages
+            .last()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.trim())
+            .filter(|text| !text.is_empty())
+    }
+    pub(super) fn validate_run(&self) -> Result<String, (StatusCode, Json<Value>)> {
+        if self.messages.len() > validation::MAX_CHAT_TURNS
+            || self
+                .messages
+                .iter()
+                .any(|m| m.content.len() > validation::MAX_CHAT_CONTENT_LEN)
+            || self.messages.iter().map(|m| m.content.len()).sum::<usize>() > 128_000
+            || self.system.as_ref().is_some_and(|s| s.len() > 24_000)
+        {
+            return Err(bad_request("chat payload too large"));
+        }
+        let last = self
+            .messages
+            .last()
+            .filter(|m| m.role == "user" && !m.content.trim().is_empty())
+            .ok_or_else(|| bad_request("last message must be a nonempty user message"))?;
+        Ok(derive_title(&last.content))
+    }
+}
+
+/// Synchronous response compatibility for old clients. Its single provider
+/// execution still publishes the same live events to newer connected clients.
 pub(crate) async fn assistant_chat(
     authed: Authed,
     State(state): State<AppState>,
-    Json(req): Json<ChatReq>,
+    Json(mut req): Json<ChatReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let title = req.validate_run()?;
+    let fresh = req.conversation_id.is_none();
+    let conversation = match req.conversation_id {
+        Some(id) => {
+            if conversation_title(&state.db, id, authed.user.id)
+                .await
+                .is_none()
+            {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error":"no such conversation"})),
+                ));
+            }
+            id
+        }
+        None => create_conversation(&state.db, authed.user.id, &title)
+            .await
+            .map_err(|_| internal_error())?,
+    };
+    let guard = state
+        .realtime
+        .reserve_run(authed.user.id, conversation)
+        .ok_or((
+            StatusCode::CONFLICT,
+            Json(json!({"error":"conversation has an active run"})),
+        ))?;
+    req.conversation_id = Some(conversation);
+    let run = RunIdentity {
+        run_id: Uuid::now_v7(),
+        request_id: Uuid::now_v7(),
+        conversation_id: conversation,
+    };
+    let user = authed.user.id;
+    state
+        .realtime
+        .claim_voice(user, authed.device.id, Some(run.run_id));
+    if fresh {
+        state.realtime.publish(
+            user,
+            Event::ConversationCreated(ConversationMetadata {
+                id: conversation,
+                title,
+                updated_at: OffsetDateTime::now_utc(),
+            }),
+        );
+    }
+    // Even an old client's HTTP disconnect must not cancel a shared answer.
+    // Legacy requests have no caller request UUID; only the additive runs API
+    // offers retry idempotency. Never automatically replay this endpoint.
+    tokio::spawn(async move {
+        let _guard = guard;
+        let mut result = execute_chat(authed, state.clone(), req, Some(run.clone()), None).await;
+        if let Ok(Json(value)) = &mut result {
+            value["new_topic"] = json!(fresh);
+        } else {
+            state.realtime.publish(
+                user,
+                Event::AssistantFailed {
+                    run,
+                    reason: jarvis_client_core::realtime::RunFailure::ProviderUnavailable,
+                },
+            );
+        }
+        result
+    })
+    .await
+    .map_err(|_| internal_error())?
+}
+
+pub(super) async fn execute_chat(
+    authed: Authed,
+    state: AppState,
+    req: ChatReq,
+    realtime_run: Option<RunIdentity>,
+    persisted_user_message: Option<CanonicalMessage>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if !allow_authenticated_device(
         &state,
@@ -129,8 +232,10 @@ pub(crate) async fn assistant_chat(
             .map(|t| (cid, t)),
         None => None,
     };
-    let (conv_id, conv_title, new_topic) = match existing {
-        Some((cid, title)) => {
+    let (conv_id, conv_title, new_topic) = match (existing, realtime_run.as_ref()) {
+        (Some((cid, title)), Some(_)) => (cid, title, false),
+        (None, Some(_)) => return Err(internal_error()),
+        (Some((cid, title)), None) => {
             let (same, proposed) = classify_topic(&state, Some(&title), &new_msg).await;
             if same {
                 (cid, title, false)
@@ -141,7 +246,7 @@ pub(crate) async fn assistant_chat(
                 (id, proposed, true)
             }
         }
-        None => {
+        (None, None) => {
             let (_same, proposed) = classify_topic(&state, None, &new_msg).await;
             let id = create_conversation(&state.db, authed.user.id, &proposed)
                 .await
@@ -151,7 +256,27 @@ pub(crate) async fn assistant_chat(
     };
 
     // Save what the owner said up front, so it survives even a brain outage.
-    append_message(&state.db, conv_id, authed.user.id, "user", &new_msg, None).await;
+    let user_already_published = persisted_user_message.is_some();
+    let user_message = match persisted_user_message {
+        Some(message) => message,
+        None => append_message(&state.db, conv_id, authed.user.id, "user", &new_msg, None)
+            .await
+            .map_err(|_| internal_error())?,
+    };
+    if let Some(run) = &realtime_run {
+        if !user_already_published {
+            state.realtime.publish(
+                authed.user.id,
+                Event::MessageCreated {
+                    request_id: run.request_id,
+                    message: user_message,
+                },
+            );
+        }
+        state
+            .realtime
+            .publish(authed.user.id, Event::AssistantStarted(run.clone()));
+    }
 
     // A fresh topic starts with a clean slate; a continuation keeps its context.
     let messages = if new_topic {
@@ -207,9 +332,53 @@ pub(crate) async fn assistant_chat(
     }
 
     let llm_started = Instant::now();
-    let request_id = Uuid::now_v7().to_string();
-    match state.llm.chat(&chat).await {
-        Ok(reply) => {
+    let request_id = realtime_run
+        .as_ref()
+        .map(|run| run.run_id.to_string())
+        .unwrap_or_else(|| Uuid::now_v7().to_string());
+    let reply = if let Some(run) = &realtime_run {
+        let hub = state.realtime.clone();
+        let run = run.clone();
+        let user = authed.user.id;
+        state
+            .llm
+            .chat_stream(
+                &chat,
+                std::sync::Arc::new(move |text| {
+                    hub.publish(
+                        user,
+                        Event::AssistantDelta {
+                            run: run.clone(),
+                            text: text.to_string(),
+                        },
+                    );
+                }),
+            )
+            .await
+    } else {
+        state.llm.chat(&chat).await
+    };
+    match reply {
+        Ok(mut reply) => {
+            let estimated_usage = reply.backend.is_some() && reply.usage.is_none();
+            if estimated_usage {
+                // Missing stream usage must not turn a metered success into
+                // an unrecorded/free request. Charge a conservative input-byte
+                // ceiling plus framing and the requested output-token limit.
+                let input_bytes = chat
+                    .messages
+                    .iter()
+                    .map(|m| m.content.len().saturating_add(32))
+                    .sum::<usize>()
+                    .saturating_add(chat.system.as_ref().map_or(0, String::len))
+                    .saturating_add(1024);
+                reply.usage = Some(llm::Usage {
+                    input_tokens: input_bytes.min(i32::MAX as usize) as u32,
+                    output_tokens: chat.max_tokens,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                });
+            }
             record_usage_with_metadata(
                 &state,
                 &reply,
@@ -218,11 +387,17 @@ pub(crate) async fn assistant_chat(
                     routing_mode: format!("{mode:?}").to_ascii_lowercase(),
                     quality_tier: format!("{:?}", requirements.tier).to_ascii_lowercase(),
                     latency_ms: llm_started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                    status: if estimated_usage {
+                        "succeeded_estimated_usage"
+                    } else {
+                        "succeeded"
+                    }
+                    .into(),
                     ..Default::default()
                 },
             )
             .await;
-            append_message(
+            let message = append_message(
                 &state.db,
                 conv_id,
                 authed.user.id,
@@ -230,7 +405,25 @@ pub(crate) async fn assistant_chat(
                 &reply.text,
                 Some(reply.model.as_str()),
             )
-            .await;
+            .await
+            .map_err(|_| internal_error())?;
+            if let Some(run) = &realtime_run {
+                state.realtime.publish(
+                    authed.user.id,
+                    Event::AssistantCompleted {
+                        run: run.clone(),
+                        message,
+                    },
+                );
+                state.realtime.publish(
+                    authed.user.id,
+                    Event::ConversationUpdated(ConversationMetadata {
+                        id: conv_id,
+                        title: conv_title.clone(),
+                        updated_at: OffsetDateTime::now_utc(),
+                    }),
+                );
+            }
             Ok(Json(json!({
                 "reply": reply.text,
                 "model": reply.model,
@@ -245,7 +438,19 @@ pub(crate) async fn assistant_chat(
         }
         Err(llm::LlmError::Refused) => {
             let text = "Sorry, daar kan ik niet op antwoorden.";
-            append_message(&state.db, conv_id, authed.user.id, "assistant", text, None).await;
+            let message =
+                append_message(&state.db, conv_id, authed.user.id, "assistant", text, None)
+                    .await
+                    .map_err(|_| internal_error())?;
+            if let Some(run) = &realtime_run {
+                state.realtime.publish(
+                    authed.user.id,
+                    Event::AssistantCompleted {
+                        run: run.clone(),
+                        message,
+                    },
+                );
+            }
             Ok(Json(json!({
                 "reply": text,
                 "model": Value::Null,
@@ -258,7 +463,7 @@ pub(crate) async fn assistant_chat(
         Err(e) => {
             // Details stay in logs; the client gets an opaque, actionable hint.
             // The user's message is already saved under `conv_id`.
-            tracing::warn!(error = %e, "assistant chat failed");
+            tracing::warn!(failure = ?e.failure_category(), "assistant chat failed");
             Err((
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
@@ -306,61 +511,19 @@ async fn async_global_brain(state: &AppState, user_id: Uuid) -> Option<(String, 
         .and_then(|r| r.provider.zip(r.model))
 }
 
-/// Ask a cheap model whether `new_msg` continues the current topic, and get a
-/// short title for the (new) topic. Best-effort: any failure keeps the current
-/// conversation (or, with none, derives a title) so chat never breaks (ADR-030).
+/// Preserve the legacy response shape without a second paid classification
+/// call. Conversation changes are explicit owner navigation, not model guesses.
 async fn classify_topic(
-    state: &AppState,
+    _state: &AppState,
     current_title: Option<&str>,
     new_msg: &str,
 ) -> (bool, String) {
-    let snippet: String = new_msg.chars().take(600).collect();
-    let system = "Je bepaalt of een nieuw bericht bij het lopende gespreksonderwerp \
-         hoort of een nieuw onderwerp begint. Antwoord UITSLUITEND met JSON: \
-         {\"same_topic\": true of false, \"title\": \"korte titel, max 5 woorden\"}. \
-         Is er geen lopend onderwerp, dan is same_topic altijd false.";
-    let user = format!(
-        "Lopend onderwerp: \"{}\"\nNieuw bericht: \"{}\"",
-        current_title.unwrap_or("(geen)"),
-        snippet
-    );
-    let req = llm::ChatRequest {
-        system: Some(system.to_string()),
-        tier: llm::Tier::Cheap,
-        mode: llm::RoutingMode::Fast,
-        messages: vec![llm::ChatMessage::user(&user)],
-        max_tokens: 60,
-        model: None,
-    };
-    match state.llm.chat(&req).await {
-        Ok(reply) => {
-            record_usage(state, &reply).await;
-            parse_topic(&reply.text)
-                .unwrap_or_else(|| (current_title.is_some(), derive_title(new_msg)))
-        }
-        // Brain down for the classifier: don't fragment — keep the current
-        // conversation if there is one, else start one with a derived title.
-        Err(_) => (current_title.is_some(), derive_title(new_msg)),
-    }
-}
-
-/// Extract `{same_topic, title}` from a model reply (tolerant of prose around
-/// the JSON). Returns None if no usable object is found.
-fn parse_topic(text: &str) -> Option<(bool, String)> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    let v: Value = serde_json::from_str(text.get(start..=end)?).ok()?;
-    let same = v
-        .get("same_topic")
-        .and_then(|b| b.as_bool())
-        .unwrap_or(false);
-    let title = v
-        .get("title")
-        .and_then(|t| t.as_str())
-        .map(clean_title)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Nieuw gesprek".to_string());
-    Some((same, title))
+    (
+        current_title.is_some(),
+        current_title
+            .map(str::to_string)
+            .unwrap_or_else(|| derive_title(new_msg)),
+    )
 }
 
 /// A short, single-line title derived from the first user message.
@@ -393,7 +556,7 @@ struct TitleRow {
     title: String,
 }
 
-async fn conversation_title(
+pub(super) async fn conversation_title(
     db: &jarvis_store::Database,
     id: Uuid,
     user_id: Uuid,
@@ -421,12 +584,14 @@ async fn create_conversation(
     )
     .bind(json!({"id": id.to_string(), "user_id": user_id.to_string(), "title": title}))
     .await
+    .map_err(|_| ())?
+    .check()
     .map_err(|_| ())?;
     Ok(id)
 }
 
-/// Append a message and bump the conversation's `updated_at`. Best-effort:
-/// persistence must never break the reply, so a failure is logged, not surfaced.
+/// Append a canonical message and bump `updated_at` atomically. Persistence
+/// must succeed before publishing a completion to any display.
 async fn append_message(
     db: &jarvis_store::Database,
     conv_id: Uuid,
@@ -434,16 +599,28 @@ async fn append_message(
     role: &str,
     content: &str,
     model: Option<&str>,
-) {
+) -> Result<CanonicalMessage, ()> {
+    let id = Uuid::now_v7();
+    let at = OffsetDateTime::now_utc();
     let res = db.query(
         "BEGIN TRANSACTION; CREATE chat_messages SET id = $id, conversation_id = $conversation_id, \
-         user_id = $user_id, role = $role, content = $content, model = $model, created_at = time::now(); \
+         user_id = $user_id, role = $role, content = $content, model = $model, created_at = <datetime>$at; \
          UPDATE conversations SET updated_at = time::now() WHERE record::id(id) = $conversation_id AND user_id = $user_id; COMMIT TRANSACTION;",
-    ).bind(json!({"id": Uuid::now_v7().to_string(), "conversation_id": conv_id.to_string(),
+    ).bind(json!({"id": id.to_string(), "at": at.format(&time::format_description::well_known::Rfc3339).map_err(|_| ())?, "conversation_id": conv_id.to_string(),
         "user_id": user_id.to_string(), "role": role, "content": content, "model": model})).await;
-    if let Err(e) = res {
-        tracing::warn!(error = %e, "failed to persist chat message");
-    }
+    res.map_err(|_| ())?.check().map_err(|_| ())?;
+    Ok(CanonicalMessage {
+        id,
+        conversation_id: conv_id,
+        role: if role == "user" {
+            MessageRole::User
+        } else {
+            MessageRole::Assistant
+        },
+        content: content.to_string(),
+        model: model.map(str::to_string),
+        created_at: at,
+    })
 }
 
 #[derive(Deserialize)]
@@ -487,6 +664,7 @@ pub(crate) async fn get_conversation(
         })?;
     #[derive(Deserialize)]
     struct MessageRow {
+        id: String,
         role: String,
         content: String,
         model: Option<String>,
@@ -494,13 +672,13 @@ pub(crate) async fn get_conversation(
         created_at: OffsetDateTime,
     }
     let mut response = state.db.query(
-        "SELECT role, content, model, created_at FROM chat_messages WHERE conversation_id = $id ORDER BY created_at ASC",
-    ).bind(json!({"id": id.to_string()})).await.map_err(|_| internal_error())?;
+        "SELECT record::id(id) AS id, role, content, model, created_at FROM chat_messages WHERE conversation_id = $id AND user_id = $user ORDER BY created_at ASC",
+    ).bind(json!({"id": id.to_string(), "user":authed.user.id.to_string()})).await.map_err(|_| internal_error())?;
     let rows: Vec<MessageRow> = response.take(0).map_err(|_| internal_error())?;
     let messages: Vec<Value> = rows
         .into_iter()
         .map(|row| {
-            json!({ "role": row.role, "content": row.content, "model": row.model, "at": row.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() })
+            json!({ "id":row.id, "role": row.role, "content": row.content, "model": row.model, "at": row.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() })
         })
         .collect();
     Ok(Json(
@@ -530,6 +708,16 @@ pub(crate) async fn conversation_brain_set(
             Json(json!({"error":"no such conversation"})),
         ));
     }
+    if let Some(title) = conversation_title(&state.db, id, authed.user.id).await {
+        state.realtime.publish(
+            authed.user.id,
+            Event::ConversationUpdated(ConversationMetadata {
+                id,
+                title,
+                updated_at: OffsetDateTime::now_utc(),
+            }),
+        );
+    }
     Ok(Json(json!({"status":"updated"})))
 }
 
@@ -539,17 +727,27 @@ pub(crate) async fn delete_conversation(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _guard = state.realtime.reserve_run(authed.user.id, id).ok_or((
+        StatusCode::CONFLICT,
+        Json(json!({"error":"conversation has an active run"})),
+    ))?;
     let mut response = state.db.query(
         "BEGIN TRANSACTION; DELETE chat_messages WHERE conversation_id = $id AND user_id = $user_id; \
-         DELETE conversations WHERE record::id(id) = $id AND user_id = $user_id RETURN record::id(id) AS id; COMMIT TRANSACTION;",
+         DELETE conversations WHERE record::id(id) = $id AND user_id = $user_id RETURN $id AS id; COMMIT TRANSACTION;",
     ).bind(json!({"id": id.to_string(), "user_id": authed.user.id.to_string()})).await.map_err(|_| internal_error())?;
-    let deleted: Option<ConversationRow> = response.take(1).map_err(|_| internal_error())?;
+    let deleted: Option<Value> = response.take(1).map_err(|_| internal_error())?;
     if deleted.is_none() {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such conversation" })),
         ));
     }
+    state.realtime.publish(
+        authed.user.id,
+        Event::ConversationDeleted {
+            conversation_id: id,
+        },
+    );
     Ok(Json(json!({ "status": "deleted" })))
 }
 

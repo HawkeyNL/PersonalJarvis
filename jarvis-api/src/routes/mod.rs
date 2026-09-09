@@ -10,5 +10,6 @@ pub(crate) mod broker;
 pub(crate) mod chat;
 pub(crate) mod coding;
 pub(crate) mod portfolio;
+pub(crate) mod runs;
 pub(crate) mod system;
 pub(crate) mod voice;

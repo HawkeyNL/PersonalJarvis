@@ -280,7 +280,8 @@ pub use surreal::{
     create_unlock_request, create_user, deny_pairing_request, deny_unlock_request, first_user,
     first_user_or_create, get_device, get_user, list_active_devices, login, pairing_request_status,
     pairing_status_for_candidate, pending_pairing_requests, pending_unlock_requests,
-    register_device, revoke_device, revoke_session, unlock_request_status, verify_device_signature,
+    register_device, revoke_device, revoke_session, session_is_active, unlock_request_status,
+    verify_device_signature,
 };
 
 #[cfg(test)]

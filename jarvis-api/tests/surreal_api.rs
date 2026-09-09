@@ -17,6 +17,9 @@ use tower::ServiceExt;
 
 use jarvis_api::{build_router, AppState, AuthLimits, RateLimiter, JARVIS_SYSTEM_FALLBACK};
 
+#[path = "realtime/mod.rs"]
+mod realtime;
+
 async fn json_body(response: axum::response::Response) -> Value {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -26,6 +29,7 @@ async fn json_body(response: axum::response::Response) -> Value {
 
 async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState {
     AppState {
+        realtime: Default::default(),
         db,
         environment: "test".to_string(),
         require_https: false,

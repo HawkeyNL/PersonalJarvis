@@ -77,6 +77,26 @@ pub async fn connect(
 /// unsafe. This is an idempotent baseline for the empty, pre-production Home
 /// Node only. Later schema changes must be explicit, versioned migrations.
 pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
+    let mut response = db
+        .query("SELECT version FROM schema_version:baseline")
+        .await
+        .map_err(StoreError::schema)?;
+    let current: Option<SchemaVersion> = response.take(0).map_err(StoreError::schema)?;
+    if current.is_some_and(|v| v.version == 7) {
+        return Ok(());
+    }
+    apply_through_six(db).await?;
+    db.query(include_str!(
+        "../../../schema/surreal/0007_assistant_runs.surql"
+    ))
+    .await
+    .map_err(StoreError::schema)?
+    .check()
+    .map_err(StoreError::schema)?;
+    Ok(())
+}
+
+async fn apply_through_six(db: &Database) -> Result<(), StoreError> {
     let mut version = db
         .query("SELECT version FROM schema_version:baseline")
         .await
