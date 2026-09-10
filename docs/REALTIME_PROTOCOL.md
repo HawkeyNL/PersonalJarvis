@@ -108,6 +108,18 @@ foreground unlock. Push notifications are outside this protocol.
 
 ## Canonical inference context
 
+Conversation history responses include additive `assistant_running` state,
+derived from the owner's active conversation reservation. Reconnecting clients
+must not assume generation stopped just because they missed live deltas.
+The field is false after the reservation ends, including failure, and after a
+Core restart; durable run status distinguishes interrupted work from completion.
+`GET /v1/assistant/requests/{request_id}` recovers a lost submission acknowledgement
+without another POST. Its lookup is bound to both authenticated user and device;
+another device's same request UUID does not address the original run. This route
+only reads the existing reservation and never invokes a provider. A missing record
+is not proof a still-in-flight submission failed, so clients must not blindly
+resubmit with a fresh request ID.
+
 Asynchronous `/v1/assistant/runs` uses the owner-scoped persisted conversation,
 not a device's supplied replica, as model context. The submitted final user turn
 is committed first and must match the newest database row before inference.

@@ -96,6 +96,17 @@ pub(crate) async fn status(
     ))
 }
 
+/// Recover a lost submission acknowledgement without resubmitting paid work.
+/// The lookup key is derived from this authenticated device, never caller identity.
+pub(crate) async fn request_status(
+    auth: Authed,
+    State(state): State<AppState>,
+    Path(request): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let id = identity(auth.user.id, auth.device.id, request);
+    status(auth, State(state), Path(id)).await
+}
+
 pub(crate) async fn submit(
     auth: Authed,
     State(state): State<AppState>,

@@ -214,6 +214,29 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     let (retry_status, retry) = post(&app, &token_a, "/v1/assistant/runs", request.clone()).await;
     assert_eq!(retry_status, StatusCode::OK, "{retry}");
     assert_eq!(submitted["run_id"], retry["run_id"]);
+    // Recover a missing HTTP acknowledgement using the original request UUID.
+    // The same UUID on another authenticated device must not locate this run.
+    for (token, expected) in [
+        (&token_a, StatusCode::OK),
+        (&token_b, StatusCode::NOT_FOUND),
+    ] {
+        let recovered = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/assistant/requests/{}",
+                        request["request_id"].as_str().unwrap()
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(recovered.status(), expected);
+        if expected == StatusCode::OK {
+            assert_eq!(json_body(recovered).await["run_id"], submitted["run_id"]);
+        }
+    }
     let mut streamed = String::new();
     let mut spoken = Vec::new();
     let canonical = loop {
@@ -441,6 +464,17 @@ async fn disconnect_and_provider_failure_never_repeat_or_lose_the_user_message(
         let (status, run) = post(&app, &token, "/v1/assistant/runs", request.clone()).await;
         assert_eq!(status, StatusCode::OK);
         tokio::time::timeout(Duration::from_secs(5), started.notified()).await?;
+        let conversation: Uuid = serde_json::from_value(run["conversation_id"].clone())?;
+        let running = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/conversations/{conversation}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(json_body(running).await["assistant_running"], true);
         drop(display); // All displays gone, while inference is still running.
         let retry = post(&app, &token, "/v1/assistant/runs", request.clone()).await;
         assert_eq!(retry.0, StatusCode::OK);
@@ -463,6 +497,7 @@ async fn disconnect_and_provider_failure_never_repeat_or_lose_the_user_message(
             )
             .await?;
         let history = json_body(response).await;
+        assert_eq!(history["assistant_running"], false);
         assert_eq!(history["messages"][0]["content"], "Keep this question");
         assert_eq!(
             history["messages"].as_array().unwrap().len(),

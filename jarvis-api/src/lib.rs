@@ -135,6 +135,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/assistant/chat", post(assistant_chat))
         .route("/v1/assistant/runs", post(routes::runs::submit))
         .route("/v1/assistant/runs/{id}", get(routes::runs::status))
+        .route(
+            "/v1/assistant/requests/{id}",
+            get(routes::runs::request_status),
+        )
         .route("/v1/assistant/orchestrate", post(assistant_orchestrate))
         .route("/v1/coding/sessions", get(coding_list).post(coding_create))
         .route("/v1/coding/sessions/{id}", post(coding_lifecycle))

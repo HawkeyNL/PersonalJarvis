@@ -693,7 +693,8 @@ pub(crate) async fn get_conversation(
         })
         .collect();
     Ok(Json(
-        json!({ "id": id, "title": title, "messages": messages }),
+        json!({ "id": id, "title": title, "messages": messages,
+            "assistant_running": state.realtime.run_active(authed.user.id, id) }),
     ))
 }
 
