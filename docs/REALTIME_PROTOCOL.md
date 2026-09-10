@@ -27,6 +27,12 @@ copying each message per device. Dropping a socket unregisters its subscriber.
 Connect attempts are limited to 30 per device/minute; voice controls to 30 and
 playback reports to 120, in addition to the existing authenticated API limiter.
 
+The disposable-database integration test also exercises actual authenticated
+`/v1/voice/playback` requests: a second non-owning device is refused, the owning
+device's start/stop statuses reach both WebSocket clients identically, and the
+fake provider's invocation count remains one throughout playback reporting.
+This validates server fanout/accounting, not audible device playback.
+
 ## Envelope
 
 Fields: `protocol`, `epoch`, `event_id`, `sequence`, `at`, `type`, `payload`.

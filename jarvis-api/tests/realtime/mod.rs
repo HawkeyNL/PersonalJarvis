@@ -279,6 +279,52 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
             .is_err()
     );
     assert_eq!(hub.voice_owner(owner.id).unwrap().0, device_a);
+    // Native playback reports are presentation metadata, not model requests.
+    // The authenticated non-owner cannot spoof playback for the owner's run.
+    assert_eq!(
+        post(
+            &app,
+            &token_b,
+            "/v1/voice/playback",
+            json!({"run_id":submitted["run_id"],"state":"started"})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    for status in ["started", "stopped"] {
+        assert_eq!(
+            post(
+                &app,
+                &token_a,
+                "/v1/voice/playback",
+                json!({"run_id":submitted["run_id"],"state":status})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        loop {
+            let first = event(&mut a).await;
+            let second = event(&mut b).await;
+            assert_eq!(first, second);
+            let playback = match first.event {
+                Event::VoiceStarted { device_id, run_id } if status == "started" => {
+                    Some((device_id, run_id))
+                }
+                Event::VoiceStopped { device_id, run_id } if status == "stopped" => {
+                    Some((device_id, run_id))
+                }
+                _ => None,
+            };
+            if let Some((device, run)) = playback {
+                assert_eq!(device, device_a);
+                assert_eq!(json!(run), submitted["run_id"]);
+                break;
+            }
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
     let response = app
         .clone()
         .oneshot(
