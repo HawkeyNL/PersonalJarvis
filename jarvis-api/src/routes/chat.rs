@@ -263,6 +263,15 @@ pub(super) async fn execute_chat(
             .await
             .map_err(|_| internal_error())?,
     };
+    let canonical_history = if user_already_published {
+        Some(
+            super::chat_context::load(&state.db, authed.user.id, &user_message)
+                .await
+                .map_err(|_| internal_error())?,
+        )
+    } else {
+        None
+    };
     if let Some(run) = &realtime_run {
         if !user_already_published {
             state.realtime.publish(
@@ -279,7 +288,9 @@ pub(super) async fn execute_chat(
     }
 
     // A fresh topic starts with a clean slate; a continuation keeps its context.
-    let messages = if new_topic {
+    let messages = if let Some(canonical) = canonical_history {
+        canonical
+    } else if new_topic {
         vec![llm::ChatMessage::user(&new_msg)]
     } else {
         history

@@ -106,6 +106,19 @@ correctness depends on a permanently connected socket. iOS/Android stop sockets
 and local speech when backgrounded/locked and reconnect after authenticated
 foreground unlock. Push notifications are outside this protocol.
 
+## Canonical inference context
+
+Asynchronous `/v1/assistant/runs` uses the owner-scoped persisted conversation,
+not a device's supplied replica, as model context. The submitted final user turn
+is committed first and must match the newest database row before inference.
+The context retains up to 32 latest complete messages within 128,000 UTF-8 bytes,
+ordered chronologically; it never summarizes through another model call or
+truncates an individual message. Missing/mismatched persistence fails before
+provider invocation. Legacy synchronous request-context behavior is retained.
+Request-id payload matching remains exact, even if a retry carries different
+client history. Tests include a stale client supplying an invented assistant
+turn: the fake provider receives the canonical stored answer instead.
+
 ## Voice
 
 The originating authenticated device claims voice for its run. Explicit HTTP

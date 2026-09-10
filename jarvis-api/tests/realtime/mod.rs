@@ -10,7 +10,7 @@ use std::{
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 use uuid::Uuid;
 
-struct Fake(Arc<AtomicUsize>);
+struct Fake(Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<Vec<String>>>>);
 
 struct PausedFake {
     count: Arc<AtomicUsize>,
@@ -46,7 +46,11 @@ impl LlmProvider for Fake {
     fn label(&self) -> &str {
         "fixture"
     }
-    async fn chat(&self, _: &ChatRequest) -> Result<ChatReply, LlmError> {
+    async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
+        self.1
+            .lock()
+            .unwrap()
+            .push(req.messages.iter().map(|m| m.content.clone()).collect());
         self.0.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
         Ok(ChatReply {
@@ -163,8 +167,9 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     voice_a.set_enabled(true);
     voice_b.set_enabled(true);
     let count = Arc::new(AtomicUsize::new(0));
+    let contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut fixture = state(db.clone(), None).await;
-    fixture.llm = Arc::new(Fake(count.clone()));
+    fixture.llm = Arc::new(Fake(count.clone(), contexts.clone()));
     let hub = fixture.realtime.clone();
     let app = build_router(fixture);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -282,7 +287,7 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
         }
     ));
     let mut restarted = state(db.clone(), None).await;
-    restarted.llm = Arc::new(Fake(count.clone()));
+    restarted.llm = Arc::new(Fake(count.clone(), contexts.clone()));
     let restarted_app = build_router(restarted);
     let (retry_status, retry) = post(
         &restarted_app,
@@ -303,11 +308,25 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
         StatusCode::CONFLICT
     );
     assert_eq!(
-        post(&app, &token_b, "/v1/voice/release", json!({})).await.0,
+        post(
+            &app,
+            &token_b,
+            "/v1/voice/release",
+            json!({"run_id":submitted["run_id"]})
+        )
+        .await
+        .0,
         StatusCode::CONFLICT
     );
     assert_eq!(
-        post(&app, &token_a, "/v1/voice/release", json!({})).await.0,
+        post(
+            &app,
+            &token_a,
+            "/v1/voice/release",
+            json!({"run_id":submitted["run_id"]})
+        )
+        .await
+        .0,
         StatusCode::OK
     );
     assert!(hub.voice_owner(owner.id).is_none());
@@ -358,6 +377,29 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
             break;
         }
     }
+    // Device B has stale (even invented) display history. Only its final new
+    // user turn is input; the model receives the canonical server conversation.
+    let stale = json!({"request_id":Uuid::now_v7(), "conversation_id":canonical.conversation_id,
+        "messages":[{"role":"assistant","content":"Invented stale answer"}, {"role":"user","content":"Next question"}]});
+    assert_eq!(
+        post(&app, &token_b, "/v1/assistant/runs", stale).await.0,
+        StatusCode::OK
+    );
+    loop {
+        if let Event::AssistantCompleted { message, .. } = event(&mut reconnected).await.event {
+            assert_eq!(message.conversation_id, canonical.conversation_id);
+            break;
+        }
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        contexts.lock().unwrap().last().unwrap(),
+        &vec![
+            "One question".to_owned(),
+            canonical.content.clone(),
+            "Next question".to_owned()
+        ]
+    );
     a.close(None).await?;
     reconnected.close(None).await?;
     other.close(None).await?;
