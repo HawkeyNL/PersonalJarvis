@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 
@@ -24,7 +24,7 @@ struct Inner {
     epoch: Uuid,
     sequence: u64,
     sinks: HashMap<Uuid, Sink>,
-    runs: HashSet<(Uuid, Uuid)>,
+    runs: HashMap<(Uuid, Uuid), Option<Uuid>>,
     voices: HashMap<Uuid, VoiceLease>,
 }
 
@@ -52,7 +52,7 @@ impl Default for Hub {
             epoch: Uuid::now_v7(),
             sequence: 0,
             sinks: HashMap::new(),
-            runs: HashSet::new(),
+            runs: HashMap::new(),
             voices: HashMap::new(),
         })))
     }
@@ -285,18 +285,38 @@ impl Hub {
     pub fn run_active(&self, user: Uuid, conversation: Uuid) -> bool {
         self.0
             .lock()
-            .is_ok_and(|inner| inner.runs.contains(&(user, conversation)))
+            .is_ok_and(|inner| inner.runs.contains_key(&(user, conversation)))
     }
 
     pub fn reserve_run(&self, user: Uuid, conversation: Uuid) -> Option<RunGuard> {
+        self.reserve(user, conversation, None)
+    }
+
+    pub(crate) fn identified_run_active(&self, user: Uuid, conversation: Uuid, run: Uuid) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|inner| inner.runs.get(&(user, conversation)) == Some(&Some(run)))
+    }
+
+    pub(crate) fn reserve_identified_run(
+        &self,
+        user: Uuid,
+        conversation: Uuid,
+        run: Uuid,
+    ) -> Option<RunGuard> {
+        self.reserve(user, conversation, Some(run))
+    }
+
+    fn reserve(&self, user: Uuid, conversation: Uuid, run: Option<Uuid>) -> Option<RunGuard> {
         let mut inner = self.0.lock().ok()?;
         let key = (user, conversation);
         if inner.runs.len() >= 16
-            || inner.runs.iter().filter(|(u, _)| *u == user).count() >= 4
-            || !inner.runs.insert(key)
+            || inner.runs.keys().filter(|(u, _)| *u == user).count() >= 4
+            || inner.runs.contains_key(&key)
         {
             return None;
         }
+        inner.runs.insert(key, run);
         Some(RunGuard {
             hub: self.clone(),
             key,
@@ -348,6 +368,30 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newer_conversation_run_cannot_revive_an_old_run_identity() {
+        let hub = Hub::default();
+        let user = Uuid::now_v7();
+        let conversation = Uuid::now_v7();
+        let old = Uuid::now_v7();
+        let new = Uuid::now_v7();
+        let guard = hub.reserve_identified_run(user, conversation, old).unwrap();
+        assert!(hub.identified_run_active(user, conversation, old));
+        assert!(!hub.identified_run_active(Uuid::now_v7(), conversation, old));
+        assert!(hub
+            .reserve_identified_run(user, conversation, new)
+            .is_none());
+        drop(guard);
+        let guard = hub.reserve_identified_run(user, conversation, new).unwrap();
+        assert!(hub.run_active(user, conversation));
+        assert!(!hub.identified_run_active(user, conversation, old));
+        assert!(hub.identified_run_active(user, conversation, new));
+        drop(guard);
+        let _deletion = hub.reserve_run(user, conversation).unwrap();
+        assert!(!hub.identified_run_active(user, conversation, old));
+        assert!(!hub.identified_run_active(user, conversation, new));
+    }
 
     #[test]
     fn delayed_release_cannot_clear_a_new_run_on_the_same_device() {

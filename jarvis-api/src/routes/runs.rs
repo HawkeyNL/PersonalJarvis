@@ -92,7 +92,7 @@ pub(crate) async fn status(
         state.realtime.epoch().ok_or_else(unavailable)?,
         state
             .realtime
-            .run_active(auth.user.id, stored.conversation_id),
+            .identified_run_active(auth.user.id, stored.conversation_id, stored.id),
     ))
 }
 
@@ -126,7 +126,7 @@ pub(crate) async fn submit(
             epoch,
             state
                 .realtime
-                .run_active(auth.user.id, stored.conversation_id),
+                .identified_run_active(auth.user.id, stored.conversation_id, stored.id),
         ));
     }
     let fresh = req.chat.conversation_id.is_none();
@@ -143,7 +143,7 @@ pub(crate) async fn submit(
     }
     let guard = state
         .realtime
-        .reserve_run(auth.user.id, conversation)
+        .reserve_identified_run(auth.user.id, conversation, id)
         .ok_or_else(conflict)?;
     let message = CanonicalMessage {
         id: Uuid::now_v7(),
@@ -172,9 +172,11 @@ pub(crate) async fn submit(
                 return Ok(response(
                     &stored,
                     epoch,
-                    state
-                        .realtime
-                        .run_active(auth.user.id, stored.conversation_id),
+                    state.realtime.identified_run_active(
+                        auth.user.id,
+                        stored.conversation_id,
+                        stored.id,
+                    ),
                 ));
             }
         }
@@ -247,6 +249,30 @@ pub(crate) async fn submit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interrupted_run_stays_interrupted_while_another_run_uses_conversation() {
+        let hub = crate::realtime::Hub::default();
+        let user = Uuid::now_v7();
+        let conversation = Uuid::now_v7();
+        let old = Stored {
+            id: Uuid::now_v7(),
+            request_id: Uuid::now_v7(),
+            conversation_id: conversation,
+            payload_hash: String::new(),
+            epoch: hub.epoch().unwrap(),
+            state: "running".into(),
+        };
+        let _current = hub
+            .reserve_identified_run(user, conversation, Uuid::now_v7())
+            .unwrap();
+        let status = response(
+            &old,
+            hub.epoch().unwrap(),
+            hub.identified_run_active(user, conversation, old.id),
+        );
+        assert_eq!(status.0["state"], "interrupted");
+        assert_eq!(status.0["run_id"], old.id.to_string());
+    }
     #[test]
     fn request_identity_is_principal_bound() {
         let u = Uuid::now_v7();

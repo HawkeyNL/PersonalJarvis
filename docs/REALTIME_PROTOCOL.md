@@ -113,6 +113,9 @@ derived from the owner's active conversation reservation. Reconnecting clients
 must not assume generation stopped just because they missed live deltas.
 The field is false after the reservation ends, including failure, and after a
 Core restart; durable run status distinguishes interrupted work from completion.
+Run status checks the exact active run identity, not merely whether its
+conversation is busy. A newer run (or a conversation deletion reservation)
+cannot make an older interrupted run appear to be running again.
 `GET /v1/assistant/requests/{request_id}` recovers a lost submission acknowledgement
 without another POST. Its lookup is bound to both authenticated user and device;
 another device's same request UUID does not address the original run. This route
