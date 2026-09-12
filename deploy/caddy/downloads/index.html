@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Jarvis — Downloads</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0b111b; color: #edf4fa; font: 1rem/1.6 system-ui, sans-serif; }
+    main { max-width: 960px; padding: 64px 24px; margin: auto; }
+    .brand { color: #68dce8; letter-spacing: .16em; font-weight: 700; }
+    h1 { font-size: clamp(2rem, 7vw, 3.5rem); line-height: 1.15; margin-bottom: 20px; }
+    p { color: #b5c4d6; overflow-wrap: anywhere; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 18px; margin: 32px 0; }
+    article { border: 1px solid #293849; border-radius: 16px; padding: 24px; background: #121d2a; }
+    h2 { margin: 0; font-size: 1.2rem; }
+    a { color: #7ee7ec; text-underline-offset: .2em; }
+    a:focus-visible { outline: 3px solid #7ee7ec; outline-offset: 5px; }
+    .button { display: inline-block; margin-top: 10px; padding: 10px 16px; border: 1px solid #7ee7ec; border-radius: 9px; text-decoration: none; }
+    footer { margin-top: 42px; border-top: 1px solid #293849; padding-top: 20px; }
+  </style>
+</head>
+<body><main>
+  <div class="brand">JARVIS</div>
+  <h1>Eén Jarvis. Op jouw apparaten.</h1>
+  <p>Installeer de app en verbind hem met jouw Home Node. De eerste installatie download je vanaf de officiële GitHub Releases. Updates in de app lopen daarna via je aangemelde Home Node-verbinding.</p>
+  <div class="cards">
+    <article><h2>Desktop</h2><p>Linux x86_64: AppImage<br>Windows x86_64: installer<br>macOS Apple Silicon: DMG</p><a class="button" href="https://github.com/HawkeyNL/PersonalJarvisApp/releases/latest" rel="noreferrer">Bekijk desktopdownloads</a></article>
+    <article><h2>Android</h2><p>Download de ondertekende APK uit dezelfde apprelease. Een AAB is niet bedoeld voor rechtstreekse installatie.</p><a class="button" href="https://github.com/HawkeyNL/PersonalJarvisApp/releases/latest" rel="noreferrer">Bekijk Android-download</a></article>
+    <article><h2>iPhone en iPad</h2><p>Installeer lokaal vanuit Xcode met je eigen Apple Account. Er is geen openbare IPA, App Store- of TestFlight-download.</p><a href="https://github.com/HawkeyNL/PersonalJarvisApp/tree/main/ios" rel="noreferrer">Bekijk Xcode-instructies</a></article>
+  </div>
+  <h2>Na installatie</h2>
+  <p>Voer het HTTPS-adres van jouw Home Node in en doorloop de apparaatregistratie. Deze pagina vraagt nooit om een token, wachtwoord of privésleutel.</p>
+  <p>Controleer de versie en platformbestanden op de releasepagina. Is er nog geen publieke release, dan is er nog niets te downloaden; deze pagina verwijst niet naar ontwikkelbuilds.</p>
+  <footer><p>Appversies gebruiken <strong>app-vX.Y.Z</strong>. Core wordt onafhankelijk bijgewerkt. Downloadbaarheid geeft geen toestemming om je Home Node te benaderen.</p></footer>
+</main></body>
+</html>

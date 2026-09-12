@@ -28,7 +28,21 @@
 		-Server
 	}
 
-	# Caddy overwrites incoming X-Forwarded-* by default when it is the first
-	# proxy. jarvis-api trusts these only from its loopback peer.
-	reverse_proxy 127.0.0.1:8080
+	# Only this exact public page is served from static storage. Never point
+	# this root at /var/lib/jarvis/app-updates or protected Core state.
+	@downloads path /downloads /downloads/
+	handle @downloads {
+		root * /usr/share/jarvis/downloads
+		rewrite * /index.html
+		header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+		header Cache-Control "public, max-age=300"
+		file_server
+	}
+
+	# All API routes, including /v1/app-updates/** and /v1/events, keep their
+	# existing Core authentication. No public mirror alias or directory listing.
+	# Caddy overwrites incoming X-Forwarded-*; Core trusts only its loopback peer.
+	handle {
+		reverse_proxy 127.0.0.1:8080
+	}
 }

@@ -12,6 +12,11 @@ Core `vX.Y.Z` and app `app-vX.Y.Z` are independent. Protocol fields, not SemVer
 equality, define compatibility. No third release repository or sibling checkout
 is required in production.
 
+An optional public installation page can be served at `/downloads` by Caddy;
+see [the routing boundary and owner setup](../../deploy/caddy/downloads/README.md).
+It links to public GitHub installation assets, not an unauthenticated mirror
+alias. Native update delivery below remains authenticated.
+
 The public PersonalJarvisApp GitHub Release is untrusted artifact transport.
 The Home Node pulls it outbound and validates the signed `latest.json`, release
 identity, complete downloadable matrix, sizes, hashes, Tauri updater signatures, and

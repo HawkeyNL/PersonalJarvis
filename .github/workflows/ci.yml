@@ -16,6 +16,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  public-download-routing:
+    name: Public downloads and protected API routing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Caddy for isolated routing test
+        run: sudo apt-get update && sudo apt-get install --yes caddy
+      - name: Verify public page never exposes the update mirror
+        run: |
+          bash deploy/caddy/tests/test-caddy-template.sh
+          python3 deploy/caddy/tests/test-public-downloads.py -v
+
   deployment-privacy:
     name: Deployment identifier privacy
     runs-on: ubuntu-24.04
