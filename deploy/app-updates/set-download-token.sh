@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Trusted owner-side hidden input only. Never run via an agent with a token.
 set -euo pipefail
+set +a
+unset token
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 [[ $EUID -eq 0 ]] || { echo 'Run through the trusted root administration path.' >&2; exit 2; }
 readonly token_dir=/etc/jarvis/app-downloads
@@ -31,6 +33,7 @@ trap 'exit 143' TERM HUP
 IFS= read -r -s -n 1025 -p 'GHCR read:packages token (hidden): ' token </dev/tty || {
   printf '\nToken entry cancelled.\n' >/dev/tty; exit 2;
 }
+export -n token
 printf '\n' >/dev/tty
 [[ -n $token && ${#token} -le 1024 && $token != *[[:space:][:cntrl:]]* ]] || {
   echo 'Invalid token input; existing token unchanged.' >&2; exit 2;
