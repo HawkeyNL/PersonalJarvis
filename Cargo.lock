@@ -2350,6 +2350,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-app-downloads"
+version = "0.1.0"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "jarvis-client-core"
 version = "0.1.0"
 dependencies = [

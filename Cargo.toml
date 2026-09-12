@@ -5,6 +5,7 @@ members = [
     "jarvis-core",
     "crates/config",
     "crates/client-core",
+    "crates/app-downloads",
     "crates/observability",
     "crates/identity",
     "crates/portfolio",
