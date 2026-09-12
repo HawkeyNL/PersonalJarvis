@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "github_username": "YOUR_GITHUB_USERNAME",
+  "version": "0.1.0",
+  "source_revision": "REPLACE_WITH_REVIEWED_40_CHARACTER_COMMIT",
+  "manifest_digest": "sha256:REPLACE_WITH_REVIEWED_CANDIDATE_MANIFEST_DIGEST"
+}

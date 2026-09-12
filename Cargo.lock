@@ -2350,6 +2350,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-app-downloads"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "hex",
+ "http",
+ "libc",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "jarvis-client-core"
 version = "0.1.0"
 dependencies = [

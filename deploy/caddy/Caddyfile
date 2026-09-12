@@ -28,7 +28,30 @@
 		-Server
 	}
 
-	# Caddy overwrites incoming X-Forwarded-* by default when it is the first
-	# proxy. jarvis-api trusts these only from its loopback peer.
-	reverse_proxy 127.0.0.1:8080
+	# Separate verified installation archive, never the authenticated mirror.
+	@downloads path /downloads /downloads/
+	handle @downloads {
+		root * /var/lib/jarvis-public-downloads
+		rewrite * /index.html
+		header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+		header Cache-Control "public, max-age=300"
+		file_server
+	}
+	# Only canonical IPA filenames can be downloaded. No directory browsing,
+	# approval metadata, staging directories or arbitrary file extensions.
+	@iosDownload path_regexp ios ^/downloads/ios/v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)/Jarvis_(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)_ios_arm64_unsigned[.]ipa$
+	handle @iosDownload {
+		root * /var/lib/jarvis-public-downloads
+		uri strip_prefix /downloads
+		header Content-Disposition attachment
+		header Cache-Control "public, max-age=3600, immutable"
+		file_server
+	}
+
+	# All API routes, including /v1/app-updates/** and /v1/events, keep their
+	# existing Core authentication. No public mirror alias or directory listing.
+	# Caddy overwrites incoming X-Forwarded-*; Core trusts only its loopback peer.
+	handle {
+		reverse_proxy 127.0.0.1:8080
+	}
 }
