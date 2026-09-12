@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, 'feat/realtime-*']
+    branches: [main, 'feat/realtime-*', 'feat/private-client-release-sync']
   pull_request:
 
 concurrency:

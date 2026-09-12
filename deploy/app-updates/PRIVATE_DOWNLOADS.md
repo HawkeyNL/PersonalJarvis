@@ -1,5 +1,8 @@
 # Private GHCR iOS candidate importer
 
+For Linux, Windows, macOS and Android see [complete private client releases](PRIVATE_CLIENT_RELEASES.md).
+Keep this iOS configuration separate; it cannot authorize automatic updates.
+
 This first importer serves **manually approved unsigned iOS candidates**, not a
 complete signed application release. It does not replace the authenticated
 app-update mirror. Existing clients do not automatically discover/install this

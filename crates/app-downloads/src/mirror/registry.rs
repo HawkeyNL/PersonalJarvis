@@ -54,6 +54,14 @@ impl Registry {
 
     pub async fn manifest(&self, digest: &str) -> Result<Vec<u8>> {
         digest_hex(digest)?;
+        self.manifest_reference(digest).await
+    }
+
+    pub async fn stable_manifest(&self) -> Result<Vec<u8>> {
+        self.manifest_reference("stable").await
+    }
+
+    async fn manifest_reference(&self, digest: &str) -> Result<Vec<u8>> {
         let response = self
             .client
             .get(format!(

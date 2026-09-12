@@ -204,7 +204,7 @@ def validate_manifest(document: Any, *, require_complete: bool = True) -> dict[s
         rendered = ", ".join(f"{platform}-{architecture}" for platform, architecture in sorted(missing))
         raise ManifestError(f"manifest is missing release targets: {rendered}")
     installers = document.get("installers", [])
-    if not isinstance(installers, list) or len(installers) > 2:
+    if not isinstance(installers, list) or len(installers) > 3:
         raise ManifestError("installers must be a bounded list")
     seen_installers: set[tuple[str, str]] = set()
     for entry in installers:
@@ -215,6 +215,7 @@ def validate_manifest(document: Any, *, require_complete: bool = True) -> dict[s
         policy = {
             ("macos", "arm64"): ("home-node-installer", ".dmg"),
             ("android", "universal"): ("app-store-bundle", ".aab"),
+            ("ios", "arm64"): ("manual-owner-signing", "_unsigned.ipa"),
         }.get(identity)
         if policy is None or entry["distribution"] != policy[0] or identity in seen_installers:
             raise ManifestError("unsupported installer target")
@@ -232,7 +233,7 @@ def validate_manifest(document: Any, *, require_complete: bool = True) -> dict[s
         if type(artifact["size"]) is not int or not 0 < artifact["size"] <= 2 * 1024**3:
             raise ManifestError("installer size is invalid")
     required_installers = {("macos", "arm64"), ("android", "universal")}
-    if require_complete and product == "clients" and seen_installers != required_installers:
+    if require_complete and product == "clients" and not required_installers <= seen_installers:
         raise ManifestError("manifest is missing required installer artifacts")
     return document
 

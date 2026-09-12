@@ -1,5 +1,8 @@
 //! Digest-pinned, manually approved iOS candidates. Not automatic app updates.
+mod apk;
 mod registry;
+pub mod release;
+pub mod release_store;
 mod store;
 
 use serde::Deserialize;

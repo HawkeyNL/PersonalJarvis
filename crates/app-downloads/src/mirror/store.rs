@@ -17,7 +17,7 @@ pub fn validate_directory(path: &Path, owner: u32) -> Result<()> {
     Ok(())
 }
 
-fn open_regular(path: &Path, owner: u32, private: bool) -> Result<File> {
+pub(super) fn open_regular(path: &Path, owner: u32, private: bool) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -156,7 +156,7 @@ impl Store {
         self.render_index()
     }
 
-    fn render_index(&self) -> Result<()> {
+    pub fn render_index(&self) -> Result<()> {
         let mut versions = Vec::new();
         for item in
             fs::read_dir(self.root.join("ios")).map_err(|_| "cannot inspect candidate inventory")?
@@ -224,7 +224,9 @@ impl Store {
             // Version parsed as numeric SemVer; no untrusted HTML or URL input.
             html.push_str(&format!("<li><a href=\"/downloads/ios/v{version}/Jarvis_{version}_ios_arm64_unsigned.ipa\">Jarvis {version} — IPA voor zelf ondertekenen</a></li>"));
         }
-        html.push_str("</ul><p>Updates voor aangemelde clients blijven gescheiden van deze publieke installatiebestanden.</p></body></html>\n");
+        html.push_str("</ul>");
+        html.push_str(&super::release_store::public_links(&self.root, self.owner)?);
+        html.push_str("<p>Updates voor aangemelde clients blijven gescheiden van deze publieke installatiebestanden.</p></body></html>\n");
         let temporary = tempfile::Builder::new()
             .prefix(".index-")
             .tempfile_in(&self.root)
@@ -252,7 +254,7 @@ impl Store {
     }
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -260,10 +262,15 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .open(path)
         .map_err(|_| "cannot stage metadata")?;
     file.write_all(bytes).map_err(|_| "cannot write metadata")?;
+    // The service deliberately uses UMask=0077. These non-secret release
+    // metadata files must nevertheless be readable by Core inside its protected
+    // root, and by the public archive renderer where applicable.
+    file.set_permissions(fs::Permissions::from_mode(0o644))
+        .map_err(|_| "cannot set metadata mode")?;
     file.sync_all().map_err(|_| "cannot sync metadata")
 }
 
-fn verify_file(path: &Path, owner: u32, layer: &Layer) -> Result<()> {
+pub(super) fn verify_file(path: &Path, owner: u32, layer: &Layer) -> Result<()> {
     let mut file = open_regular(path, owner, false)?;
     if file.metadata().map_err(|_| "cannot inspect IPA")?.len() != layer.size {
         return Err("IPA size mismatch");
@@ -282,7 +289,7 @@ fn verify_file(path: &Path, owner: u32, layer: &Layer) -> Result<()> {
     }
     Ok(())
 }
-fn sync_directory(path: &Path) -> Result<()> {
+pub(super) fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|_| "cannot sync managed directory")

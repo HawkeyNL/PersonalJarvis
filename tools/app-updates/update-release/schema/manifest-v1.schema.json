@@ -19,7 +19,7 @@
       "then": {
         "properties": {
           "artifacts": { "minItems": 4, "maxItems": 4 },
-          "installers": { "minItems": 2, "maxItems": 2 }
+          "installers": { "minItems": 2, "maxItems": 3 }
         }
       }
     },
@@ -31,14 +31,14 @@
   "properties": {
     "schema_version": { "const": 1 },
     "installers": {
-      "type": "array", "maxItems": 2,
+      "type": "array", "maxItems": 3,
       "items": {
         "type": "object", "additionalProperties": false,
         "required": ["platform", "architecture", "distribution", "artifact"],
         "properties": {
-          "platform": { "enum": ["macos", "android"] },
+          "platform": { "enum": ["macos", "android", "ios"] },
           "architecture": { "enum": ["arm64", "universal"] },
-          "distribution": { "enum": ["home-node-installer", "app-store-bundle"] },
+          "distribution": { "enum": ["home-node-installer", "app-store-bundle", "manual-owner-signing"] },
           "artifact": { "$ref": "#/properties/artifacts/items/properties/artifact" }
         }
       }

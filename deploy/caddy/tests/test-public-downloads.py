@@ -39,6 +39,17 @@ class PublicDownloadTests(unittest.TestCase):
             (archive / "index.html").write_bytes(page.read_bytes())
             (ipa_dir / "Jarvis_0.1.0_ios_arm64_unsigned.ipa").write_bytes(b"fixture-ipa-not-installable")
             (ipa_dir / "approved.json").write_text('{"fixture":"not public"}')
+            client_paths = []
+            for target, suffix in [('linux-x86_64', '.AppImage'), ('windows-x86_64', '.exe'),
+                                   ('macos-arm64', '.dmg'), ('android-universal', '.apk'),
+                                   ('ios-arm64', '_unsigned.ipa')]:
+                name = f'Jarvis_0.1.0_{target.replace("-", "_")}{suffix}'
+                relative = f'releases/v0.1.0/{target}/{name}'
+                path = archive / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'fixture-installer-not-installable')
+                client_paths.append('/downloads/' + relative)
+            (archive / 'releases/v0.1.0/manifest.json').write_text('{"fixture":"not public"}')
             api = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ProtectedAPI)
             worker = threading.Thread(target=api.serve_forever, daemon=True)
             worker.start()
@@ -100,10 +111,18 @@ class PublicDownloadTests(unittest.TestCase):
                         self.assertEqual(response.headers['Content-Disposition'], 'attachment')
                     with get('/downloads/ios/v0.2.0/Jarvis_0.2.0_ios_arm64_unsigned.ipa') as response:
                         self.assertEqual(response.status, 404)
+                    for path in client_paths:
+                        with get(path) as response:
+                            self.assertEqual(response.status, 200, path)
+                            self.assertEqual(response.read(), b'fixture-installer-not-installable')
+                            self.assertEqual(response.headers['Content-Disposition'], 'attachment')
                     for path in ("/v1/app-updates/capability", "/v1/app-updates/latest.json",
                                  "/v1/events", "/downloads/manifest.json", "/downloads/index.html",
                                  "/downloads/.env", "/downloads/%2e%2e/secret", "/index.html",
                                  '/downloads/ios/v0.1.0/approved.json', '/downloads/ios/v0.1.0/',
+                                 '/downloads/releases/v0.1.0/manifest.json', '/downloads/releases/v0.1.0/',
+                                 '/downloads/releases/v0.1.0/macos-arm64/Jarvis_0.1.0_macos_arm64.app.tar.gz',
+                                 '/downloads/releases/v0.1.0/android-universal/Jarvis_0.1.0_android_universal.aab',
                                  '/downloads/ios/.staging-x/Jarvis_0.1.0_ios_arm64_unsigned.ipa',
                                  '/downloads/ios/v0.1.0/%2e%2e/approved.json'):
                         with get(path) as response:
