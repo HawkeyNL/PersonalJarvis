@@ -150,6 +150,7 @@ mod update_mirror_tests {
 /// Shared, cheaply-cloneable application state.
 #[derive(Clone)]
 pub struct AppState {
+    pub realtime: crate::realtime::Hub,
     pub db: jarvis_store::Database,
     pub environment: String,
     /// Production requests carrying bearer credentials must have arrived over

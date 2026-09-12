@@ -691,6 +691,38 @@ pub async fn get_device(db: &Database, id: Uuid) -> Result<Option<Device>, Ident
     .await
 }
 
+/// Revalidate a previously authenticated long-lived connection without
+/// retaining its bearer token. This does not authenticate a new request.
+pub async fn session_is_active(
+    db: &Database,
+    session_id: Uuid,
+    user_id: Uuid,
+    device_id: Uuid,
+) -> Result<bool, IdentityError> {
+    let session: Option<Session> = one(
+        db,
+        &format!("SELECT {SESSION_FIELDS} FROM sessions WHERE record::id(id) = $id LIMIT 1"),
+        json!({"id": session_id.to_string()}),
+    )
+    .await?;
+    let Some(session) = session else {
+        return Ok(false);
+    };
+    if session.user_id != user_id
+        || session.device_id != device_id
+        || session.revoked_at.is_some()
+        || session.expires_at <= OffsetDateTime::now_utc()
+    {
+        return Ok(false);
+    }
+    let device: Option<Device> = one(
+        db,
+        &format!("SELECT {DEVICE_FIELDS} FROM devices WHERE record::id(id) = $id AND status = 'active' LIMIT 1"),
+        json!({"id": device_id.to_string()}),
+    ).await?;
+    Ok(device.is_some_and(|device| device.user_id == user_id))
+}
+
 pub async fn revoke_session(db: &Database, session_id: Uuid) -> Result<(), IdentityError> {
     let _: Option<serde_json::Value> = one(
         db,

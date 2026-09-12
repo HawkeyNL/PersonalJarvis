@@ -14,6 +14,7 @@ mod model_policy;
 mod ollama;
 mod openai_compat;
 mod router;
+mod stream;
 mod types;
 
 use std::sync::Arc;
@@ -29,6 +30,7 @@ pub use model_policy::{validate_hf_route, ModelAccessEntry, ModelAccessPolicy};
 pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use router::{always_available, Availability, CatalogModel, ModelClass, RouterProvider};
+pub use stream::TextDeltaSink;
 pub use types::{
     classify_task, ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, Role,
     RoutingMode, TaskRequirements, Tier, Usage,
@@ -41,6 +43,15 @@ pub trait LlmProvider: Send + Sync {
     fn label(&self) -> &str;
     /// Generate a reply for the conversation at the requested tier.
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError>;
+    /// Only user-visible assistant text may reach this callback. Providers
+    /// without native streaming return one final reply, never simulated deltas.
+    async fn chat_stream(
+        &self,
+        req: &ChatRequest,
+        _text: TextDeltaSink,
+    ) -> Result<ChatReply, LlmError> {
+        self.chat(req).await
+    }
 }
 
 /// One OpenAI-compatible backend's settings (OpenAI or DeepSeek). Key is

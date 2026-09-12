@@ -447,6 +447,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let state = AppState {
+        realtime: Default::default(),
         db,
         environment: config.environment.clone(),
         require_https: config.environment.eq_ignore_ascii_case("production"),

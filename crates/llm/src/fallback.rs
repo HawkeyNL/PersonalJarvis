@@ -33,6 +33,15 @@ impl LlmProvider for FallbackProvider {
         &self.label
     }
 
+    async fn chat_stream(
+        &self,
+        req: &ChatRequest,
+        sink: crate::TextDeltaSink,
+    ) -> Result<ChatReply, LlmError> {
+        // Shared runs must not silently retry an ambiguous paid attempt.
+        self.primary.chat_stream(req, sink).await
+    }
+
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
         match self.primary.chat(req).await {
             Ok(reply) => Ok(reply),

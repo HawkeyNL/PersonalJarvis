@@ -59,6 +59,9 @@ url.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+async-trait = "0.1"
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
 tower = { version = "0.5", features = ["util"] }
 ed25519-dalek.workspace = true
 rand.workspace = true
