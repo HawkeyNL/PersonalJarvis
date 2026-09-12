@@ -28,14 +28,23 @@
 		-Server
 	}
 
-	# Only this exact public page is served from static storage. Never point
-	# this root at /var/lib/jarvis/app-updates or protected Core state.
+	# Separate verified installation archive, never the authenticated mirror.
 	@downloads path /downloads /downloads/
 	handle @downloads {
-		root * /usr/share/jarvis/downloads
+		root * /var/lib/jarvis-public-downloads
 		rewrite * /index.html
 		header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 		header Cache-Control "public, max-age=300"
+		file_server
+	}
+	# Only canonical IPA filenames can be downloaded. No directory browsing,
+	# approval metadata, staging directories or arbitrary file extensions.
+	@iosDownload path_regexp ios ^/downloads/ios/v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)/Jarvis_(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)_ios_arm64_unsigned[.]ipa$
+	handle @iosDownload {
+		root * /var/lib/jarvis-public-downloads
+		uri strip_prefix /downloads
+		header Content-Disposition attachment
+		header Cache-Control "public, max-age=3600, immutable"
 		file_server
 	}
 

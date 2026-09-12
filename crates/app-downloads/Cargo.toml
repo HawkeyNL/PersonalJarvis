@@ -10,3 +10,14 @@ semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+hex.workspace = true
+fs2.workspace = true
+zeroize = "1"
+libc = "0.2"
+tempfile = "3"
+
+[dev-dependencies]
+http = "1"

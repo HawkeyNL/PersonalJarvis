@@ -1,8 +1,9 @@
-# Public client download retention
+# Private candidate import and public download retention
 
-Native Rust policy for a future dedicated public installation archive. It does
-not change the Python authenticated-update mirror, Core activation/rollback,
-GitHub release retention, or installed application state.
+Native Rust importer for an owner-digest-pinned iOS candidate, plus a separate
+retention planner. It does not change the authenticated-update mirror, Core
+activation/rollback, GitHub releases, or installed application state.
+See [private importer setup](../../deploy/app-updates/PRIVATE_DOWNLOADS.md).
 
 ## Exact policy, independently for every downloadable target
 
@@ -45,24 +46,24 @@ Inventory shape (base versions, not Git tags):
 ]
 ```
 
-Other targets are `windows-x86_64` and `macos-arm64`. iOS is not an installable
-public-download target. Output lists retained versions with reasons and removal
+Other targets are `windows-x86_64`, `macos-arm64`, and `ios-arm64` (manual-signing
+candidates only). Output lists retained versions with reasons and removal
 candidates. Input is bounded to 2 MiB and 10,000 records; versions to 64 bytes.
 Unknown fields/targets, duplicate target/version records and noncanonical or
 prerelease versions fail closed. Input strings are not echoed into errors.
 
-No network client, web server, background runtime, artifact loading, subprocess
-execution or filesystem deletion is present. This avoids holding binaries in
-memory and permits validating the rule before any destructive integration.
-Rust alone is not a guarantee about a future server's memory consumption.
+The `plan` command performs no network/file mutations. The separate `sync-ios`
+command requires trusted root-controlled configuration at fixed paths. It streams
+GHCR files to disk, verifies the pinned digest and exact layer checksums and
+updates a public index atomically. No subprocess execution or deletion of
+historical versions is exposed by either command.
 
 ## Integration status and requirements
 
-**Automatic storage/cleanup is not connected yet.** The current Caddy page links
-to public GitHub Releases; it has no local artifact archive to prune. A later
-trusted exporter must copy only verified installation artifacts into a separate
-root-controlled public generation, generate its index from this plan, atomically
-activate the new index and only then retire obsolete public files. Never delete
+**Automatic cleanup is not connected yet.** The initial IPA importer preserves
+all previously approved versions. Its index and Caddy route serve only the
+separate root-controlled public archive. A later retention integration must
+atomically activate an index before retiring obsolete public files. Never delete
 from the authenticated mirror or expose its filesystem as a public Caddy root.
 Never apply a client-supplied inventory as filesystem authority. Group all
 installer/signature files for a target/version under the same retention decision.

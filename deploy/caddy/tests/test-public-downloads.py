@@ -33,6 +33,12 @@ class PublicDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="jarvis-caddy-test-") as temporary:
             directory = Path(temporary)
             page = ROOT / "deploy/caddy/downloads/index.html"
+            archive = directory / "public"
+            ipa_dir = archive / "ios/v0.1.0"
+            ipa_dir.mkdir(parents=True)
+            (archive / "index.html").write_bytes(page.read_bytes())
+            (ipa_dir / "Jarvis_0.1.0_ios_arm64_unsigned.ipa").write_bytes(b"fixture-ipa-not-installable")
+            (ipa_dir / "approved.json").write_text('{"fixture":"not public"}')
             api = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ProtectedAPI)
             worker = threading.Thread(target=api.serve_forever, daemon=True)
             worker.start()
@@ -45,7 +51,7 @@ class PublicDownloadTests(unittest.TestCase):
                                          "--adapter", "caddyfile"], env=env, capture_output=True, check=True, timeout=10)
                 # Test the actual adapted route graph, changing only host/listen,
                 # fixture storage and the upstream. No production state accessed.
-                raw = result.stdout.decode().replace("/usr/share/jarvis/downloads", str(page.parent))
+                raw = result.stdout.decode().replace("/var/lib/jarvis-public-downloads", str(archive))
                 raw = raw.replace("127.0.0.1:8080", f"127.0.0.1:{api.server_port}")
                 config = json.loads(raw)
                 config["admin"] = {"disabled": True, "config": {"persist": False}}
@@ -88,9 +94,18 @@ class PublicDownloadTests(unittest.TestCase):
                             self.assertEqual(response.status, 200)
                             self.assertEqual(response.read(), page.read_bytes())
                             self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
+                    with get('/downloads/ios/v0.1.0/Jarvis_0.1.0_ios_arm64_unsigned.ipa') as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(response.read(), b'fixture-ipa-not-installable')
+                        self.assertEqual(response.headers['Content-Disposition'], 'attachment')
+                    with get('/downloads/ios/v0.2.0/Jarvis_0.2.0_ios_arm64_unsigned.ipa') as response:
+                        self.assertEqual(response.status, 404)
                     for path in ("/v1/app-updates/capability", "/v1/app-updates/latest.json",
                                  "/v1/events", "/downloads/manifest.json", "/downloads/index.html",
-                                 "/downloads/.env", "/downloads/%2e%2e/secret", "/index.html"):
+                                 "/downloads/.env", "/downloads/%2e%2e/secret", "/index.html",
+                                 '/downloads/ios/v0.1.0/approved.json', '/downloads/ios/v0.1.0/',
+                                 '/downloads/ios/.staging-x/Jarvis_0.1.0_ios_arm64_unsigned.ipa',
+                                 '/downloads/ios/v0.1.0/%2e%2e/approved.json'):
                         with get(path) as response:
                             self.assertEqual(response.status, 401, path)
                             self.assertEqual(response.headers.get("X-Fixture-API"), "protected", path)

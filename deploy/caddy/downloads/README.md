@@ -1,5 +1,11 @@
 # Public installation page
 
+> Superseded setup: the current route serves a generated index and verified
+> manual-signing IPA candidates from `/var/lib/jarvis-public-downloads`.
+> Use [private importer setup](../../app-updates/PRIVATE_DOWNLOADS.md), not the
+> older GitHub-linked page installation below. The old page is now an empty
+> fixture without download links. Do not broaden protected Jarvis permissions.
+
 `/downloads` and `/downloads/` serve one static page through the existing Caddy
 HTTPS origin on TCP 443. No JavaScript, browser authentication, telemetry, embedded
 credentials, directory browsing, or public update API is added.

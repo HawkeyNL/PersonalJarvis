@@ -28,7 +28,7 @@ fn native_cli_emits_a_plan_without_mutation_paths() {
 fn bad_input_does_not_echo_unknown_fields_or_produce_partial_plan() {
     for input in [
         br#"[{"target":"linux-x86_64","version":"1.0.0","path":"fixture-private-value"}]"#.as_slice(),
-        br#"[{"target":"ios-arm64","version":"1.0.0"}]"#.as_slice(),
+        br#"[{"target":"unknown-arm64","version":"1.0.0"}]"#.as_slice(),
         br#"[{"target":"linux-x86_64","version":"1.0.0"},{"target":"linux-x86_64","version":"1.0.0"}]"#.as_slice(),
     ] {
         let result = run(input);

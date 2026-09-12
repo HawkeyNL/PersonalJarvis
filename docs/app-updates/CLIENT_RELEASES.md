@@ -1,5 +1,10 @@
 # Signed Jarvis client releases and Home Node delivery
 
+> Current migration: public GitHub artifact publication has been disabled.
+> For the new private GHCR iOS candidate importer, use
+> [Private downloads](../../deploy/app-updates/PRIVATE_DOWNLOADS.md).
+> The older full-release procedure below does not configure that importer.
+
 ## Ownership
 
 - `HawkeyNL/PersonalJarvisApp` owns the desktop, Android, and iOS source plus
@@ -145,3 +150,12 @@ cargo test -p jarvis-api -p jarvis-client-core --locked
 
 Mock tests cannot prove production Tauri signing, APK signing continuity,
 macOS notarization, local iPhone installation, or an actual published release.
+# Current distribution migration
+
+The owner has replaced public GitHub release assets with private GHCR storage.
+The public-release setup below is legacy documentation, not the current install
+procedure. The first supported private path is an owner-digest-pinned iOS IPA
+candidate for manual signing; see
+[Private downloads](../../deploy/app-updates/PRIVATE_DOWNLOADS.md).
+It is separate from authenticated automatic updates and does not enable the
+old public publisher. Desktop/Android private release integration is unfinished.

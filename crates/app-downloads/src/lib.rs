@@ -8,6 +8,8 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod mirror;
+
 pub const MAX_CATALOG_ENTRIES: usize = 10_000;
 pub const MAX_VERSION_BYTES: usize = 64;
 const RECENT_RELEASES: usize = 3;
@@ -23,6 +25,7 @@ pub enum Target {
     WindowsX86_64,
     MacosArm64,
     AndroidUniversal,
+    IosArm64,
 }
 
 /// Only already verified, public-installable versions belong in this inventory.

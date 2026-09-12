@@ -28,6 +28,8 @@ jobs:
         run: |
           bash deploy/caddy/tests/test-caddy-template.sh
           python3 deploy/caddy/tests/test-public-downloads.py -v
+          python3 deploy/app-updates/tests/test-download-units.py -v
+          bash -n deploy/app-updates/install-app-downloads.sh deploy/app-updates/set-download-token.sh
 
   deployment-privacy:
     name: Deployment identifier privacy

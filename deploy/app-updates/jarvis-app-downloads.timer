@@ -1,0 +1,12 @@
+[Unit]
+Description=Recheck the owner-pinned iOS candidate
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+RandomizedDelaySec=10min
+Persistent=true
+Unit=jarvis-app-downloads.service
+
+[Install]
+WantedBy=timers.target
