@@ -2,13 +2,14 @@ name: Client protocol and update mirror CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feat/private-client-release-sync']
     paths:
       - ".github/workflows/app-ci.yml"
       - "docs/app-updates/**"
       - "tools/app-updates/**"
       - "deploy/app-updates/**"
       - "crates/client-core/**"
+      - "crates/app-downloads/**"
       - "crates/identity/**"
       - "jarvis-api/**"
       - "Cargo.toml"
@@ -20,6 +21,7 @@ on:
       - "tools/app-updates/**"
       - "deploy/app-updates/**"
       - "crates/client-core/**"
+      - "crates/app-downloads/**"
       - "crates/identity/**"
       - "jarvis-api/**"
       - "Cargo.toml"
@@ -64,3 +66,8 @@ jobs:
           python3 -m unittest discover -s tools/app-updates/update-release/tests -v
           python3 -m unittest discover -s tools/app-updates/update-mirror/tests -v
           bash deploy/app-updates/tests/test-app-update-assets.sh
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Mirror files remain readable under production umask
+        run: |
+          umask 077
+          cargo test --locked -p jarvis-app-downloads mirror::release_store::tests

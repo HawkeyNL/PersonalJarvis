@@ -1,4 +1,4 @@
-//! Read-only retention planner and fixed-path trusted candidate importer.
+//! Read-only retention planner and fixed-path trusted release importers.
 use std::io::{self, Read};
 
 use jarvis_app_downloads::{plan, Entry};
@@ -7,7 +7,10 @@ const MAX_INPUT_BYTES: u64 = 2 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() {
-    let result = if std::env::args().skip(1).collect::<Vec<_>>() == ["sync-ios"] {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let result = if args == ["sync-release"] {
+        sync_release().await
+    } else if args == ["sync-ios"] {
         sync_ios().await
     } else {
         run()
@@ -16,6 +19,102 @@ async fn main() {
         eprintln!("jarvis-app-downloads: {error}");
         std::process::exit(1);
     }
+}
+
+async fn sync_release() -> Result<(), &'static str> {
+    use jarvis_app_downloads::mirror::{
+        self,
+        release::{self, ReleaseConfig},
+        release_store::ReleaseStore,
+        Registry, Store,
+    };
+    use std::{io::Write, path::Path};
+    use zeroize::Zeroizing;
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("sync-release requires the trusted root administration path");
+    }
+    for parent in [
+        "/etc",
+        "/etc/jarvis",
+        "/etc/jarvis/app-downloads",
+        "/var",
+        "/var/lib",
+    ] {
+        mirror::validate_directory(Path::new(parent), 0)?;
+    }
+    let mut config: ReleaseConfig = serde_json::from_slice(&mirror::read_protected(
+        Path::new("/etc/jarvis/app-downloads/release.json"),
+        0,
+        true,
+        65536,
+    )?)
+    .map_err(|_| "invalid signed release configuration")?;
+    config.validate()?;
+    let public = Path::new("/var/lib/jarvis-public-downloads");
+    let public_store = Store::open(public, 0)?;
+    let store = ReleaseStore::open(Path::new("/var/lib/jarvis-app-updates"), 0)?;
+    let secret = Zeroizing::new(mirror::read_protected(
+        Path::new("/etc/jarvis/app-downloads/ghcr.token"),
+        0,
+        true,
+        1024,
+    )?);
+    if secret.is_empty() || !secret.iter().all(u8::is_ascii_graphic) {
+        return Err("invalid GHCR credential format");
+    }
+    let registry = Registry::authenticate(
+        &config.identity.github_username,
+        std::str::from_utf8(&secret).map_err(|_| "invalid credential format")?,
+    )
+    .await?;
+    drop(secret);
+    let oci = if config.track_stable {
+        let oci = registry.stable_manifest().await?;
+        config.discover(&oci)?;
+        oci
+    } else {
+        registry.manifest(&config.identity.manifest_digest).await?
+    };
+    let layers = release::parse_oci(&oci, &config.identity)?;
+    let manifest_layer = layers
+        .get("latest.json")
+        .ok_or("missing release metadata")?;
+    let sig_layer = layers
+        .get("latest.json.sig")
+        .ok_or("missing release signature")?;
+    let manifest = registry.descriptor(manifest_layer).await?;
+    let signature = registry.descriptor(sig_layer).await?;
+    for (bytes, layer) in [(&manifest, manifest_layer), (&signature, sig_layer)] {
+        if bytes.len() as u64 != layer.size {
+            return Err("release metadata size mismatch");
+        }
+        mirror::verify_bytes(bytes, &layer.digest)?;
+    }
+    release::validate_document(
+        &manifest,
+        std::str::from_utf8(&signature).map_err(|_| "invalid release signature")?,
+        &config,
+        &layers,
+    )?;
+    let stage = store.stage()?;
+    for (name, layer) in &layers {
+        let mut file = store.stage_file(&stage, name)?;
+        match name.as_str() {
+            "latest.json" => file
+                .write_all(&manifest)
+                .map_err(|_| "cannot stage release metadata")?,
+            "latest.json.sig" => file
+                .write_all(&signature)
+                .map_err(|_| "cannot stage release signature")?,
+            _ => registry.download(layer, &mut file).await?,
+        }
+        file.sync_all().map_err(|_| "cannot sync staged release")?;
+    }
+    let destination = store.prepare(stage, &config, &oci, public).await?;
+    public_store.render_index()?;
+    store.activate(&destination)?;
+    println!("Verified desktop and Android updates activated; iOS IPA published for local owner signing only.");
+    Ok(())
 }
 
 async fn sync_ios() -> Result<(), &'static str> {
@@ -74,7 +173,7 @@ async fn sync_ios() -> Result<(), &'static str> {
 fn run() -> Result<(), &'static str> {
     if std::env::args().skip(1).collect::<Vec<_>>() != ["plan"] {
         return Err(
-            "usage: jarvis-app-downloads plan < verified-public-inventory.json (read-only)",
+            "usage: jarvis-app-downloads plan < verified-public-inventory.json (read-only), or sync-ios / sync-release through trusted root administration",
         );
     }
     let mut bytes = Vec::new();

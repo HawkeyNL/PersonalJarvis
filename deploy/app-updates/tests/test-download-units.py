@@ -21,7 +21,8 @@ class DownloadUnitTests(unittest.TestCase):
             binary.chmod(0o755)
             for name in ('sysinit.target', 'basic.target', 'shutdown.target', 'timers.target', 'network-online.target'):
                 (units / name).write_text('[Unit]\nDescription=Fixture only\nDefaultDependencies=no\n')
-            names = ['jarvis-app-downloads.service', 'jarvis-app-downloads.timer']
+            names = ['jarvis-app-downloads.service', 'jarvis-app-downloads.timer',
+                     'jarvis-app-release-sync.service', 'jarvis-app-release-sync.timer']
             for name in names:
                 shutil.copyfile(ROOT / 'deploy/app-updates' / name, units / name)
             result = subprocess.run(['systemd-analyze', '--root', str(root), 'verify', '--man=no', *names],
@@ -35,6 +36,13 @@ class DownloadUnitTests(unittest.TestCase):
         self.assertIn('ProtectSystem=strict\n', service)
         self.assertIn('CapabilityBoundingSet=\n', service)
         self.assertNotIn('docker.sock', service)
+
+    def test_complete_release_service_writes_only_two_mirrors(self):
+        service = (ROOT / 'deploy/app-updates/jarvis-app-release-sync.service').read_text()
+        self.assertIn('ReadWritePaths=/var/lib/jarvis-public-downloads /var/lib/jarvis-app-updates\n', service)
+        self.assertIn('ExecStart=/usr/local/libexec/jarvis-app-downloads sync-release\n', service)
+        self.assertIn('CapabilityBoundingSet=\n', service)
+        self.assertIn('ProtectSystem=strict\n', service)
 
 
 if __name__ == '__main__':
