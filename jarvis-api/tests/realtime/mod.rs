@@ -1,5 +1,5 @@
 use super::*;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use jarvis_client_core::realtime::{Event, EventEnvelope};
 use jarvis_client_core::speech::{SpeechAction, VoiceGate};
 use jarvis_llm::{ChatReply, ChatRequest, LlmError, LlmProvider};
@@ -178,7 +178,40 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     let server = tokio::spawn(async move {
         axum::serve(listener, server_app).await.unwrap();
     });
-    assert!(connect_async(&url).await.is_err());
+    assert!(matches!(
+        connect_async(&url).await,
+        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+            if response.status() == StatusCode::UNAUTHORIZED
+    ));
+    // This is an event-only channel, not an alternative command endpoint.
+    // Exercise the actual transport: valid JSON, malformed JSON and oversized
+    // frames must all close the socket without invoking a model. Subsequent
+    // normal subscriptions below also prove these connections release capacity.
+    for payload in [
+        r#"{"type":"assistant.chat","content":"Do not execute"}"#.to_owned(),
+        "{malformed".to_owned(),
+        "x".repeat(2048),
+    ] {
+        let mut request = url.clone().into_client_request()?;
+        request
+            .headers_mut()
+            .insert(header::AUTHORIZATION, format!("Bearer {token_a}").parse()?);
+        let (mut rejected, _) = connect_async(request).await?;
+        assert!(matches!(
+            event(&mut rejected).await.event,
+            Event::ConnectionReady { .. }
+        ));
+        rejected
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                payload.into(),
+            ))
+            .await?;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), rejected.next()).await?,
+            Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
     let mut a_req = url.clone().into_client_request()?;
     a_req
         .headers_mut()
@@ -201,7 +234,11 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     unsafe_req
         .headers_mut()
         .insert(header::AUTHORIZATION, format!("Bearer {token_a}").parse()?);
-    assert!(connect_async(unsafe_req).await.is_err());
+    assert!(matches!(
+        connect_async(unsafe_req).await,
+        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+            if response.status() == StatusCode::BAD_REQUEST
+    ));
     assert!(matches!(
         event(&mut a).await.event,
         Event::ConnectionReady { .. }

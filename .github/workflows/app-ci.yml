@@ -2,7 +2,7 @@ name: Client protocol and update mirror CI
 
 on:
   push:
-    branches: [main, 'feat/private-client-release-sync']
+    branches: [main, 'feat/private-client-release-sync', 'fix/realtime-tls-audit']
     paths:
       - ".github/workflows/app-ci.yml"
       - "docs/app-updates/**"
