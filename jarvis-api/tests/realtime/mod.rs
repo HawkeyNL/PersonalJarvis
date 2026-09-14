@@ -178,7 +178,11 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     let server = tokio::spawn(async move {
         axum::serve(listener, server_app).await.unwrap();
     });
-    assert!(connect_async(&url).await.is_err());
+    assert!(matches!(
+        connect_async(&url).await,
+        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+            if response.status() == StatusCode::UNAUTHORIZED
+    ));
     let mut a_req = url.clone().into_client_request()?;
     a_req
         .headers_mut()
@@ -201,7 +205,11 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     unsafe_req
         .headers_mut()
         .insert(header::AUTHORIZATION, format!("Bearer {token_a}").parse()?);
-    assert!(connect_async(unsafe_req).await.is_err());
+    assert!(matches!(
+        connect_async(unsafe_req).await,
+        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+            if response.status() == StatusCode::BAD_REQUEST
+    ));
     assert!(matches!(
         event(&mut a).await.event,
         Event::ConnectionReady { .. }
