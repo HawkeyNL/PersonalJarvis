@@ -83,6 +83,36 @@ installation. The new local TLS commits have not been pushed for platform CI.
 
 ## Remaining acceptance boundaries
 
+### September 16 revalidation
+
+The current Core review worktree is `dee8b692ce3ba6837d2d109250d3ec73adae11ca`;
+its tree matches fetched Core main `b35e02288289e9880590d9cde7f6d7c51404eafd`.
+Client verification uses `879471e416ad18693acef7111cbe0be58f395e2d` (the
+Android release-tool path fix). Fetched client main is
+`5fba8f484954cb187a6de9779da26a9e17d21eb0`. The immutable client-core pin
+listed above still has no source differences from this Core worktree.
+
+Client CI [34892924319](https://github.com/HawkeyNL/PersonalJarvisApp/actions/runs/34892924319)
+completed successfully: desktop frontend, Linux/macOS/Windows native builds,
+Android debug/release validation, iOS simulator, and release/privacy checks.
+This supersedes the earlier statement that the TLS follow-up had no platform
+CI evidence; it does not establish physical-device acceptance.
+
+Fresh local checks passed: 11 shared client-core tests, 9 API realtime tests,
+4 LLM streaming tests, 34 native desktop tests, 7 frontend realtime/speech
+tests, and Core formatting. The SSE test initially failed because the sandbox
+forbade its loopback listener, then passed with socket permission; no production
+provider was contacted. The disposable-database tests described above were not
+rerun during this revalidation, so their evidence remains dated September 14.
+No merge, release or deployment was performed for this revalidation.
+
+The 20 SDK-independent Android JVM tests also passed with `--rerun-tasks`.
+Core `cargo clippy --locked --all-targets --all-features -- -D warnings` and
+`cargo test --locked --all --quiet` passed (explicitly ignored database tests
+remain ignored). `cargo audit` exited zero with three allowed warnings:
+unmaintained `atomic-polyfill` and `bincode`, and yanked `chacha20`. This is not
+a warning-free dependency audit.
+
 Before claiming physical multi-device acceptance, use an isolated test Core and
 two or more enrolled test clients. Verify the same conversation streams without
 manual refresh, a different selected conversation is not forcibly opened, only
