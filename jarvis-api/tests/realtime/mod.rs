@@ -276,10 +276,18 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     }
     let mut streamed = String::new();
     let mut spoken = Vec::new();
+    let mut previous_sequence = 0;
+    let mut started = false;
     let canonical = loop {
         let first = event(&mut a).await;
         let second = event(&mut b).await;
         assert_eq!(first, second);
+        assert!(first.sequence > previous_sequence);
+        previous_sequence = first.sequence;
+        if matches!(first.event, Event::AssistantStarted { .. }) {
+            assert!(!started, "a run must start only once");
+            started = true;
+        }
         spoken.extend(
             voice_a
                 .event(&first.event)
@@ -298,9 +306,11 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
             "{first:?}"
         );
         if let Event::AssistantDelta { text, .. } = &first.event {
+            assert!(started, "delta must follow assistant.started");
             streamed.push_str(text);
         }
         if let Event::AssistantCompleted { message, .. } = first.event {
+            assert!(started, "completion must follow assistant.started");
             break message;
         }
     };
@@ -392,6 +402,19 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
             ..
         }
     ));
+    let recovered_history = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/conversations/{}", canonical.conversation_id))
+                .header(header::AUTHORIZATION, format!("Bearer {token_b}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(recovered_history.status(), StatusCode::OK);
+    let recovered_history = json_body(recovered_history).await;
+    assert_eq!(recovered_history["messages"], history["messages"]);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
     let mut restarted = state(db.clone(), None).await;
     restarted.llm = Arc::new(Fake(count.clone(), contexts.clone()));
     let restarted_app = build_router(restarted);

@@ -102,8 +102,7 @@ Fresh local checks passed: 11 shared client-core tests, 9 API realtime tests,
 4 LLM streaming tests, 34 native desktop tests, 7 frontend realtime/speech
 tests, and Core formatting. The SSE test initially failed because the sandbox
 forbade its loopback listener, then passed with socket permission; no production
-provider was contacted. The disposable-database tests described above were not
-rerun during this revalidation, so their evidence remains dated September 14.
+provider was contacted.
 No merge, release or deployment was performed for this revalidation.
 
 The 20 SDK-independent Android JVM tests also passed with `--rerun-tasks`.
@@ -112,6 +111,16 @@ Core `cargo clippy --locked --all-targets --all-features -- -D warnings` and
 remain ignored). `cargo audit` exited zero with three allowed warnings:
 unmaintained `atomic-polyfill` and `bincode`, and yanked `chacha20`. This is not
 a warning-free dependency audit.
+
+A subsequent September 16 run executed both previously ignored realtime
+database integration tests against a new unprivileged SurrealDB 2.6.5
+in-memory process on `127.0.0.1:18081`, using fixture-only credentials. Both
+passed (0.47 seconds total). The two-socket test now additionally asserts
+strictly increasing event sequences, started-before-delta/completion ordering,
+and byte-identical canonical REST history after reconnect without another
+provider invocation. The disconnect/failure test also passed. Formatting and
+all-target/all-feature clippy with warnings denied passed after these changes.
+The disposable process is stopped after testing; production state is untouched.
 
 Before claiming physical multi-device acceptance, use an isolated test Core and
 two or more enrolled test clients. Verify the same conversation streams without
