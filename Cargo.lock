@@ -176,6 +176,7 @@ dependencies = [
  "blake2",
  "cpufeatures 0.2.17",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -2446,6 +2447,7 @@ dependencies = [
 name = "jarvis-identity"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "ed25519-dalek",
  "hex",
  "jarvis-client-core",
@@ -2460,6 +2462,7 @@ dependencies = [
  "time",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

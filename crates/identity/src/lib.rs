@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+/// Account password primitives; never a substitute for signed device approval.
+pub mod password;
 /// The SurrealDB repository is the only persistence implementation.
 pub mod surreal;
 
