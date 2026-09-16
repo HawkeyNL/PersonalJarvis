@@ -34,6 +34,7 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 
+mod account_activation;
 mod admin_helpers;
 mod agent_tree;
 mod terminal_ui;
@@ -81,6 +82,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Locally provision first-device activation; never grants remote self-enrollment.
+    Account {
+        #[command(subcommand)]
+        command: account_activation::AccountCommand,
+    },
     Version,
     /// Report safe, non-secret terminal and Crossterm capabilities.
     TerminalDiagnostics,
@@ -394,6 +400,7 @@ fn run() -> Result<()> {
         bail!("non-interactive use requires an explicit Jarvis command");
     };
     match command {
+        Commands::Account { command } => account_activation::run(command, cli.json),
         Commands::Version => version(&presentation),
         Commands::TerminalDiagnostics => unreachable!("handled before root-only commands"),
         Commands::Status => status(&presentation),

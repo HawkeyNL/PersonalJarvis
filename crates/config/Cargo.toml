@@ -12,6 +12,8 @@ ipnet.workspace = true
 sha2.workspace = true
 hex.workspace = true
 subtle.workspace = true
+serde_json.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 # Enables `figment::Jail` for hermetic env-var tests.

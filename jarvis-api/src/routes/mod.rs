@@ -3,6 +3,7 @@
 //! up centrally in [`crate::build_router`]. Handlers are `pub(crate)` so the
 //! router can name them while keeping them off the public crate API.
 
+pub(crate) mod account;
 pub(crate) mod agent;
 pub(crate) mod app_updates;
 pub(crate) mod auth;

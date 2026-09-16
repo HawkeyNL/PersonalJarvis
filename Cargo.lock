@@ -2280,13 +2280,19 @@ dependencies = [
  "clap",
  "crossterm",
  "fs2",
+ "hex",
+ "jarvis-config",
  "jarvis-llm",
+ "libc",
+ "rand 0.8.7",
  "ratatui",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]
@@ -2414,7 +2420,9 @@ dependencies = [
  "figment",
  "hex",
  "ipnet",
+ "libc",
  "serde",
+ "serde_json",
  "sha2",
  "subtle",
 ]

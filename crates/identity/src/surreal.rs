@@ -14,6 +14,9 @@ use uuid::Uuid;
 
 use jarvis_store::Database;
 
+#[path = "account.rs"]
+pub mod account;
+
 use super::{
     verify_signature, Authenticated, Challenge, Device, DeviceKey, IdentityError, LoginResult,
     PairingRequest, Platform, Session, UnlockRequest, User,
@@ -99,6 +102,7 @@ struct SessionBindings {
     device_id: String,
     #[serde(with = "serde_bytes")]
     token_hash: Vec<u8>,
+    account_revision: String,
 }
 
 #[derive(Serialize)]
@@ -573,6 +577,16 @@ pub async fn login(
     challenge_id: Uuid,
     signature: &[u8],
 ) -> Result<LoginResult, IdentityError> {
+    login_with_password(db, device_id, challenge_id, signature, None).await
+}
+
+pub async fn login_with_password(
+    db: &Database,
+    device_id: Uuid,
+    challenge_id: Uuid,
+    signature: &[u8],
+    password: Option<crate::password::AccountPassword>,
+) -> Result<LoginResult, IdentityError> {
     let challenge: StoredChallenge = one(
         db,
         "SELECT nonce, expires_at, consumed_at FROM auth_challenges WHERE record::id(id) = $id AND device_id = $device_id LIMIT 1",
@@ -600,6 +614,14 @@ pub async fn login(
     .await?
     .ok_or(IdentityError::AuthFailed)?;
 
+    let account_revision = account::verify_password(
+        db,
+        crate::password::PasswordService::shared(),
+        owner.user_id,
+        password,
+    )
+    .await?;
+
     // This conditional claim is the replay boundary: only one concurrent caller
     // can observe a returned record and proceed to mint a session.
     let claimed: Option<ClaimedRecord> = one(
@@ -621,13 +643,22 @@ pub async fn login(
     let token_hash = sha2::Sha256::digest(&token).to_vec();
     execute(
         db,
-        "CREATE sessions SET id = $id, user_id = $user_id, device_id = $device_id, token_hash = <bytes>$token_hash, \
-         created_at = time::now(), expires_at = time::now() + 7d, last_used_at = NONE, revoked_at = NONE RETURN AFTER",
+        "BEGIN TRANSACTION; \
+         LET $account = SELECT revision FROM account_passwords WHERE user_id = $user_id; \
+         IF (array::len($account) = 0 AND $account_revision != '') OR \
+            (array::len($account) > 0 AND $account[0].revision != $account_revision) \
+            { THROW 'authentication failed'; }; \
+         LET $active = SELECT id FROM devices WHERE record::id(id) = $device_id AND user_id = $user_id AND status = 'active'; \
+         IF array::len($active) != 1 { THROW 'authentication failed'; }; \
+         CREATE sessions SET id = $id, user_id = $user_id, device_id = $device_id, token_hash = <bytes>$token_hash, \
+         created_at = time::now(), expires_at = time::now() + 7d, last_used_at = NONE, revoked_at = NONE; \
+         COMMIT TRANSACTION;",
         SessionBindings {
             id: Uuid::now_v7().to_string(),
             user_id: owner.user_id.to_string(),
             device_id: device_id.to_string(),
             token_hash: token_hash.clone(),
+            account_revision: account_revision.unwrap_or_default(),
         },
     )
     .await?;

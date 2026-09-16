@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 pub(crate) use jarvis_client_core::ApprovalRequest as ApproveReq;
 use jarvis_client_core::{
-    ChallengeRequest as ChallengeReq, EnrollmentRequest as EnrollReq, LoginRequest as LoginReq,
+    ChallengeRequest as ChallengeReq, EnrollmentRequest as EnrollReq,
     PairingApproveRequest as PairingApproveReq,
 };
 use jarvis_identity as identity;
@@ -83,13 +83,42 @@ pub(crate) async fn auth_bootstrap(
     State(state): State<AppState>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    Json(req): Json<EnrollReq>,
+    Json(req): Json<PasswordEnrollmentReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(policy) = state.bootstrap_enrollment.as_ref() else {
+    // Production activation is provisioned locally at a fixed protected path;
+    // legacy environment-only verifiers cannot silently remain valid forever.
+    let policy = if state.environment == "production" {
+        jarvis_config::activation::load().map_err(|_| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"bootstrap unavailable"})),
+            )
+        })?
+    } else {
+        state.bootstrap_enrollment.clone()
+    };
+    let Some(policy) = policy else {
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({ "error": "bootstrap unavailable" })),
         ));
+    };
+    let expires_at = policy
+        .expires_at()
+        .and_then(|v| i64::try_from(v).ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"bootstrap unavailable"})),
+            )
+        })?;
+    let password = req
+        .password
+        .ok_or_else(|| bad_request("account password required"))?;
+    let req = EnrollReq {
+        name: req.name,
+        platform: req.platform,
+        public_key: req.public_key,
     };
     // Reconstruct the trusted-peer decision from the real socket. A direct
     // caller cannot make an XFF header trusted; Caddy is the only configured
@@ -127,15 +156,25 @@ pub(crate) async fn auth_bootstrap(
         identity::Platform::parse(&req.platform).map_err(|_| bad_request("unknown platform"))?;
     let key =
         hex::decode(&req.public_key).map_err(|_| bad_request("invalid public_key encoding"))?;
-    let (user, device) =
-        identity::bootstrap_register_first_device(&state.db, &req.name, platform, &key)
-            .await
-            .map_err(|_| {
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "error": "bootstrap unavailable" })),
-                )
-            })?;
+    let stored = identity::password::PasswordService::shared()
+        .hash(password)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"activation unavailable"})),
+            )
+        })?;
+    let (user, device) = identity::surreal::account::bootstrap_account(
+        &state.db, &req.name, platform, &key, stored, expires_at,
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "bootstrap unavailable" })),
+        )
+    })?;
     record_security_event(&state, Some(device.id), "auth.bootstrap", "ok", None).await;
     Ok(Json(json!({ "user_id": user.id, "device_id": device.id })))
 }
@@ -156,10 +195,25 @@ fn validate_enrollment(req: &EnrollReq) -> Result<(), (StatusCode, Json<Value>)>
 /// An untrusted candidate can request pairing but cannot select an owner: the
 /// single existing Jarvis owner is resolved server-side. No bearer token is
 /// accepted or needed for this non-authoritative waiting record.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PasswordEnrollmentReq {
+    name: String,
+    platform: String,
+    public_key: String,
+    password: Option<identity::password::AccountPassword>,
+}
+
 pub(crate) async fn pairing_create(
     State(state): State<AppState>,
-    Json(req): Json<EnrollReq>,
+    Json(req): Json<PasswordEnrollmentReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let password = req.password;
+    let req = EnrollReq {
+        name: req.name,
+        platform: req.platform,
+        public_key: req.public_key,
+    };
     validate_enrollment(&req)?;
     let user = identity::first_user(&state.db)
         .await
@@ -180,6 +234,14 @@ pub(crate) async fn pairing_create(
             Json(json!({ "error": "first device bootstrap required" })),
         ));
     }
+    identity::surreal::account::verify_password(
+        &state.db,
+        identity::password::PasswordService::shared(),
+        user.id,
+        password,
+    )
+    .await
+    .map_err(|_| unauthorized())?;
     let platform =
         identity::Platform::parse(&req.platform).map_err(|_| bad_request("unknown platform"))?;
     let key =
@@ -332,9 +394,18 @@ pub(crate) async fn auth_challenge(
 }
 
 /// Verify a signed challenge and issue a session token.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PasswordLoginReq {
+    device_id: Uuid,
+    challenge_id: Uuid,
+    signature: String,
+    password: Option<identity::password::AccountPassword>,
+}
+
 pub(crate) async fn auth_login(
     State(state): State<AppState>,
-    Json(req): Json<LoginReq>,
+    Json(req): Json<PasswordLoginReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if !validation::is_hex_of_len(&req.signature, validation::ED25519_SIGNATURE_HEX_LEN) {
         return Err(bad_request("invalid signature"));
@@ -345,7 +416,14 @@ pub(crate) async fn auth_login(
             Json(json!({ "error": "invalid signature encoding" })),
         )
     })?;
-    let result = match identity::login(&state.db, req.device_id, req.challenge_id, &signature).await
+    let result = match identity::surreal::login_with_password(
+        &state.db,
+        req.device_id,
+        req.challenge_id,
+        &signature,
+        req.password,
+    )
+    .await
     {
         Ok(r) => r,
         Err(_) => {
@@ -532,31 +610,10 @@ pub(crate) async fn unlock_deny(
 
 /// Revoke one of the authenticated user's devices.
 pub(crate) async fn delete_device(
-    authed: Authed,
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    _authed: Authed,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match identity::get_device(&state.db, id)
-        .await
-        .map_err(internal)?
-    {
-        Some(device) if device.user_id == authed.user.id => {
-            identity::revoke_device(&state.db, id)
-                .await
-                .map_err(internal)?;
-            record_security_event(
-                &state,
-                Some(authed.device.id),
-                "device.revoke",
-                "ok",
-                Some(&id.to_string()),
-            )
-            .await;
-            Ok(Json(json!({ "status": "revoked" })))
-        }
-        _ => Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "device not found" })),
-        )),
-    }
+    Err((
+        StatusCode::PRECONDITION_REQUIRED,
+        Json(json!({"error":"device-signed revocation approval required"})),
+    ))
 }

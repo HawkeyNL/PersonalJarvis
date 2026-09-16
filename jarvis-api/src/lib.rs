@@ -89,10 +89,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/voice/release", post(realtime::voice::release))
         .route("/v1/voice/playback", post(realtime::voice::playback))
         .route("/v1/auth/enroll", post(auth_enroll))
-        .route("/v1/auth/bootstrap", post(auth_bootstrap))
+        .route(
+            "/v1/auth/bootstrap",
+            post(auth_bootstrap).layer(DefaultBodyLimit::max(8192)),
+        )
         .route(
             "/v1/auth/pairing/requests",
-            post(pairing_create).get(pairing_pending),
+            post(pairing_create)
+                .get(pairing_pending)
+                .layer(DefaultBodyLimit::max(8192)),
         )
         .route(
             "/v1/auth/pairing/requests/{id}/approve",
@@ -101,7 +106,23 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/pairing/requests/{id}/deny", post(pairing_deny))
         .route("/v1/auth/pairing/requests/{id}/status", get(pairing_status))
         .route("/v1/auth/challenge", post(auth_challenge))
-        .route("/v1/auth/login", post(auth_login))
+        .route(
+            "/v1/auth/login",
+            post(auth_login).layer(DefaultBodyLimit::max(8192)),
+        )
+        .route("/v1/auth/account/status", get(routes::account::status))
+        .route(
+            "/v1/auth/account/password/requests",
+            post(routes::account::password_request).layer(DefaultBodyLimit::max(8192)),
+        )
+        .route(
+            "/v1/auth/account/requests/{id}/approve",
+            post(routes::account::approve).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/v1/devices/{id}/revoke-request",
+            post(routes::account::revoke_request),
+        )
         .route("/v1/auth/me", get(auth_me))
         .route("/v1/auth/logout", post(auth_logout))
         .route("/v1/auth/unlock/request", post(unlock_request))

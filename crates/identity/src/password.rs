@@ -27,6 +27,13 @@ pub const MAX_PASSWORD_BYTES: usize = 1024;
 /// spaces, Unicode and case are part of the exact password.
 pub struct AccountPassword(Zeroizing<String>);
 
+impl<'de> serde::Deserialize<'de> for AccountPassword {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Debug for AccountPassword {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("AccountPassword([REDACTED])")
@@ -127,6 +134,12 @@ fn engine() -> Result<Argon2<'static>, PasswordError> {
 }
 
 impl PasswordService {
+    /// One admission pool shared by all account routes in this process.
+    pub fn shared() -> &'static Self {
+        static SERVICE: std::sync::OnceLock<PasswordService> = std::sync::OnceLock::new();
+        SERVICE.get_or_init(Self::default)
+    }
+
     async fn work<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> Result<T, PasswordError> + Send + 'static,
