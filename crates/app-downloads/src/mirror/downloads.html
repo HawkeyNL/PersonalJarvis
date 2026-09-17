@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Jarvis — Downloads</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; background: #0b111b; color: #edf4fa; font: 1rem/1.6 system-ui, sans-serif; }
+main { max-width: 1000px; margin: auto; padding: 40px 20px; }
+.brand { color: #68dce8; letter-spacing: .16em; font-weight: 700; }
+h1 { font-size: clamp(2rem, 7vw, 3.5rem); line-height: 1.15; }
+h2 { font-size: 1.3rem; }
+p, li { overflow-wrap: anywhere; }
+p { color: #b5c4d6; }
+section, aside { background: #121d2a; border: 1px solid #293849; border-radius: 16px; padding: 24px; margin: 24px 0; }
+ul { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 12px; }
+a { color: #7ee7ec; display: block; padding: 16px; border: 1px solid #416273; border-radius: 10px; text-decoration: none; min-height: 48px; }
+a:hover { background: #1b3040; }
+a:focus-visible { outline: 3px solid #7ee7ec; outline-offset: 3px; }
+footer { color: #b5c4d6; border-top: 1px solid #293849; padding-top: 20px; }
+</style>
+</head>
+<body><main>
+<div class="brand">JARVIS</div>
+<h1>Jouw Jarvis, op elk apparaat.</h1>
+<p>Kies hieronder een beschikbaar installatiebestand. Vul bij de eerste start het HTTPS-adres van je eigen Home Node in en voltooi de apparaatkoppeling.</p>
+<section aria-label="Beschikbare clientreleases">{{CLIENT_RELEASES}}</section>
+<aside><h2>iPhone: eerst lokaal ondertekenen</h2>
+<p>Een IPA downloaden installeert de app niet. Bewaar het bestand in Bestanden en importeer het in je lokale ondertekeningstool, zoals AltStore Classic. De IPA is niet door Apple ondertekend en wordt niet automatisch geïnstalleerd.</p></aside>
+{{IOS_CANDIDATES}}
+<footer>Deze pagina biedt openbare eerste-installatiebestanden. Desktop- en Android-updates gebruiken na aanmelding de beveiligde verbinding met de ingestelde Home Node. Geef hier nooit een wachtwoord, token of Apple-accountgegevens op.</footer>
+</main></body></html>

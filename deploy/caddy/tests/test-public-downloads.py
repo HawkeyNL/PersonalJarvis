@@ -104,6 +104,8 @@ class PublicDownloadTests(unittest.TestCase):
                         with get(path) as response:
                             self.assertEqual(response.status, 200)
                             self.assertEqual(response.read(), page.read_bytes())
+                            self.assertEqual(response.headers.get_content_type(), "text/html")
+                            self.assertNotIn("Content-Disposition", response.headers)
                             self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
                     with get('/downloads/ios/v0.1.0/Jarvis_0.1.0_ios_arm64_unsigned.ipa') as response:
                         self.assertEqual(response.status, 200)

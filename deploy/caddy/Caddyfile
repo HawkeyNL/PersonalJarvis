@@ -33,6 +33,8 @@
 	handle @downloads {
 		root * /var/lib/jarvis-public-downloads
 		rewrite * /index.html
+		header Content-Type "text/html; charset=utf-8"
+		header -Content-Disposition
 		header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 		header Cache-Control "public, max-age=300"
 		file_server

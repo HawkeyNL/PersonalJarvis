@@ -338,7 +338,10 @@ pub(super) fn public_links(root: &Path, owner: u32) -> Result<String> {
         }
     }
     versions.sort();
-    let mut html = String::from("<h1>Jarvis clients</h1><p>De iOS-IPA vereist lokale ondertekening; geen automatische installatie.</p><ul>");
+    if versions.is_empty() {
+        return Ok(String::new());
+    }
+    let mut html = String::from("<h2>Jarvis clients</h2><p>Nieuwste releases staan bovenaan. Kies het juiste platform.</p><ul>");
     for version in versions.iter().rev() {
         for (target, suffix, label) in [
             ("linux-x86_64", ".AppImage", "Linux"),

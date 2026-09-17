@@ -87,6 +87,11 @@ fn full_verified_import_is_idempotent_and_no_token_enters_public_index() {
     let index = fs::read_to_string(root.path().join("index.html")).unwrap();
     assert!(index.contains("/downloads/ios/v0.1.0/Jarvis_0.1.0_ios_arm64_unsigned.ipa"));
     assert!(!index.contains("fixture-owner"));
+    assert!(index.contains("width=device-width, initial-scale=1"));
+    assert!(index.contains("nog geen complete release"));
+    assert!(index.contains("AltStore Classic"));
+    assert!(!index.contains("{{CLIENT_RELEASES}}"));
+    assert!(!index.contains("<script"));
     assert_eq!(
         fs::read(
             root.path()
