@@ -6,6 +6,11 @@ set -euo pipefail
 [[ ${GITHUB_ACTIONS:-} == true && ${EUID} -eq 0 ]] || { echo "CI root fixture only" >&2; exit 1; }
 api_bin=${JARVIS_API_BINARY:?set JARVIS_API_BINARY to the built jarvis-api}
 [[ -x $api_bin ]] || { echo "jarvis-api binary is unavailable" >&2; exit 1; }
+# This fixture owns fixed production-shaped paths only on an empty CI host.
+# Refuse before registering cleanup or creating anything on an installed host.
+for path in /etc/jarvis /var/lib/jarvis/agents /run/jarvis-core-admin; do
+    [[ ! -e $path && ! -L $path ]] || { echo "refusing existing host path: $path" >&2; exit 1; }
+done
 
 fixture=$(mktemp -d)
 chmod 0755 "$fixture"
@@ -17,7 +22,7 @@ created_user=false
 cleanup() {
     if [[ -n ${pid:-} ]]; then kill "$pid" 2>/dev/null || true; fi
     wait "${pid:-}" 2>/dev/null || true
-    rm -rf -- "$fixture" /etc/jarvis /var/lib/jarvis/agents
+    rm -rf -- "$fixture" /etc/jarvis /var/lib/jarvis/agents /run/jarvis-core-admin
     if [[ ${created_user:-false} == true ]]; then userdel jarvis 2>/dev/null || true; fi
 }
 trap cleanup EXIT
@@ -26,6 +31,9 @@ if ! getent passwd jarvis >/dev/null; then
     useradd --system --user-group --home-dir /nonexistent --shell /usr/sbin/nologin jarvis
     created_user=true
 fi
+# runuser does not run systemd's RuntimeDirectory setup. Reproduce the exact
+# unit contract, rather than weakening Core's required ownership/mode checks.
+install -d -o jarvis -g jarvis -m 0700 /run/jarvis-core-admin
 install -d -o root -g jarvis -m 0750 /etc/jarvis
 install -o root -g jarvis -m 0640 /dev/stdin /etc/jarvis/Jarvis.md <<'EOF'
 Synthetic protected persona.
@@ -75,4 +83,29 @@ curl --fail --silent http://127.0.0.1:18080/livez >/dev/null
 curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null
 grep -Fq 'Jarvis persona loaded' "$fixture/api.log"
 grep -Fq 'private AgentRegistry loaded' "$fixture/api.log"
+[[ -S /run/jarvis-core-admin/devices.sock && ! -L /run/jarvis-core-admin/devices.sock ]]
+[[ $(stat -c '%U:%a' /run/jarvis-core-admin/devices.sock) == jarvis:600 ]]
+python3 - <<'PY'
+import json
+import socket
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+    client.settimeout(5)
+    client.connect('/run/jarvis-core-admin/devices.sock')
+    client.sendall(b'{"operation":"list"}\n')
+    response = json.loads(client.makefile('rb').readline(262145))
+    assert response == {"ok": True, "data": {"devices": []}}, response
+PY
+# The service account owns the socket but does not acquire administrator
+# authority merely by being able to connect to it.
+runuser -u jarvis -- python3 - <<'PY'
+import socket
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+    client.settimeout(5)
+    client.connect('/run/jarvis-core-admin/devices.sock')
+    try:
+        client.sendall(b'{"operation":"list"}\n')
+        assert client.recv(1024) == b'', 'non-root peer received an authorized response'
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+PY
 echo "Protected-input Core startup fixture passed"
