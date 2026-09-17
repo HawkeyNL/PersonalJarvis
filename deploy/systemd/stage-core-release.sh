@@ -139,13 +139,12 @@ if jq -e '.components? != null' "$release_dir/release.json" >/dev/null; then
         fail "graphical administrator executable version does not match release manifest"
 fi
 find "$release_dir" -xdev -type l -print -quit | grep -q . && fail "release contains a symlink"
-sha256sum "$staging/$artifact" > "$release_dir/release.verification"
+(cd "$staging" && sha256sum "$artifact") > "$release_dir/release.verification"
 chown root:root "$release_dir/release.verification"
 chmod 0644 "$release_dir/release.verification"
 
 chown -R root:root "$release_dir"
 chmod -R go-w "$release_dir"
 mv --no-target-directory "$release_dir" "$releases_dir/$tag"
-staging=
-trap - EXIT
-echo "Jarvis release staging: verified and staged $tag. Activate it only with install-home-node-core.sh."
+echo "Jarvis release staging: verified and staged $tag."
+echo "For an existing host with a reviewed schema transition, use the staged updater's --migrate-staged mode; fresh hosts use install-home-node-core.sh."
