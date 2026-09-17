@@ -1,6 +1,7 @@
 #![cfg_attr(not(feature = "desktop"), allow(dead_code, unused_imports))]
 
 mod admin;
+mod devices;
 mod logs;
 mod session;
 
@@ -219,6 +220,23 @@ async fn system(
 }
 
 #[cfg(feature = "desktop")]
+#[tauri::command]
+async fn devices_overview(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+) -> Result<devices::Overview, String> {
+    with_session(session, |session| devices::overview(&session)).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn device_action(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+    request: devices::DeviceAction,
+) -> Result<(), String> {
+    with_session(session, move |session| devices::mutate(&session, request)).await
+}
+
+#[cfg(feature = "desktop")]
 pub fn run() {
     if let Err(error) = admin::root_guard() {
         eprintln!("jarvis-core-admin: {error}");
@@ -245,6 +263,8 @@ pub fn run() {
             model_mutation,
             credentials,
             credential_set,
+            devices_overview,
+            device_action,
             logs,
             system
         ])

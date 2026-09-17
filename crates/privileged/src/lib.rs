@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod local_devices;
+
 pub const ACTION_MODEL_SET_ENABLED: &str = "model.set_enabled";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

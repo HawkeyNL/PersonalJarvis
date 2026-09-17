@@ -301,6 +301,38 @@ is never rendered by the TUI or emitted in JSON.
 
 ## Diagnostics
 
+### Local device administration
+
+Core Admin's Devices page uses local operating-system administrator authority,
+not a remotely enrolled device identity. The GUI remains unprivileged. Its
+existing five-minute inactivity lock is retained; each approve, deny or revoke
+action additionally requests administrator authentication through PolicyKit.
+Passwords are never passed through Vue, command arguments or the local protocol.
+The packaged action uses `auth_admin`, not the cached `auth_admin_keep` policy.
+Administrator-installed PolicyKit rules remain part of the host trust boundary.
+
+The corresponding recovery/SSH commands are:
+
+```bash
+sudo jarvis --json devices list
+sudo jarvis --json devices pending
+sudo jarvis devices approve <request-uuid> --fingerprint <displayed-fingerprint>
+sudo jarvis devices deny <request-uuid>
+sudo jarvis devices revoke <device-uuid>
+```
+
+Check the pending fingerprint against the requesting device before approving.
+Revocation invalidates the device's sessions and realtime connections. Revoking
+every device does **not** reopen first-device activation or reset the account
+password. These commands are not a lost-password recovery mechanism.
+
+The fixed local Unix socket accepts kernel-verified root peers only. It is
+created inside Core's systemd-managed `RuntimeDirectory=jarvis-core-admin`;
+matching Core unit policy and the Core Admin PolicyKit package are required.
+There is no new TCP listener, HTTP administrator endpoint or arbitrary command
+executor. Remote client approvals still require their action-bound device
+signature. The existing CLI `sudo` authentication policy is unchanged.
+
 ```bash
 sudo jarvis services status
 sudo jarvis logs core --lines 100

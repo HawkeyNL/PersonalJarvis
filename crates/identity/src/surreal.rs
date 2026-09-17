@@ -17,6 +17,10 @@ use jarvis_store::Database;
 #[path = "account.rs"]
 pub mod account;
 
+#[cfg(unix)]
+#[path = "local_devices.rs"]
+pub mod local_devices;
+
 use super::{
     verify_signature, Authenticated, Challenge, Device, DeviceKey, IdentityError, LoginResult,
     PairingRequest, Platform, Session, UnlockRequest, User,
@@ -385,6 +389,25 @@ pub async fn approve_pairing_request(
         request.expires_at,
     )?;
     verify_device_signature(db, user_id, approver_device_id, &message, signature).await?;
+    activate_pairing_request(db, request, Some(approver_device_id)).await
+}
+
+#[derive(Serialize)]
+struct PairingActivationBindings {
+    id: String,
+    approver_device_id: Option<String>,
+    fingerprint: String,
+}
+
+// Shared atomic activation: callers first prove either the remote device
+// signature or the narrowly authorized local kernel-root peer.
+async fn activate_pairing_request(
+    db: &Database,
+    request: PairingRequest,
+    approver_device_id: Option<Uuid>,
+) -> Result<Device, IdentityError> {
+    let id = request.id;
+    let user_id = request.user_id;
     let device_id = Uuid::now_v7();
     let key_id = Uuid::now_v7();
     let response = db
@@ -392,7 +415,7 @@ pub async fn approve_pairing_request(
             "BEGIN TRANSACTION; \
              LET $claim = UPDATE device_pairing_requests \
                SET status = 'approved', approved_by_device_id = $approver_device_id, resolved_at = time::now() \
-               WHERE record::id(id) = $id AND user_id = $user_id AND status = 'pending' AND expires_at > time::now() RETURN AFTER; \
+               WHERE record::id(id) = $id AND user_id = $user_id AND candidate_fingerprint = $fingerprint AND status = 'pending' AND expires_at > time::now() RETURN AFTER; \
              IF array::len($claim) = 0 { THROW 'pairing request unavailable'; }; \
              CREATE devices SET id = $device_id, user_id = $user_id, name = $name, platform = $platform, \
                status = 'active', created_at = time::now(), updated_at = time::now(); \
@@ -410,10 +433,11 @@ pub async fn approve_pairing_request(
             algorithm: "ed25519".to_string(),
             public_key: request.candidate_public_key,
         })
-        .bind(json!({
-            "id": id.to_string(),
-            "approver_device_id": approver_device_id.to_string(),
-        }))
+        .bind(PairingActivationBindings {
+            id: id.to_string(),
+            approver_device_id: approver_device_id.map(|id| id.to_string()),
+            fingerprint: request.candidate_fingerprint,
+        })
         .await
         .map_err(|_| IdentityError::DatabaseSurreal)?;
     response.check().map_err(|_| IdentityError::AuthFailed)?;
@@ -1120,6 +1144,26 @@ mod tests {
         )
         .await
         .is_err());
+
+        // Local host approval shares the same one-shot transaction, but must
+        // not fabricate an approving enrolled-device ID. Exercise the NONE
+        // binding against the real schema, independently of root IPC proof.
+        let local_request = create_pairing_request(
+            &db,
+            owner.id,
+            "Local fixture",
+            Platform::Ios,
+            &SigningKey::from_bytes(&rand::random())
+                .verifying_key()
+                .to_bytes(),
+        )
+        .await?;
+        let local_id = local_request.id;
+        let local_device = activate_pairing_request(&db, local_request, None).await?;
+        assert_eq!(local_device.user_id, owner.id);
+        let consumed = pairing_request(&db, local_id, owner.id).await?.unwrap();
+        assert_eq!(consumed.status, "approved");
+        assert!(activate_pairing_request(&db, consumed, None).await.is_err());
 
         // Revoking a device invalidates every existing bearer session at once;
         // a stolen token must not remain useful until its normal expiry.

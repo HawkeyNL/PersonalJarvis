@@ -24,6 +24,8 @@ RestartSec=5s
 TimeoutStartSec=30s
 TimeoutStopSec=30s
 UMask=0077
+RuntimeDirectory=jarvis-core-admin
+RuntimeDirectoryMode=0700
 
 # Core owns no host files at runtime: durable application state is SurrealDB.
 # Keep the release read-only and make host compromise harder without granting

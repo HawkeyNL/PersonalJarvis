@@ -824,6 +824,14 @@ fn run_direct(program: &str, args: &[&str], timeout: Duration) -> AdminResult<Pr
     if unsafe { libc::geteuid() } != 0 {
         return Err("trusted administration broker is not privileged".to_owned());
     }
+    run_checked_command(program, args, timeout)
+}
+
+pub(crate) fn run_checked_command(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> AdminResult<ProgramOutput> {
     verify_root_executable(program)?;
     let mut command = Command::new(program);
     command
@@ -887,6 +895,15 @@ fn run_direct(program: &str, args: &[&str], timeout: Duration) -> AdminResult<Pr
 
 pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramOutput> {
     let (program, args, timeout) = match request {
+        BrokerRequest::Devices { pending } => (
+            ADMIN,
+            vec![
+                "--json".into(),
+                "devices".into(),
+                if pending { "pending" } else { "list" }.into(),
+            ],
+            Duration::from_secs(20),
+        ),
         BrokerRequest::Status => (
             ADMIN,
             vec!["--json".to_owned(), "status".to_owned()],

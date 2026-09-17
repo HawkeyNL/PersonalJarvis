@@ -42,6 +42,7 @@ pub(crate) enum BrokerRequest {
     Usage,
     ModelMutation { request: ModelMutation },
     Credentials,
+    Devices { pending: bool },
     Logs { query: LogQuery },
 }
 

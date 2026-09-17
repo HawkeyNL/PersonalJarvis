@@ -39,6 +39,7 @@
       "deb": {
         "desktopTemplate": "../packaging/tauri-generated.desktop",
         "files": {
+          "/usr/share/polkit-1/actions/com.hawkeynl.jarvis.devices.policy": "../packaging/com.hawkeynl.jarvis.devices.policy",
           "/usr/share/applications/com.hawkeynl.jarvis.core.admin.desktop": "../packaging/jarvis-core-admin.desktop"
         }
       }

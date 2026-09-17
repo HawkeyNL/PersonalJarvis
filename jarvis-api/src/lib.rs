@@ -27,6 +27,8 @@ use std::sync::RwLock;
 mod audit;
 mod error;
 mod extract;
+#[cfg(unix)]
+pub mod local_devices;
 mod mcp;
 mod metering;
 mod rate_limit;

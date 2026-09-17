@@ -9,6 +9,7 @@ export type ViewName =
   | "models"
   | "usage"
   | "credentials"
+  | "devices"
   | "logs"
   | "system";
 
@@ -143,8 +144,14 @@ export interface LogRecord {
 }
 export interface LogResponse { unit: string; records: LogRecord[] }
 export interface SystemResponse { values: [string, string][] }
+export interface LocalDevice { id: string; name: string; platform: string; status: string }
+export interface PendingDevice { id: string; name: string; platform: string; fingerprint: string; expires_at: number }
+export interface DeviceOverview { devices: LocalDevice[]; requests: PendingDevice[] }
+export type DeviceAction = { action: "approve"; request_id: string; fingerprint: string } | { action: "deny"; request_id: string } | { action: "revoke"; device_id: string };
 
 export const api = {
+  devices: () => invoke<DeviceOverview>("devices_overview"),
+  deviceAction: (request: DeviceAction) => invoke<void>("device_action", { request }),
   sessionAuthenticate: () =>
     invoke<SessionStatus>("session_authenticate"),
   sessionTouch: () => invoke<SessionStatus>("session_touch"),
