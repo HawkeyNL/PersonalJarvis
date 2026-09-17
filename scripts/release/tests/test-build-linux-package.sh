@@ -20,6 +20,7 @@ write_candidate() {
     done
     cp "$repo_dir/deploy/systemd/manage-systemd-units.sh" "$release/manage-systemd-units"
     chmod 0755 "$release/manage-systemd-units"
+    install -m 0755 "$repo_dir/deploy/systemd/schema-backup.sh" "$release/schema-backup"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$release/verify-home-node"
     chmod 0755 "$release/verify-home-node"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$release/install-home-node-core"
@@ -38,12 +39,13 @@ write_candidate() {
     printf '%s\n' '{"version":1,"source":"fixture","updated_at":"2026-09-01","models":[]}' \
         > "$release/pricing-registry.json"
     jq -n --arg tag "$tag" --arg revision "$revision" \
-        '{tag:$tag,revision:$revision,components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1}}' \
+        '{tag:$tag,revision:$revision,schema_migration:{version:1,target:8,from_sha256:[("a" * 64)]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1}}' \
         > "$release/release.json"
     (
         cd "$release"
         sha256sum jarvis-models jarvis-credentials pricing-registry.json \
             com.hawkeynl.jarvis.devices.policy \
+            schema-backup \
             manage-systemd-units verify-home-node install-home-node-core ui.sh \
             systemd-*.service systemd-*.timer \
             > artifact-binaries.sha256
@@ -97,7 +99,7 @@ fi
 grep -Fq 'managed unit is missing or unsafe: jarvis-config-broker.service' \
     "$fixture/bad-unit.stderr"
 
-for defect in missing tampered symlink capability; do
+for defect in missing tampered symlink capability missing-backup unsupported-schema; do
     write_candidate v9.8.10
     policy="$fixture/candidate/jarvis-core-v9.8.10/com.hawkeynl.jarvis.devices.policy"
     case $defect in
@@ -106,6 +108,11 @@ for defect in missing tampered symlink capability; do
         symlink) rm -- "$policy"; ln -s /dev/null "$policy" ;;
         capability)
             jq '.tooling.local_devices = 2' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
+            cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
+            ;;
+        missing-backup) rm -- "$fixture/candidate/jarvis-core-v9.8.10/schema-backup" ;;
+        unsupported-schema)
+            jq '.schema_migration.target = 99' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
             cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
             ;;
     esac

@@ -13,4 +13,3 @@ serde.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 uuid.workspace = true
-tempfile = "3"

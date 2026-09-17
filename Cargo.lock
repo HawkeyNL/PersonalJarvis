@@ -2600,7 +2600,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "surrealdb",
- "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "uuid",

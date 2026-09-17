@@ -107,6 +107,16 @@ validate_artifacts() {
     fi
     validate_checksum_manifest "$release"
     validate_device_policy "$release"
+    if jq -e 'has("schema_migration")' "$release/release.json" >/dev/null; then
+        jq -e '.schema_migration | .version == 1 and .target == 8 and
+            (.from_sha256 | type == "array" and length > 0 and length <= 2 and
+                all(type == "string" and test("^[0-9a-f]{64}$")))' "$release/release.json" >/dev/null || fail "unsupported schema migration declaration"
+        [[ -f $release/schema-backup && ! -L $release/schema-backup && -x $release/schema-backup ]] || fail "schema backup helper is missing or unsafe"
+        mode=$(stat -c '%a' "$release/schema-backup")
+        (( (8#$mode & 0022) == 0 )) || fail "schema backup helper permissions are unsafe"
+        matches=$(awk '$2 == "schema-backup" {n++} END {print n+0}' "$release/artifact-binaries.sha256")
+        [[ $matches == 1 ]] || fail "schema backup helper is not uniquely checksum-bound"
+    fi
     [[ -f $release/manage-systemd-units && ! -L $release/manage-systemd-units && -x $release/manage-systemd-units ]] ||
         fail "managed-systemd helper is missing or unsafe"
     for helper in verify-home-node install-home-node-core; do
@@ -152,6 +162,9 @@ validate_release() {
     validate_artifacts "$release"
     if [[ $(device_capability "$release") == 1 ]]; then
         [[ $(stat -c '%u:%g' "$release/$device_policy") == 0:0 ]] || fail "device policy is not root-owned"
+    fi
+    if jq -e 'has("schema_migration")' "$release/release.json" >/dev/null; then
+        [[ $(stat -c '%u:%g' "$release/schema-backup") == 0:0 ]] || fail "schema backup helper is not root-owned"
     fi
     [[ $(capability "$release") == 1 ]] || return 0
     entry=$(find "$release" -maxdepth 1 -type f -name 'systemd-*' \
