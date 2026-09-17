@@ -57,11 +57,16 @@ write_candidate "$tag"
 bash "$builder" package "$tag" "$revision" "$fixture"
 archive="$fixture/jarvis-core-$tag-linux-x86_64.tar.gz"
 [[ -f $archive ]]
-tar -tzf "$archive" | grep -qx "jarvis-core-$tag/jarvis-models"
-tar -tzf "$archive" | grep -qx "jarvis-core-$tag/jarvis-credentials"
-tar -tzf "$archive" | grep -qx "jarvis-core-$tag/pricing-registry.json"
-tar -tzf "$archive" | grep -qx "jarvis-core-$tag/systemd-jarvis-config-broker.service"
-tar -tzf "$archive" | grep -qx "jarvis-core-$tag/com.hawkeynl.jarvis.devices.policy"
+# Consume the complete listing before assertions: grep -q on a pipe can close
+# early and make a healthy tar fail with SIGPIPE/write error under pipefail.
+tar -tzf "$archive" > "$fixture/archive-members.txt"
+for member in jarvis-models jarvis-credentials pricing-registry.json \
+    systemd-jarvis-config-broker.service com.hawkeynl.jarvis.devices.policy; do
+    grep -Fxq "jarvis-core-$tag/$member" "$fixture/archive-members.txt" || {
+        echo "release archive is missing required member: $member" >&2
+        exit 1
+    }
+done
 extracted="$fixture/extracted"
 mkdir -p "$extracted"
 tar -xzf "$archive" -C "$extracted"
