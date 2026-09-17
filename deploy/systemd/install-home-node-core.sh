@@ -139,6 +139,21 @@ jq -e --arg tag "$release_tag" '
     exit 1
 }
 release_has_core_admin=false
+# A fresh-install helper must not become a bypass around the updater's
+# explicit cold-backup migration boundary on an existing Home Node.
+if [[ -L /opt/jarvis/current ]]; then
+    existing_release=$(readlink -f /opt/jarvis/current)
+    [[ $existing_release == /opt/jarvis/releases/* && -f $existing_release/release.json && ! -L $existing_release/release.json ]] || {
+        echo "existing release identity is unsafe; manual recovery required" >&2
+        exit 1
+    }
+    existing_schema=$(jq -er '.schema_sha256 | strings | select(test("^[0-9a-f]{64}$"))' "$existing_release/release.json")
+    candidate_schema=$(jq -er '.schema_sha256' "$release_dir/release.json")
+    [[ $existing_schema == "$candidate_schema" ]] || {
+        echo "schema change requires the candidate updater --migrate-staged $release_tag; installer refused before mutation" >&2
+        exit 1
+    }
+fi
 release_has_private_agent_tooling=false
 release_has_managed_systemd=false
 if jq -e '.tooling.private_agents? == 1' "$release_dir/release.json" >/dev/null 2>&1; then

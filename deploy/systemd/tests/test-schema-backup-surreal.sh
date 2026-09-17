@@ -54,9 +54,11 @@ id=$(bash "$helper" create v1.0.0 v1.0.1)
 "$real_docker" start "$name" >/dev/null
 ready
 printf "UPDATE marker:original SET version = 8; CREATE marker:new SET content = 'candidate-only';\n" | sql >/dev/null
+result=$(printf 'SELECT * FROM marker;\n' | sql)
+jq -e 'length == 1 and (.[0] | length) == 2 and any(.[0][]; .version == 8)' <<< "$result" >/dev/null
 bash "$helper" restore "$id"
 "$real_docker" start "$name" >/dev/null
 ready
 result=$(printf 'SELECT * FROM marker;\n' | sql)
-jq -e '.[0].status == "OK" and (.[0].result | length) == 1 and .[0].result[0].version == 6 and .[0].result[0].content == "canonical fixture"' <<< "$result" >/dev/null
+jq -e 'length == 1 and (.[0] | length) == 1 and .[0][0].version == 6 and .[0][0].content == "canonical fixture"' <<< "$result" >/dev/null
 echo 'Real SurrealDB RocksDB cold snapshot restores previous data and removes candidate-only state'

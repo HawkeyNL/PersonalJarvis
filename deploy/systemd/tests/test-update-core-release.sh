@@ -763,6 +763,11 @@ install -m 0644 "$repo_dir/jarvis-core-admin/packaging/com.hawkeynl.jarvis.devic
 jq --arg previous "$same_migrations" '.tooling.local_devices = 1 | .schema_migration = {version:1,target:8,from_sha256:[$previous]}' "$candidate/release.json" > "$fixture_dir/migration-manifest"
 install -m 0644 "$fixture_dir/migration-manifest" "$candidate/release.json"
 (cd "$candidate" && sha256sum schema-backup com.hawkeynl.jarvis.devices.policy >> artifact-binaries.sha256)
+if JARVIS_UPDATER_UNDER_TEST="$candidate/install-home-node-core" run_updater "$candidate" > "$fixture_dir/installer-migration.log" 2>&1; then
+    echo 'fresh installer bypassed controlled schema migration' >&2; exit 1
+fi
+grep -Fq 'schema change requires the candidate updater --migrate-staged' "$fixture_dir/installer-migration.log"
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v10.0.0 ]]
 printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/docker"
 chmod 0755 "$fake_bin/docker"
 export JARVIS_SCHEMA_FIXTURE_ROOT="$fixture_dir/database-fixture" JARVIS_SCHEMA_TEST_MODE=true JARVIS_MIGRATION_FIXTURE=true

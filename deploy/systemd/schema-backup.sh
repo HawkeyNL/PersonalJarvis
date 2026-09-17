@@ -6,19 +6,27 @@ umask 077
 fail() { echo "jarvis schema backup: $*" >&2; exit 1; }
 [[ $EUID == 0 ]] || fail 'root required'
 root=/var/lib/jarvis
+backups=/var/backups/jarvis-migrations
 if [[ -n ${JARVIS_SCHEMA_FIXTURE_ROOT:-} ]]; then
     [[ ${GITHUB_ACTIONS:-} == true && ${JARVIS_SCHEMA_TEST_MODE:-} == true && $JARVIS_SCHEMA_FIXTURE_ROOT == /tmp/* ]] || fail 'test-only override refused'
     root=$JARVIS_SCHEMA_FIXTURE_ROOT
+    backups="$root/migration-backups"
 fi
 database="$root/surrealdb"
-backups="$root/migration-backups"
 safe_dir() {
     [[ -d $1 && ! -L $1 ]] || fail 'required directory is missing or symlinked'
     local metadata
     metadata=$(stat -c '%u:%g:%a' "$1")
     [[ $metadata == 0:0:* ]] && (( (8#${metadata##*:} & 0022) == 0 )) || fail 'unsafe directory ownership or permissions'
 }
-safe_dir "$root"
+# Production /var/lib/jarvis is owned by the service account. Never store
+# recovery material there: an account owning the parent could rename/remove
+# even root-owned child directories. Backups have a root-controlled parent.
+[[ -d $root && ! -L $root ]] || fail 'unsafe application state directory'
+if [[ $backups == /var/backups/jarvis-migrations ]]; then
+    safe_dir /var
+    safe_dir /var/backups
+fi
 [[ ! -L $backups ]] || fail 'unsafe backup root'
 if [[ ! -e $backups ]]; then install -d -o root -g root -m 0700 "$backups"; fi
 safe_dir "$backups"
