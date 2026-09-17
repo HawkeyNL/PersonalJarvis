@@ -5,6 +5,8 @@ set -euo pipefail
 
 readonly systemd_root=${JARVIS_SYSTEMD_ROOT:-/etc/systemd/system}
 readonly releases_root=${JARVIS_RELEASES_ROOT:-/opt/jarvis/releases}
+readonly polkit_root=${JARVIS_POLKIT_ROOT:-/usr/share/polkit-1/actions}
+readonly device_policy=com.hawkeynl.jarvis.devices.policy
 readonly -a managed_units=(
     jarvis-core.service
     jarvis-config-broker.service
@@ -29,9 +31,46 @@ test_override_allowed() {
         fail "systemd path overrides are test-only"
 }
 
-if [[ $systemd_root != /etc/systemd/system || $releases_root != /opt/jarvis/releases ]]; then
+if [[ $systemd_root != /etc/systemd/system || $releases_root != /opt/jarvis/releases || $polkit_root != /usr/share/polkit-1/actions ]]; then
     test_override_allowed
 fi
+
+device_capability() {
+    local release=$1
+    if ! jq -e '.tooling | has("local_devices")' "$release/release.json" >/dev/null; then
+        echo legacy
+        return
+    fi
+    jq -e '.tooling.local_devices == 1 and (.tooling.local_devices | type) == "number"' \
+        "$release/release.json" >/dev/null || fail "unsupported local-device capability"
+    echo 1
+}
+
+validate_device_policy() {
+    local release=$1 metadata matches device_version
+    device_version=$(device_capability "$release") || return 1
+    [[ $device_version == 1 ]] || return 0
+    [[ -f $release/$device_policy && ! -L $release/$device_policy ]] || fail "device policy is missing or unsafe"
+    metadata=$(stat -c '%a' "$release/$device_policy")
+    (( (8#$metadata & 0022) == 0 )) || fail "device policy is writable by non-owner"
+    matches=$(awk -v name="$device_policy" '$2 == name { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
+    [[ $matches == 1 ]] || fail "device policy is not uniquely checksum-bound"
+}
+
+validate_policy_target() {
+    local metadata target="$polkit_root/$device_policy"
+    [[ ! -L $polkit_root ]] || fail "unsafe PolicyKit directory"
+    if [[ -e $polkit_root ]]; then
+        [[ -d $polkit_root ]] || fail "unsafe PolicyKit directory"
+        metadata=$(stat -c '%u:%g:%a' "$polkit_root")
+        [[ $metadata == 0:0:* ]] && (( (8#${metadata##*:} & 0022) == 0 )) || fail "unsafe PolicyKit directory ownership/mode"
+    fi
+    if [[ -e $target || -L $target ]]; then
+        [[ -f $target && ! -L $target ]] || fail "unsafe installed device policy"
+        metadata=$(stat -c '%u:%g:%a' "$target")
+        [[ $metadata == 0:0:* ]] && (( (8#${metadata##*:} & 0022) == 0 )) || fail "unsafe installed device policy ownership/mode"
+    fi
+}
 
 capability() {
     local release=$1
@@ -59,9 +98,15 @@ validate_checksum_manifest() {
 }
 
 validate_artifacts() {
-    local release=$1 unit path mode matches packaged expected
-    [[ $(capability "$release") == 1 ]] || return 0
+    local release=$1 unit path mode matches packaged expected managed_version device_version
+    managed_version=$(capability "$release") || return 1
+    device_version=$(device_capability "$release") || return 1
+    if [[ $managed_version != 1 ]]; then
+        [[ $device_version == legacy ]] || fail "local-device capability requires managed systemd policy"
+        return 0
+    fi
     validate_checksum_manifest "$release"
+    validate_device_policy "$release"
     [[ -f $release/manage-systemd-units && ! -L $release/manage-systemd-units && -x $release/manage-systemd-units ]] ||
         fail "managed-systemd helper is missing or unsafe"
     for helper in verify-home-node install-home-node-core; do
@@ -105,6 +150,9 @@ validate_artifacts() {
 validate_release() {
     local release=$1 entry helper metadata
     validate_artifacts "$release"
+    if [[ $(device_capability "$release") == 1 ]]; then
+        [[ $(stat -c '%u:%g' "$release/$device_policy") == 0:0 ]] || fail "device policy is not root-owned"
+    fi
     [[ $(capability "$release") == 1 ]] || return 0
     entry=$(find "$release" -maxdepth 1 -type f -name 'systemd-*' \
         \( ! -user root -o ! -group root -o -perm /022 \) -printf '%f (%y %u:%g %m)\n' -quit)
@@ -157,6 +205,13 @@ check_installed() {
     validate_release "$release"
     [[ $(capability "$release") == 1 ]] || fail "active release does not manage systemd units"
     validate_dropins
+    validate_policy_target
+    if [[ $(device_capability "$release") == 1 ]]; then
+        [[ $(stat -c '%a' "$polkit_root/$device_policy" 2>/dev/null) == 644 ]] && \
+            cmp -s "$release/$device_policy" "$polkit_root/$device_policy" || fail "installed device policy differs from active release"
+    else
+        [[ ! -e $polkit_root/$device_policy ]] || fail "legacy release has incompatible device policy installed"
+    fi
     for unit in "${managed_units[@]}"; do
         source="$release/systemd-$unit"
         target="$systemd_root/$unit"
@@ -173,8 +228,15 @@ install_units() {
     validate_release "$release"
     [[ $(capability "$release") == 1 ]] || fail "target release does not manage systemd units"
     validate_dropins
+    validate_policy_target
     [[ -d $backup && ! -L $backup && $(stat -c '%u:%g:%a' "$backup") == 0:0:700 ]] ||
         fail "unit rollback directory is unsafe"
+    if [[ -f $polkit_root/$device_policy ]]; then
+        install -o root -g root -m 0644 "$polkit_root/$device_policy" "$backup/$device_policy"
+        printf 'present\n' > "$backup/device-policy-state"
+    else
+        printf 'absent\n' > "$backup/device-policy-state"
+    fi
     install -d -o root -g root -m 0755 "$systemd_root"
     : > "$backup/state"
     chmod 0600 "$backup/state"
@@ -208,9 +270,24 @@ install_units() {
             fail "managed unit replacement failed; prior units restored"
         fi
     done
-    if ! (check_installed "$release"); then
+    if ! (install_device_policy "$release") || ! (check_installed "$release"); then
         restore_units "$backup"
         fail "installed unit verification failed; prior units restored"
+    fi
+}
+
+install_device_policy() {
+    local release=$1 staged
+    if [[ $(device_capability "$release") == 1 ]]; then
+        install -d -o root -g root -m 0755 "$polkit_root"
+        staged=$(mktemp "$polkit_root/.jarvis-device-policy.XXXXXXXX")
+        if ! install -o root -g root -m 0644 "$release/$device_policy" "$staged" || \
+            ! mv -Tf "$staged" "$polkit_root/$device_policy"; then
+            rm -f -- "$staged"
+            return 1
+        fi
+    else
+        rm -f -- "$polkit_root/$device_policy"
     fi
 }
 
@@ -218,6 +295,20 @@ restore_units() {
     local backup=$1 unit state staged
     [[ -d $backup && ! -L $backup && -f $backup/state && ! -L $backup/state ]] ||
         fail "unit rollback state is unavailable"
+    validate_policy_target
+    if [[ -f $backup/device-policy-state && ! -L $backup/device-policy-state ]]; then
+        case $(<"$backup/device-policy-state") in
+            present)
+                [[ -f $backup/$device_policy && ! -L $backup/$device_policy ]] || fail "device policy rollback file missing"
+                install -d -o root -g root -m 0755 "$polkit_root"
+                staged=$(mktemp "$polkit_root/.jarvis-device-policy.XXXXXXXX")
+                install -o root -g root -m 0644 "$backup/$device_policy" "$staged"
+                mv -Tf "$staged" "$polkit_root/$device_policy"
+                ;;
+            absent) rm -f -- "$polkit_root/$device_policy" ;;
+            *) fail "invalid device policy rollback state" ;;
+        esac
+    fi
     for unit in "${managed_units[@]}"; do
         read -r _ state < <(awk -v unit="$unit" '$1 == unit { print; exit }' "$backup/state")
         case $state in

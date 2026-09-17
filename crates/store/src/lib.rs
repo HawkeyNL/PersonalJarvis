@@ -7,6 +7,9 @@
 
 use surrealdb::{engine::remote::ws::Ws, opt::auth::Database as DatabaseAuth, Surreal};
 
+#[cfg(test)]
+mod migration_tests;
+
 #[derive(serde::Deserialize)]
 struct SchemaVersion {
     version: i64,

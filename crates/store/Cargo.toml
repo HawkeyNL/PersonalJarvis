@@ -9,3 +9,8 @@ publish = false
 surrealdb.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+uuid.workspace = true
+tempfile = "3"

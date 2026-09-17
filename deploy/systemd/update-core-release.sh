@@ -16,12 +16,15 @@ readonly core_admin_icon=/usr/share/icons/hicolor/128x128/apps/jarvis-core-admin
 readonly core_admin_version_file=/usr/share/jarvis-core-admin/version
 repository=
 github_curl_netrc=
+schema_backup_id=
+schema_backup_helper=
 
 usage() {
     cat >&2 <<'EOF'
 Usage: update-core-release [--latest|--version vMAJOR.MINOR.PATCH|--check|--status|--rollback|--rollback-candidates|--rollback-version vMAJOR.MINOR.PATCH]
 
 No argument is equivalent to --latest and is used by the systemd timer.
+Explicit offline migration: --migrate-staged vMAJOR.MINOR.PATCH (verified staged release only).
 EOF
     exit 64
 }
@@ -220,6 +223,7 @@ case ${1:-} in
     '') ;;
     --latest) [[ $# == 1 ]] || usage ;;
     --version) [[ $# == 2 && $2 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage; mode=version; requested_tag=$2 ;;
+    --migrate-staged) [[ $# == 2 && $2 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage; mode=migrate_staged; requested_tag=$2 ;;
     --check) [[ $# == 1 ]] || usage; mode=check ;;
     --status) [[ $# == 1 ]] || usage; mode=status ;;
     --rollback) [[ $# == 1 ]] || usage; mode=rollback ;;
@@ -699,6 +703,9 @@ restart_managed_services() {
 
 restore_release_transaction() {
     local previous=$1 unit_manager=$2 backup=$3 temporary_link=/opt/jarvis/.current.new
+    if [[ -n $schema_backup_id ]]; then
+        "$schema_backup_helper" restore "$schema_backup_id" || return 1
+    fi
     rm -f -- "$temporary_link"
     ln -s "$previous" "$temporary_link"
     mv -Tf "$temporary_link" "$current_link"
@@ -722,6 +729,12 @@ activate_managed_release() {
     chmod 0700 "$backup"
     if ! "$unit_manager" validate-release "$release" || \
         ! "$unit_manager" install "$release" "$backup"; then
+        if [[ -n $schema_backup_id ]]; then
+            # Core was stopped before the cold snapshot. No candidate process
+            # has started yet; restore original service availability.
+            systemctl start jarvis-surrealdb.service || true
+            systemctl start jarvis-core.service || true
+        fi
         rm -rf -- "$backup"
         return 1
     fi
@@ -735,8 +748,7 @@ activate_managed_release() {
     fi
     echo "jarvis updater: activation failed; restoring previous release and unit policy" >&2
     if ! restore_release_transaction "$previous" "$unit_manager" "$backup"; then
-        echo "jarvis updater: CRITICAL: automatic release/unit restoration failed" >&2
-        rm -rf -- "$backup"
+        echo "jarvis updater: CRITICAL: automatic release/unit restoration failed; recovery files retained at $backup" >&2
         return 1
     fi
     rm -rf -- "$backup"
@@ -812,6 +824,43 @@ fi
 if [[ $mode == rollback_candidates ]]; then
     list_rollback_candidates
     exit 0
+fi
+
+if [[ $mode == migrate_staged ]]; then
+    # Explicit owner-only maintenance, never selected by --latest or a timer.
+    # The candidate must already be staged by the verified archive path.
+    [[ $current_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "active release identity unavailable"
+    inspect_release "$current_tag"
+    [[ $inspected_verified == true ]] || fail "active release must be verified before migration"
+    inspect_release "$requested_tag"
+    [[ $inspected_verified == true ]] || fail "staged migration candidate is invalid: $inspected_reason"
+    candidate="$releases_dir/$requested_tag"
+    [[ $requested_tag != "$current_tag" ]] || fail "migration requires a different candidate release"
+    jq -e --arg previous "$current_schema_sha256" '
+        .schema_migration.version == 1 and .schema_migration.target == 8 and
+        (.schema_migration.from_sha256 | type == "array") and
+        (.schema_migration.from_sha256 | index($previous) != null) and
+        .tooling.systemd_units == 1 and .tooling.local_devices == 1
+    ' "$candidate/release.json" >/dev/null || fail "candidate does not authorize this exact schema transition"
+    schema_backup_helper="$candidate/schema-backup"
+    [[ -f $schema_backup_helper && ! -L $schema_backup_helper && -x $schema_backup_helper ]] || fail "verified schema backup helper is missing"
+    [[ $(awk '$2 == "schema-backup" { n++ } END { print n+0 }' "$candidate/artifact-binaries.sha256") == 1 ]] || fail "schema backup helper is not checksum-bound"
+    (cd "$candidate" && sha256sum --check --strict artifact-binaries.sha256 >/dev/null) || fail "candidate integrity check failed"
+    "$candidate/manage-systemd-units" validate-release "$candidate"
+    # No database password enters this helper's argv, logs or environment.
+    if ! schema_backup_id=$("$schema_backup_helper" create "$current_tag" "$requested_tag"); then
+        systemctl start jarvis-surrealdb.service || true
+        systemctl start jarvis-core.service || true
+        fail "cold backup failed; original database and release were not replaced"
+    fi
+    [[ $schema_backup_id =~ ^txn\.[A-Za-z0-9]{8}$ ]] || fail "invalid cold backup receipt; services remain stopped"
+    echo "jarvis updater: cold snapshot $schema_backup_id verified; starting controlled schema transition"
+    if activate_managed_release "$candidate" "$current_target"; then
+        "$schema_backup_helper" commit "$schema_backup_id" || fail "candidate healthy but backup commit failed; snapshot retained for operator inspection"
+        echo "jarvis updater: migrated and activated $requested_tag; private cold snapshot retained"
+        exit 0
+    fi
+    fail "migration activation failed; inspect recovery outcome before retrying"
 fi
 
 if [[ $mode == rollback || $mode == rollback_version ]]; then

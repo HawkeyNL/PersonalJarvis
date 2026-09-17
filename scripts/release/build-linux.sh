@@ -193,6 +193,8 @@ if [[ $("$temporary_release/jarvis-core-admin" --frontend-mode) != production ]]
 fi
 install -m 0644 jarvis-core-admin/packaging/jarvis-core-admin.desktop \
   "$temporary_release/jarvis-core-admin.desktop"
+install -m 0644 jarvis-core-admin/packaging/com.hawkeynl.jarvis.devices.policy \
+  "$temporary_release/com.hawkeynl.jarvis.devices.policy"
 install -m 0644 jarvis-core-admin/src-tauri/icons/128x128.png \
   "$temporary_release/jarvis-core-admin.png"
 printf '%s\n' "$core_admin_version" > "$temporary_release/jarvis-core-admin.version"
@@ -200,6 +202,7 @@ install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update
 install -m 0755 deploy/systemd/jarvis-models.sh "$temporary_release/jarvis-models"
 install -m 0755 deploy/systemd/jarvis-credentials.sh "$temporary_release/jarvis-credentials"
 install -m 0755 deploy/systemd/manage-systemd-units.sh "$temporary_release/manage-systemd-units"
+install -m 0755 deploy/systemd/schema-backup.sh "$temporary_release/schema-backup"
 install -m 0755 deploy/systemd/verify-home-node.sh "$temporary_release/verify-home-node"
 install -m 0755 deploy/systemd/install-home-node-core.sh "$temporary_release/install-home-node-core"
 install -m 0644 deploy/lib/ui.sh "$temporary_release/ui.sh"
@@ -226,6 +229,8 @@ while IFS= read -r schema; do
   sha256sum "schema/surreal/$schema"
 done < <(find schema/surreal -type f -name '*.surql' -printf '%P\n' | LC_ALL=C sort) > "$schema_manifest"
 schema_sha256=$(sha256sum "$schema_manifest" | awk '{print $1}')
+schema_six_sha256=$(head -n 6 "$schema_manifest" | sha256sum | awk '{print $1}')
+schema_seven_sha256=$(head -n 7 "$schema_manifest" | sha256sum | awk '{print $1}')
 jq -n \
   --arg tag "$release_tag" \
   --arg revision "$release_revision" \
@@ -233,7 +238,8 @@ jq -n \
   --arg core_version "$core_version" \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1}}' \
+  --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 8, from_sha256: [$schema_six, $schema_seven]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1}}' \
   > "$temporary_release/release.json"
 
 (
@@ -241,7 +247,8 @@ jq -n \
   sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-agent-bundle \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
     jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials \
-    manage-systemd-units verify-home-node install-home-node-core ui.sh \
+    com.hawkeynl.jarvis.devices.policy \
+    manage-systemd-units schema-backup verify-home-node install-home-node-core ui.sh \
     pricing-registry.json \
     install-agent-bundle \
     private-agent-poll jarvis-private-update systemd-*.service systemd-*.timer \

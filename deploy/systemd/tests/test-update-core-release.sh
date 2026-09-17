@@ -51,13 +51,17 @@ cat > "$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "$JARVIS_UPDATER_FIXTURE/systemctl.log"
+if [[ ${JARVIS_MIGRATION_FIXTURE:-false} == true && ${1:-} == restart && ${2:-} == jarvis-core.service && ! -e $JARVIS_UPDATER_FIXTURE/migrated-once ]]; then
+    printf 'candidate database\n' > "$JARVIS_SCHEMA_FIXTURE_ROOT/surrealdb/CURRENT"
+    touch "$JARVIS_UPDATER_FIXTURE/migrated-once"
+fi
 if [[ ${1:-} == restart && ${2:-} == "${JARVIS_UPDATER_SYSTEMCTL_FAIL_ONCE:-}" && \
     ! -e $JARVIS_UPDATER_FIXTURE/systemctl-failed-once ]]; then
     : > "$JARVIS_UPDATER_FIXTURE/systemctl-failed-once"
     exit 1
 fi
 case ${1:-} in
-    daemon-reload|restart|try-restart|is-enabled) exit 0 ;;
+    daemon-reload|restart|try-restart|is-enabled|stop|start) exit 0 ;;
     *) exit 1 ;;
 esac
 EOF
@@ -321,6 +325,7 @@ run_updater() {
     PATH="$fake_bin:$PATH" \
         JARVIS_UPDATER_FIXTURE="$fixture_dir" \
         JARVIS_SYSTEMD_ROOT="$systemd_fixture" \
+        JARVIS_POLKIT_ROOT="$fixture_dir/polkit" \
         JARVIS_RELEASES_ROOT=/opt/jarvis/releases \
         JARVIS_SYSTEMD_TEST_MODE=true \
         JARVIS_UPDATER_READYZ_FAIL="${JARVIS_UPDATER_READYZ_FAIL:-false}" \
@@ -747,4 +752,37 @@ if run_updater; then
 fi
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v9.0.0 ]]
 
+# Controlled schema transition uses the actual cold-copy helper, with only
+# systemd/Docker calls replaced. No production database path is touched.
+seed_active_release v10.0.0 "$same_migrations"
+write_release /opt/jarvis/releases v10.0.1 "$changed_migrations"
+mv /opt/jarvis/releases/jarvis-core-v10.0.1 /opt/jarvis/releases/v10.0.1
+candidate=/opt/jarvis/releases/v10.0.1
+install -m 0755 "$repo_dir/deploy/systemd/schema-backup.sh" "$candidate/schema-backup"
+install -m 0644 "$repo_dir/jarvis-core-admin/packaging/com.hawkeynl.jarvis.devices.policy" "$candidate/com.hawkeynl.jarvis.devices.policy"
+jq --arg previous "$same_migrations" '.tooling.local_devices = 1 | .schema_migration = {version:1,target:8,from_sha256:[$previous]}' "$candidate/release.json" > "$fixture_dir/migration-manifest"
+install -m 0644 "$fixture_dir/migration-manifest" "$candidate/release.json"
+(cd "$candidate" && sha256sum schema-backup com.hawkeynl.jarvis.devices.policy >> artifact-binaries.sha256)
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/docker"
+chmod 0755 "$fake_bin/docker"
+export JARVIS_SCHEMA_FIXTURE_ROOT="$fixture_dir/database-fixture" JARVIS_SCHEMA_TEST_MODE=true JARVIS_MIGRATION_FIXTURE=true
+mkdir -p "$JARVIS_SCHEMA_FIXTURE_ROOT/surrealdb"
+chmod 0700 "$JARVIS_SCHEMA_FIXTURE_ROOT" "$JARVIS_SCHEMA_FIXTURE_ROOT/surrealdb"
+printf 'old database\n' > "$JARVIS_SCHEMA_FIXTURE_ROOT/surrealdb/CURRENT"
+rm -f -- "$fixture_dir/readyz-failed-once"
+if JARVIS_UPDATER_READYZ_FAIL=true run_updater --migrate-staged v10.0.1; then
+    echo 'migration with failed readiness unexpectedly succeeded' >&2; exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v10.0.0 ]]
+cmp <(printf 'old database\n') "$JARVIS_SCHEMA_FIXTURE_ROOT/surrealdb/CURRENT"
+[[ ! -e $fixture_dir/polkit/com.hawkeynl.jarvis.devices.policy ]]
+rm -f -- "$fixture_dir/migrated-once"
+run_updater --migrate-staged v10.0.1
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v10.0.1 ]]
+cmp <(printf 'candidate database\n') "$JARVIS_SCHEMA_FIXTURE_ROOT/surrealdb/CURRENT"
+cmp "$candidate/com.hawkeynl.jarvis.devices.policy" "$fixture_dir/polkit/com.hawkeynl.jarvis.devices.policy"
+find "$JARVIS_SCHEMA_FIXTURE_ROOT/migration-backups" -name committed | grep -q .
+if run_updater --rollback-version v10.0.0; then
+    echo 'post-migration binary-only rollback unexpectedly succeeded' >&2; exit 1
+fi
 echo "Home Node updater fixture tests passed"
