@@ -13,6 +13,20 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+// 32 equally likely, readable symbols: 12 characters retain 60 bits of entropy.
+// The ten-minute expiry, LAN restriction, rate limit and bootstrap latch remain.
+const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const CODE_LENGTH: usize = 12;
+
+fn encode_code(bytes: &[u8; CODE_LENGTH]) -> Zeroizing<String> {
+    Zeroizing::new(
+        bytes
+            .iter()
+            .map(|byte| CODE_ALPHABET[(byte & 31) as usize] as char)
+            .collect(),
+    )
+}
+
 #[derive(Debug, Subcommand)]
 pub enum AccountCommand {
     /// Generate a ten-minute first-device code for an explicitly allowed LAN.
@@ -51,10 +65,10 @@ pub fn run(command: AccountCommand, json: bool) -> Result<()> {
         bail!("Jarvis service group is unavailable");
     }
     let gid = unsafe { (*group).gr_gid };
-    let mut raw = Zeroizing::new([0_u8; 32]);
+    let mut raw = Zeroizing::new([0_u8; CODE_LENGTH]);
     rand::RngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut *raw)
         .map_err(|_| anyhow::anyhow!("secure randomness unavailable"))?;
-    let code = Zeroizing::new(hex::encode(raw.as_slice()));
+    let code = encode_code(&raw);
     let issued_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let policy = ActivationPolicy {
         schema_version: 1,
@@ -86,4 +100,49 @@ pub fn run(command: AccountCommand, json: bool) -> Result<()> {
     )?;
     writeln!(tty, "Use it with your new account password on the first device. Existing enrollment cannot be reset with this code.")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_has_twelve_readable_symbols_and_uniform_mapping() {
+        let mut counts = [0; 32];
+        for byte in 0..=255_u8 {
+            let code = encode_code(&[byte; CODE_LENGTH]);
+            assert_eq!(code.len(), CODE_LENGTH);
+            assert!(code.bytes().all(|symbol| CODE_ALPHABET.contains(&symbol)));
+            let index = CODE_ALPHABET
+                .iter()
+                .position(|symbol| *symbol == code.as_bytes()[0])
+                .unwrap();
+            counts[index] += 1;
+        }
+        assert_eq!(counts, [8; 32]);
+    }
+
+    #[test]
+    fn short_code_uses_existing_hash_only_policy() {
+        let code = encode_code(&[0; CODE_LENGTH]);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let policy = ActivationPolicy {
+            schema_version: 1,
+            secret_sha256: hex::encode(Sha256::digest(code.as_bytes())),
+            allowed_cidrs: vec!["10.23.45.10/32".into()],
+            issued_at: now,
+            expires_at: now + 600,
+        };
+        let verifier = policy.validate(now).unwrap();
+        assert!(verifier.verifies(&code));
+        assert!(!verifier.verifies("BBBBBBBBBBBB"));
+        assert!(!verifier.verifies("aaaaaaaaaaaa"));
+        assert!(!serde_json::to_string(&policy)
+            .unwrap()
+            .contains(code.as_str()));
+        assert!(policy.validate(now + 600).is_err());
+    }
 }

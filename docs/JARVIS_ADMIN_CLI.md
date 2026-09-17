@@ -301,6 +301,18 @@ is never rendered by the TUI or emitted in JSON.
 
 ## Diagnostics
 
+### First-device activation code
+
+`sudo jarvis account activation-code --allow-cidr <private-device-ip>/32`
+prints a random, case-sensitive 12-character code in the controlling terminal.
+The alphabet uses uppercase letters and digits without `I`, `O`, `0` or `1`.
+Codes expire after ten minutes and are only valid within the explicitly allowed
+private network. Only their SHA-256 verifier is persisted. First-account
+activation is one-time; generating another code does not reset enrollment.
+Never send codes through command arguments, redirects, logs or support messages.
+The account password is separate and must be at least 15 characters. Older
+hexadecimal activation codes remain supported by the verifier and clients.
+
 ### Schema-changing account-onboarding release
 
 Routine `update --latest` and `update --version` intentionally refuse a changed
