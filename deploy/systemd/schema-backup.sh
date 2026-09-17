@@ -10,6 +10,7 @@ backups=/var/backups/jarvis-migrations
 if [[ -n ${JARVIS_SCHEMA_FIXTURE_ROOT:-} ]]; then
     [[ ${GITHUB_ACTIONS:-} == true && ${JARVIS_SCHEMA_TEST_MODE:-} == true && $JARVIS_SCHEMA_FIXTURE_ROOT == /tmp/* ]] || fail 'test-only override refused'
     root=$JARVIS_SCHEMA_FIXTURE_ROOT
+    [[ $(realpath -e -- "$root") == "$root" ]] || fail 'test root must be canonical'
     backups="$root/migration-backups"
 fi
 database="$root/surrealdb"
