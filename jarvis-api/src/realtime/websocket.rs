@@ -76,6 +76,7 @@ async fn serve(
         tokio::select! {
             event = subscription.receiver.recv() => {
                 let Some(event) = event else { break };
+                if subscription.receiver.is_closed() { break; }
                 let Ok(text) = serde_json::to_string(event.as_ref()) else { break };
                 if !send(&mut socket, Message::Text(text.into())).await { break; }
             }

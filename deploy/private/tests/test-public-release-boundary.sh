@@ -68,9 +68,12 @@ require_literal "$release_builder" \
 require_literal "$release_builder" \
     'components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}' \
     "release manifest must expose separate Core, CLI, and Core Admin App versions"
-require_literal "$release_builder" \
-    'tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1}' \
-    "release manifest must bind private-agent, admin-helper and systemd-unit tooling capabilities"
+# Individual capability guards permit additive versioned tooling. Behavioral
+# package tests validate the generated manifest/artifact pairing separately.
+for capability in private_agents admin_helpers systemd_units local_devices; do
+    require_literal "$release_builder" "$capability: 1" \
+        "release manifest must bind tooling capability $capability"
+done
 require_literal "$release_builder" \
     'install -m 0755 deploy/systemd/manage-systemd-units.sh "$temporary_release/manage-systemd-units"' \
     "canonical release builder must stage the fixed managed-systemd boundary"

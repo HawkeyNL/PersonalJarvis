@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Jarvis Core Administration",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "identifier": "com.hawkeynl.jarvis.core.admin",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -39,6 +39,7 @@
       "deb": {
         "desktopTemplate": "../packaging/tauri-generated.desktop",
         "files": {
+          "/usr/share/polkit-1/actions/com.hawkeynl.jarvis.devices.policy": "../packaging/com.hawkeynl.jarvis.devices.policy",
           "/usr/share/applications/com.hawkeynl.jarvis.core.admin.desktop": "../packaging/jarvis-core-admin.desktop"
         }
       }

@@ -135,6 +135,29 @@ impl Inner {
 }
 
 impl Hub {
+    /// Drop revoked subscriptions immediately, without waiting for heartbeat
+    /// revalidation. The socket rejects any already queued envelope on closure.
+    pub fn disconnect_owner(&self, user: Uuid, device: Option<Uuid>) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner
+                .sinks
+                .retain(|_, sink| sink.user != user || device.is_some_and(|id| sink.device != id));
+            if inner
+                .voices
+                .get(&user)
+                .is_some_and(|voice| device.is_none_or(|id| voice.device == id))
+            {
+                inner.voices.remove(&user);
+                inner.publish(
+                    user,
+                    Event::VoiceOwnerChanged {
+                        device_id: None,
+                        run_id: None,
+                    },
+                );
+            }
+        }
+    }
     pub fn claim_voice(&self, user: Uuid, device: Uuid, run: Option<Uuid>) -> bool {
         let Ok(mut inner) = self.0.lock() else {
             return false;
@@ -443,6 +466,27 @@ mod tests {
         Event::ConversationDeleted {
             conversation_id: Uuid::nil(),
         }
+    }
+
+    #[test]
+    fn revocation_closes_only_target_sockets_and_releases_voice() {
+        let hub = Hub::default();
+        let owner = Uuid::now_v7();
+        let revoked = Uuid::now_v7();
+        let a = hub.subscribe(owner, revoked).unwrap();
+        let b = hub.subscribe(owner, Uuid::now_v7()).unwrap();
+        let unrelated = hub.subscribe(Uuid::now_v7(), Uuid::now_v7()).unwrap();
+        assert!(hub.claim_voice(owner, revoked, None));
+        hub.disconnect_owner(owner, Some(revoked));
+        // Closure is visible even with queued envelopes: sockets must discard
+        // these, rather than delivering buffered private data after revocation.
+        assert!(a.receiver.is_closed());
+        assert!(!b.receiver.is_closed());
+        assert!(!unrelated.receiver.is_closed());
+        assert_eq!(hub.voice_owner(owner), None);
+        hub.disconnect_owner(owner, None);
+        assert!(b.receiver.is_closed());
+        assert!(!unrelated.receiver.is_closed());
     }
 
     #[tokio::test]

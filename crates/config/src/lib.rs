@@ -8,6 +8,9 @@
 // from `load()` for ergonomics; boxing it would break `?` in anyhow callers.
 #![allow(clippy::result_large_err)]
 
+#[cfg(unix)]
+pub mod activation;
+
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
@@ -29,14 +32,27 @@ use subtle::ConstantTimeEq;
 pub struct BootstrapEnrollment {
     secret_hash: [u8; 32],
     allowed_cidrs: Vec<IpNet>,
+    expires_at: Option<u64>,
 }
 
 impl BootstrapEnrollment {
+    pub fn expires_at(&self) -> Option<u64> {
+        self.expires_at
+    }
     pub fn allows(&self, ip: IpAddr) -> bool {
         self.allowed_cidrs.iter().any(|cidr| cidr.contains(&ip))
     }
 
     pub fn verifies(&self, supplied: &str) -> bool {
+        if supplied.len() > 256
+            || self.expires_at.is_some_and(|expires| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(true, |now| now.as_secs() >= expires)
+            })
+        {
+            return false;
+        }
         let actual = Sha256::digest(supplied.as_bytes());
         actual.as_slice().ct_eq(&self.secret_hash).into()
     }
@@ -597,6 +613,7 @@ impl AppConfig {
         Ok(Some(BootstrapEnrollment {
             secret_hash,
             allowed_cidrs,
+            expires_at: None,
         }))
     }
 

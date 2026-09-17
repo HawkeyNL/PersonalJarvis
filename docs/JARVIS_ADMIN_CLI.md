@@ -301,6 +301,74 @@ is never rendered by the TUI or emitted in JSON.
 
 ## Diagnostics
 
+### Schema-changing account-onboarding release
+
+Routine `update --latest` and `update --version` intentionally refuse a changed
+database schema. The schema-8 account release has an explicit maintenance path
+for the exact reviewed schema-6/7 fingerprints declared in its release manifest.
+It is not a generic migration override and is not invoked by the timer.
+
+After the candidate archive has been verified and staged in the immutable release
+directory, use **that candidate's** updater, not an older installed updater:
+
+```text
+sudo /opt/jarvis/releases/<candidate-tag>/update-core-release --migrate-staged <candidate-tag>
+```
+
+Replace both placeholders with the same verified `vMAJOR.MINOR.PATCH` tag.
+Do not copy individual binaries into the active release or bypass the candidate
+acceptance process. Schedule a maintenance window and close connected clients.
+This command stops Core and the fixed production SurrealDB service, checks that
+the database container stopped, creates a root-only cold snapshot, verifies the
+copied bytes, then activates matching binaries, units and PolicyKit policy.
+The database's own storage version and container image are not upgraded here.
+
+On failed activation, the original database snapshot is restored before the old
+Core is restarted. Both the snapshot and failed candidate database are retained
+privately for recovery; neither is a downloadable artifact. Snapshot creation
+failure does not replace the original database. If recovery itself fails, do not
+keep retrying: preserve the reported recovery files for local owner inspection.
+
+After successful activation, the backup is marked committed. A later ordinary
+rollback across schema fingerprints remains refused. Restoring an older database
+can lose new messages and resurrect revoked sessions/devices: it requires a
+separate, explicitly planned disaster recovery procedure, not an automatic
+binary rollback. Power loss/SIGKILL recovery is likewise a local operator task;
+the controlled rollback tests cover reported activation failures, not arbitrary
+host/storage failure. Keep a separately verified owner backup before maintenance.
+
+### Local device administration
+
+Core Admin's Devices page uses local operating-system administrator authority,
+not a remotely enrolled device identity. The GUI remains unprivileged. Its
+existing five-minute inactivity lock is retained; each approve, deny or revoke
+action additionally requests administrator authentication through PolicyKit.
+Passwords are never passed through Vue, command arguments or the local protocol.
+The packaged action uses `auth_admin`, not the cached `auth_admin_keep` policy.
+Administrator-installed PolicyKit rules remain part of the host trust boundary.
+
+The corresponding recovery/SSH commands are:
+
+```bash
+sudo jarvis --json devices list
+sudo jarvis --json devices pending
+sudo jarvis devices approve <request-uuid> --fingerprint <displayed-fingerprint>
+sudo jarvis devices deny <request-uuid>
+sudo jarvis devices revoke <device-uuid>
+```
+
+Check the pending fingerprint against the requesting device before approving.
+Revocation invalidates the device's sessions and realtime connections. Revoking
+every device does **not** reopen first-device activation or reset the account
+password. These commands are not a lost-password recovery mechanism.
+
+The fixed local Unix socket accepts kernel-verified root peers only. It is
+created inside Core's systemd-managed `RuntimeDirectory=jarvis-core-admin`;
+matching Core unit policy and the Core Admin PolicyKit package are required.
+There is no new TCP listener, HTTP administrator endpoint or arbitrary command
+executor. Remote client approvals still require their action-bound device
+signature. The existing CLI `sudo` authentication policy is unchanged.
+
 ```bash
 sudo jarvis services status
 sudo jarvis logs core --lines 100

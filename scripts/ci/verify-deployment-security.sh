@@ -2,6 +2,9 @@
 set -euo pipefail
 
 bash scripts/release/tests/test-build-linux-package.sh
+sudo bash deploy/systemd/tests/test-device-policy-release.sh
+sudo bash deploy/systemd/tests/test-schema-backup.sh
+sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-schema-backup-surreal.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-update-core-release.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-jarvis-admin-cli.sh
 bash deploy/systemd/tests/test-ui-tty.sh

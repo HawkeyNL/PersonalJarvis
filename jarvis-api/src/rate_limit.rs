@@ -234,6 +234,8 @@ pub(crate) async fn rate_limit_mw(
         "/v1/auth/pairing/requests" => Some(limits.enroll_per_min.min(5)),
         "/v1/auth/challenge" => Some(limits.challenge_per_min),
         "/v1/auth/login" => Some(limits.login_per_min),
+        _ if path.starts_with("/v1/auth/account/") => Some(5),
+        _ if path.starts_with("/v1/devices/") && path.ends_with("/revoke-request") => Some(5),
         _ if path.starts_with("/v1/auth/pairing/requests/") && path.ends_with("/status") => {
             Some(limits.challenge_per_min)
         }

@@ -14,6 +14,12 @@ configuration. Keep changes narrow and avoid speculative infrastructure.
 - Jarvis runtime, system-administration and other security-sensitive product
   actions require real device-signed, action-bound, unexpired approval; a
   Boolean approval flag or ordinary session is never sufficient.
+- Owner-approved exception: local Home Node device enrollment/revocation may
+  use freshly authenticated OS administrator authority through a narrow,
+  root-peer-verified local IPC boundary. This is not an HTTP/session bypass,
+  does not authorize agents, and does not relax signed approval for remote
+  clients or other privileged actions. Core Admin remains unprivileged and
+  must never receive the OS password; its five-minute inactivity lock remains.
 - Normal source-control and release-engineering operations in this repository
   (including editing, committing, pushing, tagging and dispatching CI/release
   workflows) are outside the Jarvis device-signing protocol. They still require

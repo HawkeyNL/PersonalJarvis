@@ -502,6 +502,11 @@ async fn main() -> anyhow::Result<()> {
             jarvis_api::refresh_usage_snapshot(&usage_snapshot_state).await;
         }
     });
+    let _local_device_admin = if state.environment == "production" {
+        Some(jarvis_api::local_devices::start(state.clone())?)
+    } else {
+        None
+    };
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "jarvis-api listening");
     // `into_make_service_with_connect_info` exposes the peer address so the

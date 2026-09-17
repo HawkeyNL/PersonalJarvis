@@ -14,6 +14,13 @@ use uuid::Uuid;
 
 use jarvis_store::Database;
 
+#[path = "account.rs"]
+pub mod account;
+
+#[cfg(unix)]
+#[path = "local_devices.rs"]
+pub mod local_devices;
+
 use super::{
     verify_signature, Authenticated, Challenge, Device, DeviceKey, IdentityError, LoginResult,
     PairingRequest, Platform, Session, UnlockRequest, User,
@@ -99,6 +106,7 @@ struct SessionBindings {
     device_id: String,
     #[serde(with = "serde_bytes")]
     token_hash: Vec<u8>,
+    account_revision: String,
 }
 
 #[derive(Serialize)]
@@ -381,6 +389,25 @@ pub async fn approve_pairing_request(
         request.expires_at,
     )?;
     verify_device_signature(db, user_id, approver_device_id, &message, signature).await?;
+    activate_pairing_request(db, request, Some(approver_device_id)).await
+}
+
+#[derive(Serialize)]
+struct PairingActivationBindings {
+    id: String,
+    approver_device_id: Option<String>,
+    fingerprint: String,
+}
+
+// Shared atomic activation: callers first prove either the remote device
+// signature or the narrowly authorized local kernel-root peer.
+async fn activate_pairing_request(
+    db: &Database,
+    request: PairingRequest,
+    approver_device_id: Option<Uuid>,
+) -> Result<Device, IdentityError> {
+    let id = request.id;
+    let user_id = request.user_id;
     let device_id = Uuid::now_v7();
     let key_id = Uuid::now_v7();
     let response = db
@@ -388,7 +415,7 @@ pub async fn approve_pairing_request(
             "BEGIN TRANSACTION; \
              LET $claim = UPDATE device_pairing_requests \
                SET status = 'approved', approved_by_device_id = $approver_device_id, resolved_at = time::now() \
-               WHERE record::id(id) = $id AND user_id = $user_id AND status = 'pending' AND expires_at > time::now() RETURN AFTER; \
+               WHERE record::id(id) = $id AND user_id = $user_id AND candidate_fingerprint = $fingerprint AND status = 'pending' AND expires_at > time::now() RETURN AFTER; \
              IF array::len($claim) = 0 { THROW 'pairing request unavailable'; }; \
              CREATE devices SET id = $device_id, user_id = $user_id, name = $name, platform = $platform, \
                status = 'active', created_at = time::now(), updated_at = time::now(); \
@@ -406,10 +433,11 @@ pub async fn approve_pairing_request(
             algorithm: "ed25519".to_string(),
             public_key: request.candidate_public_key,
         })
-        .bind(json!({
-            "id": id.to_string(),
-            "approver_device_id": approver_device_id.to_string(),
-        }))
+        .bind(PairingActivationBindings {
+            id: id.to_string(),
+            approver_device_id: approver_device_id.map(|id| id.to_string()),
+            fingerprint: request.candidate_fingerprint,
+        })
         .await
         .map_err(|_| IdentityError::DatabaseSurreal)?;
     response.check().map_err(|_| IdentityError::AuthFailed)?;
@@ -573,6 +601,16 @@ pub async fn login(
     challenge_id: Uuid,
     signature: &[u8],
 ) -> Result<LoginResult, IdentityError> {
+    login_with_password(db, device_id, challenge_id, signature, None).await
+}
+
+pub async fn login_with_password(
+    db: &Database,
+    device_id: Uuid,
+    challenge_id: Uuid,
+    signature: &[u8],
+    password: Option<crate::password::AccountPassword>,
+) -> Result<LoginResult, IdentityError> {
     let challenge: StoredChallenge = one(
         db,
         "SELECT nonce, expires_at, consumed_at FROM auth_challenges WHERE record::id(id) = $id AND device_id = $device_id LIMIT 1",
@@ -600,6 +638,14 @@ pub async fn login(
     .await?
     .ok_or(IdentityError::AuthFailed)?;
 
+    let account_revision = account::verify_password(
+        db,
+        crate::password::PasswordService::shared(),
+        owner.user_id,
+        password,
+    )
+    .await?;
+
     // This conditional claim is the replay boundary: only one concurrent caller
     // can observe a returned record and proceed to mint a session.
     let claimed: Option<ClaimedRecord> = one(
@@ -621,13 +667,22 @@ pub async fn login(
     let token_hash = sha2::Sha256::digest(&token).to_vec();
     execute(
         db,
-        "CREATE sessions SET id = $id, user_id = $user_id, device_id = $device_id, token_hash = <bytes>$token_hash, \
-         created_at = time::now(), expires_at = time::now() + 7d, last_used_at = NONE, revoked_at = NONE RETURN AFTER",
+        "BEGIN TRANSACTION; \
+         LET $account = SELECT revision FROM account_passwords WHERE user_id = $user_id; \
+         IF (array::len($account) = 0 AND $account_revision != '') OR \
+            (array::len($account) > 0 AND $account[0].revision != $account_revision) \
+            { THROW 'authentication failed'; }; \
+         LET $active = SELECT id FROM devices WHERE record::id(id) = $device_id AND user_id = $user_id AND status = 'active'; \
+         IF array::len($active) != 1 { THROW 'authentication failed'; }; \
+         CREATE sessions SET id = $id, user_id = $user_id, device_id = $device_id, token_hash = <bytes>$token_hash, \
+         created_at = time::now(), expires_at = time::now() + 7d, last_used_at = NONE, revoked_at = NONE; \
+         COMMIT TRANSACTION;",
         SessionBindings {
             id: Uuid::now_v7().to_string(),
             user_id: owner.user_id.to_string(),
             device_id: device_id.to_string(),
             token_hash: token_hash.clone(),
+            account_revision: account_revision.unwrap_or_default(),
         },
     )
     .await?;
@@ -1089,6 +1144,26 @@ mod tests {
         )
         .await
         .is_err());
+
+        // Local host approval shares the same one-shot transaction, but must
+        // not fabricate an approving enrolled-device ID. Exercise the NONE
+        // binding against the real schema, independently of root IPC proof.
+        let local_request = create_pairing_request(
+            &db,
+            owner.id,
+            "Local fixture",
+            Platform::Ios,
+            &SigningKey::from_bytes(&rand::random())
+                .verifying_key()
+                .to_bytes(),
+        )
+        .await?;
+        let local_id = local_request.id;
+        let local_device = activate_pairing_request(&db, local_request, None).await?;
+        assert_eq!(local_device.user_id, owner.id);
+        let consumed = pairing_request(&db, local_id, owner.id).await?.unwrap();
+        assert_eq!(consumed.status, "approved");
+        assert!(activate_pairing_request(&db, consumed, None).await.is_err());
 
         // Revoking a device invalidates every existing bearer session at once;
         // a stolen token must not remain useful until its normal expiry.

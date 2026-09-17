@@ -20,6 +20,9 @@ use jarvis_api::{build_router, AppState, AuthLimits, RateLimiter, JARVIS_SYSTEM_
 #[path = "realtime/mod.rs"]
 mod realtime;
 
+#[path = "account/mod.rs"]
+mod account;
+
 async fn json_body(response: axum::response::Response) -> Value {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await

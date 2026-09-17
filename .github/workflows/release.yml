@@ -37,6 +37,8 @@ jobs:
             sleep 1
           done
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-identity surreal::tests::challenge_login_cannot_be_replayed -- --ignored
+          JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-identity surreal::account::tests -- --ignored --test-threads=1
+          JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-store migration_tests -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-portfolio surreal::tests::preserves_decimal_holdings_and_owner_scope -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-api --test surreal_api -- --ignored
 
