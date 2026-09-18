@@ -5,6 +5,7 @@ set -euo pipefail
 
 [[ ${GITHUB_ACTIONS:-} == true ]] || { echo "refusing outside GitHub Actions" >&2; exit 1; }
 [[ ${EUID} -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
+[[ ! -e /opt/jarvis && ! -L /opt/jarvis ]] || { echo "refusing to replace an existing /opt/jarvis" >&2; exit 1; }
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 stager="$repo_dir/deploy/systemd/stage-core-release.sh"
@@ -147,6 +148,9 @@ for unit in jarvis-core.service jarvis-config-broker.service jarvis-codex-broker
 done
 grep -qx '1.2.3' /opt/jarvis/releases/v1.2.3/jarvis-core-admin.version
 [[ -f /opt/jarvis/releases/v1.2.3/release.verification ]]
+cmp "$fixture/jarvis-core-v1.2.3-linux-x86_64.tar.gz.sha256" \
+    /opt/jarvis/releases/v1.2.3/release.verification
+[[ -z $(find /opt/jarvis/releases -maxdepth 1 -name '.staging.*' -print -quit) ]]
 [[ $(stat -c '%U:%G:%a' /opt/jarvis/releases/v1.2.3) == root:root:755 ]]
 
 rm -rf -- /opt/jarvis
