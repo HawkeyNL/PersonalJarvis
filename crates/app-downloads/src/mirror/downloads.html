@@ -20,6 +20,13 @@ a { color: #7ee7ec; display: block; padding: 16px; border: 1px solid #416273; bo
 a:hover { background: #1b3040; }
 a:focus-visible { outline: 3px solid #7ee7ec; outline-offset: 3px; }
 footer { color: #b5c4d6; border-top: 1px solid #293849; padding-top: 20px; }
+.version-picker { display: none; }
+@supports selector(:has(option:checked)) {
+  .version-picker { display: block; }
+}
+select { width: 100%; max-width: 360px; min-height: 48px; margin: 8px 0 24px; padding: 10px 14px; background: #0b111b; color: #edf4fa; border: 1px solid #416273; border-radius: 10px; font: inherit; }
+select:focus-visible { outline: 3px solid #7ee7ec; outline-offset: 3px; }
+.latest-badge { display: inline-block; color: #34f5a0; background: #123327; border-radius: 6px; padding: 2px 8px; font-size: .85rem; }
 </style>
 </head>
 <body><main>
