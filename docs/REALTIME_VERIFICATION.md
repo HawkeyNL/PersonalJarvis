@@ -130,6 +130,15 @@ were tested at `46916f2` (the pre-existing release-preparation checkout), withou
 changing their source or immutable dependency pin. iOS cannot run locally on
 this Linux host; the existing simulator evidence is not a new device test.
 
+Two shared Rust cursor regressions now cover epoch reset after `connection.ready`,
+rejected events before readiness, stale/duplicate sequence suppression, rejection
+of old-epoch events, and incompatible protocols leaving the valid cursor intact.
+All 14 client-core tests passed with formatting and workspace clippy. These are
+test-only additions: no wire contract, runtime code or client pin was changed.
+Android's existing `RealtimeStateTest` has corresponding reconnect/sequence
+checks and passed in the JVM run above. This is not evidence of an actual
+mobile network switch or audible multi-device playback.
+
 ### September 16 revalidation
 
 The current Core review worktree is `dee8b692ce3ba6837d2d109250d3ec73adae11ca`;
