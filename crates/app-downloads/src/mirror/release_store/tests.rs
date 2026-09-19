@@ -23,6 +23,35 @@ fn prepare(store: &ReleaseStore, f: &Fixture, public: &Path) -> Result<PathBuf> 
 }
 
 #[test]
+fn download_version_picker_defaults_to_semver_latest_without_scripts() {
+    let (_temp, root, public) = dirs();
+    let owner = unsafe { libc::geteuid() };
+    let store = ReleaseStore::open(&root, owner).unwrap();
+    for (version, build) in [("0.1.9", 1), ("0.1.10", 2)] {
+        prepare(&store, &Fixture::new(version, build), &public).unwrap();
+    }
+    super::super::Store::open(&public, owner)
+        .unwrap()
+        .render_index()
+        .unwrap();
+    let html = fs::read_to_string(public.join("index.html")).unwrap();
+    assert!(html.contains("<option value=\"0.1.10\" selected>v0.1.10 — Latest</option>"));
+    assert!(html.contains("<option value=\"0.1.9\">v0.1.9</option>"));
+    assert_eq!(html.matches(" selected>").count(), 1);
+    assert_eq!(html.matches("class=\"latest-badge\"").count(), 1);
+    for version in ["0.1.9", "0.1.10"] {
+        assert!(html.contains(&format!("option[value=\"{version}\"]:checked) .client-release:not([data-version=\"{version}\"])")));
+        assert!(html.contains(&format!(
+            "class=\"client-release\" data-version=\"{version}\""
+        )));
+        assert!(html.contains(&format!("/downloads/releases/v{version}/ios-arm64/")));
+    }
+    assert!(html.contains("for=\"release-version\""));
+    assert!(!html.contains("<script"));
+    assert!(!html.contains("onchange="));
+}
+
+#[test]
 fn complete_signed_release_stages_and_activates_exact_api_layout() {
     let (_temp, root, public) = dirs();
     let owner = unsafe { libc::geteuid() };
