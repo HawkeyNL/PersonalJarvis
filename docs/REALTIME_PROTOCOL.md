@@ -68,8 +68,14 @@ an HTTP disconnect. New clients use the durable runs endpoint instead.
 
 A run has a durable unique reservation derived from authenticated user, device
 and request UUID, plus a hash of the original typed payload. A retry reuses the
-reservation; a changed payload with the same ID conflicts. Reservations remain
-after failure/deletion and are not automatically pruned or replayed. After a
+reservation; a changed payload with the same ID conflicts. This also applies
+to concurrent retries: if the same authenticated run already owns the
+conversation but its initial transaction is not yet visible, the duplicate
+submission waits up to two seconds for that reservation (50 ms polling). It
+never launches another worker. Unavailable/ambiguous persistence returns an
+error; clients retain the request ID for recovery rather than inventing a new
+one. A different run competing for the conversation still conflicts.
+Reservations remain after failure/deletion and are not automatically pruned or replayed. After a
 restart, unfinished reservations are reported as interrupted, never inferred
 to be safe to repeat. This deliberately prefers an explicit new owner request
 over accidentally repeating an ambiguous paid inference.

@@ -246,8 +246,16 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     event(&mut b).await;
     let request =
         json!({"request_id":Uuid::now_v7(),"messages":[{"role":"user","content":"One question"}]});
-    let (status, submitted) = post(&app, &token_a, "/v1/assistant/runs", request.clone()).await;
+    // Exercise overlapping mobile/HTTP retries, not only a retry after the
+    // initial acknowledgement. Both requests must converge on one durable run.
+    let ((status, submitted), (concurrent_status, concurrent)) = tokio::join!(
+        post(&app, &token_a, "/v1/assistant/runs", request.clone()),
+        post(&app, &token_a, "/v1/assistant/runs", request.clone()),
+    );
     assert_eq!(status, StatusCode::OK, "{submitted}");
+    assert_eq!(concurrent_status, StatusCode::OK, "{concurrent}");
+    assert_eq!(submitted["run_id"], concurrent["run_id"]);
+    assert_eq!(submitted["conversation_id"], concurrent["conversation_id"]);
     let (retry_status, retry) = post(&app, &token_a, "/v1/assistant/runs", request.clone()).await;
     assert_eq!(retry_status, StatusCode::OK, "{retry}");
     assert_eq!(submitted["run_id"], retry["run_id"]);
@@ -510,10 +518,13 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     // user turn is input; the model receives the canonical server conversation.
     let stale = json!({"request_id":Uuid::now_v7(), "conversation_id":canonical.conversation_id,
         "messages":[{"role":"assistant","content":"Invented stale answer"}, {"role":"user","content":"Next question"}]});
-    assert_eq!(
-        post(&app, &token_b, "/v1/assistant/runs", stale).await.0,
-        StatusCode::OK
+    let (next, overlapping) = tokio::join!(
+        post(&app, &token_b, "/v1/assistant/runs", stale.clone()),
+        post(&app, &token_b, "/v1/assistant/runs", stale),
     );
+    assert_eq!(next.0, StatusCode::OK, "{}", next.1);
+    assert_eq!(overlapping.0, StatusCode::OK, "{}", overlapping.1);
+    assert_eq!(next.1["run_id"], overlapping.1["run_id"]);
     loop {
         if let Event::AssistantCompleted { message, .. } = event(&mut reconnected).await.event {
             assert_eq!(message.conversation_id, canonical.conversation_id);
@@ -571,6 +582,24 @@ async fn disconnect_and_provider_failure_never_repeat_or_lose_the_user_message(
         assert_eq!(status, StatusCode::OK);
         tokio::time::timeout(Duration::from_secs(5), started.notified()).await?;
         let conversation: Uuid = serde_json::from_value(run["conversation_id"].clone())?;
+        let mut different_payload = request.clone();
+        different_payload["messages"][0]["content"] = json!("Conflicting retry");
+        assert_eq!(
+            post(&app, &token, "/v1/assistant/runs", different_payload)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        let another_prompt = json!({"request_id":Uuid::now_v7(),
+            "conversation_id":conversation,
+            "messages":[{"role":"user","content":"A separate competing prompt"}]});
+        assert_eq!(
+            post(&app, &token, "/v1/assistant/runs", another_prompt)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
         let running = app
             .clone()
             .oneshot(

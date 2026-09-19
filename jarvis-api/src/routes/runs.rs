@@ -141,10 +141,51 @@ pub(crate) async fn submit(
             Json(json!({"error":"no such conversation"})),
         ));
     }
-    let guard = state
+    let guard = match state
         .realtime
         .reserve_identified_run(auth.user.id, conversation, id)
-        .ok_or_else(conflict)?;
+    {
+        Some(guard) => guard,
+        None => {
+            // An identical request can arrive after the in-process reservation
+            // but before its database transaction commits. Do not misreport it
+            // as another prompt, or dispatch a second worker. Wait only for
+            // this exact authenticated run, bounded independently of DB latency.
+            if !state
+                .realtime
+                .identified_run_active(auth.user.id, conversation, id)
+            {
+                return Err(conflict());
+            }
+            return tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(stored) = load(&state, auth.user.id, id).await? {
+                        if stored.payload_hash != hash {
+                            return Err(conflict());
+                        }
+                        return Ok(response(
+                            &stored,
+                            epoch,
+                            state.realtime.identified_run_active(
+                                auth.user.id,
+                                stored.conversation_id,
+                                stored.id,
+                            ),
+                        ));
+                    }
+                    if !state
+                        .realtime
+                        .identified_run_active(auth.user.id, conversation, id)
+                    {
+                        return Err(unavailable());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .map_err(|_| unavailable())?;
+        }
+    };
     let message = CanonicalMessage {
         id: Uuid::now_v7(),
         conversation_id: conversation,
