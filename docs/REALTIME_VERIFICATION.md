@@ -115,6 +115,21 @@ Cargo audit exited zero with the same three allowed warnings listed below.
 This does not establish physical iPhone/Android/desktop acceptance. No merge,
 release, tag, deployment or client source change was performed in this audit.
 
+The same integration fixture now also constructs a new `AppState`/hub epoch
+against the existing fixture database. Retrying a previously completed or failed
+run returns the exact persisted identity/state and byte-identical REST history,
+with no additional provider invocation. A previously running reservation is
+reported as `interrupted` by both submission retry and run-status lookup; it
+does not authorize another inference. This tests loss of in-process state, not
+an OS reboot, database power loss, or physical-device reconnect.
+
+The updated two database tests, formatting and all-target/all-feature clippy
+passed again after those assertions. Native desktop tests also passed (34),
+as did all 20 Android realtime-core JVM tests with `--rerun-tasks`. The clients
+were tested at `46916f2` (the pre-existing release-preparation checkout), without
+changing their source or immutable dependency pin. iOS cannot run locally on
+this Linux host; the existing simulator evidence is not a new device test.
+
 ### September 16 revalidation
 
 The current Core review worktree is `dee8b692ce3ba6837d2d109250d3ec73adae11ca`;

@@ -610,6 +610,40 @@ async fn disconnect_and_provider_failure_never_repeat_or_lose_the_user_message(
             )
             .await?;
         assert_eq!(json_body(running).await["assistant_running"], true);
+        // A fresh Core epoch cannot know whether an old in-flight paid request
+        // finished remotely. Preserve the durable reservation as interrupted;
+        // neither retry nor status recovery may start another inference.
+        let mut recovering = state(db.clone(), None).await;
+        assert_ne!(recovering.realtime.epoch(), hub.epoch());
+        recovering.llm = Arc::new(Fake(
+            count.clone(),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+        let recovering_app = build_router(recovering);
+        let interrupted = post(
+            &recovering_app,
+            &token,
+            "/v1/assistant/runs",
+            request.clone(),
+        )
+        .await;
+        assert_eq!(interrupted.0, StatusCode::OK);
+        assert_eq!(interrupted.1["run_id"], run["run_id"]);
+        assert_eq!(interrupted.1["state"], "interrupted");
+        let recovered_status = recovering_app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/assistant/runs/{}",
+                        run["run_id"].as_str().unwrap()
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(recovered_status.status(), StatusCode::OK);
+        assert_eq!(json_body(recovered_status).await, interrupted.1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
         drop(display); // All displays gone, while inference is still running.
         let retry = post(&app, &token, "/v1/assistant/runs", request.clone()).await;
         assert_eq!(retry.0, StatusCode::OK);
@@ -638,8 +672,32 @@ async fn disconnect_and_provider_failure_never_repeat_or_lose_the_user_message(
             history["messages"].as_array().unwrap().len(),
             if fail { 1 } else { 2 }
         );
-        let retry = post(&app, &token, "/v1/assistant/runs", request).await;
+        let retry = post(&app, &token, "/v1/assistant/runs", request.clone()).await;
         assert_eq!(retry.1["state"], if fail { "failed" } else { "completed" });
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        // Simulate loss of all in-process Core state, retaining only the DB.
+        // A persisted success/failure must not become permission to regenerate.
+        let mut restarted = state(db.clone(), None).await;
+        assert_ne!(restarted.realtime.epoch(), hub.epoch());
+        restarted.llm = Arc::new(Fake(
+            count.clone(),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+        let restarted_app = build_router(restarted);
+        let after_restart = post(&restarted_app, &token, "/v1/assistant/runs", request).await;
+        assert_eq!(after_restart.0, StatusCode::OK);
+        assert_eq!(after_restart.1, retry.1);
+        let recovered = restarted_app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/conversations/{conversation}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(json_body(recovered).await, history);
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
         if !fail {
             let usage = jarvis_usage::month_statistics(&db).await?;
