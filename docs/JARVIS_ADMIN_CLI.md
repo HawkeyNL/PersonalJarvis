@@ -374,6 +374,14 @@ Revocation invalidates the device's sessions and realtime connections. Revoking
 every device does **not** reopen first-device activation or reset the account
 password. These commands are not a lost-password recovery mechanism.
 
+After the last device is revoked, an already activated account can submit a new
+pending pairing request with its existing account password. The request alone
+does not activate a device or issue a session. With no active signing device
+left, the owner must approve it through the local OS-authenticated Devices page
+or the root-peer CLI above, after checking its fingerprint. First-device
+activation remains permanently closed; do not erase database activation state
+or generate another bootstrap code to recover a revoked device.
+
 The fixed local Unix socket accepts kernel-verified root peers only. It is
 created inside Core's systemd-managed `RuntimeDirectory=jarvis-core-admin`;
 matching Core unit policy and the Core Admin PolicyKit package are required.
