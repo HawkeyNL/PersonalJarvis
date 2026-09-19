@@ -246,8 +246,16 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     event(&mut b).await;
     let request =
         json!({"request_id":Uuid::now_v7(),"messages":[{"role":"user","content":"One question"}]});
-    let (status, submitted) = post(&app, &token_a, "/v1/assistant/runs", request.clone()).await;
+    // Exercise overlapping mobile/HTTP retries, not only a retry after the
+    // initial acknowledgement. Both requests must converge on one durable run.
+    let ((status, submitted), (concurrent_status, concurrent)) = tokio::join!(
+        post(&app, &token_a, "/v1/assistant/runs", request.clone()),
+        post(&app, &token_a, "/v1/assistant/runs", request.clone()),
+    );
     assert_eq!(status, StatusCode::OK, "{submitted}");
+    assert_eq!(concurrent_status, StatusCode::OK, "{concurrent}");
+    assert_eq!(submitted["run_id"], concurrent["run_id"]);
+    assert_eq!(submitted["conversation_id"], concurrent["conversation_id"]);
     let (retry_status, retry) = post(&app, &token_a, "/v1/assistant/runs", request.clone()).await;
     assert_eq!(retry_status, StatusCode::OK, "{retry}");
     assert_eq!(submitted["run_id"], retry["run_id"]);
@@ -510,10 +518,13 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     // user turn is input; the model receives the canonical server conversation.
     let stale = json!({"request_id":Uuid::now_v7(), "conversation_id":canonical.conversation_id,
         "messages":[{"role":"assistant","content":"Invented stale answer"}, {"role":"user","content":"Next question"}]});
-    assert_eq!(
-        post(&app, &token_b, "/v1/assistant/runs", stale).await.0,
-        StatusCode::OK
+    let (next, overlapping) = tokio::join!(
+        post(&app, &token_b, "/v1/assistant/runs", stale.clone()),
+        post(&app, &token_b, "/v1/assistant/runs", stale),
     );
+    assert_eq!(next.0, StatusCode::OK, "{}", next.1);
+    assert_eq!(overlapping.0, StatusCode::OK, "{}", overlapping.1);
+    assert_eq!(next.1["run_id"], overlapping.1["run_id"]);
     loop {
         if let Event::AssistantCompleted { message, .. } = event(&mut reconnected).await.event {
             assert_eq!(message.conversation_id, canonical.conversation_id);
@@ -571,6 +582,24 @@ async fn disconnect_and_provider_failure_never_repeat_or_lose_the_user_message(
         assert_eq!(status, StatusCode::OK);
         tokio::time::timeout(Duration::from_secs(5), started.notified()).await?;
         let conversation: Uuid = serde_json::from_value(run["conversation_id"].clone())?;
+        let mut different_payload = request.clone();
+        different_payload["messages"][0]["content"] = json!("Conflicting retry");
+        assert_eq!(
+            post(&app, &token, "/v1/assistant/runs", different_payload)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        let another_prompt = json!({"request_id":Uuid::now_v7(),
+            "conversation_id":conversation,
+            "messages":[{"role":"user","content":"A separate competing prompt"}]});
+        assert_eq!(
+            post(&app, &token, "/v1/assistant/runs", another_prompt)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
         let running = app
             .clone()
             .oneshot(
@@ -581,6 +610,40 @@ async fn disconnect_and_provider_failure_never_repeat_or_lose_the_user_message(
             )
             .await?;
         assert_eq!(json_body(running).await["assistant_running"], true);
+        // A fresh Core epoch cannot know whether an old in-flight paid request
+        // finished remotely. Preserve the durable reservation as interrupted;
+        // neither retry nor status recovery may start another inference.
+        let mut recovering = state(db.clone(), None).await;
+        assert_ne!(recovering.realtime.epoch(), hub.epoch());
+        recovering.llm = Arc::new(Fake(
+            count.clone(),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+        let recovering_app = build_router(recovering);
+        let interrupted = post(
+            &recovering_app,
+            &token,
+            "/v1/assistant/runs",
+            request.clone(),
+        )
+        .await;
+        assert_eq!(interrupted.0, StatusCode::OK);
+        assert_eq!(interrupted.1["run_id"], run["run_id"]);
+        assert_eq!(interrupted.1["state"], "interrupted");
+        let recovered_status = recovering_app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/assistant/runs/{}",
+                        run["run_id"].as_str().unwrap()
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(recovered_status.status(), StatusCode::OK);
+        assert_eq!(json_body(recovered_status).await, interrupted.1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
         drop(display); // All displays gone, while inference is still running.
         let retry = post(&app, &token, "/v1/assistant/runs", request.clone()).await;
         assert_eq!(retry.0, StatusCode::OK);
@@ -609,8 +672,32 @@ async fn disconnect_and_provider_failure_never_repeat_or_lose_the_user_message(
             history["messages"].as_array().unwrap().len(),
             if fail { 1 } else { 2 }
         );
-        let retry = post(&app, &token, "/v1/assistant/runs", request).await;
+        let retry = post(&app, &token, "/v1/assistant/runs", request.clone()).await;
         assert_eq!(retry.1["state"], if fail { "failed" } else { "completed" });
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        // Simulate loss of all in-process Core state, retaining only the DB.
+        // A persisted success/failure must not become permission to regenerate.
+        let mut restarted = state(db.clone(), None).await;
+        assert_ne!(restarted.realtime.epoch(), hub.epoch());
+        restarted.llm = Arc::new(Fake(
+            count.clone(),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+        let restarted_app = build_router(restarted);
+        let after_restart = post(&restarted_app, &token, "/v1/assistant/runs", request).await;
+        assert_eq!(after_restart.0, StatusCode::OK);
+        assert_eq!(after_restart.1, retry.1);
+        let recovered = restarted_app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/conversations/{conversation}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(json_body(recovered).await, history);
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
         if !fail {
             let usage = jarvis_usage::month_statistics(&db).await?;
