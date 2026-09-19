@@ -80,6 +80,54 @@ async fn first_activation_requires_local_network_code_and_password_atomically(
         StatusCode::FORBIDDEN
     );
     assert_eq!(jarvis_identity::active_device_count(&db).await?, 1);
+    // Losing the last device must not reopen bootstrap, but a password-gated
+    // pending request must remain possible for explicit local owner approval.
+    let devices = jarvis_identity::list_active_devices(&db, owner.id).await?;
+    jarvis_identity::revoke_device(&db, devices[0].id).await?;
+    assert_eq!(jarvis_identity::active_device_count(&db).await?, 0);
+    assert!(!jarvis_identity::surreal::account::bootstrap_available(&db).await?);
+    assert_eq!(
+        app.clone()
+            .oneshot(activate("10.23.45.11:32000", &code))
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let replacement = SigningKey::from_bytes(&rand::random());
+    let pairing = |password: Option<&str>| {
+        let mut body = json!({"name":"replacement", "platform":"macos",
+            "public_key":hex::encode(replacement.verifying_key().to_bytes())});
+        if let Some(password) = password {
+            body["password"] = json!(password);
+        }
+        Request::builder()
+            .method("POST")
+            .uri("/v1/auth/pairing/requests")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    for password in [None, Some("incorrect fixture password")] {
+        assert_eq!(
+            app.clone().oneshot(pairing(password)).await?.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert!(jarvis_identity::pending_pairing_requests(&db, owner.id)
+        .await?
+        .is_empty());
+    assert_eq!(
+        app.clone()
+            .oneshot(pairing(Some("disposable activation fixture password")))
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let pending = jarvis_identity::pending_pairing_requests(&db, owner.id).await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].status, "pending");
+    assert_eq!(jarvis_identity::active_device_count(&db).await?, 0);
+    assert!(!jarvis_identity::surreal::account::bootstrap_available(&db).await?);
     Ok(())
 }
 
