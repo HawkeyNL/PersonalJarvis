@@ -6,7 +6,7 @@
 
 use std::{
     fs,
-    os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
 };
 
@@ -26,6 +26,7 @@ use jarvis_privileged::{Operation, SignedRequest};
 
 const SOCKET: &str = "/run/jarvis-config-broker/broker.sock";
 const REPLAY_DIR: &str = "/var/lib/jarvis/config-broker/replays";
+const MAX_REQUEST_BYTES: usize = 16 * 1024;
 
 #[derive(Serialize)]
 struct Reply {
@@ -33,6 +34,7 @@ struct Reply {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RequestEnvelope {
     request: SignedRequest,
 }
@@ -60,16 +62,39 @@ async fn main() -> anyhow::Result<()> {
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
     tracing::info!(socket = %socket, "root configuration broker ready");
+    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     loop {
         let (stream, _) = listener.accept().await?;
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            // Do not queue unbounded tasks while slow peers hold connections.
+            drop(stream);
+            continue;
+        };
         let db = db.clone();
         let policy = PathBuf::from(&config.llm_model_policy_path);
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(error) = handle(stream, &db, &policy).await {
                 tracing::warn!(%error, "privileged broker request denied");
             }
         });
     }
+}
+
+async fn read_request_frame(
+    reader: impl AsyncRead + Unpin,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    // Limit before allocation/read, not after an unbounded read_line.
+    let mut reader = BufReader::new(reader.take((MAX_REQUEST_BYTES + 1) as u64));
+    tokio::time::timeout(timeout, reader.read_until(b'\n', &mut line))
+        .await
+        .map_err(|_| anyhow::anyhow!("broker request timed out"))??;
+    if line.len() > MAX_REQUEST_BYTES || line.last() != Some(&b'\n') {
+        bail!("invalid broker request frame");
+    }
+    Ok(line)
 }
 
 fn prepare_socket(socket: &str) -> anyhow::Result<()> {
@@ -92,13 +117,9 @@ async fn handle(
     policy_path: &Path,
 ) -> anyhow::Result<()> {
     let (read, mut write) = stream.into_split();
-    let mut line = String::new();
-    let read_len = BufReader::new(read).read_line(&mut line).await?;
-    if read_len == 0 || read_len > 16 * 1024 {
-        bail!("invalid broker request size");
-    }
+    let line = read_request_frame(read, std::time::Duration::from_secs(5)).await?;
     let envelope: RequestEnvelope =
-        serde_json::from_str(&line).context("invalid broker request")?;
+        serde_json::from_slice(&line).map_err(|_| anyhow::anyhow!("invalid broker request"))?;
     let request = envelope.request;
     let result = async {
         request
@@ -186,14 +207,26 @@ fn apply(operation: &Operation, policy_path: &Path) -> anyhow::Result<()> {
 }
 
 fn read_protected(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.file_type().is_file()
-        || meta.file_type().is_symlink()
-        || meta.permissions().mode() & 0o022 != 0
-    {
+    use std::io::Read;
+    // Validate and read the same inode. NONBLOCK avoids hanging on a FIFO.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() || meta.uid() != 0 || meta.permissions().mode() & 0o022 != 0 {
         bail!("unsafe protected configuration");
     }
-    Ok(fs::read(path)?)
+    const MAX_POLICY_BYTES: u64 = 8 * 1024 * 1024;
+    if meta.len() > MAX_POLICY_BYTES {
+        bail!("protected configuration exceeds size limit");
+    }
+    let mut content = Vec::new();
+    file.take(MAX_POLICY_BYTES + 1).read_to_end(&mut content)?;
+    if content.len() as u64 > MAX_POLICY_BYTES {
+        bail!("protected configuration exceeds size limit");
+    }
+    Ok(content)
 }
 
 fn atomic_root_write(path: &Path, content: &[u8], mode: u32) -> anyhow::Result<()> {
@@ -222,4 +255,96 @@ fn atomic_root_write(path: &Path, content: &[u8], mode: u32) -> anyhow::Result<(
 async fn audit(db: &jarvis_store::Database, request: &SignedRequest, outcome: &str) {
     let _ = db.query("CREATE security_audit SET id = $id, ts = time::now(), device_id = $device_id, event = 'privileged_config', outcome = $outcome, detail = $detail RETURN NONE")
         .bind(json!({"id": uuid::Uuid::now_v7().to_string(), "device_id": request.device_id.to_string(), "outcome": outcome, "detail": request.operation.action()})).await;
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn protected_policy_rejects_links_nonfiles_and_unsafe_permissions() {
+        let directory =
+            std::env::temp_dir().join(format!("jarvis-policy-read-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let policy = directory.join("policy.json");
+        let link = directory.join("link.json");
+        fs::write(&policy, b"{}").unwrap();
+        fs::set_permissions(&policy, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&policy, &link).unwrap();
+        assert!(read_protected(&link).is_err());
+        assert!(read_protected(&directory).is_err());
+        // The normal non-root CI runner must not be able to supply a policy.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(read_protected(&policy).is_err());
+        } else {
+            assert_eq!(read_protected(&policy).unwrap(), b"{}");
+        }
+        fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read_protected(&policy).is_err());
+        fs::remove_file(link).unwrap();
+        fs::remove_file(policy).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepts_one_bounded_frame_only() {
+        let frame = read_request_frame(&b"{}\nignored\n"[..], Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(frame, b"{}\n");
+        let maximum = [vec![b' '; MAX_REQUEST_BYTES - 1], vec![b'\n']].concat();
+        assert_eq!(
+            read_request_frame(maximum.as_slice(), Duration::from_secs(1))
+                .await
+                .unwrap()
+                .len(),
+            MAX_REQUEST_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_oversize_and_unterminated_frames() {
+        for frame in [
+            vec![b'x'; MAX_REQUEST_BYTES + 1],
+            b"{}".to_vec(),
+            Vec::new(),
+        ] {
+            assert!(read_request_frame(frame.as_slice(), Duration::from_secs(1))
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_peer_is_timed_out_without_waiting_for_eof() {
+        let (_peer, reader) = tokio::io::duplex(64);
+        let error = read_request_frame(reader, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "broker request timed out");
+    }
+
+    #[test]
+    fn invalid_envelope_does_not_accept_extra_authority_fields() {
+        let request = SignedRequest {
+            request_id: uuid::Uuid::nil(),
+            nonce_hex: "00".repeat(32),
+            user_id: uuid::Uuid::nil(),
+            device_id: uuid::Uuid::nil(),
+            issued_at: time::OffsetDateTime::UNIX_EPOCH,
+            expires_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(1),
+            operation: Operation::ModelSetEnabled {
+                provider: "ollama-cloud".into(),
+                model: "fixture-model".into(),
+                enabled: false,
+                expected_policy_sha256: "00".repeat(32),
+            },
+            signature_hex: "00".repeat(64),
+        };
+        let mut envelope = json!({"request": request});
+        assert!(serde_json::from_value::<RequestEnvelope>(envelope.clone()).is_ok());
+        envelope["approved"] = json!(true);
+        assert!(serde_json::from_value::<RequestEnvelope>(envelope).is_err());
+    }
 }
