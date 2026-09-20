@@ -322,11 +322,20 @@ pub(crate) async fn system_usage(
 /// Jarvis' resource/agent registry — available brains + cost + the host it runs
 /// on (ADR-027 stage 3). Cached from startup; POST `/refresh` re-probes.
 pub(crate) async fn system_registry(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
-    let value = state
+    let mut value = state
         .registry
         .read()
         .map(|reg| serde_json::to_value(&*reg).unwrap_or_else(|_| json!({})))
         .unwrap_or_else(|_| json!({}));
+    // Only sampled counters are fresh; inventory remains the startup/explicit
+    // refresh snapshot. Do not rerun discovery or shell probes for live polling.
+    let live = tokio::task::spawn_blocking(registry::live_host)
+        .await
+        .ok()
+        .flatten();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("live_host".into(), json!(live));
+    }
     Json(value)
 }
 
