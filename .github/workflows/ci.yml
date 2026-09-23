@@ -54,6 +54,12 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --all
+      - name: Root broker policy transaction fixture
+        run: |
+          broker_test=$(cargo test --locked -p jarvis-api --bin jarvis-config-broker --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "jarvis-config-broker") | .executable')
+          test -n "$broker_test"
+          sudo "$broker_test" --ignored --exact request_tests::root_model_toggle_fixture_is_atomic_and_rejects_stale_or_concurrent_writes
       - name: Rootless Update Center PTY lifecycle
         run: |
           cargo build -p jarvis-admin --features tui-preview

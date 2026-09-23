@@ -298,6 +298,47 @@ mod request_tests {
     use std::time::Duration;
 
     #[test]
+    #[ignore = "requires root in an isolated CI runner; fixture paths only"]
+    fn root_model_toggle_fixture_is_atomic_and_rejects_stale_or_concurrent_writes() {
+        use std::os::fd::AsRawFd;
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let directory =
+            std::env::temp_dir().join(format!("jarvis-model-toggle-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("policy.json");
+        let initial = br#"{"version":1,"models":[{"provider":"ollama-cloud","model":"fixture","enabled":false,"source":"discovered"}]}"#;
+        fs::write(&path, initial).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let operation = Operation::ModelSetEnabled {
+            provider: "ollama-cloud".into(),
+            model: "fixture".into(),
+            enabled: true,
+            expected_policy_sha256: hex::encode(Sha256::digest(initial)),
+        };
+        // The CLI and broker lock the same stable directory, not the replaced
+        // JSON inode. A competing writer cannot consume an old snapshot.
+        let competing = fs::File::open(&directory).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(competing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(apply(&operation, &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), initial);
+        drop(competing);
+        apply(&operation, &path).unwrap();
+        let activated = read_protected(&path).unwrap();
+        let policy: ModelAccessPolicy = serde_json::from_slice(&activated).unwrap();
+        assert!(policy.allows("ollama-cloud", "fixture"));
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
+        assert!(apply(&operation, &path).is_err());
+        assert_eq!(read_protected(&path).unwrap(), activated);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn atomic_policy_write_preserves_reader_group_and_rejects_links() {
         let directory =
             std::env::temp_dir().join(format!("jarvis-policy-write-{}", uuid::Uuid::new_v4()));
