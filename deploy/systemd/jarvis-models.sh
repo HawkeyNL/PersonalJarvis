@@ -417,6 +417,17 @@ main() {
     command -v jq >/dev/null 2>&1 || fail "jq is required"
     command -v curl >/dev/null 2>&1 || fail "curl is required"
 
+    # The root broker locks this same stable directory inode. Locking the JSON
+    # file itself is insufficient because every writer replaces it atomically.
+    case ${1:-} in
+        refresh|enable|disable|set-route)
+            normalize_model_policy_boundary
+            local policy_lock
+            exec {policy_lock}<"$policy_dir"
+            flock --exclusive --wait 10 "$policy_lock" || fail "another model policy change is in progress"
+            ;;
+    esac
+
     case ${1:-} in
         refresh) (($# == 1 || $# == 2)) || usage; refresh "${2:-}" ;;
         list) (($# == 1 || $# == 2)) || usage; list_models "${2:-}" ;;

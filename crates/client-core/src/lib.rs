@@ -9,6 +9,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod account;
+pub mod model_control;
 pub mod realtime;
 pub mod speech;
 

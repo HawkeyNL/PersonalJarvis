@@ -176,6 +176,20 @@ fn consume_once(request_id: uuid::Uuid) -> anyhow::Result<()> {
 }
 
 fn apply(operation: &Operation, policy_path: &Path) -> anyhow::Result<()> {
+    // Lock the stable protected directory, not the atomically replaced file.
+    // The canonical CLI helper takes the same lock for its read/modify/write.
+    use std::os::fd::AsRawFd;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(policy_path.parent().context("policy has no parent")?)?;
+    let metadata = directory.metadata()?;
+    if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        bail!("unsafe model policy directory");
+    }
+    if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("another model policy change is in progress");
+    }
     match operation {
         Operation::ModelSetEnabled {
             provider,
@@ -230,6 +244,14 @@ fn read_protected(path: &Path) -> anyhow::Result<Vec<u8>> {
 }
 
 fn atomic_root_write(path: &Path, content: &[u8], mode: u32) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    let previous = fs::symlink_metadata(path)?;
+    if !previous.file_type().is_file()
+        || previous.uid() != 0
+        || previous.permissions().mode() & 0o022 != 0
+    {
+        bail!("unsafe protected configuration");
+    }
     let dir = path.parent().context("protected path has no parent")?;
     let temp = dir.join(format!(
         ".{}.{}.tmp",
@@ -243,13 +265,26 @@ fn atomic_root_write(path: &Path, content: &[u8], mode: u32) -> anyhow::Result<(
         .create_new(true)
         .mode(mode)
         .open(&temp)?;
-    use std::io::Write;
-    file.write_all(content)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::set_permissions(&temp, fs::Permissions::from_mode(mode))?;
-    fs::rename(&temp, path)?;
-    Ok(())
+    let result = (|| -> anyhow::Result<()> {
+        use std::io::Write;
+        // Preserve the protected file's reader group. A root:root replacement
+        // would make mode 0640 unreadable to the unprivileged Core service.
+        if unsafe { libc::fchown(file.as_raw_fd(), previous.uid(), previous.gid()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(content)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // Remove only this call's uniquely created staging file, if present.
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 async fn audit(db: &jarvis_store::Database, request: &SignedRequest, outcome: &str) {
@@ -261,6 +296,37 @@ async fn audit(db: &jarvis_store::Database, request: &SignedRequest, outcome: &s
 mod request_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn atomic_policy_write_preserves_reader_group_and_rejects_links() {
+        let directory =
+            std::env::temp_dir().join(format!("jarvis-policy-write-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let policy = directory.join("policy.json");
+        let link = directory.join("link.json");
+        fs::write(&policy, b"original").unwrap();
+        fs::set_permissions(&policy, fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&policy, &link).unwrap();
+        assert!(atomic_root_write(&link, b"denied", 0o640).is_err());
+        assert_eq!(fs::read(&policy).unwrap(), b"original");
+        if unsafe { libc::geteuid() } == 0 {
+            use std::os::fd::AsRawFd;
+            let file = fs::File::open(&policy).unwrap();
+            assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), 0, 42424) }, 0);
+            atomic_root_write(&policy, b"replacement", 0o640).unwrap();
+            let metadata = fs::metadata(&policy).unwrap();
+            assert_eq!(metadata.uid(), 0);
+            assert_eq!(metadata.gid(), 42424);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+            assert_eq!(fs::read(&policy).unwrap(), b"replacement\n");
+        } else {
+            assert!(atomic_root_write(&policy, b"denied", 0o640).is_err());
+        }
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        fs::remove_file(link).unwrap();
+        fs::remove_file(policy).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
 
     #[test]
     fn protected_policy_rejects_links_nonfiles_and_unsafe_permissions() {

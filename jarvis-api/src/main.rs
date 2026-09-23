@@ -101,6 +101,28 @@ async fn main() -> anyhow::Result<()> {
         error
     })
     .ok();
+    let unavailable_hf_routes: Vec<String> = model_policy
+        .models
+        .iter()
+        .filter(|entry| entry.provider == "huggingface")
+        .filter(|entry| {
+            let routes = entry.route.as_deref().map_or(
+                vec![
+                    config.llm_huggingface_route.as_str(),
+                    config.llm_huggingface_route_cheap.as_str(),
+                    config.llm_huggingface_route_hard.as_str(),
+                ],
+                |route| vec![route],
+            );
+            routes.iter().any(|route| {
+                !matches!(*route, "auto" | "fastest" | "cheapest" | "preferred")
+                    && !hf_catalog
+                        .as_ref()
+                        .is_some_and(|catalog| catalog.route_available(&entry.model, route))
+            })
+        })
+        .map(|entry| entry.model.clone())
+        .collect();
     for entry in model_policy
         .models
         .iter_mut()
@@ -328,7 +350,8 @@ async fn main() -> anyhow::Result<()> {
             "Hugging Face catalog unavailable; conservative unknown pricing remains active"
         ),
     }
-    let llm = jarvis_llm::build_router_with_policy(
+    let model_policy = Arc::new(jarvis_llm::LiveModelPolicy::new(model_policy));
+    let llm = jarvis_llm::build_router_with_live_policy(
         provider_cfg,
         availability,
         catalog,
@@ -459,7 +482,13 @@ async fn main() -> anyhow::Result<()> {
         speech_verify_threshold: config.speech_verify_threshold,
         registry,
         registry_input: Arc::new(registry_input),
-        model_policy: Arc::new(model_policy),
+        model_policy,
+        model_control: Arc::new(
+            jarvis_api::model_control::ModelControl::new(Some(PathBuf::from(
+                &config.llm_model_policy_path,
+            )))
+            .with_unavailable_hf_routes(unavailable_hf_routes),
+        ),
         pricing_registry: Arc::new(pricing_registry),
         usage_snapshot_path: Some(Arc::new(PathBuf::from(
             "/var/lib/jarvis/usage-summary.json",

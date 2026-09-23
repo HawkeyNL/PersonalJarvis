@@ -17,3 +17,4 @@ jarvis-identity.workspace = true
 
 [dev-dependencies]
 ed25519-dalek.workspace = true
+jarvis-client-core.workspace = true

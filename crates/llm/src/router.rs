@@ -15,7 +15,9 @@ use std::{
 use async_trait::async_trait;
 
 use crate::types::{ChatReply, ChatRequest, LlmError, ProviderFailure, Tier};
-use crate::{LlmProvider, ModelAccessPolicy};
+#[cfg(test)]
+use crate::ModelAccessPolicy;
+use crate::{LiveModelPolicy, LlmProvider};
 
 /// Live availability of a backend, by id — implemented by the api over the
 /// resource registry (`jarvis-registry`), so the router routes on what's up now.
@@ -75,7 +77,7 @@ pub struct RouterProvider {
     catalog: Vec<CatalogModel>,
     /// Root-owned, explicit allowlist.  Provider credentials do not imply
     /// permission to route to a model.
-    model_policy: ModelAccessPolicy,
+    model_policy: Arc<LiveModelPolicy>,
     health: Mutex<BTreeMap<String, HealthCooldown>>,
     label: String,
 }
@@ -95,11 +97,26 @@ impl RouterProvider {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_policy(
         candidates: Vec<Candidate>,
         availability: Arc<dyn Availability>,
         catalog: Vec<CatalogModel>,
         model_policy: ModelAccessPolicy,
+    ) -> Self {
+        Self::with_live_policy(
+            candidates,
+            availability,
+            catalog,
+            Arc::new(LiveModelPolicy::new(model_policy)),
+        )
+    }
+
+    pub(crate) fn with_live_policy(
+        candidates: Vec<Candidate>,
+        availability: Arc<dyn Availability>,
+        catalog: Vec<CatalogModel>,
+        model_policy: Arc<LiveModelPolicy>,
     ) -> Self {
         let ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
         let label = format!("router[{}]", ids.join(","));
@@ -445,6 +462,66 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[tokio::test]
+    async fn live_disable_stops_calls_without_rebuilding_router() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted(Arc<AtomicUsize>);
+        #[async_trait]
+        impl LlmProvider for Counted {
+            fn label(&self) -> &str {
+                "fixture"
+            }
+            async fn chat(&self, request: &ChatRequest) -> Result<ChatReply, LlmError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Fixed {
+                    label: "ollama-cloud".into(),
+                    ok: true,
+                }
+                .chat(request)
+                .await
+            }
+        }
+        let catalog = vec![CatalogModel {
+            backend: "ollama-cloud".into(),
+            id: "fixture".into(),
+            class: ModelClass::Light,
+        }];
+        let enabled = allow_catalog(&catalog);
+        let mut disabled = enabled.clone();
+        disabled.models[0].enabled = false;
+        let live = Arc::new(LiveModelPolicy::new(disabled.clone()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterProvider::with_live_policy(
+            vec![Candidate {
+                id: "ollama-cloud".into(),
+                provider: Arc::new(Counted(calls.clone())),
+            }],
+            always_available(),
+            catalog,
+            live.clone(),
+        );
+        let request = ChatRequest {
+            system: None,
+            messages: vec![ChatMessage::user("fixture")],
+            tier: Tier::Default,
+            mode: crate::RoutingMode::Auto,
+            max_tokens: 16,
+            model: Some("fixture".into()),
+        };
+        assert!(router.chat(&request).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        live.activate_verified_toggle(&disabled, enabled.clone(), "ollama-cloud", "fixture", true)
+            .unwrap();
+        assert!(router.chat(&request).await.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        live.activate_verified_toggle(&enabled, disabled, "ollama-cloud", "fixture", false)
+            .unwrap();
+        assert!(router.chat(&request).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        live.suspend();
+        assert!(!live.allows("ollama", "not-listed"));
     }
 
     #[test]
