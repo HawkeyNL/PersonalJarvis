@@ -5,7 +5,8 @@
 //! Direction is selected from verified release capabilities, never by comparing
 //! mtimes or by selecting whichever policy happens to exist. In particular a
 //! downgrade exports the CURRENT policy, not an old permissions snapshot.
-//! This binary is not yet wired into release activation.
+//! Selection is idempotent: an old compatibility copy never wins over the
+//! layout recorded by the installer. No model is enabled by migration.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -27,13 +28,129 @@ fn main() -> anyhow::Result<()> {
         bail!("model policy migration requires the trusted root installation path");
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let direction = match args.as_slice() {
-        [command] if command == "to-directory" => true,
-        [command] if command == "to-legacy" => false,
-        _ => bail!("usage: jarvis-model-policy-storage to-directory|to-legacy"),
-    };
     // No environment override or caller-selected path is accepted.
-    transfer(Path::new("/etc/jarvis"), direction, 0)
+    let root = Path::new("/etc/jarvis");
+    match args.as_slice() {
+        [command] if command == "layout" => {
+            let dir = directory(root, 0)?;
+            lock(&dir)?;
+            println!("{}", layout(root, 0)?);
+            Ok(())
+        }
+        [command] if command == "select-directory" => select(root, true, 0),
+        [command] if command == "select-legacy" => select(root, false, 0),
+        [command] if command == "check-directory" => {
+            directory(root, 0)?;
+            if layout(root, 0)? != "directory" { bail!("policy directory is not active"); }
+            let directory = directory(&root.join("model-policy"), 0)?;
+            let (_, group) = policy(&root.join("model-policy/policy.json"), 0)?;
+            if directory.metadata()?.gid() != group || directory.metadata()?.mode() & 0o777 != 0o750 {
+                bail!("unsafe policy directory reader permissions");
+            }
+            Ok(())
+        }
+        [command] if command == "initialize" => match fs::symlink_metadata("/opt/jarvis/current") {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => initialize(root, 0),
+            _ => bail!("initialization is only allowed before the first release activation"),
+        },
+        _ => bail!(
+            "usage: jarvis-model-policy-storage layout|check-directory|select-directory|select-legacy|initialize"
+        ),
+    }
+}
+
+fn initialize(root: &Path, owner: u32) -> anyhow::Result<()> {
+    let parent = directory(root, owner)?;
+    lock(&parent)?;
+    if root.join("model-policy").try_exists()? {
+        bail!("policy layout already exists; initialization refused");
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.join("model-policy.json"))?;
+    if unsafe { libc::fchown(file.as_raw_fd(), owner, parent.metadata()?.gid()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    file.write_all(b"{\"version\":1,\"models\":[]}\n")?;
+    file.set_permissions(fs::Permissions::from_mode(0o640))?;
+    file.sync_all()?;
+    parent.sync_all()?;
+    Ok(())
+}
+
+fn layout(root: &Path, owner: u32) -> anyhow::Result<String> {
+    let path = root.join("model-policy/layout");
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(root.join("model-policy")).is_ok() {
+                bail!("policy layout marker is missing; explicit recovery required");
+            }
+            Ok("legacy".into())
+        }
+        Err(error) => Err(error.into()),
+        Ok(_) => {
+            directory(&root.join("model-policy"), owner)?;
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.uid() != owner
+                || metadata.mode() & 0o022 != 0
+                || metadata.nlink() != 1
+                || metadata.len() > 16
+            {
+                bail!("unsafe policy layout marker");
+            }
+            let mut value = String::new();
+            file.take(17).read_to_string(&mut value)?;
+            match value.as_str() {
+                "legacy\n" => Ok("legacy".into()),
+                "directory\n" => Ok("directory".into()),
+                _ => bail!("invalid policy layout marker"),
+            }
+        }
+    }
+}
+
+fn select(root: &Path, to_directory: bool, owner: u32) -> anyhow::Result<()> {
+    let parent = directory(root, owner)?;
+    lock(&parent)?;
+    let requested = if to_directory { "directory" } else { "legacy" };
+    let current = layout(root, owner)?;
+    if current == requested {
+        let path = if to_directory {
+            root.join("model-policy/policy.json")
+        } else {
+            root.join("model-policy.json")
+        };
+        policy(&path, owner)?;
+        return Ok(());
+    }
+    transfer_locked(root, to_directory, owner, &parent)?;
+    let managed = directory(&root.join("model-policy"), owner)?;
+    lock(&managed)?;
+    let marker = root.join("model-policy/layout");
+    let temporary = root.join(format!("model-policy/.layout-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        writeln!(file, "{requested}")?;
+        file.sync_all()?;
+        fs::rename(&temporary, marker)?;
+        managed.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 fn directory(path: &Path, owner: u32) -> anyhow::Result<File> {
@@ -94,9 +211,19 @@ fn policy(path: &Path, owner: u32) -> anyhow::Result<(Vec<u8>, u32)> {
     Ok((bytes, metadata.gid()))
 }
 
+#[cfg(test)]
 fn transfer(root: &Path, to_directory: bool, owner: u32) -> anyhow::Result<()> {
     let legacy_directory = directory(root, owner)?;
     lock(&legacy_directory)?;
+    transfer_locked(root, to_directory, owner, &legacy_directory)
+}
+
+fn transfer_locked(
+    root: &Path,
+    to_directory: bool,
+    owner: u32,
+    legacy_directory: &File,
+) -> anyhow::Result<()> {
     let managed = root.join("model-policy");
     let legacy_file = root.join("model-policy.json");
     let managed_file = managed.join("policy.json");
@@ -302,5 +429,34 @@ mod tests {
         fs::write(&target, b"broken").unwrap();
         assert!(transfer(root.path(), true, owner).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"broken");
+    }
+
+    #[test]
+    fn repeated_selection_never_restores_stale_authorization() {
+        let (root, owner) = fixture();
+        select(root.path(), true, owner).unwrap();
+        let managed = root.path().join("model-policy/policy.json");
+        fs::write(&managed, DISABLED).unwrap();
+        select(root.path(), true, owner).unwrap();
+        assert_eq!(fs::read(&managed).unwrap(), DISABLED);
+        select(root.path(), false, owner).unwrap();
+        assert_eq!(
+            fs::read(root.path().join("model-policy.json")).unwrap(),
+            DISABLED
+        );
+        select(root.path(), true, owner).unwrap();
+        assert_eq!(fs::read(managed).unwrap(), DISABLED);
+    }
+
+    #[test]
+    fn corrupt_layout_does_not_guess_from_other_files() {
+        let (root, owner) = fixture();
+        select(root.path(), true, owner).unwrap();
+        fs::write(root.path().join("model-policy/layout"), b"unknown\n").unwrap();
+        assert!(select(root.path(), false, owner).is_err());
+        assert_eq!(
+            fs::read(root.path().join("model-policy.json")).unwrap(),
+            ENABLED
+        );
     }
 }

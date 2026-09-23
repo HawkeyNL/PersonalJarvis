@@ -137,10 +137,11 @@ check "/livez responds" curl --fail --silent --show-error --max-time 5 http://12
 check "/readyz responds" curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/readyz
 check "Persona readable by Core" jarvis_reads /etc/jarvis/Jarvis.md
 check "Persona is read-only to Core" jarvis_cannot_write /etc/jarvis/Jarvis.md
-if [[ -e /etc/jarvis/model-policy.json ]]; then
-    check "Model policy permissions" expect_mode /etc/jarvis/model-policy.json root:jarvis:640
-    check "Model policy readable by Core" jarvis_reads /etc/jarvis/model-policy.json
-    check "Model policy read-only to Core" jarvis_cannot_write /etc/jarvis/model-policy.json
+if [[ -e /etc/jarvis/model-policy/policy.json ]]; then
+    check "Model policy directory permissions" expect_mode /etc/jarvis/model-policy root:jarvis:750
+    check "Model policy permissions" expect_mode /etc/jarvis/model-policy/policy.json root:jarvis:640
+    check "Model policy readable by Core" jarvis_reads /etc/jarvis/model-policy/policy.json
+    check "Model policy read-only to Core" jarvis_cannot_write /etc/jarvis/model-policy/policy.json
 fi
 if [[ -e /etc/jarvis/huggingface-catalog.json ]]; then
     check "Hugging Face catalog permissions" expect_mode /etc/jarvis/huggingface-catalog.json root:jarvis:640

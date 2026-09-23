@@ -18,7 +18,7 @@ broker="$repo_dir/deploy/systemd/jarvis-config-broker.service"
 [[ -f $broker ]] || { echo "missing privileged config broker unit" >&2; exit 1; }
 grep -Fq 'User=root' "$broker"
 grep -Fq 'EnvironmentFile=/etc/jarvis/core.env' "$broker"
-grep -Fq 'ReadWritePaths=/etc/jarvis/model-policy.json' "$broker"
+grep -Fxq 'ReadWritePaths=/etc/jarvis/model-policy' "$broker" || { echo 'broker must permit atomic writes only in its dedicated policy directory' >&2; exit 1; }
 if grep -Eq 'ExecStart=.*(sh|bash)|/bin/(sh|bash)' "$broker"; then
     echo "privileged broker must not expose a shell" >&2
     exit 1

@@ -5,8 +5,8 @@
 # JSON policy through its normal root:jarvis read-only configuration boundary.
 set -euo pipefail
 
-readonly policy_file=/etc/jarvis/model-policy.json
-readonly policy_dir=/etc/jarvis
+readonly policy_file=/etc/jarvis/model-policy/policy.json
+readonly policy_dir=/etc/jarvis/model-policy
 readonly core_env=/etc/jarvis/core.env
 readonly ollama_cloud_default_base_url=https://ollama.com/v1
 readonly ollama_cloud_tags_url=https://ollama.com/api/tags
@@ -86,7 +86,7 @@ atomic_write() {
 
 atomic_write_huggingface_catalog() {
     local content=$1 tmp
-    tmp=$(mktemp "$policy_dir/.huggingface-catalog.XXXXXX")
+    tmp=$(mktemp "/etc/jarvis/.huggingface-catalog.XXXXXX")
     trap 'rm -f -- "$tmp"' RETURN
     umask 077
     printf '%s\n' "$content" > "$tmp"
@@ -421,6 +421,9 @@ main() {
     # file itself is insufficient because every writer replaces it atomically.
     case ${1:-} in
         refresh|enable|disable|set-route)
+            local migration_lock
+            exec {migration_lock}</etc/jarvis
+            flock --exclusive --wait 10 "$migration_lock" || fail "policy migration is in progress"
             normalize_model_policy_boundary
             local policy_lock
             exec {policy_lock}<"$policy_dir"

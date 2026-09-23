@@ -61,6 +61,11 @@ jobs:
           test -n "$broker_test"
           sudo "$broker_test" --ignored --exact request_tests::root_model_toggle_fixture_is_atomic_and_rejects_stale_or_concurrent_writes
           sudo "$broker_test" --ignored --exact request_tests::root_policy_namespace_requires_directory_not_file_write_access
+      - name: Native policy layout installation and rollback fixture
+        run: |
+          cargo build --locked -p jarvis-api --bin jarvis-model-policy-storage
+          sudo env GITHUB_ACTIONS=true JARVIS_POLICY_STORAGE_BINARY="$GITHUB_WORKSPACE/target/debug/jarvis-model-policy-storage" \
+            bash deploy/systemd/tests/test-model-policy-installation.sh
       - name: Rootless Update Center PTY lifecycle
         run: |
           cargo build -p jarvis-admin --features tui-preview
