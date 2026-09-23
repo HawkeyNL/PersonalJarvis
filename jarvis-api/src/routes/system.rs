@@ -272,6 +272,11 @@ async fn forward_to_broker(
     .await
     .map_err(|_| ())?
     .map_err(|_| ())?;
+    // The socket path alone is not authority. Verify the kernel-reported
+    // root peer before sending even an action-bound approval to the broker.
+    if stream.peer_cred().map_err(|_| ())?.uid() != 0 {
+        return Err(());
+    }
     let (read, mut write) = stream.into_split();
     let encoded = serde_json::to_vec(&json!({"request": request})).map_err(|_| ())?;
     if encoded.len() > 16 * 1024 {
@@ -642,5 +647,53 @@ fn yesno(b: bool) -> &'static str {
         "ja"
     } else {
         "nee"
+    }
+}
+
+#[cfg(test)]
+mod model_broker_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn unprivileged_socket_cannot_receive_a_signed_approval() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // The ordinary CI suite runs unprivileged.
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let socket = fixture.path().join("fake-broker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let captured = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                peer.read_to_end(&mut bytes),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            bytes
+        });
+        let now = time::OffsetDateTime::now_utc();
+        let request = jarvis_privileged::SignedRequest {
+            request_id: uuid::Uuid::new_v4(),
+            nonce_hex: "11".repeat(32),
+            user_id: uuid::Uuid::new_v4(),
+            device_id: uuid::Uuid::new_v4(),
+            issued_at: now,
+            expires_at: now + time::Duration::seconds(60),
+            operation: jarvis_privileged::Operation::ModelSetEnabled {
+                provider: "openai-api".into(),
+                model: "fixture".into(),
+                enabled: true,
+                expected_policy_sha256: "22".repeat(32),
+            },
+            signature_hex: "33".repeat(64),
+        };
+        assert!(forward_to_broker(socket.to_str().unwrap(), &request)
+            .await
+            .is_err());
+        assert!(captured.await.unwrap().is_empty());
     }
 }

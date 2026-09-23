@@ -11,12 +11,15 @@ binary=${JARVIS_POLICY_STORAGE_BINARY:?compiled native migration helper required
 [[ -f $binary && -x $binary && ! -L $binary ]]
 fixture=$(mktemp -d /tmp/jarvis-policy-install.XXXXXXXX)
 cleanup() {
+    rm -f -- /opt/jarvis/current
+    rmdir /opt/jarvis 2>/dev/null || true
     rm -f -- /etc/jarvis/model-policy/policy.json /etc/jarvis/model-policy/layout /etc/jarvis/model-policy.json
     rmdir /etc/jarvis/model-policy /etc/jarvis 2>/dev/null || true
     rm -rf -- "$fixture"
 }
 trap cleanup EXIT
 install -d -o root -g root -m 0750 /etc/jarvis
+install -d -o root -g root -m 0755 /opt/jarvis
 mkdir -p "$fixture/bin" "$fixture/releases" "$fixture/systemd" "$fixture/polkit"
 cat > "$fixture/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -65,6 +68,7 @@ manager="$new/manage-systemd-units"
 # Fresh host: initialize explicit deny-by-default and install packaged units.
 mkdir -m 0700 "$fixture/fresh-backup"
 "$manager" install "$new" "$fixture/fresh-backup"
+ln -s "$new" /opt/jarvis/current
 "$manager" check-installed "$new"
 jq -e '.version == 1 and .models == []' /etc/jarvis/model-policy/policy.json >/dev/null
 [[ $(stat -c %a /etc/jarvis/model-policy) == 750 ]]
@@ -74,12 +78,14 @@ jq -e '.version == 1 and .models == []' /etc/jarvis/model-policy/policy.json >/d
 # later successful upgrade. Legacy files must remain regular, never symlinks.
 printf '{"version":1,"models":[{"provider":"openai-api","model":"fixture","enabled":false}]}\n' > /etc/jarvis/model-policy/policy.json
 "$manager" restore "$old" "$fixture/fresh-backup"
+ln -sfn "$old" /opt/jarvis/current
 [[ $("$helper" layout) == legacy ]]
 jq -e '.models[0].enabled == false' /etc/jarvis/model-policy.json >/dev/null
 [[ -f /etc/jarvis/model-policy.json && ! -L /etc/jarvis/model-policy.json ]]
 
 mkdir -m 0700 "$fixture/upgrade-backup"
 "$manager" install "$new" "$fixture/upgrade-backup"
+ln -sfn "$new" /opt/jarvis/current
 "$manager" check-installed "$new"
 # Same-version repair cannot reimport stale legacy authorization.
 printf '{"version":1,"models":[{"provider":"openai-api","model":"fixture","enabled":true}]}\n' > /etc/jarvis/model-policy.json
@@ -93,9 +99,11 @@ jq -e '.models[0].enabled == false' /etc/jarvis/model-policy/policy.json >/dev/n
 # inspect its units without understanding the new capability.
 mkdir -m 0700 "$fixture/downgrade-backup"
 "$manager" install "$old" "$fixture/downgrade-backup"
+ln -sfn "$old" /opt/jarvis/current
 "$old/manage-systemd-units" check-installed "$old"
 jq -e '.models[0].enabled == false' /etc/jarvis/model-policy.json >/dev/null
 "$manager" restore "$new" "$fixture/downgrade-backup"
+ln -sfn "$new" /opt/jarvis/current
 "$manager" check-installed "$new"
 grep -Fq 'stop jarvis-config-broker.service jarvis-core.service' "$fixture/services.log"
 echo 'Native model-policy installation, repair and rollback fixtures passed'

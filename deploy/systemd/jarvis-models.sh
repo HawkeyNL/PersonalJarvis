@@ -389,6 +389,13 @@ list_models() {
       done
 }
 
+activate_model_policy() {
+    if ! systemctl try-restart jarvis-core.service >/dev/null 2>&1; then
+        systemctl stop jarvis-core.service || fail "Core could not be stopped after policy activation failed; owner recovery required"
+        fail "policy saved but Core activation failed; Core stopped safely; inspect sudo jarvis logs core"
+    fi
+}
+
 set_state() {
     local provider=$1 model=$2 enabled=$3 updated
     valid_provider "$provider" || fail "unknown provider"
@@ -400,8 +407,11 @@ set_state() {
     updated=$(jq --arg provider "$provider" --arg model "$model" --argjson enabled "$enabled" \
         '(.models[] | select(.provider == $provider and .model == $model) | .enabled) = $enabled' "$policy_file")
     atomic_write "$updated"
+    # A failed restart must not leave an old runtime authorization active after
+    # the owner revoked it on disk. Keep the new policy and stop the service;
+    # never silently report successful activation or restore an old grant.
+    activate_model_policy
     echo "jarvis-models: $provider/$model is now $( [[ $enabled == true ]] && echo enabled || echo disabled )."
-    systemctl try-restart jarvis-core.service >/dev/null 2>&1 || true
 }
 
 show_model() {

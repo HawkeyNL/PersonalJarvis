@@ -371,19 +371,19 @@ activate_release() {
 restore_previous_release() {
     ui_warning "Restoring previous release and managed unit policy"
     if [[ -n $previous_release ]]; then
-        activate_release "$previous_release"
+        activate_release "$previous_release" || return 1
     else
-        rm -f -- /opt/jarvis/current
+        rm -f -- /opt/jarvis/current || return 1
     fi
     if [[ $release_has_managed_systemd == true && -n $unit_backup ]]; then
-        "$release_dir/manage-systemd-units" restore "$release_dir" "$unit_backup"
-        systemctl daemon-reload
+        "$release_dir/manage-systemd-units" restore "$release_dir" "$unit_backup" || return 1
+        systemctl daemon-reload || return 1
     fi
     if [[ -n $previous_release ]]; then
-        systemctl start jarvis-config-broker.service
-        systemctl start jarvis-core.service
+        systemctl start jarvis-config-broker.service || return 1
+        systemctl start jarvis-core.service || return 1
         curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
-            --retry 11 --retry-delay 5 --retry-connrefused http://127.0.0.1:8080/readyz >/dev/null
+            --retry 11 --retry-delay 5 --retry-connrefused http://127.0.0.1:8080/readyz >/dev/null || return 1
     fi
     unit_transaction_started=false
 }

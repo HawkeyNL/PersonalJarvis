@@ -50,7 +50,7 @@ validate_policy_storage_artifact() {
 }
 
 prepare_policy_layout() {
-    local release=$1 backup=$2 target previous
+    local release=$1 backup=$2 target previous active expected=legacy
     target=$(policy_capability "$release") || return 1
     # Historical managers/releases did not ship this helper. Do not invent a
     # migration for them. The new updater selects the current verified manager
@@ -65,6 +65,14 @@ prepare_policy_layout() {
         "$policy_storage_helper" initialize || return 1
     fi
     previous=$("$policy_storage_helper" layout) || return 1
+    if [[ -e /opt/jarvis/current || -L /opt/jarvis/current ]]; then
+        [[ -L /opt/jarvis/current ]] || fail "active release is not a managed link"
+        active=$(readlink -f /opt/jarvis/current) || return 1
+        [[ $active == "$releases_root/"* && -d $active ]] || fail "active release escapes managed releases"
+        validate_release "$active"
+        expected=$(policy_capability "$active") || return 1
+    fi
+    [[ $previous == "$expected" ]] || fail "policy layout disagrees with active release; interrupted migration requires owner recovery"
     printf '%s\n' "$previous" > "$backup/model-policy-layout"
     # Stop both writers/readers before changing the policy location. The
     # activation caller restarts them after the complete release switch.
