@@ -1170,10 +1170,16 @@ struct ModelRecord {
 }
 
 fn read_model_policy() -> Result<ModelPolicy> {
-    let path = Path::new("/etc/jarvis/model-policy/policy.json");
-    let metadata = fs::symlink_metadata(path).context("inspect model policy")?;
-    let config_directory =
-        fs::symlink_metadata("/etc/jarvis/model-policy").context("inspect policy directory")?;
+    let path = admin_helpers::resolve_model_policy_path(
+        Path::new("/opt/jarvis/current"),
+        Path::new("/opt/jarvis/releases"),
+        Path::new("/usr/local/sbin"),
+        0,
+        0,
+    )?;
+    let metadata = fs::symlink_metadata(&path).context("inspect model policy")?;
+    let config_directory = fs::symlink_metadata(path.parent().context("policy has no directory")?)
+        .context("inspect policy directory")?;
     if !config_directory.is_dir()
         || config_directory.uid() != 0
         || config_directory.permissions().mode() & 0o777 != 0o750
