@@ -2347,6 +2347,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "surrealdb",
+ "tempfile",
  "time",
  "tokio",
  "tokio-tungstenite 0.29.0",

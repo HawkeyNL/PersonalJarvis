@@ -298,6 +298,71 @@ mod request_tests {
     use std::time::Duration;
 
     #[test]
+    #[ignore = "requires root and mount namespaces in isolated CI; fixture paths only"]
+    fn root_policy_namespace_requires_directory_not_file_write_access() {
+        use std::process::Command;
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        const FIXTURE: &str = "JARVIS_POLICY_NAMESPACE_FIXTURE";
+        const TEST: &str =
+            "request_tests::root_policy_namespace_requires_directory_not_file_write_access";
+        if let Some(path) = std::env::var_os(FIXTURE) {
+            let root = std::path::PathBuf::from(path);
+            assert_eq!(root.parent(), Some(Path::new("/tmp")));
+            assert!(root
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("jarvis-policy-namespace-"));
+            assert!(!fs::symlink_metadata(&root)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::metadata(&root).unwrap().uid(), 0);
+            let mount = |args: &[&std::ffi::OsStr]| {
+                assert!(Command::new("mount").args(args).status().unwrap().success());
+            };
+            let managed = root.join("model-policy");
+            let legacy = root.join("model-policy.json");
+            // Reproduce ProtectSystem=strict plus a file-only ReadWritePaths.
+            mount(&["--bind".as_ref(), root.as_os_str(), root.as_os_str()]);
+            mount(&["--bind".as_ref(), legacy.as_os_str(), legacy.as_os_str()]);
+            mount(&["--bind".as_ref(), managed.as_os_str(), managed.as_os_str()]);
+            mount(&["-o".as_ref(), "remount,bind,ro".as_ref(), root.as_os_str()]);
+            assert!(atomic_root_write(&legacy, b"new", 0o640).is_err());
+            assert_eq!(fs::read(&legacy).unwrap(), b"old");
+            // The dedicated directory mount permits sibling staging+rename,
+            // while unrelated protected configuration stays read-only.
+            atomic_root_write(&managed.join("policy.json"), b"new", 0o640).unwrap();
+            assert_eq!(fs::read(managed.join("policy.json")).unwrap(), b"new\n");
+            assert!(fs::write(root.join("core.env"), b"must not be writable").is_err());
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .prefix("jarvis-policy-namespace-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::create_dir(root.path().join("model-policy")).unwrap();
+        for path in [
+            root.path().join("model-policy.json"),
+            root.path().join("model-policy/policy.json"),
+        ] {
+            fs::write(&path, b"old").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        // A subprocess owns the mount namespace: no mounts leak into the
+        // parent test runner, even when an assertion fails in the child.
+        assert!(Command::new("unshare")
+            .args(["--mount", "--propagation", "private"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", TEST])
+            .env(FIXTURE, root.path())
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
     #[ignore = "requires root in an isolated CI runner; fixture paths only"]
     fn root_model_toggle_fixture_is_atomic_and_rejects_stale_or_concurrent_writes() {
         use std::os::fd::AsRawFd;

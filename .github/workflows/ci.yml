@@ -60,6 +60,7 @@ jobs:
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "jarvis-config-broker") | .executable')
           test -n "$broker_test"
           sudo "$broker_test" --ignored --exact request_tests::root_model_toggle_fixture_is_atomic_and_rejects_stale_or_concurrent_writes
+          sudo "$broker_test" --ignored --exact request_tests::root_policy_namespace_requires_directory_not_file_write_access
       - name: Rootless Update Center PTY lifecycle
         run: |
           cargo build -p jarvis-admin --features tui-preview
