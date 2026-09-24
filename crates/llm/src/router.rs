@@ -154,6 +154,23 @@ impl RouterProvider {
             }) {
                 return Some(m.id.clone());
             }
+            // Root-verified discovery can add disabled cloud models after
+            // startup. Once explicitly enabled, treat new entries as Mid, just
+            // like registry discovery. Never infer a cheap/free tier or replace
+            // a configured model's classification. Candidates and availability
+            // still enforce credentialed, configured backends and budgets.
+            if *want == ModelClass::Mid && Self::dynamic_cloud_backend(backend) {
+                if let Some(entry) = self.model_policy.snapshot().models.iter().find(|entry| {
+                    entry.provider == backend
+                        && entry.enabled
+                        && !self
+                            .catalog
+                            .iter()
+                            .any(|m| m.backend == backend && m.id == entry.model)
+                }) {
+                    return Some(entry.model.clone());
+                }
+            }
         }
         None
     }
@@ -277,10 +294,25 @@ impl RouterProvider {
     }
 
     fn requested_model_is_allowed(&self, backend: &str, model: &str) -> bool {
-        self.catalog
-            .iter()
-            .any(|entry| entry.backend == backend && entry.id == model)
+        (Self::dynamic_cloud_backend(backend)
+            || self
+                .catalog
+                .iter()
+                .any(|entry| entry.backend == backend && entry.id == model))
             && self.model_policy.allows(backend, model)
+    }
+
+    fn dynamic_cloud_backend(backend: &str) -> bool {
+        matches!(
+            backend,
+            "openai-api"
+                | "anthropic-api"
+                | "deepseek-api"
+                | "xai-api"
+                | "zai-api"
+                | "ollama-cloud"
+                | "huggingface"
+        )
     }
 }
 
@@ -731,6 +763,56 @@ mod tests {
                 > RouterProvider::cooldown_for(ProviderFailure::RateLimited)
         );
         assert!(RouterProvider::cooldown_for(ProviderFailure::Refused).is_zero());
+    }
+
+    #[tokio::test]
+    async fn post_startup_discovery_needs_approval_then_routes_without_restart() {
+        let live = Arc::new(LiveModelPolicy::new(ModelAccessPolicy::deny_by_default()));
+        let router = RouterProvider::with_live_policy(
+            vec![cand("openai-api", true)],
+            always_available(),
+            vec![],
+            live.clone(),
+        );
+        let discovered = ModelAccessPolicy {
+            version: 1,
+            models: vec![crate::ModelAccessEntry {
+                provider: "openai-api".into(),
+                model: "fixture-discovered".into(),
+                enabled: false,
+                source: "provider_api".into(),
+                route: None,
+            }],
+        };
+        live.refresh_discovery(discovered.clone()).unwrap();
+        let mut request = ChatRequest {
+            system: None,
+            messages: vec![ChatMessage::user("fixture")],
+            tier: Tier::Default,
+            mode: crate::RoutingMode::Auto,
+            max_tokens: 16,
+            model: None,
+        };
+        assert!(router.chat(&request).await.is_err());
+        assert!(!router.requested_model_is_allowed("openai-api", "fixture-discovered"));
+        let mut enabled = discovered.clone();
+        enabled.models[0].enabled = true;
+        live.activate_verified_toggle(
+            &discovered,
+            enabled,
+            "openai-api",
+            "fixture-discovered",
+            true,
+        )
+        .unwrap();
+        assert_eq!(router.chat(&request).await.unwrap().text, "openai-api");
+        request.model = Some("fixture-discovered".into());
+        assert!(router.chat(&request).await.is_ok());
+        request.model = Some("not-enabled".into());
+        assert!(router.chat(&request).await.is_err());
+        assert_eq!(router.model_for("openai-api", Tier::Cheap), None);
+        live.suspend();
+        assert!(router.chat(&request).await.is_err());
     }
 
     #[tokio::test]

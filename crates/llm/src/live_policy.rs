@@ -1,5 +1,5 @@
-//! Shared runtime allowlist. Only enable/disable changes can be activated here;
-//! provider routes and catalog changes still need a complete provider rebuild.
+//! Shared runtime allowlist. Discovery may add disabled models, but may never
+//! grant access or alter routes. Authorization changes require verified approval.
 //! This is not an authorization boundary: callers must verify the root broker's
 //! signed operation and protected on-disk result before activating a snapshot.
 
@@ -37,6 +37,46 @@ impl LiveModelPolicy {
                 models: Vec::new(),
             };
         }
+    }
+
+    /// Reconcile a verified root-owned discovery snapshot without changing any
+    /// authorization or existing route. New entries must be disabled and have
+    /// no route override (providers retain their startup route configuration).
+    /// A suspended policy can only recover through a trusted restart.
+    pub fn refresh_discovery(&self, verified: ModelAccessPolicy) -> Result<(), &'static str> {
+        if verified.models.len() > 10_000 {
+            return Err("discovered policy too large");
+        }
+        verified
+            .validate()
+            .map_err(|_| "invalid discovered policy")?;
+        let mut current = self.0.write().map_err(|_| "model policy unavailable")?;
+        if current.version != 1 {
+            return Err("model policy suspended");
+        }
+        let previous: std::collections::BTreeMap<_, _> = current
+            .models
+            .iter()
+            .map(|entry| ((entry.provider.as_str(), entry.model.as_str()), entry))
+            .collect();
+        let incoming: std::collections::BTreeMap<_, _> = verified
+            .models
+            .iter()
+            .map(|entry| ((entry.provider.as_str(), entry.model.as_str()), entry))
+            .collect();
+        for (key, old) in &previous {
+            let new = incoming.get(key).ok_or("discovery removed a model")?;
+            if old.enabled != new.enabled || old.route != new.route {
+                return Err("discovery changed authorization or routing");
+            }
+        }
+        for (key, new) in &incoming {
+            if !previous.contains_key(key) && (new.enabled || new.route.is_some()) {
+                return Err("new model is enabled or has a route override");
+            }
+        }
+        *current = verified;
+        Ok(())
     }
 
     /// Compare-and-swap exactly one approved enabled bit. The complete expected
@@ -124,5 +164,52 @@ mod tests {
             .activate_verified_toggle(&old, old.clone(), "huggingface", "org/fixture", false)
             .is_err());
         assert!(live.allows("huggingface", "org/fixture"));
+    }
+
+    #[test]
+    fn discovery_refresh_preserves_grants_and_allows_a_later_exact_signed_toggle() {
+        let live = LiveModelPolicy::new(policy());
+        let mut discovered = policy();
+        discovered.models.push(ModelAccessEntry {
+            provider: "openai-api".into(),
+            model: "fixture-new".into(),
+            enabled: false,
+            source: "provider_api".into(),
+            route: None,
+        });
+        discovered.models.reverse();
+        live.refresh_discovery(discovered.clone()).unwrap();
+        assert!(!live.allows("openai-api", "fixture-new"));
+        let mut enabled = discovered.clone();
+        enabled.models[0].enabled = true;
+        live.activate_verified_toggle(&discovered, enabled, "openai-api", "fixture-new", true)
+            .unwrap();
+        assert!(live.allows("openai-api", "fixture-new"));
+    }
+
+    #[test]
+    fn discovery_never_grants_changes_routes_removes_or_unsuspends() {
+        let live = LiveModelPolicy::new(policy());
+        let mut grant = policy();
+        grant.models[0].enabled = true;
+        assert!(live.refresh_discovery(grant).is_err());
+        let mut route = policy();
+        route.models[0].route = Some("fastest".into());
+        assert!(live.refresh_discovery(route).is_err());
+        assert!(live
+            .refresh_discovery(ModelAccessPolicy::deny_by_default())
+            .is_err());
+        let mut new_grant = policy();
+        new_grant.models.push(ModelAccessEntry {
+            provider: "openai-api".into(),
+            model: "new".into(),
+            enabled: true,
+            source: "provider_api".into(),
+            route: None,
+        });
+        assert!(live.refresh_discovery(new_grant).is_err());
+        assert_eq!(live.snapshot(), policy());
+        live.suspend();
+        assert!(live.refresh_discovery(policy()).is_err());
     }
 }
