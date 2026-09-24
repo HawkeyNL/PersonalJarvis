@@ -159,6 +159,8 @@ pub struct AppState {
     pub ibkr_gateway_url: String,
     /// The brain (DEC-001) — provider-abstracted, swappable at runtime.
     pub llm: Arc<dyn llm::LlmProvider>,
+    /// Optional Jev classifier. Its output is advisory, not authorization.
+    pub jev: Option<Arc<dyn crate::intent::FastIntentRouter>>,
     /// Max output tokens per assistant reply.
     pub llm_max_tokens: u32,
     /// Jarvis' protected identity/persona (from `/etc/jarvis/Jarvis.md`), prepended as the system

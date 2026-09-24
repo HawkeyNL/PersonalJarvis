@@ -18,7 +18,7 @@ async function setCredential(provider: CredentialProvider) {
   }
 }
 function providerLabel(provider: CredentialProvider): string {
-  return ({ anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", xai: "xAI", zai: "Z.ai", "ollama-cloud": "Ollama Cloud", huggingface: "Hugging Face" })[provider];
+  return ({ anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", xai: "xAI", zai: "Z.ai", "ollama-cloud": "Ollama Cloud", huggingface: "Hugging Face", jev: "TypeSafe Jev" })[provider];
 }
 onMounted(load);
 </script>
@@ -32,6 +32,6 @@ onMounted(load);
       <StatusBadge :state="row.configured ? 'configured' : 'not configured'" />
       <button class="small secondary" :disabled="busy" @click="setCredential(row.provider)">{{ activeProvider === row.provider ? 'Terminal open…' : (row.configured ? 'Replace' : 'Set credential') }}</button>
     </article>
-    <article class="security-card"><strong>Protected secret entry</strong><p>Set or replace opens a separate trusted GNOME terminal. A bounded metadata probe checks the credential before replacement; Core health is checked afterwards and models are refreshed automatically, disabled by default. If catalog refresh fails after saving, the terminal explains how to retry. “Configured” reports storage status, not continuous provider availability. Secrets never enter this webview or Tauri IPC.</p></article>
+    <article class="security-card"><strong>Protected secret entry</strong><p>Set or replace opens a separate trusted GNOME terminal. A bounded metadata probe checks the credential before replacement; Core health is checked afterwards. Generative-provider models are refreshed automatically and remain disabled by default. Jev is a task classifier, not an enableable chat model. “Configured” reports storage status, not continuous provider availability. Secrets never enter this webview or Tauri IPC.</p></article>
   </section>
 </template>

@@ -125,7 +125,8 @@ export type CredentialProvider =
   | "xai"
   | "zai"
   | "ollama-cloud"
-  | "huggingface";
+  | "huggingface"
+  | "jev";
 export interface CredentialRecord { provider: CredentialProvider; configured: boolean }
 export type LogService =
   | "core"

@@ -483,6 +483,16 @@ async fn main() -> anyhow::Result<()> {
         require_https: config.environment.eq_ignore_ascii_case("production"),
         ibkr_gateway_url: config.ibkr_gateway_url.clone(),
         llm,
+        jev: (!config.llm_jev_api_key.is_empty())
+            .then(|| {
+                jarvis_api::intent::JevRouter::new(
+                    config.llm_jev_api_key.clone(),
+                    config.llm_jev_model.clone(),
+                )
+                .map(|router| Arc::new(router) as Arc<dyn jarvis_api::intent::FastIntentRouter>)
+            })
+            .transpose()
+            .map_err(anyhow::Error::msg)?,
         llm_max_tokens: config.llm_max_tokens,
         jarvis_system,
         speech,

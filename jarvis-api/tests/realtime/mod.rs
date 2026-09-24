@@ -1,5 +1,6 @@
 use super::*;
 use futures_util::{SinkExt, StreamExt};
+use jarvis_api::intent::{FastIntentRouter, IntentDecision, WorkKind};
 use jarvis_client_core::realtime::{Event, EventEnvelope};
 use jarvis_client_core::speech::{SpeechAction, VoiceGate};
 use jarvis_llm::{ChatReply, ChatRequest, LlmError, LlmProvider};
@@ -11,6 +12,22 @@ use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 use uuid::Uuid;
 
 struct Fake(Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<Vec<String>>>>);
+
+struct FakeJev(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl FastIntentRouter for FakeJev {
+    async fn classify(&self, _: &str) -> Result<IntentDecision, &'static str> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(IntentDecision {
+            kind: WorkKind::Research,
+            confidence: 0.92,
+            model: "jev-fixture".into(),
+            input_tokens: 120,
+            output_tokens: 12,
+        })
+    }
+}
 
 struct PausedFake {
     count: Arc<AtomicUsize>,
@@ -167,9 +184,11 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     voice_a.set_enabled(true);
     voice_b.set_enabled(true);
     let count = Arc::new(AtomicUsize::new(0));
+    let jev_count = Arc::new(AtomicUsize::new(0));
     let contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut fixture = state(db.clone(), None).await;
     fixture.llm = Arc::new(Fake(count.clone(), contexts.clone()));
+    fixture.jev = Some(Arc::new(FakeJev(jev_count.clone())));
     let hub = fixture.realtime.clone();
     let app = build_router(fixture);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -328,6 +347,7 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
         "One canonical answer. No second inference."
     );
     assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(jev_count.load(Ordering::SeqCst), 1);
     assert!(
         tokio::time::timeout(Duration::from_millis(100), other.next())
             .await
@@ -394,7 +414,7 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     assert_eq!(history["messages"][1]["content"], canonical.content);
     assert_eq!(
         jarvis_usage::month_statistics(&db).await?.totals.requests,
-        1
+        2 // one Jev classification plus one canonical generative response
     );
     // Reconnect and authoritative recovery, without another inference.
     b.close(None).await?;

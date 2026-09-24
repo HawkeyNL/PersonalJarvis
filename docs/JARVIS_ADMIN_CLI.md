@@ -210,6 +210,40 @@ active verified release and writes `/etc/jarvis/updater.env` as `root:root
 
 ## Models and credentials
 
+TypeSafe Jev can act as the optional first-pass task classifier for ordinary
+`auto` chat. Configure it through the existing hidden-TTY, root-owned
+credential path:
+
+```bash
+sudo jarvis credentials set jev
+sudo jarvis credentials test jev
+sudo jarvis --json credentials list
+```
+
+The credential is stored only in `/etc/jarvis/secrets/jev.env` as
+`JARVIS_LLM_JEV_API_KEY`, with the same `root:jarvis 0640` boundary as other
+provider secrets. The metadata-only test calls TypeSafe's authenticated
+`GET /v1/models`; it does not run a paid classification. When configured,
+Core calls the official `POST /v1/systemone` endpoint with at most the latest
+4 KiB user turn and a fixed, typed task-choice question. It never sends the
+persona, conversation history, protected files, keys or agent prompts to Jev.
+
+Jev's high-confidence choice can select quick answer, ordinary conversation,
+research, coding or action-request *routing*. It never names an executable or
+model and cannot approve a side effect. The existing root-controlled model
+allowlist, budget and signed-action policy remain authoritative. Coding and
+host actions still need their existing signed approval and trusted broker;
+this classifier does not execute them. Low confidence, timeout, invalid
+response, oversized input or an exhausted budget leave the prior deterministic
+router in place. Explicit owner-selected Deep/Research/Fast modes and an
+owner-pinned conversation or default brain are not overridden. Jev
+classification is separately metered using the existing
+unknown-metered-price conservative fallback, not a claim about the final
+invoice. Jev is not added to the owner-enabled chat-model catalog.
+To let Jev choose among eligible models, leave the app's default and
+conversation brain selection on **Auto**; pinning either brain deliberately
+keeps that owner choice ahead of Jev.
+
 ```bash
 sudo jarvis models list
 sudo jarvis models refresh

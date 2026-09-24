@@ -275,6 +275,7 @@ pub enum CredentialProvider {
     Zai,
     OllamaCloud,
     Huggingface,
+    Jev,
 }
 
 impl CredentialProvider {
@@ -287,6 +288,7 @@ impl CredentialProvider {
             Self::Zai => "zai",
             Self::OllamaCloud => "ollama-cloud",
             Self::Huggingface => "huggingface",
+            Self::Jev => "jev",
         }
     }
 
@@ -299,6 +301,7 @@ impl CredentialProvider {
             Self::Zai => "Z.ai",
             Self::OllamaCloud => "Ollama Cloud",
             Self::Huggingface => "Hugging Face",
+            Self::Jev => "TypeSafe Jev",
         }
     }
 
@@ -311,6 +314,7 @@ impl CredentialProvider {
             "zai" => Some(Self::Zai),
             "ollama-cloud" => Some(Self::OllamaCloud),
             "huggingface" => Some(Self::Huggingface),
+            "jev" => Some(Self::Jev),
             _ => None,
         }
     }
@@ -1363,6 +1367,16 @@ mod tests {
                 OsString::from(CORE_ADMIN_BINARY),
                 OsString::from("--credential-entry"),
                 OsString::from("huggingface"),
+            ]
+        );
+        let jev: CredentialProvider = serde_json::from_str(r#""jev""#).unwrap();
+        assert_eq!(jev.cli_name(), "jev");
+        assert_eq!(
+            credential_entry_arguments(jev, Path::new(CORE_ADMIN_BINARY)),
+            vec![
+                OsString::from(CORE_ADMIN_BINARY),
+                OsString::from("--credential-entry"),
+                OsString::from("jev"),
             ]
         );
     }

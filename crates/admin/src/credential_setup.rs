@@ -1,15 +1,16 @@
 //! Credential entry remains in the trusted TTY helper; no secret enters Rust.
 use super::*;
 
-fn model_provider(provider: &CredentialProvider) -> Provider {
+fn model_provider(provider: &CredentialProvider) -> Option<Provider> {
     match provider {
-        CredentialProvider::Anthropic => Provider::AnthropicApi,
-        CredentialProvider::Openai => Provider::OpenaiApi,
-        CredentialProvider::Deepseek => Provider::DeepseekApi,
-        CredentialProvider::Xai => Provider::XaiApi,
-        CredentialProvider::Zai => Provider::ZaiApi,
-        CredentialProvider::OllamaCloud => Provider::OllamaCloud,
-        CredentialProvider::Huggingface => Provider::Huggingface,
+        CredentialProvider::Anthropic => Some(Provider::AnthropicApi),
+        CredentialProvider::Openai => Some(Provider::OpenaiApi),
+        CredentialProvider::Deepseek => Some(Provider::DeepseekApi),
+        CredentialProvider::Xai => Some(Provider::XaiApi),
+        CredentialProvider::Zai => Some(Provider::ZaiApi),
+        CredentialProvider::OllamaCloud => Some(Provider::OllamaCloud),
+        CredentialProvider::Huggingface => Some(Provider::Huggingface),
+        CredentialProvider::Jev => None,
     }
 }
 
@@ -27,7 +28,9 @@ fn setup(
         AdminHelper::Credentials,
         vec!["set".into(), provider.as_str().into()],
     )?;
-    let provider = model_provider(provider);
+    let Some(provider) = model_provider(provider) else {
+        return Ok(());
+    };
     run(AdminHelper::Models, vec!["refresh".into(), provider.as_str().into()])
         .with_context(|| format!(
             "credential verified and saved, but model catalog refresh failed; retry: sudo jarvis models refresh {}",
@@ -82,6 +85,20 @@ mod tests {
         })
         .is_err());
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn jev_credential_does_not_invoke_chat_model_discovery() {
+        let mut calls = Vec::new();
+        setup(&CredentialProvider::Jev, |helper, args| {
+            calls.push((helper, args));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            calls,
+            vec![(AdminHelper::Credentials, vec!["set".into(), "jev".into()])]
+        );
     }
 
     #[test]

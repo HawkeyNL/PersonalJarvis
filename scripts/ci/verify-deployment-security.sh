@@ -17,6 +17,7 @@ bash deploy/systemd/tests/test-model-discovery-pipeline.sh
 bash deploy/systemd/tests/test-hourly-model-catalog.sh
 bash deploy/systemd/tests/test-credential-candidate.sh
 bash deploy/systemd/tests/test-huggingface-credential-probe.sh
+bash deploy/systemd/tests/test-jev-credential-probe.sh
 sudo env GITHUB_ACTIONS=true bash deploy/surrealdb/tests/test-provision-core-user-shellless.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-stage-core-release.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-prepare-codex-worktree.sh

@@ -295,7 +295,7 @@ pub(super) async fn execute_chat(
     } else {
         history
     };
-    let mode = req
+    let requested_mode = req
         .mode
         .as_deref()
         .map(llm::RoutingMode::parse)
@@ -309,6 +309,31 @@ pub(super) async fn execute_chat(
                 })
                 .unwrap_or_default()
         });
+    let owner_brain = if requested_mode == llm::RoutingMode::Auto {
+        match conversation_brain_override(&state.db, conv_id, authed.user.id).await {
+            Some(preferred) => Some(preferred),
+            None => async_global_brain(&state, authed.user.id).await,
+        }
+    } else {
+        None
+    };
+    let owner_brain_pinned = owner_brain
+        .as_ref()
+        .is_some_and(|(provider, model)| state.model_policy.allows(provider, model));
+    // Jev classifies a bounded copy of the latest user turn. The owner-selected
+    // mode and deterministic safety floor retain final authority. A Jev result
+    // cannot name a model, trigger a tool, or approve a side effect.
+    let intent_kind = if crate::intent::should_classify(requested_mode, owner_brain_pinned) {
+        crate::intent::decide(&state, &new_msg).await
+    } else {
+        None
+    };
+    let mode = crate::intent::available_route_mode(
+        requested_mode,
+        intent_kind,
+        &new_msg,
+        state.llm.as_ref(),
+    );
     // Classification establishes a quality floor only. The complete original
     // conversation below remains the model input; no lossy summary or hidden
     // model-selection prompt is substituted for the owner's request.
@@ -330,12 +355,7 @@ pub(super) async fn execute_chat(
     // every persisted selection was allowlist-validated and is checked again
     // here to fail closed after a policy reload/revocation.
     if mode == llm::RoutingMode::Auto {
-        let preferred = conversation_brain_override(&state.db, conv_id, authed.user.id).await;
-        let preferred = match preferred {
-            Some(preferred) => Some(preferred),
-            None => async_global_brain(&state, authed.user.id).await,
-        };
-        if let Some((provider, model)) = preferred {
+        if let Some((provider, model)) = owner_brain {
             if state.model_policy.allows(&provider, &model) {
                 chat.model = Some(model);
             }
@@ -445,6 +465,7 @@ pub(super) async fn execute_chat(
                 "conversation_title": conv_title,
                 "new_topic": new_topic,
                 "routing_mode": mode,
+                "intent_kind": intent_kind.map(crate::intent::WorkKind::as_str),
             })))
         }
         Err(llm::LlmError::Refused) => {

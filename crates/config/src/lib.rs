@@ -104,6 +104,12 @@ pub struct AppConfig {
     #[serde(default)]
     pub llm_api_key: String,
 
+    /// TypeSafe Jev's advisory intent-classifier credential.
+    #[serde(default)]
+    pub llm_jev_api_key: String,
+    #[serde(default = "default_jev_model")]
+    pub llm_jev_model: String,
+
     /// Anthropic API base URL (override for a proxy or tests).
     #[serde(default = "default_anthropic_base_url")]
     pub llm_anthropic_base_url: String,
@@ -384,6 +390,10 @@ fn default_llm_provider() -> String {
     "anthropic".to_string()
 }
 
+fn default_jev_model() -> String {
+    "jev-latest".to_string()
+}
+
 fn default_anthropic_base_url() -> String {
     "https://api.anthropic.com".to_string()
 }
@@ -637,6 +647,15 @@ impl AppConfig {
     /// opens a socket. Public TLS terminates at Caddy; production Core is never
     /// allowed to become a directly reachable HTTP listener.
     pub fn validate_runtime_security(&self) -> Result<(), String> {
+        if self.llm_jev_model.is_empty()
+            || self.llm_jev_model.len() > 128
+            || !self
+                .llm_jev_model
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
+        {
+            return Err("invalid TypeSafe Jev model alias".to_string());
+        }
         if self.environment.eq_ignore_ascii_case("production") {
             let bind_addr: SocketAddr = self
                 .bind_addr
@@ -700,6 +719,8 @@ impl fmt::Debug for AppConfig {
             .field("public_hostname", &self.public_hostname)
             .field("ibkr_gateway_url", &self.ibkr_gateway_url)
             .field("llm_provider", &self.llm_provider)
+            .field("llm_jev_api_key", &redact(&self.llm_jev_api_key))
+            .field("llm_jev_model", &self.llm_jev_model)
             .field(
                 "llm_api_key",
                 &if self.llm_api_key.is_empty() {
@@ -820,6 +841,8 @@ mod tests {
             ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
             llm_provider: "anthropic".to_string(),
             llm_api_key: "sk-ant-supersecretkey".to_string(),
+            llm_jev_api_key: "jev-supersecret".to_string(),
+            llm_jev_model: default_jev_model(),
             llm_anthropic_base_url: "https://api.anthropic.com".to_string(),
             llm_model: "claude-sonnet-5".to_string(),
             llm_model_hard: "claude-opus-5".to_string(),
@@ -915,6 +938,7 @@ mod tests {
             jail.set_env("JARVIS_BIND_ADDR", "127.0.0.1:9999");
             jail.set_env("JARVIS_LOG_JSON", "true");
             jail.set_env("JARVIS_LLM_HUGGINGFACE_API_KEY", "hf-fixture-secret");
+            jail.set_env("JARVIS_LLM_JEV_API_KEY", "jev-fixture-secret");
             jail.set_env("JARVIS_LLM_HUGGINGFACE_ROUTE", "groq");
 
             let cfg = AppConfig::load()?;
@@ -922,6 +946,8 @@ mod tests {
             assert_eq!(cfg.surreal_endpoint, "127.0.0.1:8000");
             assert!(cfg.log_json);
             assert_eq!(cfg.llm_huggingface_api_key, "hf-fixture-secret");
+            assert_eq!(cfg.llm_jev_api_key, "jev-fixture-secret");
+            assert_eq!(cfg.llm_jev_model, "jev-latest");
             assert_eq!(
                 cfg.llm_huggingface_base_url,
                 "https://router.huggingface.co/v1"
@@ -947,6 +973,8 @@ mod tests {
             ibkr_gateway_url: String::new(),
             llm_provider: String::new(),
             llm_api_key: String::new(),
+            llm_jev_api_key: String::new(),
+            llm_jev_model: default_jev_model(),
             llm_anthropic_base_url: String::new(),
             llm_model: String::new(),
             llm_model_hard: String::new(),
