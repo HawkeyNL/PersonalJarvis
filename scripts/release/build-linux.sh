@@ -48,6 +48,11 @@ verify_admin_helper_candidate() {
 
 verify_systemd_unit_candidate() {
   local release=$1
+  jq -e '.tooling.model_catalog == 1 and (.tooling.model_catalog | type) == "number"' \
+    "$release/release.json" >/dev/null || {
+    echo "release candidate does not declare model-catalog capability 1" >&2
+    exit 1
+  }
   jq -e '.tooling.model_policy_directory == 1 and (.tooling.model_policy_directory | type) == "number"' \
     "$release/release.json" >/dev/null || {
     echo "release candidate does not declare model-policy directory capability 1" >&2
@@ -222,7 +227,8 @@ for unit in \
   jarvis-updater.service \
   jarvis-updater.timer \
   jarvis-private-agent-updater.service \
-  jarvis-private-agent-updater.timer; do
+  jarvis-private-agent-updater.timer \
+  jarvis-model-catalog.service jarvis-model-catalog.timer; do
   install -m 0644 "deploy/systemd/$unit" "$temporary_release/systemd-$unit"
 done
 install -m 0644 deploy/systemd/pricing-registry.json "$temporary_release/pricing-registry.json"
@@ -245,7 +251,7 @@ jq -n \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
   --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 8, from_sha256: [$schema_six, $schema_seven]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1}}' \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 8, from_sha256: [$schema_six, $schema_seven]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1}}' \
   > "$temporary_release/release.json"
 
 (

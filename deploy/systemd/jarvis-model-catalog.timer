@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly Jarvis provider model metadata refresh
+PartOf=jarvis-core.service
+
+[Timer]
+OnActiveSec=5min
+OnUnitInactiveSec=1h
+RandomizedDelaySec=30s
+AccuracySec=10s
+Unit=jarvis-model-catalog.service

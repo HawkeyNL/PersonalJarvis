@@ -67,6 +67,7 @@ export interface ModelRecord {
   output_per_million_usd: number | null;
   pricing_source: string;
   pricing_updated_at: string;
+  pricing_notes?: string;
 }
 export interface HfProviderRecord {
   provider: string;

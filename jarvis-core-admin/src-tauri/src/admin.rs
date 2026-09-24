@@ -192,6 +192,8 @@ pub struct ModelRecord {
     pub pricing_source: String,
     #[serde(default)]
     pub pricing_updated_at: String,
+    #[serde(default)]
+    pub pricing_notes: String,
 }
 
 fn unknown_price_status() -> String {

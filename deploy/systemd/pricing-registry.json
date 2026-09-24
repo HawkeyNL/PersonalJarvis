@@ -1,35 +1,592 @@
 {
   "version": 1,
-  "source": "owner-reviewed-baseline-2026-09-01; Ollama Cloud prices reviewed from https://ollama.com/pricing",
-  "updated_at": "2026-09-01",
+  "source": "release-reviewed-provider-pricing-2026-09-24",
+  "updated_at": "2026-09-24",
   "models": [
-    {"provider":"anthropic-api","model":"claude-opus-5","input_per_million_usd":5.0,"output_per_million_usd":25.0},
-    {"provider":"anthropic-api","model":"claude-sonnet-5","input_per_million_usd":3.0,"output_per_million_usd":15.0},
-    {"provider":"anthropic-api","model":"claude-haiku-4-5","input_per_million_usd":1.0,"output_per_million_usd":5.0},
-    {"provider":"openai-api","model":"gpt-4o","input_per_million_usd":2.5,"output_per_million_usd":10.0},
-    {"provider":"openai-api","model":"gpt-4o-mini","input_per_million_usd":0.15,"output_per_million_usd":0.6},
-    {"provider":"openai-api","model":"gpt-4.1","input_per_million_usd":2.5,"output_per_million_usd":10.0},
-    {"provider":"openai-api","model":"gpt-4.1-mini","input_per_million_usd":0.15,"output_per_million_usd":0.6},
-    {"provider":"deepseek-api","model":"deepseek-chat","input_per_million_usd":0.27,"output_per_million_usd":1.1},
-    {"provider":"deepseek-api","model":"deepseek-reasoner","input_per_million_usd":0.55,"output_per_million_usd":2.19},
-    {"provider":"ollama-cloud","model":"deepseek-v4-flash:0731","input_per_million_usd":0.44,"cache_read_per_million_usd":0.014,"output_per_million_usd":1.32},
-    {"provider":"ollama-cloud","model":"deepseek-v4-pro:0813","input_per_million_usd":1.32,"cache_read_per_million_usd":0.044,"output_per_million_usd":3.96},
-    {"provider":"ollama-cloud","model":"gemma4:31b","input_per_million_usd":0.14,"cache_read_per_million_usd":0.05,"output_per_million_usd":0.4},
-    {"provider":"ollama-cloud","model":"glm-5.3","input_per_million_usd":1.4,"cache_read_per_million_usd":0.26,"output_per_million_usd":4.4},
-    {"provider":"ollama-cloud","model":"glm-5.3-flash","input_per_million_usd":0.15,"cache_read_per_million_usd":0.03,"output_per_million_usd":0.5},
-    {"provider":"ollama-cloud","model":"glm-5.2","input_per_million_usd":1.4,"cache_read_per_million_usd":0.26,"output_per_million_usd":4.4},
-    {"provider":"ollama-cloud","model":"glm-5.1","input_per_million_usd":1.0,"cache_read_per_million_usd":0.2,"output_per_million_usd":3.2},
-    {"provider":"ollama-cloud","model":"gpt-oss:120b","input_per_million_usd":0.15,"cache_read_per_million_usd":0.014,"output_per_million_usd":0.6},
-    {"provider":"ollama-cloud","model":"gpt-oss:20b","input_per_million_usd":0.07,"cache_read_per_million_usd":0.035,"output_per_million_usd":0.3},
-    {"provider":"ollama-cloud","model":"kimi-k3","input_per_million_usd":3.0,"cache_read_per_million_usd":0.3,"output_per_million_usd":15.0},
-    {"provider":"ollama-cloud","model":"kimi-k2.7-code","input_per_million_usd":0.95,"cache_read_per_million_usd":0.19,"output_per_million_usd":4.0},
-    {"provider":"ollama-cloud","model":"kimi-k2.6","input_per_million_usd":0.95,"cache_read_per_million_usd":0.16,"output_per_million_usd":4.0},
-    {"provider":"ollama-cloud","model":"minimax-m3","input_per_million_usd":0.6,"cache_read_per_million_usd":0.12,"output_per_million_usd":2.4},
-    {"provider":"ollama-cloud","model":"minimax-m2.7","input_per_million_usd":0.3,"cache_read_per_million_usd":0.06,"output_per_million_usd":1.2},
-    {"provider":"ollama-cloud","model":"mistral-large-3:675b","input_per_million_usd":0.5,"cache_read_per_million_usd":0.5,"output_per_million_usd":1.5},
-    {"provider":"ollama-cloud","model":"nemotron-3-nano:30b","input_per_million_usd":0.06,"cache_read_per_million_usd":0.06,"output_per_million_usd":0.24},
-    {"provider":"ollama-cloud","model":"nemotron-3-super","input_per_million_usd":0.015,"cache_read_per_million_usd":0.015,"output_per_million_usd":0.6},
-    {"provider":"ollama-cloud","model":"nemotron-3-ultra","input_per_million_usd":0.1,"cache_read_per_million_usd":0.1,"output_per_million_usd":3.0},
-    {"provider":"ollama-cloud","model":"qwen3.5:397b","input_per_million_usd":0.6,"cache_read_per_million_usd":0.6,"output_per_million_usd":3.6}
+    {
+      "provider": "anthropic-api",
+      "model": "claude-opus-5",
+      "input_per_million_usd": 5,
+      "output_per_million_usd": 25,
+      "pricing_source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers.",
+      "cache_read_per_million_usd": 0.5
+    },
+    {
+      "provider": "anthropic-api",
+      "model": "claude-sonnet-5",
+      "input_per_million_usd": 2,
+      "output_per_million_usd": 10,
+      "pricing_source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers.",
+      "cache_read_per_million_usd": 0.2
+    },
+    {
+      "provider": "anthropic-api",
+      "model": "claude-haiku-4-5",
+      "input_per_million_usd": 1,
+      "output_per_million_usd": 5,
+      "pricing_source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers.",
+      "cache_read_per_million_usd": 0.1
+    },
+    {
+      "provider": "openai-api",
+      "model": "gpt-4o",
+      "input_per_million_usd": 2.5,
+      "output_per_million_usd": 10,
+      "pricing_source": "https://developers.openai.com/api/docs/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers.",
+      "cache_read_per_million_usd": 1.25
+    },
+    {
+      "provider": "openai-api",
+      "model": "gpt-4o-mini",
+      "input_per_million_usd": 0.15,
+      "output_per_million_usd": 0.6,
+      "pricing_source": "https://developers.openai.com/api/docs/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers.",
+      "cache_read_per_million_usd": 0.075
+    },
+    {
+      "provider": "openai-api",
+      "model": "gpt-4.1",
+      "input_per_million_usd": 2,
+      "output_per_million_usd": 8,
+      "pricing_source": "https://developers.openai.com/api/docs/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers.",
+      "cache_read_per_million_usd": 0.5
+    },
+    {
+      "provider": "openai-api",
+      "model": "gpt-4.1-mini",
+      "input_per_million_usd": 0.4,
+      "output_per_million_usd": 1.6,
+      "pricing_source": "https://developers.openai.com/api/docs/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers.",
+      "cache_read_per_million_usd": 0.1
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "deepseek-v4-flash:0731",
+      "input_per_million_usd": 0.44,
+      "cache_read_per_million_usd": 0.014,
+      "output_per_million_usd": 1.32,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Peak rates; no off-peak discount assumed.",
+      "price_status": "conservative"
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "deepseek-v4-pro:0813",
+      "input_per_million_usd": 1.32,
+      "cache_read_per_million_usd": 0.044,
+      "output_per_million_usd": 3.96,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Peak rates; no off-peak discount assumed.",
+      "price_status": "conservative"
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "gemma4:31b",
+      "input_per_million_usd": 0.14,
+      "cache_read_per_million_usd": 0.05,
+      "output_per_million_usd": 0.4,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "glm-5.3",
+      "input_per_million_usd": 1.4,
+      "cache_read_per_million_usd": 0.26,
+      "output_per_million_usd": 4.4,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "glm-5.3-flash",
+      "input_per_million_usd": 0.15,
+      "cache_read_per_million_usd": 0.03,
+      "output_per_million_usd": 0.5,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "glm-5.2",
+      "input_per_million_usd": 1.4,
+      "cache_read_per_million_usd": 0.26,
+      "output_per_million_usd": 4.4,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "glm-5.1",
+      "input_per_million_usd": 1,
+      "cache_read_per_million_usd": 0.2,
+      "output_per_million_usd": 3.2,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "gpt-oss:120b",
+      "input_per_million_usd": 0.15,
+      "cache_read_per_million_usd": 0.014,
+      "output_per_million_usd": 0.6,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "gpt-oss:20b",
+      "input_per_million_usd": 0.07,
+      "cache_read_per_million_usd": 0.035,
+      "output_per_million_usd": 0.3,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "kimi-k3",
+      "input_per_million_usd": 3,
+      "cache_read_per_million_usd": 0.3,
+      "output_per_million_usd": 15,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "kimi-k2.7-code",
+      "input_per_million_usd": 0.95,
+      "cache_read_per_million_usd": 0.19,
+      "output_per_million_usd": 4,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "kimi-k2.6",
+      "input_per_million_usd": 0.95,
+      "cache_read_per_million_usd": 0.16,
+      "output_per_million_usd": 4,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "minimax-m3",
+      "input_per_million_usd": 0.6,
+      "cache_read_per_million_usd": 0.12,
+      "output_per_million_usd": 2.4,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "minimax-m2.7",
+      "input_per_million_usd": 0.3,
+      "cache_read_per_million_usd": 0.06,
+      "output_per_million_usd": 1.2,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "mistral-large-3:675b",
+      "input_per_million_usd": 0.5,
+      "cache_read_per_million_usd": null,
+      "output_per_million_usd": 1.5,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "nemotron-3-nano:30b",
+      "input_per_million_usd": 0.06,
+      "cache_read_per_million_usd": null,
+      "output_per_million_usd": 0.24,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "nemotron-3-super",
+      "input_per_million_usd": 0.015,
+      "cache_read_per_million_usd": 0.015,
+      "output_per_million_usd": 0.6,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "nemotron-3-ultra",
+      "input_per_million_usd": 0.1,
+      "cache_read_per_million_usd": 0.1,
+      "output_per_million_usd": 3,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "qwen3.5:397b",
+      "input_per_million_usd": 0.6,
+      "cache_read_per_million_usd": null,
+      "output_per_million_usd": 3.6,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "openai-api",
+      "model": "gpt-6-astra",
+      "input_per_million_usd": 10,
+      "cache_read_per_million_usd": 1,
+      "output_per_million_usd": 50,
+      "pricing_source": "https://developers.openai.com/api/docs/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text rates; above 272K input tokens input/cache x2 and output x1.5. Excludes cache writes, tools, Fast and regional premiums.",
+      "long_context": {
+        "from_input_tokens": 272001,
+        "input_per_million_usd": 20,
+        "cache_read_per_million_usd": 2,
+        "output_per_million_usd": 75
+      }
+    },
+    {
+      "provider": "openai-api",
+      "model": "gpt-6-sol",
+      "input_per_million_usd": 2,
+      "cache_read_per_million_usd": 0.2,
+      "output_per_million_usd": 10,
+      "pricing_source": "https://developers.openai.com/api/docs/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text rates; above 272K input tokens input/cache x2 and output x1.5. Excludes cache writes, tools, Fast and regional premiums.",
+      "long_context": {
+        "from_input_tokens": 272001,
+        "input_per_million_usd": 4,
+        "cache_read_per_million_usd": 0.4,
+        "output_per_million_usd": 15
+      }
+    },
+    {
+      "provider": "openai-api",
+      "model": "gpt-6-luna",
+      "input_per_million_usd": 0.1,
+      "cache_read_per_million_usd": 0.01,
+      "output_per_million_usd": 0.5,
+      "pricing_source": "https://developers.openai.com/api/docs/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text rates; above 272K input tokens input/cache x2 and output x1.5. Excludes cache writes, tools, Fast and regional premiums.",
+      "long_context": {
+        "from_input_tokens": 272001,
+        "input_per_million_usd": 0.2,
+        "cache_read_per_million_usd": 0.02,
+        "output_per_million_usd": 0.75
+      }
+    },
+    {
+      "provider": "anthropic-api",
+      "model": "claude-opus-5-5",
+      "input_per_million_usd": 4,
+      "cache_read_per_million_usd": 0.2,
+      "output_per_million_usd": 20,
+      "pricing_source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "anthropic-api",
+      "model": "claude-fable-5-1",
+      "input_per_million_usd": 10,
+      "cache_read_per_million_usd": 0.25,
+      "output_per_million_usd": 50,
+      "pricing_source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "anthropic-api",
+      "model": "claude-opus-4-6",
+      "input_per_million_usd": 5,
+      "cache_read_per_million_usd": 0.5,
+      "output_per_million_usd": 25,
+      "pricing_source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "anthropic-api",
+      "model": "claude-sonnet-4-6",
+      "input_per_million_usd": 3,
+      "cache_read_per_million_usd": 0.3,
+      "output_per_million_usd": 15,
+      "pricing_source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "deepseek-api",
+      "model": "deepseek-flash",
+      "input_per_million_usd": 0.3,
+      "cache_read_per_million_usd": 0.006,
+      "output_per_million_usd": 1.2,
+      "pricing_source": "https://api-docs.deepseek.com/quick_start/pricing/",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Peak rates; off-peak costs less. No calendar-dependent discount assumed.",
+      "price_status": "conservative"
+    },
+    {
+      "provider": "deepseek-api",
+      "model": "deepseek-v4-flash",
+      "input_per_million_usd": 0.3,
+      "cache_read_per_million_usd": 0.006,
+      "output_per_million_usd": 1.2,
+      "pricing_source": "https://api-docs.deepseek.com/quick_start/pricing/",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Peak rates; off-peak costs less. No calendar-dependent discount assumed.",
+      "price_status": "conservative"
+    },
+    {
+      "provider": "deepseek-api",
+      "model": "deepseek-v4-flash-vision-exp",
+      "input_per_million_usd": 0.3,
+      "cache_read_per_million_usd": 0.006,
+      "output_per_million_usd": 1.2,
+      "pricing_source": "https://api-docs.deepseek.com/quick_start/pricing/",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Peak rates; off-peak costs less. No calendar-dependent discount assumed.",
+      "price_status": "conservative"
+    },
+    {
+      "provider": "deepseek-api",
+      "model": "deepseek-v4-pro",
+      "input_per_million_usd": 1.32,
+      "cache_read_per_million_usd": 0.044,
+      "output_per_million_usd": 3.96,
+      "pricing_source": "https://api-docs.deepseek.com/quick_start/pricing/",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Peak rates; off-peak costs less. No calendar-dependent discount assumed.",
+      "price_status": "conservative"
+    },
+    {
+      "provider": "xai-api",
+      "model": "grok-4.7",
+      "input_per_million_usd": 2,
+      "cache_read_per_million_usd": 0.5,
+      "output_per_million_usd": 6,
+      "pricing_source": "https://docs.x.ai/developers/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text rates; at 200K input tokens all token rates x2. Excludes tools and regional premiums.",
+      "long_context": {
+        "from_input_tokens": 200000,
+        "input_per_million_usd": 4,
+        "cache_read_per_million_usd": 1,
+        "output_per_million_usd": 12
+      }
+    },
+    {
+      "provider": "xai-api",
+      "model": "grok-4.6",
+      "input_per_million_usd": 2,
+      "cache_read_per_million_usd": 0.5,
+      "output_per_million_usd": 6,
+      "pricing_source": "https://docs.x.ai/developers/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text rates; at 200K input tokens all token rates x2. Excludes tools and regional premiums.",
+      "long_context": {
+        "from_input_tokens": 200000,
+        "input_per_million_usd": 4,
+        "cache_read_per_million_usd": 1,
+        "output_per_million_usd": 12
+      }
+    },
+    {
+      "provider": "xai-api",
+      "model": "grok-4.5",
+      "input_per_million_usd": 2,
+      "cache_read_per_million_usd": 0.3,
+      "output_per_million_usd": 6,
+      "pricing_source": "https://docs.x.ai/developers/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text rates; at 200K input tokens all token rates x2. Excludes tools and regional premiums.",
+      "long_context": {
+        "from_input_tokens": 200000,
+        "input_per_million_usd": 4,
+        "cache_read_per_million_usd": 0.6,
+        "output_per_million_usd": 12
+      }
+    },
+    {
+      "provider": "xai-api",
+      "model": "grok-4.3",
+      "input_per_million_usd": 1.25,
+      "cache_read_per_million_usd": 0.2,
+      "output_per_million_usd": 2.5,
+      "pricing_source": "https://docs.x.ai/developers/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text rates; at 200K input tokens all token rates x2. Excludes tools and regional premiums.",
+      "long_context": {
+        "from_input_tokens": 200000,
+        "input_per_million_usd": 2.5,
+        "cache_read_per_million_usd": 0.4,
+        "output_per_million_usd": 5
+      }
+    },
+    {
+      "provider": "xai-api",
+      "model": "grok-build-0.1",
+      "input_per_million_usd": 1,
+      "cache_read_per_million_usd": 0.2,
+      "output_per_million_usd": 2,
+      "pricing_source": "https://docs.x.ai/developers/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text rates; at 200K input tokens all token rates x2. Excludes tools and regional premiums.",
+      "long_context": {
+        "from_input_tokens": 200000,
+        "input_per_million_usd": 2,
+        "cache_read_per_million_usd": 0.4,
+        "output_per_million_usd": 4
+      }
+    },
+    {
+      "provider": "zai-api",
+      "model": "glm-5.3",
+      "input_per_million_usd": 1.4,
+      "cache_read_per_million_usd": 0.26,
+      "output_per_million_usd": 4.4,
+      "pricing_source": "https://docs.z.ai/guides/overview/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "zai-api",
+      "model": "glm-5.3-flash",
+      "input_per_million_usd": 0.15,
+      "cache_read_per_million_usd": 0.03,
+      "output_per_million_usd": 0.5,
+      "pricing_source": "https://docs.z.ai/guides/overview/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "zai-api",
+      "model": "glm-5.3-flashx",
+      "input_per_million_usd": 0.37,
+      "cache_read_per_million_usd": 0.075,
+      "output_per_million_usd": 1.25,
+      "pricing_source": "https://docs.z.ai/guides/overview/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "zai-api",
+      "model": "glm-5.2",
+      "input_per_million_usd": 1.4,
+      "cache_read_per_million_usd": 0.26,
+      "output_per_million_usd": 4.4,
+      "pricing_source": "https://docs.z.ai/guides/overview/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "zai-api",
+      "model": "glm-5.1",
+      "input_per_million_usd": 1.4,
+      "cache_read_per_million_usd": 0.26,
+      "output_per_million_usd": 4.4,
+      "pricing_source": "https://docs.z.ai/guides/overview/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "zai-api",
+      "model": "glm-5",
+      "input_per_million_usd": 1,
+      "cache_read_per_million_usd": 0.2,
+      "output_per_million_usd": 3.2,
+      "pricing_source": "https://docs.z.ai/guides/overview/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "zai-api",
+      "model": "glm-4.7",
+      "input_per_million_usd": 0.6,
+      "cache_read_per_million_usd": 0.11,
+      "output_per_million_usd": 2.2,
+      "pricing_source": "https://docs.z.ai/guides/overview/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "zai-api",
+      "model": "glm-4.7-flashx",
+      "input_per_million_usd": 0.07,
+      "cache_read_per_million_usd": 0.01,
+      "output_per_million_usd": 0.4,
+      "pricing_source": "https://docs.z.ai/guides/overview/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "zai-api",
+      "model": "glm-4.6",
+      "input_per_million_usd": 0.6,
+      "cache_read_per_million_usd": 0.11,
+      "output_per_million_usd": 2.2,
+      "pricing_source": "https://docs.z.ai/guides/overview/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "zai-api",
+      "model": "glm-4.5",
+      "input_per_million_usd": 0.6,
+      "cache_read_per_million_usd": 0.11,
+      "output_per_million_usd": 2.2,
+      "pricing_source": "https://docs.z.ai/guides/overview/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Standard global text-token rates; excludes tools, taxes and optional service tiers."
+    },
+    {
+      "provider": "ollama-cloud",
+      "model": "deepseek-v4.1-flash",
+      "input_per_million_usd": 0.3,
+      "cache_read_per_million_usd": 0.006,
+      "output_per_million_usd": 1.2,
+      "pricing_source": "https://ollama.com/pricing",
+      "pricing_updated_at": "2026-09-24",
+      "pricing_notes": "Peak rates; no off-peak discount assumed.",
+      "price_status": "conservative"
+    }
   ]
 }

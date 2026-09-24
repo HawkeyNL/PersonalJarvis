@@ -23,12 +23,17 @@ sudo jarvis credentials test openai
 sudo jarvis credentials remove openai
 ```
 
-`set` installs a temporary root-only file atomically, restarts Core and waits
+`set` first probes the candidate credential using metadata only. A rejected or
+unverifiable candidate leaves the existing credential untouched. It then
+installs a temporary root-only file atomically, restarts Core and waits
 for `/livez` and `/readyz`.  A failed restart restores the old credential
 state. `test` performs a bounded authenticated metadata probe (`/models` where
 the provider supports it; Anthropic's model-list endpoint otherwise) using an
 ephemeral root-only curl config, then checks Core health. It intentionally does
-not perform a paid generation request or print a provider response.
+not perform a paid generation request or print a provider response. After a
+successful `set`, the CLI refreshes that provider's model catalog; discovered
+models remain disabled. If this refresh fails, the validated credential remains
+saved and the command reports the partial failure with a retry command.
 Local Ollama has no credential. Remote Ollama is a distinct `ollama-cloud`
 provider and must use an explicit credential and model allowlist entry.
 
@@ -50,6 +55,37 @@ sudo jarvis models show openai-api gpt-4o-mini
 The policy matches the literal provider and model ID. A newly listed or renamed
 model does not inherit another model's permission. Refresh retains existing
 entries if a provider/discovery operation is unavailable.
+
+### Hourly metadata refresh
+
+Releases declaring `tooling.model_catalog: 1` include verified
+`jarvis-model-catalog.service` and `.timer` units. Core starts the timer at boot
+and restart. Its first run is after five minutes, then one hour after each
+completed run, with up to 30 seconds of jitter. A single oneshot service and
+the existing policy lock prevent overlapping writes. This does not restart
+Core, generate completions, enable models or change owner-selected HF routes.
+
+Only safely configured credential files are used. The seven cloud providers
+are checked independently; a failed request retains the previous model policy,
+does not prevent the remaining providers being checked, and fails the service
+visibly. Requests have bounded time/size. Anthropic catalogs exceeding the
+supported 1,000-record page are refused rather than silently truncated.
+
+After installing such a release:
+
+```bash
+systemctl status jarvis-model-catalog.timer
+systemctl list-timers jarvis-model-catalog.timer
+sudo journalctl -u jarvis-model-catalog.service -n 50 --no-pager
+sudo jarvis models refresh-configured
+```
+
+The last command runs the same configured-provider refresh manually. Existing
+models absent from a later catalog are retained, not silently deauthorized.
+HF route prices come from metadata; other provider prices remain reviewed
+release snapshots, not hourly scraped billing pages. Rollback to a release
+without this capability removes the new canonical timer/service files through
+the verified unit manager; failed activation restores the backed-up unit set.
 
 ### App-mediated owner changes
 
@@ -91,14 +127,50 @@ with a soft threshold for cost-aware selection and a per-request hard cap.
 
 `/etc/jarvis/pricing-registry.json` is a root-owned, Core-readable (`0640`)
 versioned registry with a source note and update date. Entries are exact
-provider/model pairs. It is initialized once during setup and an explicit owner
-entry is never overwritten by a release. Verified releases may add reviewed
-exact-model coverage for pairs that are absent from the owner registry; the
+provider/model pairs. Fresh setup initializes an empty owner override registry;
+reviewed defaults remain in the immutable release. Verified releases update
+default rates while explicit owner entries continue to take precedence; the
 effective source/date reports both layers. An owner can stage a reviewed
 replacement atomically, retain the ownership/mode, then restart Core. Malformed
 input falls back to the built-in conservative registry and is logged without
 affecting availability. Unknown remote models remain explicitly unknown and
 use conservative accounting rather than a fabricated zero price.
+
+The packaged `deploy/systemd/pricing-registry.json` is also embedded in Core;
+there is no separate Rust baseline to maintain. Per-entry `pricing_source`,
+`pricing_updated_at` and `pricing_notes` identify the actual provider source
+and conditions. Legacy entries inherit their original registry provenance before
+layers are merged, so adding a new release does not make an old owner price
+appear freshly reviewed. For the two historical setup catalogs dated August 27
+and September 1, 2026, exact unmodified shipped entries are treated as defaults
+only if their registry source/date also match. Changed entries are retained.
+Set `owner_override: true` to deliberately pin even an unchanged historical
+rate. Migration happens only when reading: no owner file is rewritten, so an
+older binary can still read its previous configuration after rollback.
+
+The September 24 catalog covers reviewed text models from OpenAI, Anthropic,
+DeepSeek, xAI, Z.ai and Ollama Cloud. HF prices remain discovered per route;
+there is intentionally no fabricated universal HF model price. Discovery and
+pricing are separate: a newly discovered model is disabled and may have unknown
+pricing until its exact ID is reviewed. No model-name prefix matching is used.
+
+Shown rates are standard global USD/million text tokens, not a provider invoice.
+Optional `long_context` rates include an inclusive `from_input_tokens`
+threshold; accounting selects them using fresh plus cached input tokens, and
+multi-call estimates apply the threshold per call, not to the sum of calls.
+DeepSeek/Ollama time-dependent rates use the peak rate, classified conservative.
+Missing cache discounts remain null in the UI and use the full input rate for
+accounting, never an invented 90% discount. Unknown models have no unrelated
+source/date label. Core Admin exposes per-model pricing details.
+
+This is a release-reviewed snapshot, not a live price scraper. Changing a
+credential or refreshing model IDs does not scrape billing pages or rewrite
+owner prices. Cache-write fees, nonstandard service tiers, region premiums,
+tools and taxes are not included in the displayed input/cache-read/output
+columns; their treatment requires additional accounting before these estimates
+can be considered invoice-equivalent. Configure appropriate owner rates for
+nonstandard endpoints. Never interpret an unknown price as authorization or free
+usage.
 
 Core persists bounded monthly aggregates for requests, input/output/cache
 tokens and estimated spend. The aggregate contains no prompts, replies,
