@@ -4,6 +4,7 @@
 //! crosses an existing typed helper boundary from the surrounding admin crate.
 
 use super::*;
+use std::net::IpAddr;
 
 const VIEWS: [AppView; 10] = [
     AppView::Overview,
@@ -88,6 +89,7 @@ struct LogEntry {
     level: Option<String>,
     message: String,
     target: Option<String>,
+    source_ip: Option<IpAddr>,
 }
 
 enum Snapshot {
@@ -2221,6 +2223,7 @@ fn safe_log_entry(line: &str) -> LogEntry {
             level: None,
             message: "[structured log omitted: no safe message field]".to_owned(),
             target: None,
+            source_ip: None,
         };
     }
 
@@ -2248,6 +2251,7 @@ fn safe_log_entry(line: &str) -> LogEntry {
             level: Some(if system { "SYSTEM" } else { "INFO" }.to_owned()),
             message: sanitize_log_text(message),
             target,
+            source_ip: None,
         };
     }
 
@@ -2256,6 +2260,7 @@ fn safe_log_entry(line: &str) -> LogEntry {
         level: None,
         message: sanitize_log_text(line),
         target: None,
+        source_ip: None,
     }
 }
 
@@ -2286,9 +2291,18 @@ fn log_entry_from_json(
         .and_then(serde_json::Value::as_str)
         .map(sanitize_log_text)
         .or(fallback_target);
+    // Display only a parsed IP literal. Never render arbitrary structured
+    // fields (including forwarding headers, tokens or credential material).
+    let source_ip = object
+        .get("ip")
+        .or_else(|| object.get("client_ip"))
+        .or_else(|| object.get("remote_ip"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<IpAddr>().ok());
 
     if let Ok(nested) = serde_json::from_str::<serde_json::Value>(raw_message) {
-        if let Some(entry) = log_entry_from_json(&nested, timestamp.clone(), target.clone()) {
+        if let Some(mut entry) = log_entry_from_json(&nested, timestamp.clone(), target.clone()) {
+            entry.source_ip = entry.source_ip.or(source_ip);
             return Some(entry);
         }
     }
@@ -2317,6 +2331,7 @@ fn log_entry_from_json(
         level: Some(level),
         message: sanitize_log_text(raw_message),
         target,
+        source_ip,
     })
 }
 
@@ -2406,7 +2421,11 @@ fn wrap_log_entry(entry: &LogEntry, width: usize) -> Vec<String> {
         (None, Some(level)) => level.clone(),
         (None, None) => String::new(),
     };
-    let body = log_message_with_target(entry);
+    let message = log_message_with_target(entry);
+    let body = match entry.source_ip {
+        Some(ip) => format!("[{ip}] {message}"),
+        None => message,
+    };
     if header.is_empty() {
         return wrap_hanging("", &body, width);
     }
@@ -3207,20 +3226,39 @@ mod tests {
     #[test]
     fn logs_parse_only_safe_json_and_compact_systemd_output() {
         let json = safe_log_entry(
-            r#"{"timestamp":"2026-08-30T12:08:11+02:00","level":"warn","message":"pricing registry unavailable","target":"jarvis_usage","token":"must-not-render"}"#,
+            r#"{"timestamp":"2026-08-30T12:08:11+02:00","level":"warn","message":"pricing registry unavailable","target":"jarvis_usage","ip":"198.51.100.20","token":"must-not-render"}"#,
         );
         assert_eq!(json.timestamp.as_deref(), Some("12:08:11"));
         assert_eq!(json.level.as_deref(), Some("WARN"));
         assert_eq!(json.message, "pricing registry unavailable");
         assert_eq!(json.target.as_deref(), Some("jarvis_usage"));
+        assert_eq!(
+            json.source_ip.map(|ip| ip.to_string()).as_deref(),
+            Some("198.51.100.20")
+        );
+        assert!(wrap_log_entry(&json, 80)
+            .join(" ")
+            .contains("[198.51.100.20]"));
         assert!(!format!("{json:?}").contains("must-not-render"));
 
         let journal_json = safe_log_entry(
-            r#"2026-08-30T12:48:04+02:00 jarvis-api[3962]: {"timestamp":"2026-08-30T10:48:04.354642Z","level":"WARN","message":"no persona file; using built-in fallback persona","path":"/protected/private/path","target":"jarvis_api"}"#,
+            r#"2026-08-30T12:48:04+02:00 jarvis-api[3962]: {"timestamp":"2026-08-30T10:48:04.354642Z","level":"WARN","message":"no persona file; using built-in fallback persona","ip":"2001:db8::5","path":"/protected/private/path","target":"jarvis_api"}"#,
         );
         assert_eq!(journal_json.timestamp.as_deref(), Some("12:48:04"));
         assert_eq!(journal_json.level.as_deref(), Some("WARN"));
+        assert_eq!(
+            journal_json.source_ip.map(|ip| ip.to_string()).as_deref(),
+            Some("2001:db8::5")
+        );
         assert!(!format!("{journal_json:?}").contains("/protected/private/path"));
+
+        let invalid_ip = safe_log_entry(
+            r#"{"message":"auth rate limit hit","ip":"token=must-not-render","authorization":"must-not-render"}"#,
+        );
+        assert_eq!(invalid_ip.source_ip, None);
+        assert!(!wrap_log_entry(&invalid_ip, 50)
+            .join(" ")
+            .contains("must-not-render"));
 
         let system = safe_log_entry(
             "2026-08-30T13:07:31+0200 jarvis-home-fixture systemd[1]: stopping jarvis-core.service",
@@ -3252,6 +3290,7 @@ mod tests {
             level: Some("WARN".to_owned()),
             message: sanitize_log_text(&long_message),
             target: Some("jarvis_usage".to_owned()),
+            source_ip: Some("198.51.100.20".parse().unwrap()),
         };
         let wide = wrap_log_entry(&entry, 80);
         let narrow = wrap_log_entry(&entry, 42);
@@ -3280,6 +3319,7 @@ mod tests {
                 level: None,
                 message: "界x".to_owned(),
                 target: None,
+                source_ip: None,
             },
             1,
         );

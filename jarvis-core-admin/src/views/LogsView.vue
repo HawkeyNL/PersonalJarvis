@@ -11,7 +11,7 @@ const services: { value: LogService; label: string }[] = [
   { value: "agents-updater", label: "Agent updater" },
 ];
 const service = ref<LogService>("core"); const level = ref("ALL"); const search = ref(""); const records = ref<LogRecord[]>([]); const unit = ref(""); const busy = ref(false); const error = ref(""); const follow = ref(false); const viewport = ref<HTMLElement | null>(null); let timer: number | undefined;
-const filtered = computed(() => { const needle = search.value.toLowerCase(); return records.value.filter((record) => (level.value === "ALL" || record.level === level.value) && (!needle || `${record.timestamp ?? ""} ${record.level} ${record.target ?? ""} ${record.message} ${record.details.flat().join(" ")}`.toLowerCase().includes(needle))); });
+const filtered = computed(() => { const needle = search.value.toLowerCase(); return records.value.filter((record) => (level.value === "ALL" || record.level === level.value) && (!needle || `${record.timestamp ?? ""} ${record.level} ${record.target ?? ""} ${record.source_ip ?? ""} ${record.message} ${record.details.flat().join(" ")}`.toLowerCase().includes(needle))); });
 async function load(quiet = false) { if (!quiet) busy.value = true; error.value = ""; try { const response = await api.logs(service.value, 750); records.value = response.records; unit.value = response.unit; if (follow.value) await nextTick(() => { if (viewport.value) viewport.value.scrollTop = viewport.value.scrollHeight; }); } catch (e) { error.value = errorText(e); follow.value = false; } finally { busy.value = false; } }
 function syncFollow() { clearInterval(timer); if (follow.value) { load(); timer = window.setInterval(() => load(true), 2500); } }
 watch(service, () => load()); watch(follow, syncFollow); onMounted(load); onBeforeUnmount(() => clearInterval(timer));
@@ -28,7 +28,7 @@ watch(service, () => load()); watch(follow, syncFollow); onMounted(load); onBefo
     </section>
     <section ref="viewport" class="log-viewport" aria-live="polite">
       <article v-for="record in filtered" :key="`${record.id}-${record.timestamp}`" class="log-entry" :class="`level-${record.level.toLowerCase()}`">
-        <div class="log-line"><time>{{ record.timestamp ?? "--:--:--" }}</time><span class="log-level">{{ record.level }}</span><span v-if="record.target" class="log-target">{{ record.target }}</span><span class="log-message">{{ record.message }}</span></div>
+        <div class="log-line"><time>{{ record.timestamp ?? "--:--:--" }}</time><span class="log-level">{{ record.level }}</span><span v-if="record.target" class="log-target">{{ record.target }}</span><span class="log-message"><span v-if="record.source_ip" class="log-ip">[{{ record.source_ip }}] </span>{{ record.message }}</span></div>
         <details v-if="record.details.length"><summary>Structured details</summary><dl><template v-for="[key, value] in record.details" :key="key"><dt>{{ key }}</dt><dd>{{ value }}</dd></template></dl></details>
       </article>
       <div v-if="!filtered.length && !busy" class="empty-state">No matching safe log records.</div>

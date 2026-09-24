@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::net::IpAddr;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct LogRecord {
@@ -7,6 +8,7 @@ pub struct LogRecord {
     pub level: String,
     pub message: String,
     pub target: Option<String>,
+    pub source_ip: Option<IpAddr>,
     pub details: Vec<(String, String)>,
 }
 
@@ -48,6 +50,7 @@ fn parse_line(id: usize, line: &str) -> LogRecord {
             level: if system { "SYSTEM" } else { "INFO" }.to_owned(),
             message: sanitize(message, 16_384),
             target,
+            source_ip: None,
             details: Vec::new(),
         };
     }
@@ -58,6 +61,7 @@ fn parse_line(id: usize, line: &str) -> LogRecord {
         level: "INFO".to_owned(),
         message: sanitize(&controlled, 16_384),
         target: None,
+        source_ip: None,
         details: Vec::new(),
     }
 }
@@ -88,8 +92,17 @@ fn structured(
         .and_then(serde_json::Value::as_str)
         .map(|value| sanitize(value, 128))
         .or(fallback_target);
+    // Keep the explicit source address, but never pass arbitrary structured
+    // fields through to the webview. Forwarding headers are not authoritative.
+    let source_ip = object
+        .get("ip")
+        .or_else(|| object.get("client_ip"))
+        .or_else(|| object.get("remote_ip"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<IpAddr>().ok());
     if let Ok(nested) = serde_json::from_str::<serde_json::Value>(message) {
-        if let Some(record) = structured(id, &nested, timestamp.clone(), target.clone()) {
+        if let Some(mut record) = structured(id, &nested, timestamp.clone(), target.clone()) {
+            record.source_ip = record.source_ip.or(source_ip);
             return Some(record);
         }
     }
@@ -130,6 +143,7 @@ fn structured(
         level,
         message: sanitize(message, 16_384),
         target,
+        source_ip,
         details,
     })
 }
@@ -205,11 +219,30 @@ mod tests {
 
     #[test]
     fn parses_safe_json_and_discards_secret_fields() {
-        let records = parse_lines(&[r#"{"timestamp":"2026-08-30T12:08:11Z","level":"warn","message":"pricing unavailable","target":"jarvis_usage","api_key":"never"}"#.to_owned()]);
+        let records = parse_lines(&[r#"{"timestamp":"2026-08-30T12:08:11Z","level":"warn","message":"pricing unavailable","target":"jarvis_usage","ip":"198.51.100.20","api_key":"never"}"#.to_owned()]);
         assert_eq!(records[0].timestamp.as_deref(), Some("12:08:11"));
         assert_eq!(records[0].level, "WARN");
         assert_eq!(records[0].message, "pricing unavailable");
+        assert_eq!(
+            records[0].source_ip.map(|ip| ip.to_string()).as_deref(),
+            Some("198.51.100.20")
+        );
         assert!(!format!("{:?}", records[0]).contains("never"));
+    }
+
+    #[test]
+    fn source_ip_is_validated_and_nested_journal_json_keeps_it() {
+        let lines = [
+            r#"2026-08-30T12:48:04+02:00 jarvis-api[3962]: {"level":"WARN","message":"auth rate limit hit","ip":"2001:db8::5","authorization":"never"}"#.to_owned(),
+            r#"{"message":"auth rate limit hit","ip":"token=never","authorization":"never"}"#.to_owned(),
+        ];
+        let records = parse_lines(&lines);
+        assert_eq!(
+            records[0].source_ip.map(|ip| ip.to_string()).as_deref(),
+            Some("2001:db8::5")
+        );
+        assert_eq!(records[1].source_ip, None);
+        assert!(!format!("{records:?}").contains("never"));
     }
 
     #[test]
