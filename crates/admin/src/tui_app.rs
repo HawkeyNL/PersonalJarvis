@@ -420,6 +420,7 @@ impl JarvisApp {
                     cache_read_per_million_usd: Some(1.25),
                     output_per_million_usd: Some(10.0),
                     pricing_source: "fixture".to_owned(),
+                    pricing_notes: String::new(),
                     pricing_updated_at: "2026-09-01".to_owned(),
                 },
                 usage_insights::PricedModelRecord {
@@ -433,6 +434,7 @@ impl JarvisApp {
                     cache_read_per_million_usd: None,
                     output_per_million_usd: None,
                     pricing_source: "fixture".to_owned(),
+                    pricing_notes: String::new(),
                     pricing_updated_at: "2026-09-01".to_owned(),
                 },
             ],

@@ -34,7 +34,7 @@ pub fn is_metered(backend: &str) -> bool {
 pub struct Price {
     pub input: f64,
     pub output: f64,
-    /// Cached input reads (cheaper). Defaults to 10% of input when unknown.
+    /// Cached input reads. Unknown discounts use the full input rate.
     pub cache_read: f64,
 }
 
@@ -51,7 +51,7 @@ pub struct PricingRegistry {
     pub models: Vec<PricingEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PricingEntry {
     pub provider: String,
     pub model: String,
@@ -64,6 +64,26 @@ pub struct PricingEntry {
     /// `known`.
     #[serde(default = "known_price_status")]
     pub price_status: PriceStatus,
+    #[serde(default)]
+    pub pricing_source: Option<String>,
+    #[serde(default)]
+    pub pricing_updated_at: Option<String>,
+    #[serde(default)]
+    pub pricing_notes: Option<String>,
+    #[serde(default)]
+    pub long_context: Option<LongContextPrice>,
+    /// Explicitly retain even a rate identical to a historical shipped default.
+    #[serde(default)]
+    pub owner_override: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LongContextPrice {
+    /// Inclusive threshold, including cached input tokens.
+    pub from_input_tokens: u32,
+    pub input_per_million_usd: f64,
+    pub output_per_million_usd: f64,
+    pub cache_read_per_million_usd: f64,
 }
 
 const fn known_price_status() -> PriceStatus {
@@ -72,41 +92,12 @@ const fn known_price_status() -> PriceStatus {
 
 impl PricingRegistry {
     pub fn builtin() -> Self {
-        Self {
-            version: 1,
-            source: "owner-reviewed-baseline-2026-09-01".into(),
-            updated_at: "2026-09-01".into(),
-            models: vec![
-                entry("anthropic-api", "claude-opus-5", 5.0, 25.0),
-                entry("anthropic-api", "claude-sonnet-5", 3.0, 15.0),
-                entry("anthropic-api", "claude-haiku-4-5", 1.0, 5.0),
-                entry("openai-api", "gpt-4o", 2.5, 10.0),
-                entry("openai-api", "gpt-4o-mini", 0.15, 0.60),
-                entry("openai-api", "gpt-4.1", 2.5, 10.0),
-                entry("openai-api", "gpt-4.1-mini", 0.15, 0.60),
-                entry("deepseek-api", "deepseek-chat", 0.27, 1.10),
-                entry("deepseek-api", "deepseek-reasoner", 0.55, 2.19),
-                entry_cached("ollama-cloud", "deepseek-v4-flash:0731", 0.44, 0.014, 1.32),
-                entry_cached("ollama-cloud", "deepseek-v4-pro:0813", 1.32, 0.044, 3.96),
-                entry_cached("ollama-cloud", "gemma4:31b", 0.14, 0.05, 0.40),
-                entry_cached("ollama-cloud", "glm-5.3", 1.40, 0.26, 4.40),
-                entry_cached("ollama-cloud", "glm-5.3-flash", 0.15, 0.03, 0.50),
-                entry_cached("ollama-cloud", "glm-5.2", 1.40, 0.26, 4.40),
-                entry_cached("ollama-cloud", "glm-5.1", 1.00, 0.20, 3.20),
-                entry_cached("ollama-cloud", "gpt-oss:120b", 0.15, 0.014, 0.60),
-                entry_cached("ollama-cloud", "gpt-oss:20b", 0.07, 0.035, 0.30),
-                entry_cached("ollama-cloud", "kimi-k3", 3.00, 0.30, 15.00),
-                entry_cached("ollama-cloud", "kimi-k2.7-code", 0.95, 0.19, 4.00),
-                entry_cached("ollama-cloud", "kimi-k2.6", 0.95, 0.16, 4.00),
-                entry_cached("ollama-cloud", "minimax-m3", 0.60, 0.12, 2.40),
-                entry_cached("ollama-cloud", "minimax-m2.7", 0.30, 0.06, 1.20),
-                entry_cached("ollama-cloud", "mistral-large-3:675b", 0.50, 0.50, 1.50),
-                entry_cached("ollama-cloud", "nemotron-3-nano:30b", 0.06, 0.06, 0.24),
-                entry_cached("ollama-cloud", "nemotron-3-super", 0.015, 0.015, 0.60),
-                entry_cached("ollama-cloud", "nemotron-3-ultra", 0.10, 0.10, 3.00),
-                entry_cached("ollama-cloud", "qwen3.5:397b", 0.60, 0.60, 3.60),
-            ],
-        }
+        // One reviewed artifact for runtime accounting, CLI and GUI; no second
+        // hand-maintained Rust price table that can drift from release data.
+        serde_json::from_str(include_str!(
+            "../../../deploy/systemd/pricing-registry.json"
+        ))
+        .expect("release pricing registry must pass the catalog tests")
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
@@ -122,8 +113,28 @@ impl PricingRegistry {
     /// the release-reviewed baseline. Owner entries always win; a release can
     /// therefore add safe coverage without overwriting an explicit override.
     pub fn load_with_builtin(path: impl AsRef<Path>) -> Result<Self, String> {
-        let mut registry = Self::load(path)?;
-        let builtin = Self::builtin();
+        Self::load(path)?.with_release(Self::builtin())
+    }
+
+    /// Read-time migration only. Files remain untouched, including on rollback.
+    /// Only exact entries from the two historically shipped default catalogs
+    /// are discarded. Custom entries and explicit overrides always survive.
+    pub fn with_release(mut self, builtin: Self) -> Result<Self, String> {
+        self.validate()?;
+        builtin.validate()?;
+        for raw in [
+            include_str!("../data/legacy-pricing-2026-08-27.json"),
+            include_str!("../data/legacy-pricing-2026-09-01.json"),
+        ] {
+            let legacy: Self = serde_json::from_str(raw).expect("tested legacy pricing snapshot");
+            if self.source == legacy.source && self.updated_at == legacy.updated_at {
+                self.models.retain(|entry| {
+                    entry.owner_override || !legacy.models.iter().any(|default| default == entry)
+                });
+            }
+        }
+        let mut registry = self;
+        registry.bind_provenance();
         let mut added = false;
         for entry in builtin.models {
             if !registry
@@ -145,6 +156,17 @@ impl PricingRegistry {
         Ok(registry)
     }
 
+    fn bind_provenance(&mut self) {
+        for entry in &mut self.models {
+            entry
+                .pricing_source
+                .get_or_insert_with(|| self.source.clone());
+            entry
+                .pricing_updated_at
+                .get_or_insert_with(|| self.updated_at.clone());
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.version != 1 || self.source.trim().is_empty() || self.updated_at.trim().is_empty() {
             return Err("unsupported or incomplete pricing registry".into());
@@ -160,6 +182,18 @@ impl PricingRegistry {
                 || entry
                     .cache_read_per_million_usd
                     .is_some_and(|price| !price.is_finite() || price < 0.0)
+                || entry.long_context.as_ref().is_some_and(|tier| {
+                    tier.from_input_tokens == 0
+                        || [
+                            tier.input_per_million_usd,
+                            tier.output_per_million_usd,
+                            tier.cache_read_per_million_usd,
+                        ]
+                        .iter()
+                        .any(|price| !price.is_finite() || *price < 0.0)
+                        || tier.input_per_million_usd < entry.input_per_million_usd
+                        || tier.output_per_million_usd < entry.output_per_million_usd
+                })
                 || seen
                     .insert((entry.provider.clone(), entry.model.clone()), ())
                     .is_some()
@@ -185,7 +219,7 @@ impl PricingRegistry {
                     output: entry.output_per_million_usd,
                     cache_read: entry
                         .cache_read_per_million_usd
-                        .unwrap_or(entry.input_per_million_usd * 0.1),
+                        .unwrap_or(entry.input_per_million_usd),
                 },
                 entry.price_status,
             );
@@ -208,6 +242,7 @@ impl PricingRegistry {
     }
 }
 
+#[cfg(test)]
 fn entry(provider: &str, model: &str, input: f64, output: f64) -> PricingEntry {
     PricingEntry {
         provider: provider.into(),
@@ -216,23 +251,11 @@ fn entry(provider: &str, model: &str, input: f64, output: f64) -> PricingEntry {
         output_per_million_usd: output,
         cache_read_per_million_usd: None,
         price_status: PriceStatus::Known,
-    }
-}
-
-fn entry_cached(
-    provider: &str,
-    model: &str,
-    input: f64,
-    cache_read: f64,
-    output: f64,
-) -> PricingEntry {
-    PricingEntry {
-        provider: provider.into(),
-        model: model.into(),
-        input_per_million_usd: input,
-        output_per_million_usd: output,
-        cache_read_per_million_usd: Some(cache_read),
-        price_status: PriceStatus::Known,
+        pricing_source: None,
+        pricing_updated_at: None,
+        pricing_notes: None,
+        long_context: None,
+        owner_override: false,
     }
 }
 
@@ -258,7 +281,7 @@ impl Price {
         Self {
             input,
             output,
-            cache_read: input * 0.1,
+            cache_read: input,
         }
     }
 }
@@ -302,7 +325,20 @@ pub fn cost_eur_with_registry(
     if !is_metered(backend) {
         return 0.0;
     }
-    let (p, _) = registry.price_for(backend, model);
+    let (mut p, _) = registry.price_for(backend, model);
+    if let Some(tier) = registry
+        .models
+        .iter()
+        .find(|entry| entry.provider == backend && entry.model == model)
+        .and_then(|entry| entry.long_context.as_ref())
+        .filter(|tier| input_tokens.saturating_add(cache_read_tokens) >= tier.from_input_tokens)
+    {
+        p = Price {
+            input: tier.input_per_million_usd,
+            output: tier.output_per_million_usd,
+            cache_read: tier.cache_read_per_million_usd,
+        };
+    }
     let per_mtok = |tokens: u32, usd: f64| (tokens as f64 / 1_000_000.0) * usd;
     let usd = per_mtok(input_tokens, p.input)
         + per_mtok(output_tokens, p.output)
@@ -404,11 +440,11 @@ pub fn estimate_task_cost_with_registry(
         registry,
         backend,
         model,
-        input_tokens_per_call.saturating_mul(calls),
-        output_tokens_per_call.saturating_mul(calls),
+        input_tokens_per_call,
+        output_tokens_per_call,
         0,
         eur_per_usd,
-    );
+    ) * f64::from(calls);
     let status = registry.price_for(backend, model).1;
     let low_factor = match status {
         PriceStatus::Unknown | PriceStatus::Conservative => 1.0,
@@ -618,7 +654,7 @@ mod tests {
         assert!(is_metered("openai-api"));
         assert!(is_metered("deepseek-api"));
         assert!(is_metered("huggingface"));
-        // 1M in + 1M out on sonnet = (3 + 15) USD × 0.92 ≈ 16.56 EUR.
+        // 1M in + 1M out on sonnet = (2 + 10) USD × 0.92 = 11.04 EUR.
         let c = cost_eur(
             "anthropic-api",
             "claude-sonnet-5",
@@ -627,12 +663,12 @@ mod tests {
             0,
             0.92,
         );
-        assert!((c - 16.56).abs() < 1e-6, "got {c}");
+        assert!((c - 11.04).abs() < 1e-6, "got {c}");
     }
 
     #[test]
     fn deepseek_is_far_cheaper_than_opus() {
-        let ds = cost_eur("deepseek-api", "deepseek-chat", 500_000, 500_000, 0, 0.92);
+        let ds = cost_eur("deepseek-api", "deepseek-flash", 500_000, 500_000, 0, 0.92);
         let opus = cost_eur("anthropic-api", "claude-opus-5", 500_000, 500_000, 0, 0.92);
         assert!(ds < opus / 10.0, "deepseek {ds} vs opus {opus}");
     }
@@ -761,11 +797,20 @@ mod tests {
             registry.price_for("ollama-cloud", "gpt-oss:20b").0.input,
             9.0
         );
+        let owner = registry
+            .models
+            .iter()
+            .find(|entry| entry.model == "gpt-oss:20b")
+            .unwrap();
+        assert_eq!(owner.pricing_source.as_deref(), Some("owner"));
+        assert_eq!(owner.pricing_updated_at.as_deref(), Some("2026-09-01"));
         assert_eq!(
             registry.price_for("ollama-cloud", "glm-5.3").1,
             PriceStatus::Known
         );
-        assert!(registry.source.contains("owner-reviewed-baseline"));
-        assert_eq!(registry.updated_at, "2026-09-01");
+        assert!(registry
+            .source
+            .contains("release-reviewed-provider-pricing"));
+        assert_eq!(registry.updated_at, "2026-09-24");
     }
 }

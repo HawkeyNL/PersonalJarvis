@@ -23,23 +23,7 @@ const USAGE_SUMMARY: &str = "/var/lib/jarvis/usage-summary.json";
 const HUGGINGFACE_CATALOG: &str = "/etc/jarvis/huggingface-catalog.json";
 const MAX_DOCUMENT_SIZE: u64 = 512 * 1024;
 
-#[derive(Clone, Debug, Deserialize)]
-struct PricingRegistry {
-    version: u32,
-    source: String,
-    updated_at: String,
-    models: Vec<PricingEntry>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct PricingEntry {
-    provider: String,
-    model: String,
-    input_per_million_usd: f64,
-    output_per_million_usd: f64,
-    #[serde(default)]
-    cache_read_per_million_usd: Option<f64>,
-}
+use jarvis_usage::{PriceStatus, PricingRegistry};
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct PricedModelRecord {
@@ -54,6 +38,7 @@ pub(super) struct PricedModelRecord {
     pub(super) output_per_million_usd: Option<f64>,
     pub(super) pricing_source: String,
     pub(super) pricing_updated_at: String,
+    pub(super) pricing_notes: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +109,7 @@ pub(super) struct PricingSummary {
 }
 
 fn validate_pricing_registry(registry: &PricingRegistry) -> Result<()> {
+    registry.validate().map_err(anyhow::Error::msg)?;
     if registry.version != 1
         || registry.source.trim().is_empty()
         || registry.updated_at.trim().is_empty()
@@ -238,23 +224,7 @@ fn read_layered_pricing_registry() -> Result<PricingRegistry> {
     let mut owner = parse_pricing_registry(path)?;
     if let Some(release_path) = resolve_optional_release_data_file(RELEASE_PRICING_REGISTRY)? {
         let release = parse_pricing_registry(&release_path)?;
-        let mut added = false;
-        for entry in release.models {
-            if !owner
-                .models
-                .iter()
-                .any(|current| current.provider == entry.provider && current.model == entry.model)
-            {
-                owner.models.push(entry);
-                added = true;
-            }
-        }
-        if added {
-            owner.source = format!("{} + {}", owner.source, release.source);
-            if release.updated_at > owner.updated_at {
-                owner.updated_at = release.updated_at;
-            }
-        }
+        owner = owner.with_release(release).map_err(anyhow::Error::msg)?;
     }
     validate_pricing_registry(&owner)?;
     Ok(owner)
@@ -353,8 +323,14 @@ fn priced_model_policy_with_registry_and_hf(
                 route: model.route.clone(),
                 price_status: if local {
                     "local"
-                } else if entry.is_some() {
-                    "known"
+                } else if let Some(entry) = entry {
+                    match entry.price_status {
+                        PriceStatus::Estimated => "estimated",
+                        PriceStatus::Conservative => "conservative",
+                        PriceStatus::Unknown => "unknown",
+                        PriceStatus::Local => "local",
+                        PriceStatus::Known => "known",
+                    }
                 } else if hf_price.is_some() {
                     if model.route.as_deref().is_some_and(|route| {
                         !matches!(route, "auto" | "fastest" | "cheapest" | "preferred")
@@ -370,17 +346,47 @@ fn priced_model_policy_with_registry_and_hf(
                     .map(|value| value.input_per_million_usd)
                     .or(hf_price.map(|price| price.0)),
                 cache_read_per_million_usd: entry
-                    .and_then(|value| {
-                        value
-                            .cache_read_per_million_usd
-                            .or(Some(value.input_per_million_usd * 0.1))
-                    })
-                    .or(hf_price.map(|price| price.0)),
+                    .and_then(|value| value.cache_read_per_million_usd),
                 output_per_million_usd: entry
                     .map(|value| value.output_per_million_usd)
                     .or(hf_price.map(|price| price.1)),
-                pricing_source: pricing.source.clone(),
-                pricing_updated_at: pricing.updated_at.clone(),
+                pricing_source: entry
+                    .map(|e| {
+                        e.pricing_source
+                            .clone()
+                            .unwrap_or_else(|| pricing.source.clone())
+                    })
+                    .unwrap_or_else(|| {
+                        if hf_price.is_some() {
+                            "https://router.huggingface.co/v1/models".into()
+                        } else {
+                            String::new()
+                        }
+                    }),
+                pricing_updated_at: entry
+                    .map(|e| {
+                        e.pricing_updated_at
+                            .clone()
+                            .unwrap_or_else(|| pricing.updated_at.clone())
+                    })
+                    .unwrap_or_else(|| {
+                        if hf_price.is_some() {
+                            hf_catalog
+                                .map(|c| c.discovered_at.clone())
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
+                    }),
+                pricing_notes: entry
+                    .and_then(|e| e.pricing_notes.clone())
+                    .unwrap_or_else(|| {
+                        if hf_price.is_some() {
+                            "Discovered route estimate; cache discount unknown".into()
+                        } else {
+                            String::new()
+                        }
+                    }),
             }
         })
         .collect();
@@ -449,6 +455,75 @@ pub(super) fn usage(json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ModelRecord;
+
+    #[test]
+    fn release_catalog_projects_provider_specific_metadata_without_enabling_models() {
+        let registry: PricingRegistry = serde_json::from_str(include_str!(
+            "../../../deploy/systemd/pricing-registry.json"
+        ))
+        .unwrap();
+        validate_pricing_registry(&registry).unwrap();
+        let policy = ModelPolicy {
+            version: 1,
+            models: registry
+                .models
+                .iter()
+                .map(|entry| ModelRecord {
+                    provider: entry.provider.clone(),
+                    model: entry.model.clone(),
+                    enabled: false,
+                    source: "provider_api".into(),
+                    route: None,
+                })
+                .collect(),
+        };
+        let projected = priced_model_policy_with_registry(policy, &registry);
+        for (model, entry) in projected.models.iter().zip(&registry.models) {
+            assert!(!model.enabled);
+            assert_eq!(
+                model.input_per_million_usd,
+                Some(entry.input_per_million_usd)
+            );
+            assert_eq!(
+                model.cache_read_per_million_usd,
+                entry.cache_read_per_million_usd
+            );
+            assert_eq!(
+                model.pricing_source,
+                entry.pricing_source.as_deref().unwrap()
+            );
+            assert_eq!(
+                model.price_status,
+                serde_json::to_value(entry.price_status)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+            );
+        }
+        let json = serde_json::to_value(projected).unwrap();
+        assert!(json["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["model"] == "gpt-6-astra" && m["input_per_million_usd"] == 10.0));
+    }
+
+    #[test]
+    fn absent_prices_have_no_unrelated_source_or_invented_cache_discount() {
+        let registry: PricingRegistry = serde_json::from_str(
+            r#"{"version":1,"source":"owner","updated_at":"2026-09-01","models":[{"provider":"openai-api","model":"custom","input_per_million_usd":2,"output_per_million_usd":8}]}"#
+        ).unwrap();
+        let policy: ModelPolicy = serde_json::from_str(
+            r#"{"version":1,"models":[{"provider":"openai-api","model":"custom","enabled":false,"source":"fixture"},{"provider":"xai-api","model":"unknown","enabled":false,"source":"fixture"}]}"#
+        ).unwrap();
+        let projected = priced_model_policy_with_registry(policy, &registry);
+        assert_eq!(projected.models[0].cache_read_per_million_usd, None);
+        assert_eq!(projected.models[1].price_status, "unknown");
+        assert!(projected.models[1].pricing_source.is_empty());
+        assert!(projected.models[1].pricing_updated_at.is_empty());
+        assert_eq!(projected.models[1].input_per_million_usd, None);
+    }
 
     #[test]
     fn registry_rejects_duplicate_exact_pairs() {
@@ -510,6 +585,12 @@ mod tests {
         let projected = priced_model_policy_with_registry_and_hf(policy, &registry, Some(&catalog));
         assert_eq!(projected.models[0].price_status, "conservative");
         assert_eq!(projected.models[0].output_per_million_usd, Some(0.3));
+        assert_eq!(projected.models[0].cache_read_per_million_usd, None);
+        assert_eq!(
+            projected.models[0].pricing_source,
+            "https://router.huggingface.co/v1/models"
+        );
+        assert_eq!(projected.models[0].pricing_updated_at, "fixture");
         assert!(huggingface_routes(&catalog, "org/model").contains(&"groq".to_owned()));
     }
 

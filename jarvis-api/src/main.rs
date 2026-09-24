@@ -331,6 +331,13 @@ async fn main() -> anyhow::Result<()> {
                             input_per_million_usd: input,
                             output_per_million_usd: output,
                             cache_read_per_million_usd: Some(input),
+                            pricing_source: Some("https://router.huggingface.co/v1/models".into()),
+                            pricing_updated_at: Some(hf_catalog.discovered_at.clone()),
+                            pricing_notes: Some(
+                                "Discovered route estimate; no cache discount assumed".into(),
+                            ),
+                            long_context: None,
+                            owner_override: false,
                             price_status: if entry.route.as_deref().is_some_and(|route| {
                                 !matches!(route, "auto" | "fastest" | "cheapest" | "preferred")
                             }) {

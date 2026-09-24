@@ -19,7 +19,28 @@ readonly -a managed_units=(
     jarvis-updater.timer
     jarvis-private-agent-updater.service
     jarvis-private-agent-updater.timer
+    jarvis-model-catalog.service
+    jarvis-model-catalog.timer
 )
+
+catalog_capability() {
+    local release=$1
+    if ! jq -e '.tooling | has("model_catalog")' "$release/release.json" >/dev/null; then
+        echo legacy
+        return
+    fi
+    jq -e '.tooling.model_catalog == 1 and (.tooling.model_catalog | type) == "number" and .tooling.admin_helpers == 1 and .tooling.model_policy_directory == 1 and .tooling.systemd_units == 1' "$release/release.json" >/dev/null ||
+        fail "unsupported model-catalog capability"
+    echo 1
+}
+
+unit_required() {
+    case $2 in
+        jarvis-model-catalog.service|jarvis-model-catalog.timer)
+            [[ $(catalog_capability "$1") == 1 ]] ;;
+        *) return 0 ;;
+    esac
+}
 
 fail() { echo "jarvis systemd units: $*" >&2; exit 1; }
 usage() {
@@ -172,6 +193,7 @@ validate_artifacts() {
     managed_version=$(capability "$release") || return 1
     device_version=$(device_capability "$release") || return 1
     policy_version=$(policy_capability "$release") || return 1
+    catalog_capability "$release" >/dev/null || return 1
     if [[ $managed_version != 1 ]]; then
         [[ $device_version == legacy ]] || fail "local-device capability requires managed systemd policy"
         [[ $policy_version == legacy ]] || fail "model-policy directory capability requires managed systemd policy"
@@ -201,11 +223,13 @@ validate_artifacts() {
         [[ -e $packaged || -L $packaged ]] || continue
         expected=false
         for unit in "${managed_units[@]}"; do
+            unit_required "$release" "$unit" || continue
             [[ ${packaged##*/} == "systemd-$unit" ]] && expected=true
         done
         [[ $expected == true ]] || fail "unexpected managed unit artifact: ${packaged##*/}"
     done
     for unit in "${managed_units[@]}"; do
+        unit_required "$release" "$unit" || continue
         path="$release/systemd-$unit"
         [[ -f $path && ! -L $path ]] || fail "managed unit is missing or unsafe: $unit"
         mode=$(stat -c '%a' "$path")
@@ -307,6 +331,10 @@ check_installed() {
     for unit in "${managed_units[@]}"; do
         source="$release/systemd-$unit"
         target="$systemd_root/$unit"
+        if ! unit_required "$release" "$unit"; then
+            [[ ! -e $target && ! -L $target ]] || fail "legacy release has incompatible catalog unit installed: $unit"
+            continue
+        fi
         [[ -f $target && ! -L $target ]] || fail "installed managed unit is missing or unsafe: $unit"
         metadata=$(stat -c '%u:%g:%a' "$target")
         [[ $metadata == 0:0:644 ]] || fail "installed managed unit permissions differ from release policy: $unit"
@@ -346,6 +374,7 @@ install_units() {
         fi
     done
     for unit in "${managed_units[@]}"; do
+        unit_required "$release" "$unit" || continue
         source="$release/systemd-$unit"
         staged="$systemd_root/.$unit.jarvis-new"
         rm -f -- "$staged"
@@ -360,6 +389,10 @@ install_units() {
         fail "policy layout preparation failed; release not activated"
     fi
     for unit in "${managed_units[@]}"; do
+        if ! unit_required "$release" "$unit"; then
+            rm -f -- "$systemd_root/$unit"
+            continue
+        fi
         if ! mv -Tf "$systemd_root/.$unit.jarvis-new" "$systemd_root/$unit"; then
             restore_units "$backup"
             [[ ! -e $backup/model-policy-layout ]] || systemctl start jarvis-config-broker.service jarvis-core.service

@@ -2,6 +2,7 @@
 # Static security regression coverage for PR #26.  No real provider or secret
 # is required in CI.
 set -euo pipefail
+trap 'echo "Model/credential boundary assertion failed at line $LINENO" >&2' ERR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 credentials="$repo_dir/deploy/systemd/jarvis-credentials.sh"
@@ -91,7 +92,8 @@ grep -Fq 'atomic_write' "$models"
 grep -Fq 'ollama-cloud' "$models"
 grep -Fq "provider == \$item[0] and .model == \$item[1]" "$models"
 grep -Fq "curl --config \"\$config\"" "$models"
-grep -Fq 'mktemp /run/jarvis-model-discovery' "$models"
+grep -Fq 'mktemp "$runtime/jarvis-model-discovery.XXXXXX"' "$models"
+grep -Fq 'runtime=/run' "$models"
 grep -Fq 'provider_api' "$models"
 grep -Fq 'ollama_cloud_default_base_url=https://ollama.com/v1' "$models"
 grep -Fq 'ollama_cloud_tags_url=https://ollama.com/api/tags' "$models"

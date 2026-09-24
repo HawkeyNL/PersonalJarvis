@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 mod account_activation;
 mod admin_helpers;
 mod agent_tree;
+mod credential_setup;
 mod local_devices;
 mod terminal_ui;
 mod tui_app;
@@ -201,6 +202,8 @@ struct ModelsArgs {
 }
 #[derive(Debug, Subcommand)]
 enum ModelsCommand {
+    /// Metadata-only refresh of credentialed providers; used by the hourly timer.
+    RefreshConfigured,
     Refresh {
         provider: Option<Provider>,
     },
@@ -1304,6 +1307,7 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
         return Ok(());
     }
     let arguments: Vec<String> = match args.command {
+        ModelsCommand::RefreshConfigured => vec!["refresh-configured".to_owned()],
         ModelsCommand::Refresh { provider } => vec!["refresh".to_owned()]
             .into_iter()
             .chain(provider.map(|value| value.as_str().to_owned()))
@@ -1498,7 +1502,7 @@ fn credentials(args: CredentialsArgs, presentation: &Presentation, verbose: bool
     let arguments = match args.command {
         CredentialsCommand::List => vec!["list".to_owned()],
         CredentialsCommand::Set { provider } => {
-            vec!["set".to_owned(), provider.as_str().to_owned()]
+            return credential_setup::set(&provider, verbose);
         }
         CredentialsCommand::Test { provider } => {
             vec!["test".to_owned(), provider.as_str().to_owned()]

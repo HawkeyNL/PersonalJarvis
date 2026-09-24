@@ -2284,6 +2284,7 @@ dependencies = [
  "jarvis-config",
  "jarvis-llm",
  "jarvis-privileged",
+ "jarvis-usage",
  "libc",
  "rand 0.8.7",
  "ratatui",

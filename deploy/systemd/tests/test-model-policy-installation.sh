@@ -48,15 +48,24 @@ candidate() {
         if [[ $capability == legacy && $unit == jarvis-config-broker.service ]]; then
             sed -i 's#ReadWritePaths=/etc/jarvis/model-policy$#ReadWritePaths=/etc/jarvis/model-policy.json#' "$release/systemd-$unit"
         fi
+        if [[ $capability == legacy && $unit == jarvis-core.service ]]; then
+            sed -i '/^Wants=jarvis-model-catalog.timer$/d' "$release/systemd-$unit"
+        fi
     done
     if [[ $capability == directory ]]; then
         install -o root -g root -m 0755 "$binary" "$release/jarvis-model-policy-storage"
-        printf '{"tooling":{"systemd_units":1,"model_policy_directory":1}}\n' > "$release/release.json"
+        for unit in jarvis-model-catalog.service jarvis-model-catalog.timer; do
+            install -m 0644 "$repo/deploy/systemd/$unit" "$release/systemd-$unit"
+        done
+        for helper in jarvis-models jarvis-credentials; do
+            install -m 0755 "$repo/deploy/systemd/$helper.sh" "$release/$helper"
+        done
+        printf '{"tooling":{"systemd_units":1,"model_policy_directory":1,"admin_helpers":1,"model_catalog":1}}\n' > "$release/release.json"
     else
         printf '{"tooling":{"systemd_units":1}}\n' > "$release/release.json"
     fi
     (cd "$release"; sha256sum manage-systemd-units verify-home-node install-home-node-core ui.sh systemd-* > artifact-binaries.sha256
-        if [[ $capability == directory ]]; then sha256sum jarvis-model-policy-storage >> artifact-binaries.sha256; fi)
+        if [[ $capability == directory ]]; then sha256sum jarvis-model-policy-storage jarvis-models jarvis-credentials >> artifact-binaries.sha256; fi)
 }
 candidate v1.0.0 legacy
 candidate v1.1.0 directory
@@ -70,6 +79,8 @@ mkdir -m 0700 "$fixture/fresh-backup"
 "$manager" install "$new" "$fixture/fresh-backup"
 ln -s "$new" /opt/jarvis/current
 "$manager" check-installed "$new"
+cmp "$new/systemd-jarvis-model-catalog.timer" "$fixture/systemd/jarvis-model-catalog.timer"
+cmp "$new/systemd-jarvis-model-catalog.service" "$fixture/systemd/jarvis-model-catalog.service"
 jq -e '.version == 1 and .models == []' /etc/jarvis/model-policy/policy.json >/dev/null
 [[ $(stat -c %a /etc/jarvis/model-policy) == 750 ]]
 [[ $(stat -c %a /etc/jarvis/model-policy/policy.json) == 640 ]]
@@ -78,6 +89,7 @@ jq -e '.version == 1 and .models == []' /etc/jarvis/model-policy/policy.json >/d
 # later successful upgrade. Legacy files must remain regular, never symlinks.
 printf '{"version":1,"models":[{"provider":"openai-api","model":"fixture","enabled":false}]}\n' > /etc/jarvis/model-policy/policy.json
 "$manager" restore "$old" "$fixture/fresh-backup"
+[[ ! -e $fixture/systemd/jarvis-model-catalog.timer && ! -e $fixture/systemd/jarvis-model-catalog.service ]]
 ln -sfn "$old" /opt/jarvis/current
 [[ $("$helper" layout) == legacy ]]
 jq -e '.models[0].enabled == false' /etc/jarvis/model-policy.json >/dev/null
@@ -99,6 +111,7 @@ jq -e '.models[0].enabled == false' /etc/jarvis/model-policy/policy.json >/dev/n
 # inspect its units without understanding the new capability.
 mkdir -m 0700 "$fixture/downgrade-backup"
 "$manager" install "$old" "$fixture/downgrade-backup"
+[[ ! -e $fixture/systemd/jarvis-model-catalog.timer && ! -e $fixture/systemd/jarvis-model-catalog.service ]]
 ln -sfn "$old" /opt/jarvis/current
 "$old/manage-systemd-units" check-installed "$old"
 jq -e '.models[0].enabled == false' /etc/jarvis/model-policy.json >/dev/null
