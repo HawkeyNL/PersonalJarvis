@@ -725,6 +725,16 @@ restore_release_transaction() {
 activate_managed_release() {
     local release=$1 previous=$2 backup temporary_link=/opt/jarvis/.current.new
     local unit_manager="$release/manage-systemd-units"
+    # A legacy target cannot export the current directory policy itself. Use
+    # the current verified manager for that transition and its recovery path.
+    if jq -e '.tooling.model_policy_directory == 1' "$previous/release.json" >/dev/null && \
+        ! jq -e '.tooling.model_policy_directory == 1' "$release/release.json" >/dev/null; then
+        unit_manager="$previous/manage-systemd-units"
+    fi
+    if jq -e '.tooling.model_catalog == 1' "$previous/release.json" >/dev/null && \
+        ! jq -e '.tooling.model_catalog == 1' "$release/release.json" >/dev/null; then
+        unit_manager="$previous/manage-systemd-units"
+    fi
     backup=$(mktemp -d /run/jarvis-systemd-rollback.XXXXXXXX)
     chmod 0700 "$backup"
     if ! "$unit_manager" validate-release "$release" || \

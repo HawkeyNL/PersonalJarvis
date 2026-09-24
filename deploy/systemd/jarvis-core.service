@@ -1,6 +1,7 @@
 [Unit]
 Description=Jarvis Core API
 Wants=network-online.target
+Wants=jarvis-model-catalog.timer
 After=network-online.target jarvis-surrealdb.service
 
 [Service]

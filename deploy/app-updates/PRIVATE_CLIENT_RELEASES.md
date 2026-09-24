@@ -104,6 +104,35 @@ After a successful manual import and actual client test:
 sudo systemctl enable --now jarvis-app-release-sync.timer
 ```
 
+`enable` makes this persistent across host reboots. The timer runs about five
+minutes after boot and every thirty minutes thereafter (with up to five minutes
+of jitter); there is no constantly running download process. A failed network
+check leaves the previous verified generation available. To follow future
+signed releases rather than repeatedly checking one digest, explicitly approve
+`track_stable: true` after the pinned first import has passed acceptance.
+
+Verify activation and delivery separately:
+
+```sh
+systemctl is-enabled jarvis-app-release-sync.timer
+systemctl list-timers jarvis-app-release-sync.timer --all
+# Substitute the owner's configured HTTPS origin, without a trailing slash.
+curl --fail --head "https://<configured-home-node>/downloads/"
+```
+
+Both `/downloads` and `/downloads/` must return `200` and `text/html`, without
+`Content-Disposition: attachment`. A zero-byte `404` is not a downloadable
+installer: inspect the installed Caddy routing and generated public index.
+Installers alone use attachment responses. The Rust importer renders a mobile
+HTML page from validated local inventory; no frontend service or embedded Home
+Node hostname is needed. An iOS IPA still requires local owner signing.
+
+Desktop and Android updaters do not follow these public links or a custom deep
+link: native clients derive `/v1/app-updates/**` from the enrolled runtime HTTPS
+origin, authenticate, and reject cross-origin downloads. Keep those routes
+behind Core authentication. Do not fix a missing public page by exposing the
+protected mirror, metadata, token, or arbitrary directory listings.
+
 ## Acceptance
 
 1. Public `/downloads/` lists all successfully imported installers.

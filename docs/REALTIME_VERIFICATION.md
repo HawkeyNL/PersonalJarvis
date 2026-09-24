@@ -83,6 +83,62 @@ installation. The new local TLS commits have not been pushed for platform CI.
 
 ## Remaining acceptance boundaries
 
+### September 19 concurrent-retry regression
+
+Revalidation started from fetched Core main
+`5e9334a` on local branch `audit/realtime-september-19`. Client main was
+`ec562c9`; the existing release-preparation branch was left unchanged.
+
+Extending the two-socket test to submit identical HTTP requests concurrently
+reproduced a failure in an existing conversation: one request returned HTTP
+409 before the other request's durable reservation became visible. It did not
+create a second inference, but failed the retry/reuse contract. The submission
+path now waits boundedly for an already active identical run's reservation,
+validates its payload hash, and returns the existing identity without spawning
+another worker. Distinct competing runs still conflict.
+
+Both database integration tests passed ten consecutive times against a fresh
+rootless in-memory SurrealDB 2.6.5 fixture. The test checks identical events and
+canonical text on two sockets, one provider call, one voice owner, offline
+recovery, and failures. Additional assertions preserve conflict rejection for
+changed payloads and competing prompts. No production database was accessed.
+The official test binary was downloaded into a temporary directory and checked
+against its GitHub release asset SHA-256; each database process was stopped by
+the test shell's exit trap.
+
+Fresh checks passed: 12 shared client-core tests, 10 API realtime unit tests,
+4 LLM streaming tests, three desktop frontend realtime/speech test files,
+workspace tests, formatting and all-target/all-feature clippy. Database tests
+remain ignored by the normal workspace command and were run separately above.
+The LLM socket test required execution outside the socket-restricting sandbox.
+Cargo audit exited zero with the same three allowed warnings listed below.
+This does not establish physical iPhone/Android/desktop acceptance. No merge,
+release, tag, deployment or client source change was performed in this audit.
+
+The same integration fixture now also constructs a new `AppState`/hub epoch
+against the existing fixture database. Retrying a previously completed or failed
+run returns the exact persisted identity/state and byte-identical REST history,
+with no additional provider invocation. A previously running reservation is
+reported as `interrupted` by both submission retry and run-status lookup; it
+does not authorize another inference. This tests loss of in-process state, not
+an OS reboot, database power loss, or physical-device reconnect.
+
+The updated two database tests, formatting and all-target/all-feature clippy
+passed again after those assertions. Native desktop tests also passed (34),
+as did all 20 Android realtime-core JVM tests with `--rerun-tasks`. The clients
+were tested at `46916f2` (the pre-existing release-preparation checkout), without
+changing their source or immutable dependency pin. iOS cannot run locally on
+this Linux host; the existing simulator evidence is not a new device test.
+
+Two shared Rust cursor regressions now cover epoch reset after `connection.ready`,
+rejected events before readiness, stale/duplicate sequence suppression, rejection
+of old-epoch events, and incompatible protocols leaving the valid cursor intact.
+All 14 client-core tests passed with formatting and workspace clippy. These are
+test-only additions: no wire contract, runtime code or client pin was changed.
+Android's existing `RealtimeStateTest` has corresponding reconnect/sequence
+checks and passed in the JVM run above. This is not evidence of an actual
+mobile network switch or audible multi-device playback.
+
 ### September 16 revalidation
 
 The current Core review worktree is `dee8b692ce3ba6837d2d109250d3ec73adae11ca`;

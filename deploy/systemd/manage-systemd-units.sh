@@ -7,6 +7,7 @@ readonly systemd_root=${JARVIS_SYSTEMD_ROOT:-/etc/systemd/system}
 readonly releases_root=${JARVIS_RELEASES_ROOT:-/opt/jarvis/releases}
 readonly polkit_root=${JARVIS_POLKIT_ROOT:-/usr/share/polkit-1/actions}
 readonly device_policy=com.hawkeynl.jarvis.devices.policy
+readonly policy_storage_helper="$(cd -- "$(dirname -- "$0")" && pwd)/jarvis-model-policy-storage"
 readonly -a managed_units=(
     jarvis-core.service
     jarvis-config-broker.service
@@ -18,12 +19,102 @@ readonly -a managed_units=(
     jarvis-updater.timer
     jarvis-private-agent-updater.service
     jarvis-private-agent-updater.timer
+    jarvis-model-catalog.service
+    jarvis-model-catalog.timer
 )
+
+catalog_capability() {
+    local release=$1
+    if ! jq -e '.tooling | has("model_catalog")' "$release/release.json" >/dev/null; then
+        echo legacy
+        return
+    fi
+    jq -e '.tooling.model_catalog == 1 and (.tooling.model_catalog | type) == "number" and .tooling.admin_helpers == 1 and .tooling.model_policy_directory == 1 and .tooling.systemd_units == 1' "$release/release.json" >/dev/null ||
+        fail "unsupported model-catalog capability"
+    echo 1
+}
+
+unit_required() {
+    case $2 in
+        jarvis-model-catalog.service|jarvis-model-catalog.timer)
+            [[ $(catalog_capability "$1") == 1 ]] ;;
+        *) return 0 ;;
+    esac
+}
 
 fail() { echo "jarvis systemd units: $*" >&2; exit 1; }
 usage() {
     echo "usage: $0 validate-artifacts|validate-release|check-installed|install|restore RELEASE [BACKUP_DIR]" >&2
     exit 64
+}
+
+policy_capability() {
+    local release=$1
+    if ! jq -e '.tooling | has("model_policy_directory")' "$release/release.json" >/dev/null; then
+        echo legacy
+        return
+    fi
+    jq -e '.tooling.model_policy_directory == 1 and (.tooling.model_policy_directory | type) == "number"' \
+        "$release/release.json" >/dev/null || fail "unsupported model-policy directory capability"
+    echo directory
+}
+
+validate_policy_storage_artifact() {
+    local release=$1 mode matches
+    [[ $(policy_capability "$release") == directory ]] || return 0
+    [[ -f $release/jarvis-model-policy-storage && ! -L $release/jarvis-model-policy-storage && -x $release/jarvis-model-policy-storage ]] ||
+        fail "model-policy migration helper is missing or unsafe"
+    mode=$(stat -c '%a' "$release/jarvis-model-policy-storage")
+    (( (8#$mode & 0022) == 0 )) || fail "model-policy migration helper is writable by non-owner"
+    matches=$(awk '$2 == "jarvis-model-policy-storage" {n++} END {print n+0}' "$release/artifact-binaries.sha256")
+    [[ $matches == 1 ]] || fail "model-policy migration helper is not uniquely checksum-bound"
+}
+
+prepare_policy_layout() {
+    local release=$1 backup=$2 target previous active expected=legacy
+    target=$(policy_capability "$release") || return 1
+    # Historical managers/releases did not ship this helper. Do not invent a
+    # migration for them. The new updater selects the current verified manager
+    # when downgrading to such a release.
+    if [[ ! -e $policy_storage_helper ]]; then
+        [[ $target == legacy ]] || fail "policy migration tooling is unavailable"
+        return 0
+    fi
+    [[ -f $policy_storage_helper && ! -L $policy_storage_helper && $(stat -c '%u' "$policy_storage_helper") == 0 ]] ||
+        fail "unsafe policy migration helper"
+    if [[ $target == directory && ! -e /opt/jarvis/current && ! -L /opt/jarvis/current && ! -e /etc/jarvis/model-policy.json && ! -L /etc/jarvis/model-policy.json ]]; then
+        "$policy_storage_helper" initialize || return 1
+    fi
+    previous=$("$policy_storage_helper" layout) || return 1
+    if [[ -e /opt/jarvis/current || -L /opt/jarvis/current ]]; then
+        [[ -L /opt/jarvis/current ]] || fail "active release is not a managed link"
+        active=$(readlink -f /opt/jarvis/current) || return 1
+        [[ $active == "$releases_root/"* && -d $active ]] || fail "active release escapes managed releases"
+        validate_release "$active"
+        expected=$(policy_capability "$active") || return 1
+    fi
+    [[ $previous == "$expected" ]] || fail "policy layout disagrees with active release; interrupted migration requires owner recovery"
+    printf '%s\n' "$previous" > "$backup/model-policy-layout"
+    # Stop both writers/readers before changing the policy location. The
+    # activation caller restarts them after the complete release switch.
+    if ! systemctl stop jarvis-config-broker.service jarvis-core.service; then
+        systemctl start jarvis-config-broker.service jarvis-core.service || true
+        return 1
+    fi
+    if ! "$policy_storage_helper" "select-$target"; then
+        systemctl start jarvis-config-broker.service jarvis-core.service || true
+        return 1
+    fi
+}
+
+restore_policy_layout() {
+    local backup=$1 previous
+    [[ -e $backup/model-policy-layout ]] || return 0
+    [[ -f $backup/model-policy-layout && ! -L $backup/model-policy-layout ]] || fail "unsafe policy rollback state"
+    previous=$(<"$backup/model-policy-layout")
+    [[ $previous == legacy || $previous == directory ]] || fail "invalid policy rollback layout"
+    systemctl stop jarvis-config-broker.service jarvis-core.service || return 1
+    "$policy_storage_helper" "select-$previous" || fail "policy rollback failed; services remain stopped"
 }
 
 test_override_allowed() {
@@ -98,15 +189,19 @@ validate_checksum_manifest() {
 }
 
 validate_artifacts() {
-    local release=$1 unit path mode matches packaged expected managed_version device_version
+    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version
     managed_version=$(capability "$release") || return 1
     device_version=$(device_capability "$release") || return 1
+    policy_version=$(policy_capability "$release") || return 1
+    catalog_capability "$release" >/dev/null || return 1
     if [[ $managed_version != 1 ]]; then
         [[ $device_version == legacy ]] || fail "local-device capability requires managed systemd policy"
+        [[ $policy_version == legacy ]] || fail "model-policy directory capability requires managed systemd policy"
         return 0
     fi
     validate_checksum_manifest "$release"
     validate_device_policy "$release"
+    validate_policy_storage_artifact "$release"
     if jq -e 'has("schema_migration")' "$release/release.json" >/dev/null; then
         jq -e '.schema_migration | .version == 1 and .target == 8 and
             (.from_sha256 | type == "array" and length > 0 and length <= 2 and
@@ -128,11 +223,13 @@ validate_artifacts() {
         [[ -e $packaged || -L $packaged ]] || continue
         expected=false
         for unit in "${managed_units[@]}"; do
+            unit_required "$release" "$unit" || continue
             [[ ${packaged##*/} == "systemd-$unit" ]] && expected=true
         done
         [[ $expected == true ]] || fail "unexpected managed unit artifact: ${packaged##*/}"
     done
     for unit in "${managed_units[@]}"; do
+        unit_required "$release" "$unit" || continue
         path="$release/systemd-$unit"
         [[ -f $path && ! -L $path ]] || fail "managed unit is missing or unsafe: $unit"
         mode=$(stat -c '%a' "$path")
@@ -160,6 +257,9 @@ validate_artifacts() {
 validate_release() {
     local release=$1 entry helper metadata
     validate_artifacts "$release"
+    if [[ $(policy_capability "$release") == directory ]]; then
+        [[ $(stat -c '%u:%g' "$release/jarvis-model-policy-storage") == 0:0 ]] || fail "policy migration helper is not root-owned"
+    fi
     if [[ $(device_capability "$release") == 1 ]]; then
         [[ $(stat -c '%u:%g' "$release/$device_policy") == 0:0 ]] || fail "device policy is not root-owned"
     fi
@@ -216,6 +316,9 @@ validate_dropins() {
 check_installed() {
     local release=$1 unit source target metadata
     validate_release "$release"
+    if [[ $(policy_capability "$release") == directory ]]; then
+        "$policy_storage_helper" check-directory || fail "active release model-policy layout is not installed safely"
+    fi
     [[ $(capability "$release") == 1 ]] || fail "active release does not manage systemd units"
     validate_dropins
     validate_policy_target
@@ -228,6 +331,10 @@ check_installed() {
     for unit in "${managed_units[@]}"; do
         source="$release/systemd-$unit"
         target="$systemd_root/$unit"
+        if ! unit_required "$release" "$unit"; then
+            [[ ! -e $target && ! -L $target ]] || fail "legacy release has incompatible catalog unit installed: $unit"
+            continue
+        fi
         [[ -f $target && ! -L $target ]] || fail "installed managed unit is missing or unsafe: $unit"
         metadata=$(stat -c '%u:%g:%a' "$target")
         [[ $metadata == 0:0:644 ]] || fail "installed managed unit permissions differ from release policy: $unit"
@@ -267,6 +374,7 @@ install_units() {
         fi
     done
     for unit in "${managed_units[@]}"; do
+        unit_required "$release" "$unit" || continue
         source="$release/systemd-$unit"
         staged="$systemd_root/.$unit.jarvis-new"
         rm -f -- "$staged"
@@ -276,15 +384,25 @@ install_units() {
         fi
         staged_units+=("$staged")
     done
+    if ! prepare_policy_layout "$release" "$backup"; then
+        rm -f -- "${staged_units[@]}"
+        fail "policy layout preparation failed; release not activated"
+    fi
     for unit in "${managed_units[@]}"; do
+        if ! unit_required "$release" "$unit"; then
+            rm -f -- "$systemd_root/$unit"
+            continue
+        fi
         if ! mv -Tf "$systemd_root/.$unit.jarvis-new" "$systemd_root/$unit"; then
             restore_units "$backup"
+            [[ ! -e $backup/model-policy-layout ]] || systemctl start jarvis-config-broker.service jarvis-core.service
             rm -f -- "${staged_units[@]}"
             fail "managed unit replacement failed; prior units restored"
         fi
     done
     if ! (install_device_policy "$release") || ! (check_installed "$release"); then
         restore_units "$backup"
+        [[ ! -e $backup/model-policy-layout ]] || systemctl start jarvis-config-broker.service jarvis-core.service
         fail "installed unit verification failed; prior units restored"
     fi
 }
@@ -308,6 +426,7 @@ restore_units() {
     local backup=$1 unit state staged
     [[ -d $backup && ! -L $backup && -f $backup/state && ! -L $backup/state ]] ||
         fail "unit rollback state is unavailable"
+    restore_policy_layout "$backup"
     validate_policy_target
     if [[ -f $backup/device-policy-state && ! -L $backup/device-policy-state ]]; then
         case $(<"$backup/device-policy-state") in

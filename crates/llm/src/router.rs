@@ -15,7 +15,9 @@ use std::{
 use async_trait::async_trait;
 
 use crate::types::{ChatReply, ChatRequest, LlmError, ProviderFailure, Tier};
-use crate::{LlmProvider, ModelAccessPolicy};
+#[cfg(test)]
+use crate::ModelAccessPolicy;
+use crate::{LiveModelPolicy, LlmProvider};
 
 /// Live availability of a backend, by id — implemented by the api over the
 /// resource registry (`jarvis-registry`), so the router routes on what's up now.
@@ -75,7 +77,7 @@ pub struct RouterProvider {
     catalog: Vec<CatalogModel>,
     /// Root-owned, explicit allowlist.  Provider credentials do not imply
     /// permission to route to a model.
-    model_policy: ModelAccessPolicy,
+    model_policy: Arc<LiveModelPolicy>,
     health: Mutex<BTreeMap<String, HealthCooldown>>,
     label: String,
 }
@@ -95,11 +97,26 @@ impl RouterProvider {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_policy(
         candidates: Vec<Candidate>,
         availability: Arc<dyn Availability>,
         catalog: Vec<CatalogModel>,
         model_policy: ModelAccessPolicy,
+    ) -> Self {
+        Self::with_live_policy(
+            candidates,
+            availability,
+            catalog,
+            Arc::new(LiveModelPolicy::new(model_policy)),
+        )
+    }
+
+    pub(crate) fn with_live_policy(
+        candidates: Vec<Candidate>,
+        availability: Arc<dyn Availability>,
+        catalog: Vec<CatalogModel>,
+        model_policy: Arc<LiveModelPolicy>,
     ) -> Self {
         let ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
         let label = format!("router[{}]", ids.join(","));
@@ -136,6 +153,23 @@ impl RouterProvider {
                     && self.model_policy.allows(&m.backend, &m.id)
             }) {
                 return Some(m.id.clone());
+            }
+            // Root-verified discovery can add disabled cloud models after
+            // startup. Once explicitly enabled, treat new entries as Mid, just
+            // like registry discovery. Never infer a cheap/free tier or replace
+            // a configured model's classification. Candidates and availability
+            // still enforce credentialed, configured backends and budgets.
+            if *want == ModelClass::Mid && Self::dynamic_cloud_backend(backend) {
+                if let Some(entry) = self.model_policy.snapshot().models.iter().find(|entry| {
+                    entry.provider == backend
+                        && entry.enabled
+                        && !self
+                            .catalog
+                            .iter()
+                            .any(|m| m.backend == backend && m.id == entry.model)
+                }) {
+                    return Some(entry.model.clone());
+                }
             }
         }
         None
@@ -260,10 +294,25 @@ impl RouterProvider {
     }
 
     fn requested_model_is_allowed(&self, backend: &str, model: &str) -> bool {
-        self.catalog
-            .iter()
-            .any(|entry| entry.backend == backend && entry.id == model)
+        (Self::dynamic_cloud_backend(backend)
+            || self
+                .catalog
+                .iter()
+                .any(|entry| entry.backend == backend && entry.id == model))
             && self.model_policy.allows(backend, model)
+    }
+
+    fn dynamic_cloud_backend(backend: &str) -> bool {
+        matches!(
+            backend,
+            "openai-api"
+                | "anthropic-api"
+                | "deepseek-api"
+                | "xai-api"
+                | "zai-api"
+                | "ollama-cloud"
+                | "huggingface"
+        )
     }
 }
 
@@ -445,6 +494,66 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[tokio::test]
+    async fn live_disable_stops_calls_without_rebuilding_router() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted(Arc<AtomicUsize>);
+        #[async_trait]
+        impl LlmProvider for Counted {
+            fn label(&self) -> &str {
+                "fixture"
+            }
+            async fn chat(&self, request: &ChatRequest) -> Result<ChatReply, LlmError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Fixed {
+                    label: "ollama-cloud".into(),
+                    ok: true,
+                }
+                .chat(request)
+                .await
+            }
+        }
+        let catalog = vec![CatalogModel {
+            backend: "ollama-cloud".into(),
+            id: "fixture".into(),
+            class: ModelClass::Light,
+        }];
+        let enabled = allow_catalog(&catalog);
+        let mut disabled = enabled.clone();
+        disabled.models[0].enabled = false;
+        let live = Arc::new(LiveModelPolicy::new(disabled.clone()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterProvider::with_live_policy(
+            vec![Candidate {
+                id: "ollama-cloud".into(),
+                provider: Arc::new(Counted(calls.clone())),
+            }],
+            always_available(),
+            catalog,
+            live.clone(),
+        );
+        let request = ChatRequest {
+            system: None,
+            messages: vec![ChatMessage::user("fixture")],
+            tier: Tier::Default,
+            mode: crate::RoutingMode::Auto,
+            max_tokens: 16,
+            model: Some("fixture".into()),
+        };
+        assert!(router.chat(&request).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        live.activate_verified_toggle(&disabled, enabled.clone(), "ollama-cloud", "fixture", true)
+            .unwrap();
+        assert!(router.chat(&request).await.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        live.activate_verified_toggle(&enabled, disabled, "ollama-cloud", "fixture", false)
+            .unwrap();
+        assert!(router.chat(&request).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        live.suspend();
+        assert!(!live.allows("ollama", "not-listed"));
     }
 
     #[test]
@@ -654,6 +763,56 @@ mod tests {
                 > RouterProvider::cooldown_for(ProviderFailure::RateLimited)
         );
         assert!(RouterProvider::cooldown_for(ProviderFailure::Refused).is_zero());
+    }
+
+    #[tokio::test]
+    async fn post_startup_discovery_needs_approval_then_routes_without_restart() {
+        let live = Arc::new(LiveModelPolicy::new(ModelAccessPolicy::deny_by_default()));
+        let router = RouterProvider::with_live_policy(
+            vec![cand("openai-api", true)],
+            always_available(),
+            vec![],
+            live.clone(),
+        );
+        let discovered = ModelAccessPolicy {
+            version: 1,
+            models: vec![crate::ModelAccessEntry {
+                provider: "openai-api".into(),
+                model: "fixture-discovered".into(),
+                enabled: false,
+                source: "provider_api".into(),
+                route: None,
+            }],
+        };
+        live.refresh_discovery(discovered.clone()).unwrap();
+        let mut request = ChatRequest {
+            system: None,
+            messages: vec![ChatMessage::user("fixture")],
+            tier: Tier::Default,
+            mode: crate::RoutingMode::Auto,
+            max_tokens: 16,
+            model: None,
+        };
+        assert!(router.chat(&request).await.is_err());
+        assert!(!router.requested_model_is_allowed("openai-api", "fixture-discovered"));
+        let mut enabled = discovered.clone();
+        enabled.models[0].enabled = true;
+        live.activate_verified_toggle(
+            &discovered,
+            enabled,
+            "openai-api",
+            "fixture-discovered",
+            true,
+        )
+        .unwrap();
+        assert_eq!(router.chat(&request).await.unwrap().text, "openai-api");
+        request.model = Some("fixture-discovered".into());
+        assert!(router.chat(&request).await.is_ok());
+        request.model = Some("not-enabled".into());
+        assert!(router.chat(&request).await.is_err());
+        assert_eq!(router.model_for("openai-api", Tier::Cheap), None);
+        live.suspend();
+        assert!(router.chat(&request).await.is_err());
     }
 
     #[tokio::test]

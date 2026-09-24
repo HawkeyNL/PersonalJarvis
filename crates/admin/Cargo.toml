@@ -1,6 +1,6 @@
 [package]
 name = "jarvis-admin"
-version = "0.1.5"
+version = "0.1.6"
 edition.workspace = true
 rust-version.workspace = true
 
@@ -24,6 +24,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 jarvis-llm.workspace = true
+jarvis-usage.workspace = true
 jarvis-config.workspace = true
 jarvis-privileged.workspace = true
 uuid.workspace = true

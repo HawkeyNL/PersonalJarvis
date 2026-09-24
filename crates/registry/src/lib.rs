@@ -11,6 +11,9 @@
 use serde::Serialize;
 use tokio::process::Command;
 
+mod telemetry;
+pub use telemetry::live_host;
+
 /// A full snapshot of what Jarvis can run and run on.
 #[derive(Debug, Clone, Serialize)]
 pub struct Registry {

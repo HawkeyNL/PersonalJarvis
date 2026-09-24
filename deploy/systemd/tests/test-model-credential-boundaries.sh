@@ -2,6 +2,7 @@
 # Static security regression coverage for PR #26.  No real provider or secret
 # is required in CI.
 set -euo pipefail
+trap 'echo "Model/credential boundary assertion failed at line $LINENO" >&2' ERR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 credentials="$repo_dir/deploy/systemd/jarvis-credentials.sh"
@@ -18,7 +19,7 @@ broker="$repo_dir/deploy/systemd/jarvis-config-broker.service"
 [[ -f $broker ]] || { echo "missing privileged config broker unit" >&2; exit 1; }
 grep -Fq 'User=root' "$broker"
 grep -Fq 'EnvironmentFile=/etc/jarvis/core.env' "$broker"
-grep -Fq 'ReadWritePaths=/etc/jarvis/model-policy.json' "$broker"
+grep -Fxq 'ReadWritePaths=/etc/jarvis/model-policy' "$broker" || { echo 'broker must permit atomic writes only in its dedicated policy directory' >&2; exit 1; }
 if grep -Eq 'ExecStart=.*(sh|bash)|/bin/(sh|bash)' "$broker"; then
     echo "privileged broker must not expose a shell" >&2
     exit 1
@@ -91,7 +92,8 @@ grep -Fq 'atomic_write' "$models"
 grep -Fq 'ollama-cloud' "$models"
 grep -Fq "provider == \$item[0] and .model == \$item[1]" "$models"
 grep -Fq "curl --config \"\$config\"" "$models"
-grep -Fq 'mktemp /run/jarvis-model-discovery' "$models"
+grep -Fq 'mktemp "$runtime/jarvis-model-discovery.XXXXXX"' "$models"
+grep -Fq 'runtime=/run' "$models"
 grep -Fq 'provider_api' "$models"
 grep -Fq 'ollama_cloud_default_base_url=https://ollama.com/v1' "$models"
 grep -Fq 'ollama_cloud_tags_url=https://ollama.com/api/tags' "$models"

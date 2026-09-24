@@ -221,6 +221,42 @@ fn versioned_admin_helpers_come_from_the_active_release() {
 }
 
 #[test]
+fn model_policy_location_follows_active_capability_not_cli_version() {
+    let (_directory, current, releases, legacy, uid, gid) = admin_helper_layout(true);
+    let resolve =
+        || admin_helpers::resolve_model_policy_path(&current, &releases, &legacy, uid, gid);
+    assert_eq!(
+        resolve().unwrap(),
+        PathBuf::from("/etc/jarvis/model-policy.json")
+    );
+    let manifest = releases.join("v0.0.20/release.json");
+    fs::write(
+        &manifest,
+        r#"{"tag":"v0.0.20","tooling":{"admin_helpers":1,"model_policy_directory":1}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        resolve().unwrap(),
+        PathBuf::from("/etc/jarvis/model-policy/policy.json")
+    );
+    fs::write(
+        &manifest,
+        r#"{"tag":"v0.0.20","tooling":{"admin_helpers":1,"model_policy_directory":2}}"#,
+    )
+    .unwrap();
+    assert!(resolve().is_err());
+}
+
+#[test]
+fn model_policy_legacy_helper_layout_remains_readable() {
+    let (_directory, current, releases, legacy, uid, gid) = admin_helper_layout(false);
+    assert_eq!(
+        admin_helpers::resolve_model_policy_path(&current, &releases, &legacy, uid, gid).unwrap(),
+        PathBuf::from("/etc/jarvis/model-policy.json")
+    );
+}
+
+#[test]
 fn legacy_release_without_capability_uses_fixed_compatibility_paths() {
     let (_directory, current, releases, legacy, uid, gid) = admin_helper_layout(false);
     let helper =

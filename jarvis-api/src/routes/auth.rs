@@ -228,12 +228,22 @@ pub(crate) async fn pairing_create(
         .await
         .map_err(internal)?
         == 0
+        && (identity::surreal::account::bootstrap_available(&state.db)
+            .await
+            .map_err(internal)?
+            || !identity::surreal::account::password_required(&state.db, user.id)
+                .await
+                .map_err(internal)?)
     {
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({ "error": "first device bootstrap required" })),
         ));
     }
+    // After one-time activation, revoking the last device must still allow a
+    // password-authenticated pending request. This grants no device authority:
+    // explicit root-peer local approval is still required when no active
+    // signing device remains. Legacy/unactivated owners cannot use this path.
     identity::surreal::account::verify_password(
         &state.db,
         identity::password::PasswordService::shared(),

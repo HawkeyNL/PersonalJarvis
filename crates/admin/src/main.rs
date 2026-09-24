@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 mod account_activation;
 mod admin_helpers;
 mod agent_tree;
+mod credential_setup;
 mod local_devices;
 mod terminal_ui;
 mod tui_app;
@@ -201,6 +202,8 @@ struct ModelsArgs {
 }
 #[derive(Debug, Subcommand)]
 enum ModelsCommand {
+    /// Metadata-only refresh of credentialed providers; used by the hourly timer.
+    RefreshConfigured,
     Refresh {
         provider: Option<Provider>,
     },
@@ -1170,11 +1173,20 @@ struct ModelRecord {
 }
 
 fn read_model_policy() -> Result<ModelPolicy> {
-    let path = Path::new("/etc/jarvis/model-policy.json");
-    let metadata = fs::symlink_metadata(path).context("inspect model policy")?;
-    let config_directory =
-        fs::symlink_metadata("/etc/jarvis").context("inspect config directory")?;
-    if metadata.file_type().is_symlink()
+    let path = admin_helpers::resolve_model_policy_path(
+        Path::new("/opt/jarvis/current"),
+        Path::new("/opt/jarvis/releases"),
+        Path::new("/usr/local/sbin"),
+        0,
+        0,
+    )?;
+    let metadata = fs::symlink_metadata(&path).context("inspect model policy")?;
+    let config_directory = fs::symlink_metadata(path.parent().context("policy has no directory")?)
+        .context("inspect policy directory")?;
+    if !config_directory.is_dir()
+        || config_directory.uid() != 0
+        || config_directory.permissions().mode() & 0o777 != 0o750
+        || !metadata.is_file()
         || metadata.uid() != 0
         || metadata.gid() != config_directory.gid()
         || metadata.permissions().mode() & 0o777 != 0o640
@@ -1295,6 +1307,7 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
         return Ok(());
     }
     let arguments: Vec<String> = match args.command {
+        ModelsCommand::RefreshConfigured => vec!["refresh-configured".to_owned()],
         ModelsCommand::Refresh { provider } => vec!["refresh".to_owned()]
             .into_iter()
             .chain(provider.map(|value| value.as_str().to_owned()))
@@ -1489,7 +1502,7 @@ fn credentials(args: CredentialsArgs, presentation: &Presentation, verbose: bool
     let arguments = match args.command {
         CredentialsCommand::List => vec!["list".to_owned()],
         CredentialsCommand::Set { provider } => {
-            vec!["set".to_owned(), provider.as_str().to_owned()]
+            return credential_setup::set(&provider, verbose);
         }
         CredentialsCommand::Test { provider } => {
             vec!["test".to_owned(), provider.as_str().to_owned()]

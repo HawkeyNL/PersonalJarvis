@@ -48,6 +48,16 @@ verify_admin_helper_candidate() {
 
 verify_systemd_unit_candidate() {
   local release=$1
+  jq -e '.tooling.model_catalog == 1 and (.tooling.model_catalog | type) == "number"' \
+    "$release/release.json" >/dev/null || {
+    echo "release candidate does not declare model-catalog capability 1" >&2
+    exit 1
+  }
+  jq -e '.tooling.model_policy_directory == 1 and (.tooling.model_policy_directory | type) == "number"' \
+    "$release/release.json" >/dev/null || {
+    echo "release candidate does not declare model-policy directory capability 1" >&2
+    exit 1
+  }
   jq -e '.tooling.systemd_units == 1 and (.tooling.systemd_units | type) == "number"' \
     "$release/release.json" >/dev/null || {
     echo "release candidate does not declare managed-systemd capability 1" >&2
@@ -180,6 +190,7 @@ temporary_release="$temporary/$release_name"
 mkdir -p "$temporary_release"
 install -m 0755 "$release_target_dir/release/jarvis-api" "$temporary_release/jarvis-api"
 install -m 0755 "$release_target_dir/release/jarvis-config-broker" "$temporary_release/jarvis-config-broker"
+install -m 0755 "$release_target_dir/release/jarvis-model-policy-storage" "$temporary_release/jarvis-model-policy-storage"
 install -m 0755 "$release_target_dir/release/jarvis-codex-broker" "$temporary_release/jarvis-codex-broker"
 install -m 0755 "$release_target_dir/release/jarvis-agent-bundle" "$temporary_release/jarvis-agent-bundle"
 install -m 0755 "$release_target_dir/release/jarvis" "$temporary_release/jarvis"
@@ -216,7 +227,8 @@ for unit in \
   jarvis-updater.service \
   jarvis-updater.timer \
   jarvis-private-agent-updater.service \
-  jarvis-private-agent-updater.timer; do
+  jarvis-private-agent-updater.timer \
+  jarvis-model-catalog.service jarvis-model-catalog.timer; do
   install -m 0644 "deploy/systemd/$unit" "$temporary_release/systemd-$unit"
 done
 install -m 0644 deploy/systemd/pricing-registry.json "$temporary_release/pricing-registry.json"
@@ -239,7 +251,7 @@ jq -n \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
   --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 8, from_sha256: [$schema_six, $schema_seven]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1}}' \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 8, from_sha256: [$schema_six, $schema_seven]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1}}' \
   > "$temporary_release/release.json"
 
 (
@@ -248,7 +260,7 @@ jq -n \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
     jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials \
     com.hawkeynl.jarvis.devices.policy \
-    manage-systemd-units schema-backup verify-home-node install-home-node-core ui.sh \
+    manage-systemd-units jarvis-model-policy-storage schema-backup verify-home-node install-home-node-core ui.sh \
     pricing-registry.json \
     install-agent-bundle \
     private-agent-poll jarvis-private-update systemd-*.service systemd-*.timer \

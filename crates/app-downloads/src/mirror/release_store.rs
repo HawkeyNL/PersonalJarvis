@@ -338,8 +338,32 @@ pub(super) fn public_links(root: &Path, owner: u32) -> Result<String> {
         }
     }
     versions.sort();
-    let mut html = String::from("<h1>Jarvis clients</h1><p>De iOS-IPA vereist lokale ondertekening; geen automatische installatie.</p><ul>");
+    if versions.is_empty() {
+        return Ok(String::new());
+    }
+    let latest = versions.last().expect("nonempty versions");
+    let mut html = String::from("<div class=\"release-browser\"><h2>Jarvis clients</h2><label class=\"version-picker\" for=\"release-version\">Versie</label><select id=\"release-version\" class=\"version-picker\">");
     for version in versions.iter().rev() {
+        let selected = if version == latest { " selected" } else { "" };
+        let label = if version == latest { " — Latest" } else { "" };
+        html.push_str(&format!(
+            "<option value=\"{version}\"{selected}>v{version}{label}</option>"
+        ));
+    }
+    html.push_str("</select><style>@supports selector(:has(option:checked)) {");
+    for version in versions.iter().rev() {
+        // Only validated numeric SemVer enters CSS/HTML. No scripts or CSP
+        // relaxation: older browsers simply show all releases as a fallback.
+        html.push_str(&format!(".release-browser:has(option[value=\"{version}\"]:checked) .client-release:not([data-version=\"{version}\"]) {{ display: none; }}"));
+    }
+    html.push_str("}</style>");
+    for version in versions.iter().rev() {
+        let badge = if version == latest {
+            " <span class=\"latest-badge\">Latest · nieuwste versie</span>"
+        } else {
+            ""
+        };
+        html.push_str(&format!("<div class=\"client-release\" data-version=\"{version}\"><h3>Jarvis {version}{badge}</h3><ul>"));
         for (target, suffix, label) in [
             ("linux-x86_64", ".AppImage", "Linux"),
             ("windows-x86_64", ".exe", "Windows"),
@@ -356,7 +380,8 @@ pub(super) fn public_links(root: &Path, owner: u32) -> Result<String> {
             )?;
             html.push_str(&format!("<li><a href=\"/downloads/releases/v{version}/{target}/{name}\">Jarvis {version} — {label}</a></li>"));
         }
+        html.push_str("</ul></div>");
     }
-    html.push_str("</ul>");
+    html.push_str("</div>");
     Ok(html)
 }

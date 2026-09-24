@@ -1,6 +1,6 @@
 [package]
 name = "jarvis-api"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
@@ -59,6 +59,7 @@ url.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+tempfile = "3"
 async-trait = "0.1"
 tokio-tungstenite = "0.29"
 futures-util = "0.3"

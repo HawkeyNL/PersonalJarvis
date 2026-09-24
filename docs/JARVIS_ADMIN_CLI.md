@@ -301,6 +301,18 @@ is never rendered by the TUI or emitted in JSON.
 
 ## Diagnostics
 
+### First-device activation code
+
+`sudo jarvis account activation-code --allow-cidr <private-device-ip>/32`
+prints a random, case-sensitive 12-character code in the controlling terminal.
+The alphabet uses uppercase letters and digits without `I`, `O`, `0` or `1`.
+Codes expire after ten minutes and are only valid within the explicitly allowed
+private network. Only their SHA-256 verifier is persisted. First-account
+activation is one-time; generating another code does not reset enrollment.
+Never send codes through command arguments, redirects, logs or support messages.
+The account password is separate and must be at least 15 characters. Older
+hexadecimal activation codes remain supported by the verifier and clients.
+
 ### Schema-changing account-onboarding release
 
 Routine `update --latest` and `update --version` intentionally refuse a changed
@@ -361,6 +373,14 @@ Check the pending fingerprint against the requesting device before approving.
 Revocation invalidates the device's sessions and realtime connections. Revoking
 every device does **not** reopen first-device activation or reset the account
 password. These commands are not a lost-password recovery mechanism.
+
+After the last device is revoked, an already activated account can submit a new
+pending pairing request with its existing account password. The request alone
+does not activate a device or issue a session. With no active signing device
+left, the owner must approve it through the local OS-authenticated Devices page
+or the root-peer CLI above, after checking its fingerprint. First-device
+activation remains permanently closed; do not erase database activation state
+or generate another bootstrap code to recover a revoked device.
 
 The fixed local Unix socket accepts kernel-verified root peers only. It is
 created inside Core's systemd-managed `RuntimeDirectory=jarvis-core-admin`;

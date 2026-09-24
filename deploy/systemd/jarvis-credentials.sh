@@ -125,16 +125,15 @@ restart_or_rollback() {
         rm -f -- "$file"
     fi
     systemctl restart jarvis-core.service >/dev/null 2>&1 || true
-    systemctl --no-pager --full status jarvis-core.service 2>/dev/null | tail -n 20 >&2 || true
+    echo "jarvis-credentials: inspect 'sudo jarvis health' for recovery status." >&2
     return 1
 }
 
-set_credential() {
+set_credential() (
     local provider=$1 var file tmp backup='' had_backup=no secret
     [[ $provider != ollama ]] || fail "local Ollama has no credential; use ollama-cloud only for a remote API"
     var=$(provider_var "$provider") || fail "unknown provider"
     require_tty
-    ensure_provider_defaults "$provider"
     install -d -o root -g jarvis -m 0750 "$secret_dir"
     file=$(credential_file "$provider")
     printf 'Enter %s credential (input hidden): ' "$provider" >/dev/tty
@@ -142,24 +141,37 @@ set_credential() {
     printf '\n' >/dev/tty
     [[ -n $secret && $secret != *$'\n'* && ${#secret} -le 8192 ]] || fail "credential is empty or malformed"
     tmp=$(mktemp "$secret_dir/.${provider}.XXXXXX")
-    backup=$(mktemp "$secret_dir/.${provider}.backup.XXXXXX")
-    trap 'rm -f -- "$tmp" "$backup"; unset secret' RETURN
+    trap 'rm -f -- "$tmp"; unset secret' EXIT
     umask 077
     printf '%s=%s\n' "$var" "$secret" > "$tmp"
     unset secret
-    chown root:jarvis "$tmp"
-    chmod 0640 "$tmp"
-    if [[ -e $file ]]; then
+    install_credential_candidate "$provider" "$tmp"
+)
+
+# Called only with a hidden-input temporary, never with a caller-selected path.
+# Keep the old credential untouched until the metadata-only probe succeeds.
+install_credential_candidate() (
+    local provider=$1 tmp=$2 file backup='' had_backup=no
+    file=$(credential_file "$provider")
+    trap 'rm -f -- "$tmp"; [[ -z $backup ]] || rm -f -- "$backup"' EXIT
+    echo "jarvis-credentials: checking $provider credential; no generation request is made."
+    if ! probe_provider "$provider" "$tmp"; then
+        fail "$provider credential could not be verified (rejected, unavailable, or invalid metadata); previous credential unchanged"
+    fi
+    ensure_provider_defaults "$provider"
+    backup=$(mktemp "$secret_dir/.${provider}.backup.XXXXXX")
+    if [[ -e $file || -L $file ]]; then
         [[ -f $file && ! -L $file && $(stat -c '%U:%G:%a' "$file") == root:jarvis:640 ]] || fail "existing credential permissions are unsafe"
         cp --preserve=mode,ownership "$file" "$backup"
         had_backup=yes
     fi
+    chown root:jarvis "$tmp"
+    chmod 0640 "$tmp"
     mv -f -- "$tmp" "$file"
     restart_or_rollback "$file" "$backup" "$had_backup" || fail "credential change rolled back"
     rm -f -- "$backup"
-    trap - RETURN
-    echo "jarvis-credentials: $provider is configured; no credential value was displayed."
-}
+    echo "jarvis-credentials: $provider credential probe and Core health check succeeded; credential saved."
+)
 
 list_credentials() {
     local provider file configured
@@ -193,7 +205,7 @@ test_credential() {
 # Authenticated, read-only provider probe. The key is written only into an
 # ephemeral mode-0600 curl config in /run, never onto curl's argv or stdout.
 # Every endpoint below is metadata-only and must not create a paid generation.
-probe_provider() {
+probe_provider() (
     local provider=$1 file=$2 variable key escaped_key base config http_code url response_file=''
     command -v curl >/dev/null 2>&1 || fail "curl is required for credential testing"
     variable=$(provider_var "$provider") || return 1
@@ -201,7 +213,7 @@ probe_provider() {
     [[ -n $key ]] || return 1
     escaped_key=$(curl_config_escape "$key")
     config=$(mktemp /run/jarvis-credential-test.XXXXXX)
-    trap 'rm -f -- "$config"; [[ -z ${response_file:-} ]] || rm -f -- "$response_file"; unset key escaped_key' RETURN
+    trap 'rm -f -- "$config"; [[ -z ${response_file:-} ]] || rm -f -- "$response_file"; unset key escaped_key' EXIT
     umask 077
     case $provider in
         anthropic)
@@ -228,23 +240,18 @@ probe_provider() {
         *) return 1 ;;
     esac
     unset key escaped_key
-    if [[ $provider == huggingface ]]; then
-        response_file=$(mktemp /run/jarvis-credential-response.XXXXXX)
-        chmod 0600 "$response_file"
+    response_file=$(mktemp /run/jarvis-credential-response.XXXXXX)
+    chmod 0600 "$response_file"
+    # Do not echo provider bodies or curl diagnostics: either can contain
+    # attacker-controlled data, including a reflected Authorization value.
+    http_code=$(curl --config "$config" --output "$response_file" --silent --max-time 10 --max-filesize 8388608 --write-out '%{http_code}' 2>/dev/null) || return 1
+    [[ $http_code =~ ^2[0-9]{2}$ ]] || return 1
+    if [[ $provider == ollama-cloud ]]; then
+        jq -e '(.models | type == "array") and any(.models[]?; (.name | type == "string") and (.name | length > 0))' "$response_file" >/dev/null 2>&1
+    else
+        valid_huggingface_model_response "$response_file" 2>/dev/null
     fi
-    http_code=$(curl --config "$config" --output "${response_file:-/dev/null}" --silent --show-error --max-time 10 --max-filesize 8388608 --write-out '%{http_code}' || true)
-    trap - RETURN
-    rm -f -- "$config"
-    [[ $http_code =~ ^2[0-9]{2}$ ]] || { [[ -z $response_file ]] || rm -f -- "$response_file"; return 1; }
-    if [[ $provider == huggingface ]]; then
-        valid_huggingface_model_response "$response_file" || {
-            rm -f -- "$response_file"
-            return 1
-        }
-        rm -f -- "$response_file"
-    fi
-    return 0
-}
+)
 
 valid_huggingface_model_response() {
     jq -e '(.data | type == "array") and any(.data[]?; (.id | type == "string") and (.id | length > 0) and (.id | length <= 256) and (.id | test("[[:cntrl:]]") | not))' "$1" >/dev/null

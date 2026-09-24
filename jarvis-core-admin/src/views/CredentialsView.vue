@@ -9,9 +9,13 @@ const rows = ref<CredentialRecord[]>([]); const busy = ref(false); const error =
 async function load() { busy.value = true; error.value = ""; try { rows.value = await api.credentials(); } catch (e) { error.value = errorText(e); } finally { busy.value = false; } }
 async function setCredential(provider: CredentialProvider) {
   busy.value = true; error.value = ""; result.value = null; activeProvider.value = provider;
-  try { result.value = await api.credentialSet(provider); rows.value = await api.credentials(); }
+  try { result.value = await api.credentialSet(provider); }
   catch (e) { error.value = errorText(e); }
-  finally { busy.value = false; activeProvider.value = null; }
+  finally {
+    // Saving may succeed even when the subsequent metadata refresh fails.
+    try { rows.value = await api.credentials(); } catch (e) { if (!error.value) error.value = errorText(e); }
+    busy.value = false; activeProvider.value = null;
+  }
 }
 function providerLabel(provider: CredentialProvider): string {
   return ({ anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", xai: "xAI", zai: "Z.ai", "ollama-cloud": "Ollama Cloud", huggingface: "Hugging Face" })[provider];
@@ -28,6 +32,6 @@ onMounted(load);
       <StatusBadge :state="row.configured ? 'configured' : 'not configured'" />
       <button class="small secondary" :disabled="busy" @click="setCredential(row.provider)">{{ activeProvider === row.provider ? 'Terminal open…' : (row.configured ? 'Replace' : 'Set credential') }}</button>
     </article>
-    <article class="security-card"><strong>Protected secret entry</strong><p>Set or replace opens a separate trusted GNOME terminal. The active release helper reads the secret invisibly from that terminal; the value never enters this webview or Tauri IPC. System authorization may ask for confirmation according to the active polkit policy.</p></article>
+    <article class="security-card"><strong>Protected secret entry</strong><p>Set or replace opens a separate trusted GNOME terminal. A bounded metadata probe checks the credential before replacement; Core health is checked afterwards and models are refreshed automatically, disabled by default. If catalog refresh fails after saving, the terminal explains how to retry. “Configured” reports storage status, not continuous provider availability. Secrets never enter this webview or Tauri IPC.</p></article>
   </section>
 </template>

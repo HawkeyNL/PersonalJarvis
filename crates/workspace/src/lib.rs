@@ -89,20 +89,21 @@ impl WorktreePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn repository() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .unwrap()
-            .to_path_buf()
+    fn repository() -> tempfile::TempDir {
+        // This planner only inspects the checkout marker; it never executes
+        // Git. A fixture avoids compile-time paths to removed CI worktrees.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        directory
     }
 
     #[test]
     fn plans_only_detached_commit_worktrees_outside_the_repository() {
         let temporary = tempfile::tempdir().unwrap();
         let parent = temporary.path().canonicalize().unwrap();
+        let repo = repository();
         let plan = WorktreePlan::new(
-            repository(),
+            repo.path(),
             &parent,
             Uuid::nil(),
             "0123456789abcdef0123456789abcdef01234567",
@@ -118,16 +119,21 @@ mod tests {
     fn rejects_live_tree_parents_and_mutable_revisions() {
         let repo = repository();
         assert_eq!(
-            WorktreePlan::new(&repo, &repo, Uuid::nil(), "0123456"),
+            WorktreePlan::new(repo.path(), repo.path(), Uuid::nil(), "0123456"),
             Err(WorkspaceError::InvalidParent)
         );
         let temporary = tempfile::tempdir().unwrap();
         assert_eq!(
-            WorktreePlan::new(&repo, temporary.path(), Uuid::nil(), "main"),
+            WorktreePlan::new(repo.path(), temporary.path(), Uuid::nil(), "main"),
             Err(WorkspaceError::InvalidRevision)
         );
         assert_eq!(
-            WorktreePlan::new(&repo, temporary.path(), Uuid::nil(), "--upload-pack=x"),
+            WorktreePlan::new(
+                repo.path(),
+                temporary.path(),
+                Uuid::nil(),
+                "--upload-pack=x"
+            ),
             Err(WorkspaceError::InvalidRevision)
         );
     }

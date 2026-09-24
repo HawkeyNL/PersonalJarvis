@@ -14,7 +14,7 @@ revision=0123456789abcdef0123456789abcdef01234567
 write_candidate() {
     local tag=$1 release="$fixture/candidate/jarvis-core-$1" helper unit
     mkdir -p "$release"
-    for helper in jarvis-models jarvis-credentials; do
+    for helper in jarvis-models jarvis-credentials jarvis-model-policy-storage; do
         printf '#!/usr/bin/env bash\nprintf "%s fixture\\n"\n' "$helper" > "$release/$helper"
         chmod 0755 "$release/$helper"
     done
@@ -32,18 +32,18 @@ write_candidate() {
     for unit in jarvis-core.service jarvis-config-broker.service jarvis-codex-broker.service \
         jarvis-codex.service jarvis-opensandbox.service jarvis-surrealdb.service \
         jarvis-updater.service jarvis-updater.timer \
-        jarvis-private-agent-updater.service jarvis-private-agent-updater.timer; do
+        jarvis-private-agent-updater.service jarvis-private-agent-updater.timer \
+        jarvis-model-catalog.service jarvis-model-catalog.timer; do
         cp "$repo_dir/deploy/systemd/$unit" "$release/systemd-$unit"
         chmod 0644 "$release/systemd-$unit"
     done
-    printf '%s\n' '{"version":1,"source":"fixture","updated_at":"2026-09-01","models":[]}' \
-        > "$release/pricing-registry.json"
+    install -m 0644 "$repo_dir/deploy/systemd/pricing-registry.json" "$release/pricing-registry.json"
     jq -n --arg tag "$tag" --arg revision "$revision" \
-        '{tag:$tag,revision:$revision,schema_migration:{version:1,target:8,from_sha256:[("a" * 64)]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1}}' \
+        '{tag:$tag,revision:$revision,schema_migration:{version:1,target:8,from_sha256:[("a" * 64)]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1,model_policy_directory:1,model_catalog:1}}' \
         > "$release/release.json"
     (
         cd "$release"
-        sha256sum jarvis-models jarvis-credentials pricing-registry.json \
+        sha256sum jarvis-models jarvis-credentials jarvis-model-policy-storage pricing-registry.json \
             com.hawkeynl.jarvis.devices.policy \
             schema-backup \
             manage-systemd-units verify-home-node install-home-node-core ui.sh \
@@ -60,7 +60,8 @@ archive="$fixture/jarvis-core-$tag-linux-x86_64.tar.gz"
 # Consume the complete listing before assertions: grep -q on a pipe can close
 # early and make a healthy tar fail with SIGPIPE/write error under pipefail.
 tar -tzf "$archive" > "$fixture/archive-members.txt"
-for member in jarvis-models jarvis-credentials pricing-registry.json \
+for member in jarvis-models jarvis-credentials jarvis-model-policy-storage pricing-registry.json \
+    systemd-jarvis-model-catalog.service systemd-jarvis-model-catalog.timer \
     systemd-jarvis-config-broker.service com.hawkeynl.jarvis.devices.policy; do
     grep -Fxq "jarvis-core-$tag/$member" "$fixture/archive-members.txt" || {
         echo "release archive is missing required member: $member" >&2
@@ -74,10 +75,15 @@ cmp "$fixture/candidate/jarvis-core-$tag/jarvis-models" \
     "$extracted/jarvis-core-$tag/jarvis-models"
 cmp "$fixture/candidate/jarvis-core-$tag/jarvis-credentials" \
     "$extracted/jarvis-core-$tag/jarvis-credentials"
+cmp "$repo_dir/deploy/systemd/pricing-registry.json" \
+    "$extracted/jarvis-core-$tag/pricing-registry.json"
+jq -e 'any(.models[]; .provider == "openai-api" and .model == "gpt-6-astra" and .input_per_million_usd == 10)' \
+    "$extracted/jarvis-core-$tag/pricing-registry.json" >/dev/null
 jq -e '.tooling.admin_helpers == 1' \
     "$extracted/jarvis-core-$tag/release.json" >/dev/null
 jq -e '.tooling.systemd_units == 1' \
     "$extracted/jarvis-core-$tag/release.json" >/dev/null
+jq -e '.tooling.model_catalog == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
 
 bad_tag=v9.8.8
 write_candidate "$bad_tag"
@@ -104,7 +110,7 @@ fi
 grep -Fq 'managed unit is missing or unsafe: jarvis-config-broker.service' \
     "$fixture/bad-unit.stderr"
 
-for defect in missing tampered symlink capability missing-backup unsupported-schema; do
+for defect in missing tampered symlink capability missing-backup unsupported-schema missing-migration unsafe-migration unsupported-layout missing-catalog-service missing-catalog-timer unsupported-catalog; do
     write_candidate v9.8.10
     policy="$fixture/candidate/jarvis-core-v9.8.10/com.hawkeynl.jarvis.devices.policy"
     case $defect in
@@ -116,6 +122,18 @@ for defect in missing tampered symlink capability missing-backup unsupported-sch
             cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
             ;;
         missing-backup) rm -- "$fixture/candidate/jarvis-core-v9.8.10/schema-backup" ;;
+        missing-migration) rm -- "$fixture/candidate/jarvis-core-v9.8.10/jarvis-model-policy-storage" ;;
+        missing-catalog-service) rm -- "$fixture/candidate/jarvis-core-v9.8.10/systemd-jarvis-model-catalog.service" ;;
+        missing-catalog-timer) rm -- "$fixture/candidate/jarvis-core-v9.8.10/systemd-jarvis-model-catalog.timer" ;;
+        unsupported-catalog)
+            jq '.tooling.model_catalog = 2' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
+            cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
+            ;;
+        unsafe-migration) chmod 0777 "$fixture/candidate/jarvis-core-v9.8.10/jarvis-model-policy-storage" ;;
+        unsupported-layout)
+            jq '.tooling.model_policy_directory = 2' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
+            cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
+            ;;
         unsupported-schema)
             jq '.schema_migration.target = 99' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
             cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
@@ -128,4 +146,13 @@ for defect in missing tampered symlink capability missing-backup unsupported-sch
     # Remove the fixture symlink before constructing the next candidate.
     [[ ! -L $policy ]] || rm -- "$policy"
 done
+# A previously verified release without the new capability remains inspectable.
+write_candidate v9.8.11
+legacy="$fixture/candidate/jarvis-core-v9.8.11"
+jq 'del(.tooling.model_catalog)' "$legacy/release.json" > "$fixture/manifest"
+cp "$fixture/manifest" "$legacy/release.json"
+rm -- "$legacy/systemd-jarvis-model-catalog.service" "$legacy/systemd-jarvis-model-catalog.timer"
+sed '/systemd-jarvis-model-catalog[.]/d' "$legacy/artifact-binaries.sha256" > "$fixture/checksums"
+cp "$fixture/checksums" "$legacy/artifact-binaries.sha256"
+bash "$legacy/manage-systemd-units" validate-artifacts "$legacy"
 echo "Canonical release package fixture tests passed"

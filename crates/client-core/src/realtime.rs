@@ -147,6 +147,57 @@ impl EventCursor {
 mod tests {
     use super::*;
 
+    fn envelope(epoch: u128, sequence: u64, ready: bool) -> EventEnvelope {
+        EventEnvelope {
+            protocol: REALTIME_PROTOCOL,
+            epoch: Uuid::from_u128(epoch),
+            event_id: Uuid::from_u128(sequence.into()),
+            sequence,
+            at: OffsetDateTime::UNIX_EPOCH,
+            event: if ready {
+                Event::ConnectionReady {
+                    device_id: Uuid::from_u128(10),
+                    reconcile: true,
+                }
+            } else {
+                Event::ConversationDeleted {
+                    conversation_id: Uuid::from_u128(20),
+                }
+            },
+        }
+    }
+
+    #[test]
+    fn restarted_core_requires_ready_before_accepting_reset_sequence() {
+        let mut cursor = EventCursor::default();
+        assert!(!cursor.accept(&envelope(1, 1, false)));
+        assert!(cursor.accept(&envelope(1, 100, true)));
+        assert!(cursor.accept(&envelope(1, 105, false)));
+        assert!(!cursor.accept(&envelope(2, 1, false)));
+        // A rejected epoch must not discard the previous valid cursor.
+        assert!(!cursor.accept(&envelope(1, 104, false)));
+        assert!(cursor.accept(&envelope(1, 106, false)));
+        assert!(cursor.accept(&envelope(2, 1, true)));
+        assert!(cursor.accept(&envelope(2, 2, false)));
+        assert!(!cursor.accept(&envelope(2, 2, false)));
+        assert!(!cursor.accept(&envelope(1, 200, false)));
+        assert!(cursor.accept(&envelope(2, 3, false)));
+    }
+
+    #[test]
+    fn incompatible_protocol_cannot_advance_or_reset_the_cursor() {
+        let mut cursor = EventCursor::default();
+        assert!(cursor.accept(&envelope(1, 5, true)));
+        for (epoch, ready) in [(1, false), (2, true)] {
+            let mut incompatible = envelope(epoch, 500, ready);
+            incompatible.protocol = REALTIME_PROTOCOL + 1;
+            assert!(!cursor.accept(&incompatible));
+        }
+        assert!(cursor.accept(&envelope(1, 6, false)));
+        assert!(!cursor.accept(&envelope(1, 5, true)));
+        assert!(cursor.accept(&envelope(1, 7, true)));
+    }
+
     #[test]
     fn wire_contract_and_duplicate_suppression() {
         let mut event = EventEnvelope {

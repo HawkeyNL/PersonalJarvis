@@ -5,8 +5,8 @@
 # JSON policy through its normal root:jarvis read-only configuration boundary.
 set -euo pipefail
 
-readonly policy_file=/etc/jarvis/model-policy.json
-readonly policy_dir=/etc/jarvis
+readonly policy_file=/etc/jarvis/model-policy/policy.json
+readonly policy_dir=/etc/jarvis/model-policy
 readonly core_env=/etc/jarvis/core.env
 readonly ollama_cloud_default_base_url=https://ollama.com/v1
 readonly ollama_cloud_tags_url=https://ollama.com/api/tags
@@ -70,34 +70,30 @@ normalize_model_policy_boundary() {
     esac
 }
 
-atomic_write() {
+atomic_write() (
     local content=$1 tmp
     normalize_model_policy_boundary
-    tmp=$(mktemp "$policy_dir/.model-policy.XXXXXX")
-    trap 'rm -f -- "$tmp"' RETURN
+    tmp=$(mktemp "$policy_dir/.model-policy.XXXXXX") || fail "cannot stage model policy"
+    trap 'rm -f -- "$tmp"' EXIT
     umask 077
-    printf '%s\n' "$content" > "$tmp"
-    chown root:jarvis "$tmp"
-    chmod 0640 "$tmp"
-    jq -e '.version == 1 and (.models | type == "array")' "$tmp" >/dev/null
-    mv -f -- "$tmp" "$policy_file"
-    trap - RETURN
-}
+    printf '%s\n' "$content" > "$tmp" &&
+        chown root:jarvis "$tmp" && chmod 0640 "$tmp" &&
+        jq -e '.version == 1 and (.models | type == "array")' "$tmp" >/dev/null &&
+        mv -f -- "$tmp" "$policy_file" || fail "model policy replacement failed"
+)
 
-atomic_write_huggingface_catalog() {
+atomic_write_huggingface_catalog() (
     local content=$1 tmp
-    tmp=$(mktemp "$policy_dir/.huggingface-catalog.XXXXXX")
-    trap 'rm -f -- "$tmp"' RETURN
+    tmp=$(mktemp "/etc/jarvis/.huggingface-catalog.XXXXXX") || fail "cannot stage huggingface catalog"
+    trap 'rm -f -- "$tmp"' EXIT
     umask 077
-    printf '%s\n' "$content" > "$tmp"
+    printf '%s\n' "$content" > "$tmp" || fail "cannot write huggingface catalog"
     [[ $(stat -c %s "$tmp") -le $max_huggingface_catalog_bytes ]] || fail "huggingface catalog exceeds the size limit"
     jq -e '.version == 1 and (.models | type == "array" and length <= 2000)' "$tmp" >/dev/null ||
         fail "huggingface catalog normalization failed"
-    chown root:jarvis "$tmp"
-    chmod 0640 "$tmp"
-    mv -f -- "$tmp" "$huggingface_catalog_file"
-    trap - RETURN
-}
+    chown root:jarvis "$tmp" && chmod 0640 "$tmp" &&
+        mv -f -- "$tmp" "$huggingface_catalog_file" || fail "huggingface catalog replacement failed"
+)
 
 empty_policy() { printf '%s\n' '{"version":1,"models":[]}'; }
 
@@ -152,6 +148,7 @@ configured_models() {
 
 provider_secret_var() {
     case $1 in
+        anthropic-api) printf '%s\n' JARVIS_LLM_API_KEY ;;
         openai-api) printf '%s\n' JARVIS_LLM_OPENAI_API_KEY ;;
         deepseek-api) printf '%s\n' JARVIS_LLM_DEEPSEEK_API_KEY ;;
         xai-api) printf '%s\n' JARVIS_LLM_XAI_API_KEY ;;
@@ -178,7 +175,12 @@ curl_config_escape() {
 }
 
 provider_base_url() {
+    [[ -f $core_env && ! -L $core_env ]] || return 1
+    # Root-owned configuration, never a caller-supplied URL or environment.
+    # shellcheck disable=SC1090,SC1091
+    source "$core_env"
     case $1 in
+        anthropic-api) printf '%s\n' "${JARVIS_LLM_ANTHROPIC_BASE_URL:-https://api.anthropic.com}" ;;
         openai-api) printf '%s\n' "${JARVIS_LLM_OPENAI_BASE_URL:-https://api.openai.com/v1}" ;;
         deepseek-api) printf '%s\n' "${JARVIS_LLM_DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}" ;;
         xai-api) printf '%s\n' "${JARVIS_LLM_XAI_BASE_URL:-https://api.x.ai/v1}" ;;
@@ -196,12 +198,18 @@ parse_remote_model_response() {
     local provider=$1 response=$2 jq_filter
     case $provider in
         ollama-cloud) jq_filter='.models[]?.name?' ;;
-        openai-api|deepseek-api|xai-api|zai-api|huggingface) jq_filter='.data[]?.id?' ;;
+        anthropic-api|openai-api|deepseek-api|xai-api|zai-api|huggingface) jq_filter='.data[]?.id?' ;;
         *) return 1 ;;
     esac
+    # Validate the whole bounded document before jq can emit any partial rows.
+    if [[ $provider == ollama-cloud ]]; then
+        jq -se 'length == 1 and (.[0].models | type == "array" and length <= 2000)' <<<"$response" >/dev/null 2>&1 || return 1
+    else
+        jq -se 'length == 1 and (.[0].data | type == "array" and length <= 2000)' <<<"$response" >/dev/null 2>&1 || return 1
+    fi
     jq -c --arg provider "$provider" \
         "$jq_filter | select(type == \"string\" and length > 0 and length <= 256 and (test(\"[[:cntrl:]]\") | not)) | [\$provider, .]" \
-        <<<"$response" || true
+        <<<"$response"
 }
 
 normalize_huggingface_catalog() {
@@ -264,7 +272,7 @@ merge_model_policy() {
 # ephemeral mode-0600 curl config, never in argv/output/policy. OpenAI-compatible
 # providers expose `data[].id`; Ollama Cloud exposes its native authenticated
 # `/api/tags` metadata as `models[].name` even though chat uses `/v1`.
-discover_remote_models() {
+discover_remote_models() (
     local provider=$1 variable credential_file key escaped_key config response url
     variable=$(provider_secret_var "$provider") || return 0
     credential_file="/etc/jarvis/secrets/${provider%-api}.env"
@@ -273,8 +281,13 @@ discover_remote_models() {
     [[ $(stat -c '%U:%G:%a' "$credential_file" 2>/dev/null || true) == root:jarvis:640 ]] || return 0
     key=$(read_credential_value "$credential_file" "$variable") || return 0
     [[ -n $key ]] || return 0
-    config=$(mktemp /run/jarvis-model-discovery.XXXXXX)
-    trap 'rm -f -- "$config"; unset key escaped_key' RETURN
+    local runtime=/run
+    if [[ -d /run/jarvis-model-catalog && ! -L /run/jarvis-model-catalog &&
+        $(stat -c '%u:%g:%a' /run/jarvis-model-catalog) == 0:0:700 ]]; then
+        runtime=/run/jarvis-model-catalog
+    fi
+    config=$(mktemp "$runtime/jarvis-model-discovery.XXXXXX")
+    trap 'rm -f -- "$config"; unset key escaped_key' EXIT
     umask 077
     if [[ $provider == ollama-cloud ]]; then
         url=$ollama_cloud_tags_url
@@ -283,25 +296,59 @@ discover_remote_models() {
         base=$(provider_base_url "$provider")
         [[ -n $base && $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 0
         url="${base%/}/models"
+        [[ $provider != anthropic-api ]] || url="${base%/}/v1/models?limit=1000"
     fi
     escaped_key=$(curl_config_escape "$key")
     printf 'url = "%s"\nheader = "Authorization: Bearer %s"\n' "$url" "$escaped_key" > "$config"
+    if [[ $provider == anthropic-api ]]; then
+        printf 'url = "%s"\nheader = "x-api-key: %s"\nheader = "anthropic-version: 2023-06-01"\n' "$url" "$escaped_key" > "$config"
+    fi
     unset key escaped_key
     response=$(curl --config "$config" --fail --silent --show-error --max-time 10 --max-filesize "$max_huggingface_catalog_bytes" 2>/dev/null) || {
-        trap - RETURN
         rm -f -- "$config"
         return 0
     }
-    trap - RETURN
     rm -f -- "$config"
     [[ ${#response} -le $max_huggingface_catalog_bytes ]] || return 0
+    # Never silently promote an incomplete paginated catalog.
+    if [[ $provider == anthropic-api ]] && jq -e '.has_more == true' <<<"$response" >/dev/null; then
+        echo "jarvis-models: anthropic-api catalog exceeds one bounded page; previous catalog retained" >&2
+        return 0
+    fi
+    local rows
+    rows=$(parse_remote_model_response "$provider" "$response") || return 1
+    [[ -n $rows ]] || return 0
     if [[ $provider == huggingface ]]; then
         local normalized
         normalized=$(normalize_huggingface_catalog "$response") || return 0
         [[ $(jq '.models | length' <<<"$normalized") -gt 0 ]] || return 0
-        atomic_write_huggingface_catalog "$normalized"
+        atomic_write_huggingface_catalog "$normalized" || return 1
     fi
-    parse_remote_model_response "$provider" "$response"
+    printf '%s\n' "$rows"
+)
+
+credential_configured() {
+    local file="/etc/jarvis/secrets/${1%-api}.env" variable
+    variable=$(provider_secret_var "$1") || return 1
+    [[ -f $file && ! -L $file &&
+        $(stat -c '%U:%G:%a' "$file" 2>/dev/null) == root:jarvis:640 ]] || return 1
+    [[ -n $(read_credential_value "$file" "$variable") ]]
+}
+
+refresh_configured() {
+    local provider failed=0 count=0
+    for provider in anthropic-api openai-api deepseek-api xai-api zai-api ollama-cloud huggingface; do
+        credential_configured "$provider" || continue
+        count=$((count + 1))
+        if (refresh "$provider"); then
+            echo "jarvis-models: $provider metadata refreshed"
+        else
+            echo "jarvis-models: $provider refresh failed; prior model choices retained" >&2
+            failed=1
+        fi
+    done
+    echo "jarvis-models: checked $count configured providers; no models enabled"
+    return "$failed"
 }
 
 refresh() {
@@ -315,9 +362,11 @@ refresh() {
         known=$(jq --arg provider "$provider" '[.[] | select(.[0] == $provider)]' <<<"$known")
     fi
     discovered='[]'
-    for candidate in openai-api deepseek-api xai-api zai-api ollama-cloud huggingface; do
+    for candidate in anthropic-api openai-api deepseek-api xai-api zai-api ollama-cloud huggingface; do
         [[ -z $provider || $provider == "$candidate" ]] || continue
-        discovered=$(discover_remote_models "$candidate" | aggregate_discovered_models 2>/dev/null || printf '[]')
+        if ! discovered=$(discover_remote_models "$candidate" | aggregate_discovered_models 2>/dev/null); then
+            discovered='[]'
+        fi
         if [[ -n $provider && $provider == "$candidate" && $discovered == '[]' ]]; then
             fail "$candidate model discovery returned no models; credential or provider metadata endpoint is unavailable"
         fi
@@ -327,7 +376,8 @@ refresh() {
     # best-effort all-provider refresh failures. New remote entries are disabled.
     # Explicit remote-provider refreshes above fail instead of reporting false success.
     merged=$(merge_model_policy "$old" "$known")
-    atomic_write "$merged"
+    jq -e '.models | length <= 2000' <<<"$merged" >/dev/null || fail "model policy size limit exceeded; previous policy retained"
+    atomic_write "$merged" || fail "model policy replacement failed; previous policy retained"
     echo "jarvis-models: refreshed policy; new remote models remain disabled."
 }
 
@@ -389,6 +439,13 @@ list_models() {
       done
 }
 
+activate_model_policy() {
+    if ! systemctl try-restart jarvis-core.service >/dev/null 2>&1; then
+        systemctl stop jarvis-core.service || fail "Core could not be stopped after policy activation failed; owner recovery required"
+        fail "policy saved but Core activation failed; Core stopped safely; inspect sudo jarvis logs core"
+    fi
+}
+
 set_state() {
     local provider=$1 model=$2 enabled=$3 updated
     valid_provider "$provider" || fail "unknown provider"
@@ -400,8 +457,11 @@ set_state() {
     updated=$(jq --arg provider "$provider" --arg model "$model" --argjson enabled "$enabled" \
         '(.models[] | select(.provider == $provider and .model == $model) | .enabled) = $enabled' "$policy_file")
     atomic_write "$updated"
+    # A failed restart must not leave an old runtime authorization active after
+    # the owner revoked it on disk. Keep the new policy and stop the service;
+    # never silently report successful activation or restore an old grant.
+    activate_model_policy
     echo "jarvis-models: $provider/$model is now $( [[ $enabled == true ]] && echo enabled || echo disabled )."
-    systemctl try-restart jarvis-core.service >/dev/null 2>&1 || true
 }
 
 show_model() {
@@ -417,7 +477,22 @@ main() {
     command -v jq >/dev/null 2>&1 || fail "jq is required"
     command -v curl >/dev/null 2>&1 || fail "curl is required"
 
+    # The root broker locks this same stable directory inode. Locking the JSON
+    # file itself is insufficient because every writer replaces it atomically.
     case ${1:-} in
+        refresh|refresh-configured|enable|disable|set-route)
+            local migration_lock
+            exec {migration_lock}</etc/jarvis
+            flock --exclusive --wait 10 "$migration_lock" || fail "policy migration is in progress"
+            normalize_model_policy_boundary
+            local policy_lock
+            exec {policy_lock}<"$policy_dir"
+            flock --exclusive --wait 10 "$policy_lock" || fail "another model policy change is in progress"
+            ;;
+    esac
+
+    case ${1:-} in
+        refresh-configured) (($# == 1)) || usage; refresh_configured ;;
         refresh) (($# == 1 || $# == 2)) || usage; refresh "${2:-}" ;;
         list) (($# == 1 || $# == 2)) || usage; list_models "${2:-}" ;;
         enable) (($# == 3)) || usage; set_state "$2" "$3" true ;;

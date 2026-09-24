@@ -206,22 +206,18 @@ pub fn privileged_config_approval_message(
     expires_at: OffsetDateTime,
     target_state_hash: &[u8; 32],
 ) -> Result<Vec<u8>, IdentityError> {
-    if action.is_empty() || action.len() > 64 || nonce.len() != 32 || expires_at < issued_at {
-        return Err(IdentityError::AuthFailed);
-    }
-    let mut message = Vec::with_capacity(64 + action.len());
-    message.extend_from_slice(b"jarvis-privileged-config-v1\0");
-    message.extend_from_slice(&(action.len() as u16).to_be_bytes());
-    message.extend_from_slice(action.as_bytes());
-    message.extend_from_slice(payload_hash);
-    message.extend_from_slice(request_id.as_bytes());
-    message.extend_from_slice(nonce);
-    message.extend_from_slice(user_id.as_bytes());
-    message.extend_from_slice(device_id.as_bytes());
-    message.extend_from_slice(&issued_at.unix_timestamp().to_be_bytes());
-    message.extend_from_slice(&expires_at.unix_timestamp().to_be_bytes());
-    message.extend_from_slice(target_state_hash);
-    Ok(message)
+    jarvis_client_core::model_control::approval_message(
+        action,
+        payload_hash,
+        request_id,
+        nonce,
+        user_id,
+        device_id,
+        issued_at,
+        expires_at,
+        target_state_hash,
+    )
+    .map_err(|_| IdentityError::AuthFailed)
 }
 
 /// Canonical, domain-separated bytes for a privileged Codex/OpenSandbox coding

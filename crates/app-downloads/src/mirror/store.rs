@@ -219,14 +219,28 @@ impl Store {
             }
         }
         versions.sort();
-        let mut html = String::from("<!doctype html><html lang=\"nl\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Jarvis downloads</title><body><h1>Jarvis iOS-testbuilds</h1><p>Deze IPA vereist lokale ondertekening door de eigenaar. Geen automatische installatie, Apple-distributiesignature of complete productrelease.</p><ul>");
+        let mut candidates = String::new();
+        if !versions.is_empty() {
+            candidates.push_str("<section><h2>Losse iOS-testbuilds</h2><p>Dit zijn afzonderlijke candidates, geen complete clientrelease.</p><ul>");
+        }
         for version in versions.iter().rev() {
             // Version parsed as numeric SemVer; no untrusted HTML or URL input.
-            html.push_str(&format!("<li><a href=\"/downloads/ios/v{version}/Jarvis_{version}_ios_arm64_unsigned.ipa\">Jarvis {version} — IPA voor zelf ondertekenen</a></li>"));
+            candidates.push_str(&format!("<li><a href=\"/downloads/ios/v{version}/Jarvis_{version}_ios_arm64_unsigned.ipa\">Jarvis {version} — IPA voor zelf ondertekenen</a></li>"));
         }
-        html.push_str("</ul>");
-        html.push_str(&super::release_store::public_links(&self.root, self.owner)?);
-        html.push_str("<p>Updates voor aangemelde clients blijven gescheiden van deze publieke installatiebestanden.</p></body></html>\n");
+        if !versions.is_empty() {
+            candidates.push_str("</ul></section>");
+        }
+        let releases = super::release_store::public_links(&self.root, self.owner)?;
+        let releases = if releases.is_empty() {
+            "<h2>Clientreleases</h2><p>Er is nog geen complete release geïmporteerd. Probeer het later opnieuw.</p>"
+        } else {
+            &releases
+        };
+        // Only validated numeric versions and fixed platform names enter these
+        // fragments; no remote labels, credentials or absolute origins.
+        let html = include_str!("downloads.html")
+            .replace("{{CLIENT_RELEASES}}", releases)
+            .replace("{{IOS_CANDIDATES}}", &candidates);
         let temporary = tempfile::Builder::new()
             .prefix(".index-")
             .tempfile_in(&self.root)
