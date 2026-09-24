@@ -279,6 +279,8 @@ if [[ ${hops:-0} != 0 && ${hops:-0} != 1 ]]; then
 fi
 
 unit_backup=
+unit_transaction_started=false
+install_unit_policy() {
 if [[ $release_has_managed_systemd == true ]]; then
     unit_backup=$(mktemp -d /run/jarvis-systemd-install-rollback.XXXXXXXX)
     chmod 0700 "$unit_backup"
@@ -293,6 +295,7 @@ else
         install -o root -g root -m 0644 "$repo_dir/deploy/systemd/$unit" "/etc/systemd/system/$unit"
     done
 fi
+}
 install -d -o root -g root -m 0755 /usr/local/libexec/jarvis
 if [[ $release_has_managed_systemd == true ]]; then
     install -o root -g root -m 0644 "$release_dir/ui.sh" /usr/local/libexec/jarvis/ui.sh
@@ -368,18 +371,36 @@ activate_release() {
 restore_previous_release() {
     ui_warning "Restoring previous release and managed unit policy"
     if [[ -n $previous_release ]]; then
-        activate_release "$previous_release"
+        activate_release "$previous_release" || return 1
     else
-        rm -f -- /opt/jarvis/current
+        rm -f -- /opt/jarvis/current || return 1
     fi
     if [[ $release_has_managed_systemd == true && -n $unit_backup ]]; then
-        "$release_dir/manage-systemd-units" restore "$release_dir" "$unit_backup"
-        systemctl daemon-reload
+        "$release_dir/manage-systemd-units" restore "$release_dir" "$unit_backup" || return 1
+        systemctl daemon-reload || return 1
     fi
-    systemctl try-restart jarvis-config-broker.service >/dev/null 2>&1 || true
-    systemctl try-restart jarvis-core.service >/dev/null 2>&1 || true
+    if [[ -n $previous_release ]]; then
+        systemctl start jarvis-config-broker.service || return 1
+        systemctl start jarvis-core.service || return 1
+        curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+            --retry 11 --retry-delay 5 --retry-connrefused http://127.0.0.1:8080/readyz >/dev/null || return 1
+    fi
+    unit_transaction_started=false
 }
 
+installer_exit() {
+    local status=$?
+    trap - EXIT
+    if [[ $status != 0 && $unit_transaction_started == true ]]; then
+        if ! restore_previous_release; then
+            echo "CRITICAL: installation recovery failed; preserve $unit_backup for owner recovery" >&2
+        fi
+    fi
+    exit "$status"
+}
+trap installer_exit EXIT
+install_unit_policy
+unit_transaction_started=true
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/jarvis-core.service
 systemd-analyze verify /etc/systemd/system/jarvis-config-broker.service
@@ -394,11 +415,7 @@ systemd-analyze verify /etc/systemd/system/jarvis-private-agent-updater.timer
 ui_detail "Starting SurrealDB and Jarvis Core …"
 if ! systemctl enable --now jarvis-surrealdb.service; then
     ui_error "SurrealDB could not start; active release was not changed"
-    if [[ $release_has_managed_systemd == true && -n $unit_backup ]]; then
-        "$release_dir/manage-systemd-units" restore "$release_dir" "$unit_backup"
-        systemctl daemon-reload
-        rm -rf -- "$unit_backup"
-    fi
+    restore_previous_release
     exit 1
 fi
 
@@ -443,7 +460,9 @@ ui_success "/livez ready"
 ui_success "/readyz ready"
 if [[ $release_has_managed_systemd == true ]]; then
     "$release_dir/manage-systemd-units" check-installed "$release_dir"
+    unit_transaction_started=false
     rm -rf -- "$unit_backup"
 fi
+unit_transaction_started=false
 [[ ${JARVIS_VERBOSE:-0} == 1 ]] && systemctl --no-pager --full status jarvis-core
 ui_detail "Jarvis Core is running from $release_dir"

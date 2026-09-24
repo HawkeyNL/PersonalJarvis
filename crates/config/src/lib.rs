@@ -135,7 +135,10 @@ pub struct AppConfig {
     /// Root-owned JSON allowlist of exact provider/model pairs.  A credential
     /// alone never enables a remote model.  Missing/empty policy therefore
     /// leaves remote providers safely unavailable.
-    #[serde(default = "default_llm_model_policy_path")]
+    #[serde(
+        default = "default_llm_model_policy_path",
+        deserialize_with = "model_policy_path"
+    )]
     pub llm_model_policy_path: String,
 
     /// Root-owned, versioned provider pricing metadata. It is not a secret;
@@ -412,7 +415,20 @@ fn default_ollama_model() -> String {
 }
 
 fn default_llm_model_policy_path() -> String {
-    "/etc/jarvis/model-policy.json".to_string()
+    "/etc/jarvis/model-policy/policy.json".to_string()
+}
+
+fn model_policy_path<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let path = String::deserialize(deserializer)?;
+    // Older core.env files explicitly set the former default. Keep that
+    // spelling as a configuration alias, never as a stale-file fallback.
+    Ok(if path == "/etc/jarvis/model-policy.json" {
+        default_llm_model_policy_path()
+    } else {
+        path
+    })
 }
 
 fn default_llm_pricing_registry_path() -> String {
@@ -768,6 +784,25 @@ impl fmt::Debug for AppConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_policy_setting_maps_to_directory_without_file_fallback() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            #[serde(
+                default = "super::default_llm_model_policy_path",
+                deserialize_with = "super::model_policy_path"
+            )]
+            path: String,
+        }
+        let legacy: Fixture =
+            serde_json::from_str(r#"{"path":"/etc/jarvis/model-policy.json"}"#).unwrap();
+        let default: Fixture = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.path, "/etc/jarvis/model-policy/policy.json");
+        assert_eq!(legacy.path, default.path);
+        let custom: Fixture =
+            serde_json::from_str(r#"{"path":"/tmp/fixture-policy.json"}"#).unwrap();
+        assert_eq!(custom.path, "/tmp/fixture-policy.json");
+    }
     use super::*;
 
     #[test]

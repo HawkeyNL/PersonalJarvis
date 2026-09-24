@@ -42,6 +42,7 @@ pub(crate) async fn system_brain(authed: Authed, State(state): State<AppState>) 
     let preference = brain_preference(&state.db, authed.user.id).await;
     let enabled: Vec<Value> = state
         .model_policy
+        .snapshot()
         .models
         .iter()
         .filter(|entry| entry.enabled)
@@ -166,9 +167,53 @@ pub(crate) async fn system_privileged_config(
             Json(json!({"error":"privileged configuration unavailable"})),
         ));
     };
+    let _mutation = state.model_control.mutation.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"error":"another model change is in progress"})),
+        )
+    })?;
+    let (expected, hash) = state
+        .model_control
+        .read()
+        .map_err(|_| model_activation_error())?;
+    let jarvis_privileged::Operation::ModelSetEnabled {
+        provider,
+        model,
+        enabled,
+        expected_policy_sha256,
+    } = &request.operation;
+    if *enabled && !state.model_control.can_enable(provider, model) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(
+                json!({"error":"selected Hugging Face route is unavailable; refresh the trusted catalog and restart Core"}),
+            ),
+        ));
+    }
+    if hash != *expected_policy_sha256 || expected != state.model_policy.snapshot() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error":"model policy changed; refresh before approving"})),
+        ));
+    }
     let result = forward_to_broker(socket, &request).await;
     match result {
         Ok(()) => {
+            let activated = state
+                .model_control
+                .read()
+                .map_err(|_| ())
+                .and_then(|(verified, _)| {
+                    state
+                        .model_policy
+                        .activate_verified_toggle(&expected, verified, provider, model, *enabled)
+                        .map_err(|_| ())
+                });
+            if activated.is_err() {
+                state.model_policy.suspend();
+                return Err(model_activation_error());
+            }
             record_security_event(
                 &state,
                 Some(authed.device.id),
@@ -177,9 +222,19 @@ pub(crate) async fn system_privileged_config(
                 Some(request.operation.action()),
             )
             .await;
-            Ok(Json(json!({"status":"accepted","restart_required":true})))
+            Ok(Json(json!({"status":"active","restart_required":false})))
         }
         Err(()) => {
+            // A lost reply is not proof that the broker did not commit. Never
+            // keep an old grant live when protected readback is inconclusive.
+            if !state
+                .model_control
+                .read()
+                .is_ok_and(|(policy, _)| policy == expected)
+            {
+                state.model_policy.suspend();
+                return Err(model_activation_error());
+            }
             record_security_event(
                 &state,
                 Some(authed.device.id),
@@ -196,11 +251,20 @@ pub(crate) async fn system_privileged_config(
     }
 }
 
+fn model_activation_error() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(
+            json!({"error":"model activation could not be verified; owner must verify policy and restart Core"}),
+        ),
+    )
+}
+
 async fn forward_to_broker(
     socket: &str,
     request: &jarvis_privileged::SignedRequest,
 ) -> Result<(), ()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::net::UnixStream::connect(socket),
@@ -208,6 +272,11 @@ async fn forward_to_broker(
     .await
     .map_err(|_| ())?
     .map_err(|_| ())?;
+    // The socket path alone is not authority. Verify the kernel-reported
+    // root peer before sending even an action-bound approval to the broker.
+    if stream.peer_cred().map_err(|_| ())?.uid() != 0 {
+        return Err(());
+    }
     let (read, mut write) = stream.into_split();
     let encoded = serde_json::to_vec(&json!({"request": request})).map_err(|_| ())?;
     if encoded.len() > 16 * 1024 {
@@ -218,12 +287,12 @@ async fn forward_to_broker(
     let mut reply = String::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        BufReader::new(read).read_line(&mut reply),
+        BufReader::new(read.take(1025)).read_line(&mut reply),
     )
     .await
     .map_err(|_| ())?
     .map_err(|_| ())?;
-    (reply.trim() == r#"{"status":"applied"}"#)
+    (reply.len() <= 1024 && reply.trim() == r#"{"status":"applied"}"#)
         .then_some(())
         .ok_or(())
 }
@@ -354,13 +423,24 @@ pub(crate) async fn system_registry_refresh(
 /// is intentionally root-operated for now; a bearer session alone must not
 /// rewrite Home Node policy or activate paid models.
 pub(crate) async fn system_model_policy(
-    _authed: Authed,
+    authed: Authed,
     State(state): State<AppState>,
 ) -> Json<Value> {
+    let policy = state.model_policy.snapshot();
+    let verified = state
+        .model_control
+        .read()
+        .ok()
+        .filter(|(disk, _)| *disk == policy);
+    let mutable = verified.is_some() && state.privileged_broker_socket.is_some();
     Json(json!({
-        "version": state.model_policy.version,
-        "models": state.model_policy.models,
-        "mutation": "root-operated: sudo jarvis-models enable|disable",
+        "version": policy.version,
+        "models": policy.models,
+        "mutation": if mutable { "device-signed-model-toggle-v1" } else { "unavailable" },
+        "policy_sha256": verified.map(|(_, hash)| hash),
+        "user_id": authed.user.id,
+        "device_id": authed.device.id,
+        "server_time": time::OffsetDateTime::now_utc().unix_timestamp(),
     }))
 }
 
@@ -567,5 +647,53 @@ fn yesno(b: bool) -> &'static str {
         "ja"
     } else {
         "nee"
+    }
+}
+
+#[cfg(test)]
+mod model_broker_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn unprivileged_socket_cannot_receive_a_signed_approval() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // The ordinary CI suite runs unprivileged.
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let socket = fixture.path().join("fake-broker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let captured = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                peer.read_to_end(&mut bytes),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            bytes
+        });
+        let now = time::OffsetDateTime::now_utc();
+        let request = jarvis_privileged::SignedRequest {
+            request_id: uuid::Uuid::new_v4(),
+            nonce_hex: "11".repeat(32),
+            user_id: uuid::Uuid::new_v4(),
+            device_id: uuid::Uuid::new_v4(),
+            issued_at: now,
+            expires_at: now + time::Duration::seconds(60),
+            operation: jarvis_privileged::Operation::ModelSetEnabled {
+                provider: "openai-api".into(),
+                model: "fixture".into(),
+                enabled: true,
+                expected_policy_sha256: "22".repeat(32),
+            },
+            signature_hex: "33".repeat(64),
+        };
+        assert!(forward_to_broker(socket.to_str().unwrap(), &request)
+            .await
+            .is_err());
+        assert!(captured.await.unwrap().is_empty());
     }
 }

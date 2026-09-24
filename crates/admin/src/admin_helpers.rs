@@ -276,6 +276,40 @@ pub(super) fn resolve_admin_helper(
     Ok(path)
 }
 
+pub(super) fn resolve_model_policy_path(
+    current: &Path,
+    releases: &Path,
+    legacy_sbin: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<PathBuf> {
+    // Reuse the canonical active-release trust boundary. In particular an RC
+    // CLI must not assume its own layout is already active on the Home Node.
+    let helper = resolve_admin_helper(
+        current,
+        releases,
+        legacy_sbin,
+        AdminHelper::Models,
+        expected_uid,
+        expected_gid,
+    )?;
+    let directory = helper.parent().context("model helper has no parent")?;
+    if directory == legacy_sbin {
+        return Ok(PathBuf::from("/etc/jarvis/model-policy.json"));
+    }
+    // This immutable release manifest was ownership/size/link checked above;
+    // use the resolved helper's parent, not the potentially switched current link.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("release.json"))?)?;
+    match manifest.pointer("/tooling/model_policy_directory") {
+        None => Ok(PathBuf::from("/etc/jarvis/model-policy.json")),
+        Some(value) if value.as_u64() == Some(1) => {
+            Ok(PathBuf::from("/etc/jarvis/model-policy/policy.json"))
+        }
+        Some(_) => bail!("unsupported active model-policy layout capability"),
+    }
+}
+
 fn validate_owned_path(
     path: &Path,
     expected_uid: u32,

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 bash scripts/release/tests/test-build-linux-package.sh
+bash deploy/systemd/tests/test-model-policy-activation.sh
 sudo bash deploy/systemd/tests/test-device-policy-release.sh
 sudo bash deploy/systemd/tests/test-schema-backup.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-schema-backup-surreal.sh

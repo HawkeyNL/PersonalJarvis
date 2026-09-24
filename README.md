@@ -27,3 +27,16 @@ For a provisioned Home Node, the canonical root-operated owner interface is
 [`sudo jarvis ...`](docs/JARVIS_ADMIN_CLI.md). It wraps the existing verified
 release updater, model policy, credential manager, private-agent updater, and
 bounded diagnostics without giving those privileges to Jarvis Core.
+
+Client model controls use a fresh native OS authentication prompt and a
+device-signed, short-lived approval bound to the exact model, requested state,
+and policy revision. Core reports success only after protected disk readback
+and live router activation agree. A credential or ordinary session alone does
+not authorize a model change.
+
+Releases declaring `tooling.model_policy_directory: 1` include the native
+policy-layout migration helper and matching broker unit. Normal activation
+migrates the policy; rollback to a legacy release exports the current owner
+choices rather than restoring stale model grants. Repeated installation does
+not reimport the legacy copy. An ambiguous/interrupted layout fails closed and
+requires owner recovery instead of guessing which copy is authoritative.

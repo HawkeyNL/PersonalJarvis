@@ -12,7 +12,7 @@ pub mod local_devices;
 pub const ACTION_MODEL_SET_ENABLED: &str = "model.set_enabled";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     /// Change the enabled state of an already-discovered exact model pair.
     /// `expected_policy_sha256` prevents a signature for one policy version
@@ -47,10 +47,11 @@ impl Operation {
                         | "zai-api"
                         | "ollama"
                         | "ollama-cloud"
+                        | "huggingface"
                         | "claude-cli"
                 ) || model.is_empty()
                     || model.len() > 256
-                    || model.contains(['\n', '\r', '\0'])
+                    || model.chars().any(char::is_control)
                     || expected_policy_sha256.len() != 64
                     || hex::decode(expected_policy_sha256).is_err()
                 {
@@ -71,6 +72,7 @@ impl Operation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignedRequest {
     pub request_id: Uuid,
     pub nonce_hex: String,
@@ -133,7 +135,7 @@ impl SignedRequest {
     }
 
     pub fn reject_if_expired(&self, now: OffsetDateTime) -> Result<(), ProtocolError> {
-        if now > self.expires_at || now < self.issued_at - time::Duration::seconds(30) {
+        if now >= self.expires_at || now < self.issued_at - time::Duration::seconds(30) {
             Err(ProtocolError::Expired)
         } else {
             Ok(())
@@ -163,6 +165,41 @@ mod tests {
             },
             signature_hex: hex::encode([0_u8; 64]),
         }
+    }
+    #[test]
+    fn native_model_approval_matches_broker_bytes_and_request_shape() {
+        let approval = jarvis_client_core::model_control::ModelToggleApproval {
+            request_id: Uuid::from_bytes([1; 16]),
+            nonce_hex: "02".repeat(32),
+            user_id: Uuid::from_bytes([3; 16]),
+            device_id: Uuid::from_bytes([4; 16]),
+            issued_at: 1,
+            expires_at: 121,
+            provider: "huggingface".into(),
+            model: "org/fixture".into(),
+            enabled: true,
+            expected_policy_sha256: "05".repeat(32),
+        };
+        let key = SigningKey::from_bytes(&[6; 32]);
+        let signature = hex::encode(key.sign(&approval.message().unwrap()).to_bytes());
+        let wire = approval.signed_request(&signature).unwrap();
+        let request: SignedRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(request.message().unwrap(), approval.message().unwrap());
+        assert!(jarvis_identity::verify_signature(
+            key.verifying_key().as_bytes(),
+            &request.message().unwrap(),
+            &hex::decode(signature).unwrap()
+        )
+        .is_ok());
+        let mut changed = approval.clone();
+        changed.enabled = false;
+        assert_ne!(changed.message().unwrap(), approval.message().unwrap());
+        changed = approval.clone();
+        changed.expected_policy_sha256 = "07".repeat(32);
+        assert_ne!(changed.message().unwrap(), approval.message().unwrap());
+        changed = approval;
+        changed.provider = "shell".into();
+        assert!(changed.message().is_err());
     }
     #[test]
     fn signed_message_rejects_arbitrary_path_and_command_shapes() {
@@ -206,5 +243,46 @@ mod tests {
         let mut req = request();
         req.expires_at = req.issued_at - time::Duration::seconds(1);
         assert!(req.message().is_err());
+    }
+
+    #[test]
+    fn discovered_huggingface_identity_is_supported_without_changing_route() {
+        let mut req = request();
+        let Operation::ModelSetEnabled {
+            provider, model, ..
+        } = &mut req.operation;
+        *provider = "huggingface".into();
+        *model = "fixture-org/fixture-model".into();
+        assert!(req.message().is_ok());
+        // Discovery and exact policy membership are still enforced by the broker.
+    }
+
+    #[test]
+    fn approval_expires_at_deadline_not_after_it() {
+        let req = request();
+        assert_eq!(
+            req.reject_if_expired(req.expires_at),
+            Err(ProtocolError::Expired)
+        );
+        assert!(req
+            .reject_if_expired(req.expires_at - time::Duration::nanoseconds(1))
+            .is_ok());
+    }
+
+    #[test]
+    fn unknown_fields_and_control_characters_are_rejected() {
+        let req = request();
+        let mut value = serde_json::to_value(&req).unwrap();
+        value["approved"] = true.into();
+        assert!(serde_json::from_value::<SignedRequest>(value).is_err());
+        let mut value = serde_json::to_value(&req).unwrap();
+        value["operation"]["shell"] = "ignored-command".into();
+        assert!(serde_json::from_value::<SignedRequest>(value).is_err());
+        for control in ['\t', '\u{001b}', '\u{007f}'] {
+            let mut req = request();
+            let Operation::ModelSetEnabled { model, .. } = &mut req.operation;
+            *model = format!("fixture{control}model");
+            assert_eq!(req.message(), Err(ProtocolError::InvalidOperation));
+        }
     }
 }

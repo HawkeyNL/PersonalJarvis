@@ -5,8 +5,8 @@
 # JSON policy through its normal root:jarvis read-only configuration boundary.
 set -euo pipefail
 
-readonly policy_file=/etc/jarvis/model-policy.json
-readonly policy_dir=/etc/jarvis
+readonly policy_file=/etc/jarvis/model-policy/policy.json
+readonly policy_dir=/etc/jarvis/model-policy
 readonly core_env=/etc/jarvis/core.env
 readonly ollama_cloud_default_base_url=https://ollama.com/v1
 readonly ollama_cloud_tags_url=https://ollama.com/api/tags
@@ -86,7 +86,7 @@ atomic_write() {
 
 atomic_write_huggingface_catalog() {
     local content=$1 tmp
-    tmp=$(mktemp "$policy_dir/.huggingface-catalog.XXXXXX")
+    tmp=$(mktemp "/etc/jarvis/.huggingface-catalog.XXXXXX")
     trap 'rm -f -- "$tmp"' RETURN
     umask 077
     printf '%s\n' "$content" > "$tmp"
@@ -389,6 +389,13 @@ list_models() {
       done
 }
 
+activate_model_policy() {
+    if ! systemctl try-restart jarvis-core.service >/dev/null 2>&1; then
+        systemctl stop jarvis-core.service || fail "Core could not be stopped after policy activation failed; owner recovery required"
+        fail "policy saved but Core activation failed; Core stopped safely; inspect sudo jarvis logs core"
+    fi
+}
+
 set_state() {
     local provider=$1 model=$2 enabled=$3 updated
     valid_provider "$provider" || fail "unknown provider"
@@ -400,8 +407,11 @@ set_state() {
     updated=$(jq --arg provider "$provider" --arg model "$model" --argjson enabled "$enabled" \
         '(.models[] | select(.provider == $provider and .model == $model) | .enabled) = $enabled' "$policy_file")
     atomic_write "$updated"
+    # A failed restart must not leave an old runtime authorization active after
+    # the owner revoked it on disk. Keep the new policy and stop the service;
+    # never silently report successful activation or restore an old grant.
+    activate_model_policy
     echo "jarvis-models: $provider/$model is now $( [[ $enabled == true ]] && echo enabled || echo disabled )."
-    systemctl try-restart jarvis-core.service >/dev/null 2>&1 || true
 }
 
 show_model() {
@@ -416,6 +426,20 @@ main() {
     [[ ${EUID} -eq 0 ]] || fail "must run as root"
     command -v jq >/dev/null 2>&1 || fail "jq is required"
     command -v curl >/dev/null 2>&1 || fail "curl is required"
+
+    # The root broker locks this same stable directory inode. Locking the JSON
+    # file itself is insufficient because every writer replaces it atomically.
+    case ${1:-} in
+        refresh|enable|disable|set-route)
+            local migration_lock
+            exec {migration_lock}</etc/jarvis
+            flock --exclusive --wait 10 "$migration_lock" || fail "policy migration is in progress"
+            normalize_model_policy_boundary
+            local policy_lock
+            exec {policy_lock}<"$policy_dir"
+            flock --exclusive --wait 10 "$policy_lock" || fail "another model policy change is in progress"
+            ;;
+    esac
 
     case ${1:-} in
         refresh) (($# == 1 || $# == 2)) || usage; refresh "${2:-}" ;;

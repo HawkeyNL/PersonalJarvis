@@ -27,9 +27,10 @@ ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 # RuntimeDirectory=/StateDirectory= make these two narrowly scoped trees
-# writable even with ProtectSystem=strict; only the policy file needs an
-# explicit host exception.
-ReadWritePaths=/etc/jarvis/model-policy.json
+# writable even with ProtectSystem=strict. Atomic policy replacement requires
+# sibling staging and rename in this separate, root-owned directory; no access
+# to the protected parent directory or Core environment is granted.
+ReadWritePaths=/etc/jarvis/model-policy
 
 [Install]
 WantedBy=multi-user.target

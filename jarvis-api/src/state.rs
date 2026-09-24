@@ -172,9 +172,9 @@ pub struct AppState {
     pub registry: Arc<RwLock<registry::Registry>>,
     /// Inputs to re-collect the registry on refresh.
     pub registry_input: Arc<registry::CollectInput>,
-    /// Immutable snapshot loaded from the root-owned allowlist at startup.
-    /// Changes are activated by the root-operated command/restart flow.
-    pub model_policy: Arc<llm::ModelAccessPolicy>,
+    /// Shared by API checks and the router; activation follows broker verification.
+    pub model_policy: Arc<llm::LiveModelPolicy>,
+    pub model_control: Arc<crate::model_control::ModelControl>,
     /// Root-owned/versioned provider pricing. Missing or malformed deployment
     /// input is replaced with conservative built-in pricing at startup.
     pub pricing_registry: Arc<jarvis_usage::PricingRegistry>,

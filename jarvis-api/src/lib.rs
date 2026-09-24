@@ -31,6 +31,7 @@ mod extract;
 pub mod local_devices;
 mod mcp;
 mod metering;
+pub mod model_control;
 mod rate_limit;
 pub mod realtime;
 mod routes;

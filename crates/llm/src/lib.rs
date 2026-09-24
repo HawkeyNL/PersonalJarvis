@@ -10,6 +10,7 @@ mod claude_cli;
 mod fallback;
 mod huggingface;
 mod huggingface_catalog;
+mod live_policy;
 mod model_policy;
 mod ollama;
 mod openai_compat;
@@ -26,6 +27,7 @@ pub use claude_cli::ClaudeCliProvider;
 pub use fallback::FallbackProvider;
 pub use huggingface::{hf_routed_model, HuggingFaceProvider, HuggingFaceRoute};
 pub use huggingface_catalog::{HuggingFaceCatalog, HuggingFaceModel, HuggingFaceProviderMetadata};
+pub use live_policy::LiveModelPolicy;
 pub use model_policy::{validate_hf_route, ModelAccessEntry, ModelAccessPolicy};
 pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
@@ -296,6 +298,20 @@ pub fn build_router_with_policy(
     catalog: Vec<router::CatalogModel>,
     model_policy: ModelAccessPolicy,
 ) -> Arc<dyn LlmProvider> {
+    build_router_with_live_policy(
+        cfg,
+        availability,
+        catalog,
+        Arc::new(LiveModelPolicy::new(model_policy)),
+    )
+}
+
+pub fn build_router_with_live_policy(
+    cfg: ProviderConfig,
+    availability: Arc<dyn Availability>,
+    catalog: Vec<router::CatalogModel>,
+    model_policy: Arc<LiveModelPolicy>,
+) -> Arc<dyn LlmProvider> {
     let mut candidates = Vec::new();
     if let Some(ollama) = build_ollama(&cfg) {
         candidates.push(router::Candidate {
@@ -345,7 +361,7 @@ pub fn build_router_with_policy(
             provider: ollama_cloud,
         });
     }
-    if let Some(huggingface) = build_huggingface(&cfg.huggingface, &model_policy) {
+    if let Some(huggingface) = build_huggingface(&cfg.huggingface, &model_policy.snapshot()) {
         candidates.push(router::Candidate {
             id: "huggingface".into(),
             provider: huggingface,
@@ -354,7 +370,7 @@ pub fn build_router_with_policy(
     if candidates.is_empty() {
         return Arc::new(Unconfigured);
     }
-    Arc::new(RouterProvider::with_policy(
+    Arc::new(RouterProvider::with_live_policy(
         candidates,
         availability,
         catalog,

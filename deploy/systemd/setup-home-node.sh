@@ -74,7 +74,9 @@ fi
 ui_step "[4/7] Protected configuration"
 ui_run "Protected persona installed" bash /usr/local/libexec/jarvis/install-private-config --source "$private_agents"
 ui_run "Private agent bundle activated" env JARVIS_AGENT_BUNDLE_VALIDATOR="/opt/jarvis/releases/$release_tag/jarvis-agent-bundle" bash /usr/local/libexec/jarvis/install-agent-bundle --source "$private_agents"
-if [[ ! -e /etc/jarvis/model-policy.json ]]; then
+if jq -e '.tooling.model_policy_directory == 1' "/opt/jarvis/releases/$release_tag/release.json" >/dev/null; then
+    ui_warning "Model policy storage is initialized/migrated by the verified release installer; remote models remain owner-controlled"
+elif [[ ! -e /etc/jarvis/model-policy.json ]]; then
     ui_run "Owner model policy initialized (remote models disabled)" /usr/local/sbin/jarvis-models refresh
 else
     ui_warning "Owner model policy unchanged; use sudo jarvis models refresh to discover configured models"
