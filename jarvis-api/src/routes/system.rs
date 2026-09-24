@@ -426,16 +426,29 @@ pub(crate) async fn system_model_policy(
     authed: Authed,
     State(state): State<AppState>,
 ) -> Json<Value> {
+    // Serialize discovery reconciliation with signed mutations. Reading the
+    // catalog cannot grant access: only disabled additions/metadata are allowed.
+    let _guard = state.model_control.mutation.lock().await;
+    let disk = state.model_control.read();
+    if let Ok((stored, _)) = &disk {
+        let _ = state.model_policy.refresh_discovery(stored.clone());
+    }
     let policy = state.model_policy.snapshot();
-    let verified = state
-        .model_control
-        .read()
-        .ok()
-        .filter(|(disk, _)| *disk == policy);
+    let unavailable_reason = if state.privileged_broker_socket.is_none() {
+        Some("broker_unavailable")
+    } else {
+        match &disk {
+            Err(_) => Some("policy_unavailable"),
+            Ok((stored, _)) if *stored != policy => Some("policy_reload_required"),
+            Ok(_) => None,
+        }
+    };
+    let verified = disk.ok().filter(|(disk, _)| *disk == policy);
     let mutable = verified.is_some() && state.privileged_broker_socket.is_some();
     Json(json!({
         "version": policy.version,
-        "models": policy.models,
+        "models": crate::model_control::priced_models(&policy, &state.pricing_registry),
+        "mutation_unavailable_reason": unavailable_reason,
         "mutation": if mutable { "device-signed-model-toggle-v1" } else { "unavailable" },
         "policy_sha256": verified.map(|(_, hash)| hash),
         "user_id": authed.user.id,
