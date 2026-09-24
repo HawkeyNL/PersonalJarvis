@@ -141,6 +141,7 @@ export interface LogRecord {
   level: string;
   message: string;
   target: string | null;
+  source_ip: string | null;
   details: [string, string][];
 }
 export interface LogResponse { unit: string; records: LogRecord[] }
