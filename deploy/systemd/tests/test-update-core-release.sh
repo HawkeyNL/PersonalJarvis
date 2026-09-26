@@ -51,7 +51,32 @@ cat > "$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "$JARVIS_UPDATER_FIXTURE/systemctl.log"
-if [[ ${JARVIS_MIGRATION_FIXTURE:-false} == true && ${1:-} == restart && ${2:-} == jarvis-core.service && ! -e $JARVIS_UPDATER_FIXTURE/migrated-once ]]; then
+if [[ ${JARVIS_LAYA_STATE_FIXTURE:-false} == true ]]; then
+    unit=${3:-}
+    [[ $unit == jarvis-laya.* ]] || unit=${2:-}
+    if [[ $unit == jarvis-laya.socket || $unit == jarvis-laya.service ]]; then
+        state="$JARVIS_UPDATER_FIXTURE/$unit"
+        case ${1:-} in
+            is-active) [[ -e $state.active ]]; exit ;;
+            is-enabled) [[ -e $state.enabled ]]; exit ;;
+            stop)
+                rm -f -- "$state.active"
+                [[ $unit != jarvis-laya.socket ]] || rm -f -- "$JARVIS_UPDATER_FIXTURE/jarvis-laya.service.active"
+                exit 0 ;;
+            restart)
+                # Requires=socket means a socket restart can stop a warm service.
+                [[ $unit != jarvis-laya.socket ]] || rm -f -- "$JARVIS_UPDATER_FIXTURE/jarvis-laya.service.active"
+                touch "$state.active"
+                [[ $unit != jarvis-laya.service ]] || touch "$JARVIS_UPDATER_FIXTURE/jarvis-laya.socket.active"
+                exit 0 ;;
+            start)
+                touch "$state.active"
+                [[ $unit != jarvis-laya.service ]] || touch "$JARVIS_UPDATER_FIXTURE/jarvis-laya.socket.active"
+                exit 0 ;;
+        esac
+    fi
+fi
+if [[ ${JARVIS_MIGRATION_FIXTURE:-false} == true && ( ${1:-} == restart || ${1:-} == start ) && ${2:-} == jarvis-core.service && ! -e $JARVIS_UPDATER_FIXTURE/migrated-once ]]; then
     printf 'candidate database\n' > "$JARVIS_SCHEMA_FIXTURE_ROOT/surrealdb/CURRENT"
     touch "$JARVIS_UPDATER_FIXTURE/migrated-once"
 fi
@@ -88,6 +113,9 @@ done
 [[ -n $url ]] || { echo "curl invocation lacks a URL" >&2; exit 1; }
 
 case "$url" in
+    http://jarvis-laya.local/health)
+        printf '{"status":"ok","loaded":["english","multilingual"]}\n'
+        ;;
     */releases/latest|*/releases/tags/*)
         cat "$JARVIS_UPDATER_FIXTURE/metadata.json"
         ;;
@@ -122,6 +150,7 @@ write_release() {
     local app_version=${6:-${tag#v}}
     local admin_helpers=${7:-true}
     local systemd_units=${8:-$admin_helpers}
+    local laya_runtime=${9:-false}
     mkdir -p "$root/jarvis-core-$tag"
     chmod 0755 "$root/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
@@ -179,6 +208,15 @@ write_release() {
             chmod 0644 "$root/jarvis-core-$tag/systemd-$unit"
         done
     fi
+    if [[ $laya_runtime == true ]]; then
+        cp "$repo_dir/deploy/systemd/laya-offline.py" "$root/jarvis-core-$tag/laya-offline.py"
+        cp "$repo_dir/deploy/systemd/provision-laya.sh" "$root/jarvis-core-$tag/provision-laya"
+        cp "$repo_dir/deploy/systemd/jarvis-laya.service" "$root/jarvis-core-$tag/systemd-jarvis-laya.service"
+        cp "$repo_dir/deploy/systemd/jarvis-laya.socket" "$root/jarvis-core-$tag/systemd-jarvis-laya.socket"
+        chmod 0644 "$root/jarvis-core-$tag/laya-offline.py" "$root/jarvis-core-$tag/systemd-jarvis-laya.service" \
+            "$root/jarvis-core-$tag/systemd-jarvis-laya.socket"
+        chmod 0755 "$root/jarvis-core-$tag/provision-laya"
+    fi
     jq -n \
         --arg tag "$tag" \
         --arg schema_sha256 "$schema_sha256" \
@@ -187,7 +225,8 @@ write_release() {
         --arg app_version "$app_version" \
         --argjson admin_helpers "$admin_helpers" \
         --argjson systemd_units "$systemd_units" \
-        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}, tooling: ({private_agents: 1} + if $admin_helpers then {admin_helpers: 1} else {} end + if $systemd_units then {systemd_units: 1} else {} end)}' \
+        --argjson laya_runtime "$laya_runtime" \
+        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}, tooling: ({private_agents: 1} + if $admin_helpers then {admin_helpers: 1} else {} end + if $systemd_units then {systemd_units: 1} else {} end + if $laya_runtime then {laya_runtime: 1} else {} end)}' \
         > "$root/jarvis-core-$tag/release.json"
     chmod 0644 "$root/jarvis-core-$tag/release.json"
     local -a checksummed=(
@@ -208,6 +247,9 @@ write_release() {
             checksummed+=("systemd-$unit")
         done
     fi
+    if [[ $laya_runtime == true ]]; then
+        checksummed+=(laya-offline.py provision-laya systemd-jarvis-laya.service systemd-jarvis-laya.socket)
+    fi
     (
         cd "$root/jarvis-core-$tag"
         sha256sum "${checksummed[@]}" > artifact-binaries.sha256
@@ -222,16 +264,20 @@ seed_active_release() {
     local tag=$1
     local schema_sha256=$2
     local admin_helpers=${3:-true}
+    local laya_runtime=${4:-false}
     rm -rf -- /opt/jarvis
     install -d -o root -g root -m 0755 /opt/jarvis/releases
     write_release /opt/jarvis/releases "$tag" "$schema_sha256" \
-        "${tag#v}" "${tag#v}" "${tag#v}" "$admin_helpers" "$admin_helpers"
+        "${tag#v}" "${tag#v}" "${tag#v}" "$admin_helpers" "$admin_helpers" "$laya_runtime"
     mv "/opt/jarvis/releases/jarvis-core-$tag" "/opt/jarvis/releases/$tag"
     ln -s "/opt/jarvis/releases/$tag" /opt/jarvis/current
-    rm -f -- "$systemd_fixture"/jarvis-*.service "$systemd_fixture"/jarvis-*.timer
+    rm -f -- "$systemd_fixture"/jarvis-*.service "$systemd_fixture"/jarvis-*.timer "$systemd_fixture"/jarvis-*.socket
     if [[ $admin_helpers == true ]]; then
         cp /opt/jarvis/releases/$tag/systemd-*.service \
             /opt/jarvis/releases/$tag/systemd-*.timer "$systemd_fixture/"
+        if [[ $laya_runtime == true ]]; then
+            cp /opt/jarvis/releases/$tag/systemd-*.socket "$systemd_fixture/"
+        fi
         for installed in "$systemd_fixture"/systemd-*; do
             mv "$installed" "$systemd_fixture/${installed##*/systemd-}"
         done
@@ -269,12 +315,13 @@ prepare_candidate() {
     local app_version=${5:-${tag#v}}
     local admin_helpers=${6:-true}
     local omitted_helper=${7:-}
+    local laya_runtime=${8:-false}
     local asset_root="$fixture_dir/asset"
     local artifact="jarvis-core-$tag-linux-x86_64.tar.gz"
     rm -rf -- "$asset_root"
     mkdir -p "$asset_root"
     write_release "$asset_root" "$tag" "$schema_sha256" "$core_version" "$cli_version" \
-        "$app_version" "$admin_helpers"
+        "$app_version" "$admin_helpers" "$admin_helpers" "$laya_runtime"
     if [[ -n $omitted_helper ]]; then
         rm -f -- "$asset_root/jarvis-core-$tag/$omitted_helper"
     fi
@@ -330,6 +377,7 @@ run_updater() {
         JARVIS_SYSTEMD_TEST_MODE=true \
         JARVIS_UPDATER_READYZ_FAIL="${JARVIS_UPDATER_READYZ_FAIL:-false}" \
         JARVIS_UPDATER_SYSTEMCTL_FAIL_ONCE="${JARVIS_UPDATER_SYSTEMCTL_FAIL_ONCE:-}" \
+        JARVIS_LAYA_STATE_FIXTURE="${JARVIS_LAYA_STATE_FIXTURE:-false}" \
         bash "${JARVIS_UPDATER_UNDER_TEST:-$updater}" "$@"
 }
 
@@ -790,4 +838,57 @@ find "$JARVIS_SCHEMA_FIXTURE_ROOT/migration-backups" -name committed | grep -q .
 if run_updater --rollback-version v10.0.0; then
     echo 'post-migration binary-only rollback unexpectedly succeeded' >&2; exit 1
 fi
+
+# Optional Laya lifecycle: fake systemd deliberately drops the service when
+# its required socket restarts. The updater must explicitly restore warmness.
+unset JARVIS_SCHEMA_FIXTURE_ROOT JARVIS_SCHEMA_TEST_MODE JARVIS_MIGRATION_FIXTURE
+export JARVIS_LAYA_STATE_FIXTURE=true
+set_laya_state() {
+    rm -f -- "$fixture_dir"/jarvis-laya.{socket,service}.{active,enabled}
+    for state in "$@"; do
+        touch "$fixture_dir/jarvis-laya.$state"
+    done
+}
+assert_laya_state() {
+    local expected=$1 actual=
+    for state in socket.active service.active socket.enabled service.enabled; do
+        [[ ! -e $fixture_dir/jarvis-laya.$state ]] || actual+="$state "
+    done
+    [[ $actual == "$expected" ]] || {
+        echo "Laya lifecycle mismatch: expected '$expected', got '$actual'" >&2
+        exit 1
+    }
+}
+prepare_laya_candidate() {
+    local tag=$1
+    prepare_candidate "$tag" "$same_migrations" "${tag#v}" "${tag#v}" "${tag#v}" true '' true
+}
+for mode in inactive socket_only warm; do
+    seed_active_release v11.0.0 "$same_migrations" true true
+    case $mode in
+        inactive)
+            # Enabled is independent from active; a stopped enabled service
+            # must not be started just because its unit definition changed.
+            set_laya_state service.enabled ; expected='service.enabled ' ;;
+        socket_only)
+            set_laya_state socket.active socket.enabled ; expected='socket.active socket.enabled ' ;;
+        warm)
+            set_laya_state socket.active service.active service.enabled ; expected='socket.active service.active service.enabled ' ;;
+    esac
+    prepare_laya_candidate v11.0.1
+    run_updater
+    [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v11.0.1 ]]
+    assert_laya_state "$expected"
+    ! grep -Eq '^(enable|disable) jarvis-laya\.' "$fixture_dir/systemctl.log"
+
+    # Failed next activation must restore the prior release AND the owner's
+    # original active/enabled state, not merely restore the unit files.
+    prepare_laya_candidate v11.0.2
+    rm -f -- "$fixture_dir/readyz-failed-once"
+    if JARVIS_UPDATER_READYZ_FAIL=true run_updater; then
+        echo "failed Laya $mode activation unexpectedly succeeded" >&2; exit 1
+    fi
+    [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v11.0.1 ]]
+    assert_laya_state "$expected"
+done
 echo "Home Node updater fixture tests passed"

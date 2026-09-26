@@ -66,8 +66,15 @@ generated checksum manifest before moving the snapshot into root-owned
 staging. No Python model repository code, pickle `.bin` file, symlink, or
 world-writable artifact is accepted by the provisioner. Reviewed staging stays
 root:root and unchanged across retries; a temporary root:jarvis-laya read-only
-wheelhouse/lockfile copy is deleted on success or failure. It installs with
-`pip --no-index --require-hashes`; normal service startup has
+wheelhouse/lockfile copy is deleted on success or failure.
+The reviewed lockfile accepts only ordinary `package==version` pins with
+SHA-256 hashes; index options, remote/direct references and local file URLs
+are rejected. Every staged package must be a regular `.whl` whose digest is
+listed in that lockfile; source distributions and symlinks are rejected.
+The installer runs as `jarvis-laya` inside a separate Linux network namespace
+with a controlled environment, using `pip --no-index --require-hashes
+--only-binary=:all:`. If namespace creation fails, provisioning stops before
+pip runs. This is independent of firewall and proxy settings. Normal service startup has
 `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` and needs no network.
 
 After a verified Core release contains these artifacts, the owner can run:
@@ -86,8 +93,13 @@ socket `/run/jarvis-laya.sock` (root:jarvis, 0660), never a TCP listener, Caddy
 or LAN. Core uses a fixed virtual HTTP hostname over that socket; DNS is not
 consulted. systemd passes the listening fd to the unprivileged service, so
 `jarvis-laya` does not need membership in the socket's `jarvis` client group.
-Core updates use `try-restart` only: an inactive owner-disabled Laya service
-or socket stays inactive, while an already active one may restart. The service runs CPU-only with a resident model, bounds memory/tasks, and has no
+Core updates capture Laya's active and enabled states separately. An inactive
+socket and service remain inactive (even if enabled); a socket-only runtime
+remains socket-only; a warm service is deliberately restarted after its socket
+and is active with resident models again when activation completes. Failed
+Core activation restores the prior units and this same active state. The
+updater never enables or disables either unit and does not promise zero
+downtime. The service runs CPU-only with a resident model, bounds memory/tasks, and has no
 need for `/etc/jarvis/secrets`, private agents, Docker or owner home. The
 optional `/etc/jarvis/laya.env` is for trusted local tuning such as
 `LAYA_THREADS=2`; the wrapper ignores attempts to set a TCP host or API key.

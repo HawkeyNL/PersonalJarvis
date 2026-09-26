@@ -8,7 +8,7 @@ prepare_installer_input() {
         fail 'unsafe reviewed installer source'
     [[ -f $source/requirements.lock && ! -L $source/requirements.lock ]] ||
         fail 'missing reviewed requirements.lock'
-    unsafe=$(find "$source/wheels" \( -type l -o ! -type d -a ! -type f \) -print -quit)
+    unsafe=$(find "$source/wheels" -mindepth 1 \( -type l -o ! -type f -o ! -name '*.whl' \) -print -quit)
     [[ -z $unsafe ]] || fail "unsafe wheelhouse entry: $unsafe"
     wheel_count=$(find "$source/wheels" -type f -printf '.\n' | wc -l)
     bytes=$(du -sb -- "$source/wheels" "$source/requirements.lock" | awk '{sum += $1} END {print sum+0}')
@@ -20,6 +20,66 @@ prepare_installer_input() {
     find "$destination" -type f -exec chmod 0640 {} +
 }
 fail() { echo "Laya provisioning: $*" >&2; exit 1; }
+validate_lockfile() {
+    python3 - "$1" <<'PY' || fail 'reviewed lockfile contains an unsupported requirement or source'
+import pathlib
+import re
+import sys
+
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+if not raw or len(raw) > 1_048_576:
+    raise SystemExit(1)
+try:
+    lines = raw.decode('ascii').splitlines()
+except UnicodeDecodeError:
+    raise SystemExit(1)
+pin = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9,._-]+\])?==[0-9][A-Za-z0-9.!+_-]*\Z')
+digest = re.compile(r'--hash=sha256:[0-9a-f]{64}\Z')
+pending = ''
+seen = set()
+for line in lines:
+    line = line.strip()
+    if not line or line.startswith('#'):
+        if pending:
+            raise SystemExit(1)
+        continue
+    continuation = line.endswith('\\')
+    pending += ' ' + (line[:-1].strip() if continuation else line)
+    if continuation:
+        continue
+    fields = pending.split()
+    pending = ''
+    if len(fields) < 2 or not pin.fullmatch(fields[0]) or not all(digest.fullmatch(value) for value in fields[1:]):
+        raise SystemExit(1)
+    name = re.split(r'\[|==', fields[0], maxsplit=1)[0].lower().replace('_', '-').replace('.', '-')
+    if name in seen:
+        raise SystemExit(1)
+    seen.add(name)
+if pending or not seen:
+    raise SystemExit(1)
+PY
+}
+validate_wheelhouse_hashes() {
+    local source=$1 package digest
+    while IFS= read -r -d '' package; do
+        digest=$(sha256sum -- "$package")
+        digest=${digest%% *}
+        grep -Fq -- "sha256:$digest" "$source/requirements.lock" ||
+            fail "reviewed wheel is not hash-bound by requirements.lock: ${package##*/}"
+    done < <(find "$source/wheels" -mindepth 1 -maxdepth 1 -type f -name '*.whl' -print0)
+}
+run_networkless_as() {
+    local identity=$1
+    shift
+    # Only the trusted namespace setup and privilege-drop helpers run as root.
+    # A failed unshare aborts provisioning before any third-party code executes.
+    if [[ ${GITHUB_ACTIONS:-} == true && ${JARVIS_LAYA_TEST_ISOLATION_FAIL:-false} == true ]]; then
+        return 1
+    fi
+    /usr/bin/unshare --net -- /usr/sbin/runuser -u "$identity" -- \
+        /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+        PIP_NO_CACHE_DIR=1 PYTHONDONTWRITEBYTECODE=1 "$@"
+}
 # CI exercises the exact materialization/cleanup path with fixture-sized inputs.
 # This unprivileged mode cannot provision or activate a runtime.
 if [[ ${1:-} == --fixture-installer-input ]]; then
@@ -27,9 +87,18 @@ if [[ ${1:-} == --fixture-installer-input ]]; then
         fail 'unsafe installer fixture invocation'
     fixture_input=$(mktemp -d "$3/.installer-input.XXXXXXXX")
     trap 'rm -rf -- "$fixture_input"' EXIT
+    validate_lockfile "$2/requirements.lock"
+    validate_wheelhouse_hashes "$2"
     prepare_installer_input "$2" "$fixture_input" "$(id -gn)"
     [[ -f $fixture_input/requirements.lock && -d $fixture_input/wheels ]] || fail 'fixture copy failed'
     fail 'simulated failure after temporary installer input preparation'
+fi
+if [[ ${1:-} == --fixture-networkless ]]; then
+    [[ $# == 4 && ${GITHUB_ACTIONS:-} == true && $EUID == 0 && $2 == /tmp/* && \
+       -d $2 && ! -L $2 && $3 =~ ^[0-9]{1,5}$ && $4 =~ ^[0-9]{1,5}$ && \
+       -f $2/probe.py && ! -L $2/probe.py ]] || fail 'unsafe networkless fixture invocation'
+    run_networkless_as nobody /usr/bin/python3 "$2/probe.py" "$2" "$3" "$4"
+    exit
 fi
 [[ $EUID == 0 ]] || { echo 'Laya provisioning requires root' >&2; exit 1; }
 readonly revision=55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851
@@ -59,8 +128,10 @@ LC_ALL=C awk '
 grep -Eq '^laya\[serve\]==0[.]3[.]20([[:space:]\\]|$)' "$stage/requirements.lock" ||
     fail 'lockfile does not pin laya[serve]==0.3.20'
 grep -Fq "sha256:$wheel_sha" "$stage/requirements.lock" || fail 'lockfile omits reviewed Laya wheel hash'
+validate_lockfile "$stage/requirements.lock"
 unsafe=$(find "$stage" \( -type l -o \( -type f -o -type d \) \( -perm /022 -o ! -user root -o ! -group root \) -o ! -type f -a ! -type d \) -print -quit)
 [[ -z $unsafe ]] || fail "unsafe staged file or symlink: $unsafe"
+validate_wheelhouse_hashes "$stage"
 unsafe=$(find "$snapshot" -type f ! \( -name '*.json' -o -name '*.safetensors' -o -name '*.txt' -o -name '*.model' \) -print -quit)
 [[ -z $unsafe ]] || fail "unexpected model file: $unsafe"
 diff -u \
@@ -104,10 +175,10 @@ python3 -m venv "$candidate"
 # is readable by jarvis-laya; pip still runs offline and requires lockfile hashes.
 prepare_installer_input "$stage" "$installer_input" jarvis-laya
 chown -R jarvis-laya:jarvis-laya "$candidate"
-runuser -u jarvis-laya -- env -i PATH=/usr/bin:/bin HOME=/nonexistent \
-    PIP_NO_CACHE_DIR=1 PYTHONDONTWRITEBYTECODE=1 \
+run_networkless_as jarvis-laya \
     "$candidate/bin/python" -m pip install --disable-pip-version-check --no-index \
-    --find-links "$installer_input/wheels" --require-hashes -r "$installer_input/requirements.lock" >/dev/null
+    --find-links "$installer_input/wheels" --require-hashes --only-binary=:all: \
+    -r "$installer_input/requirements.lock" >/dev/null
 [[ $(runuser -u jarvis-laya -- env -i PATH=/usr/bin:/bin HOME=/nonexistent \
     "$candidate/bin/python" -c 'import importlib.metadata; print(importlib.metadata.version("laya"))') == 0.3.20 ]] ||
     fail 'installed Laya version differs from reviewed wheel'
