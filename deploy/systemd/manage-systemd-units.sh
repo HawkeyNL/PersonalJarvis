@@ -21,7 +21,20 @@ readonly -a managed_units=(
     jarvis-private-agent-updater.timer
     jarvis-model-catalog.service
     jarvis-model-catalog.timer
+    jarvis-laya.service
+    jarvis-laya.socket
 )
+
+laya_capability() {
+    local release=$1
+    if ! jq -e '.tooling | has("laya_runtime")' "$release/release.json" >/dev/null; then
+        echo legacy
+        return
+    fi
+    jq -e '.tooling.laya_runtime == 1 and (.tooling.laya_runtime | type) == "number" and .tooling.systemd_units == 1' "$release/release.json" >/dev/null ||
+        fail "unsupported Laya runtime capability"
+    echo 1
+}
 
 catalog_capability() {
     local release=$1
@@ -38,6 +51,8 @@ unit_required() {
     case $2 in
         jarvis-model-catalog.service|jarvis-model-catalog.timer)
             [[ $(catalog_capability "$1") == 1 ]] ;;
+        jarvis-laya.service|jarvis-laya.socket)
+            [[ $(laya_capability "$1") == 1 ]] ;;
         *) return 0 ;;
     esac
 }
@@ -189,10 +204,21 @@ validate_checksum_manifest() {
 }
 
 validate_artifacts() {
-    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version
+    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version laya_version
     managed_version=$(capability "$release") || return 1
     device_version=$(device_capability "$release") || return 1
     policy_version=$(policy_capability "$release") || return 1
+    laya_version=$(laya_capability "$release") || return 1
+    if [[ $laya_version == 1 ]]; then
+        [[ -f $release/laya-offline.py && ! -L $release/laya-offline.py ]] || fail "Laya runtime wrapper is missing or unsafe"
+        mode=$(stat -c '%a' "$release/laya-offline.py")
+        (( (8#$mode & 0022) == 0 )) || fail "Laya runtime wrapper permissions are unsafe"
+        matches=$(awk '$2 == "laya-offline.py" { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
+        [[ $matches == 1 ]] || fail "Laya runtime wrapper is not uniquely checksum-bound"
+        [[ -f $release/provision-laya && ! -L $release/provision-laya && -x $release/provision-laya ]] || fail "Laya provisioner is missing or unsafe"
+        matches=$(awk '$2 == "provision-laya" { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
+        [[ $matches == 1 ]] || fail "Laya provisioner is not uniquely checksum-bound"
+    fi
     catalog_capability "$release" >/dev/null || return 1
     if [[ $managed_version != 1 ]]; then
         [[ $device_version == legacy ]] || fail "local-device capability requires managed systemd policy"
@@ -219,7 +245,7 @@ validate_artifacts() {
             fail "versioned Home Node helper is missing or unsafe: $helper"
     done
     [[ -f $release/ui.sh && ! -L $release/ui.sh ]] || fail "versioned terminal UI helper is missing or unsafe"
-    for packaged in "$release"/systemd-*.service "$release"/systemd-*.timer; do
+    for packaged in "$release"/systemd-*.service "$release"/systemd-*.timer "$release"/systemd-*.socket; do
         [[ -e $packaged || -L $packaged ]] || continue
         expected=false
         for unit in "${managed_units[@]}"; do
@@ -263,6 +289,11 @@ validate_release() {
     if [[ $(device_capability "$release") == 1 ]]; then
         [[ $(stat -c '%u:%g' "$release/$device_policy") == 0:0 ]] || fail "device policy is not root-owned"
     fi
+    if [[ $(laya_capability "$release") == 1 ]]; then
+        [[ $(stat -c '%u:%g' "$release/laya-offline.py") == 0:0 ]] || fail "Laya runtime wrapper is not root-owned"
+        metadata=$(stat -c '%u:%g:%a' "$release/provision-laya")
+        [[ $metadata == 0:0:* ]] && (( (8#${metadata##*:} & 0022) == 0 && (8#${metadata##*:} & 0111) != 0 )) || fail "Laya provisioner permissions are unsafe"
+    fi
     if jq -e 'has("schema_migration")' "$release/release.json" >/dev/null; then
         [[ $(stat -c '%u:%g' "$release/schema-backup") == 0:0 ]] || fail "schema backup helper is not root-owned"
     fi
@@ -304,7 +335,7 @@ validate_dropins() {
                 key=${line%%=*}
                 key=${key%${key##*[![:space:]]}}
                 case $key in
-                    Type|RemainAfterExit|ExecStart|ExecStartPre|ExecStartPost|ExecReload|ExecStop|User|Group|SupplementaryGroups|DynamicUser|Environment|EnvironmentFile|WorkingDirectory|RootDirectory|RootImage|NoNewPrivileges|CapabilityBoundingSet|AmbientCapabilities|ProtectSystem|ProtectHome|ProtectControlGroups|ProtectKernelModules|ProtectKernelTunables|PrivateTmp|PrivateDevices|RestrictAddressFamilies|ReadWritePaths|ReadOnlyPaths|InaccessiblePaths|BindPaths|BindReadOnlyPaths|RuntimeDirectory|RuntimeDirectoryMode|StateDirectory|StateDirectoryMode|CacheDirectory|LogsDirectory|UMask|Requires|Wants|After|Before|ConditionPathExists|Unit|OnBootSec|OnUnitActiveSec|OnCalendar|Persistent|RandomizedDelaySec)
+                    Type|RemainAfterExit|ExecStart|ExecStartPre|ExecStartPost|ExecReload|ExecStop|User|Group|SupplementaryGroups|DynamicUser|Environment|EnvironmentFile|WorkingDirectory|RootDirectory|RootImage|NoNewPrivileges|CapabilityBoundingSet|AmbientCapabilities|ProtectSystem|ProtectHome|ProtectControlGroups|ProtectKernelModules|ProtectKernelTunables|PrivateTmp|PrivateDevices|RestrictAddressFamilies|ReadWritePaths|ReadOnlyPaths|InaccessiblePaths|BindPaths|BindReadOnlyPaths|RuntimeDirectory|RuntimeDirectoryMode|StateDirectory|StateDirectoryMode|CacheDirectory|LogsDirectory|UMask|Requires|Wants|After|Before|ConditionPathExists|Unit|OnBootSec|OnUnitActiveSec|OnCalendar|Persistent|RandomizedDelaySec|ListenStream|ListenDatagram|SocketUser|SocketGroup|SocketMode|Accept|Service|RemoveOnStop)
                         fail "conflicting release-owned directive $key in administrator drop-in $file"
                         ;;
                 esac

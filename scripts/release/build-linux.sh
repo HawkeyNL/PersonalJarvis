@@ -53,6 +53,11 @@ verify_systemd_unit_candidate() {
     echo "release candidate does not declare model-catalog capability 1" >&2
     exit 1
   }
+  jq -e '.tooling.laya_runtime == 1 and (.tooling.laya_runtime | type) == "number"' \
+    "$release/release.json" >/dev/null || {
+    echo "release candidate does not declare Laya runtime capability 1" >&2
+    exit 1
+  }
   jq -e '.tooling.model_policy_directory == 1 and (.tooling.model_policy_directory | type) == "number"' \
     "$release/release.json" >/dev/null || {
     echo "release candidate does not declare model-policy directory capability 1" >&2
@@ -216,6 +221,8 @@ install -m 0755 deploy/systemd/manage-systemd-units.sh "$temporary_release/manag
 install -m 0755 deploy/systemd/schema-backup.sh "$temporary_release/schema-backup"
 install -m 0755 deploy/systemd/verify-home-node.sh "$temporary_release/verify-home-node"
 install -m 0755 deploy/systemd/install-home-node-core.sh "$temporary_release/install-home-node-core"
+install -m 0644 deploy/systemd/laya-offline.py "$temporary_release/laya-offline.py"
+install -m 0755 deploy/systemd/provision-laya.sh "$temporary_release/provision-laya"
 install -m 0644 deploy/lib/ui.sh "$temporary_release/ui.sh"
 for unit in \
   jarvis-core.service \
@@ -228,7 +235,8 @@ for unit in \
   jarvis-updater.timer \
   jarvis-private-agent-updater.service \
   jarvis-private-agent-updater.timer \
-  jarvis-model-catalog.service jarvis-model-catalog.timer; do
+  jarvis-model-catalog.service jarvis-model-catalog.timer \
+  jarvis-laya.service jarvis-laya.socket; do
   install -m 0644 "deploy/systemd/$unit" "$temporary_release/systemd-$unit"
 done
 install -m 0644 deploy/systemd/pricing-registry.json "$temporary_release/pricing-registry.json"
@@ -251,7 +259,7 @@ jq -n \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
   --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 8, from_sha256: [$schema_six, $schema_seven]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1}}' \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 8, from_sha256: [$schema_six, $schema_seven]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1}}' \
   > "$temporary_release/release.json"
 
 (
@@ -260,10 +268,10 @@ jq -n \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
     jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials \
     com.hawkeynl.jarvis.devices.policy \
-    manage-systemd-units jarvis-model-policy-storage schema-backup verify-home-node install-home-node-core ui.sh \
+    manage-systemd-units jarvis-model-policy-storage schema-backup verify-home-node install-home-node-core ui.sh laya-offline.py provision-laya \
     pricing-registry.json \
     install-agent-bundle \
-    private-agent-poll jarvis-private-update systemd-*.service systemd-*.timer \
+    private-agent-poll jarvis-private-update systemd-*.service systemd-*.timer systemd-*.socket \
     > artifact-binaries.sha256
 )
 verify_admin_helper_candidate "$temporary_release"

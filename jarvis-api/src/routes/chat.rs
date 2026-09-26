@@ -320,8 +320,8 @@ pub(super) async fn execute_chat(
     let owner_brain_pinned = owner_brain
         .as_ref()
         .is_some_and(|(provider, model)| state.model_policy.allows(provider, model));
-    // Jev classifies a bounded copy of the latest user turn. The owner-selected
-    // mode and deterministic safety floor retain final authority. A Jev result
+    // System-1 classifies a bounded copy of the latest user turn. The owner-selected
+    // mode and deterministic safety floor retain final authority. A classifier result
     // cannot name a model, trigger a tool, or approve a side effect.
     let intent_kind = if crate::intent::should_classify(requested_mode, owner_brain_pinned) {
         crate::intent::decide(&state, &new_msg).await

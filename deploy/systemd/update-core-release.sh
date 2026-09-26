@@ -694,6 +694,10 @@ restart_managed_services() {
     systemctl try-restart jarvis-codex.service >/dev/null 2>&1 || true
     systemctl try-restart jarvis-opensandbox.service >/dev/null 2>&1 || true
     systemctl restart jarvis-core.service || return 1
+    # Optional classifier: restart only if the owner had it running. Its
+    # failure never gates Core readiness or the normal Jev/Auto fallback.
+    systemctl try-restart jarvis-laya.socket >/dev/null 2>&1 || true
+    systemctl try-restart jarvis-laya.service >/dev/null 2>&1 || true
     curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
         --retry 11 --retry-delay 5 --retry-connrefused \
         http://127.0.0.1:8080/readyz >/dev/null || return 1
@@ -717,6 +721,8 @@ restore_release_transaction() {
     systemctl try-restart jarvis-codex.service >/dev/null 2>&1 || true
     systemctl try-restart jarvis-opensandbox.service >/dev/null 2>&1 || true
     systemctl restart jarvis-core.service >/dev/null 2>&1 || return 1
+    systemctl try-restart jarvis-laya.socket >/dev/null 2>&1 || true
+    systemctl try-restart jarvis-laya.service >/dev/null 2>&1 || true
     curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
         --retry 11 --retry-delay 5 --retry-connrefused \
         http://127.0.0.1:8080/readyz >/dev/null || return 1
@@ -733,6 +739,20 @@ activate_managed_release() {
     fi
     if jq -e '.tooling.model_catalog == 1' "$previous/release.json" >/dev/null && \
         ! jq -e '.tooling.model_catalog == 1' "$release/release.json" >/dev/null; then
+        unit_manager="$previous/manage-systemd-units"
+    fi
+    if jq -e '.tooling.laya_runtime == 1' "$previous/release.json" >/dev/null && \
+        ! jq -e '.tooling.laya_runtime == 1' "$release/release.json" >/dev/null; then
+        # Do not remove a unit beneath an owner-enabled or running model
+        # service. The current manager understands how to remove its unit
+        # after the owner has stopped/disabled it deliberately.
+        if systemctl is-active --quiet jarvis-laya.service || \
+            systemctl is-enabled --quiet jarvis-laya.service || \
+            systemctl is-active --quiet jarvis-laya.socket || \
+            systemctl is-enabled --quiet jarvis-laya.socket; then
+            echo 'jarvis updater: disable and stop optional jarvis-laya.service and jarvis-laya.socket before rolling back to a pre-Laya release' >&2
+            return 1
+        fi
         unit_manager="$previous/manage-systemd-units"
     fi
     backup=$(mktemp -d /run/jarvis-systemd-rollback.XXXXXXXX)

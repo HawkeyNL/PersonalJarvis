@@ -173,6 +173,27 @@ fi
 check "OpenSandbox remains disabled" bash -c '! systemctl is-enabled --quiet jarvis-opensandbox.service'
 check "OpenSandbox remains inactive" bash -c '! systemctl is-active --quiet jarvis-opensandbox.service'
 
+# Optional System-1 service is not a Core readiness dependency. If it runs,
+# its local IPC/identity boundary is still mandatory; reachability degrades to
+# Jev/ordinary Auto without making the Home Node unhealthy.
+if systemctl is-active --quiet jarvis-laya.service; then
+    check "Laya service uses its dedicated identity" bash -c \
+        '[[ $(systemctl show -p User --value jarvis-laya.service) == jarvis-laya ]]'
+    check "Laya socket is systemd-owned and private" bash -c \
+        '[[ -S /run/jarvis-laya.sock && ! -L /run/jarvis-laya.sock && $(stat -c "%u:%G:%a" /run/jarvis-laya.sock) == 0:jarvis:660 ]]'
+    check "Laya socket unit is active" systemctl is-active --quiet jarvis-laya.socket
+    laya_health=$(curl --fail --silent --show-error --max-time 2 --max-filesize 4096 \
+        --unix-socket /run/jarvis-laya.sock http://jarvis-laya.local/health 2>/dev/null) || laya_health=
+    if jq -e '.status == "ok" and (.loaded | type) == "array" and (.device | type) == "string"' <<<"$laya_health" >/dev/null 2>&1; then
+        loaded=$(jq -r '.loaded | map(select(. == "english" or . == "multilingual")) | join(",")' <<<"$laya_health")
+        ui_detail "Laya classifier: running, reachable, CPU checkpoint(s): ${loaded:-none} (optional)"
+    else
+        ui_warning "Laya classifier is not reachable; Jev/Auto fallback remains available"
+    fi
+else
+    ui_detail "Laya classifier: inactive (optional; Jev/Auto fallback remains available)"
+fi
+
 if ((failures)); then
     ui_error "Security verification: $passed passed, $failures failed. Do not enable public ingress."
     exit 1

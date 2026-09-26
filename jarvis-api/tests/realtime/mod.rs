@@ -1,6 +1,8 @@
 use super::*;
 use futures_util::{SinkExt, StreamExt};
-use jarvis_api::intent::{FastIntentRouter, IntentDecision, WorkKind};
+use jarvis_api::intent::{
+    FastIntentProvider, IntentDecision, IntentRouterChain, LayaMode, WorkKind,
+};
 use jarvis_client_core::realtime::{Event, EventEnvelope};
 use jarvis_client_core::speech::{SpeechAction, VoiceGate};
 use jarvis_llm::{ChatReply, ChatRequest, LlmError, LlmProvider};
@@ -16,7 +18,10 @@ struct Fake(Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<Vec<String>>>>);
 struct FakeJev(Arc<AtomicUsize>);
 
 #[async_trait::async_trait]
-impl FastIntentRouter for FakeJev {
+impl FastIntentProvider for FakeJev {
+    fn provider_id(&self) -> &'static str {
+        "jev"
+    }
     async fn classify(&self, _: &str) -> Result<IntentDecision, &'static str> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(IntentDecision {
@@ -188,7 +193,13 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     let contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut fixture = state(db.clone(), None).await;
     fixture.llm = Arc::new(Fake(count.clone(), contexts.clone()));
-    fixture.jev = Some(Arc::new(FakeJev(jev_count.clone())));
+    fixture.fast_intent_router = Some(Arc::new(IntentRouterChain {
+        laya: None,
+        jev: Some(Arc::new(FakeJev(jev_count.clone()))),
+        mode: LayaMode::Off,
+        laya_threshold: 0.95,
+        jev_threshold: 0.75,
+    }));
     let hub = fixture.realtime.clone();
     let app = build_router(fixture);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

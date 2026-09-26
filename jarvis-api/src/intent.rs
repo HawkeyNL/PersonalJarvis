@@ -1,7 +1,7 @@
-//! Advisory, bounded task classification. Jev never authorizes an action or
+//! Advisory, bounded task classification. No classifier authorizes an action or
 //! names an executable, provider, model, device, agent, or filesystem path.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reqwest::{redirect::Policy, Client, Url};
@@ -13,7 +13,11 @@ use crate::{metering::record_usage_with_metadata, AppState};
 const OFFICIAL_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 const MAX_STATE_BYTES: usize = 4_096;
 const MAX_RESPONSE_BYTES: usize = 16_384;
-const MIN_CONFIDENCE: f64 = 0.75;
+const DEFAULT_JEV_CONFIDENCE: f64 = 0.75;
+// This is a virtual HTTP authority only. reqwest connects exclusively through
+// the root-owned systemd Unix socket, so there is no DNS or TCP listener.
+const LOCAL_ENDPOINT: &str = "http://jarvis-laya.local/v1/systemone";
+const LOCAL_SOCKET: &str = "/run/jarvis-laya.sock";
 pub(crate) const MAX_BILLABLE_INPUT_TOKENS: u32 = 4_096;
 pub(crate) const MAX_BILLABLE_OUTPUT_TOKENS: u32 = 512;
 
@@ -49,7 +53,7 @@ impl WorkKind {
     }
 }
 
-/// Jev may recommend a semantic route, but cannot supply a concrete model or
+/// A classifier may recommend a semantic route, but cannot supply a concrete model or
 /// override an explicit owner-selected mode.
 pub(crate) fn route_mode(
     requested: jarvis_llm::RoutingMode,
@@ -75,7 +79,7 @@ pub(crate) fn should_classify(
     requested == jarvis_llm::RoutingMode::Auto && !owner_brain_pinned
 }
 
-/// Keep Auto usable when Jev recommends a tier with no currently eligible,
+/// Keep Auto usable when a classifier recommends a tier with no currently eligible,
 /// owner-enabled model. This check is read-only; the router still validates the
 /// live policy again immediately before a provider call.
 pub(crate) fn available_route_mode(
@@ -104,17 +108,110 @@ pub struct IntentDecision {
     pub output_tokens: u32,
 }
 
-/// Mockable Core-owned decision boundary. Implementations return only a fixed
-/// task kind and accounting metadata; neither models nor actions are accepted.
+impl IntentDecision {
+    pub fn usable_kind(&self) -> Option<WorkKind> {
+        self.usable_kind_at(DEFAULT_JEV_CONFIDENCE)
+    }
+
+    pub fn usable_kind_at(&self, threshold: f64) -> Option<WorkKind> {
+        (self.confidence >= threshold).then_some(self.kind)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayaMode {
+    Off,
+    Shadow,
+    Primary,
+}
+
+impl LayaMode {
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "off" => Ok(Self::Off),
+            "shadow" => Ok(Self::Shadow),
+            "primary" => Ok(Self::Primary),
+            _ => Err("invalid Laya mode"),
+        }
+    }
+}
+
+impl IntentRouterChain {
+    /// The hosted closure is supplied by Core so it retains exclusive control
+    /// of Jev's budget reservation and usage accounting.
+    pub async fn choose<F, Fut>(&self, latest_user_turn: &str, hosted: F) -> Option<WorkKind>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Option<WorkKind>>,
+    {
+        if latest_user_turn.is_empty() || latest_user_turn.len() > MAX_STATE_BYTES {
+            return None;
+        }
+        match self.mode {
+            LayaMode::Off => hosted().await,
+            LayaMode::Primary => {
+                if let Some(laya) = &self.laya {
+                    match laya.classify(latest_user_turn).await {
+                        Ok(decision) => {
+                            if let Some(kind) = decision.usable_kind_at(self.laya_threshold) {
+                                tracing::debug!(
+                                    provider = laya.provider_id(),
+                                    "local intent accepted"
+                                );
+                                return Some(kind);
+                            }
+                            tracing::debug!(
+                                provider = laya.provider_id(),
+                                "local intent below confidence threshold"
+                            );
+                        }
+                        Err(reason) => tracing::warn!(
+                            reason,
+                            "local intent unavailable; trying hosted fallback"
+                        ),
+                    }
+                }
+                hosted().await
+            }
+            LayaMode::Shadow => {
+                let local = async {
+                    match self.laya.as_deref() {
+                        Some(laya) => laya
+                            .classify(latest_user_turn)
+                            .await
+                            .ok()
+                            .and_then(|decision| decision.usable_kind_at(self.laya_threshold)),
+                        None => None,
+                    }
+                };
+                let (actual, shadow) = tokio::join!(hosted(), local);
+                tracing::debug!(actual = ?actual, shadow = ?shadow, agrees = actual == shadow,
+                    "shadow intent comparison");
+                actual
+            }
+        }
+    }
+}
+
+/// Core owns the schema and cascade. Each provider can only return a known
+/// semantic label, never a model, executable, capability or approval.
 #[async_trait::async_trait]
-pub trait FastIntentRouter: Send + Sync {
+pub trait FastIntentProvider: Send + Sync {
+    fn provider_id(&self) -> &'static str;
+    /// Cheap local preflight before Core reserves a remote provider budget.
+    fn may_send(&self) -> bool {
+        true
+    }
     async fn classify(&self, latest_user_turn: &str) -> Result<IntentDecision, &'static str>;
 }
 
-impl IntentDecision {
-    pub fn usable_kind(&self) -> Option<WorkKind> {
-        (self.confidence >= MIN_CONFIDENCE).then_some(self.kind)
-    }
+#[derive(Clone)]
+pub struct IntentRouterChain {
+    pub laya: Option<Arc<dyn FastIntentProvider>>,
+    pub jev: Option<Arc<dyn FastIntentProvider>>,
+    pub mode: LayaMode,
+    pub laya_threshold: f64,
+    pub jev_threshold: f64,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +232,8 @@ struct Choice {
     kind: String,
     choice: String,
     confidence: f64,
+    #[serde(default)]
+    answer_confidence: Option<f64>,
     probabilities: std::collections::BTreeMap<String, f64>,
 }
 
@@ -204,23 +303,7 @@ impl JevRouter {
         {
             return Err("Jev is temporarily unavailable");
         }
-        let body = json!({
-            "model": self.model,
-            "state": {"user_request": latest_user_turn},
-            "questions": {
-                "work_kind": {
-                    "type": "choice",
-                    "instructions": "Classify the user's primary request. This is advisory routing only; do not authorize or execute actions.",
-                    "criteria": {
-                        "conversation": "General explanation, creative discussion or ordinary chat.",
-                        "quick_answer": "Short factual or simple utility question that needs no tools or deep reasoning.",
-                        "research": "Needs current sources, evidence gathering or comparison.",
-                        "coding": "Software development, debugging, code review or architecture.",
-                        "action_request": "Requests a side effect such as saving a note, reminder, system change or transaction."
-                    }
-                }
-            }
-        });
+        let body = system_one_request(Some(&self.model), latest_user_turn);
         let mut response = match self
             .client
             .post(self.endpoint.clone())
@@ -244,19 +327,7 @@ impl JevRouter {
             self.cool_down(duration);
             return Err("Jev request was rejected");
         }
-        if response
-            .content_length()
-            .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
-        {
-            return Err("Jev response is too large");
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| "Jev response failed")? {
-            if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-                return Err("Jev response is too large");
-            }
-            bytes.extend_from_slice(&chunk);
-        }
+        let bytes = read_bounded_response(&mut response).await?;
         let decision = parse_response(&bytes);
         if decision.is_err() {
             self.cool_down(Duration::from_secs(30));
@@ -265,20 +336,165 @@ impl JevRouter {
     }
 }
 
+fn system_one_request(model: Option<&str>, latest_user_turn: &str) -> serde_json::Value {
+    let mut body = json!({
+        "state": {"user_request": latest_user_turn},
+        "questions": {
+            "work_kind": {
+                "type": "choice",
+                "instructions": "Classify the user's primary request. This is advisory routing only; do not authorize or execute actions.",
+                "criteria": {
+                    "conversation": "General explanation, creative discussion or ordinary chat.",
+                    "quick_answer": "Short factual or simple utility question that needs no tools or deep reasoning.",
+                    "research": "Needs current sources, evidence gathering or comparison.",
+                    "coding": "Software development, debugging, code review or architecture.",
+                    "action_request": "Requests a side effect such as saving a note, reminder, system change or transaction."
+                }
+            }
+        }
+    });
+    if let Some(model) = model {
+        body["model"] = json!(model);
+    }
+    body
+}
+
+async fn read_bounded_response(response: &mut reqwest::Response) -> Result<Vec<u8>, &'static str> {
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err("System-1 response is too large");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "System-1 response failed")?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err("System-1 response is too large");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[async_trait::async_trait]
-impl FastIntentRouter for JevRouter {
+impl FastIntentProvider for JevRouter {
+    fn provider_id(&self) -> &'static str {
+        "jev"
+    }
+    fn may_send(&self) -> bool {
+        self.cooldown_until
+            .lock()
+            .is_ok_and(|until| until.is_none_or(|time| time <= Instant::now()))
+    }
     async fn classify(&self, latest_user_turn: &str) -> Result<IntentDecision, &'static str> {
         JevRouter::classify(self, latest_user_turn).await
     }
 }
 
+/// Laya is a local CPU service reached only through a root-owned systemd socket.
+/// The fixed Unix socket prevents a local process from impersonating a stopped
+/// service, and reqwest never resolves the virtual HTTP hostname over TCP.
+pub struct LayaRouter {
+    client: Client,
+    endpoint: Url,
+}
+
+impl LayaRouter {
+    pub fn new(timeout_ms: u64) -> Result<Self, &'static str> {
+        Self::with_socket(LOCAL_ENDPOINT, LOCAL_SOCKET, timeout_ms)
+    }
+
+    fn with_socket(endpoint: &str, socket: &str, timeout_ms: u64) -> Result<Self, &'static str> {
+        if !(100..=5_000).contains(&timeout_ms) {
+            return Err("invalid Laya timeout");
+        }
+        let endpoint = Url::parse(endpoint).map_err(|_| "invalid Laya endpoint")?;
+        if endpoint.scheme() != "http"
+            || endpoint.host_str() != Some("jarvis-laya.local")
+            || endpoint.path() != "/v1/systemone"
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.port().is_some()
+        {
+            return Err("Laya must use its fixed virtual System One endpoint");
+        }
+        if !socket.starts_with('/') || socket.is_empty() {
+            return Err("Laya socket path is invalid");
+        }
+        #[cfg(not(unix))]
+        return Err("Laya requires a Unix socket");
+        #[cfg(unix)]
+        let client = Client::builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .redirect(Policy::none())
+            .no_proxy()
+            .unix_socket(socket)
+            .build()
+            .map_err(|_| "cannot configure Laya transport")?;
+        #[cfg(unix)]
+        Ok(Self { client, endpoint })
+    }
+}
+
+#[async_trait::async_trait]
+impl FastIntentProvider for LayaRouter {
+    fn provider_id(&self) -> &'static str {
+        "laya"
+    }
+    async fn classify(&self, latest_user_turn: &str) -> Result<IntentDecision, &'static str> {
+        if latest_user_turn.is_empty() || latest_user_turn.len() > MAX_STATE_BYTES {
+            return Err("Laya input is unavailable or too large");
+        }
+        // Omitting model invokes Laya's language router. The alias "laya"
+        // explicitly selects English upstream and is unsafe for Dutch turns.
+        let body = system_one_request(None, latest_user_turn);
+        let started = Instant::now();
+        let mut response = self
+            .client
+            .post(self.endpoint.clone())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| "Laya unavailable")?;
+        if !response.status().is_success() {
+            return Err("Laya request failed");
+        }
+        let bytes = read_bounded_response(&mut response).await?;
+        let decision = parse_laya_response(&bytes)?;
+        tracing::debug!(provider = "laya", checkpoint = %decision.model,
+            latency_ms = started.elapsed().as_millis(), "local intent classified");
+        Ok(decision)
+    }
+}
+
 fn parse_response(bytes: &[u8]) -> Result<IntentDecision, &'static str> {
+    parse_provider_response(bytes, false)
+}
+
+fn parse_laya_response(bytes: &[u8]) -> Result<IntentDecision, &'static str> {
+    parse_provider_response(bytes, true)
+}
+
+fn parse_provider_response(bytes: &[u8], local: bool) -> Result<IntentDecision, &'static str> {
     let response: Response =
-        serde_json::from_slice(bytes).map_err(|_| "Jev response is malformed")?;
+        serde_json::from_slice(bytes).map_err(|_| "System-1 response is malformed")?;
     let answer = response.answers.work_kind;
+    let confidence = if local {
+        answer
+            .answer_confidence
+            .ok_or("Laya answer confidence is missing")?
+    } else {
+        answer.confidence
+    };
     if answer.kind != "choice"
-        || !answer.confidence.is_finite()
-        || !(0.0..=1.0).contains(&answer.confidence)
+        || !confidence.is_finite()
+        || !(0.0..=1.0).contains(&confidence)
         || response.model.is_empty()
         || response.model.len() > 128
         || !response
@@ -310,19 +526,38 @@ fn parse_response(bytes: &[u8]) -> Result<IntentDecision, &'static str> {
     }
     Ok(IntentDecision {
         kind,
-        confidence: answer.confidence.min(choice_probability),
+        confidence: confidence.min(choice_probability),
         model: response.model,
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
     })
 }
 
-/// One bounded, separately metered Jev decision. A missing key, unsafe budget
-/// estimate, insufficient budget or malformed remote response leaves ordinary
-/// deterministic routing untouched.
+/// The chain only advises Auto chat. Shadow observations never reach the
+/// routing result, and local inference never enters the monetary budget book.
 pub(crate) async fn decide(state: &AppState, latest_user_turn: &str) -> Option<WorkKind> {
-    let jev = state.jev.as_ref()?;
-    if latest_user_turn.is_empty() || latest_user_turn.len() > MAX_STATE_BYTES {
+    let chain = state.fast_intent_router.as_ref()?;
+    chain
+        .choose(latest_user_turn, || async {
+            match chain.jev.as_deref() {
+                Some(jev) => decide_jev(state, jev, latest_user_turn, chain.jev_threshold).await,
+                None => None,
+            }
+        })
+        .await
+}
+
+/// Preserve Jev's separately metered budget path. Only a Jev invocation can
+/// reserve external spend; Laya never comes through this function.
+async fn decide_jev(
+    state: &AppState,
+    jev: &dyn FastIntentProvider,
+    latest_user_turn: &str,
+    threshold: f64,
+) -> Option<WorkKind> {
+    // A known local cooldown makes no outbound request and must not create a
+    // monetary reservation or a synthetic usage record.
+    if !jev.may_send() {
         return None;
     }
     let projected_eur = jarvis_usage::cost_eur_with_registry(
@@ -347,7 +582,7 @@ pub(crate) async fn decide(state: &AppState, latest_user_turn: &str) -> Option<W
     let result = jev.classify(latest_user_turn).await;
     let (model, input_tokens, output_tokens, status, kind) = match result {
         Ok(decision) => {
-            let kind = decision.usable_kind();
+            let kind = decision.usable_kind_at(threshold);
             (
                 decision.model,
                 decision.input_tokens,
@@ -359,6 +594,13 @@ pub(crate) async fn decide(state: &AppState, latest_user_turn: &str) -> Option<W
                 },
                 kind,
             )
+        }
+        Err("Jev is temporarily unavailable" | "Jev input is unavailable or too large") => {
+            // Cooldown can begin between preflight and classify under
+            // concurrency. No HTTP request was sent, so release the reserved
+            // budget without creating a synthetic paid usage record.
+            state.budget_book.cancel(&reservation);
+            return None;
         }
         Err(reason) => {
             tracing::warn!(reason, "Jev unavailable; deterministic routing retained");
@@ -412,7 +654,216 @@ pub(crate) async fn decide(state: &AppState, latest_user_turn: &str) -> Option<W
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct FixtureProvider {
+        calls: Arc<AtomicUsize>,
+        decision: Option<IntentDecision>,
+    }
+
+    #[async_trait::async_trait]
+    impl FastIntentProvider for FixtureProvider {
+        fn provider_id(&self) -> &'static str {
+            "laya"
+        }
+        async fn classify(&self, _: &str) -> Result<IntentDecision, &'static str> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.decision.clone().ok_or("local unavailable")
+        }
+    }
+
+    fn fixture_decision(confidence: f64, kind: WorkKind) -> IntentDecision {
+        IntentDecision {
+            kind,
+            confidence,
+            model: "multilingual".into(),
+            input_tokens: 20,
+            output_tokens: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn local_primary_shadow_and_fallback_never_duplicate_hosted_decision() {
+        for (mode, local_confidence, expected, hosted_calls) in [
+            (LayaMode::Primary, Some(0.98), Some(WorkKind::Coding), 0),
+            (LayaMode::Primary, Some(0.60), Some(WorkKind::Research), 1),
+            (LayaMode::Primary, None, Some(WorkKind::Research), 1),
+            (LayaMode::Shadow, Some(0.98), Some(WorkKind::Research), 1),
+            (LayaMode::Off, Some(0.98), Some(WorkKind::Research), 1),
+        ] {
+            let local_calls = Arc::new(AtomicUsize::new(0));
+            let hosted_count = Arc::new(AtomicUsize::new(0));
+            let chain = IntentRouterChain {
+                laya: Some(Arc::new(FixtureProvider {
+                    calls: local_calls.clone(),
+                    decision: local_confidence
+                        .map(|confidence| fixture_decision(confidence, WorkKind::Coding)),
+                })),
+                jev: None,
+                mode,
+                laya_threshold: 0.95,
+                jev_threshold: 0.75,
+            };
+            let answer = chain
+                .choose("review code", || async {
+                    hosted_count.fetch_add(1, Ordering::SeqCst);
+                    Some(WorkKind::Research)
+                })
+                .await;
+            assert_eq!(answer, expected);
+            assert_eq!(hosted_count.load(Ordering::SeqCst), hosted_calls);
+            assert_eq!(
+                local_calls.load(Ordering::SeqCst),
+                usize::from(mode != LayaMode::Off)
+            );
+        }
+    }
+
+    #[test]
+    fn local_requires_answer_probability_not_jev_entropy_confidence() {
+        let mut payload = json!({
+            "model":"multilingual",
+            "answers":{"work_kind":{"type":"choice","choice":"coding",
+                "confidence":0.99,"answer_confidence":0.61,
+                "probabilities":{"conversation":0.10,"quick_answer":0.10,
+                    "research":0.09,"coding":0.61,"action_request":0.10}}},
+            "usage":{"input_tokens":20,"output_tokens":0}
+        });
+        let decision = parse_laya_response(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(decision.confidence, 0.61);
+        assert_eq!(decision.usable_kind_at(0.95), None);
+        payload["answers"]["work_kind"]
+            .as_object_mut()
+            .unwrap()
+            .remove("answer_confidence");
+        assert!(parse_laya_response(&serde_json::to_vec(&payload).unwrap()).is_err());
+        payload["answers"]["work_kind"]["answer_confidence"] = json!(0.99);
+        payload["answers"]["work_kind"]["choice"] = json!("execute_shell");
+        assert!(parse_laya_response(&serde_json::to_vec(&payload).unwrap()).is_err());
+        assert!(parse_laya_response(&vec![b'x'; MAX_RESPONSE_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn local_endpoint_rejects_tcp_and_unsafe_urls() {
+        for endpoint in [
+            "http://192.0.2.10:8091/v1/systemone",
+            "https://127.0.0.1:8091/v1/systemone",
+            "http://127.0.0.1:8091/v1/systemone?token=x",
+            "http://user@127.0.0.1:8091/v1/systemone",
+        ] {
+            assert!(LayaRouter::with_socket(endpoint, LOCAL_SOCKET, 1000).is_err());
+        }
+        assert!(LayaRouter::new(1000).is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_unix_socket_contract_has_no_credential_and_bounds_responses() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("laya.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            loop {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                header.push(byte[0]);
+                assert!(header.len() < 8192);
+                if header.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = String::from_utf8(header).unwrap();
+            assert!(header.starts_with("POST /v1/systemone HTTP/1.1"));
+            assert!(!header.to_ascii_lowercase().contains("authorization:"));
+            let length = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            let mut request = vec![0; length];
+            socket.read_exact(&mut request).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&request).unwrap();
+            assert!(
+                body.get("model").is_none(),
+                "local model must auto-route by language"
+            );
+            assert_eq!(body["state"]["user_request"], "Hoi, bekijk mijn code");
+            let reply = json!({"model":"multilingual",
+                "answers":{"work_kind":{"type":"choice","choice":"coding",
+                    "confidence":0.98,"answer_confidence":0.98,
+                    "probabilities":{"conversation":0.005,"quick_answer":0.005,
+                        "research":0.005,"coding":0.98,"action_request":0.005}}},
+                "usage":{"input_tokens":20,"output_tokens":0}})
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let local =
+            LayaRouter::with_socket(LOCAL_ENDPOINT, socket_path.to_str().unwrap(), 1000).unwrap();
+        assert_eq!(
+            local.classify("Hoi, bekijk mijn code").await.unwrap().kind,
+            WorkKind::Coding
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_local_service_immediately_falls_back_without_jev_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("missing.sock");
+        let local = Arc::new(
+            LayaRouter::with_socket(LOCAL_ENDPOINT, socket.to_str().unwrap(), 100).unwrap(),
+        );
+        let chain = IntentRouterChain {
+            laya: Some(local),
+            jev: None,
+            mode: LayaMode::Primary,
+            laya_threshold: 0.95,
+            jev_threshold: 0.75,
+        };
+        assert_eq!(chain.choose("hello", || async { None }).await, None);
+    }
+
+    #[tokio::test]
+    async fn local_socket_timeout_and_oversized_response_degrade_safely() {
+        let directory = tempfile::tempdir().unwrap();
+        let slow_path = directory.path().join("slow.sock");
+        let slow = tokio::net::UnixListener::bind(&slow_path).unwrap();
+        let slow_server = tokio::spawn(async move {
+            let (_connection, _) = slow.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        let router =
+            LayaRouter::with_socket(LOCAL_ENDPOINT, slow_path.to_str().unwrap(), 100).unwrap();
+        assert!(router.classify("Hoi").await.is_err());
+        slow_server.await.unwrap();
+
+        let large_path = directory.path().join("large.sock");
+        let large = tokio::net::UnixListener::bind(&large_path).unwrap();
+        let large_server = tokio::spawn(async move {
+            let (mut connection, _) = large.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = connection.read(&mut request).await.unwrap();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_RESPONSE_BYTES + 1
+            );
+            connection.write_all(header.as_bytes()).await.unwrap();
+        });
+        let router =
+            LayaRouter::with_socket(LOCAL_ENDPOINT, large_path.to_str().unwrap(), 1000).unwrap();
+        assert!(router.classify("Hoi").await.is_err());
+        large_server.await.unwrap();
+    }
 
     #[test]
     fn parses_only_high_confidence_bounded_known_choices() {
@@ -624,6 +1075,7 @@ mod tests {
             router.classify("hello again").await.unwrap_err(),
             "Jev is temporarily unavailable"
         );
+        assert!(!FastIntentProvider::may_send(&router));
     }
 
     #[tokio::test]
