@@ -4,6 +4,7 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 fixture=$(mktemp -d /tmp/jarvis-laya-provision.XXXXXXXX)
 trap 'rm -rf -- "$fixture"' EXIT
+trap 'rc=$?; echo "Laya provisioning fixture failed at line $LINENO: $BASH_COMMAND" >&2; [[ ! -f $fixture/output ]] || sed -n "1,12p" "$fixture/output" >&2; exit "$rc"' ERR
 mkdir -p "$fixture/reviewed/wheels" "$fixture/runtime"
 printf 'laya[serve]==0.3.20 --hash=sha256:%064d\n' 0 > "$fixture/reviewed/requirements.lock"
 printf 'fixture wheel bytes\n' > "$fixture/reviewed/wheels/fixture.whl"
