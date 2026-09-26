@@ -39,7 +39,8 @@ assert os.geteuid() != 0
 assert os.readlink('/proc/self/ns/net') != (root / 'host-netns').read_text()
 assert (root / 'input').read_text() == 'reviewed fixture bytes\\n'
 (root / 'candidate' / 'write-proof').write_text('writable\\n')
-assert set(os.environ) == {'PATH', 'HOME', 'PIP_NO_CACHE_DIR', 'PYTHONDONTWRITEBYTECODE'}
+assert set(os.environ) == {'PATH', 'HOME', 'PIP_NO_CACHE_DIR', 'PYTHONDONTWRITEBYTECODE', 'LC_CTYPE'}
+assert os.environ['LC_CTYPE'] == 'C.UTF-8'
 for family, host, port in ((socket.AF_INET, '127.0.0.1', int(sys.argv[2])),
                            (socket.AF_INET6, '::1', int(sys.argv[3]))):
     try:
