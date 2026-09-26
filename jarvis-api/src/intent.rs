@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use reqwest::{redirect::Policy, Client, Url};
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::{oneshot, Semaphore};
 
 use crate::{metering::record_usage_with_metadata, AppState};
 
@@ -18,6 +19,8 @@ const DEFAULT_JEV_CONFIDENCE: f64 = 0.75;
 // the root-owned systemd Unix socket, so there is no DNS or TCP listener.
 const LOCAL_ENDPOINT: &str = "http://jarvis-laya.local/v1/systemone";
 const LOCAL_SOCKET: &str = "/run/jarvis-laya.sock";
+const MAX_SHADOW_TASKS: usize = 4;
+const SHADOW_TASK_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const MAX_BILLABLE_INPUT_TOKENS: u32 = 4_096;
 pub(crate) const MAX_BILLABLE_OUTPUT_TOKENS: u32 = 512;
 
@@ -174,19 +177,41 @@ impl IntentRouterChain {
                 hosted().await
             }
             LayaMode::Shadow => {
-                let local = async {
-                    match self.laya.as_deref() {
-                        Some(laya) => laya
-                            .classify(latest_user_turn)
-                            .await
-                            .ok()
-                            .and_then(|decision| decision.usable_kind_at(self.laya_threshold)),
-                        None => None,
-                    }
-                };
-                let (actual, shadow) = tokio::join!(hosted(), local);
-                tracing::debug!(actual = ?actual, shadow = ?shadow, agrees = actual == shadow,
-                    "shadow intent comparison");
+                let comparison = self.laya.as_ref().and_then(|laya| {
+                    self.shadow_slots
+                        .clone()
+                        .try_acquire_owned()
+                        .ok()
+                        .map(|permit| (Arc::clone(laya), permit))
+                });
+                let actual_sender = comparison.map(|(laya, permit)| {
+                    let turn = latest_user_turn.to_owned();
+                    let threshold = self.laya_threshold;
+                    let (sender, receiver) = oneshot::channel();
+                    // The permit bounds concurrent observations; the timeout also
+                    // bounds a provider that never replies or an abandoned request.
+                    // Tokio aborts this task on runtime shutdown.
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let observation = async {
+                            let shadow = laya
+                                .classify(&turn)
+                                .await
+                                .ok()
+                                .and_then(|decision| decision.usable_kind_at(threshold));
+                            if let Ok(actual) = receiver.await {
+                                tracing::debug!(actual = ?actual, shadow = ?shadow,
+                                    agrees = actual == shadow, "shadow intent comparison");
+                            }
+                        };
+                        let _ = tokio::time::timeout(SHADOW_TASK_TIMEOUT, observation).await;
+                    });
+                    sender
+                });
+                let actual = hosted().await;
+                if let Some(sender) = actual_sender {
+                    let _ = sender.send(actual);
+                }
                 actual
             }
         }
@@ -212,6 +237,26 @@ pub struct IntentRouterChain {
     pub mode: LayaMode,
     pub laya_threshold: f64,
     pub jev_threshold: f64,
+    shadow_slots: Arc<Semaphore>,
+}
+
+impl IntentRouterChain {
+    pub fn new(
+        laya: Option<Arc<dyn FastIntentProvider>>,
+        jev: Option<Arc<dyn FastIntentProvider>>,
+        mode: LayaMode,
+        laya_threshold: f64,
+        jev_threshold: f64,
+    ) -> Self {
+        Self {
+            laya,
+            jev,
+            mode,
+            laya_threshold,
+            jev_threshold,
+            shadow_slots: Arc::new(Semaphore::new(MAX_SHADOW_TASKS)),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -509,20 +554,21 @@ fn parse_provider_response(bytes: &[u8], local: bool) -> Result<IntentDecision, 
         })
         || !(0.95..=1.05).contains(&answer.probabilities.values().sum::<f64>())
     {
-        return Err("Jev decision is uncertain or malformed");
+        return Err("System-1 decision is uncertain or malformed");
     }
-    let kind = WorkKind::parse(&answer.choice).ok_or("Jev returned an unknown task kind")?;
+    let kind =
+        WorkKind::parse(&answer.choice).ok_or("System-1 provider returned an unknown task kind")?;
     let choice_probability = answer
         .probabilities
         .get(&answer.choice)
         .copied()
-        .ok_or("Jev decision is uncertain")?;
+        .ok_or("System-1 decision is uncertain")?;
     if answer
         .probabilities
         .values()
         .any(|alternative| *alternative > choice_probability)
     {
-        return Err("Jev decision is uncertain");
+        return Err("System-1 decision is uncertain");
     }
     Ok(IntentDecision {
         kind,
@@ -656,6 +702,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Notify;
 
     struct FixtureProvider {
         calls: Arc<AtomicUsize>,
@@ -683,6 +730,89 @@ mod tests {
         }
     }
 
+    struct BlockedShadow {
+        calls: Arc<AtomicUsize>,
+        started: Arc<Notify>,
+        finished: Arc<Notify>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl FastIntentProvider for BlockedShadow {
+        fn provider_id(&self) -> &'static str {
+            "laya"
+        }
+        async fn classify(&self, _: &str) -> Result<IntentDecision, &'static str> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release
+                .acquire()
+                .await
+                .map_err(|_| "shadow stopped")?
+                .forget();
+            self.finished.notify_one();
+            Err("local unavailable")
+        }
+    }
+
+    #[tokio::test]
+    async fn shadow_never_waits_for_slow_or_failed_local_and_is_bounded() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let chain = IntentRouterChain::new(
+            Some(Arc::new(BlockedShadow {
+                calls: calls.clone(),
+                started: started.clone(),
+                finished: finished.clone(),
+                release: release.clone(),
+            })),
+            None,
+            LayaMode::Shadow,
+            0.95,
+            0.75,
+        );
+        let hosted_calls = AtomicUsize::new(0);
+        for _ in 0..MAX_SHADOW_TASKS {
+            // A held shadow can never make the authoritative hosted decision wait.
+            let answer = tokio::time::timeout(
+                Duration::from_secs(1),
+                chain.choose("review code", || async {
+                    hosted_calls.fetch_add(1, Ordering::SeqCst);
+                    Some(WorkKind::Research)
+                }),
+            )
+            .await
+            .expect("shadow delayed authoritative route");
+            assert_eq!(answer, Some(WorkKind::Research));
+            tokio::time::timeout(Duration::from_secs(1), started.notified())
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_SHADOW_TASKS);
+        assert_eq!(hosted_calls.load(Ordering::SeqCst), MAX_SHADOW_TASKS);
+        // Saturation drops only shadow work; it must not drop the real route.
+        assert_eq!(
+            chain
+                .choose("another prompt", || async {
+                    hosted_calls.fetch_add(1, Ordering::SeqCst);
+                    Some(WorkKind::Coding)
+                })
+                .await,
+            Some(WorkKind::Coding)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_SHADOW_TASKS);
+        assert_eq!(hosted_calls.load(Ordering::SeqCst), MAX_SHADOW_TASKS + 1);
+        for _ in 0..MAX_SHADOW_TASKS {
+            release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(1), finished.notified())
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_SHADOW_TASKS);
+    }
+
     #[tokio::test]
     async fn local_primary_shadow_and_fallback_never_duplicate_hosted_decision() {
         for (mode, local_confidence, expected, hosted_calls) in [
@@ -694,17 +824,17 @@ mod tests {
         ] {
             let local_calls = Arc::new(AtomicUsize::new(0));
             let hosted_count = Arc::new(AtomicUsize::new(0));
-            let chain = IntentRouterChain {
-                laya: Some(Arc::new(FixtureProvider {
+            let chain = IntentRouterChain::new(
+                Some(Arc::new(FixtureProvider {
                     calls: local_calls.clone(),
                     decision: local_confidence
                         .map(|confidence| fixture_decision(confidence, WorkKind::Coding)),
                 })),
-                jev: None,
+                None,
                 mode,
-                laya_threshold: 0.95,
-                jev_threshold: 0.75,
-            };
+                0.95,
+                0.75,
+            );
             let answer = chain
                 .choose("review code", || async {
                     hosted_count.fetch_add(1, Ordering::SeqCst);
@@ -713,10 +843,12 @@ mod tests {
                 .await;
             assert_eq!(answer, expected);
             assert_eq!(hosted_count.load(Ordering::SeqCst), hosted_calls);
-            assert_eq!(
-                local_calls.load(Ordering::SeqCst),
-                usize::from(mode != LayaMode::Off)
-            );
+            if mode != LayaMode::Shadow {
+                assert_eq!(
+                    local_calls.load(Ordering::SeqCst),
+                    usize::from(mode != LayaMode::Off)
+                );
+            }
         }
     }
 
@@ -823,13 +955,7 @@ mod tests {
         let local = Arc::new(
             LayaRouter::with_socket(LOCAL_ENDPOINT, socket.to_str().unwrap(), 100).unwrap(),
         );
-        let chain = IntentRouterChain {
-            laya: Some(local),
-            jev: None,
-            mode: LayaMode::Primary,
-            laya_threshold: 0.95,
-            jev_threshold: 0.75,
-        };
+        let chain = IntentRouterChain::new(Some(local), None, LayaMode::Primary, 0.95, 0.75);
         assert_eq!(chain.choose("hello", || async { None }).await, None);
     }
 

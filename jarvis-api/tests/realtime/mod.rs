@@ -193,13 +193,13 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     let contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut fixture = state(db.clone(), None).await;
     fixture.llm = Arc::new(Fake(count.clone(), contexts.clone()));
-    fixture.fast_intent_router = Some(Arc::new(IntentRouterChain {
-        laya: None,
-        jev: Some(Arc::new(FakeJev(jev_count.clone()))),
-        mode: LayaMode::Off,
-        laya_threshold: 0.95,
-        jev_threshold: 0.75,
-    }));
+    fixture.fast_intent_router = Some(Arc::new(IntentRouterChain::new(
+        None,
+        Some(Arc::new(FakeJev(jev_count.clone()))),
+        LayaMode::Off,
+        0.95,
+        0.75,
+    )));
     let hub = fixture.realtime.clone();
     let app = build_router(fixture);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

@@ -58,7 +58,7 @@ def predict(text, timeout):
     answer = json.loads(raw)["answers"]["work_kind"]
     choice = answer["choice"]
     confidence = answer["answer_confidence"]
-    if choice not in LABELS or not isinstance(confidence, (int, float)) or not math.isfinite(confidence):
+    if choice not in LABELS or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
         raise ValueError("invalid classifier answer")
     return choice, confidence, latency_ms
 
@@ -79,6 +79,54 @@ def process_cpu_seconds(pid):
     return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
 
 
+def evaluate_cases(cases, threshold, timeout, predictor=predict):
+    """Every labeled fixture counts; unavailable predictions are incorrect.
+
+    Coverage is accepted/total, and accepted accuracy is correct/accepted.
+    This local-only evaluator never calls Jev or a generative provider.
+    """
+    counts = Counter()
+    per_class = defaultdict(Counter)
+    confusion = defaultdict(Counter)
+    latencies = []
+    errors = 0
+    for case in cases:
+        expected, text = case["expected"], case["text"]
+        if expected not in LABELS or not isinstance(text, str) or not 1 <= len(text) <= 4096:
+            raise ValueError("invalid fixture")
+        per_class[expected]["total"] += 1
+        try:
+            predicted, confidence, ms = predictor(text, timeout)
+            latencies.append(ms)
+            accepted = confidence >= threshold
+            correct = predicted == expected
+            counts["accepted"] += accepted
+            counts["accepted_correct"] += accepted and correct
+            counts["correct"] += correct
+            per_class[expected]["correct"] += correct
+            confusion[expected][predicted] += 1
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            errors += 1
+            confusion[expected]["unavailable"] += 1
+    total = len(cases)
+    accepted = counts["accepted"]
+    return {
+        "count": total, "errors": errors,
+        "accuracy": round(counts["correct"] / total, 4),
+        "accepted_count": accepted,
+        "accepted_correct": counts["accepted_correct"],
+        "accepted_accuracy": round(counts["accepted_correct"] / accepted, 4) if accepted else None,
+        "coverage_at_threshold": round(accepted / total, 4),
+        "fallback_percentage": round(100 * (1 - accepted / total), 2),
+        "jev_comparison": {"available": False},
+        "per_class": {label: {"correct": per_class[label]["correct"],
+            "total": per_class[label]["total"]} for label in LABELS},
+        "confusion": dict(confusion),
+        "p50_ms": percentile(latencies, 0.5), "p95_ms": percentile(latencies, 0.95),
+        "p99_ms": percentile(latencies, 0.99) if len(latencies) >= 100 else None,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--corpus", type=Path, default=Path(__file__).with_name("intent-corpus.json"))
@@ -92,49 +140,24 @@ def main():
     cases = json.loads(args.corpus.read_text())
     if not isinstance(cases, list) or not 1 <= len(cases) <= 10000:
         parser.error("corpus must contain 1-10000 entries")
-    counts = Counter()
-    per_class = defaultdict(Counter)
-    confusion = defaultdict(Counter)
-    latencies = []
-    errors = 0
     cpu_before = process_cpu_seconds(args.pid)
     started = time.monotonic()
-    for case in cases:
-        expected, text = case["expected"], case["text"]
-        if expected not in LABELS or not isinstance(text, str) or not 1 <= len(text) <= 4096:
-            parser.error("invalid fixture")
-        try:
-            predicted, confidence, ms = predict(text, args.timeout)
-            latencies.append(ms)
-            counts["covered"] += confidence >= args.threshold
-            counts["correct"] += predicted == expected
-            per_class[expected]["total"] += 1
-            per_class[expected]["correct"] += predicted == expected
-            confusion[expected][predicted] += 1
-        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-            errors += 1
+    try:
+        metrics = evaluate_cases(cases, args.threshold, args.timeout)
+    except ValueError as error:
+        parser.error(str(error))
     elapsed = time.monotonic() - started
     cpu_after = process_cpu_seconds(args.pid)
-    total = len(cases)
     result = {
-        "count": total, "errors": errors,
-        "accuracy": round(counts["correct"] / total, 4),
-        "coverage_at_threshold": round(counts["covered"] / total, 4),
-        "fallback_percentage": round(100 * (1 - counts["covered"] / total), 2),
-        "disagreement_rate_with_jev": None,
-        "per_class": {label: {"correct": per_class[label]["correct"],
-            "total": per_class[label]["total"]} for label in LABELS},
-        "confusion": dict(confusion),
-        "p50_ms": percentile(latencies, 0.5), "p95_ms": percentile(latencies, 0.95),
-        "p99_ms": percentile(latencies, 0.99) if len(latencies) >= 100 else None,
-        "requests_per_second": round(total / elapsed, 3),
+        **metrics,
+        "requests_per_second": round(len(cases) / elapsed, 3),
         "rss_kb": process_rss_kb(args.pid),
         "cold_load_ms": args.cold_load_ms,
         "cpu_percent_of_one_core": round(100 * (cpu_after - cpu_before) / elapsed, 2)
             if cpu_before is not None and cpu_after is not None else None,
     }
     print(json.dumps(result, indent=2, sort_keys=True))
-    if errors:
+    if metrics["errors"]:
         raise SystemExit(1)
 
 

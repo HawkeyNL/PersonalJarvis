@@ -11,7 +11,9 @@ prompts or entire conversation.
 
 `JARVIS_LAYA_MODE=off` is the default and preserves Jev-only behavior. In
 `shadow`, Jev determines the actual route and local Laya is observed only for
-comparison; a Laya result cannot trigger research, coding or any action. In
+comparison. The authoritative route does not await Laya: at most four shadow
+observations run concurrently, each bounded to five seconds, and excess
+observations are skipped. A Laya result cannot trigger research, coding or any action. In
 `primary`, a valid Laya answer at or above the local threshold determines the
 advisory label; otherwise Jev is attempted once if configured and budgeted;
 otherwise ordinary Jarvis Auto routing remains. Explicit Fast/Deep/Research
@@ -62,7 +64,9 @@ revision above and allow only
 configuration/tokenizer text or JSON and `.safetensors` files. Review the
 generated checksum manifest before moving the snapshot into root-owned
 staging. No Python model repository code, pickle `.bin` file, symlink, or
-world-writable artifact is accepted by the provisioner. It installs with
+world-writable artifact is accepted by the provisioner. Reviewed staging stays
+root:root and unchanged across retries; a temporary root:jarvis-laya read-only
+wheelhouse/lockfile copy is deleted on success or failure. It installs with
 `pip --no-index --require-hashes`; normal service startup has
 `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` and needs no network.
 
@@ -80,7 +84,10 @@ uses a root-managed runtime and model snapshot, and activates the Python venv
 with a local symlink. The service receives only the root-owned systemd Unix
 socket `/run/jarvis-laya.sock` (root:jarvis, 0660), never a TCP listener, Caddy
 or LAN. Core uses a fixed virtual HTTP hostname over that socket; DNS is not
-consulted. The service runs CPU-only with a resident model, bounds memory/tasks, and has no
+consulted. systemd passes the listening fd to the unprivileged service, so
+`jarvis-laya` does not need membership in the socket's `jarvis` client group.
+Core updates use `try-restart` only: an inactive owner-disabled Laya service
+or socket stays inactive, while an already active one may restart. The service runs CPU-only with a resident model, bounds memory/tasks, and has no
 need for `/etc/jarvis/secrets`, private agents, Docker or owner home. The
 optional `/etc/jarvis/laya.env` is for trusted local tuning such as
 `LAYA_THREADS=2`; the wrapper ignores attempts to set a TCP host or API key.
@@ -103,12 +110,14 @@ python3 tools/laya/benchmark.py \
   --pid "$(systemctl show -p MainPID --value jarvis-laya.service)"
 ```
 
-The report includes accuracy, per-class counts, confusion matrix, threshold
-coverage/fallback rate, p50/p95 latency, p99 for at least 100 samples,
+The report includes raw accuracy (correct / all fixtures), per-class counts
+(including unavailable/error fixtures in the denominator), confusion matrix,
+threshold coverage (accepted / all fixtures), accepted accuracy (correct
+accepted / accepted, or null if none), fallback rate, p50/p95 latency, p99 for at least 100 samples,
 requests/s, RSS and process CPU. Cold model load must be measured separately
 when starting the service and supplied with `--cold-load-ms`; it is never
-fabricated from a warm request. `disagreement_rate_with_jev` remains `null`
-unless a budgeted Core shadow evaluation is collected. The harness never
+fabricated from a warm request. `jev_comparison.available=false` makes clear
+that this local-only harness does not compare Jev. The harness never
 calls paid Jev directly or bypasses Core's budget. Public upstream benchmark
 scores are not Jarvis acceptance evidence; upstream also cautions that base
 checkpoints can be overconfident or weak on unfamiliar typed decisions.

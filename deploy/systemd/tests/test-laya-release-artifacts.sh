@@ -7,8 +7,13 @@ grep -Fxq 'ListenStream=/run/jarvis-laya.sock' "$socket_unit"
 grep -Fxq 'SocketUser=root' "$socket_unit"
 grep -Fxq 'SocketGroup=jarvis' "$socket_unit"
 grep -Fxq 'SocketMode=0660' "$socket_unit"
+grep -Fxq 'User=jarvis-laya' "$repo/deploy/systemd/jarvis-laya.service"
+grep -Fxq 'Group=jarvis-laya' "$repo/deploy/systemd/jarvis-laya.service"
+! grep -Eq '^SupplementaryGroups=.*jarvis([[:space:]]|$)' "$repo/deploy/systemd/jarvis-laya.service"
 ! grep -Eq '^Listen(Stream|Datagram)=[0-9]|^Listen(Stream|Datagram)=127[.]' "$socket_unit"
 grep -Fxq 'RestrictAddressFamilies=AF_UNIX' "$repo/deploy/systemd/jarvis-laya.service"
+[[ $(grep -Ec '^[[:space:]]*systemctl try-restart jarvis-laya\.(socket|service)' "$repo/deploy/systemd/update-core-release.sh") == 4 ]]
+! grep -Eq '^[[:space:]]*systemctl (enable|start|restart) jarvis-laya\.(socket|service)' "$repo/deploy/systemd/update-core-release.sh"
 fixture=$(mktemp -d /tmp/jarvis-laya-release.XXXXXXXX)
 trap 'rm -rf -- "$fixture"' EXIT
 release=$fixture/release

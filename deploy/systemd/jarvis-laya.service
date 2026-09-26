@@ -10,6 +10,8 @@ ConditionPathExists=/var/lib/jarvis-laya/models/55cf4c4ebb4ebe31b2550e8bdf3bd21b
 Type=exec
 User=jarvis-laya
 Group=jarvis-laya
+# systemd passes the listening socket fd; this identity does not need to
+# connect to /run/jarvis-laya.sock or join its client-facing jarvis group.
 ExecStart=/opt/jarvis/laya/current/bin/python /opt/jarvis/current/laya-offline.py
 WorkingDirectory=/var/lib/jarvis-laya
 Environment=PYTHONDONTWRITEBYTECODE=1

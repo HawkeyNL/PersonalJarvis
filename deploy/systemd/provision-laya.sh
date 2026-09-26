@@ -2,6 +2,35 @@
 # Owner-operated offline activation from a separately reviewed, root-staged
 # wheelhouse and exact HF snapshot. Never invoked by Core or at service start.
 set -euo pipefail
+prepare_installer_input() {
+    local source=$1 destination=$2 reader_group=$3 unsafe wheel_count bytes
+    [[ -d $source && ! -L $source && -d $source/wheels && ! -L $source/wheels ]] ||
+        fail 'unsafe reviewed installer source'
+    [[ -f $source/requirements.lock && ! -L $source/requirements.lock ]] ||
+        fail 'missing reviewed requirements.lock'
+    unsafe=$(find "$source/wheels" \( -type l -o ! -type d -a ! -type f \) -print -quit)
+    [[ -z $unsafe ]] || fail "unsafe wheelhouse entry: $unsafe"
+    wheel_count=$(find "$source/wheels" -type f -printf '.\n' | wc -l)
+    bytes=$(du -sb -- "$source/wheels" "$source/requirements.lock" | awk '{sum += $1} END {print sum+0}')
+    (( wheel_count >= 1 && wheel_count <= 512 && bytes <= 17179869184 )) ||
+        fail 'reviewed installer input exceeds count or size bounds'
+    cp -a -- "$source/requirements.lock" "$source/wheels" "$destination/"
+    chown -R "$(id -u):$reader_group" "$destination"
+    find "$destination" -type d -exec chmod 0750 {} +
+    find "$destination" -type f -exec chmod 0640 {} +
+}
+fail() { echo "Laya provisioning: $*" >&2; exit 1; }
+# CI exercises the exact materialization/cleanup path with fixture-sized inputs.
+# This unprivileged mode cannot provision or activate a runtime.
+if [[ ${1:-} == --fixture-installer-input ]]; then
+    [[ $# == 3 && ${GITHUB_ACTIONS:-} == true && $EUID != 0 && $3 == /tmp/* && -d $3 && ! -L $3 ]] ||
+        fail 'unsafe installer fixture invocation'
+    fixture_input=$(mktemp -d "$3/.installer-input.XXXXXXXX")
+    trap 'rm -rf -- "$fixture_input"' EXIT
+    prepare_installer_input "$2" "$fixture_input" "$(id -gn)"
+    [[ -f $fixture_input/requirements.lock && -d $fixture_input/wheels ]] || fail 'fixture copy failed'
+    fail 'simulated failure after temporary installer input preparation'
+fi
 [[ $EUID == 0 ]] || { echo 'Laya provisioning requires root' >&2; exit 1; }
 readonly revision=55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851
 readonly wheel_sha=6039e802fa5effb8dd492061cd7ad39a43087beadc4a4fa4a649614e77eb83d4
@@ -10,11 +39,10 @@ readonly root=/opt/jarvis/laya
 readonly models=/var/lib/jarvis-laya/models
 readonly wheel=$stage/wheels/laya-0.3.20-py3-none-any.whl
 readonly snapshot=$stage/models/$revision
-fail() { echo "Laya provisioning: $*" >&2; exit 1; }
 
 for directory in /var/cache/jarvis-laya "$stage" "$stage/wheels" "$stage/models" "$snapshot"; do
     [[ -d $directory && ! -L $directory ]] || fail "missing or unsafe staging directory: $directory"
-    [[ $(stat -c '%u' "$directory") == 0 ]] || fail "staging directory is not root-owned: $directory"
+    [[ $(stat -c '%u:%g' "$directory") == 0:0 ]] || fail "staging directory is not root:root: $directory"
     mode=$(stat -c '%a' "$directory")
     (( (8#$mode & 0022) == 0 )) || fail "staging directory is writable by non-owner: $directory"
 done
@@ -31,7 +59,7 @@ LC_ALL=C awk '
 grep -Eq '^laya\[serve\]==0[.]3[.]20([[:space:]\\]|$)' "$stage/requirements.lock" ||
     fail 'lockfile does not pin laya[serve]==0.3.20'
 grep -Fq "sha256:$wheel_sha" "$stage/requirements.lock" || fail 'lockfile omits reviewed Laya wheel hash'
-unsafe=$(find "$stage" \( -type l -o -type f \( -perm /022 -o ! -user root -o ! -group root \) \) -print -quit)
+unsafe=$(find "$stage" \( -type l -o \( -type f -o -type d \) \( -perm /022 -o ! -user root -o ! -group root \) -o ! -type f -a ! -type d \) -print -quit)
 [[ -z $unsafe ]] || fail "unsafe staged file or symlink: $unsafe"
 unsafe=$(find "$snapshot" -type f ! \( -name '*.json' -o -name '*.safetensors' -o -name '*.txt' -o -name '*.model' \) -print -quit)
 [[ -z $unsafe ]] || fail "unexpected model file: $unsafe"
@@ -64,24 +92,22 @@ install -d -o root -g root -m 0755 "$root" "$root/releases"
 install -d -o root -g jarvis-laya -m 0750 /var/lib/jarvis-laya "$models"
 candidate=$(mktemp -d "$root/releases/.laya-0.3.20.XXXXXXXX")
 model_candidate=$(mktemp -d "$models/.snapshot.XXXXXXXX")
+installer_input=$(mktemp -d "$root/releases/.installer-input.XXXXXXXX")
 cleanup() {
     [[ -z ${candidate:-} || ! -d $candidate ]] || rm -rf -- "$candidate"
     [[ -z ${model_candidate:-} || ! -d $model_candidate ]] || rm -rf -- "$model_candidate"
+    [[ -z ${installer_input:-} || ! -d $installer_input ]] || rm -rf -- "$installer_input"
 }
 trap cleanup EXIT
 python3 -m venv "$candidate"
-# The wheelhouse is read-only to the service identity. Execute third-party
-# installer code without root authority or an inherited privileged environment.
-chgrp jarvis-laya /var/cache/jarvis-laya
-chmod 0750 /var/cache/jarvis-laya
-chown -R root:jarvis-laya "$stage"
-find "$stage" -type d -exec chmod 0750 {} +
-find "$stage" -type f -exec chmod 0640 {} +
+# Never mutate canonical reviewed root:root staging. Only this disposable copy
+# is readable by jarvis-laya; pip still runs offline and requires lockfile hashes.
+prepare_installer_input "$stage" "$installer_input" jarvis-laya
 chown -R jarvis-laya:jarvis-laya "$candidate"
 runuser -u jarvis-laya -- env -i PATH=/usr/bin:/bin HOME=/nonexistent \
     PIP_NO_CACHE_DIR=1 PYTHONDONTWRITEBYTECODE=1 \
     "$candidate/bin/python" -m pip install --disable-pip-version-check --no-index \
-    --find-links "$stage/wheels" --require-hashes -r "$stage/requirements.lock" >/dev/null
+    --find-links "$installer_input/wheels" --require-hashes -r "$installer_input/requirements.lock" >/dev/null
 [[ $(runuser -u jarvis-laya -- env -i PATH=/usr/bin:/bin HOME=/nonexistent \
     "$candidate/bin/python" -c 'import importlib.metadata; print(importlib.metadata.version("laya"))') == 0.3.20 ]] ||
     fail 'installed Laya version differs from reviewed wheel'

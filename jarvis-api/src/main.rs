@@ -503,13 +503,13 @@ async fn main() -> anyhow::Result<()> {
                 .transpose()
                 .map_err(anyhow::Error::msg)?;
             (jev.is_some() || laya.is_some()).then(|| {
-                Arc::new(IntentRouterChain {
+                Arc::new(IntentRouterChain::new(
                     laya,
                     jev,
                     mode,
-                    laya_threshold: config.laya_confidence_threshold,
-                    jev_threshold: config.jev_confidence_threshold,
-                })
+                    config.laya_confidence_threshold,
+                    config.jev_confidence_threshold,
+                ))
             })
         },
         llm_max_tokens: config.llm_max_tokens,
