@@ -863,9 +863,11 @@ prepare_laya_candidate() {
     local tag=$1
     prepare_candidate "$tag" "$same_migrations" "${tag#v}" "${tag#v}" "${tag#v}" true '' true
 }
-for mode in inactive socket_only warm; do
+for mode in disabled inactive socket_only warm; do
     seed_active_release v11.0.0 "$same_migrations" true true
     case $mode in
+        disabled)
+            set_laya_state ; expected='' ;;
         inactive)
             # Enabled is independent from active; a stopped enabled service
             # must not be started just because its unit definition changed.
