@@ -43,6 +43,11 @@ pub use types::{
 pub trait LlmProvider: Send + Sync {
     /// Short label for telemetry / UI (e.g. `"anthropic:claude-sonnet-5"`).
     fn label(&self) -> &str;
+    /// Read-only availability hint for advisory routing. Providers that do not
+    /// maintain a model catalog keep their existing behavior by default.
+    fn can_serve_tier(&self, _tier: Tier) -> bool {
+        true
+    }
     /// Generate a reply for the conversation at the requested tier.
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError>;
     /// Only user-visible assistant text may reach this callback. Providers

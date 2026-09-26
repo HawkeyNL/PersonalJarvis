@@ -30,13 +30,16 @@ chmod 0755 "$stub"
 # clean CI runner.  Verify copies with only those fixed binary paths replaced;
 # this still catches unit syntax and hardening regressions without mutating
 # /opt, /usr/local, or the runner's service state.
-for unit in "$repo_dir"/deploy/systemd/*.service "$repo_dir"/deploy/systemd/*.timer; do
+for unit in "$repo_dir"/deploy/systemd/*.service "$repo_dir"/deploy/systemd/*.timer "$repo_dir"/deploy/systemd/*.socket; do
     candidate="$fixture_dir/${unit##*/}"
     sed -E \
         -e "s#^(ExecStart|ExecStartPre)=/opt/jarvis/current/[^[:space:]]+#\\1=$stub#" \
         -e "s#^(ExecStart|ExecStartPre)=/usr/local/(sbin|libexec)/jarvis[^[:space:]]*#\\1=$stub#" \
         -e "s#^(ExecStart|ExecStartPre)=/usr/local/bin/codex#\\1=$stub#" \
+        -e "s#^(ExecStart|ExecStartPre)=/opt/jarvis/laya/current/bin/python.*#\\1=$stub#" \
         "$unit" > "$candidate"
+done
+for candidate in "$fixture_dir"/*.service "$fixture_dir"/*.timer "$fixture_dir"/*.socket; do
     systemd-analyze verify "$candidate"
 done
 echo "Systemd runtime lifecycle checks passed"

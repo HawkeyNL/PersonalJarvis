@@ -16,7 +16,7 @@ usage() {
     cat >&2 <<'EOF'
 Usage: sudo jarvis-credentials <set|list|test|remove> [provider]
 
-Providers: anthropic, openai, deepseek, xai, zai, ollama-cloud, huggingface.
+Providers: anthropic, openai, deepseek, xai, zai, ollama-cloud, huggingface, jev.
 Local Ollama has no credential; configure its loopback URL/model in core.env.
 EOF
     exit 64
@@ -31,6 +31,7 @@ provider_var() {
         zai) printf '%s\n' JARVIS_LLM_ZAI_API_KEY ;;
         ollama-cloud) printf '%s\n' JARVIS_LLM_OLLAMA_CLOUD_API_KEY ;;
         huggingface) printf '%s\n' JARVIS_LLM_HUGGINGFACE_API_KEY ;;
+        jev) printf '%s\n' JARVIS_LLM_JEV_API_KEY ;;
         *) return 1 ;;
     esac
 }
@@ -176,7 +177,7 @@ install_credential_candidate() (
 list_credentials() {
     local provider file configured
     printf '%-16s %-12s %s\n' PROVIDER CONFIGURED STATUS
-    for provider in anthropic openai deepseek xai zai ollama-cloud huggingface; do
+    for provider in anthropic openai deepseek xai zai ollama-cloud huggingface jev; do
         file=$(credential_file "$provider")
         configured=no
         [[ -f $file && ! -L $file && $(stat -c '%U:%G:%a' "$file" 2>/dev/null || true) == root:jarvis:640 ]] && configured=yes
@@ -232,6 +233,9 @@ probe_provider() (
             url=$ollama_cloud_tags_url
             printf 'url = "%s"\nheader = "Authorization: Bearer %s"\n' "$url" "$escaped_key" > "$config"
             ;;
+        jev)
+            printf 'url = "https://api.typesafe.ai/v1/models"\nheader = "Authorization: Bearer %s"\n' "$escaped_key" > "$config"
+            ;;
         openai|deepseek|xai|zai|huggingface)
             base=$(openai_compatible_base_url "$provider") || return 1
             [[ $base =~ ^https://[A-Za-z0-9._:/-]+$ ]] || return 1
@@ -248,6 +252,8 @@ probe_provider() (
     [[ $http_code =~ ^2[0-9]{2}$ ]] || return 1
     if [[ $provider == ollama-cloud ]]; then
         jq -e '(.models | type == "array") and any(.models[]?; (.name | type == "string") and (.name | length > 0))' "$response_file" >/dev/null 2>&1
+    elif [[ $provider == jev ]]; then
+        valid_jev_model_response "$response_file" 2>/dev/null
     else
         valid_huggingface_model_response "$response_file" 2>/dev/null
     fi
@@ -255,6 +261,10 @@ probe_provider() (
 
 valid_huggingface_model_response() {
     jq -e '(.data | type == "array") and any(.data[]?; (.id | type == "string") and (.id | length > 0) and (.id | length <= 256) and (.id | test("[[:cntrl:]]") | not))' "$1" >/dev/null
+}
+
+valid_jev_model_response() {
+    jq -e '(.models | type == "array") and any(.models[]?; (.name | type == "string") and (.name | test("^[A-Za-z0-9._:/-]{1,128}$")))' "$1" >/dev/null
 }
 
 # curl config uses quoted values. Escape the only two metacharacters that may

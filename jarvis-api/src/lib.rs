@@ -27,6 +27,7 @@ use std::sync::RwLock;
 mod audit;
 mod error;
 mod extract;
+pub mod intent;
 #[cfg(unix)]
 pub mod local_devices;
 mod mcp;

@@ -1,0 +1,46 @@
+[Unit]
+Description=Jarvis local Laya System-1 classifier (optional)
+After=local-fs.target
+Requires=jarvis-laya.socket
+After=jarvis-laya.socket
+ConditionPathExists=/opt/jarvis/laya/current/bin/python
+ConditionPathExists=/var/lib/jarvis-laya/models/55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851
+
+[Service]
+Type=exec
+User=jarvis-laya
+Group=jarvis-laya
+# systemd passes the listening socket fd; this identity does not need to
+# connect to /run/jarvis-laya.sock or join its client-facing jarvis group.
+ExecStart=/opt/jarvis/laya/current/bin/python /opt/jarvis/current/laya-offline.py
+WorkingDirectory=/var/lib/jarvis-laya
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=LAYA_DEVICE=cpu
+Environment=LAYA_PRELOAD=1
+Environment=LAYA_MODELS=english,multilingual
+EnvironmentFile=-/etc/jarvis/laya.env
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=3min
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+InaccessiblePaths=-/etc/jarvis/secrets -/run/docker.sock -/var/lib/jarvis/agents
+MemoryMax=6G
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

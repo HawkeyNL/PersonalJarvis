@@ -10,6 +10,10 @@ sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-update-core-release.
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-jarvis-admin-cli.sh
 bash deploy/systemd/tests/test-ui-tty.sh
 bash deploy/systemd/tests/test-systemd-runtime-lifecycle.sh
+bash deploy/systemd/tests/test-laya-release-artifacts.sh
+sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-laya-provision-retry.sh
+sudo env GITHUB_ACTIONS=true python3 deploy/systemd/tests/test-laya-networkless.py
+python3 -m unittest discover -s tools/laya -p 'test_*.py'
 bash deploy/systemd/tests/test-production-bootstrap-assets.sh
 bash deploy/systemd/tests/test-output-presentation.sh
 bash deploy/systemd/tests/test-model-credential-boundaries.sh
@@ -17,6 +21,7 @@ bash deploy/systemd/tests/test-model-discovery-pipeline.sh
 bash deploy/systemd/tests/test-hourly-model-catalog.sh
 bash deploy/systemd/tests/test-credential-candidate.sh
 bash deploy/systemd/tests/test-huggingface-credential-probe.sh
+bash deploy/systemd/tests/test-jev-credential-probe.sh
 sudo env GITHUB_ACTIONS=true bash deploy/surrealdb/tests/test-provision-core-user-shellless.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-stage-core-release.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-prepare-codex-worktree.sh

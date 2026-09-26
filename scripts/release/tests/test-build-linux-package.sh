@@ -27,27 +27,29 @@ write_candidate() {
     chmod 0755 "$release/install-home-node-core"
     printf '# fixture terminal presentation\n' > "$release/ui.sh"
     chmod 0644 "$release/ui.sh"
+    install -m 0644 "$repo_dir/deploy/systemd/laya-offline.py" "$release/laya-offline.py"
+    install -m 0755 "$repo_dir/deploy/systemd/provision-laya.sh" "$release/provision-laya"
     cp "$repo_dir/jarvis-core-admin/packaging/com.hawkeynl.jarvis.devices.policy" "$release/com.hawkeynl.jarvis.devices.policy"
     chmod 0644 "$release/com.hawkeynl.jarvis.devices.policy"
     for unit in jarvis-core.service jarvis-config-broker.service jarvis-codex-broker.service \
         jarvis-codex.service jarvis-opensandbox.service jarvis-surrealdb.service \
         jarvis-updater.service jarvis-updater.timer \
         jarvis-private-agent-updater.service jarvis-private-agent-updater.timer \
-        jarvis-model-catalog.service jarvis-model-catalog.timer; do
+        jarvis-model-catalog.service jarvis-model-catalog.timer jarvis-laya.service jarvis-laya.socket; do
         cp "$repo_dir/deploy/systemd/$unit" "$release/systemd-$unit"
         chmod 0644 "$release/systemd-$unit"
     done
     install -m 0644 "$repo_dir/deploy/systemd/pricing-registry.json" "$release/pricing-registry.json"
     jq -n --arg tag "$tag" --arg revision "$revision" \
-        '{tag:$tag,revision:$revision,schema_migration:{version:1,target:8,from_sha256:[("a" * 64)]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1,model_policy_directory:1,model_catalog:1}}' \
+        '{tag:$tag,revision:$revision,schema_migration:{version:1,target:8,from_sha256:[("a" * 64)]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1,model_policy_directory:1,model_catalog:1,laya_runtime:1}}' \
         > "$release/release.json"
     (
         cd "$release"
         sha256sum jarvis-models jarvis-credentials jarvis-model-policy-storage pricing-registry.json \
             com.hawkeynl.jarvis.devices.policy \
-            schema-backup \
+            schema-backup laya-offline.py provision-laya \
             manage-systemd-units verify-home-node install-home-node-core ui.sh \
-            systemd-*.service systemd-*.timer \
+            systemd-*.service systemd-*.timer systemd-*.socket \
             > artifact-binaries.sha256
     )
 }
@@ -60,8 +62,9 @@ archive="$fixture/jarvis-core-$tag-linux-x86_64.tar.gz"
 # Consume the complete listing before assertions: grep -q on a pipe can close
 # early and make a healthy tar fail with SIGPIPE/write error under pipefail.
 tar -tzf "$archive" > "$fixture/archive-members.txt"
-for member in jarvis-models jarvis-credentials jarvis-model-policy-storage pricing-registry.json \
+for member in jarvis-models jarvis-credentials jarvis-model-policy-storage pricing-registry.json laya-offline.py provision-laya \
     systemd-jarvis-model-catalog.service systemd-jarvis-model-catalog.timer \
+    systemd-jarvis-laya.service systemd-jarvis-laya.socket \
     systemd-jarvis-config-broker.service com.hawkeynl.jarvis.devices.policy; do
     grep -Fxq "jarvis-core-$tag/$member" "$fixture/archive-members.txt" || {
         echo "release archive is missing required member: $member" >&2
@@ -84,6 +87,7 @@ jq -e '.tooling.admin_helpers == 1' \
 jq -e '.tooling.systemd_units == 1' \
     "$extracted/jarvis-core-$tag/release.json" >/dev/null
 jq -e '.tooling.model_catalog == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
+jq -e '.tooling.laya_runtime == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
 
 bad_tag=v9.8.8
 write_candidate "$bad_tag"
@@ -110,7 +114,7 @@ fi
 grep -Fq 'managed unit is missing or unsafe: jarvis-config-broker.service' \
     "$fixture/bad-unit.stderr"
 
-for defect in missing tampered symlink capability missing-backup unsupported-schema missing-migration unsafe-migration unsupported-layout missing-catalog-service missing-catalog-timer unsupported-catalog; do
+for defect in missing tampered symlink capability missing-backup unsupported-schema missing-migration unsafe-migration unsupported-layout missing-catalog-service missing-catalog-timer unsupported-catalog missing-laya-unit missing-laya-socket missing-laya-wrapper unsupported-laya; do
     write_candidate v9.8.10
     policy="$fixture/candidate/jarvis-core-v9.8.10/com.hawkeynl.jarvis.devices.policy"
     case $defect in
@@ -125,6 +129,13 @@ for defect in missing tampered symlink capability missing-backup unsupported-sch
         missing-migration) rm -- "$fixture/candidate/jarvis-core-v9.8.10/jarvis-model-policy-storage" ;;
         missing-catalog-service) rm -- "$fixture/candidate/jarvis-core-v9.8.10/systemd-jarvis-model-catalog.service" ;;
         missing-catalog-timer) rm -- "$fixture/candidate/jarvis-core-v9.8.10/systemd-jarvis-model-catalog.timer" ;;
+        missing-laya-unit) rm -- "$fixture/candidate/jarvis-core-v9.8.10/systemd-jarvis-laya.service" ;;
+        missing-laya-socket) rm -- "$fixture/candidate/jarvis-core-v9.8.10/systemd-jarvis-laya.socket" ;;
+        missing-laya-wrapper) rm -- "$fixture/candidate/jarvis-core-v9.8.10/laya-offline.py" ;;
+        unsupported-laya)
+            jq '.tooling.laya_runtime = 2' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
+            cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
+            ;;
         unsupported-catalog)
             jq '.tooling.model_catalog = 2' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
             cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
@@ -149,10 +160,13 @@ done
 # A previously verified release without the new capability remains inspectable.
 write_candidate v9.8.11
 legacy="$fixture/candidate/jarvis-core-v9.8.11"
-jq 'del(.tooling.model_catalog)' "$legacy/release.json" > "$fixture/manifest"
+jq 'del(.tooling.model_catalog, .tooling.laya_runtime)' "$legacy/release.json" > "$fixture/manifest"
 cp "$fixture/manifest" "$legacy/release.json"
-rm -- "$legacy/systemd-jarvis-model-catalog.service" "$legacy/systemd-jarvis-model-catalog.timer"
-sed '/systemd-jarvis-model-catalog[.]/d' "$legacy/artifact-binaries.sha256" > "$fixture/checksums"
+rm -- "$legacy/systemd-jarvis-model-catalog.service" "$legacy/systemd-jarvis-model-catalog.timer" \
+    "$legacy/systemd-jarvis-laya.service" "$legacy/systemd-jarvis-laya.socket" "$legacy/laya-offline.py" "$legacy/provision-laya"
+sed -e '/systemd-jarvis-model-catalog[.]/d' -e '/systemd-jarvis-laya[.]service/d' -e '/systemd-jarvis-laya[.]socket/d' \
+    -e '/ laya-offline[.]py$/d' -e '/ provision-laya$/d' \
+    "$legacy/artifact-binaries.sha256" > "$fixture/checksums"
 cp "$fixture/checksums" "$legacy/artifact-binaries.sha256"
 bash "$legacy/manage-systemd-units" validate-artifacts "$legacy"
 echo "Canonical release package fixture tests passed"

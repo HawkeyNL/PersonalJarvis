@@ -291,6 +291,7 @@ enum CredentialProvider {
     #[value(name = "ollama-cloud")]
     OllamaCloud,
     Huggingface,
+    Jev,
 }
 impl CredentialProvider {
     fn as_str(&self) -> &'static str {
@@ -302,6 +303,7 @@ impl CredentialProvider {
             Self::Zai => "zai",
             Self::OllamaCloud => "ollama-cloud",
             Self::Huggingface => "huggingface",
+            Self::Jev => "jev",
         }
     }
 }
@@ -1427,6 +1429,7 @@ fn credential_statuses() -> Vec<CredentialStatus> {
         "zai",
         "ollama-cloud",
         "huggingface",
+        "jev",
     ]
     .into_iter()
     .map(|provider| {

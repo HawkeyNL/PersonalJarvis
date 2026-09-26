@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub mod surreal;
 
 /// The metered backends — the only ones that spend money.
-pub const METERED_BACKENDS: [&str; 7] = [
+pub const METERED_BACKENDS: [&str; 8] = [
     "anthropic-api",
     "openai-api",
     "deepseek-api",
@@ -22,6 +22,7 @@ pub const METERED_BACKENDS: [&str; 7] = [
     "zai-api",
     "ollama-cloud",
     "huggingface",
+    "jev",
 ];
 
 /// Whether a backend id bills per token (vs. the free plan/local brains).
@@ -654,6 +655,7 @@ mod tests {
         assert!(is_metered("openai-api"));
         assert!(is_metered("deepseek-api"));
         assert!(is_metered("huggingface"));
+        assert!(is_metered("jev"));
         // 1M in + 1M out on sonnet = (2 + 10) USD × 0.92 = 11.04 EUR.
         let c = cost_eur(
             "anthropic-api",

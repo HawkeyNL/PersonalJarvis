@@ -18,6 +18,10 @@ repository=
 github_curl_netrc=
 schema_backup_id=
 schema_backup_helper=
+laya_socket_was_active=false
+laya_service_was_active=false
+laya_socket_was_enabled=false
+laya_service_was_enabled=false
 
 usage() {
     cat >&2 <<'EOF'
@@ -686,14 +690,84 @@ install_versioned_tooling() {
     [[ $agent_tooling_present == false || -x /usr/local/libexec/jarvis/private-agent-poll ]]
 }
 
+capture_laya_runtime_state() {
+    laya_socket_was_active=false
+    laya_service_was_active=false
+    laya_socket_was_enabled=false
+    laya_service_was_enabled=false
+    systemctl is-active --quiet jarvis-laya.socket && laya_socket_was_active=true
+    systemctl is-active --quiet jarvis-laya.service && laya_service_was_active=true
+    systemctl is-enabled --quiet jarvis-laya.socket && laya_socket_was_enabled=true
+    systemctl is-enabled --quiet jarvis-laya.service && laya_service_was_enabled=true
+    return 0
+}
+
+wait_for_warm_laya() {
+    local response attempt
+    [[ $laya_service_was_active == true ]] || return 0
+    for ((attempt = 0; attempt < 90; attempt++)); do
+        response=$(curl --fail --silent --show-error --max-time 2 --max-filesize 4096 \
+            --unix-socket /run/jarvis-laya.sock http://jarvis-laya.local/health 2>/dev/null) || response=
+        if jq -e '.status == "ok" and (.loaded | index("english") != null and index("multilingual") != null)' \
+            <<< "$response" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo 'jarvis updater: previously warm Laya did not reload both local models' >&2
+    return 1
+}
+
+restore_laya_runtime_state() {
+    local socket_active=false service_active=false socket_enabled=false service_enabled=false
+    # No enable/disable operation belongs to a release update. Capture the
+    # owner's preference separately from active state and fail if it drifted.
+    if [[ $laya_service_was_active == true ]]; then
+        systemctl stop jarvis-laya.service || return 1
+        if [[ $laya_socket_was_active == true ]]; then
+            systemctl restart jarvis-laya.socket || return 1
+        else
+            systemctl start jarvis-laya.socket || return 1
+        fi
+        systemctl start jarvis-laya.service || return 1
+    elif [[ $laya_socket_was_active == true ]]; then
+        systemctl stop jarvis-laya.service >/dev/null 2>&1 || true
+        systemctl restart jarvis-laya.socket || return 1
+        # A socket-only owner choice must not be promoted to resident service.
+        if systemctl is-active --quiet jarvis-laya.service; then
+            systemctl stop jarvis-laya.service || return 1
+        fi
+    else
+        # Stopping an absent optional unit is harmless, including rollback to
+        # a verified pre-Laya release. Never start it from an inactive state.
+        systemctl stop jarvis-laya.service >/dev/null 2>&1 || true
+        systemctl stop jarvis-laya.socket >/dev/null 2>&1 || true
+    fi
+    systemctl is-active --quiet jarvis-laya.socket && socket_active=true
+    systemctl is-active --quiet jarvis-laya.service && service_active=true
+    systemctl is-enabled --quiet jarvis-laya.socket && socket_enabled=true
+    systemctl is-enabled --quiet jarvis-laya.service && service_enabled=true
+    [[ $socket_active == true || $laya_service_was_active == false ]] || return 1
+    [[ $socket_active == true || $laya_socket_was_active == false ]] || return 1
+    [[ $socket_active == false || $laya_socket_was_active == true || $laya_service_was_active == true ]] || return 1
+    [[ $service_active == $laya_service_was_active &&
+       $socket_enabled == $laya_socket_was_enabled &&
+       $service_enabled == $laya_service_was_enabled ]] || return 1
+    wait_for_warm_laya
+}
+
 restart_managed_services() {
     systemctl daemon-reload || return 1
+    # Quiesce Core before manipulating the private socket, so no chat request
+    # can accidentally cold-start a socket-only classifier during restoration.
+    systemctl stop jarvis-core.service || return 1
     systemctl restart jarvis-surrealdb.service || return 1
     systemctl restart jarvis-config-broker.service || return 1
     systemctl try-restart jarvis-codex-broker.service >/dev/null 2>&1 || true
     systemctl try-restart jarvis-codex.service >/dev/null 2>&1 || true
     systemctl try-restart jarvis-opensandbox.service >/dev/null 2>&1 || true
-    systemctl restart jarvis-core.service || return 1
+    restore_laya_runtime_state || return 1
+    systemctl start jarvis-core.service || return 1
     curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
         --retry 11 --retry-delay 5 --retry-connrefused \
         http://127.0.0.1:8080/readyz >/dev/null || return 1
@@ -711,12 +785,14 @@ restore_release_transaction() {
     mv -Tf "$temporary_link" "$current_link"
     "$unit_manager" restore "$previous" "$backup" || return 1
     systemctl daemon-reload || return 1
+    systemctl stop jarvis-core.service >/dev/null 2>&1 || return 1
     systemctl restart jarvis-surrealdb.service >/dev/null 2>&1 || return 1
     systemctl restart jarvis-config-broker.service >/dev/null 2>&1 || return 1
     systemctl try-restart jarvis-codex-broker.service >/dev/null 2>&1 || true
     systemctl try-restart jarvis-codex.service >/dev/null 2>&1 || true
     systemctl try-restart jarvis-opensandbox.service >/dev/null 2>&1 || true
-    systemctl restart jarvis-core.service >/dev/null 2>&1 || return 1
+    restore_laya_runtime_state || return 1
+    systemctl start jarvis-core.service >/dev/null 2>&1 || return 1
     curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
         --retry 11 --retry-delay 5 --retry-connrefused \
         http://127.0.0.1:8080/readyz >/dev/null || return 1
@@ -735,6 +811,21 @@ activate_managed_release() {
         ! jq -e '.tooling.model_catalog == 1' "$release/release.json" >/dev/null; then
         unit_manager="$previous/manage-systemd-units"
     fi
+    if jq -e '.tooling.laya_runtime == 1' "$previous/release.json" >/dev/null && \
+        ! jq -e '.tooling.laya_runtime == 1' "$release/release.json" >/dev/null; then
+        # Do not remove a unit beneath an owner-enabled or running model
+        # service. The current manager understands how to remove its unit
+        # after the owner has stopped/disabled it deliberately.
+        if systemctl is-active --quiet jarvis-laya.service || \
+            systemctl is-enabled --quiet jarvis-laya.service || \
+            systemctl is-active --quiet jarvis-laya.socket || \
+            systemctl is-enabled --quiet jarvis-laya.socket; then
+            echo 'jarvis updater: disable and stop optional jarvis-laya.service and jarvis-laya.socket before rolling back to a pre-Laya release' >&2
+            return 1
+        fi
+        unit_manager="$previous/manage-systemd-units"
+    fi
+    capture_laya_runtime_state
     backup=$(mktemp -d /run/jarvis-systemd-rollback.XXXXXXXX)
     chmod 0700 "$backup"
     if ! "$unit_manager" validate-release "$release" || \
@@ -773,6 +864,7 @@ repair_active_managed_units() {
         return 0
     fi
     echo "jarvis updater: repairing managed systemd units for active release $tag"
+    capture_laya_runtime_state
     backup=$(mktemp -d /run/jarvis-systemd-rollback.XXXXXXXX)
     chmod 0700 "$backup"
     if "$unit_manager" install "$release" "$backup" && restart_managed_services && \

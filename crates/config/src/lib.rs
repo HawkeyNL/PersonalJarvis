@@ -104,6 +104,23 @@ pub struct AppConfig {
     #[serde(default)]
     pub llm_api_key: String,
 
+    /// TypeSafe Jev's advisory intent-classifier credential.
+    #[serde(default)]
+    pub llm_jev_api_key: String,
+    #[serde(default = "default_jev_model")]
+    pub llm_jev_model: String,
+    /// Optional local System-1 classifier: off, shadow, or primary.
+    #[serde(default = "default_laya_mode")]
+    pub laya_mode: String,
+    #[serde(default = "default_laya_endpoint")]
+    pub laya_endpoint: String,
+    #[serde(default = "default_laya_timeout_ms")]
+    pub laya_timeout_ms: u64,
+    #[serde(default = "default_laya_confidence_threshold")]
+    pub laya_confidence_threshold: f64,
+    #[serde(default = "default_jev_confidence_threshold")]
+    pub jev_confidence_threshold: f64,
+
     /// Anthropic API base URL (override for a proxy or tests).
     #[serde(default = "default_anthropic_base_url")]
     pub llm_anthropic_base_url: String,
@@ -384,6 +401,26 @@ fn default_llm_provider() -> String {
     "anthropic".to_string()
 }
 
+fn default_jev_model() -> String {
+    "jev-latest".to_string()
+}
+
+fn default_laya_mode() -> String {
+    "off".to_string()
+}
+fn default_laya_endpoint() -> String {
+    "http://jarvis-laya.local/v1/systemone".to_string()
+}
+fn default_laya_timeout_ms() -> u64 {
+    1_500
+}
+fn default_laya_confidence_threshold() -> f64 {
+    0.95
+}
+fn default_jev_confidence_threshold() -> f64 {
+    0.75
+}
+
 fn default_anthropic_base_url() -> String {
     "https://api.anthropic.com".to_string()
 }
@@ -637,6 +674,29 @@ impl AppConfig {
     /// opens a socket. Public TLS terminates at Caddy; production Core is never
     /// allowed to become a directly reachable HTTP listener.
     pub fn validate_runtime_security(&self) -> Result<(), String> {
+        if !matches!(self.laya_mode.as_str(), "off" | "shadow" | "primary") {
+            return Err("JARVIS_LAYA_MODE must be off, shadow, or primary".to_string());
+        }
+        if self.laya_endpoint != "http://jarvis-laya.local/v1/systemone" {
+            return Err("Laya endpoint must be the fixed Unix-socket virtual URL".to_string());
+        }
+        if !(100..=5_000).contains(&self.laya_timeout_ms)
+            || !self.laya_confidence_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.laya_confidence_threshold)
+            || !self.jev_confidence_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.jev_confidence_threshold)
+        {
+            return Err("invalid System-1 timeout or confidence threshold".to_string());
+        }
+        if self.llm_jev_model.is_empty()
+            || self.llm_jev_model.len() > 128
+            || !self
+                .llm_jev_model
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
+        {
+            return Err("invalid TypeSafe Jev model alias".to_string());
+        }
         if self.environment.eq_ignore_ascii_case("production") {
             let bind_addr: SocketAddr = self
                 .bind_addr
@@ -700,6 +760,13 @@ impl fmt::Debug for AppConfig {
             .field("public_hostname", &self.public_hostname)
             .field("ibkr_gateway_url", &self.ibkr_gateway_url)
             .field("llm_provider", &self.llm_provider)
+            .field("llm_jev_api_key", &redact(&self.llm_jev_api_key))
+            .field("llm_jev_model", &self.llm_jev_model)
+            .field("laya_mode", &self.laya_mode)
+            .field("laya_endpoint", &self.laya_endpoint)
+            .field("laya_timeout_ms", &self.laya_timeout_ms)
+            .field("laya_confidence_threshold", &self.laya_confidence_threshold)
+            .field("jev_confidence_threshold", &self.jev_confidence_threshold)
             .field(
                 "llm_api_key",
                 &if self.llm_api_key.is_empty() {
@@ -820,6 +887,13 @@ mod tests {
             ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
             llm_provider: "anthropic".to_string(),
             llm_api_key: "sk-ant-supersecretkey".to_string(),
+            llm_jev_api_key: "jev-supersecret".to_string(),
+            llm_jev_model: default_jev_model(),
+            laya_mode: default_laya_mode(),
+            laya_endpoint: default_laya_endpoint(),
+            laya_timeout_ms: default_laya_timeout_ms(),
+            laya_confidence_threshold: default_laya_confidence_threshold(),
+            jev_confidence_threshold: default_jev_confidence_threshold(),
             llm_anthropic_base_url: "https://api.anthropic.com".to_string(),
             llm_model: "claude-sonnet-5".to_string(),
             llm_model_hard: "claude-opus-5".to_string(),
@@ -915,6 +989,7 @@ mod tests {
             jail.set_env("JARVIS_BIND_ADDR", "127.0.0.1:9999");
             jail.set_env("JARVIS_LOG_JSON", "true");
             jail.set_env("JARVIS_LLM_HUGGINGFACE_API_KEY", "hf-fixture-secret");
+            jail.set_env("JARVIS_LLM_JEV_API_KEY", "jev-fixture-secret");
             jail.set_env("JARVIS_LLM_HUGGINGFACE_ROUTE", "groq");
 
             let cfg = AppConfig::load()?;
@@ -922,6 +997,8 @@ mod tests {
             assert_eq!(cfg.surreal_endpoint, "127.0.0.1:8000");
             assert!(cfg.log_json);
             assert_eq!(cfg.llm_huggingface_api_key, "hf-fixture-secret");
+            assert_eq!(cfg.llm_jev_api_key, "jev-fixture-secret");
+            assert_eq!(cfg.llm_jev_model, "jev-latest");
             assert_eq!(
                 cfg.llm_huggingface_base_url,
                 "https://router.huggingface.co/v1"
@@ -947,6 +1024,13 @@ mod tests {
             ibkr_gateway_url: String::new(),
             llm_provider: String::new(),
             llm_api_key: String::new(),
+            llm_jev_api_key: String::new(),
+            llm_jev_model: default_jev_model(),
+            laya_mode: default_laya_mode(),
+            laya_endpoint: default_laya_endpoint(),
+            laya_timeout_ms: default_laya_timeout_ms(),
+            laya_confidence_threshold: default_laya_confidence_threshold(),
+            jev_confidence_threshold: default_jev_confidence_threshold(),
             llm_anthropic_base_url: String::new(),
             llm_model: String::new(),
             llm_model_hard: String::new(),
@@ -1058,6 +1142,35 @@ mod tests {
 
             jail.set_env("JARVIS_TRUSTED_PROXY_HOPS", "2");
             jail.set_env("JARVIS_TRUSTED_PROXY_IPS", "127.0.0.1");
+            assert!(AppConfig::load()?.validate_runtime_security().is_err());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn laya_is_off_by_default_and_cannot_point_at_remote_or_unbounded_runtime() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("JARVIS_SURREAL_ENDPOINT", "127.0.0.1:8000");
+            jail.set_env("JARVIS_SURREAL_USERNAME", "core");
+            jail.set_env("JARVIS_SURREAL_PASSWORD", "test-password");
+            let cfg = AppConfig::load()?;
+            assert_eq!(cfg.laya_mode, "off");
+            assert!(cfg.validate_runtime_security().is_ok());
+            jail.set_env("JARVIS_LAYA_MODE", "shadow");
+            assert!(AppConfig::load()?.validate_runtime_security().is_ok());
+            jail.set_env(
+                "JARVIS_LAYA_ENDPOINT",
+                "http://192.0.2.10:8091/v1/systemone",
+            );
+            assert!(AppConfig::load()?.validate_runtime_security().is_err());
+            jail.set_env(
+                "JARVIS_LAYA_ENDPOINT",
+                "http://jarvis-laya.local/v1/systemone",
+            );
+            jail.set_env("JARVIS_LAYA_TIMEOUT_MS", "60000");
+            assert!(AppConfig::load()?.validate_runtime_security().is_err());
+            jail.set_env("JARVIS_LAYA_TIMEOUT_MS", "1500");
+            jail.set_env("JARVIS_LAYA_CONFIDENCE_THRESHOLD", "-0.2");
             assert!(AppConfig::load()?.validate_runtime_security().is_err());
             Ok(())
         });

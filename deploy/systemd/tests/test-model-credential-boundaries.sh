@@ -123,7 +123,7 @@ grep -Fq '/etc/jarvis/secrets' "$prepare"
 grep -Fq '/etc/jarvis/pricing-registry.json' "$prepare"
 grep -Fq '[[ ! -e /etc/jarvis/pricing-registry.json ]]' "$prepare"
 
-for provider in anthropic openai deepseek xai zai ollama-cloud huggingface; do
+for provider in anthropic openai deepseek xai zai ollama-cloud huggingface jev; do
     grep -Fq "EnvironmentFile=-/etc/jarvis/secrets/$provider.env" "$unit"
 done
 

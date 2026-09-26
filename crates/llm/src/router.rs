@@ -322,6 +322,12 @@ impl LlmProvider for RouterProvider {
         &self.label
     }
 
+    fn can_serve_tier(&self, tier: Tier) -> bool {
+        self.plan(tier)
+            .iter()
+            .any(|candidate| self.model_for(&candidate.id, tier).is_some())
+    }
+
     async fn chat_stream(
         &self,
         req: &ChatRequest,
@@ -582,6 +588,29 @@ mod tests {
         );
         // Ollama has only a light model → nothing for a Hard task (uses default).
         assert_eq!(r.model_for("ollama", Tier::Hard), None);
+    }
+
+    #[test]
+    fn advisory_tier_check_respects_live_owner_allowlist() {
+        let c = vec![CatalogModel {
+            backend: "openai-api".into(),
+            id: "owner-enabled-mid".into(),
+            class: ModelClass::Mid,
+        }];
+        let enabled = allow_catalog(&c);
+        let live = Arc::new(LiveModelPolicy::new(enabled));
+        let r = RouterProvider::with_live_policy(
+            vec![cand("openai-api", true)],
+            always_available(),
+            c,
+            live.clone(),
+        );
+        assert!(!r.can_serve_tier(Tier::Cheap));
+        assert!(r.can_serve_tier(Tier::Default));
+        assert!(r.can_serve_tier(Tier::Hard));
+        live.suspend();
+        assert!(!r.can_serve_tier(Tier::Default));
+        assert!(!r.can_serve_tier(Tier::Hard));
     }
 
     #[tokio::test]

@@ -2341,6 +2341,7 @@ dependencies = [
  "jarvis-usage",
  "libc",
  "rand 0.8.7",
+ "reqwest",
  "rust_decimal",
  "semver",
  "serde",

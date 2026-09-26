@@ -483,6 +483,35 @@ async fn main() -> anyhow::Result<()> {
         require_https: config.environment.eq_ignore_ascii_case("production"),
         ibkr_gateway_url: config.ibkr_gateway_url.clone(),
         llm,
+        fast_intent_router: {
+            use jarvis_api::intent::{
+                FastIntentProvider, IntentRouterChain, JevRouter, LayaMode, LayaRouter,
+            };
+            let mode = LayaMode::parse(&config.laya_mode).map_err(anyhow::Error::msg)?;
+            let jev = (!config.llm_jev_api_key.is_empty())
+                .then(|| {
+                    JevRouter::new(config.llm_jev_api_key.clone(), config.llm_jev_model.clone())
+                        .map(|provider| Arc::new(provider) as Arc<dyn FastIntentProvider>)
+                })
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            let laya = (mode != LayaMode::Off)
+                .then(|| {
+                    LayaRouter::new(config.laya_timeout_ms)
+                        .map(|provider| Arc::new(provider) as Arc<dyn FastIntentProvider>)
+                })
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            (jev.is_some() || laya.is_some()).then(|| {
+                Arc::new(IntentRouterChain::new(
+                    laya,
+                    jev,
+                    mode,
+                    config.laya_confidence_threshold,
+                    config.jev_confidence_threshold,
+                ))
+            })
+        },
         llm_max_tokens: config.llm_max_tokens,
         jarvis_system,
         speech,

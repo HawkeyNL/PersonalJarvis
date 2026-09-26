@@ -1,0 +1,13 @@
+[Unit]
+Description=Root-owned local socket for the optional Jarvis Laya classifier
+
+[Socket]
+ListenStream=/run/jarvis-laya.sock
+Accept=no
+SocketUser=root
+SocketGroup=jarvis
+SocketMode=0660
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
