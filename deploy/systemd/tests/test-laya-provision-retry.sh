@@ -5,6 +5,7 @@ repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 fixture=$(mktemp -d /tmp/jarvis-laya-provision.XXXXXXXX)
 trap 'rm -rf -- "$fixture"' EXIT
 trap 'rc=$?; echo "Laya provisioning fixture failed at line $LINENO: $BASH_COMMAND" >&2; [[ ! -f $fixture/output ]] || sed -n "1,12p" "$fixture/output" >&2; exit "$rc"' ERR
+install -m 0755 "$repo/deploy/systemd/provision-laya.sh" "$fixture/provision-laya.sh"
 mkdir -p "$fixture/reviewed/wheels" "$fixture/runtime"
 printf 'laya[serve]==0.3.20 --hash=sha256:%064d\n' 0 > "$fixture/reviewed/requirements.lock"
 printf 'fixture wheel bytes\n' > "$fixture/reviewed/wheels/fixture.whl"
@@ -21,7 +22,7 @@ fi
 before=$(find "$fixture/reviewed" -type f -print0 | sort -z | xargs -0 sha256sum)
 ownership=$(find "$fixture/reviewed" -printf '%P %u:%g %m\n' | sort)
 for attempt in 1 2; do
-    if GITHUB_ACTIONS=true "${runner[@]}" "$repo/deploy/systemd/provision-laya.sh" \
+    if GITHUB_ACTIONS=true "${runner[@]}" "$fixture/provision-laya.sh" \
         --fixture-installer-input "$fixture/reviewed" "$fixture/runtime" \
         >"$fixture/output" 2>&1; then
         echo 'simulated provisioning failure unexpectedly succeeded' >&2; exit 1
@@ -33,7 +34,7 @@ for attempt in 1 2; do
     [[ -z $(find "$fixture/runtime" -mindepth 1 -print -quit) ]]
 done
 ln -s /etc/passwd "$fixture/reviewed/wheels/unsafe.whl"
-if GITHUB_ACTIONS=true "${runner[@]}" "$repo/deploy/systemd/provision-laya.sh" \
+if GITHUB_ACTIONS=true "${runner[@]}" "$fixture/provision-laya.sh" \
     --fixture-installer-input "$fixture/reviewed" "$fixture/runtime" \
     >"$fixture/output" 2>&1; then
     echo 'symlinked installer input was accepted' >&2; exit 1
