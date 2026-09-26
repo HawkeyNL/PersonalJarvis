@@ -88,8 +88,8 @@ if [[ ${1:-} == --fixture-installer-input ]]; then
     fixture_input=$(mktemp -d "$3/.installer-input.XXXXXXXX")
     trap 'rm -rf -- "$fixture_input"' EXIT
     validate_lockfile "$2/requirements.lock"
-    validate_wheelhouse_hashes "$2"
     prepare_installer_input "$2" "$fixture_input" "$(id -gn)"
+    validate_wheelhouse_hashes "$2"
     [[ -f $fixture_input/requirements.lock && -d $fixture_input/wheels ]] || fail 'fixture copy failed'
     fail 'simulated failure after temporary installer input preparation'
 fi
