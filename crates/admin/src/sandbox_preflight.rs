@@ -59,6 +59,10 @@ fn verify(json_output: bool) -> Result<()> {
         return Ok(());
     }
     let mut issues = Vec::new();
+    // The checked-in production broker still uses the explicit unavailable
+    // adapter. A linked account or healthy manager is not proof that model
+    // tools can be safely isolated from a subscription credential.
+    issues.push("reviewed credential-isolated Codex subscription adapter unavailable");
     let endpoint = config_value(&raw, "JARVIS_CODEX_OPENSANDBOX_ENDPOINT");
     if !endpoint.is_some_and(loopback_endpoint) {
         issues.push("manager endpoint is not explicitly loopback");
@@ -102,7 +106,7 @@ fn verify(json_output: bool) -> Result<()> {
     }
     // Read-only checks cannot prove Kata selection, runtime resource quotas,
     // DNS rebinding defence or actual egress isolation. Never claim ready.
-    print(json_output, "acceptance_required", &issues, safe_image);
+    print(json_output, "provider_unavailable", &issues, safe_image);
     if issues.is_empty() {
         bail!("physical Kata/egress and subscription acceptance still required");
     }

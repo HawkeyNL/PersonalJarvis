@@ -141,6 +141,10 @@ pub fn profile_network_policy(profile: SandboxProfile) -> NetworkPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxTask {
     pub task_id: Uuid,
+    /// Trusted logical session binding for Codex manager metadata. Never
+    /// populated from an arbitrary public sandbox request.
+    #[serde(default)]
+    pub codex_session_id: Option<Uuid>,
     pub profile: SandboxProfile,
     pub command: Vec<String>,
     pub network_policy: NetworkPolicy,
@@ -160,6 +164,7 @@ impl SandboxTask {
         network_policy.validate()?;
         Ok(Self {
             task_id: Uuid::now_v7(),
+            codex_session_id: None,
             profile,
             command,
             network_policy,
@@ -185,6 +190,14 @@ pub struct SandboxHandle {
     pub provider_id: String,
     pub task_id: Uuid,
     pub profile: SandboxProfile,
+}
+
+/// A manager workload with verified Jarvis Codex metadata. The list endpoint
+/// is authenticated and loopback-only; unrelated workloads are omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedCodexSandbox {
+    pub handle: SandboxHandle,
+    pub coding_session_id: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,6 +476,80 @@ pub struct OpenSandboxProvider {
 }
 
 impl OpenSandboxProvider {
+    /// Bounded, metadata-filtered discovery for crash recovery. Incomplete or
+    /// malformed manager results fail closed; callers must not start new runs.
+    pub async fn list_owned_codex(&self) -> Result<Vec<OwnedCodexSandbox>, SandboxError> {
+        if !self.codex_only {
+            return Err(SandboxError::Unsupported);
+        }
+        let endpoint = self.endpoint("v1/sandboxes")?;
+        let mut owned = Vec::new();
+        for page in 1..=10_u32 {
+            let page_value = page.to_string();
+            let response =
+                self.request_success(self.authenticated(self.client.get(endpoint.clone())).query(
+                    &[
+                        ("metadata", "jarvis.profile=codex"),
+                        ("page", page_value.as_str()),
+                        ("pageSize", "100"),
+                    ],
+                ))
+                .await?;
+            let body: Value = response
+                .json()
+                .await
+                .map_err(|_| SandboxError::InvalidProviderResponse)?;
+            let items = body
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or(SandboxError::InvalidProviderResponse)?;
+            if items.len() > 100 {
+                return Err(SandboxError::InvalidProviderResponse);
+            }
+            for item in items {
+                let metadata = item
+                    .get("metadata")
+                    .and_then(Value::as_object)
+                    .ok_or(SandboxError::InvalidProviderResponse)?;
+                if metadata.get("jarvis.profile").and_then(Value::as_str) != Some("codex") {
+                    continue;
+                }
+                let id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| is_safe_provider_id(id))
+                    .ok_or(SandboxError::InvalidProviderResponse)?;
+                let run_id = metadata
+                    .get("jarvis.run_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .ok_or(SandboxError::InvalidProviderResponse)?;
+                let coding_session_id = metadata
+                    .get("jarvis.session_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .ok_or(SandboxError::InvalidProviderResponse)?;
+                owned.push(OwnedCodexSandbox {
+                    handle: SandboxHandle {
+                        provider_id: id.to_owned(),
+                        task_id: run_id,
+                        profile: SandboxProfile::Codex,
+                    },
+                    coding_session_id,
+                });
+            }
+            let has_next = body
+                .get("pagination")
+                .and_then(|v| v.get("hasNextPage"))
+                .and_then(Value::as_bool)
+                .ok_or(SandboxError::InvalidProviderResponse)?;
+            if !has_next {
+                return Ok(owned);
+            }
+        }
+        Err(SandboxError::OutputLimitExceeded)
+    }
+
     pub fn for_home_node(config: OpenSandboxConfig) -> Result<Self, SandboxError> {
         let endpoint = validate_loopback_endpoint(&config.endpoint)?;
         if config.api_key.trim().is_empty() || !config.images.validate() {
@@ -565,7 +652,9 @@ impl SandboxProvider for OpenSandboxProvider {
         }
     }
     async fn create(&self, task: &SandboxTask) -> Result<SandboxHandle, SandboxError> {
-        if self.codex_only && task.profile != SandboxProfile::Codex {
+        if self.codex_only
+            && (task.profile != SandboxProfile::Codex || task.codex_session_id.is_none())
+        {
             return Err(SandboxError::InvalidTask);
         }
         task.network_policy.validate()?;
@@ -870,6 +959,18 @@ fn opensandbox_network_policy(policy: &NetworkPolicy) -> Value {
 
 fn opensandbox_create_payload(task: &SandboxTask, images: &OpenSandboxImages) -> Value {
     let limits = profile_limits(task.profile);
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("jarvis.task_id".into(), json!(task.task_id.to_string()));
+    metadata.insert(
+        "jarvis.profile".into(),
+        json!(sandbox_profile_name(task.profile)),
+    );
+    if task.profile == SandboxProfile::Codex {
+        metadata.insert("jarvis.run_id".into(), json!(task.task_id.to_string()));
+        if let Some(session_id) = task.codex_session_id {
+            metadata.insert("jarvis.session_id".into(), json!(session_id.to_string()));
+        }
+    }
     json!({
         "image": { "uri": images.for_profile(task.profile) },
         "entrypoint": ["tail", "-f", "/dev/null"],
@@ -879,10 +980,7 @@ fn opensandbox_create_payload(task: &SandboxTask, images: &OpenSandboxImages) ->
             "memory": format!("{}Mi", limits.memory_mib),
         },
         "networkPolicy": opensandbox_network_policy(&task.network_policy),
-        "metadata": {
-            "jarvis.task_id": task.task_id.to_string(),
-            "jarvis.profile": sandbox_profile_name(task.profile),
-        },
+        "metadata": metadata,
     })
 }
 
@@ -1303,6 +1401,29 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("@sha256:"));
+    }
+
+    #[test]
+    fn codex_payload_has_independent_run_and_session_recovery_metadata() {
+        let mut task = SandboxTask::new(
+            SandboxProfile::Codex,
+            vec!["/usr/local/bin/jarvis-codex-runtime".into()],
+        )
+        .unwrap();
+        let session = Uuid::now_v7();
+        task.codex_session_id = Some(session);
+        let payload = opensandbox_create_payload(&task, &test_images());
+        assert_eq!(payload["metadata"]["jarvis.profile"], "codex");
+        assert_eq!(
+            payload["metadata"]["jarvis.run_id"],
+            task.task_id.to_string()
+        );
+        assert_eq!(
+            payload["metadata"]["jarvis.session_id"],
+            session.to_string()
+        );
+        assert!(payload["metadata"].get("capability").is_none());
+        assert!(payload.get("env").is_none());
     }
 
     #[test]

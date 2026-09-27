@@ -263,8 +263,8 @@ validate_artifacts() {
     validate_device_policy "$release"
     validate_policy_storage_artifact "$release"
     if jq -e 'has("schema_migration")' "$release/release.json" >/dev/null; then
-        jq -e '.schema_migration | .version == 1 and (.target == 8 or .target == 9) and
-            (.from_sha256 | type == "array" and length > 0 and length <= 3 and
+        jq -e '.schema_migration | .version == 1 and (.target == 8 or .target == 9 or .target == 10) and
+            (.from_sha256 | type == "array" and length > 0 and length <= 4 and
                 all(type == "string" and test("^[0-9a-f]{64}$")))' "$release/release.json" >/dev/null || fail "unsupported schema migration declaration"
         [[ -f $release/schema-backup && ! -L $release/schema-backup && -x $release/schema-backup ]] || fail "schema backup helper is missing or unsafe"
         mode=$(stat -c '%a' "$release/schema-backup")

@@ -89,6 +89,72 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
 }
 
 #[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn coding_subscription_reservation_is_server_issued_single_lease_and_zero_api_spend(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!(
+        "reservation_fixture_{}",
+        uuid::Uuid::now_v7().simple()
+    ))
+    .use_db("test")
+    .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let user = uuid::Uuid::now_v7();
+    let other_user = uuid::Uuid::now_v7();
+    let session = uuid::Uuid::now_v7();
+    let id = jarvis_usage::coding_reservations::reserve(&db, user, session).await?;
+    assert!(jarvis_usage::coding_reservations::lease(
+        &db,
+        id,
+        other_user,
+        session,
+        uuid::Uuid::now_v7(),
+        60
+    )
+    .await?
+    .is_none());
+    let run_a = uuid::Uuid::now_v7();
+    let run_b = uuid::Uuid::now_v7();
+    let (a, b) = tokio::join!(
+        jarvis_usage::coding_reservations::lease(&db, id, user, session, run_a, 60),
+        jarvis_usage::coding_reservations::lease(&db, id, user, session, run_b, 60),
+    );
+    let a = a?;
+    let b = b?;
+    assert_eq!(
+        usize::from(a.is_some()) + usize::from(b.is_some()),
+        1,
+        "concurrent lease must have exactly one winner"
+    );
+    let winner = if a.is_some() { run_a } else { run_b };
+    assert!(jarvis_usage::coding_reservations::finish(&db, id, winner, true).await?);
+    assert!(jarvis_usage::coding_reservations::lease(
+        &db,
+        id,
+        user,
+        session,
+        uuid::Uuid::now_v7(),
+        60
+    )
+    .await?
+    .is_none());
+    let mut query = db.query("SELECT status,api_spend_cents,compute_class,run_id FROM coding_reservations WHERE record::id(id)=$id LIMIT 1")
+        .bind(json!({"id":id.to_string()})).await?.check()?;
+    let rows: Vec<Value> = query.take(0)?;
+    assert_eq!(rows[0]["status"], "settled");
+    assert_eq!(rows[0]["compute_class"], "subscription");
+    assert_eq!(rows[0]["api_spend_cents"], 0);
+    assert_eq!(rows[0]["run_id"], winner.to_string());
+    Ok(())
+}
+
+#[tokio::test]
 async fn every_application_update_route_requires_authentication_before_storage_access() {
     // An unconnected database proves missing authentication does not query it.
     let mut fixture = state(jarvis_store::Database::init(), None).await;

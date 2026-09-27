@@ -168,6 +168,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/assistant/orchestrate", post(assistant_orchestrate))
         .route("/v1/coding/sessions", get(coding_list).post(coding_create))
         .route("/v1/coding/sessions/{id}", post(coding_lifecycle))
+        .route(
+            "/v1/coding/sessions/{id}/reservations",
+            post(routes::coding::reserve_run),
+        )
         .route("/v1/coding/runs/{id}", get(coding_run_status))
         .route("/v1/coding/runs/{id}/cancel", post(coding_run_cancel))
         .route(

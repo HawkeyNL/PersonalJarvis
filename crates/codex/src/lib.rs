@@ -146,7 +146,8 @@ pub struct RunCapabilityClaims {
     pub base_commit_sha: String,
     pub expires_at: OffsetDateTime,
     pub budget_reservation_id: Uuid,
-    pub budget_limit_cents: u64,
+    /// Non-monetary subscription operations, not EUR API cents.
+    pub execution_unit_limit: u64,
     pub operation: BrokeredCodexOperation,
 }
 
@@ -154,13 +155,13 @@ impl RunCapabilityClaims {
     pub fn from_signed_request(
         run_id: Uuid,
         request: &SignedCodingRequest,
-        budget_limit_cents: u64,
+        execution_unit_limit: u64,
     ) -> Result<Self, CapabilityError> {
         request
             .operation
             .validate()
             .map_err(|_| CapabilityError::InvalidClaims)?;
-        if budget_limit_cents == 0 {
+        if execution_unit_limit == 0 {
             return Err(CapabilityError::InvalidClaims);
         }
         let (coding_session_id, repository, base_commit_sha, budget_reservation_id) =
@@ -192,7 +193,7 @@ impl RunCapabilityClaims {
             base_commit_sha,
             expires_at: request.expires_at,
             budget_reservation_id,
-            budget_limit_cents,
+            execution_unit_limit,
             operation: BrokeredCodexOperation::RunApprovedTask,
         })
     }
@@ -262,7 +263,7 @@ struct StoredCapability {
     claims: RunCapabilityClaims,
     status: CapabilityStatus,
     used_request_ids: HashSet<Uuid>,
-    used_cents: u64,
+    used_units: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -303,7 +304,7 @@ impl RunCapabilityAuthority {
                 claims,
                 status: CapabilityStatus::Active,
                 used_request_ids: HashSet::new(),
-                used_cents: 0,
+                used_units: 0,
             },
         );
         Ok(token)
@@ -316,10 +317,10 @@ impl RunCapabilityAuthority {
         &self,
         token: &RunCapabilityToken,
         request: &BrokeredCodexRequest,
-        reserve_cents: u64,
+        reserve_units: u64,
         now: OffsetDateTime,
     ) -> Result<(), CapabilityError> {
-        self.authorize_raw(&token.0, request, reserve_cents, now)
+        self.authorize_raw(&token.0, request, reserve_units, now)
     }
 
     /// Validate raw token text received from the sandbox narrow broker API.
@@ -328,7 +329,7 @@ impl RunCapabilityAuthority {
         &self,
         token: &str,
         request: &BrokeredCodexRequest,
-        reserve_cents: u64,
+        reserve_units: u64,
         now: OffsetDateTime,
     ) -> Result<(), CapabilityError> {
         if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -370,13 +371,13 @@ impl RunCapabilityAuthority {
         {
             return Err(CapabilityError::Replay);
         }
-        if reserve_cents == 0
-            || stored.used_cents.saturating_add(reserve_cents) > stored.claims.budget_limit_cents
+        if reserve_units == 0
+            || stored.used_units.saturating_add(reserve_units) > stored.claims.execution_unit_limit
         {
             return Err(CapabilityError::BudgetExceeded);
         }
         stored.used_request_ids.insert(request.request_id);
-        stored.used_cents = stored.used_cents.saturating_add(reserve_cents);
+        stored.used_units = stored.used_units.saturating_add(reserve_units);
         Ok(())
     }
 
@@ -600,6 +601,8 @@ pub enum CodingRunError {
     SandboxFailed,
     #[error("sandbox execution timed out")]
     TimedOut,
+    #[error("sandbox ownership cleanup requires recovery")]
+    CleanupRequired,
 }
 
 /// Run exactly one approved coding task in a disposable OpenSandbox workload.
@@ -611,6 +614,35 @@ pub struct ApprovedSandboxRun<'a, A: relay::CodexSubscriptionAdapter + ?Sized> {
     pub authority: &'a RunCapabilityAuthority,
     pub run_id: Uuid,
     pub capability: Option<RunCapabilityToken>,
+}
+
+/// Production records the manager-issued sandbox ID before uploading any
+/// source or starting model/tool work. A no-op recorder is used only by
+/// pre-existing isolated unit tests and non-production callers.
+#[async_trait::async_trait]
+pub trait SandboxOwnershipRecorder: Send + Sync {
+    async fn created(&self, handle: &jarvis_sandbox::SandboxHandle) -> Result<(), CodingRunError>;
+    async fn cleanup(
+        &self,
+        handle: &jarvis_sandbox::SandboxHandle,
+        terminated: bool,
+    ) -> Result<(), CodingRunError>;
+}
+
+struct NoopOwnershipRecorder;
+
+#[async_trait::async_trait]
+impl SandboxOwnershipRecorder for NoopOwnershipRecorder {
+    async fn created(&self, _: &jarvis_sandbox::SandboxHandle) -> Result<(), CodingRunError> {
+        Ok(())
+    }
+    async fn cleanup(
+        &self,
+        _: &jarvis_sandbox::SandboxHandle,
+        _: bool,
+    ) -> Result<(), CodingRunError> {
+        Ok(())
+    }
 }
 
 pub async fn execute_in_sandbox<
@@ -638,7 +670,31 @@ pub async fn execute_in_sandbox_with_cancel<
     snapshot: RepositorySnapshot,
     context: TaskContextInput,
     gate: ApprovedSandboxRun<'_, A>,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<CodingRunResult, CodingRunError> {
+    execute_in_sandbox_tracked(
+        provider,
+        request,
+        snapshot,
+        context,
+        gate,
+        cancel,
+        &NoopOwnershipRecorder,
+    )
+    .await
+}
+
+pub async fn execute_in_sandbox_tracked<
+    P: jarvis_sandbox::SandboxProvider,
+    A: relay::CodexSubscriptionAdapter + ?Sized,
+>(
+    provider: &P,
+    request: &SignedCodingRequest,
+    snapshot: RepositorySnapshot,
+    context: TaskContextInput,
+    gate: ApprovedSandboxRun<'_, A>,
     mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ownership: &dyn SandboxOwnershipRecorder,
 ) -> Result<CodingRunResult, CodingRunError> {
     request
         .operation
@@ -668,12 +724,30 @@ pub async fn execute_in_sandbox_with_cancel<
         .sandbox_task()
         .map_err(|_| CodingRunError::SandboxFailed)?;
     task.task_id = gate.run_id;
+    task.codex_session_id = Some(match &request.operation {
+        CodingOperation::StartCodingRun {
+            coding_session_id, ..
+        }
+        | CodingOperation::ResumeCodingRun {
+            coding_session_id, ..
+        } => *coding_session_id,
+    });
     let sandbox_input = SandboxRunInput::from_approved(request, gate.run_id, &snapshot)
         .map_err(|_| CodingRunError::SandboxFailed)?;
     let handle = provider
         .create(&task)
         .await
         .map_err(|_| CodingRunError::SandboxUnavailable)?;
+    if let Err(error) = ownership.created(&handle).await {
+        let terminated = provider.terminate(handle.clone()).await.is_ok();
+        let _ = ownership.cleanup(&handle, terminated).await;
+        gate.authority.revoke_run(gate.run_id, false);
+        return if terminated {
+            Err(error)
+        } else {
+            Err(CodingRunError::CleanupRequired)
+        };
+    }
     // The signed limit bounds upload, relay, provider execution and artifact
     // collection together. A stalled manager cannot stretch a 1-second owner
     // approval into the profile's much larger infrastructure ceiling.
@@ -819,10 +893,13 @@ pub async fn execute_in_sandbox_with_cancel<
     .unwrap_or(Err(CodingRunError::TimedOut));
     // Destruction is mandatory for success, failure and cancellation paths.
     // There is no retained sandbox to resume later.
-    let terminated = provider.terminate(handle).await;
+    let terminated = provider.terminate(handle.clone()).await.is_ok();
     gate.authority.revoke_run(gate.run_id, result.is_ok());
-    if terminated.is_err() {
-        return Err(CodingRunError::SandboxFailed);
+    if ownership.cleanup(&handle, terminated).await.is_err() {
+        return Err(CodingRunError::CleanupRequired);
+    }
+    if !terminated {
+        return Err(CodingRunError::CleanupRequired);
     }
     result
 }
@@ -1856,6 +1933,80 @@ mod tests {
         ) -> Result<(), jarvis_sandbox::SandboxError> {
             self.calls.lock().unwrap().push("terminate");
             Ok(())
+        }
+    }
+
+    struct RecordingOwnership {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        reject_persistence: bool,
+    }
+
+    #[async_trait]
+    impl SandboxOwnershipRecorder for RecordingOwnership {
+        async fn created(&self, _: &jarvis_sandbox::SandboxHandle) -> Result<(), CodingRunError> {
+            self.calls.lock().unwrap().push("persist_sandbox_id");
+            if self.reject_persistence {
+                Err(CodingRunError::SandboxFailed)
+            } else {
+                Ok(())
+            }
+        }
+        async fn cleanup(
+            &self,
+            _: &jarvis_sandbox::SandboxHandle,
+            _: bool,
+        ) -> Result<(), CodingRunError> {
+            self.calls.lock().unwrap().push("persist_cleanup");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_id_is_persisted_before_any_upload_and_persistence_failure_terminates() {
+        for reject_persistence in [false, true] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let provider = TestProvider {
+                calls: calls.clone(),
+                available: true,
+            };
+            let ownership = RecordingOwnership {
+                calls: calls.clone(),
+                reject_persistence,
+            };
+            let request = signed_start();
+            let (authority, capability, run_id) = capability_for(&request);
+            let result = execute_in_sandbox_tracked(
+                &provider,
+                &request,
+                valid_snapshot(&request),
+                TaskContextInput::default(),
+                ApprovedSandboxRun {
+                    adapter: &TestAdapter,
+                    authority: &authority,
+                    run_id,
+                    capability: Some(capability),
+                },
+                None,
+                &ownership,
+            )
+            .await;
+            assert!(result.is_err());
+            let calls = calls.lock().unwrap();
+            let created = calls.iter().position(|call| *call == "create").unwrap();
+            let persisted = calls
+                .iter()
+                .position(|call| *call == "persist_sandbox_id")
+                .unwrap();
+            let terminated = calls.iter().position(|call| *call == "terminate").unwrap();
+            assert!(created < persisted && persisted < terminated);
+            if reject_persistence {
+                assert!(
+                    !calls.contains(&"upload"),
+                    "no source may enter an untracked sandbox"
+                );
+            } else {
+                assert!(persisted < calls.iter().position(|call| *call == "upload").unwrap());
+            }
         }
     }
 

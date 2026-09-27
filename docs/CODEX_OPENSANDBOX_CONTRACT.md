@@ -106,6 +106,24 @@ be explicitly configured; no mutable image is accepted. `sudo jarvis sandbox
 verify` is read-only and never claims that merely seeing Docker proves Kata,
 egress, quota or account acceptance.
 
+Core now issues a short-lived subscription reservation from an authenticated
+coding session. The signed request carries its ID, but the broker must lease
+the matching database row for that owner/session/run before minting a run
+capability. This is a non-monetary execution slot with an explicit maximum
+runtime and provider-turn ceiling; successful subscription work settles with
+zero Jarvis API-spend cents, while failure releases the slot without making
+it reusable. A random UUID from the client is not reservation authority.
+
+The OpenSandbox create request carries bounded `jarvis.run_id`,
+`jarvis.session_id` and `jarvis.profile=codex` metadata. The manager-issued
+sandbox ID is recorded on the durable run before source upload or execution.
+At broker start and periodically, the broker lists only manager workloads
+with Jarvis Codex metadata and terminates stale owned workloads before
+releasing their reservations. Incomplete cleanup stops admission of new runs;
+unrelated OpenSandbox workloads are never deleted. This recovery path still
+requires disposable-manager/SurrealDB integration and crash-injection proof
+before production activation.
+
 The remaining provider activation gate is precise: the current official
 [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server)
 labels the app-server command and WebSocket transport experimental and not

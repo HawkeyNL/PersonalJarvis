@@ -13,7 +13,11 @@ use std::{
     io::{Read, Write},
     os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
 };
 
 use anyhow::{bail, Context};
@@ -22,18 +26,19 @@ use serde_json::json;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{watch, OwnedSemaphorePermit, Semaphore},
+    sync::{watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
 };
 
 use jarvis_codex::{
     relay::{CodexSubscriptionAdapter, UnavailableSubscriptionAdapter},
     snapshot::TrustedRepositoryRegistry,
-    ApprovedSandboxRun, CodingOperation, RunCapabilityAuthority, RunCapabilityClaims,
-    SignedCodingRequest, TaskContextInput,
+    ApprovedSandboxRun, CodingOperation, CodingRunError, RunCapabilityAuthority,
+    RunCapabilityClaims, SandboxOwnershipRecorder, SignedCodingRequest, TaskContextInput,
 };
 use jarvis_config::AppConfig;
 use jarvis_identity as identity;
-use jarvis_sandbox::{OpenSandboxProvider, SandboxAvailability, SandboxProvider};
+use jarvis_sandbox::{OpenSandboxProvider, SandboxAvailability, SandboxHandle, SandboxProvider};
+use jarvis_usage::coding_reservations;
 
 const DEFAULT_SOCKET: &str = "/run/jarvis-codex-broker/broker.sock";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -56,6 +61,9 @@ struct BrokerState {
     authority: Arc<RunCapabilityAuthority>,
     active: Arc<Mutex<HashMap<uuid::Uuid, watch::Sender<bool>>>>,
     run_slots: Arc<Semaphore>,
+    cleanup_healthy: Arc<AtomicBool>,
+    cleanup_epoch: Arc<AtomicU64>,
+    reconcile_lock: Arc<AsyncMutex<()>>,
 }
 
 struct RunJob {
@@ -66,6 +74,49 @@ struct RunJob {
     capability: jarvis_codex::RunCapabilityToken,
     receiver: watch::Receiver<bool>,
     _slot: OwnedSemaphorePermit,
+}
+
+struct DurableSandboxOwnership<'a> {
+    db: &'a jarvis_store::Database,
+    run_id: uuid::Uuid,
+}
+
+#[async_trait::async_trait]
+impl SandboxOwnershipRecorder for DurableSandboxOwnership<'_> {
+    async fn created(&self, handle: &SandboxHandle) -> Result<(), CodingRunError> {
+        let mut response = self.db.query("UPDATE coding_runs SET sandbox_provider='opensandbox',sandbox_id=$sandbox,sandbox_state='active',sandbox_created_at=time::now(),sandbox_cleanup_status=NONE,status='running',updated_at=time::now() WHERE record::id(id)=$run AND status='preparing' AND sandbox_id=NONE RETURN record::id(id) AS id")
+            .bind(json!({"run":self.run_id.to_string(),"sandbox":handle.provider_id}))
+            .await.map_err(|_|CodingRunError::SandboxFailed)?;
+        let rows: Vec<serde_json::Value> = response
+            .take(0)
+            .map_err(|_| CodingRunError::SandboxFailed)?;
+        if rows.len() != 1 {
+            return Err(CodingRunError::SandboxFailed);
+        }
+        Ok(())
+    }
+
+    async fn cleanup(
+        &self,
+        handle: &SandboxHandle,
+        terminated: bool,
+    ) -> Result<(), CodingRunError> {
+        let state = if terminated {
+            "terminated"
+        } else {
+            "cleanup_failed"
+        };
+        let mut response = self.db.query("UPDATE coding_runs SET sandbox_state=$state,sandbox_cleanup_status=$state,updated_at=time::now() WHERE record::id(id)=$run AND sandbox_id=$sandbox RETURN record::id(id) AS id")
+            .bind(json!({"run":self.run_id.to_string(),"sandbox":handle.provider_id,"state":state}))
+            .await.map_err(|_|CodingRunError::SandboxFailed)?;
+        let rows: Vec<serde_json::Value> = response
+            .take(0)
+            .map_err(|_| CodingRunError::SandboxFailed)?;
+        if rows.len() != 1 {
+            return Err(CodingRunError::SandboxFailed);
+        }
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -90,7 +141,6 @@ async fn main() -> anyhow::Result<()> {
         &config.surreal_password,
     )
     .await?;
-    reconcile_stale_runs(&db).await?;
     let state = Arc::new(BrokerState {
         db,
         core_uid: lookup_core_uid()?,
@@ -99,6 +149,27 @@ async fn main() -> anyhow::Result<()> {
         authority: Arc::new(RunCapabilityAuthority::default()),
         active: Arc::new(Mutex::new(HashMap::new())),
         run_slots: Arc::new(Semaphore::new(2)),
+        cleanup_healthy: Arc::new(AtomicBool::new(false)),
+        cleanup_epoch: Arc::new(AtomicU64::new(0)),
+        reconcile_lock: Arc::new(AsyncMutex::new(())),
+    });
+    reconcile_owned_sandboxes(&state).await?;
+    state.cleanup_healthy.store(true, Ordering::SeqCst);
+    let maintenance = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            maintenance.cleanup_healthy.store(false, Ordering::SeqCst);
+            let observed_epoch = maintenance.cleanup_epoch.load(Ordering::SeqCst);
+            let result = reconcile_owned_sandboxes(&maintenance).await;
+            if let Err(error) = result {
+                tracing::error!(%error, "Codex owned sandbox reconciliation requires recovery");
+            } else if maintenance.cleanup_epoch.load(Ordering::SeqCst) == observed_epoch {
+                maintenance.cleanup_healthy.store(true, Ordering::SeqCst);
+            }
+        }
     });
     prepare_socket(socket)?;
     let listener = UnixListener::bind(socket)?;
@@ -151,9 +222,70 @@ fn configured_sandbox() -> anyhow::Result<Option<Arc<OpenSandboxProvider>>> {
     )?)))
 }
 
-async fn reconcile_stale_runs(db: &jarvis_store::Database) -> anyhow::Result<()> {
-    db.query("UPDATE coding_runs SET status='failed',failure_category='broker_restarted',reservation_status='released',updated_at=time::now(),completed_at=time::now() WHERE status IN ['queued','preparing','running','cancelling'] RETURN NONE")
+async fn reconcile_owned_sandboxes(state: &BrokerState) -> anyhow::Result<()> {
+    let _reconcile_guard = state.reconcile_lock.lock().await;
+    // Without the manager there is no proof that an old workload is gone.
+    // Execution is already disabled in this state, so do not release a lease.
+    let Some(manager) = state.sandbox.as_ref() else {
+        return Ok(());
+    };
+    let owned = manager.list_owned_codex().await?;
+    let active = state
+        .active
+        .lock()
+        .map_err(|_| anyhow::anyhow!("run registry unavailable"))?
+        .keys()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    for item in &owned {
+        if active.contains(&item.handle.task_id) {
+            continue;
+        }
+        // The authenticated manager metadata is the second ownership key for
+        // the crash window before sandbox_id could be persisted.
+        manager.terminate(item.handle.clone()).await?;
+        let _ = state.db.query("UPDATE coding_runs SET sandbox_provider='opensandbox',sandbox_id=$sandbox,sandbox_state='orphan_recovered',sandbox_cleanup_status='terminated',updated_at=time::now() WHERE record::id(id)=$run AND coding_session_id=$session AND (sandbox_id=NONE OR sandbox_id=$sandbox) RETURN NONE")
+            .bind(json!({"run":item.handle.task_id.to_string(),"session":item.coding_session_id.to_string(),"sandbox":item.handle.provider_id})).await?.check()?;
+        audit(
+            &state.db,
+            None,
+            "orphan_cleanup",
+            "Jarvis Codex sandbox terminated",
+        )
+        .await;
+    }
+    // Never claim cleanup while a manager-owned workload is still listed.
+    let remaining = manager.list_owned_codex().await?;
+    if remaining
+        .iter()
+        .any(|item| !active.contains(&item.handle.task_id))
+    {
+        bail!("Jarvis Codex orphan sandbox cleanup incomplete");
+    }
+    let mut response = state.db.query("SELECT record::id(id) AS run_id,reservation_id,user_id,status,sandbox_id,sandbox_state FROM coding_runs WHERE status IN ['queued','preparing','running','cancelling'] OR sandbox_state='cleanup_failed' LIMIT 1000")
         .await?.check()?;
+    let rows: Vec<serde_json::Value> = response.take(0)?;
+    if rows.len() == 1000 {
+        bail!("Codex recovery scan exceeded bound");
+    }
+    for row in rows {
+        let run_id = row
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|v| uuid::Uuid::parse_str(v).ok())
+            .context("invalid durable run ID")?;
+        if active.contains(&run_id) {
+            continue;
+        }
+        let reservation_id = row
+            .get("reservation_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|v| uuid::Uuid::parse_str(v).ok())
+            .context("invalid durable reservation ID")?;
+        let _ = coding_reservations::finish(&state.db, reservation_id, run_id, false).await?;
+        state.db.query("UPDATE coding_runs SET status='failed',failure_category='broker_restarted',reservation_status='released',sandbox_state='terminated',sandbox_cleanup_status='terminated',updated_at=time::now(),completed_at=time::now() WHERE record::id(id)=$run AND status IN ['queued','preparing','running','cancelling'] RETURN NONE")
+            .bind(json!({"run":run_id.to_string()})).await?.check()?;
+    }
     Ok(())
 }
 
@@ -320,6 +452,10 @@ async fn start_run(
     state: &Arc<BrokerState>,
     signed: &SignedCodingRequest,
 ) -> anyhow::Result<uuid::Uuid> {
+    let _reconcile_guard = state.reconcile_lock.lock().await;
+    if !state.cleanup_healthy.load(Ordering::SeqCst) {
+        bail!("Codex sandbox cleanup requires recovery");
+    }
     let sandbox = state
         .sandbox
         .as_ref()
@@ -338,8 +474,26 @@ async fn start_run(
     }
     let run_id = uuid::Uuid::now_v7();
     let claims = RunCapabilityClaims::from_signed_request(run_id, signed, 1)?;
+    let requested_runtime_secs = match &signed.operation {
+        CodingOperation::StartCodingRun { timeout_secs, .. }
+        | CodingOperation::ResumeCodingRun { timeout_secs, .. } => *timeout_secs,
+    };
+    let lease = coding_reservations::lease(
+        &state.db,
+        claims.budget_reservation_id,
+        signed.user_id,
+        claims.coding_session_id,
+        run_id,
+        requested_runtime_secs,
+    )
+    .await?
+    .context("server-issued subscription reservation missing, expired or already leased")?;
+    if lease.max_provider_turns == 0 || lease.max_runtime_secs < requested_runtime_secs as u32 {
+        coding_reservations::finish(&state.db, lease.id, run_id, false).await?;
+        bail!("subscription reservation limits do not authorize this run");
+    }
     let snapshot_sha = snapshot.sha256_hex();
-    state.db.query("CREATE coding_runs SET id=$run,request_id=$request,coding_session_id=$session,user_id=$user,device_id=$device,repository_id=$repository_id,repository_owner=$repository_owner,repository_name=$repository_name,base_sha=$base,snapshot_sha256=$snapshot,reservation_id=$reservation,reservation_units=1,reservation_status='active',status='queued',summary=NONE,failure_category=NONE,artifacts=[],compute_class='subscription',created_at=time::now(),updated_at=time::now(),completed_at=NONE RETURN NONE")
+    let created = state.db.query("CREATE coding_runs SET id=$run,request_id=$request,coding_session_id=$session,user_id=$user,device_id=$device,repository_id=$repository_id,repository_owner=$repository_owner,repository_name=$repository_name,base_sha=$base,snapshot_sha256=$snapshot,reservation_id=$reservation,reservation_units=1,reservation_status='active',status='queued',summary=NONE,failure_category=NONE,artifacts=[],compute_class='subscription',sandbox_provider=NONE,sandbox_id=NONE,sandbox_state='not_created',sandbox_created_at=NONE,sandbox_cleanup_status=NONE,created_at=time::now(),updated_at=time::now(),completed_at=NONE RETURN NONE")
         .bind(json!({
             "run":run_id.to_string(),"request":signed.request_id.to_string(),
             "session":claims.coding_session_id.to_string(),"user":signed.user_id.to_string(),
@@ -347,7 +501,11 @@ async fn start_run(
             "repository_owner":claims.repository.owner,"repository_name":claims.repository.name,
             "base":claims.base_commit_sha,"snapshot":snapshot_sha,
             "reservation":claims.budget_reservation_id.to_string(),
-        })).await?.check()?;
+        })).await.map_err(anyhow::Error::from).and_then(|response| response.check().map_err(anyhow::Error::from));
+    if let Err(error) = created {
+        coding_reservations::finish(&state.db, lease.id, run_id, false).await?;
+        return Err(error);
+    }
     let capability = match state.authority.mint(claims) {
         Ok(token) => token,
         Err(error) => {
@@ -360,6 +518,7 @@ async fn start_run(
                 &[],
             )
             .await?;
+            coding_reservations::finish(&state.db, lease.id, run_id, false).await?;
             return Err(error.into());
         }
     };
@@ -395,7 +554,7 @@ async fn run_worker(state: Arc<BrokerState>, job: RunJob) {
         receiver,
         _slot,
     } = job;
-    let started = state.db.query("UPDATE coding_runs SET status='running',updated_at=time::now() WHERE record::id(id)=$run AND status='queued' RETURN record::id(id) AS id")
+    let started = state.db.query("UPDATE coding_runs SET status='preparing',updated_at=time::now() WHERE record::id(id)=$run AND status='queued' RETURN record::id(id) AS id")
         .bind(json!({"run":run_id.to_string()})).await;
     let started = started
         .ok()
@@ -417,6 +576,17 @@ async fn run_worker(state: Arc<BrokerState>, job: RunJob) {
             &[],
         )
         .await;
+        let reservation_id = match &signed.operation {
+            CodingOperation::StartCodingRun {
+                budget_reservation_id,
+                ..
+            }
+            | CodingOperation::ResumeCodingRun {
+                budget_reservation_id,
+                ..
+            } => *budget_reservation_id,
+        };
+        let _ = coding_reservations::finish(&state.db, reservation_id, run_id, false).await;
         state
             .active
             .lock()
@@ -424,7 +594,11 @@ async fn run_worker(state: Arc<BrokerState>, job: RunJob) {
             .map(|mut runs| runs.remove(&run_id));
         return;
     }
-    let result = jarvis_codex::execute_in_sandbox_with_cancel(
+    let ownership = DurableSandboxOwnership {
+        db: &state.db,
+        run_id,
+    };
+    let result = jarvis_codex::execute_in_sandbox_tracked(
         state
             .sandbox
             .as_ref()
@@ -440,8 +614,22 @@ async fn run_worker(state: Arc<BrokerState>, job: RunJob) {
             capability: Some(capability),
         },
         Some(receiver.clone()),
+        &ownership,
     )
     .await;
+    if matches!(&result, Err(CodingRunError::CleanupRequired)) {
+        state.cleanup_epoch.fetch_add(1, Ordering::SeqCst);
+        state.cleanup_healthy.store(false, Ordering::SeqCst);
+        state.authority.revoke_run(run_id, false);
+        let _ = state.db.query("UPDATE coding_runs SET failure_category='cleanup_required',updated_at=time::now() WHERE record::id(id)=$run AND status IN ['preparing','running','cancelling'] RETURN NONE")
+            .bind(json!({"run":run_id.to_string()})).await;
+        state
+            .active
+            .lock()
+            .ok()
+            .map(|mut runs| runs.remove(&run_id));
+        return;
+    }
     let cancelled = *receiver.borrow();
     match result {
         Ok(mut result) if !cancelled && result.status == "completed" => {
@@ -462,6 +650,17 @@ async fn run_worker(state: Arc<BrokerState>, job: RunJob) {
                 )
                 .await;
                 state.authority.revoke_run(run_id, false);
+                let reservation_id = match &signed.operation {
+                    CodingOperation::StartCodingRun {
+                        budget_reservation_id,
+                        ..
+                    }
+                    | CodingOperation::ResumeCodingRun {
+                        budget_reservation_id,
+                        ..
+                    } => *budget_reservation_id,
+                };
+                let _ = coding_reservations::finish(&state.db, reservation_id, run_id, false).await;
                 state
                     .active
                     .lock()
@@ -550,6 +749,25 @@ async fn run_worker(state: Arc<BrokerState>, job: RunJob) {
     let _ = state.db.query("UPDATE coding_runs SET status='cancelled',failure_category='owner_cancelled',reservation_status='released',updated_at=time::now(),completed_at=time::now() WHERE record::id(id)=$run AND status='cancelling' RETURN NONE")
         .bind(json!({"run":run_id.to_string()})).await;
     state.authority.revoke_run(run_id, false);
+    let reservation_id = match &signed.operation {
+        CodingOperation::StartCodingRun {
+            budget_reservation_id,
+            ..
+        }
+        | CodingOperation::ResumeCodingRun {
+            budget_reservation_id,
+            ..
+        } => *budget_reservation_id,
+    };
+    let final_status = run_status(&state.db, run_id, signed.user_id).await;
+    let settled = matches!(final_status.as_deref(), Ok("completed"));
+    if matches!(
+        coding_reservations::finish(&state.db, reservation_id, run_id, settled).await,
+        Ok(true)
+    ) {
+        let _ = state.db.query("UPDATE coding_runs SET reservation_status='released' WHERE record::id(id)=$run AND reservation_status='active' RETURN NONE")
+            .bind(json!({"run":run_id.to_string()})).await;
+    }
     state
         .active
         .lock()
@@ -677,7 +895,7 @@ async fn mark_run_finished(
     failure: Option<&str>,
     artifacts: &[String],
 ) -> anyhow::Result<bool> {
-    let mut response = db.query("UPDATE coding_runs SET status=$status,summary=$summary,failure_category=$failure,artifacts=$artifacts,reservation_status='released',updated_at=time::now(),completed_at=time::now() WHERE record::id(id)=$run AND status IN ['queued','preparing','running','cancelling'] AND ($status!='completed' OR status='running') AND ($status='cancelled' OR status!='cancelling') RETURN record::id(id) AS id")
+    let mut response = db.query("UPDATE coding_runs SET status=$status,summary=$summary,failure_category=$failure,artifacts=$artifacts,updated_at=time::now(),completed_at=time::now() WHERE record::id(id)=$run AND status IN ['queued','preparing','running','cancelling'] AND ($status!='completed' OR status='running') AND ($status='cancelled' OR status!='cancelling') RETURN record::id(id) AS id")
         .bind(json!({"status":status,"summary":summary,"failure":failure,"artifacts":artifacts,"run":run_id.to_string()}))
         .await?.check()?;
     let rows: Vec<serde_json::Value> = response.take(0)?;

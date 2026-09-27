@@ -1012,7 +1012,7 @@ if [[ $mode == migrate_staged ]]; then
     candidate="$releases_dir/$requested_tag"
     [[ $requested_tag != "$current_tag" ]] || fail "migration requires a different candidate release"
     jq -e --arg previous "$current_schema_sha256" '
-        .schema_migration.version == 1 and (.schema_migration.target == 8 or .schema_migration.target == 9) and
+        .schema_migration.version == 1 and (.schema_migration.target == 8 or .schema_migration.target == 9 or .schema_migration.target == 10) and
         (.schema_migration.from_sha256 | type == "array") and
         (.schema_migration.from_sha256 | index($previous) != null) and
         .tooling.systemd_units == 1 and .tooling.local_devices == 1

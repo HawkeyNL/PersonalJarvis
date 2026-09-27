@@ -52,6 +52,38 @@ pub(crate) async fn list(a: Authed, State(s): State<AppState>) -> Json<Value> {
     let rows:Vec<Value>=s.db.query("SELECT record::id(id) AS id,repository,base_revision,objective,state,checkpoint,updated_at FROM coding_sessions WHERE user_id=$user_id ORDER BY updated_at DESC LIMIT 50").bind(json!({"user_id":a.user.id.to_string()})).await.ok().and_then(|mut x|x.take(0).ok()).unwrap_or_default();
     Json(json!({"sessions":rows}))
 }
+
+/// Issue a short-lived subscription execution reservation to this authenticated
+/// owner. The device subsequently signs this ID with the exact coding task;
+/// the broker must independently lease the database record before use.
+pub(crate) async fn reserve_run(
+    a: Authed,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut response = s.db.query("SELECT state FROM coding_sessions WHERE record::id(id)=$id AND user_id=$user AND state IN ['active','suspended'] LIMIT 1")
+        .bind(json!({"id":id.to_string(),"user":a.user.id.to_string()}))
+        .await.map_err(|_|err())?;
+    let rows: Vec<Value> = response.take(0).map_err(|_| err())?;
+    if rows.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"no active coding session"})),
+        ));
+    }
+    let reservation_id = jarvis_usage::coding_reservations::reserve(&s.db, a.user.id, id)
+        .await
+        .map_err(|_| err())?;
+    Ok(Json(json!({
+        "reservation_id":reservation_id,
+        "compute_class":"subscription",
+        "api_spend_cents":0,
+        "execution_units":1,
+        "max_runtime_secs":jarvis_usage::coding_reservations::MAX_RUNTIME_SECS,
+        "max_provider_turns":jarvis_usage::coding_reservations::MAX_PROVIDER_TURNS,
+        "expires_in_secs":300,
+    })))
+}
 pub(crate) async fn lifecycle(
     a: Authed,
     State(s): State<AppState>,

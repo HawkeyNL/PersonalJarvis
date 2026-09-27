@@ -11,6 +11,7 @@
 use std::{collections::BTreeMap, fs, path::Path, sync::Mutex};
 
 use serde::{Deserialize, Serialize};
+pub mod coding_reservations;
 pub mod surreal;
 
 /// The metered backends — the only ones that spend money.

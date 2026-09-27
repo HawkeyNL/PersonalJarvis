@@ -246,7 +246,7 @@ mod tests {
                 base_commit_sha: input.base_commit_sha.clone(),
                 expires_at: OffsetDateTime::now_utc() + time::Duration::minutes(1),
                 budget_reservation_id: input.budget_reservation_id,
-                budget_limit_cents: 1,
+                execution_unit_limit: 1,
                 operation: BrokeredCodexOperation::RunApprovedTask,
             })
             .unwrap();
