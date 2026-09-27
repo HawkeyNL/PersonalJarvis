@@ -151,6 +151,62 @@ async fn coding_subscription_reservation_is_server_issued_single_lease_and_zero_
     assert_eq!(rows[0]["compute_class"], "subscription");
     assert_eq!(rows[0]["api_spend_cents"], 0);
     assert_eq!(rows[0]["run_id"], winner.to_string());
+    let expired = jarvis_usage::coding_reservations::reserve(&db, user, session).await?;
+    assert!(jarvis_usage::coding_reservations::lease(
+        &db,
+        expired,
+        user,
+        uuid::Uuid::now_v7(),
+        uuid::Uuid::now_v7(),
+        60
+    )
+    .await?
+    .is_none());
+    assert!(jarvis_usage::coding_reservations::lease(
+        &db,
+        expired,
+        user,
+        session,
+        uuid::Uuid::now_v7(),
+        u64::from(jarvis_usage::coding_reservations::MAX_RUNTIME_SECS) + 1
+    )
+    .await?
+    .is_none());
+    db.query("UPDATE coding_reservations SET expires_at=time::now()-1s WHERE record::id(id)=$id RETURN NONE")
+        .bind(json!({"id":expired.to_string()})).await?.check()?;
+    assert!(jarvis_usage::coding_reservations::lease(
+        &db,
+        expired,
+        user,
+        session,
+        uuid::Uuid::now_v7(),
+        60
+    )
+    .await?
+    .is_none());
+    let released = jarvis_usage::coding_reservations::reserve(&db, user, session).await?;
+    let cancelled_run = uuid::Uuid::now_v7();
+    assert!(jarvis_usage::coding_reservations::lease(
+        &db,
+        released,
+        user,
+        session,
+        cancelled_run,
+        60
+    )
+    .await?
+    .is_some());
+    assert!(jarvis_usage::coding_reservations::finish(&db, released, cancelled_run, false).await?);
+    assert!(jarvis_usage::coding_reservations::lease(
+        &db,
+        released,
+        user,
+        session,
+        uuid::Uuid::now_v7(),
+        60
+    )
+    .await?
+    .is_none());
     Ok(())
 }
 

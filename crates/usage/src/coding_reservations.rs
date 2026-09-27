@@ -5,7 +5,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub const MAX_RUNTIME_SECS: u32 = 600;
-pub const MAX_PROVIDER_TURNS: u32 = 12;
+// The current reviewed relay authorizes one provider operation. Raise this
+// only together with an audited iterative tool protocol and its tests.
+pub const MAX_PROVIDER_TURNS: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeasedReservation {
@@ -20,8 +22,8 @@ pub struct LeasedReservation {
 /// sign the exact returned ID before the broker can lease it.
 pub async fn reserve(db: &Database, user_id: Uuid, session_id: Uuid) -> Result<Uuid, StoreError> {
     let id = Uuid::now_v7();
-    db.query("CREATE coding_reservations SET id=$id,user_id=$user,coding_session_id=$session,purpose='codex_coding_run',compute_class='subscription',api_spend_cents=0,execution_units=1,max_runtime_secs=$runtime,max_provider_turns=$turns,status='reserved',run_id=NONE,created_at=time::now(),updated_at=time::now(),expires_at=time::now()+5m RETURN NONE")
-        .bind(json!({"id":id.to_string(),"user":user_id.to_string(),"session":session_id.to_string(),"runtime":MAX_RUNTIME_SECS,"turns":MAX_PROVIDER_TURNS}))
+    db.query("CREATE coding_reservations SET id=$id,user_id=$user,coding_session_id=$coding_session_key,purpose='codex_coding_run',compute_class='subscription',api_spend_cents=0,execution_units=1,max_runtime_secs=$runtime,max_provider_turns=$turns,status='reserved',run_id=NONE,created_at=time::now(),updated_at=time::now(),expires_at=time::now()+5m RETURN NONE")
+        .bind(json!({"id":id.to_string(),"user":user_id.to_string(),"coding_session_key":session_id.to_string(),"runtime":MAX_RUNTIME_SECS,"turns":MAX_PROVIDER_TURNS}))
         .await.map_err(StoreError::schema)?.check().map_err(StoreError::schema)?;
     Ok(id)
 }
@@ -37,8 +39,8 @@ pub async fn lease(
     run_id: Uuid,
     requested_runtime_secs: u64,
 ) -> Result<Option<LeasedReservation>, StoreError> {
-    let mut response = db.query("UPDATE coding_reservations SET status='leased',run_id=$run,updated_at=time::now() WHERE record::id(id)=$id AND user_id=$user AND coding_session_id=$session AND purpose='codex_coding_run' AND compute_class='subscription' AND api_spend_cents=0 AND execution_units=1 AND status='reserved' AND expires_at>time::now() AND max_runtime_secs >= $runtime RETURN id,max_runtime_secs,max_provider_turns")
-        .bind(json!({"id":id.to_string(),"user":user_id.to_string(),"session":session_id.to_string(),"run":run_id.to_string(),"runtime":requested_runtime_secs}))
+    let mut response = db.query("UPDATE coding_reservations SET status='leased',run_id=$run,updated_at=time::now() WHERE record::id(id)=$id AND user_id=$user AND coding_session_id=$coding_session_key AND purpose='codex_coding_run' AND compute_class='subscription' AND api_spend_cents=0 AND execution_units=1 AND status='reserved' AND expires_at>time::now() AND max_runtime_secs >= $runtime RETURN id,max_runtime_secs,max_provider_turns")
+        .bind(json!({"id":id.to_string(),"user":user_id.to_string(),"coding_session_key":session_id.to_string(),"run":run_id.to_string(),"runtime":requested_runtime_secs}))
         .await.map_err(StoreError::schema)?.check().map_err(StoreError::schema)?;
     let rows: Vec<Value> = response.take(0).map_err(StoreError::schema)?;
     let Some(row) = rows.into_iter().next() else {

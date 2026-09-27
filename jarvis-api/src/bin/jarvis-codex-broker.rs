@@ -244,8 +244,8 @@ async fn reconcile_owned_sandboxes(state: &BrokerState) -> anyhow::Result<()> {
         // The authenticated manager metadata is the second ownership key for
         // the crash window before sandbox_id could be persisted.
         manager.terminate(item.handle.clone()).await?;
-        let _ = state.db.query("UPDATE coding_runs SET sandbox_provider='opensandbox',sandbox_id=$sandbox,sandbox_state='orphan_recovered',sandbox_cleanup_status='terminated',updated_at=time::now() WHERE record::id(id)=$run AND coding_session_id=$session AND (sandbox_id=NONE OR sandbox_id=$sandbox) RETURN NONE")
-            .bind(json!({"run":item.handle.task_id.to_string(),"session":item.coding_session_id.to_string(),"sandbox":item.handle.provider_id})).await?.check()?;
+        let _ = state.db.query("UPDATE coding_runs SET sandbox_provider='opensandbox',sandbox_id=$sandbox,sandbox_state='orphan_recovered',sandbox_cleanup_status='terminated',updated_at=time::now() WHERE record::id(id)=$run AND coding_session_id=$coding_session_key AND (sandbox_id=NONE OR sandbox_id=$sandbox) RETURN NONE")
+            .bind(json!({"run":item.handle.task_id.to_string(),"coding_session_key":item.coding_session_id.to_string(),"sandbox":item.handle.provider_id})).await?.check()?;
         audit(
             &state.db,
             None,
@@ -282,9 +282,81 @@ async fn reconcile_owned_sandboxes(state: &BrokerState) -> anyhow::Result<()> {
             .and_then(serde_json::Value::as_str)
             .and_then(|v| uuid::Uuid::parse_str(v).ok())
             .context("invalid durable reservation ID")?;
-        let _ = coding_reservations::finish(&state.db, reservation_id, run_id, false).await?;
-        state.db.query("UPDATE coding_runs SET status='failed',failure_category='broker_restarted',reservation_status='released',sandbox_state='terminated',sandbox_cleanup_status='terminated',updated_at=time::now(),completed_at=time::now() WHERE record::id(id)=$run AND status IN ['queued','preparing','running','cancelling'] RETURN NONE")
-            .bind(json!({"run":run_id.to_string()})).await?.check()?;
+        let status = row
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .context("invalid durable run state")?;
+        let _ =
+            coding_reservations::finish(&state.db, reservation_id, run_id, status == "completed")
+                .await?;
+        if matches!(status, "queued" | "preparing" | "running" | "cancelling") {
+            state.db.query("UPDATE coding_runs SET status='failed',failure_category='broker_restarted',reservation_status='released',sandbox_state='terminated',sandbox_cleanup_status='terminated',updated_at=time::now(),completed_at=time::now() WHERE record::id(id)=$run AND status IN ['queued','preparing','running','cancelling'] RETURN NONE")
+                .bind(json!({"run":run_id.to_string()})).await?.check()?;
+        } else {
+            state.db.query("UPDATE coding_runs SET sandbox_state='terminated',sandbox_cleanup_status='terminated',reservation_status='released',updated_at=time::now() WHERE record::id(id)=$run AND sandbox_state='cleanup_failed' RETURN NONE")
+                .bind(json!({"run":run_id.to_string()})).await?.check()?;
+        }
+    }
+    // A broker can die after the conditional lease but before CREATE
+    // coding_runs. Such a lease cannot be revived or spent again; release it
+    // only after the manager metadata scan proved no unowned workload remains.
+    let mut leases = state.db.query("SELECT record::id(id) AS reservation_id,run_id FROM coding_reservations WHERE status='leased' LIMIT 1000")
+        .await?.check()?;
+    let leases: Vec<serde_json::Value> = leases.take(0)?;
+    if leases.len() == 1000 {
+        bail!("Codex reservation recovery scan exceeded bound");
+    }
+    for lease in leases {
+        let reservation_id = lease
+            .get("reservation_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|v| uuid::Uuid::parse_str(v).ok())
+            .context("invalid leased reservation ID")?;
+        let run_id = lease
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|v| uuid::Uuid::parse_str(v).ok())
+            .context("invalid leased run ID")?;
+        if active.contains(&run_id) {
+            continue;
+        }
+        let mut present = state
+            .db
+            .query("SELECT status,sandbox_state FROM coding_runs WHERE record::id(id)=$run LIMIT 1")
+            .bind(json!({"run":run_id.to_string()}))
+            .await?
+            .check()?;
+        let rows: Vec<serde_json::Value> = present.take(0)?;
+        if rows.is_empty() {
+            let _ = coding_reservations::finish(&state.db, reservation_id, run_id, false).await?;
+            audit(
+                &state.db,
+                None,
+                "orphan_reservation",
+                "unattached subscription lease released",
+            )
+            .await;
+        } else if let Some(row) = rows.first() {
+            let status = row
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .context("invalid leased run state")?;
+            let sandbox_state = row.get("sandbox_state").and_then(serde_json::Value::as_str);
+            if matches!(status, "completed" | "failed" | "timed_out" | "cancelled")
+                && matches!(
+                    sandbox_state,
+                    Some("terminated" | "orphan_recovered" | "not_created")
+                )
+            {
+                let _ = coding_reservations::finish(
+                    &state.db,
+                    reservation_id,
+                    run_id,
+                    status == "completed",
+                )
+                .await?;
+            }
+        }
     }
     Ok(())
 }
@@ -493,10 +565,10 @@ async fn start_run(
         bail!("subscription reservation limits do not authorize this run");
     }
     let snapshot_sha = snapshot.sha256_hex();
-    let created = state.db.query("CREATE coding_runs SET id=$run,request_id=$request,coding_session_id=$session,user_id=$user,device_id=$device,repository_id=$repository_id,repository_owner=$repository_owner,repository_name=$repository_name,base_sha=$base,snapshot_sha256=$snapshot,reservation_id=$reservation,reservation_units=1,reservation_status='active',status='queued',summary=NONE,failure_category=NONE,artifacts=[],compute_class='subscription',sandbox_provider=NONE,sandbox_id=NONE,sandbox_state='not_created',sandbox_created_at=NONE,sandbox_cleanup_status=NONE,created_at=time::now(),updated_at=time::now(),completed_at=NONE RETURN NONE")
+    let created = state.db.query("CREATE coding_runs SET id=$run,request_id=$request,coding_session_id=$coding_session_key,user_id=$user,device_id=$device,repository_id=$repository_id,repository_owner=$repository_owner,repository_name=$repository_name,base_sha=$base,snapshot_sha256=$snapshot,reservation_id=$reservation,reservation_units=1,reservation_status='active',status='queued',summary=NONE,failure_category=NONE,artifacts=[],compute_class='subscription',sandbox_provider=NONE,sandbox_id=NONE,sandbox_state='not_created',sandbox_created_at=NONE,sandbox_cleanup_status=NONE,created_at=time::now(),updated_at=time::now(),completed_at=NONE RETURN NONE")
         .bind(json!({
             "run":run_id.to_string(),"request":signed.request_id.to_string(),
-            "session":claims.coding_session_id.to_string(),"user":signed.user_id.to_string(),
+            "coding_session_key":claims.coding_session_id.to_string(),"user":signed.user_id.to_string(),
             "device":signed.device_id.to_string(),"repository_id":claims.repository.id,
             "repository_owner":claims.repository.owner,"repository_name":claims.repository.name,
             "base":claims.base_commit_sha,"snapshot":snapshot_sha,
@@ -677,8 +749,8 @@ async fn run_worker(state: Arc<BrokerState>, job: RunJob) {
             // Never expose a completed run/artifact before its factual resume
             // checkpoint has been stored. A concurrent cancellation may still
             // win the final transition; its run remains cancelled.
-            let checkpoint_saved = state.db.query("UPDATE coding_sessions SET checkpoint=$checkpoint,state='suspended',updated_at=time::now() WHERE record::id(id)=$session AND user_id=$user RETURN record::id(id) AS id")
-                .bind(json!({"checkpoint":checkpoint,"session":result.coding_session_id.to_string(),"user":signed.user_id.to_string()}))
+            let checkpoint_saved = state.db.query("UPDATE coding_sessions SET checkpoint=$checkpoint,state='suspended',updated_at=time::now() WHERE record::id(id)=$coding_session_key AND user_id=$user RETURN record::id(id) AS id")
+                .bind(json!({"checkpoint":checkpoint,"coding_session_key":result.coding_session_id.to_string(),"user":signed.user_id.to_string()}))
                 .await.ok().and_then(|mut response| response.take::<Vec<serde_json::Value>>(0).ok())
                 .is_some_and(|rows| !rows.is_empty());
             let completed = if checkpoint_saved {

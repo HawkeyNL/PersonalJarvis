@@ -123,6 +123,12 @@ releasing their reservations. Incomplete cleanup stops admission of new runs;
 unrelated OpenSandbox workloads are never deleted. This recovery path still
 requires disposable-manager/SurrealDB integration and crash-injection proof
 before production activation.
+The signed runtime deadline includes sandbox creation; a timed-out or lost
+create response is treated as uncertain ownership rather than as proof that
+no workload exists. The metadata scan must resolve it before the reservation
+can be released. The current one-shot relay reserves one non-monetary provider
+operation, not a fictitious cent; multi-turn model/tool interaction is not yet
+enabled.
 
 The remaining provider activation gate is precise: the current official
 [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server)

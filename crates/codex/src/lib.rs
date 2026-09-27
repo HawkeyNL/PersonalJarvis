@@ -734,10 +734,15 @@ pub async fn execute_in_sandbox_tracked<
     });
     let sandbox_input = SandboxRunInput::from_approved(request, gate.run_id, &snapshot)
         .map_err(|_| CodingRunError::SandboxFailed)?;
-    let handle = provider
-        .create(&task)
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(sandbox_input.timeout_secs);
+    // A manager may create a workload but lose its response. Treat create
+    // timeout/error as uncertain ownership: pause admission until metadata
+    // reconciliation proves whether an orphan needs destruction.
+    let handle = tokio::time::timeout_at(deadline, provider.create(&task))
         .await
-        .map_err(|_| CodingRunError::SandboxUnavailable)?;
+        .map_err(|_| CodingRunError::CleanupRequired)?
+        .map_err(|_| CodingRunError::CleanupRequired)?;
     if let Err(error) = ownership.created(&handle).await {
         let terminated = provider.terminate(handle.clone()).await.is_ok();
         let _ = ownership.cleanup(&handle, terminated).await;
@@ -751,8 +756,8 @@ pub async fn execute_in_sandbox_tracked<
     // The signed limit bounds upload, relay, provider execution and artifact
     // collection together. A stalled manager cannot stretch a 1-second owner
     // approval into the profile's much larger infrastructure ceiling.
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(sandbox_input.timeout_secs),
+    let result = tokio::time::timeout_at(
+        deadline,
         async {
         provider
             .set_network_policy(&handle, &task.network_policy)
@@ -1847,6 +1852,7 @@ mod tests {
     struct TestProvider {
         calls: Arc<Mutex<Vec<&'static str>>>,
         available: bool,
+        delay_create: bool,
     }
 
     #[async_trait]
@@ -1864,6 +1870,9 @@ mod tests {
             task: &jarvis_sandbox::SandboxTask,
         ) -> Result<jarvis_sandbox::SandboxHandle, jarvis_sandbox::SandboxError> {
             self.calls.lock().unwrap().push("create");
+            if self.delay_create {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
             Ok(jarvis_sandbox::SandboxHandle {
                 provider_id: "test-run".into(),
                 task_id: task.task_id,
@@ -1939,6 +1948,7 @@ mod tests {
     struct RecordingOwnership {
         calls: Arc<Mutex<Vec<&'static str>>>,
         reject_persistence: bool,
+        reject_cleanup: bool,
     }
 
     #[async_trait]
@@ -1957,7 +1967,11 @@ mod tests {
             _: bool,
         ) -> Result<(), CodingRunError> {
             self.calls.lock().unwrap().push("persist_cleanup");
-            Ok(())
+            if self.reject_cleanup {
+                Err(CodingRunError::SandboxFailed)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1968,10 +1982,12 @@ mod tests {
             let provider = TestProvider {
                 calls: calls.clone(),
                 available: true,
+                delay_create: false,
             };
             let ownership = RecordingOwnership {
                 calls: calls.clone(),
                 reject_persistence,
+                reject_cleanup: false,
             };
             let request = signed_start();
             let (authority, capability, run_id) = capability_for(&request);
@@ -2011,11 +2027,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_record_failure_requires_reconciliation_even_after_termination() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = TestProvider {
+            calls: calls.clone(),
+            available: true,
+            delay_create: false,
+        };
+        let ownership = RecordingOwnership {
+            calls: calls.clone(),
+            reject_persistence: false,
+            reject_cleanup: true,
+        };
+        let request = signed_start();
+        let (authority, capability, run_id) = capability_for(&request);
+        let result = execute_in_sandbox_tracked(
+            &provider,
+            &request,
+            valid_snapshot(&request),
+            TaskContextInput::default(),
+            ApprovedSandboxRun {
+                adapter: &TestAdapter,
+                authority: &authority,
+                run_id,
+                capability: Some(capability),
+            },
+            None,
+            &ownership,
+        )
+        .await;
+        assert!(matches!(result, Err(CodingRunError::CleanupRequired)));
+        let calls = calls.lock().unwrap();
+        assert!(calls.contains(&"terminate"));
+        assert_eq!(calls.last(), Some(&"persist_cleanup"));
+    }
+
+    #[tokio::test]
+    async fn create_timeout_is_uncertain_ownership_and_never_uploads() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = TestProvider {
+            calls: calls.clone(),
+            available: true,
+            delay_create: true,
+        };
+        let mut request = signed_start();
+        if let CodingOperation::StartCodingRun { timeout_secs, .. } = &mut request.operation {
+            *timeout_secs = 1;
+        }
+        let (authority, capability, run_id) = capability_for(&request);
+        let result = execute_in_sandbox_tracked(
+            &provider,
+            &request,
+            valid_snapshot(&request),
+            TaskContextInput::default(),
+            ApprovedSandboxRun {
+                adapter: &TestAdapter,
+                authority: &authority,
+                run_id,
+                capability: Some(capability),
+            },
+            None,
+            &NoopOwnershipRecorder,
+        )
+        .await;
+        assert!(matches!(result, Err(CodingRunError::CleanupRequired)));
+        let calls = calls.lock().unwrap();
+        assert!(calls.contains(&"create"));
+        assert!(!calls.contains(&"upload"));
+    }
+
+    #[tokio::test]
     async fn coding_execution_never_falls_back_without_broker_capability() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let provider = TestProvider {
             calls: calls.clone(),
             available: true,
+            delay_create: false,
         };
         let err = execute_in_sandbox(
             &provider,
@@ -2054,6 +2141,7 @@ mod tests {
         let provider = TestProvider {
             calls: calls.clone(),
             available: true,
+            delay_create: false,
         };
         let request = signed_start();
         let (authority, capability, run_id) = capability_for(&request);
@@ -2081,6 +2169,7 @@ mod tests {
         let provider = TestProvider {
             calls: calls.clone(),
             available: true,
+            delay_create: false,
         };
         let request = signed_start();
         let (authority, capability, run_id) = capability_for(&request);

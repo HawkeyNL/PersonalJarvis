@@ -1426,6 +1426,47 @@ mod tests {
         assert!(payload.get("env").is_none());
     }
 
+    #[tokio::test]
+    async fn authenticated_manager_listing_discovers_only_bound_codex_workloads() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let run = Uuid::now_v7();
+        let session = Uuid::now_v7();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).await.unwrap();
+            let text = std::str::from_utf8(&request[..count]).unwrap();
+            assert!(text.starts_with("GET /v1/sandboxes?"));
+            assert!(text.contains("metadata=jarvis.profile%3Dcodex"));
+            assert!(text
+                .to_ascii_lowercase()
+                .contains("open-sandbox-api-key: fixture-manager-key"));
+            let body = json!({
+                "items": [
+                    {"id":"owned-codex-1","metadata":{"jarvis.profile":"codex","jarvis.run_id":run.to_string(),"jarvis.session_id":session.to_string()}},
+                    {"id":"unrelated","metadata":{"jarvis.profile":"research"}}
+                ],
+                "pagination":{"page":1,"pageSize":100,"totalItems":2,"totalPages":1,"hasNextPage":false}
+            }).to_string();
+            let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let provider = OpenSandboxProvider::for_codex_broker(
+            format!("http://127.0.0.1:{port}/"),
+            "fixture-manager-key".into(),
+            format!("registry.example/codex@sha256:{}", "a".repeat(64)),
+        )
+        .unwrap();
+        let owned = provider.list_owned_codex().await.unwrap();
+        server.await.unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].handle.provider_id, "owned-codex-1");
+        assert_eq!(owned[0].handle.task_id, run);
+        assert_eq!(owned[0].coding_session_id, session);
+    }
+
     #[test]
     fn input_and_shell_arguments_cannot_escape_the_sandbox_protocol() {
         for name in ["../secret", "/etc/shadow", "input\\file", "input//file"] {
