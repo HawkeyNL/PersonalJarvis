@@ -8,6 +8,8 @@ Implement three related operational capabilities for PersonalJarvis:
 
 Work against CURRENT main and coordinate cleanly with the intelligent model-router/model-access work. Do not duplicate or weaken that architecture.
 
+Follow-up implementation of subscription-backed Claude/Codex authentication and bounded task context is specified in `docs/SUBSCRIPTION_WORKER_CONTEXT_ROUTING_GOAL.md`. Provider account lifecycle remains owner-only.
+
 ## 1. Owner-selectable brain
 
 The owner must be able to configure the default Jarvis brain from the authenticated Jarvis app/API.
