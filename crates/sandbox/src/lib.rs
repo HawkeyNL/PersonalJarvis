@@ -308,6 +308,32 @@ pub trait SandboxProvider: Send + Sync {
         handle: &SandboxHandle,
         paths: &[String],
     ) -> Result<Vec<CollectedArtifact>, SandboxError>;
+    /// Read only the fixed, transient Codex request file through the
+    /// authenticated manager-to-sandbox control plane. No sandbox network
+    /// route back to the Home Node is introduced.
+    async fn read_codex_task_request(
+        &self,
+        _: &SandboxHandle,
+    ) -> Result<Option<Vec<u8>>, SandboxError> {
+        Err(SandboxError::Unsupported)
+    }
+    async fn write_codex_task_response(
+        &self,
+        handle: &SandboxHandle,
+        bytes: Vec<u8>,
+    ) -> Result<(), SandboxError> {
+        if bytes.len() > 640 * 1024 {
+            return Err(SandboxError::InvalidInput);
+        }
+        self.upload(
+            handle,
+            TaskInput {
+                name: "task-response.json".into(),
+                bytes,
+            },
+        )
+        .await
+    }
     async fn terminate(&self, handle: SandboxHandle) -> Result<(), SandboxError>;
 }
 
@@ -433,6 +459,7 @@ pub struct OpenSandboxProvider {
     api_key: String,
     images: OpenSandboxImages,
     client: Client,
+    codex_only: bool,
 }
 
 impl OpenSandboxProvider {
@@ -456,7 +483,31 @@ impl OpenSandboxProvider {
             api_key: config.api_key,
             images: config.images,
             client,
+            codex_only: false,
         })
+    }
+
+    /// Restricted constructor for the Codex broker. Other profiles are
+    /// rejected even though the underlying manager supports them.
+    pub fn for_codex_broker(
+        endpoint: String,
+        api_key: String,
+        image_digest: String,
+    ) -> Result<Self, SandboxError> {
+        let images = OpenSandboxImages {
+            research: image_digest.clone(),
+            coding: image_digest.clone(),
+            browser: image_digest.clone(),
+            data_analysis: image_digest.clone(),
+            codex: image_digest,
+        };
+        let mut provider = Self::for_home_node(OpenSandboxConfig {
+            endpoint,
+            api_key,
+            images,
+        })?;
+        provider.codex_only = true;
+        Ok(provider)
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, SandboxError> {
@@ -514,6 +565,9 @@ impl SandboxProvider for OpenSandboxProvider {
         }
     }
     async fn create(&self, task: &SandboxTask) -> Result<SandboxHandle, SandboxError> {
+        if self.codex_only && task.profile != SandboxProfile::Codex {
+            return Err(SandboxError::InvalidTask);
+        }
         task.network_policy.validate()?;
         let endpoint = self.endpoint("v1/sandboxes")?;
         let response = self
@@ -680,7 +734,7 @@ impl SandboxProvider for OpenSandboxProvider {
                 .get(&sandbox_path)
                 .ok_or(SandboxError::InvalidProviderResponse)?;
             if file.get("type").and_then(Value::as_str) != Some("file")
-                || file.get("size").and_then(Value::as_u64) > Some(MAX_ARTIFACT_BYTES)
+                || !matches!(file.get("size").and_then(Value::as_u64), Some(size) if size <= MAX_ARTIFACT_BYTES)
             {
                 return Err(SandboxError::InvalidArtifact);
             }
@@ -705,6 +759,48 @@ impl SandboxProvider for OpenSandboxProvider {
             });
         }
         Ok(artifacts)
+    }
+    async fn read_codex_task_request(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<Option<Vec<u8>>, SandboxError> {
+        if handle.profile != SandboxProfile::Codex {
+            return Err(SandboxError::InvalidTask);
+        }
+        const PATH: &str = "/workspace/channel/task-request.json";
+        const LIMIT: usize = 48 * 1024;
+        let info_endpoint = self.proxy_endpoint(handle, "/files/info")?;
+        let response = self
+            .authenticated(self.client.get(info_endpoint))
+            .query(&[("path", PATH)])
+            .send()
+            .await
+            .map_err(|_| SandboxError::Unavailable)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let info: Value = response
+            .error_for_status()
+            .map_err(|_| SandboxError::ProviderRequestFailed)?
+            .json()
+            .await
+            .map_err(|_| SandboxError::InvalidProviderResponse)?;
+        let Some(file) = info.get(PATH) else {
+            return Ok(None);
+        };
+        if file.get("type").and_then(Value::as_str) != Some("file")
+            || !matches!(file.get("size").and_then(Value::as_u64), Some(size) if size <= LIMIT as u64)
+        {
+            return Err(SandboxError::InvalidArtifact);
+        }
+        let endpoint = self.proxy_endpoint(handle, "/files/download")?;
+        let response = self
+            .request_success(
+                self.authenticated(self.client.get(endpoint))
+                    .query(&[("path", PATH)]),
+            )
+            .await?;
+        bounded_response_bytes(response, LIMIT).await.map(Some)
     }
     async fn terminate(&self, handle: SandboxHandle) -> Result<(), SandboxError> {
         let endpoint = self.endpoint(&format!("v1/sandboxes/{}", handle.provider_id))?;
@@ -1160,6 +1256,22 @@ mod tests {
             .unwrap_err(),
             SandboxError::InvalidConfiguration
         );
+    }
+
+    #[tokio::test]
+    async fn codex_broker_provider_refuses_every_other_profile() {
+        let provider = OpenSandboxProvider::for_codex_broker(
+            "http://127.0.0.1:8090/".into(),
+            "fixture-manager-key".into(),
+            format!("registry.example/codex@sha256:{}", "a".repeat(64)),
+        )
+        .unwrap();
+        let task = SandboxTask::new(
+            SandboxProfile::Coding,
+            vec!["/usr/local/bin/jarvis-codex-runtime".into()],
+        )
+        .unwrap();
+        assert_eq!(provider.create(&task).await, Err(SandboxError::InvalidTask));
     }
 
     #[test]

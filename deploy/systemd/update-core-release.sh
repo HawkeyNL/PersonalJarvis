@@ -884,6 +884,18 @@ activate_managed_release() {
         fi
         unit_manager="$previous/manage-systemd-units"
     fi
+    if jq -e '.tooling.codex_runtime == 1' "$previous/release.json" >/dev/null && \
+        ! jq -e '.tooling.codex_runtime == 1' "$release/release.json" >/dev/null; then
+        # A release without the fixed, verified sandbox runtime must not be
+        # installed while the optional Codex execution broker is active or
+        # owner-enabled. This is deliberately conservative for legacy targets.
+        if systemctl is-active --quiet jarvis-codex-broker.service || \
+            systemctl is-enabled --quiet jarvis-codex-broker.service; then
+            echo 'jarvis updater: stop and disable Codex broker before rolling back to a pre-Codex-runtime release' >&2
+            return 1
+        fi
+        unit_manager="$previous/manage-systemd-units"
+    fi
     capture_laya_runtime_state
     capture_claude_runtime_state
     backup=$(mktemp -d /run/jarvis-systemd-rollback.XXXXXXXX)
@@ -1000,7 +1012,7 @@ if [[ $mode == migrate_staged ]]; then
     candidate="$releases_dir/$requested_tag"
     [[ $requested_tag != "$current_tag" ]] || fail "migration requires a different candidate release"
     jq -e --arg previous "$current_schema_sha256" '
-        .schema_migration.version == 1 and .schema_migration.target == 8 and
+        .schema_migration.version == 1 and (.schema_migration.target == 8 or .schema_migration.target == 9) and
         (.schema_migration.from_sha256 | type == "array") and
         (.schema_migration.from_sha256 | index($previous) != null) and
         .tooling.systemd_units == 1 and .tooling.local_devices == 1

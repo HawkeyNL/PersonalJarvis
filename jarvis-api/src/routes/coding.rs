@@ -3,7 +3,8 @@
 use crate::{audit::record_security_event, AppState, Authed};
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{header::CONTENT_TYPE, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
@@ -15,6 +16,8 @@ pub(crate) struct Create {
     repository: String,
     base_revision: String,
     objective: String,
+    #[serde(default)]
+    owner_constraints: Vec<String>,
 }
 #[derive(Deserialize)]
 pub(crate) struct Lifecycle {
@@ -32,8 +35,15 @@ pub(crate) async fn create(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let session = jarvis_codex::CodingSession::new(r.repository, r.base_revision, r.objective)
         .map_err(|_| bad())?;
-    s.db.query("CREATE coding_sessions SET id=$id,user_id=$user_id,repository=$repository,base_revision=$base_revision,objective=$objective,state='active',checkpoint=NONE,created_at=time::now(),updated_at=time::now() RETURN NONE")
- .bind(json!({"id":session.id.to_string(),"user_id":a.user.id.to_string(),"repository":session.repository,"base_revision":session.base_revision,"objective":session.objective})).await.map_err(|_|err())?;
+    if r.owner_constraints.len() > 8
+        || r.owner_constraints
+            .iter()
+            .any(|value| value.trim().is_empty() || value.chars().count() > 1_000)
+    {
+        return Err(bad());
+    }
+    s.db.query("CREATE coding_sessions SET id=$id,user_id=$user_id,repository=$repository,base_revision=$base_revision,objective=$objective,owner_constraints=$owner_constraints,state='active',checkpoint=NONE,created_at=time::now(),updated_at=time::now() RETURN NONE")
+ .bind(json!({"id":session.id.to_string(),"user_id":a.user.id.to_string(),"repository":session.repository,"base_revision":session.base_revision,"objective":session.objective,"owner_constraints":r.owner_constraints})).await.map_err(|_|err())?;
     Ok(Json(
         json!({"session_id":session.id,"state":"active","execution":"requires signed approval and OpenSandbox"}),
     ))
@@ -158,8 +168,163 @@ pub(crate) async fn start_or_resume(
     ))
 }
 
-async fn forward_to_broker(socket: &str, request: &jarvis_codex::BrokerRequest) -> Result<(), ()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+/// Owner-scoped factual run status. This never exposes a capability, provider
+/// transcript or raw sandbox log.
+pub(crate) async fn run_status(
+    a: Authed,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    Ok(Json(load_run(&s.db, a.user.id, id).await?))
+}
+
+async fn load_run(
+    db: &jarvis_store::Database,
+    user_id: Uuid,
+    id: Uuid,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    let mut response = db.query("SELECT record::id(id) AS run_id,coding_session_id,repository_id,repository_owner,repository_name,base_sha,snapshot_sha256,status,summary,failure_category,artifacts,compute_class,created_at,updated_at,completed_at FROM coding_runs WHERE record::id(id)=$id AND user_id=$user LIMIT 1")
+        .bind(json!({"id":id.to_string(),"user":user_id.to_string()}))
+        .await.map_err(|_|err())?;
+    let rows: Vec<Value> = response.take(0).map_err(|_| err())?;
+    let row = rows.into_iter().next().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"no such coding run"})),
+        )
+    })?;
+    Ok(row)
+}
+
+/// Cancellation is routed only to the local broker. Core verifies the owner
+/// scope first, while the broker independently verifies its Unix peer and the
+/// same durable run owner before stopping any workload.
+pub(crate) async fn run_cancel(
+    a: Authed,
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let row = load_run(&s.db, a.user.id, id).await?;
+    if row
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "completed" | "failed" | "timed_out" | "cancelled"))
+    {
+        return Ok(Json(json!({"status":"already_terminal"})));
+    }
+    let socket = s.codex_broker_socket.as_deref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"secure coding execution unavailable"})),
+        )
+    })?;
+    let reply = forward_to_broker(
+        socket,
+        &jarvis_codex::BrokerRequest::CancelCodingRun {
+            run_id: id,
+            user_id: a.user.id,
+        },
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"coding cancellation unavailable"})),
+        )
+    })?;
+    Ok(Json(json!({"status":reply})))
+}
+
+pub(crate) async fn run_artifact(
+    a: Authed,
+    State(s): State<AppState>,
+    Path((id, name)): Path<(Uuid, String)>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let artifact = match name.as_str() {
+        "result.json" => jarvis_codex::CodingArtifactName::ResultJson,
+        "patch.diff" => jarvis_codex::CodingArtifactName::PatchDiff,
+        _ => return Err(bad()),
+    };
+    let row = load_run(&s.db, a.user.id, id).await?;
+    if row.get("status").and_then(Value::as_str) != Some("completed") {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error":"artifact unavailable"})),
+        ));
+    }
+    let socket = s.codex_broker_socket.as_deref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"artifact service unavailable"})),
+        )
+    })?;
+    let request = jarvis_codex::BrokerRequest::GetCodingArtifact {
+        run_id: id,
+        user_id: a.user.id,
+        artifact,
+    };
+    let content = fetch_artifact(socket, &request, artifact.file_name())
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"artifact service unavailable"})),
+            )
+        })?;
+    let mime = if name == "result.json" {
+        "application/json"
+    } else {
+        "text/plain; charset=utf-8"
+    };
+    Ok(([(CONTENT_TYPE, mime)], content).into_response())
+}
+
+async fn fetch_artifact(
+    socket: &str,
+    request: &jarvis_codex::BrokerRequest,
+    expected_name: &str,
+) -> Result<String, ()> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::UnixStream::connect(socket),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    let (read, mut write) = stream.into_split();
+    let encoded = serde_json::to_vec(request).map_err(|_| ())?;
+    write.write_all(&encoded).await.map_err(|_| ())?;
+    write.write_all(b"\n").await.map_err(|_| ())?;
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        BufReader::new(read.take(1_100_001)).read_line(&mut line),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    if line.is_empty() || line.len() > 1_100_000 || !line.ends_with('\n') {
+        return Err(());
+    }
+    let reply: Value = serde_json::from_str(&line).map_err(|_| ())?;
+    if reply.get("status").and_then(Value::as_str) != Some("artifact")
+        || reply.get("name").and_then(Value::as_str) != Some(expected_name)
+    {
+        return Err(());
+    }
+    let content = reply.get("content").and_then(Value::as_str).ok_or(())?;
+    if content.len() > 512 * 1024 {
+        return Err(());
+    }
+    Ok(content.to_owned())
+}
+
+async fn forward_to_broker(
+    socket: &str,
+    request: &jarvis_codex::BrokerRequest,
+) -> Result<String, ()> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::net::UnixStream::connect(socket),
@@ -177,14 +342,20 @@ async fn forward_to_broker(socket: &str, request: &jarvis_codex::BrokerRequest) 
     let mut reply = String::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        BufReader::new(read).read_line(&mut reply),
+        BufReader::new(read.take(4097)).read_line(&mut reply),
     )
     .await
     .map_err(|_| ())?
     .map_err(|_| ())?;
-    (reply.trim() == r#"{"status":"accepted"}"#)
-        .then_some(())
-        .ok_or(())
+    if reply.len() > 4096 {
+        return Err(());
+    }
+    let status: Value = serde_json::from_str(&reply).map_err(|_| ())?;
+    match status.get("status").and_then(Value::as_str) {
+        Some("accepted") => Ok("accepted".into()),
+        Some("cancelling") => Ok("cancelling".into()),
+        _ => Err(()),
+    }
 }
 fn bad() -> (StatusCode, Json<Value>) {
     (

@@ -26,13 +26,22 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 8);
+    assert_eq!(version.unwrap().version, 9);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
     db.use_db("from_seven").await?;
     apply_through_seven(&db).await?;
-    apply_baseline_schema(&db).await?; // Also support 7 -> 8 explicitly.
+    apply_baseline_schema(&db).await?; // Also support 7 -> 9 explicitly.
+    db.use_db("from_eight").await?;
+    apply_through_eight(&db).await?;
+    apply_baseline_schema(&db).await?;
+    let mut migrated = db
+        .query("SELECT version FROM schema_version:baseline")
+        .await?
+        .check()?;
+    let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
+    assert_eq!(migrated_version.unwrap().version, 9);
     db.query("UPDATE schema_version:baseline SET version = 99;")
         .await?
         .check()?;

@@ -4,7 +4,7 @@
 use std::{
     collections::HashSet,
     fs,
-    io::Read,
+    io::{Cursor, Read},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -166,14 +166,82 @@ impl TrustedRepositoryRegistry {
             &["archive", "--format=tar", commit_sha],
             MAX_REPOSITORY_ARCHIVE_BYTES,
         )?;
-        if archive.is_empty() {
-            return Err(SnapshotError::GitFailure);
-        }
+        validate_archive(&archive, commit_sha)?;
         Ok(RepositorySnapshot {
             base_commit_sha: commit_sha.to_owned(),
             archive,
         })
     }
+}
+
+/// Re-parse the generated tar before it crosses into OpenSandbox. This is a
+/// second check after `ls-tree`: archive metadata itself is untrusted input.
+pub fn validate_archive(archive: &[u8], commit_sha: &str) -> Result<(), SnapshotError> {
+    if archive.is_empty() || archive.len() > MAX_REPOSITORY_ARCHIVE_BYTES {
+        return Err(SnapshotError::Oversized);
+    }
+    if !is_commit_sha(commit_sha) {
+        return Err(SnapshotError::UnreviewedCommit);
+    }
+    let mut entries = tar::Archive::new(Cursor::new(archive));
+    let mut count = 0usize;
+    let mut total = 0usize;
+    let mut saw_commit_header = false;
+    for entry in entries.entries().map_err(|_| SnapshotError::UnsafeTree)? {
+        let mut entry = entry.map_err(|_| SnapshotError::UnsafeTree)?;
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() {
+            if saw_commit_header
+                || count != 0
+                || entry.path_bytes().as_ref() != b"pax_global_header"
+            {
+                return Err(SnapshotError::UnsafeTree);
+            }
+            if entry.size() > 128 {
+                return Err(SnapshotError::UnsafeTree);
+            }
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .map_err(|_| SnapshotError::UnsafeTree)?;
+            let text = std::str::from_utf8(&data).map_err(|_| SnapshotError::UnsafeTree)?;
+            let (length, value) = text.split_once(' ').ok_or(SnapshotError::UnsafeTree)?;
+            if length.parse::<usize>().ok() != Some(data.len())
+                || value != format!("comment={commit_sha}\n")
+            {
+                return Err(SnapshotError::UnsafeTree);
+            }
+            saw_commit_header = true;
+            continue;
+        }
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(SnapshotError::UnsafeTree);
+        }
+        let path_bytes = entry.path_bytes();
+        let path = std::str::from_utf8(&path_bytes).map_err(|_| SnapshotError::UnsafeTree)?;
+        let path = if kind.is_dir() {
+            path.strip_suffix('/').unwrap_or(path)
+        } else {
+            path
+        };
+        if !safe_snapshot_path(path) {
+            return Err(SnapshotError::UnsafeTree);
+        }
+        count += 1;
+        if count > MAX_TREE_ENTRIES {
+            return Err(SnapshotError::Oversized);
+        }
+        total = total
+            .saturating_add(entry.size() as usize)
+            .saturating_add(1024);
+        if total > MAX_REPOSITORY_ARCHIVE_BYTES {
+            return Err(SnapshotError::Oversized);
+        }
+    }
+    if count == 0 || !saw_commit_header {
+        return Err(SnapshotError::UnsafeTree);
+    }
+    Ok(())
 }
 
 impl RepositorySnapshot {
@@ -250,7 +318,7 @@ fn validate_tree(tree: &[u8]) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-fn safe_snapshot_path(path: &str) -> bool {
+pub(crate) fn safe_snapshot_path(path: &str) -> bool {
     if path.is_empty() || path.starts_with('/') || path.contains('\\') || path.contains('\0') {
         return false;
     }

@@ -45,8 +45,8 @@ and Docker/host ranges remain denied, including through DNS rebinding.
 
 ## Reviewed repository snapshot foundation
 
-`jarvis-codex::snapshot` implements a fail-closed, read-only registry for a
-future trusted broker integration. Production registry bytes come only from
+`jarvis-codex::snapshot` implements a fail-closed, read-only registry used by
+the broker execution path after its provider activation gate. Production registry bytes come only from
 root-owned `/etc/jarvis/codex-repositories.json` (version 1), with at most 32
 entries. Each entry contains a validated logical `RepositoryIdentity` and one
 reviewed `refs/heads/...` ref; it cannot name a path or Git URL. A matching
@@ -54,15 +54,15 @@ root-owned bare mirror must exist as
 `/var/lib/jarvis-codex-repositories/<id>.git`. An exact commit must be reachable
 from that ref. The snapshot is a bounded Git archive from that exact commit,
 not a live checkout or bind mount. Symlinks, submodules, traversal, common
-credential filenames, and oversized trees fail closed. The archive hash is
+credential filenames, and oversized trees fail closed. The resulting tar is
+parsed and validated again before upload. The archive hash is
 available for run provenance. The fixed local Git subprocess has a 30-second
 deadline and receives a clean environment.
 
-This module is not yet wired into the production broker. No repository
-registry, mirror, or Codex workload is installed or activated merely by adding
-the module. Broader content/credential inspection and full archive validation
-remain mandatory before broker activation; a filename denylist alone is not
-proof that a repository contains no secrets.
+No repository registry, mirror, or Codex workload is installed or activated
+merely by adding this code. A filename denylist alone is not proof that a
+reviewed repository contains no secrets; the owner must approve the mirror
+contents before allowing a coding run.
 
 ## Broker-mediated authentication
 
@@ -87,31 +87,36 @@ revoke outstanding tokens. The broker does not expose model selection, a
 generic OpenAI endpoint, credential inspection, arbitrary request bodies or
 general command execution.
 
-## Production activation gate
+## Current execution path and remaining activation gate
 
-The present OpenSandbox network policy correctly blocks sandbox-to-host and
-private-network connections. It therefore cannot yet reach the narrow broker
-API without an explicit, reviewable OpenSandbox-native task proxy that preserves
-the same per-run capability checks. The Home Node must not enable the Codex
-broker socket or real runs until that reverse/task-proxy mechanism is proven
-end-to-end. A missing broker-auth path fails before sandbox creation; it never
-falls back to a host `codex` process. This is an activation gate, not a
-convenience TODO.
+The sandbox never opens a host/private-network connection. The fixed
+`jarvis-codex-runtime` writes one bounded transient task request inside its
+disposable workspace. The broker reads it through OpenSandbox's authenticated
+manager file API, checks every capability binding, and writes one fixed task
+response through that same manager API. This is a per-run, one-operation relay,
+not a general HTTP/OpenAI proxy or mounted broker socket. CI uses a fake
+subscription adapter to exercise the full runtime/relay/teardown sequence;
+this is not evidence of a live Codex subscription run.
 
-The checked-in OpenSandbox deployment provides authenticated, loopback-only
-manager-to-sandbox lifecycle/exec/file operations, but no reviewed
-sandbox-to-broker task channel. `CODEX_SANDBOX_COMMAND` names
-`/usr/local/bin/jarvis-codex-runtime`, which is not built into a reviewed Codex
-workload image by this repository. The current official
+The broker has owner-scoped durable run records, status/cancel handling,
+bounded artifact validation and a fixed private artifact store. An owner-run
+image build uses only the checksum-bound release runtime plus a reviewed
+digest-pinned Ubuntu base, offline. The resulting registry image digest must
+be explicitly configured; no mutable image is accepted. `sudo jarvis sandbox
+verify` is read-only and never claims that merely seeing Docker proves Kata,
+egress, quota or account acceptance.
+
+The remaining provider activation gate is precise: the current official
 [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server)
 labels the app-server command and WebSocket transport experimental and not
 supported for production workloads. The stable `codex exec` command runs
 model-generated shell commands; invoking it with the long-lived subscription
 credential in a host process is not a provider-only task proxy. Neither route
-is a substitute for a reviewed, task-scoped channel that keeps credentials
-out of the untrusted workload. PR #58 supplies only the account/subscription
-foundation. The execution broker must remain closed until an actual production
-channel, immutable workload and adversarial lifecycle tests exist.
+is a reviewed, provider-only subscription adapter for this isolated channel.
+The production adapter therefore reports unavailable and `start_run` refuses
+before creating a run or sandbox. This gate must not be replaced with a host
+Codex CLI, `OPENAI_API_KEY`, an undocumented OAuth endpoint, or a credential
+mount. Real Home Node/Kata and owner-account acceptance are also still pending.
 
 When that gate is met, each completed, failed, timed-out or cancelled run still
 terminates its disposable sandbox. Resume starts a new sandbox from the current
