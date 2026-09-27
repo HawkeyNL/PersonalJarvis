@@ -9,6 +9,7 @@ export type ViewName =
   | "models"
   | "usage"
   | "credentials"
+  | "ai-accounts"
   | "devices"
   | "logs"
   | "system";
@@ -128,6 +129,15 @@ export type CredentialProvider =
   | "huggingface"
   | "jev";
 export interface CredentialRecord { provider: CredentialProvider; configured: boolean }
+export type AiAccountProvider = "claude" | "codex";
+export type AiAccountAction = "connect" | "test" | "reconnect" | "disconnect";
+export interface AiAccountRecord {
+  provider: AiAccountProvider;
+  worker: string;
+  state: "connected" | "logged_out" | "runtime_missing" | "wrong_auth_mode" | "unhealthy";
+  billing: "subscription" | "unverified" | "overage_unverified";
+  runtime: "inactive" | "socket_ready" | "active" | "unavailable";
+}
 export type LogService =
   | "core"
   | "surrealdb"
@@ -179,6 +189,9 @@ export const api = {
   modelMutation: (request: Record<string, string>) =>
     invoke<OperationResult>("model_mutation", { request }),
   credentials: () => invoke<CredentialRecord[]>("credentials"),
+  aiAccounts: () => invoke<AiAccountRecord[]>("ai_accounts"),
+  aiAccountAction: (provider: AiAccountProvider, action: AiAccountAction) =>
+    invoke<OperationResult>("ai_account_action", { provider, action }),
   credentialSet: (provider: CredentialProvider) =>
     invoke<OperationResult>("credential_set", { provider }),
   logs: (service: LogService, lines = 500) =>

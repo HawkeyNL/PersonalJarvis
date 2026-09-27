@@ -1,31 +1,23 @@
-//! Brain via the local `claude` CLI (Claude Code) in headless mode, so Jarvis
-//! runs on the user's Claude *subscription* instead of the metered API (ADR-027).
-//!
-//! Every CLI failure — a non-zero exit, unparseable output, or an `is_error`
-//! result (which is how a plan/rate limit surfaces) — is returned as an
-//! `LlmError`, so a [`FallbackProvider`](crate::FallbackProvider) falls through
-//! to the API: "API als vangnet als de CLI vol is." A genuine answer is returned
-//! as-is; no tools run (the neutral working dir keeps Claude Code out of the repo).
-//!
-//! The persona is passed with `--system-prompt` (which **replaces** Claude Code's
-//! default system prompt), not `--append-system-prompt` (which keeps it). This is
-//! deliberate: as a pure brain, the model must *be* Jarvis — with `--append-` the
-//! built-in "you are Claude Code" identity leaks through on "who are you?".
+//! Subscription-backed Claude brain through a local unprivileged worker.
+//! Core never executes the official CLI or reads its credential store.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::Deserialize;
-use tokio::process::Command;
+use tokio::{io::AsyncReadExt, io::AsyncWriteExt, net::UnixStream};
 
-use crate::types::{truncate, ChatMessage, ChatReply, ChatRequest, LlmError, Role, Tier, Usage};
-use crate::LlmProvider;
+use crate::{
+    claude_worker_protocol::{
+        ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState, MAX_REPLY_BYTES,
+        MAX_REQUEST_BYTES, SOCKET,
+    },
+    types::{ChatMessage, ChatReply, ChatRequest, LlmError, Role, Tier, Usage},
+    LlmProvider,
+};
 
-/// How long to wait for the CLI before giving up (and letting the fallback run).
-const CLI_TIMEOUT: Duration = Duration::from_secs(120);
+const WORKER_TIMEOUT: Duration = Duration::from_secs(125);
 
 pub struct ClaudeCliProvider {
-    bin: String,
     model_default: String,
     model_hard: String,
     model_cheap: String,
@@ -34,16 +26,15 @@ pub struct ClaudeCliProvider {
 
 impl ClaudeCliProvider {
     pub fn new(
-        bin: impl Into<String>,
+        _legacy_binary: impl Into<String>,
         model_default: impl Into<String>,
         model_hard: impl Into<String>,
         model_cheap: impl Into<String>,
     ) -> Self {
-        let bin = bin.into();
+        // Preserve constructor compatibility, never execute a caller path in Core.
         let model_default = model_default.into();
         Self {
             label: format!("claude-cli:{model_default}"),
-            bin,
             model_default,
             model_hard: model_hard.into(),
             model_cheap: model_cheap.into(),
@@ -66,139 +57,135 @@ impl LlmProvider for ClaudeCliProvider {
     }
 
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
-        let prompt = build_prompt(&req.messages);
-        let model = req
-            .model
-            .clone()
-            .unwrap_or_else(|| self.model_for(req.tier).to_string());
-
-        let mut cmd = Command::new(&self.bin);
-        cmd.arg("-p")
-            .arg(&prompt)
-            .arg("--output-format")
-            .arg("json")
-            .arg("--model")
-            .arg(&model);
-        // Replace (not append) the system prompt so the model *is* Jarvis, not
-        // Claude Code — otherwise the CLI's built-in identity answers "wie ben jij?".
-        if let Some(system) = req.system.as_deref().filter(|s| !s.trim().is_empty()) {
-            cmd.arg("--system-prompt").arg(system);
-        }
-        // Run somewhere neutral so headless Claude Code can't wander the repo.
-        cmd.current_dir(std::env::temp_dir());
-        cmd.kill_on_drop(true);
-
-        let output = tokio::time::timeout(CLI_TIMEOUT, cmd.output())
-            .await
-            .map_err(|_| LlmError::Api {
-                status: 504,
-                body: "claude CLI timed out".into(),
-            })?
-            .map_err(|e| LlmError::NotConfigured(format!("claude CLI '{}': {e}", self.bin)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let code = output.status.code().unwrap_or(-1);
-            return Err(LlmError::Api {
-                status: 502,
-                body: format!("claude CLI exit {code}: {}", truncate(stderr.trim(), 300)),
-            });
-        }
-
-        parse_cli_output(&String::from_utf8_lossy(&output.stdout), &model)
-    }
-}
-
-/// Flatten the conversation into a single prompt. One turn passes through as-is;
-/// multi-turn becomes a labeled transcript ending on Jarvis' cue.
-fn build_prompt(messages: &[ChatMessage]) -> String {
-    match messages {
-        [] => String::new(),
-        [only] => only.content.clone(),
-        many => {
-            let mut s = String::new();
-            for m in many {
-                let who = match m.role {
-                    Role::User => "Gebruiker",
-                    Role::Assistant => "Jarvis",
-                };
-                s.push_str(who);
-                s.push_str(": ");
-                s.push_str(&m.content);
-                s.push('\n');
-            }
-            s.push_str("Jarvis:");
-            s
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct CliResult {
-    #[serde(default)]
-    is_error: bool,
-    #[serde(default)]
-    subtype: String,
-    #[serde(default)]
-    result: String,
-    #[serde(default)]
-    usage: Option<CliUsage>,
-}
-
-#[derive(Deserialize)]
-struct CliUsage {
-    #[serde(default)]
-    input_tokens: u32,
-    #[serde(default)]
-    output_tokens: u32,
-    #[serde(default)]
-    cache_read_input_tokens: u32,
-    #[serde(default)]
-    cache_creation_input_tokens: u32,
-}
-
-/// Parse `claude -p --output-format json` output into a reply. An `is_error`
-/// result (e.g. a usage/plan limit) becomes an error so the fallback can run.
-fn parse_cli_output(stdout: &str, model: &str) -> Result<ChatReply, LlmError> {
-    let parsed: CliResult = serde_json::from_str(stdout.trim()).map_err(|e| LlmError::Api {
-        status: 502,
-        body: format!(
-            "unparseable claude CLI output: {e}: {}",
-            truncate(stdout, 200)
-        ),
-    })?;
-
-    if parsed.is_error {
-        let detail = if parsed.result.trim().is_empty() {
-            parsed.subtype
-        } else {
-            parsed.result
+        let request = ClaudeWorkerRequest {
+            protocol: 1,
+            model: req
+                .model
+                .clone()
+                .unwrap_or_else(|| self.model_for(req.tier).to_owned()),
+            system: req.system.clone(),
+            prompt: build_bounded_prompt(&req.messages),
         };
-        // 429 → looks like a limit; let the fallback (API) take over.
-        return Err(LlmError::Api {
-            status: 429,
-            body: truncate(detail.trim(), 300),
-        });
+        if !request.valid() {
+            return Err(LlmError::NotConfigured(
+                "Claude worker request exceeds the bounded context policy".into(),
+            ));
+        }
+        let model = request.model.clone();
+        let payload = serde_json::to_vec(&request).map_err(|_| safe_failure())?;
+        if payload.len() + 1 > MAX_REQUEST_BYTES {
+            return Err(safe_failure());
+        }
+        let reply = tokio::time::timeout(WORKER_TIMEOUT, async {
+            let mut socket = UnixStream::connect(SOCKET)
+                .await
+                .map_err(|_| safe_failure())?;
+            socket
+                .write_all(&payload)
+                .await
+                .map_err(|_| safe_failure())?;
+            socket.write_all(b"\n").await.map_err(|_| safe_failure())?;
+            socket.shutdown().await.map_err(|_| safe_failure())?;
+            let mut response = Vec::new();
+            socket
+                .take((MAX_REPLY_BYTES + 1) as u64)
+                .read_to_end(&mut response)
+                .await
+                .map_err(|_| safe_failure())?;
+            if response.len() > MAX_REPLY_BYTES {
+                return Err(safe_failure());
+            }
+            serde_json::from_slice::<ClaudeWorkerReply>(&response).map_err(|_| safe_failure())
+        })
+        .await
+        .map_err(|_| LlmError::Api {
+            status: 504,
+            body: "Claude worker timed out".into(),
+        })??;
+        reply_to_chat(reply, model)
     }
+}
 
-    let text = parsed.result.trim().to_string();
-    if text.is_empty() {
-        return Err(LlmError::Empty);
+fn safe_failure() -> LlmError {
+    LlmError::Api {
+        status: 503,
+        body: "Claude subscription worker unavailable".into(),
     }
-    Ok(ChatReply {
-        text,
-        model: model.to_string(),
-        backend: Some("claude-cli".into()),
-        requested_route: None,
-        actual_provider: None,
-        stop_reason: Some("end_turn".into()),
-        usage: parsed.usage.map(|u| Usage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-            cache_read_tokens: u.cache_read_input_tokens,
-            cache_write_tokens: u.cache_creation_input_tokens,
+}
+
+fn reply_to_chat(reply: ClaudeWorkerReply, model: String) -> Result<ChatReply, LlmError> {
+    if reply.protocol != 1 {
+        return Err(safe_failure());
+    }
+    match reply.state {
+        ClaudeWorkerState::SubscriptionUnavailable => Err(LlmError::Api {
+            status: 503,
+            body: "Claude subscription unavailable".into(),
         }),
-    })
+        ClaudeWorkerState::PlanLimit => Err(LlmError::Api {
+            status: 429,
+            body: "Claude subscription plan limit reached".into(),
+        }),
+        ClaudeWorkerState::IncompatibleRuntime => Err(LlmError::Api {
+            status: 503,
+            body: "Claude subscription runtime is incompatible".into(),
+        }),
+        ClaudeWorkerState::RuntimeFailure => Err(safe_failure()),
+        ClaudeWorkerState::Completed => {
+            let text = reply
+                .text
+                .filter(|text| !text.trim().is_empty())
+                .ok_or(LlmError::Empty)?;
+            Ok(ChatReply {
+                text,
+                model,
+                backend: Some("claude-cli".into()),
+                requested_route: None,
+                actual_provider: None,
+                stop_reason: Some("end_turn".into()),
+                usage: Some(Usage {
+                    input_tokens: reply.input_tokens.unwrap_or(0),
+                    output_tokens: reply.output_tokens.unwrap_or(0),
+                    cache_read_tokens: reply.cache_read_tokens.unwrap_or(0),
+                    cache_write_tokens: reply.cache_write_tokens.unwrap_or(0),
+                }),
+            })
+        }
+    }
+}
+
+/// Include only the most recent eight turns, with an aggregate character cap.
+fn build_bounded_prompt(messages: &[ChatMessage]) -> String {
+    let mut selected = Vec::new();
+    let mut remaining = 24_000;
+    for message in messages.iter().rev().take(8) {
+        let content: String = message
+            .content
+            .chars()
+            .rev()
+            .take(remaining)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        remaining -= content.chars().count();
+        selected.push((message.role, content));
+        if remaining == 0 {
+            break;
+        }
+    }
+    selected.reverse();
+    let mut prompt = String::new();
+    for (role, content) in selected {
+        prompt.push_str(match role {
+            Role::User => "Gebruiker: ",
+            Role::Assistant => "Jarvis: ",
+        });
+        prompt.push_str(&content);
+        prompt.push('\n');
+    }
+    prompt.push_str("Jarvis:");
+    prompt
 }
 
 #[cfg(test)]
@@ -206,48 +193,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_a_successful_result() {
-        let json = r#"{"type":"result","subtype":"success","is_error":false,
-            "result":"Hallo, ik ben Jarvis.","session_id":"x",
-            "usage":{"input_tokens":12,"output_tokens":7,"cache_read_input_tokens":3,"cache_creation_input_tokens":0}}"#;
-        let reply = parse_cli_output(json, "claude-sonnet-5").unwrap();
-        assert_eq!(reply.text, "Hallo, ik ben Jarvis.");
-        assert_eq!(reply.model, "claude-sonnet-5");
-        let u = reply.usage.unwrap();
-        assert_eq!(u.input_tokens, 12);
-        assert_eq!(u.cache_read_tokens, 3);
+    fn context_compiler_is_bounded_and_recent() {
+        let mut messages = vec![ChatMessage::user("old private history")];
+        messages.extend((0..9).map(|number| ChatMessage::user(format!("recent {number}"))));
+        let prompt = build_bounded_prompt(&messages);
+        assert!(!prompt.contains("old private history"));
+        assert!(!prompt.contains("recent 0"));
+        assert!(prompt.contains("recent 8"));
+        let large = build_bounded_prompt(&[ChatMessage::user("x".repeat(100_000))]);
+        assert!(large.len() < 25_000);
     }
 
     #[test]
-    fn an_error_result_becomes_a_fallback_error() {
-        let json = r#"{"type":"result","subtype":"error_usage_limit","is_error":true,
-            "result":"usage limit reached"}"#;
-        match parse_cli_output(json, "claude-sonnet-5") {
-            Err(LlmError::Api { status, body }) => {
-                assert_eq!(status, 429);
-                assert!(body.contains("usage limit"));
-            }
-            other => panic!("expected Api error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn multi_turn_prompt_is_labeled() {
-        let p = build_prompt(&[
-            ChatMessage::user("hoi"),
-            ChatMessage::assistant("hallo"),
-            ChatMessage::user("hoe gaat het?"),
-        ]);
-        assert!(p.contains("Gebruiker: hoi"));
-        assert!(p.contains("Jarvis: hallo"));
-        assert!(p.trim_end().ends_with("Jarvis:"));
-    }
-
-    #[test]
-    fn single_turn_prompt_passes_through() {
-        assert_eq!(
-            build_prompt(&[ChatMessage::user("alleen dit")]),
-            "alleen dit"
+    fn plan_limit_is_structured_and_non_secret() {
+        let result = reply_to_chat(
+            ClaudeWorkerReply::failure(ClaudeWorkerState::PlanLimit),
+            "claude".into(),
         );
+        assert!(matches!(result, Err(LlmError::Api { status: 429, .. })));
     }
 }

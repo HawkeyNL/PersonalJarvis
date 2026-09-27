@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 mod account_activation;
 mod admin_helpers;
 mod agent_tree;
+mod ai_accounts;
 mod credential_setup;
 mod local_devices;
 mod terminal_ui;
@@ -84,6 +85,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Owner-only subscription account management; never exposed through Core HTTP.
+    Accounts {
+        #[command(subcommand)]
+        command: ai_accounts::AccountsCommand,
+    },
     /// Host-local owner device administration; never available through HTTP.
     Devices {
         #[command(subcommand)]
@@ -411,6 +417,7 @@ fn run() -> Result<()> {
         bail!("non-interactive use requires an explicit Jarvis command");
     };
     match command {
+        Commands::Accounts { command } => ai_accounts::run(command, cli.json),
         Commands::Account { command } => account_activation::run(command, cli.json),
         Commands::Devices { command } => local_devices::run(command, cli.json),
         Commands::Version => version(&presentation),

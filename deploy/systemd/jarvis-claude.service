@@ -1,0 +1,39 @@
+[Unit]
+Description=Jarvis Claude subscription worker
+Requires=jarvis-claude.socket
+After=jarvis-claude.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=jarvis-claude
+Group=jarvis-claude
+ExecStart=/opt/jarvis/current/jarvis-claude-worker
+WorkingDirectory=/var/lib/jarvis-claude
+UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN OPENAI_API_KEY SSH_AUTH_SOCK
+StateDirectory=jarvis-claude
+StateDirectoryMode=0700
+RuntimeDirectory=jarvis-claude
+RuntimeDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+InaccessiblePaths=/etc/jarvis /var/lib/jarvis /var/lib/jarvis-codex
+TasksMax=64
+MemoryMax=2G
+
+# This service is deliberately socket-activated, not enabled at boot on its own.

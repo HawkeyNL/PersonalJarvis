@@ -23,7 +23,20 @@ readonly -a managed_units=(
     jarvis-model-catalog.timer
     jarvis-laya.service
     jarvis-laya.socket
+    jarvis-claude.service
+    jarvis-claude.socket
 )
+
+subscription_capability() {
+    local release=$1
+    if ! jq -e '.tooling | has("subscription_workers")' "$release/release.json" >/dev/null; then
+        echo legacy
+        return
+    fi
+    jq -e '.tooling.subscription_workers == 1 and (.tooling.subscription_workers | type) == "number" and .tooling.systemd_units == 1' "$release/release.json" >/dev/null ||
+        fail "unsupported subscription-worker capability"
+    echo 1
+}
 
 laya_capability() {
     local release=$1
@@ -53,6 +66,8 @@ unit_required() {
             [[ $(catalog_capability "$1") == 1 ]] ;;
         jarvis-laya.service|jarvis-laya.socket)
             [[ $(laya_capability "$1") == 1 ]] ;;
+        jarvis-claude.service|jarvis-claude.socket)
+            [[ $(subscription_capability "$1") == 1 ]] ;;
         *) return 0 ;;
     esac
 }
@@ -204,11 +219,20 @@ validate_checksum_manifest() {
 }
 
 validate_artifacts() {
-    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version laya_version
+    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version laya_version subscription_version
     managed_version=$(capability "$release") || return 1
     device_version=$(device_capability "$release") || return 1
     policy_version=$(policy_capability "$release") || return 1
     laya_version=$(laya_capability "$release") || return 1
+    subscription_version=$(subscription_capability "$release") || return 1
+    if [[ $subscription_version == 1 ]]; then
+        [[ -f $release/jarvis-claude-worker && ! -L $release/jarvis-claude-worker && -x $release/jarvis-claude-worker ]] ||
+            fail "Claude subscription worker is missing or unsafe"
+        mode=$(stat -c '%a' "$release/jarvis-claude-worker")
+        (( (8#$mode & 0022) == 0 )) || fail "Claude subscription worker permissions are unsafe"
+        matches=$(awk '$2 == "jarvis-claude-worker" { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
+        [[ $matches == 1 ]] || fail "Claude subscription worker is not uniquely checksum-bound"
+    fi
     if [[ $laya_version == 1 ]]; then
         [[ -f $release/laya-offline.py && ! -L $release/laya-offline.py ]] || fail "Laya runtime wrapper is missing or unsafe"
         mode=$(stat -c '%a' "$release/laya-offline.py")
@@ -223,6 +247,7 @@ validate_artifacts() {
     if [[ $managed_version != 1 ]]; then
         [[ $device_version == legacy ]] || fail "local-device capability requires managed systemd policy"
         [[ $policy_version == legacy ]] || fail "model-policy directory capability requires managed systemd policy"
+        [[ $subscription_version == legacy ]] || fail "subscription workers require managed systemd policy"
         return 0
     fi
     validate_checksum_manifest "$release"

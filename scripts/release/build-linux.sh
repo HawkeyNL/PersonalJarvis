@@ -58,6 +58,11 @@ verify_systemd_unit_candidate() {
     echo "release candidate does not declare Laya runtime capability 1" >&2
     exit 1
   }
+  jq -e '.tooling.subscription_workers == 1 and (.tooling.subscription_workers | type) == "number"' \
+    "$release/release.json" >/dev/null || {
+    echo "release candidate does not declare subscription-worker capability 1" >&2
+    exit 1
+  }
   jq -e '.tooling.model_policy_directory == 1 and (.tooling.model_policy_directory | type) == "number"' \
     "$release/release.json" >/dev/null || {
     echo "release candidate does not declare model-policy directory capability 1" >&2
@@ -197,6 +202,7 @@ install -m 0755 "$release_target_dir/release/jarvis-api" "$temporary_release/jar
 install -m 0755 "$release_target_dir/release/jarvis-config-broker" "$temporary_release/jarvis-config-broker"
 install -m 0755 "$release_target_dir/release/jarvis-model-policy-storage" "$temporary_release/jarvis-model-policy-storage"
 install -m 0755 "$release_target_dir/release/jarvis-codex-broker" "$temporary_release/jarvis-codex-broker"
+install -m 0755 "$release_target_dir/release/jarvis-claude-worker" "$temporary_release/jarvis-claude-worker"
 install -m 0755 "$release_target_dir/release/jarvis-agent-bundle" "$temporary_release/jarvis-agent-bundle"
 install -m 0755 "$release_target_dir/release/jarvis" "$temporary_release/jarvis"
 install -m 0755 "$release_target_dir/release/jarvis-core-admin" "$temporary_release/jarvis-core-admin"
@@ -236,7 +242,8 @@ for unit in \
   jarvis-private-agent-updater.service \
   jarvis-private-agent-updater.timer \
   jarvis-model-catalog.service jarvis-model-catalog.timer \
-  jarvis-laya.service jarvis-laya.socket; do
+  jarvis-laya.service jarvis-laya.socket \
+  jarvis-claude.service jarvis-claude.socket; do
   install -m 0644 "deploy/systemd/$unit" "$temporary_release/systemd-$unit"
 done
 install -m 0644 deploy/systemd/pricing-registry.json "$temporary_release/pricing-registry.json"
@@ -259,12 +266,12 @@ jq -n \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
   --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 8, from_sha256: [$schema_six, $schema_seven]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1}}' \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 8, from_sha256: [$schema_six, $schema_seven]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1}}' \
   > "$temporary_release/release.json"
 
 (
   cd "$temporary_release"
-  sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-agent-bundle \
+  sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-claude-worker jarvis-agent-bundle \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
     jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials \
     com.hawkeynl.jarvis.devices.policy \

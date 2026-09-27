@@ -1,0 +1,13 @@
+[Unit]
+Description=Jarvis Claude subscription worker socket
+
+[Socket]
+ListenStream=/run/jarvis-claude.sock
+SocketUser=root
+SocketGroup=jarvis
+SocketMode=0660
+RemoveOnStop=yes
+Service=jarvis-claude.service
+
+[Install]
+WantedBy=sockets.target

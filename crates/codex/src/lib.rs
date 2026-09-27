@@ -22,6 +22,7 @@ pub const MAX_CHECKPOINT_CHARS: usize = 16_000;
 pub const MAX_CODING_TIMEOUT_SECS: u64 = 15 * 60;
 pub const MAX_CODING_ARTIFACTS: u8 = 32;
 pub const MAX_CODING_OUTPUT_BYTES: u64 = 512 * 1024;
+pub const MAX_TASK_ENVELOPE_BYTES: usize = 32 * 1024;
 pub const ACTION_CODING_START: &str = "coding.start";
 pub const ACTION_CODING_RESUME: &str = "coding.resume";
 pub const ACTION_CODEX_RUN_APPROVED_TASK: &str = "codex.run_approved_task";
@@ -439,6 +440,10 @@ pub async fn execute_in_sandbox<P: jarvis_sandbox::SandboxProvider>(
         .operation
         .validate()
         .map_err(|_| CodingRunError::SandboxFailed)?;
+    let task_context = request
+        .operation
+        .compile_task_envelope(TaskContextInput::default())
+        .map_err(|_| CodingRunError::SandboxFailed)?;
     snapshot.validate_for(&request.operation)?;
     let capability = capability.ok_or(CodingRunError::CodexAuthenticationUnavailable)?;
     if !matches!(
@@ -468,6 +473,17 @@ pub async fn execute_in_sandbox<P: jarvis_sandbox::SandboxProvider>(
                 jarvis_sandbox::TaskInput {
                     name: "request.json".into(),
                     bytes: request_json,
+                },
+            )
+            .await
+            .map_err(|_| CodingRunError::SandboxFailed)?;
+        provider
+            .upload(
+                &handle,
+                jarvis_sandbox::TaskInput {
+                    name: "task-context.json".into(),
+                    bytes: serde_json::to_vec(&task_context)
+                        .map_err(|_| CodingRunError::SandboxFailed)?,
                 },
             )
             .await
@@ -850,6 +866,154 @@ pub struct CodingCheckpoint {
     pub decisions: Vec<String>,
     pub pending: Vec<String>,
     pub tests: String,
+}
+
+/// Provider-neutral, bounded context for a delegated coding task. This is a
+/// projection of an already signed operation, not a new authorization surface.
+/// In particular, file references are logical identifiers, never host paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskEnvelope {
+    pub intent: String,
+    pub objective: String,
+    pub owner_constraints: Vec<String>,
+    pub recent_deltas: Vec<String>,
+    pub selected_facts: Vec<ProvenancedFact>,
+    pub repository: RepositoryIdentity,
+    pub base_commit_sha: String,
+    pub coding_session_id: Uuid,
+    pub checkpoint: Option<CodingCheckpoint>,
+    pub timeout_secs: u64,
+    pub max_output_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenancedFact {
+    pub fact: String,
+    pub source: String,
+}
+
+/// Optional relevant material supplied by a trusted compiler caller. Raw
+/// history is never automatically loaded; the caller selects deltas/facts.
+#[derive(Default)]
+pub struct TaskContextInput {
+    pub owner_constraints: Vec<String>,
+    pub recent_deltas: Vec<String>,
+    pub selected_facts: Vec<ProvenancedFact>,
+}
+
+impl CodingOperation {
+    pub fn compile_task_envelope(
+        &self,
+        input: TaskContextInput,
+    ) -> Result<TaskEnvelope, CodingProtocolError> {
+        self.validate()?;
+        if input.owner_constraints.len() > 8
+            || input
+                .owner_constraints
+                .iter()
+                .any(|value| value.trim().is_empty() || value.chars().count() > 1_000)
+            || input.selected_facts.len() > 16
+            || input.selected_facts.iter().any(|value| {
+                value.fact.trim().is_empty()
+                    || value.fact.chars().count() > 1_000
+                    || !is_safe_identifier(&value.source, 128)
+            })
+        {
+            return Err(CodingProtocolError::InvalidOperation);
+        }
+        let (
+            coding_session_id,
+            repository,
+            base_commit_sha,
+            objective,
+            checkpoint,
+            timeout_secs,
+            max_output_bytes,
+        ) = match self {
+            Self::StartCodingRun {
+                coding_session_id,
+                repository,
+                base_commit_sha,
+                objective,
+                checkpoint,
+                timeout_secs,
+                max_output_bytes,
+                ..
+            } => (
+                *coding_session_id,
+                repository.clone(),
+                base_commit_sha.clone(),
+                objective.clone(),
+                checkpoint.clone(),
+                *timeout_secs,
+                *max_output_bytes,
+            ),
+            Self::ResumeCodingRun {
+                coding_session_id,
+                repository,
+                base_commit_sha,
+                checkpoint,
+                timeout_secs,
+                max_output_bytes,
+                ..
+            } => (
+                *coding_session_id,
+                repository.clone(),
+                base_commit_sha.clone(),
+                checkpoint.summary.clone(),
+                Some(checkpoint.clone()),
+                *timeout_secs,
+                *max_output_bytes,
+            ),
+        };
+        let mut envelope = TaskEnvelope {
+            intent: "coding".into(),
+            objective,
+            owner_constraints: input.owner_constraints,
+            recent_deltas: input
+                .recent_deltas
+                .into_iter()
+                .rev()
+                .take(8)
+                .map(|delta| {
+                    delta
+                        .chars()
+                        .rev()
+                        .take(2_048)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect()
+                })
+                .collect(),
+            selected_facts: input.selected_facts,
+            repository,
+            base_commit_sha,
+            coding_session_id,
+            checkpoint,
+            timeout_secs,
+            max_output_bytes,
+        };
+        envelope.recent_deltas.reverse();
+        // Drop raw deltas first. Never silently drop explicit owner constraints
+        // or the latest factual checkpoint merely to fit the worker budget.
+        while serde_json::to_vec(&envelope)
+            .map_err(|_| CodingProtocolError::InvalidOperation)?
+            .len()
+            > MAX_TASK_ENVELOPE_BYTES
+        {
+            if !envelope.recent_deltas.is_empty() {
+                envelope.recent_deltas.remove(0);
+            } else if !envelope.selected_facts.is_empty() {
+                envelope.selected_facts.remove(0);
+            } else {
+                return Err(CodingProtocolError::InvalidOperation);
+            }
+        }
+        Ok(envelope)
+    }
 }
 
 impl CodingCheckpoint {
@@ -1274,8 +1438,18 @@ mod tests {
         async fn upload(
             &self,
             _: &jarvis_sandbox::SandboxHandle,
-            _: jarvis_sandbox::TaskInput,
+            input: jarvis_sandbox::TaskInput,
         ) -> Result<(), jarvis_sandbox::SandboxError> {
+            assert!(matches!(
+                input.name.as_str(),
+                "request.json" | "task-context.json" | "repository.tar" | "codex-capability.json"
+            ));
+            if input.name == "task-context.json" {
+                assert!(input.bytes.len() <= MAX_TASK_ENVELOPE_BYTES);
+                let envelope: TaskEnvelope = serde_json::from_slice(&input.bytes).unwrap();
+                assert_eq!(envelope.intent, "coding");
+                assert_eq!(envelope.base_commit_sha, "a".repeat(40));
+            }
             self.calls.lock().unwrap().push("upload");
             Ok(())
         }
@@ -1371,6 +1545,70 @@ mod tests {
         .unwrap();
         assert_eq!(result.status, "completed");
         assert_eq!(calls.lock().unwrap().last(), Some(&"terminate"));
+    }
+
+    #[test]
+    fn delegated_context_keeps_checkpoint_and_constraints_not_long_history() {
+        let mut request = signed_start();
+        if let CodingOperation::StartCodingRun { checkpoint, .. } = &mut request.operation {
+            *checkpoint = Some(CodingCheckpoint {
+                summary: "Observed baseline behavior".into(),
+                decisions: vec!["Keep device-signed approval".into()],
+                pending: vec!["Verify sandbox isolation".into()],
+                tests: "Unit fixtures passed".into(),
+            });
+        }
+        let envelope = request
+            .operation
+            .compile_task_envelope(TaskContextInput {
+                owner_constraints: vec!["Only run read-only tests".into()],
+                recent_deltas: (0..100)
+                    .map(|index| format!("old or recent {index}: {}", "x".repeat(8_000)))
+                    .collect(),
+                selected_facts: vec![ProvenancedFact {
+                    fact: "baseline checks passed".into(),
+                    source: "checkpoint-1".into(),
+                }],
+            })
+            .unwrap();
+        let encoded = serde_json::to_vec(&envelope).unwrap();
+        assert!(encoded.len() <= MAX_TASK_ENVELOPE_BYTES);
+        assert_eq!(envelope.owner_constraints, ["Only run read-only tests"]);
+        assert_eq!(
+            envelope
+                .checkpoint
+                .as_ref()
+                .map(|item| item.summary.as_str()),
+            Some("Observed baseline behavior")
+        );
+        assert!(!envelope
+            .recent_deltas
+            .iter()
+            .any(|delta| delta.contains("old or recent 0:")));
+        assert!(envelope.recent_deltas.len() <= 8);
+        assert!(envelope
+            .recent_deltas
+            .iter()
+            .all(|delta| delta.chars().count() <= 2_048));
+        assert_eq!(
+            envelope.repository,
+            match request.operation {
+                CodingOperation::StartCodingRun { repository, .. } => repository,
+                _ => unreachable!(),
+            }
+        );
+    }
+
+    #[test]
+    fn delegated_context_rejects_oversized_owner_constraints_without_dropping_them() {
+        let request = signed_start();
+        assert!(request
+            .operation
+            .compile_task_envelope(TaskContextInput {
+                owner_constraints: vec!["x".repeat(1_001)],
+                ..TaskContextInput::default()
+            })
+            .is_err());
     }
 
     fn broker_request(claims: &RunCapabilityClaims) -> BrokeredCodexRequest {
