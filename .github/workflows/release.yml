@@ -41,6 +41,7 @@ jobs:
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-store migration_tests -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-portfolio surreal::tests::preserves_decimal_holdings_and_owner_scope -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-api --test surreal_api -- --ignored
+          JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-api --bin jarvis-codex-broker -- --ignored
 
   deployment-security:
     name: Deployment and sandbox security fixtures

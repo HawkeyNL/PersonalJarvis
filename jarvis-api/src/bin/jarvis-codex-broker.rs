@@ -1159,7 +1159,135 @@ async fn audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        extract::{Path as RoutePath, State},
+        http::{HeaderMap, StatusCode},
+        routing::{delete, get},
+        Json, Router,
+    };
     use jarvis_sandbox::CollectedArtifact;
+    use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
+
+    type ManagerItems = Arc<Mutex<Vec<serde_json::Value>>>;
+
+    async fn listed(
+        State(items): State<ManagerItems>,
+        headers: HeaderMap,
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
+        if headers
+            .get("OPEN-SANDBOX-API-KEY")
+            .and_then(|v| v.to_str().ok())
+            != Some("fixture-key")
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Ok(Json(
+            json!({"items":*items.lock().unwrap(),"pagination":{"hasNextPage":false}}),
+        ))
+    }
+
+    async fn deleted(
+        State(items): State<ManagerItems>,
+        RoutePath(id): RoutePath<String>,
+        headers: HeaderMap,
+    ) -> StatusCode {
+        if headers
+            .get("OPEN-SANDBOX-API-KEY")
+            .and_then(|v| v.to_str().ok())
+            != Some("fixture-key")
+        {
+            return StatusCode::UNAUTHORIZED;
+        }
+        let mut items = items.lock().unwrap();
+        let before = items.len();
+        items.retain(|item| item.get("id").and_then(serde_json::Value::as_str) != Some(&id));
+        if before == items.len() {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::NO_CONTENT
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn startup_reconciles_stale_and_unrecorded_owned_sandboxes_without_touching_others(
+    ) -> anyhow::Result<()> {
+        let db = Surreal::new::<Ws>(std::env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+        db.signin(Root {
+            username: &std::env::var("JARVIS_SURREAL_TEST_USER")?,
+            password: &std::env::var("JARVIS_SURREAL_TEST_PASS")?,
+        })
+        .await?;
+        db.use_ns(format!(
+            "codex_recovery_fixture_{}",
+            uuid::Uuid::now_v7().simple()
+        ))
+        .use_db("test")
+        .await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+        let user = uuid::Uuid::now_v7();
+        let session = uuid::Uuid::now_v7();
+        let run = uuid::Uuid::now_v7();
+        let orphan = uuid::Uuid::now_v7();
+        let reservation = coding_reservations::reserve(&db, user, session).await?;
+        coding_reservations::lease(&db, reservation, user, session, run, 60)
+            .await?
+            .context("reservation lease failed")?;
+        db.query("CREATE coding_runs SET id=$run,request_id=$request,coding_session_id=$coding_session_key,user_id=$user,device_id=$device,repository_id='fixture',repository_owner='Example',repository_name='Repo',base_sha=$base,snapshot_sha256=NONE,reservation_id=$reservation,reservation_units=1,reservation_status='active',status='running',summary=NONE,failure_category=NONE,artifacts=[],compute_class='subscription',sandbox_provider='opensandbox',sandbox_id='stale-owned',sandbox_state='active',sandbox_created_at=time::now(),sandbox_cleanup_status=NONE,created_at=time::now(),updated_at=time::now(),completed_at=NONE RETURN NONE")
+            .bind(json!({"run":run.to_string(),"request":uuid::Uuid::now_v7().to_string(),"coding_session_key":session.to_string(),"user":user.to_string(),"device":uuid::Uuid::now_v7().to_string(),"base":"a".repeat(40),"reservation":reservation.to_string()}))
+            .await?.check()?;
+        let items: ManagerItems = Arc::new(Mutex::new(vec![
+            json!({"id":"stale-owned","metadata":{"jarvis.profile":"codex","jarvis.run_id":run.to_string(),"jarvis.session_id":session.to_string()}}),
+            json!({"id":"unrecorded-owned","metadata":{"jarvis.profile":"codex","jarvis.run_id":orphan.to_string(),"jarvis.session_id":session.to_string()}}),
+            json!({"id":"unrelated","metadata":{"jarvis.profile":"research"}}),
+        ]));
+        let app = Router::new()
+            .route("/v1/sandboxes", get(listed))
+            .route("/v1/sandboxes/{id}", delete(deleted))
+            .with_state(items.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let manager = Arc::new(OpenSandboxProvider::for_codex_broker(
+            format!("http://{address}/"),
+            "fixture-key".into(),
+            format!("fixture/codex@sha256:{}", "a".repeat(64)),
+        )?);
+        let state = BrokerState {
+            db: db.clone(),
+            core_uid: 0,
+            sandbox: Some(manager),
+            adapter: Arc::new(UnavailableSubscriptionAdapter),
+            authority: Arc::new(RunCapabilityAuthority::default()),
+            active: Arc::new(Mutex::new(HashMap::new())),
+            run_slots: Arc::new(Semaphore::new(2)),
+            cleanup_healthy: Arc::new(AtomicBool::new(false)),
+            cleanup_epoch: Arc::new(AtomicU64::new(0)),
+            reconcile_lock: Arc::new(AsyncMutex::new(())),
+        };
+        reconcile_owned_sandboxes(&state).await?;
+        reconcile_owned_sandboxes(&state).await?; // idempotent restart
+        let remaining = items.lock().unwrap().clone();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["id"], "unrelated");
+        let mut rows = db
+            .query("SELECT status,sandbox_state FROM coding_runs WHERE record::id(id)=$run LIMIT 1")
+            .bind(json!({"run":run.to_string()}))
+            .await?
+            .check()?;
+        let rows: Vec<serde_json::Value> = rows.take(0)?;
+        assert_eq!(rows[0]["status"], "failed");
+        assert_eq!(rows[0]["sandbox_state"], "terminated");
+        let mut lease = db.query("SELECT status,api_spend_cents FROM coding_reservations WHERE record::id(id)=$id LIMIT 1")
+            .bind(json!({"id":reservation.to_string()})).await?.check()?;
+        let lease: Vec<serde_json::Value> = lease.take(0)?;
+        assert_eq!(lease[0]["status"], "released");
+        assert_eq!(lease[0]["api_spend_cents"], 0);
+        server.abort();
+        Ok(())
+    }
 
     #[test]
     fn artifact_store_accepts_only_fixed_bounded_regular_outputs() {
