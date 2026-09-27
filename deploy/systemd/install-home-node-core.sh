@@ -220,6 +220,25 @@ if ! getent passwd jarvis >/dev/null; then
     useradd --system --user-group --home-dir /var/lib/jarvis --shell /usr/sbin/nologin jarvis
 fi
 install -d -o jarvis -g jarvis -m 0750 /var/lib/jarvis
+for worker in jarvis-claude jarvis-codex; do
+    if ! getent passwd "$worker" >/dev/null; then
+        useradd --system --user-group --home-dir "/var/lib/$worker" --shell /usr/sbin/nologin "$worker"
+    fi
+    id -nG "$worker" | tr ' ' '\n' | grep -qx docker && {
+        echo "$worker must not be a Docker-group member" >&2
+        exit 1
+    }
+    worker_state="/var/lib/$worker"
+    if [[ -e $worker_state || -L $worker_state ]]; then
+        [[ -d $worker_state && ! -L $worker_state &&
+           $(stat -c '%U:%G:%a' "$worker_state") == "$worker:$worker:700" ]] || {
+            echo "unsafe $worker subscription state directory" >&2
+            exit 1
+        }
+    else
+        install -d -o "$worker" -g "$worker" -m 0700 "$worker_state"
+    fi
+done
 
 [[ -f /etc/jarvis/surrealdb.env && ! -L /etc/jarvis/surrealdb.env ]] || {
     echo "missing root-only /etc/jarvis/surrealdb.env" >&2

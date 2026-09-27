@@ -265,6 +265,52 @@ pub struct CredentialRecord {
     pub configured: bool,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiAccountRecord {
+    pub provider: String,
+    pub worker: String,
+    pub state: String,
+    pub billing: String,
+    pub runtime: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AiAccountProvider {
+    Claude,
+    Codex,
+}
+
+impl AiAccountProvider {
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AiAccountAction {
+    Connect,
+    Test,
+    Reconnect,
+    Disconnect,
+}
+
+impl AiAccountAction {
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Test => "test",
+            Self::Reconnect => "reconnect",
+            Self::Disconnect => "disconnect",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CredentialProvider {
@@ -563,6 +609,108 @@ pub fn model_mutation(
 
 pub fn credentials(session: &SessionManager) -> AdminResult<Vec<CredentialRecord>> {
     parse_json(&session.run(BrokerRequest::Credentials)?.stdout)
+}
+
+pub fn ai_accounts(session: &SessionManager) -> AdminResult<Vec<AiAccountRecord>> {
+    let rows: Vec<AiAccountRecord> = parse_json(&session.run(BrokerRequest::Accounts)?.stdout)?;
+    if rows.len() != 2
+        || rows.iter().any(|row| {
+            !matches!(
+                (row.provider.as_str(), row.worker.as_str()),
+                ("claude", "jarvis-claude") | ("codex", "jarvis-codex")
+            )
+                || !matches!(
+                    row.state.as_str(),
+                    "connected" | "logged_out" | "runtime_missing" | "wrong_auth_mode" | "unhealthy"
+                )
+                || !matches!(row.billing.as_str(), "subscription" | "unverified" | "overage_unverified")
+                || !matches!(
+                    row.runtime.as_str(),
+                    "inactive" | "socket_ready" | "active" | "unavailable"
+                )
+        })
+        || rows[0].provider == rows[1].provider
+    {
+        return Err("AI account status contained unexpected metadata".to_owned());
+    }
+    Ok(rows)
+}
+
+pub fn ai_account_action(
+    session: &SessionManager,
+    provider: AiAccountProvider,
+    action: AiAccountAction,
+) -> AdminResult<OperationResult> {
+    session.require_active()?;
+    let entry_binary = credential_entry_binary()?;
+    let mut args = vec![
+        entry_binary.into_os_string(),
+        OsString::from("--account-entry"),
+        OsString::from(action.cli_name()),
+        OsString::from(provider.cli_name()),
+    ];
+    let (program, mut terminal_args) = if Path::new(PTYXIS).exists() {
+        verify_root_executable(PTYXIS)?;
+        (PTYXIS, vec![OsString::from("--title=Jarvis AI account"), OsString::from("--")])
+    } else if Path::new(GNOME_TERMINAL).exists() {
+        verify_root_executable(GNOME_TERMINAL)?;
+        (GNOME_TERMINAL, vec![OsString::from("--wait"), OsString::from("--title=Jarvis AI account"), OsString::from("--")])
+    } else {
+        return Err("no supported GNOME account terminal is installed".to_owned());
+    };
+    terminal_args.append(&mut args);
+    let mut command = Command::new(program);
+    command.args(terminal_args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    configure_desktop_environment(&mut command);
+    if !command.status().map_err(|_| "could not open trusted account terminal".to_owned())?.success() {
+        return Err("AI account operation was cancelled or did not complete".to_owned());
+    }
+    Ok(OperationResult {
+        success: true,
+        summary: format!("{} account operation finished", provider.cli_name()),
+        detail: "The trusted terminal closed; refresh the status to verify the result.".to_owned(),
+    })
+}
+
+pub fn ai_account_entry(action: &OsStr, provider: &OsStr) -> AdminResult<()> {
+    root_guard()?;
+    let action = match action.to_str() {
+        Some("connect") => AiAccountAction::Connect,
+        Some("test") => AiAccountAction::Test,
+        Some("reconnect") => AiAccountAction::Reconnect,
+        Some("disconnect") => AiAccountAction::Disconnect,
+        _ => return Err("unsupported AI account operation".to_owned()),
+    };
+    let provider = match provider.to_str() {
+        Some("claude") => AiAccountProvider::Claude,
+        Some("codex") => AiAccountProvider::Codex,
+        _ => return Err("unsupported AI account provider".to_owned()),
+    };
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
+        return Err("AI account operation requires a controlling terminal".to_owned());
+    }
+    verify_root_executable(PKEXEC)?;
+    verify_root_executable(ADMIN)?;
+    println!("Jarvis AI account · {} · {}", provider.cli_name(), action.cli_name());
+    println!("Provider authentication stays inside the dedicated worker identity.");
+    let status = Command::new(PKEXEC)
+        .arg(ADMIN)
+        .arg("accounts")
+        .arg(action.cli_name())
+        .arg(provider.cli_name())
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("LANG", "C.UTF-8")
+        .status()
+        .map_err(|_| "could not start trusted AI account operation".to_owned())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("AI account operation did not complete".to_owned())
+    }
 }
 
 pub fn credential_set(
@@ -1046,6 +1194,11 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
             ],
             Duration::from_secs(120),
         ),
+        BrokerRequest::Accounts => (
+            ADMIN,
+            vec!["--json".to_owned(), "accounts".to_owned(), "list".to_owned()],
+            Duration::from_secs(30),
+        ),
         BrokerRequest::Logs { query } => {
             if !(1..=2_000).contains(&query.lines) {
                 return Err("log line count must be between 1 and 2000".to_owned());
@@ -1388,5 +1541,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.total_tokens, 18);
+    }
+
+    #[test]
+    fn ai_account_status_rejects_provider_credentials_in_frontend_payload() {
+        let safe = r#"{"provider":"claude","worker":"jarvis-claude","state":"connected","billing":"overage_unverified","runtime":"inactive"}"#;
+        let row: AiAccountRecord = serde_json::from_str(safe).unwrap();
+        assert_eq!(row.billing, "overage_unverified");
+        let with_token = safe.replace("\"runtime\"", "\"access_token\":\"canary-secret\",\"runtime\"");
+        assert!(serde_json::from_str::<AiAccountRecord>(&with_token).is_err());
     }
 }

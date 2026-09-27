@@ -22,6 +22,10 @@ laya_socket_was_active=false
 laya_service_was_active=false
 laya_socket_was_enabled=false
 laya_service_was_enabled=false
+claude_socket_was_active=false
+claude_service_was_active=false
+claude_socket_was_enabled=false
+claude_service_was_enabled=false
 
 usage() {
     cat >&2 <<'EOF'
@@ -702,6 +706,48 @@ capture_laya_runtime_state() {
     return 0
 }
 
+capture_claude_runtime_state() {
+    claude_socket_was_active=false
+    claude_service_was_active=false
+    claude_socket_was_enabled=false
+    claude_service_was_enabled=false
+    systemctl is-active --quiet jarvis-claude.socket && claude_socket_was_active=true
+    systemctl is-active --quiet jarvis-claude.service && claude_service_was_active=true
+    systemctl is-enabled --quiet jarvis-claude.socket && claude_socket_was_enabled=true
+    systemctl is-enabled --quiet jarvis-claude.service && claude_service_was_enabled=true
+    return 0
+}
+
+restore_claude_runtime_state() {
+    local socket_active=false service_active=false socket_enabled=false service_enabled=false
+    # Account opt-in is separate from release activation. Preserve active and
+    # enabled state independently; do not warm a socket-only owner choice.
+    if [[ $claude_service_was_active == true ]]; then
+        systemctl stop jarvis-claude.service || return 1
+        systemctl restart jarvis-claude.socket || return 1
+        systemctl start jarvis-claude.service || return 1
+    elif [[ $claude_socket_was_active == true ]]; then
+        systemctl stop jarvis-claude.service >/dev/null 2>&1 || true
+        systemctl restart jarvis-claude.socket || return 1
+        if systemctl is-active --quiet jarvis-claude.service; then
+            systemctl stop jarvis-claude.service || return 1
+        fi
+    else
+        systemctl stop jarvis-claude.service >/dev/null 2>&1 || true
+        systemctl stop jarvis-claude.socket >/dev/null 2>&1 || true
+    fi
+    systemctl is-active --quiet jarvis-claude.socket && socket_active=true
+    systemctl is-active --quiet jarvis-claude.service && service_active=true
+    systemctl is-enabled --quiet jarvis-claude.socket && socket_enabled=true
+    systemctl is-enabled --quiet jarvis-claude.service && service_enabled=true
+    [[ $socket_active == true || $claude_service_was_active == false ]] || return 1
+    [[ $socket_active == true || $claude_socket_was_active == false ]] || return 1
+    [[ $socket_active == false || $claude_socket_was_active == true || $claude_service_was_active == true ]] || return 1
+    [[ $service_active == $claude_service_was_active &&
+       $socket_enabled == $claude_socket_was_enabled &&
+       $service_enabled == $claude_service_was_enabled ]] || return 1
+}
+
 wait_for_warm_laya() {
     local response attempt
     [[ $laya_service_was_active == true ]] || return 0
@@ -767,6 +813,7 @@ restart_managed_services() {
     systemctl try-restart jarvis-codex.service >/dev/null 2>&1 || true
     systemctl try-restart jarvis-opensandbox.service >/dev/null 2>&1 || true
     restore_laya_runtime_state || return 1
+    restore_claude_runtime_state || return 1
     systemctl start jarvis-core.service || return 1
     curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
         --retry 11 --retry-delay 5 --retry-connrefused \
@@ -792,6 +839,7 @@ restore_release_transaction() {
     systemctl try-restart jarvis-codex.service >/dev/null 2>&1 || true
     systemctl try-restart jarvis-opensandbox.service >/dev/null 2>&1 || true
     restore_laya_runtime_state || return 1
+    restore_claude_runtime_state || return 1
     systemctl start jarvis-core.service >/dev/null 2>&1 || return 1
     curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
         --retry 11 --retry-delay 5 --retry-connrefused \
@@ -825,7 +873,19 @@ activate_managed_release() {
         fi
         unit_manager="$previous/manage-systemd-units"
     fi
+    if jq -e '.tooling.subscription_workers == 1' "$previous/release.json" >/dev/null && \
+        ! jq -e '.tooling.subscription_workers == 1' "$release/release.json" >/dev/null; then
+        if systemctl is-active --quiet jarvis-claude.service || \
+            systemctl is-enabled --quiet jarvis-claude.service || \
+            systemctl is-active --quiet jarvis-claude.socket || \
+            systemctl is-enabled --quiet jarvis-claude.socket; then
+            echo 'jarvis updater: disconnect and stop optional Claude worker before rolling back to a pre-subscription-worker release' >&2
+            return 1
+        fi
+        unit_manager="$previous/manage-systemd-units"
+    fi
     capture_laya_runtime_state
+    capture_claude_runtime_state
     backup=$(mktemp -d /run/jarvis-systemd-rollback.XXXXXXXX)
     chmod 0700 "$backup"
     if ! "$unit_manager" validate-release "$release" || \
@@ -865,6 +925,7 @@ repair_active_managed_units() {
     fi
     echo "jarvis updater: repairing managed systemd units for active release $tag"
     capture_laya_runtime_state
+    capture_claude_runtime_state
     backup=$(mktemp -d /run/jarvis-systemd-rollback.XXXXXXXX)
     chmod 0700 "$backup"
     if "$unit_manager" install "$release" "$backup" && restart_managed_services && \

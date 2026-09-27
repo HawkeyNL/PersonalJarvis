@@ -11,6 +11,7 @@ sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-jarvis-admin-cli.sh
 bash deploy/systemd/tests/test-ui-tty.sh
 bash deploy/systemd/tests/test-systemd-runtime-lifecycle.sh
 bash deploy/systemd/tests/test-laya-release-artifacts.sh
+bash deploy/systemd/tests/test-subscription-worker-release.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-laya-provision-retry.sh
 sudo env GITHUB_ACTIONS=true python3 deploy/systemd/tests/test-laya-networkless.py
 python3 -m unittest discover -s tools/laya -p 'test_*.py'

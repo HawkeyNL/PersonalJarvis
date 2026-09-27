@@ -4,6 +4,7 @@ import { api, errorText, type ViewName } from "./admin";
 import NavIcon from "./components/NavIcon.vue";
 import AgentsView from "./views/AgentsView.vue";
 import CredentialsView from "./views/CredentialsView.vue";
+import AiAccountsView from "./views/AiAccountsView.vue";
 import DevicesView from "./views/DevicesView.vue";
 import HealthView from "./views/HealthView.vue";
 import LogsView from "./views/LogsView.vue";
@@ -23,11 +24,11 @@ const navSections: { label: string; items: { id: ViewName; label: string }[] }[]
     { id: "agents", label: "Agents" }, { id: "models", label: "Models" }, { id: "usage", label: "Usage & Costs" },
   ] },
   { label: "Administration", items: [
-    { id: "devices", label: "Devices" }, { id: "credentials", label: "Credentials" }, { id: "update", label: "Update" }, { id: "system", label: "System" },
+    { id: "devices", label: "Devices" }, { id: "ai-accounts", label: "AI Accounts" }, { id: "credentials", label: "Credentials" }, { id: "update", label: "Update" }, { id: "system", label: "System" },
   ] },
 ];
 const items = navSections.flatMap((section) => section.items);
-const views = { overview: OverviewView, health: HealthView, services: ServicesView, update: UpdateView, agents: AgentsView, models: ModelsView, usage: UsageView, credentials: CredentialsView, devices: DevicesView, logs: LogsView, system: SystemView };
+const views = { overview: OverviewView, health: HealthView, services: ServicesView, update: UpdateView, agents: AgentsView, models: ModelsView, usage: UsageView, credentials: CredentialsView, "ai-accounts": AiAccountsView, devices: DevicesView, logs: LogsView, system: SystemView };
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const TOUCH_INTERVAL_MS = 5 * 1000;
 const active = ref<ViewName>("overview");

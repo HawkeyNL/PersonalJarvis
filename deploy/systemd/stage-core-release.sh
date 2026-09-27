@@ -92,6 +92,10 @@ release_dir="$staging/$expected_top"
 [[ -x $release_dir/jarvis-api && ! -L $release_dir/jarvis-api ]] || fail "release binary is invalid"
 [[ -x $release_dir/jarvis-config-broker && ! -L $release_dir/jarvis-config-broker ]] || fail "config broker is invalid"
 [[ -x $release_dir/jarvis-codex-broker && ! -L $release_dir/jarvis-codex-broker ]] || fail "Codex broker is invalid"
+if jq -e '.tooling.subscription_workers? == 1' "$release_dir/release.json" >/dev/null 2>&1; then
+    [[ -x $release_dir/jarvis-claude-worker && ! -L $release_dir/jarvis-claude-worker ]] ||
+        fail "Claude subscription worker is invalid"
+fi
 [[ -x $release_dir/jarvis-agent-bundle && ! -L $release_dir/jarvis-agent-bundle ]] || fail "agent-bundle validator is invalid"
 [[ -x $release_dir/jarvis && ! -L $release_dir/jarvis ]] || fail "Jarvis admin binary is invalid"
 [[ -x $release_dir/update-core-release && ! -L $release_dir/update-core-release ]] || \

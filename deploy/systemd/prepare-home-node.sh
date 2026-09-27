@@ -17,6 +17,20 @@ if ! getent passwd jarvis-codex >/dev/null; then
     useradd --system --user-group --home-dir /var/lib/jarvis-codex --shell /usr/sbin/nologin jarvis-codex
 fi
 id -nG jarvis-codex | tr ' ' '\n' | grep -qx docker && fail "jarvis-codex must not be a Docker-group member"
+if ! getent passwd jarvis-claude >/dev/null; then
+    useradd --system --user-group --home-dir /var/lib/jarvis-claude --shell /usr/sbin/nologin jarvis-claude
+fi
+id -nG jarvis-claude | tr ' ' '\n' | grep -qx docker && fail "jarvis-claude must not be a Docker-group member"
+for worker in jarvis-claude jarvis-codex; do
+    worker_state="/var/lib/$worker"
+    if [[ -e $worker_state || -L $worker_state ]]; then
+        [[ -d $worker_state && ! -L $worker_state &&
+           $(stat -c '%U:%G:%a' "$worker_state") == "$worker:$worker:700" ]] ||
+            fail "unsafe $worker subscription state directory"
+    else
+        install -d -o "$worker" -g "$worker" -m 0700 "$worker_state"
+    fi
+done
 
 install -d -o jarvis -g jarvis -m 0750 /var/lib/jarvis
 # The config broker's persistent and ephemeral state are intentionally created

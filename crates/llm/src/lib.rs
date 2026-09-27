@@ -7,6 +7,7 @@
 
 mod anthropic;
 mod claude_cli;
+pub mod claude_worker_protocol;
 mod fallback;
 mod huggingface;
 mod huggingface_catalog;
@@ -98,7 +99,8 @@ pub struct ProviderConfig {
     pub model_cheap: String,
     pub ollama_url: String,
     pub ollama_model: String,
-    /// Path/name of the `claude` CLI (for `provider = "claude-cli"`).
+    /// Legacy configuration field; ignored by Core. The dedicated worker uses
+    /// a fixed reviewed official runtime path instead of a caller path.
     pub claude_cli_bin: String,
     /// OpenAI backend (key + base URL + per-tier models).
     pub openai: OpenAiBackend,
@@ -214,8 +216,8 @@ fn build_openai_compat(
 ///
 /// - `provider = "router"` / `"auto"` ⇒ the registry-aware [`RouterProvider`]
 ///   (see [`build_router`]); the smart mode that picks per task.
-/// - `provider = "claude-cli"` ⇒ your Claude *plan* via the `claude` CLI, with
-///   the Anthropic API (else Ollama) as the fallback when the plan is full.
+/// - `provider = "claude-cli"` ⇒ the isolated Claude subscription worker.
+///   It never silently switches to a metered API when the plan is full.
 /// - `provider = "anthropic"` + key ⇒ Anthropic, Ollama as local fallback.
 /// - `provider = "ollama"`, or nothing else buildable ⇒ Ollama only.
 /// - Nothing buildable ⇒ an [`Unconfigured`] brain that returns a clear error.
@@ -232,13 +234,7 @@ pub fn build_provider(cfg: ProviderConfig) -> Arc<dyn LlmProvider> {
 
     match cfg.provider.to_ascii_lowercase().as_str() {
         "router" | "auto" => build_router(cfg, always_available(), Vec::new()),
-        "claude-cli" => {
-            let cli = build_claude_cli(&cfg);
-            match anthropic.or(ollama) {
-                Some(fallback) => Arc::new(FallbackProvider::new(cli, fallback)),
-                None => cli,
-            }
-        }
+        "claude-cli" => build_claude_cli(&cfg),
         "openai" => single_or_fallback(
             build_openai_compat("openai", "openai-api", &cfg.openai),
             ollama,
@@ -485,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_cli_falls_back_to_api_when_keyed() {
+    fn explicit_claude_subscription_never_adds_paid_api_fallback() {
         let brain = build_provider(ProviderConfig {
             provider: "claude-cli".into(),
             api_key: Some("sk-ant-test".into()),
@@ -503,11 +499,7 @@ mod tests {
             ollama_cloud: OpenAiBackend::default(),
             huggingface: HuggingFaceBackend::default(),
         });
-        // CLI primary, API as the fallback ("vangnet als de CLI vol is").
-        assert_eq!(
-            brain.label(),
-            "claude-cli:claude-sonnet-5→anthropic:claude-sonnet-5"
-        );
+        assert_eq!(brain.label(), "claude-cli:claude-sonnet-5");
     }
 
     #[test]

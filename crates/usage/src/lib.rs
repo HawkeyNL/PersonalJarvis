@@ -25,9 +25,32 @@ pub const METERED_BACKENDS: [&str; 8] = [
     "jev",
 ];
 
+/// Execution and billing class are distinct from model names. An unknown
+/// backend is never presented as free or as a verified subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeClass {
+    Local,
+    Subscription,
+    MeteredApi,
+    Unknown,
+}
+
+pub fn compute_class(backend: &str) -> ComputeClass {
+    if METERED_BACKENDS.contains(&backend) {
+        ComputeClass::MeteredApi
+    } else {
+        match backend {
+            "ollama" | "laya" => ComputeClass::Local,
+            "claude-cli" | "codex" => ComputeClass::Subscription,
+            _ => ComputeClass::Unknown,
+        }
+    }
+}
+
 /// Whether a backend id bills per token (vs. the free plan/local brains).
 pub fn is_metered(backend: &str) -> bool {
-    METERED_BACKENDS.contains(&backend)
+    compute_class(backend) == ComputeClass::MeteredApi
 }
 
 /// Per-1M-token price in USD.
@@ -637,6 +660,15 @@ impl BudgetBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_class_does_not_confuse_subscription_with_paid_api() {
+        assert_eq!(compute_class("claude-cli"), ComputeClass::Subscription);
+        assert_eq!(compute_class("codex"), ComputeClass::Subscription);
+        assert_eq!(compute_class("laya"), ComputeClass::Local);
+        assert_eq!(compute_class("anthropic-api"), ComputeClass::MeteredApi);
+        assert_eq!(compute_class("unreviewed"), ComputeClass::Unknown);
+    }
 
     #[test]
     fn plan_and_local_are_free() {

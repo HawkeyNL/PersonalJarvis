@@ -188,6 +188,27 @@ async fn credentials(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+async fn ai_accounts(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+) -> Result<Vec<admin::AiAccountRecord>, String> {
+    with_session(session, |session| admin::ai_accounts(&session)).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn ai_account_action(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+    provider: admin::AiAccountProvider,
+    action: admin::AiAccountAction,
+) -> Result<admin::OperationResult, String> {
+    with_session(session, move |session| {
+        admin::ai_account_action(&session, provider, action)
+    })
+    .await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 async fn credential_set(
     session: tauri::State<'_, Arc<session::SessionManager>>,
     provider: admin::CredentialProvider,
@@ -262,6 +283,8 @@ pub fn run() {
             usage,
             model_mutation,
             credentials,
+            ai_accounts,
+            ai_account_action,
             credential_set,
             devices_overview,
             device_action,
@@ -297,6 +320,16 @@ pub fn run_credential_entry(provider: &std::ffi::OsStr) -> ! {
     match &result {
         Ok(()) => println!("\nCredential setup completed successfully."),
         Err(error) => eprintln!("\nJarvis credential setup: {error}"),
+    }
+    admin::wait_for_credential_terminal();
+    std::process::exit(if result.is_ok() { 0 } else { 1 });
+}
+
+pub fn run_account_entry(action: &std::ffi::OsStr, provider: &std::ffi::OsStr) -> ! {
+    let result = admin::ai_account_entry(action, provider);
+    match &result {
+        Ok(()) => println!("\nAI account operation completed."),
+        Err(error) => eprintln!("\nJarvis AI account: {error}"),
     }
     admin::wait_for_credential_terminal();
     std::process::exit(if result.is_ok() { 0 } else { 1 });

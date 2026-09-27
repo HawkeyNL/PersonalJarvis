@@ -51,27 +51,28 @@ cat > "$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "$JARVIS_UPDATER_FIXTURE/systemctl.log"
-if [[ ${JARVIS_LAYA_STATE_FIXTURE:-false} == true ]]; then
+if [[ ${JARVIS_LAYA_STATE_FIXTURE:-false} == true || ${JARVIS_CLAUDE_STATE_FIXTURE:-false} == true ]]; then
     unit=${3:-}
-    [[ $unit == jarvis-laya.* ]] || unit=${2:-}
-    if [[ $unit == jarvis-laya.socket || $unit == jarvis-laya.service ]]; then
+    [[ $unit == jarvis-laya.* || $unit == jarvis-claude.* ]] || unit=${2:-}
+    if [[ $unit == jarvis-laya.socket || $unit == jarvis-laya.service || $unit == jarvis-claude.socket || $unit == jarvis-claude.service ]]; then
+        base=${unit%.*}
         state="$JARVIS_UPDATER_FIXTURE/$unit"
         case ${1:-} in
             is-active) [[ -e $state.active ]]; exit ;;
             is-enabled) [[ -e $state.enabled ]]; exit ;;
             stop)
                 rm -f -- "$state.active"
-                [[ $unit != jarvis-laya.socket ]] || rm -f -- "$JARVIS_UPDATER_FIXTURE/jarvis-laya.service.active"
+                [[ $unit != *.socket ]] || rm -f -- "$JARVIS_UPDATER_FIXTURE/$base.service.active"
                 exit 0 ;;
             restart)
                 # Requires=socket means a socket restart can stop a warm service.
-                [[ $unit != jarvis-laya.socket ]] || rm -f -- "$JARVIS_UPDATER_FIXTURE/jarvis-laya.service.active"
+                [[ $unit != *.socket ]] || rm -f -- "$JARVIS_UPDATER_FIXTURE/$base.service.active"
                 touch "$state.active"
-                [[ $unit != jarvis-laya.service ]] || touch "$JARVIS_UPDATER_FIXTURE/jarvis-laya.socket.active"
+                [[ $unit != *.service ]] || touch "$JARVIS_UPDATER_FIXTURE/$base.socket.active"
                 exit 0 ;;
             start)
                 touch "$state.active"
-                [[ $unit != jarvis-laya.service ]] || touch "$JARVIS_UPDATER_FIXTURE/jarvis-laya.socket.active"
+                [[ $unit != *.service ]] || touch "$JARVIS_UPDATER_FIXTURE/$base.socket.active"
                 exit 0 ;;
         esac
     fi
@@ -151,6 +152,7 @@ write_release() {
     local admin_helpers=${7:-true}
     local systemd_units=${8:-$admin_helpers}
     local laya_runtime=${9:-false}
+    local subscription_workers=${10:-false}
     mkdir -p "$root/jarvis-core-$tag"
     chmod 0755 "$root/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
@@ -217,6 +219,14 @@ write_release() {
             "$root/jarvis-core-$tag/systemd-jarvis-laya.socket"
         chmod 0755 "$root/jarvis-core-$tag/provision-laya"
     fi
+    if [[ $subscription_workers == true ]]; then
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-claude-worker"
+        chmod 0755 "$root/jarvis-core-$tag/jarvis-claude-worker"
+        for unit in jarvis-claude.service jarvis-claude.socket; do
+            cp "$repo_dir/deploy/systemd/$unit" "$root/jarvis-core-$tag/systemd-$unit"
+            chmod 0644 "$root/jarvis-core-$tag/systemd-$unit"
+        done
+    fi
     jq -n \
         --arg tag "$tag" \
         --arg schema_sha256 "$schema_sha256" \
@@ -226,7 +236,8 @@ write_release() {
         --argjson admin_helpers "$admin_helpers" \
         --argjson systemd_units "$systemd_units" \
         --argjson laya_runtime "$laya_runtime" \
-        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}, tooling: ({private_agents: 1} + if $admin_helpers then {admin_helpers: 1} else {} end + if $systemd_units then {systemd_units: 1} else {} end + if $laya_runtime then {laya_runtime: 1} else {} end)}' \
+        --argjson subscription_workers "$subscription_workers" \
+        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}, tooling: ({private_agents: 1} + if $admin_helpers then {admin_helpers: 1} else {} end + if $systemd_units then {systemd_units: 1} else {} end + if $laya_runtime then {laya_runtime: 1} else {} end + if $subscription_workers then {subscription_workers: 1} else {} end)}' \
         > "$root/jarvis-core-$tag/release.json"
     chmod 0644 "$root/jarvis-core-$tag/release.json"
     local -a checksummed=(
@@ -250,6 +261,9 @@ write_release() {
     if [[ $laya_runtime == true ]]; then
         checksummed+=(laya-offline.py provision-laya systemd-jarvis-laya.service systemd-jarvis-laya.socket)
     fi
+    if [[ $subscription_workers == true ]]; then
+        checksummed+=(jarvis-claude-worker systemd-jarvis-claude.service systemd-jarvis-claude.socket)
+    fi
     (
         cd "$root/jarvis-core-$tag"
         sha256sum "${checksummed[@]}" > artifact-binaries.sha256
@@ -265,17 +279,18 @@ seed_active_release() {
     local schema_sha256=$2
     local admin_helpers=${3:-true}
     local laya_runtime=${4:-false}
+    local subscription_workers=${5:-false}
     rm -rf -- /opt/jarvis
     install -d -o root -g root -m 0755 /opt/jarvis/releases
     write_release /opt/jarvis/releases "$tag" "$schema_sha256" \
-        "${tag#v}" "${tag#v}" "${tag#v}" "$admin_helpers" "$admin_helpers" "$laya_runtime"
+        "${tag#v}" "${tag#v}" "${tag#v}" "$admin_helpers" "$admin_helpers" "$laya_runtime" "$subscription_workers"
     mv "/opt/jarvis/releases/jarvis-core-$tag" "/opt/jarvis/releases/$tag"
     ln -s "/opt/jarvis/releases/$tag" /opt/jarvis/current
     rm -f -- "$systemd_fixture"/jarvis-*.service "$systemd_fixture"/jarvis-*.timer "$systemd_fixture"/jarvis-*.socket
     if [[ $admin_helpers == true ]]; then
         cp /opt/jarvis/releases/$tag/systemd-*.service \
             /opt/jarvis/releases/$tag/systemd-*.timer "$systemd_fixture/"
-        if [[ $laya_runtime == true ]]; then
+        if [[ $laya_runtime == true || $subscription_workers == true ]]; then
             cp /opt/jarvis/releases/$tag/systemd-*.socket "$systemd_fixture/"
         fi
         for installed in "$systemd_fixture"/systemd-*; do
@@ -316,12 +331,13 @@ prepare_candidate() {
     local admin_helpers=${6:-true}
     local omitted_helper=${7:-}
     local laya_runtime=${8:-false}
+    local subscription_workers=${9:-false}
     local asset_root="$fixture_dir/asset"
     local artifact="jarvis-core-$tag-linux-x86_64.tar.gz"
     rm -rf -- "$asset_root"
     mkdir -p "$asset_root"
     write_release "$asset_root" "$tag" "$schema_sha256" "$core_version" "$cli_version" \
-        "$app_version" "$admin_helpers" "$admin_helpers" "$laya_runtime"
+        "$app_version" "$admin_helpers" "$admin_helpers" "$laya_runtime" "$subscription_workers"
     if [[ -n $omitted_helper ]]; then
         rm -f -- "$asset_root/jarvis-core-$tag/$omitted_helper"
     fi
@@ -892,5 +908,47 @@ for mode in disabled inactive socket_only warm; do
     fi
     [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v11.0.1 ]]
     assert_laya_state "$expected"
+done
+# Subscription worker update/rollback must preserve opt-in and current active
+# state; socket-only use must not silently launch a persistent worker.
+unset JARVIS_LAYA_STATE_FIXTURE
+export JARVIS_CLAUDE_STATE_FIXTURE=true
+set_claude_state() {
+    rm -f -- "$fixture_dir"/jarvis-claude.{socket,service}.{active,enabled}
+    for state in "$@"; do
+        touch "$fixture_dir/jarvis-claude.$state"
+    done
+}
+assert_claude_state() {
+    local expected=$1 actual=
+    for state in socket.active service.active socket.enabled service.enabled; do
+        [[ ! -e $fixture_dir/jarvis-claude.$state ]] || actual+="$state "
+    done
+    [[ $actual == "$expected" ]] || {
+        echo "Claude lifecycle mismatch: expected '$expected', got '$actual'" >&2
+        exit 1
+    }
+}
+for mode in disabled inactive socket_only active; do
+    seed_active_release v12.0.0 "$same_migrations" true false true
+    case $mode in
+        disabled) set_claude_state ; expected='' ;;
+        inactive) set_claude_state service.enabled ; expected='service.enabled ' ;;
+        socket_only) set_claude_state socket.active socket.enabled ; expected='socket.active socket.enabled ' ;;
+        active) set_claude_state socket.active service.active socket.enabled ; expected='socket.active service.active socket.enabled ' ;;
+    esac
+    prepare_candidate v12.0.1 "$same_migrations" 12.0.1 12.0.1 12.0.1 true '' false true
+    run_updater
+    [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v12.0.1 ]]
+    assert_claude_state "$expected"
+    ! grep -Eq '^(enable|disable) jarvis-claude\.' "$fixture_dir/systemctl.log"
+
+    prepare_candidate v12.0.2 "$same_migrations" 12.0.2 12.0.2 12.0.2 true '' false true
+    rm -f -- "$fixture_dir/readyz-failed-once"
+    if JARVIS_UPDATER_READYZ_FAIL=true run_updater; then
+        echo "failed Claude $mode activation unexpectedly succeeded" >&2; exit 1
+    fi
+    [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v12.0.1 ]]
+    assert_claude_state "$expected"
 done
 echo "Home Node updater fixture tests passed"
