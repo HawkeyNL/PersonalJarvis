@@ -12,10 +12,24 @@ grep -Fxq 'User=jarvis-claude' "$service"
 grep -Fxq 'Group=jarvis-claude' "$service"
 grep -Fxq 'ProtectHome=true' "$service"
 grep -Fxq 'ProtectSystem=strict' "$service"
+grep -Fxq 'ExecStart=/opt/jarvis/current/jarvis-claude-worker' "$service"
 grep -Fxq 'InaccessiblePaths=/etc/jarvis /var/lib/jarvis /var/lib/jarvis-codex' "$service"
 ! grep -Eq '^SupplementaryGroups=|^EnvironmentFile=.*(anthropic|openai|core[.]env)' "$service"
 ! grep -Eq '^Listen(Stream|Datagram)=[0-9]|^Listen(Stream|Datagram)=127[.]' "$socket"
-if ! verification=$(systemd-analyze verify "$service" "$socket" 2>&1); then
+
+fixture=$(mktemp -d /tmp/jarvis-subscription-release.XXXXXXXX)
+trap 'rm -rf -- "$fixture"' EXIT
+# systemd-analyze also checks that ExecStart exists. A clean CI runner has no
+# activated /opt/jarvis/current, so verify a copy with only that fixed binary
+# path replaced by a disposable executable. The production unit stays intact.
+stub="$fixture/jarvis-claude-worker"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$stub"
+chmod 0755 "$stub"
+sed "s#^ExecStart=/opt/jarvis/current/jarvis-claude-worker\$#ExecStart=$stub#" \
+    "$service" > "$fixture/jarvis-claude.service"
+install -m 0644 "$socket" "$fixture/jarvis-claude.socket"
+if ! verification=$(systemd-analyze verify \
+    "$fixture/jarvis-claude.service" "$fixture/jarvis-claude.socket" 2>&1); then
     residual=$(printf '%s\n' "$verification" | sed \
         -e '/^Failed to turn off SO_PASSRIGHTS on user lookup socket, ignoring: Operation not permitted$/d' \
         -e '/^Failed to enable SO_PASSCRED on handoff timestamp socket: Operation not permitted$/d')
@@ -23,8 +37,6 @@ if ! verification=$(systemd-analyze verify "$service" "$socket" 2>&1); then
     echo 'systemd-analyze verify restricted by local sandbox; static unit checks completed'
 fi
 
-fixture=$(mktemp -d /tmp/jarvis-subscription-release.XXXXXXXX)
-trap 'rm -rf -- "$fixture"' EXIT
 release=$fixture/release
 mkdir -p "$release"
 install -m 0755 "$repo/deploy/systemd/manage-systemd-units.sh" "$release/manage-systemd-units"
