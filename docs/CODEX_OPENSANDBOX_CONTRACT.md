@@ -79,8 +79,10 @@ workload image by this repository. The official Codex App Server's documented
 production transport is stdio JSONL; Unix-socket WebSocket and remote code-mode
 host options remain experimental. Neither an experimental App Server transport
 nor a host Codex process with repository tools is a substitute for the missing
-task-scoped proxy. This PR must remain draft until a concrete channel,
-workload image and adversarial lifecycle tests are implemented and reviewed.
+task-scoped proxy. PR #58 is the account/subscription foundation and keeps
+Codex execution deliberately disabled. A separate, reviewed execution PR must
+provide the channel, workload image and adversarial lifecycle tests before
+the owner may activate production Codex runs.
 
 When that gate is met, each completed, failed, timed-out or cancelled run still
 terminates its disposable sandbox. Resume starts a new sandbox from the current

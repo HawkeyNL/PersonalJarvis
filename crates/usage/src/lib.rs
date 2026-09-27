@@ -1,8 +1,8 @@
 //! LLM usage & cost tracking — the money side of the cost-aware router (ADR-027).
 //!
-//! Only *metered* API backends cost money; the Claude plan (`claude-cli`) and
-//! local Ollama remain zero-cost. Provider-reported token counts are recorded
-//! for every backend, while paid calls additionally receive an estimated cost.
+//! Only known metered API backends contribute estimated API spend; subscription
+//! and local runs do not. A subscription can still incur provider-side overage
+//! that Jarvis cannot independently verify. Unknown backends are not free.
 //! Monthly spend feeds a hard EUR budget the router enforces before paid calls.
 //!
 //! Prices are best-effort estimates in USD per 1M tokens (providers bill in USD);
@@ -229,8 +229,13 @@ impl PricingRegistry {
     }
 
     pub fn price_for(&self, backend: &str, model: &str) -> (Price, PriceStatus) {
-        if !is_metered(backend) {
-            return (Price::new(0.0, 0.0), PriceStatus::Local);
+        match compute_class(backend) {
+            ComputeClass::Local => return (Price::new(0.0, 0.0), PriceStatus::Local),
+            ComputeClass::Subscription => {
+                return (Price::new(0.0, 0.0), PriceStatus::Subscription);
+            }
+            ComputeClass::Unknown => return (Price::new(3.0, 15.0), PriceStatus::Unknown),
+            ComputeClass::MeteredApi => {}
         }
         if let Some(entry) = self
             .models
@@ -294,6 +299,7 @@ pub enum PriceStatus {
     Conservative,
     Unknown,
     Local,
+    Subscription,
 }
 
 pub fn price_status(backend: &str, model: &str) -> PriceStatus {
@@ -346,7 +352,10 @@ pub fn cost_eur_with_registry(
     cache_read_tokens: u32,
     eur_per_usd: f64,
 ) -> f64 {
-    if !is_metered(backend) {
+    if matches!(
+        compute_class(backend),
+        ComputeClass::Local | ComputeClass::Subscription
+    ) {
         return 0.0;
     }
     let (mut p, _) = registry.price_for(backend, model);
@@ -472,12 +481,15 @@ pub fn estimate_task_cost_with_registry(
     let status = registry.price_for(backend, model).1;
     let low_factor = match status {
         PriceStatus::Unknown | PriceStatus::Conservative => 1.0,
-        PriceStatus::Known | PriceStatus::Estimated | PriceStatus::Local => 0.6,
+        PriceStatus::Known
+        | PriceStatus::Estimated
+        | PriceStatus::Local
+        | PriceStatus::Subscription => 0.6,
     };
     let high_factor = match status {
         PriceStatus::Unknown => 2.5,
         PriceStatus::Estimated | PriceStatus::Known => 1.6,
-        PriceStatus::Conservative | PriceStatus::Local => 1.0,
+        PriceStatus::Conservative | PriceStatus::Local | PriceStatus::Subscription => 1.0,
     };
     CostEstimate {
         low_eur: likely * low_factor,
@@ -679,6 +691,10 @@ mod tests {
         assert_eq!(cost_eur("ollama", "llama3.2", 5000, 5000, 0, 0.92), 0.0);
         assert!(!is_metered("claude-cli"));
         assert!(!is_metered("ollama"));
+        assert_eq!(
+            price_status("claude-cli", "claude-opus-5"),
+            PriceStatus::Subscription
+        );
     }
 
     #[test]
@@ -713,6 +729,28 @@ mod tests {
         assert!(c > 0.0);
         let hf = cost_eur("huggingface", "org/future-model", 1_000, 1_000, 0, 0.92);
         assert!(hf >= 1_000.0);
+    }
+
+    #[test]
+    fn unknown_backend_is_never_classified_as_free() {
+        let mut registry = PricingRegistry::builtin();
+        registry
+            .models
+            .push(entry("unreviewed", "future-model", 0.0, 0.0));
+        let (price, status) = registry.price_for("unreviewed", "future-model");
+        assert_eq!(status, PriceStatus::Unknown);
+        assert!(price.input > 0.0);
+        assert!(
+            cost_eur_with_registry(
+                &registry,
+                "unreviewed",
+                "future-model",
+                1_000,
+                1_000,
+                0,
+                0.92
+            ) > 0.0
+        );
     }
 
     #[test]

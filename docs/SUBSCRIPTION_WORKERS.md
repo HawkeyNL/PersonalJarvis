@@ -59,6 +59,9 @@ a safe unavailable/plan-limit state. Claude runs are classified as
 silently fall back to paid Anthropic API credit. The normal Auto router may
 consider a *separately owner-enabled* metered API route under its existing
 policy, which is not a subscription entitlement.
+An unrecognized backend is not classified as local or subscription: it is
+unavailable to the router, and pricing diagnostics use an unknown,
+conservative estimate rather than zero cost.
 
 Core Admin deliberately reports Claude billing as `overage_unverified` even
 when `claude auth status` confirms a subscription login. The CLI cannot verify
@@ -117,9 +120,18 @@ account, the owner can deliberately enable the local worker with
 enabled by `accounts connect` or by a Core update. `sudo jarvis accounts
 status claude` reports login status, not a verified billing ceiling.
 
-Current limitations before production rollout: the official provider CLIs
-must be installed and verified under their pinned host paths; live account
-login/runtime behaviour must be tested with the owner's subscription; the
-Codex task-scoped OpenSandbox proxy remains gated; and a real Home Node
-end-to-end verification is still required. Do not treat a green mock/fixture
-test as proof of a working subscription or safe Codex sandbox activation.
+PR #58 delivers account linking, the isolated Claude worker, compute-class
+accounting and bounded delegated-context primitives. It does not enable Codex
+coding execution. A separate execution PR must implement the reviewed
+OpenSandbox workload, task-scoped proxy, repository snapshot authority and run
+lifecycle before that path can be activated. This missing execution layer does
+not block merging the fail-closed foundation.
+
+Before production activation, the owner must install and review the official
+CLIs at their pinned host paths, verify/disable Claude extra usage in the
+Anthropic account, connect and test each account through Core Admin or the
+local admin CLI, and explicitly enable the Claude worker socket. A harmless
+bounded Claude prompt should then confirm worker routing and subscription
+telemetry with no metered-API entry. Real account login and Home Node behavior
+have not been established by mock/fixture tests. The private `Jarvis.md`
+persona remains owner-managed and is not changed by this foundation.

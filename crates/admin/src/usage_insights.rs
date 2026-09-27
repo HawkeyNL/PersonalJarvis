@@ -329,6 +329,7 @@ fn priced_model_policy_with_registry_and_hf(
                         PriceStatus::Conservative => "conservative",
                         PriceStatus::Unknown => "unknown",
                         PriceStatus::Local => "local",
+                        PriceStatus::Subscription => "subscription",
                         PriceStatus::Known => "known",
                     }
                 } else if hf_price.is_some() {

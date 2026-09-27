@@ -281,8 +281,11 @@ pub fn router_catalog(reg: &Arc<RwLock<registry::Registry>>) -> Vec<llm::Catalog
 
 impl llm::Availability for BrainAvailability {
     fn is_available(&self, backend_id: &str) -> bool {
-        // Metered backends are cut off once the monthly budget is reached, so
-        // the router falls back to the free plan/Ollama.
+        // Unknown compute cannot be trusted as free or within an API budget.
+        if usage::compute_class(backend_id) == usage::ComputeClass::Unknown {
+            return false;
+        }
+        // Metered backends are cut off once the monthly budget is reached.
         if usage::is_metered(backend_id)
             && self.spent_cents.load(Ordering::Relaxed) >= self.budget_cents
         {
@@ -309,5 +312,37 @@ mod tests {
     async fn root_reports_service_name() {
         let Json(body) = root().await;
         assert_eq!(body["service"], "jarvis-api");
+    }
+
+    #[test]
+    fn unknown_compute_is_unavailable_even_when_registry_marks_it_available() {
+        let availability = BrainAvailability {
+            registry: Arc::new(RwLock::new(registry::Registry {
+                host: registry::HostInfo {
+                    os: "fixture".into(),
+                    arch: "x86_64".into(),
+                    cpu: "fixture".into(),
+                    cpu_cores: 1,
+                    mem_total_gb: 1.0,
+                    gpu: String::new(),
+                },
+                software: vec![],
+                brains: vec![registry::Brain {
+                    id: "unreviewed".into(),
+                    label: "fixture".into(),
+                    cost: registry::CostTier::Local,
+                    available: true,
+                    note: String::new(),
+                }],
+                models: vec![],
+                active_brain: "fixture".into(),
+            })),
+            spent_cents: Arc::new(AtomicU64::new(0)),
+            budget_cents: 1_000,
+        };
+        assert!(!llm::Availability::is_available(
+            &availability,
+            "unreviewed"
+        ));
     }
 }
