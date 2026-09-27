@@ -39,7 +39,7 @@ pub async fn lease(
     run_id: Uuid,
     requested_runtime_secs: u64,
 ) -> Result<Option<LeasedReservation>, StoreError> {
-    let mut response = db.query("UPDATE coding_reservations SET status='leased',run_id=$run,updated_at=time::now() WHERE record::id(id)=$id AND user_id=$user AND coding_session_id=$coding_session_key AND purpose='codex_coding_run' AND compute_class='subscription' AND api_spend_cents=0 AND execution_units=1 AND status='reserved' AND expires_at>time::now() AND max_runtime_secs >= $runtime RETURN id,max_runtime_secs,max_provider_turns")
+    let mut response = db.query("UPDATE coding_reservations SET status='leased',run_id=$run,updated_at=time::now() WHERE record::id(id)=$id AND user_id=$user AND coding_session_id=$coding_session_key AND purpose='codex_coding_run' AND compute_class='subscription' AND api_spend_cents=0 AND execution_units=1 AND status='reserved' AND expires_at>time::now() AND max_runtime_secs >= $runtime RETURN record::id(id) AS id,max_runtime_secs,max_provider_turns")
         .bind(json!({"id":id.to_string(),"user":user_id.to_string(),"coding_session_key":session_id.to_string(),"run":run_id.to_string(),"runtime":requested_runtime_secs}))
         .await.map_err(StoreError::schema)?.check().map_err(StoreError::schema)?;
     let rows: Vec<Value> = response.take(0).map_err(StoreError::schema)?;

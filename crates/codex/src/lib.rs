@@ -739,10 +739,21 @@ pub async fn execute_in_sandbox_tracked<
     // A manager may create a workload but lose its response. Treat create
     // timeout/error as uncertain ownership: pause admission until metadata
     // reconciliation proves whether an orphan needs destruction.
-    let handle = tokio::time::timeout_at(deadline, provider.create(&task))
-        .await
-        .map_err(|_| CodingRunError::CleanupRequired)?
-        .map_err(|_| CodingRunError::CleanupRequired)?;
+    if cancel.as_ref().is_some_and(|receiver| *receiver.borrow()) {
+        return Err(CodingRunError::SandboxFailed);
+    }
+    let handle = tokio::select! {
+        biased;
+        _ = wait_for_cancellation(&mut cancel) => {
+            // The manager may have accepted CREATE before its response was
+            // cancelled. Metadata reconciliation must establish ownership.
+            return Err(CodingRunError::CleanupRequired);
+        }
+        result = tokio::time::timeout_at(deadline, provider.create(&task)) => {
+            result.map_err(|_| CodingRunError::CleanupRequired)?
+                .map_err(|_| CodingRunError::CleanupRequired)?
+        }
+    };
     if let Err(error) = ownership.created(&handle).await {
         let terminated = provider.terminate(handle.clone()).await.is_ok();
         let _ = ownership.cleanup(&handle, terminated).await;
@@ -756,7 +767,10 @@ pub async fn execute_in_sandbox_tracked<
     // The signed limit bounds upload, relay, provider execution and artifact
     // collection together. A stalled manager cannot stretch a 1-second owner
     // approval into the profile's much larger infrastructure ceiling.
-    let result = tokio::time::timeout_at(
+    let result = tokio::select! {
+        biased;
+        _ = wait_for_cancellation(&mut cancel) => Err(CodingRunError::SandboxFailed),
+        result = tokio::time::timeout_at(
         deadline,
         async {
         provider
@@ -818,16 +832,6 @@ pub async fn execute_in_sandbox_tracked<
         tokio::pin!(execution_future);
         tokio::pin!(relay_future);
         let execution_first = tokio::select! {
-            biased;
-            _ = async {
-                if let Some(receiver) = cancel.as_mut() {
-                    if !*receiver.borrow() {
-                        let _ = receiver.changed().await;
-                    }
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => return Err(CodingRunError::SandboxFailed),
             relay_result = &mut relay_future => { relay_result?; None },
             execution = &mut execution_future => {
                 let execution = execution.map_err(|_| CodingRunError::SandboxFailed)?;
@@ -843,19 +847,7 @@ pub async fn execute_in_sandbox_tracked<
             relay_future.await?;
             execution
         } else {
-            tokio::select! {
-                biased;
-                _ = async {
-                    if let Some(receiver) = cancel.as_mut() {
-                        if !*receiver.borrow() {
-                            let _ = receiver.changed().await;
-                        }
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => return Err(CodingRunError::SandboxFailed),
-                execution = &mut execution_future => execution.map_err(|_| CodingRunError::SandboxFailed)?,
-            }
+            execution_future.await.map_err(|_| CodingRunError::SandboxFailed)?
         };
         if execution.timed_out {
             return Err(CodingRunError::TimedOut);
@@ -893,9 +885,8 @@ pub async fn execute_in_sandbox_tracked<
             artifact_contents: artifacts,
         })
         },
-    )
-    .await
-    .unwrap_or(Err(CodingRunError::TimedOut));
+    ) => result.unwrap_or(Err(CodingRunError::TimedOut)),
+    };
     // Destruction is mandatory for success, failure and cancellation paths.
     // There is no retained sandbox to resume later.
     let terminated = provider.terminate(handle.clone()).await.is_ok();
@@ -907,6 +898,23 @@ pub async fn execute_in_sandbox_tracked<
         return Err(CodingRunError::CleanupRequired);
     }
     result
+}
+
+async fn wait_for_cancellation(cancel: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    let Some(receiver) = cancel else {
+        std::future::pending::<()>().await;
+        unreachable!();
+    };
+    loop {
+        if *receiver.borrow_and_update() {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            // Losing the sender is not an owner cancellation. The signed
+            // deadline still bounds the run and the broker owns teardown.
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// A root-managed registry resolves this logical identity to a trusted source
@@ -1853,6 +1861,7 @@ mod tests {
         calls: Arc<Mutex<Vec<&'static str>>>,
         available: bool,
         delay_create: bool,
+        stalled_upload: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[async_trait]
@@ -1895,6 +1904,10 @@ mod tests {
                 assert_eq!(envelope.base_commit_sha, "a".repeat(40));
             }
             self.calls.lock().unwrap().push("upload");
+            if let Some(signal) = &self.stalled_upload {
+                signal.notify_one();
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
         async fn set_network_policy(
@@ -1983,6 +1996,7 @@ mod tests {
                 calls: calls.clone(),
                 available: true,
                 delay_create: false,
+                stalled_upload: None,
             };
             let ownership = RecordingOwnership {
                 calls: calls.clone(),
@@ -2033,6 +2047,7 @@ mod tests {
             calls: calls.clone(),
             available: true,
             delay_create: false,
+            stalled_upload: None,
         };
         let ownership = RecordingOwnership {
             calls: calls.clone(),
@@ -2069,6 +2084,7 @@ mod tests {
             calls: calls.clone(),
             available: true,
             delay_create: true,
+            stalled_upload: None,
         };
         let mut request = signed_start();
         if let CodingOperation::StartCodingRun { timeout_secs, .. } = &mut request.operation {
@@ -2103,6 +2119,7 @@ mod tests {
             calls: calls.clone(),
             available: true,
             delay_create: false,
+            stalled_upload: None,
         };
         let err = execute_in_sandbox(
             &provider,
@@ -2142,6 +2159,7 @@ mod tests {
             calls: calls.clone(),
             available: true,
             delay_create: false,
+            stalled_upload: None,
         };
         let request = signed_start();
         let (authority, capability, run_id) = capability_for(&request);
@@ -2164,12 +2182,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signalled_cancellation_reaches_sandbox_termination() {
+    async fn pre_signalled_cancellation_never_creates_sandbox() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let provider = TestProvider {
             calls: calls.clone(),
             available: true,
             delay_create: false,
+            stalled_upload: None,
         };
         let request = signed_start();
         let (authority, capability, run_id) = capability_for(&request);
@@ -2190,7 +2209,44 @@ mod tests {
         .await;
         drop(sender);
         assert!(matches!(result, Err(CodingRunError::SandboxFailed)));
+        assert!(!calls.lock().unwrap().contains(&"create"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_stalled_upload_terminates_owned_sandbox() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let provider = TestProvider {
+            calls: calls.clone(),
+            available: true,
+            delay_create: false,
+            stalled_upload: Some(signal.clone()),
+        };
+        let request = signed_start();
+        let (authority, capability, run_id) = capability_for(&request);
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let run = execute_in_sandbox_with_cancel(
+            &provider,
+            &request,
+            valid_snapshot(&request),
+            TaskContextInput::default(),
+            ApprovedSandboxRun {
+                adapter: &TestAdapter,
+                authority: &authority,
+                run_id,
+                capability: Some(capability),
+            },
+            Some(receiver),
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            _ = signal.notified() => {},
+            result = &mut run => panic!("run ended before upload cancellation: {result:?}"),
+        }
+        sender.send(true).unwrap();
+        assert_eq!(run.await, Err(CodingRunError::SandboxFailed));
         assert_eq!(calls.lock().unwrap().last(), Some(&"terminate"));
+        assert!(!calls.lock().unwrap().contains(&"exec"));
     }
 
     struct WorkspaceRelayProvider {
