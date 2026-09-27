@@ -33,6 +33,12 @@ default. The envelope is capped at 32 KiB. Old raw deltas are dropped before
 explicit owner constraints or the latest checkpoint; if those cannot fit,
 execution fails closed.
 
+For a resumed run, the objective must come from the existing owner-scoped
+coding session, not from the checkpoint summary. The checkpoint records facts
+about prior work; it is not a replacement authorization or a new objective.
+If the trusted session objective cannot be loaded and matched to the signed
+session/repository/revision, resume is refused before sandbox creation.
+
 The profile retains the existing OpenSandbox default-deny egress policy. Its
 allowlist is limited to package/source registries; loopback, RFC1918, link-local
 and Docker/host ranges remain denied, including through DNS rebinding.
@@ -75,14 +81,16 @@ The checked-in OpenSandbox deployment provides authenticated, loopback-only
 manager-to-sandbox lifecycle/exec/file operations, but no reviewed
 sandbox-to-broker task channel. `CODEX_SANDBOX_COMMAND` names
 `/usr/local/bin/jarvis-codex-runtime`, which is not built into a reviewed Codex
-workload image by this repository. The official Codex App Server's documented
-production transport is stdio JSONL; Unix-socket WebSocket and remote code-mode
-host options remain experimental. Neither an experimental App Server transport
-nor a host Codex process with repository tools is a substitute for the missing
-task-scoped proxy. PR #58 is the account/subscription foundation and keeps
-Codex execution deliberately disabled. A separate, reviewed execution PR must
-provide the channel, workload image and adversarial lifecycle tests before
-the owner may activate production Codex runs.
+workload image by this repository. The current official
+[Codex App Server documentation](https://learn.chatgpt.com/docs/app-server)
+labels the app-server command and WebSocket transport experimental and not
+supported for production workloads. The stable `codex exec` command runs
+model-generated shell commands; invoking it with the long-lived subscription
+credential in a host process is not a provider-only task proxy. Neither route
+is a substitute for a reviewed, task-scoped channel that keeps credentials
+out of the untrusted workload. PR #58 supplies only the account/subscription
+foundation. The execution broker must remain closed until an actual production
+channel, immutable workload and adversarial lifecycle tests exist.
 
 When that gate is met, each completed, failed, timed-out or cancelled run still
 terminates its disposable sandbox. Resume starts a new sandbox from the current

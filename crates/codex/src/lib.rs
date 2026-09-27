@@ -23,6 +23,10 @@ pub const MAX_CODING_TIMEOUT_SECS: u64 = 15 * 60;
 pub const MAX_CODING_ARTIFACTS: u8 = 32;
 pub const MAX_CODING_OUTPUT_BYTES: u64 = 512 * 1024;
 pub const MAX_TASK_ENVELOPE_BYTES: usize = 32 * 1024;
+/// The OpenSandbox upload boundary accepts at most this many bytes per input.
+/// A larger repository snapshot cannot be transferred through the reviewed
+/// provider API and must fail before creating a workload.
+pub const MAX_REPOSITORY_ARCHIVE_BYTES: usize = jarvis_sandbox::MAX_INPUT_BYTES;
 pub const ACTION_CODING_START: &str = "coding.start";
 pub const ACTION_CODING_RESUME: &str = "coding.resume";
 pub const ACTION_CODEX_RUN_APPROVED_TASK: &str = "codex.run_approved_task";
@@ -302,7 +306,7 @@ impl RunCapabilityAuthority {
         if stored.status != CapabilityStatus::Active {
             return Err(CapabilityError::Revoked);
         }
-        if now > stored.claims.expires_at {
+        if now >= stored.claims.expires_at {
             return Err(CapabilityError::Expired);
         }
         if request.run_id != stored.claims.run_id
@@ -319,8 +323,8 @@ impl RunCapabilityAuthority {
         if request.operation != stored.claims.operation {
             return Err(CapabilityError::OperationDenied);
         }
-        if !stored.used_request_ids.insert(request.request_id)
-            || stored.used_request_ids.len() > MAX_CAPABILITY_REQUESTS
+        if stored.used_request_ids.contains(&request.request_id)
+            || stored.used_request_ids.len() >= MAX_CAPABILITY_REQUESTS
         {
             return Err(CapabilityError::Replay);
         }
@@ -329,6 +333,7 @@ impl RunCapabilityAuthority {
         {
             return Err(CapabilityError::BudgetExceeded);
         }
+        stored.used_request_ids.insert(request.request_id);
         stored.used_cents = stored.used_cents.saturating_add(reserve_cents);
         Ok(())
     }
@@ -389,7 +394,7 @@ impl RepositorySnapshot {
         };
         if self.base_commit_sha != *expected
             || self.archive.is_empty()
-            || self.archive.len() > 64 * 1024 * 1024
+            || self.archive.len() > MAX_REPOSITORY_ARCHIVE_BYTES
         {
             return Err(CodingRunError::RepositoryIsolationUnavailable);
         }
@@ -435,6 +440,7 @@ pub async fn execute_in_sandbox<P: jarvis_sandbox::SandboxProvider>(
     request: &SignedCodingRequest,
     snapshot: RepositorySnapshot,
     capability: Option<RunCapabilityToken>,
+    context: TaskContextInput,
 ) -> Result<CodingRunResult, CodingRunError> {
     request
         .operation
@@ -442,7 +448,7 @@ pub async fn execute_in_sandbox<P: jarvis_sandbox::SandboxProvider>(
         .map_err(|_| CodingRunError::SandboxFailed)?;
     let task_context = request
         .operation
-        .compile_task_envelope(TaskContextInput::default())
+        .compile_task_envelope(context)
         .map_err(|_| CodingRunError::SandboxFailed)?;
     snapshot.validate_for(&request.operation)?;
     let capability = capability.ok_or(CodingRunError::CodexAuthenticationUnavailable)?;
@@ -898,6 +904,9 @@ pub struct ProvenancedFact {
 /// history is never automatically loaded; the caller selects deltas/facts.
 #[derive(Default)]
 pub struct TaskContextInput {
+    /// Loaded from the owner-scoped, durable coding session for resume. A
+    /// checkpoint summary must never replace the original owner objective.
+    pub original_objective: Option<String>,
     pub owner_constraints: Vec<String>,
     pub recent_deltas: Vec<String>,
     pub selected_facts: Vec<ProvenancedFact>,
@@ -909,6 +918,11 @@ impl CodingOperation {
         input: TaskContextInput,
     ) -> Result<TaskEnvelope, CodingProtocolError> {
         self.validate()?;
+        if input.original_objective.as_deref().is_some_and(|value| {
+            value.trim().is_empty() || value.chars().count() > MAX_TASK_SUMMARY_CHARS
+        }) {
+            return Err(CodingProtocolError::InvalidOperation);
+        }
         if input.owner_constraints.len() > 8
             || input
                 .owner_constraints
@@ -945,7 +959,11 @@ impl CodingOperation {
                 *coding_session_id,
                 repository.clone(),
                 base_commit_sha.clone(),
-                objective.clone(),
+                if input.original_objective.is_some() {
+                    return Err(CodingProtocolError::InvalidOperation);
+                } else {
+                    objective.clone()
+                },
                 checkpoint.clone(),
                 *timeout_secs,
                 *max_output_bytes,
@@ -962,7 +980,10 @@ impl CodingOperation {
                 *coding_session_id,
                 repository.clone(),
                 base_commit_sha.clone(),
-                checkpoint.summary.clone(),
+                input
+                    .original_objective
+                    .clone()
+                    .ok_or(CodingProtocolError::InvalidOperation)?,
                 Some(checkpoint.clone()),
                 *timeout_secs,
                 *max_output_bytes,
@@ -1516,11 +1537,25 @@ mod tests {
                 archive: vec![1],
             },
             None,
+            TaskContextInput::default(),
         )
         .await
         .unwrap_err();
         assert_eq!(err, CodingRunError::CodexAuthenticationUnavailable);
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn repository_snapshot_cannot_exceed_provider_upload_limit() {
+        let request = signed_start();
+        assert_eq!(
+            RepositorySnapshot {
+                base_commit_sha: "a".repeat(40),
+                archive: vec![0; MAX_REPOSITORY_ARCHIVE_BYTES + 1],
+            }
+            .validate_for(&request.operation),
+            Err(CodingRunError::RepositoryIsolationUnavailable)
+        );
     }
 
     #[tokio::test]
@@ -1540,6 +1575,7 @@ mod tests {
                 archive: vec![1],
             },
             Some(capability),
+            TaskContextInput::default(),
         )
         .await
         .unwrap();
@@ -1561,6 +1597,7 @@ mod tests {
         let envelope = request
             .operation
             .compile_task_envelope(TaskContextInput {
+                original_objective: None,
                 owner_constraints: vec!["Only run read-only tests".into()],
                 recent_deltas: (0..100)
                     .map(|index| format!("old or recent {index}: {}", "x".repeat(8_000)))
@@ -1611,6 +1648,53 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn resume_requires_trusted_original_objective_not_checkpoint_summary() {
+        let start = signed_start();
+        let CodingOperation::StartCodingRun {
+            coding_session_id,
+            repository,
+            base_commit_sha,
+            budget_reservation_id,
+            ..
+        } = start.operation
+        else {
+            unreachable!()
+        };
+        let resume = CodingOperation::ResumeCodingRun {
+            coding_session_id,
+            repository,
+            base_commit_sha,
+            checkpoint: CodingCheckpoint {
+                summary: "Only the last checkpoint, not the task".into(),
+                decisions: vec![],
+                pending: vec![],
+                tests: "Not run".into(),
+            },
+            timeout_secs: 60,
+            budget_reservation_id,
+            max_artifacts: 1,
+            max_output_bytes: 1_024,
+        };
+        assert_eq!(
+            resume.compile_task_envelope(TaskContextInput::default()),
+            Err(CodingProtocolError::InvalidOperation)
+        );
+        let envelope = resume
+            .compile_task_envelope(TaskContextInput {
+                original_objective: Some("Implement the approved parser fix".into()),
+                recent_deltas: vec!["New failing test".into()],
+                ..TaskContextInput::default()
+            })
+            .unwrap();
+        assert_eq!(envelope.objective, "Implement the approved parser fix");
+        assert_eq!(envelope.recent_deltas, ["New failing test"]);
+        assert_eq!(
+            envelope.checkpoint.unwrap().summary,
+            "Only the last checkpoint, not the task"
+        );
+    }
+
     fn broker_request(claims: &RunCapabilityClaims) -> BrokeredCodexRequest {
         BrokeredCodexRequest {
             request_id: Uuid::now_v7(),
@@ -1659,6 +1743,8 @@ mod tests {
             authority.authorize(&token, &too_much, 6, now),
             Err(CapabilityError::BudgetExceeded)
         );
+        // A rejected budget attempt does not burn its request ID.
+        authority.authorize(&token, &too_much, 5, now).unwrap();
         authority.revoke_for_cancel(&token);
         let after_cancel = broker_request(&claims);
         assert_eq!(
@@ -1679,6 +1765,33 @@ mod tests {
                 now + Duration::seconds(2)
             ),
             Err(CapabilityError::Expired)
+        );
+    }
+
+    #[test]
+    fn capability_request_history_stays_bounded_under_rejected_flood() {
+        let request = signed_start();
+        let authority = RunCapabilityAuthority::default();
+        let claims =
+            RunCapabilityClaims::from_signed_request(Uuid::now_v7(), &request, 100).unwrap();
+        let token = authority.mint(claims.clone()).unwrap();
+        let now = OffsetDateTime::now_utc();
+        for _ in 0..MAX_CAPABILITY_REQUESTS {
+            authority
+                .authorize(&token, &broker_request(&claims), 1, now)
+                .unwrap();
+        }
+        for _ in 0..1_000 {
+            assert_eq!(
+                authority.authorize(&token, &broker_request(&claims), 1, now),
+                Err(CapabilityError::Replay)
+            );
+        }
+        let hash: [u8; 32] = Sha256::digest(token.0.as_bytes()).into();
+        let stored = authority.capabilities.lock().unwrap();
+        assert_eq!(
+            stored[&hash].used_request_ids.len(),
+            MAX_CAPABILITY_REQUESTS
         );
     }
 
