@@ -126,6 +126,10 @@ fn reply_to_chat(reply: ClaudeWorkerReply, model: String) -> Result<ChatReply, L
             status: 429,
             body: "Claude subscription plan limit reached".into(),
         }),
+        ClaudeWorkerState::IncompatibleRuntime => Err(LlmError::Api {
+            status: 503,
+            body: "Claude subscription runtime is incompatible".into(),
+        }),
         ClaudeWorkerState::RuntimeFailure => Err(safe_failure()),
         ClaudeWorkerState::Completed => {
             let text = reply

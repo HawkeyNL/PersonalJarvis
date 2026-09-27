@@ -186,6 +186,9 @@ pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
                 require_tty()?;
                 validate_root_executable(provider.binary())?;
                 ensure_service_identity(provider)?;
+                if provider == AccountProvider::Claude && !claude_runtime_compatible() {
+                    bail!("Claude runtime version is incompatible with the reviewed worker flags");
+                }
                 let mut child = worker_command(provider, provider.connect_args(), true)?;
                 child
                     .stdin(Stdio::inherit())
@@ -368,6 +371,14 @@ fn ensure_service_identity(provider: AccountProvider) -> Result<()> {
 }
 
 fn status(provider: AccountProvider) -> AccountStatus {
+    if provider == AccountProvider::Claude {
+        let Ok(command) = worker_command(provider, &["--version"], false) else {
+            return AccountStatus::new(provider, "runtime_missing");
+        };
+        if !claude_version_command_compatible(command) {
+            return AccountStatus::new(provider, "incompatible_runtime");
+        }
+    }
     let Ok(mut command) = worker_command(provider, provider.status_args(), false) else {
         return AccountStatus::new(provider, "runtime_missing");
     };
@@ -381,6 +392,20 @@ fn status(provider: AccountProvider) -> AccountStatus {
     let mut result = AccountStatus::new(provider, state);
     result.runtime = runtime_state(provider);
     result
+}
+
+fn claude_runtime_compatible() -> bool {
+    worker_command(AccountProvider::Claude, &["--version"], false)
+        .is_ok_and(claude_version_command_compatible)
+}
+
+fn claude_version_command_compatible(mut command: Command) -> bool {
+    bounded_status_output(&mut command)
+        .ok()
+        .flatten()
+        .is_some_and(|output| {
+            jarvis_llm::claude_worker_protocol::reviewed_claude_version(output.as_bytes())
+        })
 }
 
 fn runtime_state(provider: AccountProvider) -> &'static str {
@@ -692,5 +717,7 @@ mod tests {
         let encoded = serde_json::to_string(&result).unwrap();
         assert!(!encoded.contains("canary-secret"));
         assert!(!encoded.contains("email"));
+        let incompatible = AccountStatus::new(AccountProvider::Claude, "incompatible_runtime");
+        assert_eq!(incompatible.billing, "unverified");
     }
 }

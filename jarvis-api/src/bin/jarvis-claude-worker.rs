@@ -14,8 +14,8 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use jarvis_llm::claude_worker_protocol::{
-    claude_subscription_status, ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState,
-    MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
+    claude_subscription_status, reviewed_claude_version, ClaudeWorkerReply, ClaudeWorkerRequest,
+    ClaudeWorkerState, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
 };
 use serde::Deserialize;
 use tokio::{
@@ -116,12 +116,46 @@ async fn handle(stream: &mut UnixStream) -> Result<ClaudeWorkerReply> {
     if !request.valid() {
         bail!("invalid Claude worker request shape");
     }
+    if !supported_runtime().await {
+        return Ok(ClaudeWorkerReply::failure(
+            ClaudeWorkerState::IncompatibleRuntime,
+        ));
+    }
     if !subscription_auth().await {
         return Ok(ClaudeWorkerReply::failure(
             ClaudeWorkerState::SubscriptionUnavailable,
         ));
     }
     run_official_client(request).await
+}
+
+/// The reviewed non-interactive invocation requires `--restricted`, introduced
+/// in Claude Code 2.1.248. Do not probe by launching a paid prompt; `--help`
+/// is also incomplete according to the official CLI reference. An unreviewed
+/// minor/major line must be explicitly checked before this worker uses it.
+async fn supported_runtime() -> bool {
+    let mut command = clean_command();
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        stdout.take(1025).read_to_end(&mut bytes).await?;
+        child.wait().await
+    })
+    .await;
+    matches!(result, Ok(Ok(status)) if status.success())
+        && bytes.len() <= 1024
+        && reviewed_claude_version(&bytes)
 }
 
 async fn send(stream: &mut UnixStream, reply: ClaudeWorkerReply) -> Result<()> {

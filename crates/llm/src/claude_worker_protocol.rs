@@ -7,6 +7,20 @@ pub const SOCKET: &str = "/run/jarvis-claude.sock";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_REPLY_BYTES: usize = 256 * 1024;
 
+/// The reviewed CLI contract is Claude Code 2.1.248+ within its 2.1 line.
+/// `--restricted` first appeared in 2.1.248. A later minor/major line needs
+/// explicit review before the subscription worker can run it.
+pub fn reviewed_claude_version(output: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(output) else {
+        return false;
+    };
+    let versions = text
+        .split(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .filter_map(|candidate| semver::Version::parse(candidate).ok())
+        .collect::<Vec<_>>();
+    matches!(versions.as_slice(), [version] if version.major == 2 && version.minor == 1 && version.patch >= 248)
+}
+
 /// Conservative projection of official CLI JSON. Unknown billing metadata
 /// never authorizes a subscription run.
 pub fn claude_subscription_status(bytes: &[u8]) -> &'static str {
@@ -63,6 +77,7 @@ pub enum ClaudeWorkerState {
     Completed,
     SubscriptionUnavailable,
     PlanLimit,
+    IncompatibleRuntime,
     RuntimeFailure,
 }
 
@@ -113,5 +128,15 @@ mod tests {
             ..request
         }
         .valid());
+    }
+
+    #[test]
+    fn runtime_version_review_gate_is_fail_closed() {
+        assert!(reviewed_claude_version(b"2.1.248 (Claude Code)"));
+        assert!(reviewed_claude_version(b"Claude Code v2.1.300\n"));
+        assert!(!reviewed_claude_version(b"2.1.247 (Claude Code)"));
+        assert!(!reviewed_claude_version(b"2.2.0 (Claude Code)"));
+        assert!(!reviewed_claude_version(b"2.1.248 9.9.9"));
+        assert!(!reviewed_claude_version(b"unrecognized"));
     }
 }

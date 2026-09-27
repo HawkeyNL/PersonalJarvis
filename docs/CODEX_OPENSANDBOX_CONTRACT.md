@@ -25,6 +25,14 @@ the server-owned `Codex` OpenSandbox profile and fixed runtime command. It
 uploads a snapshot and request data, never mounts a live checkout, `/etc`, a
 home directory, Docker socket, Jarvis secrets or provider environment.
 
+The sandbox also receives a finite `task-context.json` projection of the
+signed objective, logical repository and exact SHA, resource ceilings and
+latest factual checkpoint. A trusted compiler may add selected provenanced
+facts and recent deltas; it never forwards whole conversation history by
+default. The envelope is capped at 32 KiB. Old raw deltas are dropped before
+explicit owner constraints or the latest checkpoint; if those cannot fit,
+execution fails closed.
+
 The profile retains the existing OpenSandbox default-deny egress policy. Its
 allowlist is limited to package/source registries; loopback, RFC1918, link-local
 and Docker/host ranges remain denied, including through DNS rebinding.
@@ -33,8 +41,8 @@ and Docker/host ranges remain denied, including through DNS rebinding.
 
 Provisioning, reconnecting, disconnecting or switching the long-lived Codex/ChatGPT account is an explicit owner-admin operation. Jarvis Core, agents, MCP tools and sandbox workloads may consume only the already-authorized runtime capability; they have no account-lifecycle authority. A subscription-auth failure must not silently activate separately billed API credentials.
 
-The Codex broker retains the long-lived provider credential in its own
-root-managed service environment; it is never represented in the sandbox
+The official Codex runtime retains the long-lived provider credential under
+the dedicated `jarvis-codex` identity; it is never represented in the sandbox
 provider API, image, environment, artifacts or logs. Following a signed start
 or resume, the broker may mint a cryptographically random, opaque capability
 token. It stores only the SHA-256 token verifier with these claims:
@@ -62,6 +70,17 @@ broker socket or real runs until that reverse/task-proxy mechanism is proven
 end-to-end. A missing broker-auth path fails before sandbox creation; it never
 falls back to a host `codex` process. This is an activation gate, not a
 convenience TODO.
+
+The checked-in OpenSandbox deployment provides authenticated, loopback-only
+manager-to-sandbox lifecycle/exec/file operations, but no reviewed
+sandbox-to-broker task channel. `CODEX_SANDBOX_COMMAND` names
+`/usr/local/bin/jarvis-codex-runtime`, which is not built into a reviewed Codex
+workload image by this repository. The official Codex App Server's documented
+production transport is stdio JSONL; Unix-socket WebSocket and remote code-mode
+host options remain experimental. Neither an experimental App Server transport
+nor a host Codex process with repository tools is a substitute for the missing
+task-scoped proxy. This PR must remain draft until a concrete channel,
+workload image and adversarial lifecycle tests are implemented and reviewed.
 
 When that gate is met, each completed, failed, timed-out or cancelled run still
 terminates its disposable sandbox. Resume starts a new sandbox from the current

@@ -23,6 +23,15 @@ before the first production connection. The current development host has no
 installed Claude CLI, so a real subscription-backed run has not been accepted
 here.
 
+The reviewed Claude worker invocation requires Claude Code 2.1.248 or newer
+within the 2.1 line because `--restricted` was introduced there. Core Admin
+checks bounded `--version` output before account linking or declaring the
+account connected. The worker repeats that check before a run and returns
+`incompatible_runtime` without a model call for an older, unparseable or
+unreviewed version. This is a version/flag contract gate, not live billing
+proof; a future CLI line needs review. The official CLI reference warns that
+`--help` does not list every flag, so it is not used for this gate.
+
 The accounts CLI starts each official login/status/logout command in a bounded
 transient systemd service under the appropriate dedicated system user. The
 transient service uses `/usr/bin/env -i` before invoking the provider CLI, so
@@ -80,6 +89,9 @@ sudo jarvis accounts disconnect codex
 `runtime_missing` means the reviewed official binary or dedicated identity is
 missing or its protected state layout failed validation. `wrong_auth_mode` means subscription/ChatGPT authentication
 could not be proven; an API-key/PAYG login is not treated as subscription.
+`incompatible_runtime` means the installed Claude CLI is outside the reviewed
+version/flag contract. Recheck it after an owner-reviewed CLI update before
+enabling the worker socket.
 `logged_out` needs an explicit owner-initiated Connect or Reconnect. A plan
 limit is reported as a bounded runtime failure and never authorizes paid
 credits. Jarvis never reconnects accounts itself.
