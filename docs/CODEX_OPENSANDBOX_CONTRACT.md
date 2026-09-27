@@ -31,6 +31,8 @@ and Docker/host ranges remain denied, including through DNS rebinding.
 
 ## Broker-mediated authentication
 
+Provisioning, reconnecting, disconnecting or switching the long-lived Codex/ChatGPT account is an explicit owner-admin operation. Jarvis Core, agents, MCP tools and sandbox workloads may consume only the already-authorized runtime capability; they have no account-lifecycle authority. A subscription-auth failure must not silently activate separately billed API credentials.
+
 The Codex broker retains the long-lived provider credential in its own
 root-managed service environment; it is never represented in the sandbox
 provider API, image, environment, artifacts or logs. Following a signed start
