@@ -17,6 +17,8 @@ use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod snapshot;
+
 pub const MAX_TASK_SUMMARY_CHARS: usize = 8_000;
 pub const MAX_CHECKPOINT_CHARS: usize = 16_000;
 pub const MAX_CODING_TIMEOUT_SECS: u64 = 15 * 60;
@@ -815,6 +817,8 @@ impl SignedCodingRequest {
 
 fn is_safe_identifier(value: &str, max: usize) -> bool {
     !value.is_empty()
+        && value != "."
+        && value != ".."
         && value.len() <= max
         && value
             .bytes()
@@ -1423,6 +1427,18 @@ mod tests {
             request.message(),
             Err(CodingProtocolError::InvalidOperation)
         );
+
+        for id in [".", ".."] {
+            let mut request = signed_start();
+            let CodingOperation::StartCodingRun { repository, .. } = &mut request.operation else {
+                unreachable!()
+            };
+            repository.id = id.into();
+            assert_eq!(
+                request.message(),
+                Err(CodingProtocolError::InvalidOperation)
+            );
+        }
 
         let mut request = signed_start();
         request.expires_at = request.issued_at - Duration::seconds(1);

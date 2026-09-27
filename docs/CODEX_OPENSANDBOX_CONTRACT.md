@@ -43,6 +43,27 @@ The profile retains the existing OpenSandbox default-deny egress policy. Its
 allowlist is limited to package/source registries; loopback, RFC1918, link-local
 and Docker/host ranges remain denied, including through DNS rebinding.
 
+## Reviewed repository snapshot foundation
+
+`jarvis-codex::snapshot` implements a fail-closed, read-only registry for a
+future trusted broker integration. Production registry bytes come only from
+root-owned `/etc/jarvis/codex-repositories.json` (version 1), with at most 32
+entries. Each entry contains a validated logical `RepositoryIdentity` and one
+reviewed `refs/heads/...` ref; it cannot name a path or Git URL. A matching
+root-owned bare mirror must exist as
+`/var/lib/jarvis-codex-repositories/<id>.git`. An exact commit must be reachable
+from that ref. The snapshot is a bounded Git archive from that exact commit,
+not a live checkout or bind mount. Symlinks, submodules, traversal, common
+credential filenames, and oversized trees fail closed. The archive hash is
+available for run provenance. The fixed local Git subprocess has a 30-second
+deadline and receives a clean environment.
+
+This module is not yet wired into the production broker. No repository
+registry, mirror, or Codex workload is installed or activated merely by adding
+the module. Broader content/credential inspection and full archive validation
+remain mandatory before broker activation; a filename denylist alone is not
+proof that a repository contains no secrets.
+
 ## Broker-mediated authentication
 
 Provisioning, reconnecting, disconnecting or switching the long-lived Codex/ChatGPT account is an explicit owner-admin operation. Jarvis Core, agents, MCP tools and sandbox workloads may consume only the already-authorized runtime capability; they have no account-lifecycle authority. A subscription-auth failure must not silently activate separately billed API credentials.
