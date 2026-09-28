@@ -76,6 +76,29 @@ struct RunJob {
     _slot: OwnedSemaphorePermit,
 }
 
+/// A broker task can unwind or be aborted without reaching its normal
+/// epilogue. In that case it must stop hiding its sandbox from reconciliation
+/// and close admission until the manager metadata scan proves cleanup.
+struct ActiveRunGuard {
+    active: Arc<Mutex<HashMap<uuid::Uuid, watch::Sender<bool>>>>,
+    cleanup_healthy: Arc<AtomicBool>,
+    cleanup_epoch: Arc<AtomicU64>,
+    run_id: uuid::Uuid,
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        let uncertain = match self.active.lock() {
+            Ok(mut runs) => runs.remove(&self.run_id).is_some(),
+            Err(_) => true,
+        };
+        if uncertain {
+            self.cleanup_epoch.fetch_add(1, Ordering::SeqCst);
+            self.cleanup_healthy.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 struct DurableSandboxOwnership<'a> {
     db: &'a jarvis_store::Database,
     run_id: uuid::Uuid,
@@ -626,6 +649,12 @@ async fn run_worker(state: Arc<BrokerState>, job: RunJob) {
         receiver,
         _slot,
     } = job;
+    let _active_guard = ActiveRunGuard {
+        active: state.active.clone(),
+        cleanup_healthy: state.cleanup_healthy.clone(),
+        cleanup_epoch: state.cleanup_epoch.clone(),
+        run_id,
+    };
     let started = state.db.query("UPDATE coding_runs SET status='preparing',updated_at=time::now() WHERE record::id(id)=$run AND status='queued' RETURN record::id(id) AS id")
         .bind(json!({"run":run_id.to_string()})).await;
     let started = started
@@ -1169,6 +1198,37 @@ mod tests {
     use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
 
     type ManagerItems = Arc<Mutex<Vec<serde_json::Value>>>;
+
+    #[test]
+    fn lost_worker_cannot_hide_an_owned_sandbox_from_reconciliation() {
+        let run_id = uuid::Uuid::now_v7();
+        let (sender, _) = watch::channel(false);
+        let active = Arc::new(Mutex::new(HashMap::from([(run_id, sender)])));
+        let healthy = Arc::new(AtomicBool::new(true));
+        let epoch = Arc::new(AtomicU64::new(0));
+        let guard = ActiveRunGuard {
+            active: active.clone(),
+            cleanup_healthy: healthy.clone(),
+            cleanup_epoch: epoch.clone(),
+            run_id,
+        };
+        drop(guard);
+        assert!(!active.lock().unwrap().contains_key(&run_id));
+        assert!(!healthy.load(Ordering::SeqCst));
+        assert_eq!(epoch.load(Ordering::SeqCst), 1);
+
+        // A normal worker already removed itself after confirmed teardown.
+        healthy.store(true, Ordering::SeqCst);
+        let guard = ActiveRunGuard {
+            active,
+            cleanup_healthy: healthy.clone(),
+            cleanup_epoch: epoch.clone(),
+            run_id,
+        };
+        drop(guard);
+        assert!(healthy.load(Ordering::SeqCst));
+        assert_eq!(epoch.load(Ordering::SeqCst), 1);
+    }
 
     async fn listed(
         State(items): State<ManagerItems>,

@@ -124,6 +124,9 @@ unrelated OpenSandbox workloads are never deleted. One disposable
 manager/SurrealDB fixture now covers a stale recorded sandbox and an
 unrecorded owned orphan; the full crash-injection matrix remains required
 before production activation.
+An unexpectedly dropped broker run also removes its in-memory active marker
+and closes new-run admission, so the next bounded reconciliation scan cannot
+mistake its workload for a healthy running task.
 The signed runtime deadline includes sandbox creation; a timed-out or lost
 create response is treated as uncertain ownership rather than as proof that
 no workload exists. The metadata scan must resolve it before the reservation
