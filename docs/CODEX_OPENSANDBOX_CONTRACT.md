@@ -120,8 +120,9 @@ sandbox ID is recorded on the durable run before source upload or execution.
 At broker start and periodically, the broker lists only manager workloads
 with Jarvis Codex metadata and terminates stale owned workloads before
 releasing their reservations. Incomplete cleanup stops admission of new runs;
-unrelated OpenSandbox workloads are never deleted. This recovery path still
-requires disposable-manager/SurrealDB integration and crash-injection proof
+unrelated OpenSandbox workloads are never deleted. One disposable
+manager/SurrealDB fixture now covers a stale recorded sandbox and an
+unrecorded owned orphan; the full crash-injection matrix remains required
 before production activation.
 The signed runtime deadline includes sandbox creation; a timed-out or lost
 create response is treated as uncertain ownership rather than as proof that
@@ -129,6 +130,13 @@ no workload exists. The metadata scan must resolve it before the reservation
 can be released. The current one-shot relay reserves one non-monetary provider
 operation, not a fictitious cent; multi-turn model/tool interaction is not yet
 enabled.
+
+The current one-shot relay also has no source-edit tool or final-tree diff
+generator. It therefore rejects even a syntactically valid provider-supplied
+nonempty patch: a model's patch text alone is not evidence that those edits
+exist in the disposable workspace. Read-only/no-op results can be validated;
+editable coding results require a reviewed sandbox tool loop and canonical
+patch generation from the actual final tree.
 
 The remaining provider activation gate is precise: the current official
 [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server)
@@ -141,6 +149,10 @@ The production adapter therefore reports unavailable and `start_run` refuses
 before creating a run or sandbox. This gate must not be replaced with a host
 Codex CLI, `OPENAI_API_KEY`, an undocumented OAuth endpoint, or a credential
 mount. Real Home Node/Kata and owner-account acceptance are also still pending.
+For a personal ChatGPT login, official `codex login` plus `codex exec` is a
+supported local user workflow, but it does not solve this credential-separated
+OpenSandbox worker boundary. Managed-workspace WIF/access tokens must not be
+assumed available to a personal account.
 
 When that gate is met, each completed, failed, timed-out or cancelled run still
 terminates its disposable sandbox. Resume starts a new sandbox from the current

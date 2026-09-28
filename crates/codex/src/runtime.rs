@@ -94,7 +94,9 @@ pub struct SandboxResultDocument {
 }
 
 /// Final outputs are untrusted even when returned by a disposable workload.
-/// A successful run may return a patch, but this function never applies it.
+/// The current one-shot relay has no source-edit tool and cannot prove that a
+/// provider-supplied patch matches the final sandbox tree. Until that proof
+/// exists, a nonempty patch is rejected even if its syntax is otherwise safe.
 pub fn validate_final_artifacts(
     artifacts: &[CollectedArtifact],
     expected: &SandboxRunInput,
@@ -132,7 +134,7 @@ pub fn validate_final_artifacts(
         || result.base_commit_sha != expected.base_commit_sha
         || result.summary.len() > MAX_SUMMARY_BYTES
         || result.patch_present != !patch_bytes.contents.is_empty()
-        || (result.outcome != TaskOutcome::Completed && result.patch_present)
+        || result.patch_present
     {
         return Err(RuntimeError::InvalidResponse);
     }
@@ -331,7 +333,7 @@ pub fn run_in_workspace(root: &Path) -> Result<(), RuntimeError> {
     if response.binding != request.brokered_request()
         || response.summary.len() > MAX_SUMMARY_BYTES
         || response.patch_diff.len() > MAX_PATCH_BYTES
-        || (response.outcome != TaskOutcome::Completed && !response.patch_diff.is_empty())
+        || !response.patch_diff.is_empty()
     {
         return Err(RuntimeError::InvalidResponse);
     }
@@ -612,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn final_artifacts_reject_wrong_binding_and_protected_patch() {
+    fn final_artifacts_reject_wrong_binding_and_unproven_provider_patch() {
         let repository = RepositoryIdentity {
             id: "fixture".into(),
             owner: "Example".into(),
@@ -638,7 +640,7 @@ mod tests {
             base_commit_sha: expected.base_commit_sha.clone(),
             outcome: TaskOutcome::Completed,
             summary: "fixture".into(),
-            patch_present: true,
+            patch_present: false,
         };
         let patch = "diff --git a/src/main.rs b/src/main.rs\nindex 1111111..2222222 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n";
         let artifacts = vec![
@@ -648,10 +650,21 @@ mod tests {
             },
             CollectedArtifact {
                 path: "patch.diff".into(),
-                contents: patch.as_bytes().to_vec(),
+                contents: Vec::new(),
             },
         ];
         assert!(validate_final_artifacts(&artifacts, &expected).is_ok());
+        let mut invented = artifacts.clone();
+        invented[0].contents = serde_json::to_vec(&SandboxResultDocument {
+            patch_present: true,
+            ..result
+        })
+        .unwrap();
+        invented[1].contents = patch.as_bytes().to_vec();
+        assert!(matches!(
+            validate_final_artifacts(&invented, &expected),
+            Err(RuntimeError::InvalidResponse)
+        ));
         let mut too_small = expected.clone();
         too_small.max_output_bytes = 1;
         assert!(matches!(
@@ -661,15 +674,10 @@ mod tests {
         let mut altered = expected.clone();
         altered.run_id = Uuid::now_v7();
         assert!(validate_final_artifacts(&artifacts, &altered).is_err());
-        let protected = patch.replace("src/main.rs", "Jarvis.md");
-        let mut artifacts = artifacts;
-        artifacts[1].contents = protected.into_bytes();
-        assert!(validate_final_artifacts(&artifacts, &expected).is_err());
-        artifacts[1].contents = patch.replace("src/main.rs", "../escape").into_bytes();
-        assert!(validate_final_artifacts(&artifacts, &expected).is_err());
-        artifacts[1].contents = patch.replace("@@ -1 +1 @@", "@@ -2,2 +1 @@").into_bytes();
-        assert!(validate_final_artifacts(&artifacts, &expected).is_err());
-        artifacts[1].contents = patch.replace("+new\n", "+new\n+extra\n").into_bytes();
-        assert!(validate_final_artifacts(&artifacts, &expected).is_err());
+        assert_eq!(validate_patch(patch), Ok(()));
+        assert!(validate_patch(&patch.replace("src/main.rs", "Jarvis.md")).is_err());
+        assert!(validate_patch(&patch.replace("src/main.rs", "../escape")).is_err());
+        assert!(validate_patch(&patch.replace("@@ -1 +1 @@", "@@ -2,2 +1 @@")).is_err());
+        assert!(validate_patch(&patch.replace("+new\n", "+new\n+extra\n")).is_err());
     }
 }
