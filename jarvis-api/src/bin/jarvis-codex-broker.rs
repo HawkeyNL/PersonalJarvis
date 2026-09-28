@@ -1199,6 +1199,12 @@ mod tests {
 
     type ManagerItems = Arc<Mutex<Vec<serde_json::Value>>>;
 
+    #[derive(Clone)]
+    struct ManagerFixture {
+        items: ManagerItems,
+        reject_delete: Arc<AtomicBool>,
+    }
+
     #[test]
     fn lost_worker_cannot_hide_an_owned_sandbox_from_reconciliation() {
         let run_id = uuid::Uuid::now_v7();
@@ -1231,7 +1237,7 @@ mod tests {
     }
 
     async fn listed(
-        State(items): State<ManagerItems>,
+        State(fixture): State<ManagerFixture>,
         headers: HeaderMap,
     ) -> Result<Json<serde_json::Value>, StatusCode> {
         if headers
@@ -1242,12 +1248,12 @@ mod tests {
             return Err(StatusCode::UNAUTHORIZED);
         }
         Ok(Json(
-            json!({"items":*items.lock().unwrap(),"pagination":{"hasNextPage":false}}),
+            json!({"items":*fixture.items.lock().unwrap(),"pagination":{"hasNextPage":false}}),
         ))
     }
 
     async fn deleted(
-        State(items): State<ManagerItems>,
+        State(fixture): State<ManagerFixture>,
         RoutePath(id): RoutePath<String>,
         headers: HeaderMap,
     ) -> StatusCode {
@@ -1258,7 +1264,10 @@ mod tests {
         {
             return StatusCode::UNAUTHORIZED;
         }
-        let mut items = items.lock().unwrap();
+        if fixture.reject_delete.load(Ordering::SeqCst) {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+        let mut items = fixture.items.lock().unwrap();
         let before = items.len();
         items.retain(|item| item.get("id").and_then(serde_json::Value::as_str) != Some(&id));
         if before == items.len() {
@@ -1301,10 +1310,14 @@ mod tests {
             json!({"id":"unrecorded-owned","metadata":{"jarvis.profile":"codex","jarvis.run_id":orphan.to_string(),"jarvis.session_id":session.to_string()}}),
             json!({"id":"unrelated","metadata":{"jarvis.profile":"research"}}),
         ]));
+        let reject_delete = Arc::new(AtomicBool::new(true));
         let app = Router::new()
             .route("/v1/sandboxes", get(listed))
             .route("/v1/sandboxes/{id}", delete(deleted))
-            .with_state(items.clone());
+            .with_state(ManagerFixture {
+                items: items.clone(),
+                reject_delete: reject_delete.clone(),
+            });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let server = tokio::spawn(async move {
@@ -1327,6 +1340,28 @@ mod tests {
             cleanup_epoch: Arc::new(AtomicU64::new(0)),
             reconcile_lock: Arc::new(AsyncMutex::new(())),
         };
+        // A failed manager deletion must not release the subscription lease
+        // or mark the stale run complete. Admission stays closed until a
+        // later scan proves every Jarvis-owned workload was removed.
+        assert!(reconcile_owned_sandboxes(&state).await.is_err());
+        assert!(!state.cleanup_healthy.load(Ordering::SeqCst));
+        assert_eq!(items.lock().unwrap().len(), 3);
+        let mut blocked = db
+            .query("SELECT status FROM coding_reservations WHERE record::id(id)=$id LIMIT 1")
+            .bind(json!({"id":reservation.to_string()}))
+            .await?
+            .check()?;
+        let blocked: Vec<serde_json::Value> = blocked.take(0)?;
+        assert_eq!(blocked[0]["status"], "leased");
+        let mut stale = db
+            .query("SELECT status,sandbox_state FROM coding_runs WHERE record::id(id)=$run LIMIT 1")
+            .bind(json!({"run":run.to_string()}))
+            .await?
+            .check()?;
+        let stale: Vec<serde_json::Value> = stale.take(0)?;
+        assert_eq!(stale[0]["status"], "running");
+        assert_eq!(stale[0]["sandbox_state"], "active");
+        reject_delete.store(false, Ordering::SeqCst);
         reconcile_owned_sandboxes(&state).await?;
         reconcile_owned_sandboxes(&state).await?; // idempotent restart
         let remaining = items.lock().unwrap().clone();
