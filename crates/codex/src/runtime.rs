@@ -4,9 +4,10 @@
 //! is representable here.
 
 use std::{
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
     thread,
     time::{Duration, Instant},
@@ -27,6 +28,7 @@ const MAX_CAPABILITY_BYTES: usize = 256;
 const MAX_RESPONSE_BYTES: usize = 640 * 1024;
 const MAX_SUMMARY_BYTES: usize = 8 * 1024;
 const MAX_PATCH_BYTES: usize = 512 * 1024;
+const MAX_SOURCE_ENTRIES: usize = 40_000;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -337,6 +339,10 @@ pub fn run_in_workspace(root: &Path) -> Result<(), RuntimeError> {
     {
         return Err(RuntimeError::InvalidResponse);
     }
+    // A no-patch result is only truthful if the actual disposable source tree
+    // still matches the reviewed exact-SHA archive. Future edit support must
+    // generate its canonical patch from this tree, not provider prose.
+    verify_unmodified_source(&archive, &root.join("source"))?;
     let result = SandboxResultDocument {
         request_id: request.request_id,
         run_id: request.run_id,
@@ -364,6 +370,103 @@ pub fn run_in_workspace(root: &Path) -> Result<(), RuntimeError> {
     .map_err(|_| RuntimeError::OutputFailure)?;
     // The short-lived capability is not retained among final artifacts.
     let _ = fs::remove_file(channel.join("task-request.json"));
+    Ok(())
+}
+
+fn verify_unmodified_source(archive_bytes: &[u8], source: &Path) -> Result<(), RuntimeError> {
+    let mut expected_files = HashMap::new();
+    let mut expected_dirs = HashSet::new();
+    let mut archive = tar::Archive::new(io::Cursor::new(archive_bytes));
+    for entry in archive
+        .entries()
+        .map_err(|_| RuntimeError::InvalidArchive)?
+    {
+        let mut entry = entry.map_err(|_| RuntimeError::InvalidArchive)?;
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() {
+            continue;
+        }
+        let path_bytes = entry.path_bytes();
+        let raw = std::str::from_utf8(&path_bytes).map_err(|_| RuntimeError::InvalidArchive)?;
+        let path = if kind.is_dir() {
+            raw.trim_end_matches('/')
+        } else {
+            raw
+        }
+        .to_owned();
+        if !safe_snapshot_path(&path) {
+            return Err(RuntimeError::InvalidArchive);
+        }
+        let mut parent = path.as_str();
+        while let Some((prefix, _)) = parent.rsplit_once('/') {
+            expected_dirs.insert(prefix.to_owned());
+            parent = prefix;
+        }
+        if kind.is_dir() {
+            expected_dirs.insert(path.clone());
+        } else if kind.is_file() {
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .map_err(|_| RuntimeError::InvalidArchive)?;
+            if expected_files
+                .insert(path, Sha256::digest(&bytes).to_vec())
+                .is_some()
+            {
+                return Err(RuntimeError::InvalidArchive);
+            }
+        } else {
+            return Err(RuntimeError::InvalidArchive);
+        }
+        if expected_files.len().saturating_add(expected_dirs.len()) > MAX_SOURCE_ENTRIES {
+            return Err(RuntimeError::InvalidArchive);
+        }
+    }
+    let mut actual_files = HashSet::new();
+    let mut actual_dirs = HashSet::new();
+    let mut pending = vec![source.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|_| RuntimeError::InvalidResponse)? {
+            let entry = entry.map_err(|_| RuntimeError::InvalidResponse)?;
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(source)
+                .ok()
+                .and_then(|value| value.to_str())
+                .ok_or(RuntimeError::InvalidResponse)?;
+            if !safe_snapshot_path(relative) {
+                return Err(RuntimeError::InvalidResponse);
+            }
+            let meta = fs::symlink_metadata(&path).map_err(|_| RuntimeError::InvalidResponse)?;
+            if meta.file_type().is_dir() {
+                if !expected_dirs.contains(relative) || !actual_dirs.insert(relative.to_owned()) {
+                    return Err(RuntimeError::InvalidResponse);
+                }
+                pending.push(path);
+            } else if meta.file_type().is_file() {
+                let expected = expected_files
+                    .get(relative)
+                    .ok_or(RuntimeError::InvalidResponse)?;
+                if meta.uid() != unsafe { libc::geteuid() }
+                    || meta.nlink() != 1
+                    || meta.permissions().mode() & 0o777 != 0o600
+                    || !actual_files.insert(relative.to_owned())
+                    || Sha256::digest(read_regular(&path, MAX_REPOSITORY_ARCHIVE_BYTES)?).as_slice()
+                        != expected.as_slice()
+                {
+                    return Err(RuntimeError::InvalidResponse);
+                }
+            } else {
+                return Err(RuntimeError::InvalidResponse);
+            }
+            if actual_files.len().saturating_add(actual_dirs.len()) > MAX_SOURCE_ENTRIES {
+                return Err(RuntimeError::InvalidResponse);
+            }
+        }
+    }
+    if actual_files.len() != expected_files.len() || actual_dirs.len() != expected_dirs.len() {
+        return Err(RuntimeError::InvalidResponse);
+    }
     Ok(())
 }
 
@@ -600,6 +703,40 @@ mod tests {
         assert_eq!(
             validate_archive(&valid, &"b".repeat(40)),
             Err(crate::snapshot::SnapshotError::UnsafeTree)
+        );
+    }
+
+    #[test]
+    fn no_patch_result_requires_exact_unmodified_sandbox_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let sha = "a".repeat(40);
+        let archive = fixture_archive(&sha, "src/lib.rs", tar::EntryType::Regular);
+        unpack_reviewed_archive(&archive, &sha, &source).unwrap();
+        assert_eq!(verify_unmodified_source(&archive, &source), Ok(()));
+
+        fs::write(source.join("src/lib.rs"), b"unreported edit\n").unwrap();
+        assert_eq!(
+            verify_unmodified_source(&archive, &source),
+            Err(RuntimeError::InvalidResponse)
+        );
+        fs::write(source.join("src/lib.rs"), b"safe fixture\n").unwrap();
+        fs::set_permissions(source.join("src/lib.rs"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            verify_unmodified_source(&archive, &source),
+            Err(RuntimeError::InvalidResponse)
+        );
+        fs::set_permissions(source.join("src/lib.rs"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(source.join("src/extra.rs"), b"unexpected\n").unwrap();
+        assert_eq!(
+            verify_unmodified_source(&archive, &source),
+            Err(RuntimeError::InvalidResponse)
+        );
+        fs::remove_file(source.join("src/extra.rs")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", source.join("src/link")).unwrap();
+        assert_eq!(
+            verify_unmodified_source(&archive, &source),
+            Err(RuntimeError::InvalidResponse)
         );
     }
 

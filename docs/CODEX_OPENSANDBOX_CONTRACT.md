@@ -137,7 +137,10 @@ enabled.
 The current one-shot relay also has no source-edit tool or final-tree diff
 generator. It therefore rejects even a syntactically valid provider-supplied
 nonempty patch: a model's patch text alone is not evidence that those edits
-exist in the disposable workspace. Read-only/no-op results can be validated;
+exist in the disposable workspace. A no-patch result now requires a bounded
+comparison of every unpacked file and directory against the exact-SHA archive;
+modified, added, missing, linked or permission-changed source files fail.
+Read-only/no-op results can be validated;
 editable coding results require a reviewed sandbox tool loop and canonical
 patch generation from the actual final tree.
 
