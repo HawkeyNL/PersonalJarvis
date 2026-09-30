@@ -124,6 +124,11 @@ unrelated OpenSandbox workloads are never deleted. One disposable
 manager/SurrealDB fixture now covers a stale recorded sandbox and an
 unrecorded owned orphan; the full crash-injection matrix remains required
 before production activation.
+For Codex workloads, a successful manager DELETE alone does not complete
+cleanup: the broker-side provider checks the authenticated owned-workload
+listing again and only reports termination after the run is absent. A
+temporarily stale listing keeps the run in cleanup-required state; retrying
+after a DELETE/404 is safe only when that listing confirms absence.
 An unexpectedly dropped broker run also removes its in-memory active marker
 and closes new-run admission, so the next bounded reconciliation scan cannot
 mistake its workload for a healthy running task.
@@ -144,13 +149,15 @@ Read-only/no-op results can be validated;
 editable coding results require a reviewed sandbox tool loop and canonical
 patch generation from the actual final tree.
 
-The remaining provider activation gate is precise: the current official
+The remaining provider activation gate is precise: the official
 [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server)
-labels the app-server command and WebSocket transport experimental and not
-supported for production workloads. The stable `codex exec` command runs
-model-generated shell commands; invoking it with the long-lived subscription
-credential in a host process is not a provider-only task proxy. Neither route
-is a reviewed, provider-only subscription adapter for this isolated channel.
+describes a supported structured client protocol, but the server can execute
+model-generated commands where its process runs. Starting that authenticated
+server on the Home Node would therefore grant model output host execution;
+placing it in OpenSandbox with a personal stored-login credential would expose
+the persistent credential to sandbox code. The stable `codex exec` command has
+the same placement problem. Neither route by itself is a reviewed,
+credential-isolated subscription adapter for this channel.
 The production adapter therefore reports unavailable and `start_run` refuses
 before creating a run or sandbox. This gate must not be replaced with a host
 Codex CLI, `OPENAI_API_KEY`, an undocumented OAuth endpoint, or a credential

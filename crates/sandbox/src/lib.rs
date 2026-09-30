@@ -893,9 +893,36 @@ impl SandboxProvider for OpenSandboxProvider {
     }
     async fn terminate(&self, handle: SandboxHandle) -> Result<(), SandboxError> {
         let endpoint = self.endpoint(&format!("v1/sandboxes/{}", handle.provider_id))?;
-        self.request_success(self.authenticated(self.client.delete(endpoint)))
+        let response = self
+            .authenticated(self.client.delete(endpoint))
+            .send()
             .await
-            .map(|_| ())
+            .map_err(|_| SandboxError::Unavailable)?;
+        if !response.status().is_success()
+            && !(self.codex_only && response.status() == reqwest::StatusCode::NOT_FOUND)
+        {
+            return Err(SandboxError::ProviderRequestFailed);
+        }
+        if self.codex_only {
+            // An accepted DELETE is not proof that the manager has stopped
+            // the workload. The broker may release its durable reservation
+            // only after the owned-workload listing confirms disappearance.
+            // A failed/incomplete listing keeps admission closed for recovery.
+            for attempt in 0..3 {
+                let owned = self.list_owned_codex().await?;
+                if !owned.iter().any(|item| {
+                    item.handle.provider_id == handle.provider_id
+                        || item.handle.task_id == handle.task_id
+                }) {
+                    return Ok(());
+                }
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+            }
+            return Err(SandboxError::ProviderRequestFailed);
+        }
+        Ok(())
     }
 }
 
@@ -1465,6 +1492,103 @@ mod tests {
         assert_eq!(owned[0].handle.provider_id, "owned-codex-1");
         assert_eq!(owned[0].handle.task_id, run);
         assert_eq!(owned[0].coding_session_id, session);
+    }
+
+    #[tokio::test]
+    async fn codex_delete_requires_confirmed_manager_disappearance() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let run = Uuid::now_v7();
+        let session = Uuid::now_v7();
+        let server = tokio::spawn(async move {
+            for request_index in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).await.unwrap();
+                let request = std::str::from_utf8(&request[..count]).unwrap();
+                if request_index == 0 {
+                    assert!(request.starts_with("DELETE /v1/sandboxes/owned-codex-1 "));
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(request.starts_with("GET /v1/sandboxes?"));
+                    let body = json!({
+                        "items": [{"id":"owned-codex-1","metadata":{
+                            "jarvis.profile":"codex",
+                            "jarvis.run_id":run.to_string(),
+                            "jarvis.session_id":session.to_string()
+                        }}],
+                        "pagination":{"hasNextPage":false}
+                    })
+                    .to_string();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(reply.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let provider = OpenSandboxProvider::for_codex_broker(
+            format!("http://127.0.0.1:{port}/"),
+            "fixture-manager-key".into(),
+            format!("registry.example/codex@sha256:{}", "a".repeat(64)),
+        )
+        .unwrap();
+        let handle = SandboxHandle {
+            provider_id: "owned-codex-1".into(),
+            task_id: run,
+            profile: SandboxProfile::Codex,
+        };
+        assert_eq!(
+            provider.terminate(handle).await,
+            Err(SandboxError::ProviderRequestFailed)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_delete_is_retry_safe_when_manager_already_removed_workload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).await.unwrap();
+                let request = std::str::from_utf8(&request[..count]).unwrap();
+                let reply = if index == 0 {
+                    assert!(request.starts_with("DELETE /v1/sandboxes/owned-codex-1 "));
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned()
+                } else {
+                    assert!(request.starts_with("GET /v1/sandboxes?"));
+                    let body = json!({"items":[],"pagination":{"hasNextPage":false}}).to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let provider = OpenSandboxProvider::for_codex_broker(
+            format!("http://127.0.0.1:{port}/"),
+            "fixture-manager-key".into(),
+            format!("registry.example/codex@sha256:{}", "a".repeat(64)),
+        )
+        .unwrap();
+        let handle = SandboxHandle {
+            provider_id: "owned-codex-1".into(),
+            task_id: Uuid::now_v7(),
+            profile: SandboxProfile::Codex,
+        };
+        assert!(provider.terminate(handle).await.is_ok());
+        server.await.unwrap();
     }
 
     #[test]
