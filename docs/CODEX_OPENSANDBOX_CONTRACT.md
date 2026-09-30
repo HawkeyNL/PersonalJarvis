@@ -151,13 +151,14 @@ patch generation from the actual final tree.
 
 The remaining provider activation gate is precise: the official
 [Codex App Server documentation](https://learn.chatgpt.com/docs/app-server)
-describes a supported structured client protocol, but the server can execute
-model-generated commands where its process runs. Starting that authenticated
-server on the Home Node would therefore grant model output host execution;
-placing it in OpenSandbox with a personal stored-login credential would expose
-the persistent credential to sandbox code. The stable `codex exec` command has
-the same placement problem. Neither route by itself is a reviewed,
-credential-isolated subscription adapter for this channel.
+describes a structured client protocol but still labels the app-server command
+and WebSocket transport experimental and unsupported for production workloads.
+The server can also execute model-generated commands where its process runs.
+Starting that authenticated server on the Home Node would grant model output
+host execution; placing it in OpenSandbox with a personal stored-login
+credential would expose the persistent credential to sandbox code. The stable
+`codex exec` command has the same placement problem. Neither route by itself
+is a reviewed, credential-isolated subscription adapter for this channel.
 The production adapter therefore reports unavailable and `start_run` refuses
 before creating a run or sandbox. This gate must not be replaced with a host
 Codex CLI, `OPENAI_API_KEY`, an undocumented OAuth endpoint, or a credential
