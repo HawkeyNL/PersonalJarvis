@@ -6,16 +6,13 @@ use crate::claude_worker_protocol::ClaudeWorkerState;
 
 pub const SOCKET: &str = "/run/jarvis-codex-chat.sock";
 
-/// The exact `codex --version` the owner reviewed against the documented
-/// `codex exec` flags this worker uses.
-///
-/// PLACEHOLDER, deliberately empty: no Codex CLI version has been verified
-/// for this worker yet, so every run returns `incompatible_runtime` without a
-/// model call. The owner sets the exact version (for example `0.0.0`, digits
-/// only) in a reviewed change after checking that installed version's
-/// `codex exec --help` and the official non-interactive documentation. A
-/// newer CLI needs a new review; there is no "or newer".
-pub const REVIEWED_CODEX_VERSION: &str = "";
+/// Environment variable holding the exact `codex --version` number the owner
+/// reviewed against the documented `codex exec` flags this worker uses. The
+/// worker reads it once at start; systemd sets it from the optional,
+/// root-owned `EnvironmentFile` of `jarvis-codex-chat.service`. Unset, empty
+/// or malformed means every run returns `incompatible_runtime` without a
+/// model call. A newer CLI needs a new review; there is no "or newer".
+pub const REVIEWED_VERSION_ENV: &str = "JARVIS_CODEX_REVIEWED_VERSION";
 
 /// Fail-closed version gate: exactly one version-looking token in the bounded
 /// output, equal to the reviewed version. An empty review never matches.
@@ -81,12 +78,13 @@ mod tests {
 
     #[test]
     fn version_gate_requires_an_exact_owner_review() {
-        assert!(!reviewed_codex_version(
-            b"codex-cli 1.2.3\n",
-            REVIEWED_CODEX_VERSION
-        ));
-        assert!(!reviewed_codex_version(b"codex-cli 1.2.3\n", ""));
-        assert!(reviewed_codex_version(b"codex-cli 1.2.3\n", "1.2.3"));
+        let output = b"codex-cli 1.2.3\n";
+        // Unset, empty or malformed owner review: refuse.
+        for reviewed in ["", " ", "v1.2.3", "1.2", "1.2.3 ", "latest"] {
+            assert!(!reviewed_codex_version(output, reviewed), "{reviewed:?}");
+        }
+        // Exact match only.
+        assert!(reviewed_codex_version(output, "1.2.3"));
         assert!(!reviewed_codex_version(b"codex-cli 1.2.4\n", "1.2.3"));
         assert!(!reviewed_codex_version(b"codex-cli 1.2.3 9.9.9", "1.2.3"));
         assert!(!reviewed_codex_version(b"unrecognized", "1.2.3"));

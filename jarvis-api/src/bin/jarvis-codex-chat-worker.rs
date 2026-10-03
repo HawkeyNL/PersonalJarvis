@@ -14,7 +14,7 @@ use jarvis_llm::{
     },
     codex_chat_protocol::{
         classify_codex_failure, codex_subscription_status, reviewed_codex_version,
-        REVIEWED_CODEX_VERSION,
+        REVIEWED_VERSION_ENV,
     },
 };
 use subscription_worker::{
@@ -50,6 +50,11 @@ async fn main() -> Result<()> {
         bail!("Codex chat worker refuses to start with an API key in its environment");
     }
     validate_root_binary(CODEX)?;
+    // Owner-reviewed CLI version from the root-owned unit configuration.
+    // Unset or non-UTF-8 becomes empty, which the gate never accepts.
+    let reviewed: &'static str = std::env::var(REVIEWED_VERSION_ENV)
+        .unwrap_or_default()
+        .leak();
     validate_private_dir(HOME, worker_uid)?;
     validate_private_dir(RUNTIME, worker_uid)?;
     let listener = inherited_listener()?;
@@ -71,7 +76,7 @@ async fn main() -> Result<()> {
             let _permit = permit;
             let reply = match tokio::time::timeout(
                 RUN_TIMEOUT + Duration::from_secs(5),
-                handle(&mut stream),
+                handle(&mut stream, reviewed),
             )
             .await
             {
@@ -83,7 +88,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle(stream: &mut UnixStream) -> Result<ClaudeWorkerReply> {
+async fn handle(stream: &mut UnixStream, reviewed: &str) -> Result<ClaudeWorkerReply> {
     let mut bytes = Vec::new();
     stream
         .take((MAX_REQUEST_BYTES + 1) as u64)
@@ -97,7 +102,7 @@ async fn handle(stream: &mut UnixStream) -> Result<ClaudeWorkerReply> {
         bail!("invalid Codex chat request shape");
     }
     let version = bounded_stdout(&["--version"], Duration::from_secs(3)).await;
-    if !version.is_some_and(|output| reviewed_codex_version(&output, REVIEWED_CODEX_VERSION)) {
+    if !version.is_some_and(|output| reviewed_codex_version(&output, reviewed)) {
         return Ok(ClaudeWorkerReply::failure(
             ClaudeWorkerState::IncompatibleRuntime,
         ));

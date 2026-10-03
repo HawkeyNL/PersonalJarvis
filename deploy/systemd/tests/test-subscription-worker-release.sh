@@ -38,7 +38,9 @@ for directive in NoNewPrivileges=true CapabilityBoundingSet= LockPersonality=tru
 done
 grep -Eq '^InaccessiblePaths=/etc/jarvis /var/lib/jarvis .*-/var/lib/jarvis-claude .*-/var/lib/jarvis-codex-broker .*-/var/lib/jarvis-engineering ' "$chat_service"
 grep -Eq '^UnsetEnvironment=.*OPENAI_API_KEY .*CODEX_API_KEY ' "$chat_service"
-! grep -Eq '^SupplementaryGroups=|^EnvironmentFile=|^Environment=|^ReadWritePaths=|^\[Install\]' "$chat_service"
+! grep -Eq '^SupplementaryGroups=|^Environment=|^ReadWritePaths=|^\[Install\]' "$chat_service"
+# The only environment source is the optional owner-reviewed version file.
+[[ $(grep -E '^EnvironmentFile=' "$chat_service") == 'EnvironmentFile=-/etc/jarvis/codex-chat-worker.env' ]]
 ! grep -Eq '^Listen(Stream|Datagram)=[0-9]|^Listen(Stream|Datagram)=127[.]' "$chat_socket"
 
 fixture=$(mktemp -d /tmp/jarvis-subscription-release.XXXXXXXX)

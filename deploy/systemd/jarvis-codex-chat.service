@@ -12,6 +12,10 @@ User=jarvis-codex
 Group=jarvis-codex
 ExecStart=/opt/jarvis/current/jarvis-codex-chat-worker
 WorkingDirectory=/run/jarvis-codex-chat
+# Owner-written, root-owned, optional: JARVIS_CODEX_REVIEWED_VERSION=<exact
+# reviewed `codex --version` number>. Read by systemd before the sandbox
+# applies. Absent, empty or malformed keeps every run incompatible_runtime.
+EnvironmentFile=-/etc/jarvis/codex-chat-worker.env
 UnsetEnvironment=OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN OPENAI_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN HF_TOKEN SSH_AUTH_SOCK
 StateDirectory=jarvis-codex
 StateDirectoryMode=0700
