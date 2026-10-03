@@ -42,7 +42,7 @@ write_candidate() {
     done
     install -m 0644 "$repo_dir/deploy/systemd/pricing-registry.json" "$release/pricing-registry.json"
     jq -n --arg tag "$tag" --arg revision "$revision" \
-        '{tag:$tag,revision:$revision,schema_migration:{version:1,target:10,from_sha256:[("a" * 64)]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1,model_policy_directory:1,model_catalog:1,laya_runtime:1,subscription_workers:1,codex_runtime:1,backup_timer:1}}' \
+        '{tag:$tag,revision:$revision,schema_sha256:("b" * 64),schema_migration:{version:1,target:10,from_sha256:[("a" * 64)]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1,model_policy_directory:1,model_catalog:1,laya_runtime:1,subscription_workers:1,codex_runtime:1,backup_timer:1}}' \
         > "$release/release.json"
     (
         cd "$release"
@@ -95,6 +95,15 @@ jq -e '.tooling.model_catalog == 1' "$extracted/jarvis-core-$tag/release.json" >
 jq -e '.tooling.laya_runtime == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
 jq -e '.tooling.subscription_workers == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
 jq -e '.tooling.backup_timer == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
+components="$fixture/jarvis-core-$tag-components.json"
+(cd "$fixture" && sha256sum --check --strict "jarvis-core-$tag-components.json.sha256" >/dev/null)
+jq -e --slurpfile release "$extracted/jarvis-core-$tag/release.json" \
+    '.schema_sha256 == $release[0].schema_sha256 and .schema_migration == $release[0].schema_migration and
+     .components == $release[0].components and (keys == ["components","revision","schema_migration","schema_sha256","tag"])' \
+    "$components" >/dev/null || {
+    echo "published component manifest does not carry the release schema fields" >&2
+    exit 1
+}
 
 bad_tag=v9.8.8
 write_candidate "$bad_tag"
