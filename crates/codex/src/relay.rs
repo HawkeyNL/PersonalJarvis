@@ -46,7 +46,7 @@ impl CodexSubscriptionAdapter for UnavailableSubscriptionAdapter {
     }
 }
 
-pub async fn relay_once<P: SandboxProvider, A: CodexSubscriptionAdapter + ?Sized>(
+pub async fn relay_once<P: SandboxProvider + ?Sized, A: CodexSubscriptionAdapter + ?Sized>(
     provider: &P,
     adapter: &A,
     handle: &SandboxHandle,

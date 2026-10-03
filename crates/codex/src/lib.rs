@@ -685,7 +685,7 @@ pub async fn execute_in_sandbox_with_cancel<
 }
 
 pub async fn execute_in_sandbox_tracked<
-    P: jarvis_sandbox::SandboxProvider,
+    P: jarvis_sandbox::SandboxProvider + ?Sized,
     A: relay::CodexSubscriptionAdapter + ?Sized,
 >(
     provider: &P,

@@ -12,7 +12,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -56,8 +56,9 @@ struct Reply {
 struct BrokerState {
     db: jarvis_store::Database,
     core_uid: u32,
-    sandbox: Option<Arc<OpenSandboxProvider>>,
+    sandbox: Option<Arc<dyn SandboxProvider>>,
     adapter: Arc<dyn CodexSubscriptionAdapter>,
+    artifacts_root: PathBuf,
     authority: Arc<RunCapabilityAuthority>,
     active: Arc<Mutex<HashMap<uuid::Uuid, watch::Sender<bool>>>>,
     run_slots: Arc<Semaphore>,
@@ -167,8 +168,9 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(BrokerState {
         db,
         core_uid: lookup_core_uid()?,
-        sandbox: configured_sandbox()?,
+        sandbox: configured_sandbox(|name| std::env::var(name).ok())?,
         adapter: Arc::new(UnavailableSubscriptionAdapter),
+        artifacts_root: PathBuf::from(ARTIFACTS_ROOT),
         authority: Arc::new(RunCapabilityAuthority::default()),
         active: Arc::new(Mutex::new(HashMap::new())),
         run_slots: Arc::new(Semaphore::new(2)),
@@ -229,17 +231,16 @@ fn lookup_core_uid() -> anyhow::Result<u32> {
     Ok(unsafe { (*entry).pw_uid })
 }
 
-fn configured_sandbox() -> anyhow::Result<Option<Arc<OpenSandboxProvider>>> {
-    if std::env::var("JARVIS_CODEX_EXECUTION_ENABLED")
-        .ok()
-        .as_deref()
-        != Some("1")
-    {
+fn configured_sandbox(
+    env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Option<Arc<dyn SandboxProvider>>> {
+    if env("JARVIS_CODEX_EXECUTION_ENABLED").as_deref() != Some("1") {
         return Ok(None);
     }
-    let endpoint = std::env::var("JARVIS_CODEX_OPENSANDBOX_ENDPOINT")?;
-    let key = std::env::var("JARVIS_CODEX_OPENSANDBOX_API_KEY")?;
-    let digest = std::env::var("JARVIS_CODEX_WORKLOAD_IMAGE")?;
+    let endpoint =
+        env("JARVIS_CODEX_OPENSANDBOX_ENDPOINT").context("OpenSandbox endpoint missing")?;
+    let key = env("JARVIS_CODEX_OPENSANDBOX_API_KEY").context("OpenSandbox API key missing")?;
+    let digest = env("JARVIS_CODEX_WORKLOAD_IMAGE").context("Codex workload image missing")?;
     Ok(Some(Arc::new(OpenSandboxProvider::for_codex_broker(
         endpoint, key, digest,
     )?)))
@@ -285,7 +286,7 @@ async fn reconcile_owned_sandboxes(state: &BrokerState) -> anyhow::Result<()> {
     {
         bail!("Jarvis Codex orphan sandbox cleanup incomplete");
     }
-    let mut response = state.db.query("SELECT record::id(id) AS run_id,reservation_id,user_id,status,sandbox_id,sandbox_state FROM coding_runs WHERE status IN ['queued','preparing','running','cancelling'] OR sandbox_state='cleanup_failed' LIMIT 1000")
+    let mut response = state.db.query("SELECT record::id(id) AS run_id,reservation_id,user_id,status,sandbox_id,sandbox_state FROM coding_runs WHERE status IN ['queued','preparing','running','cancelling'] OR sandbox_state IN ['active','termination_requested','cleanup_failed'] LIMIT 1000")
         .await?.check()?;
     let rows: Vec<serde_json::Value> = response.take(0)?;
     if rows.len() == 1000 {
@@ -309,6 +310,20 @@ async fn reconcile_owned_sandboxes(state: &BrokerState) -> anyhow::Result<()> {
             .get("status")
             .and_then(serde_json::Value::as_str)
             .context("invalid durable run state")?;
+        // Metadata discovery alone is not proof for a workload whose run row
+        // still names it: delete it by ID (idempotent) before recording it.
+        if let (Some(sandbox_id), Some("active" | "termination_requested" | "cleanup_failed")) = (
+            row.get("sandbox_id").and_then(serde_json::Value::as_str),
+            row.get("sandbox_state").and_then(serde_json::Value::as_str),
+        ) {
+            manager
+                .terminate(SandboxHandle {
+                    provider_id: sandbox_id.to_owned(),
+                    task_id: run_id,
+                    profile: jarvis_sandbox::SandboxProfile::Codex,
+                })
+                .await?;
+        }
         let _ =
             coding_reservations::finish(&state.db, reservation_id, run_id, status == "completed")
                 .await?;
@@ -316,7 +331,9 @@ async fn reconcile_owned_sandboxes(state: &BrokerState) -> anyhow::Result<()> {
             state.db.query("UPDATE coding_runs SET status='failed',failure_category='broker_restarted',reservation_status='released',sandbox_state='terminated',sandbox_cleanup_status='terminated',updated_at=time::now(),completed_at=time::now() WHERE record::id(id)=$run AND status IN ['queued','preparing','running','cancelling'] RETURN NONE")
                 .bind(json!({"run":run_id.to_string()})).await?.check()?;
         } else {
-            state.db.query("UPDATE coding_runs SET sandbox_state='terminated',sandbox_cleanup_status='terminated',reservation_status='released',updated_at=time::now() WHERE record::id(id)=$run AND sandbox_state='cleanup_failed' RETURN NONE")
+            // A terminal run whose cleanup record never landed: the manager
+            // scan above proved its workload is gone.
+            state.db.query("UPDATE coding_runs SET sandbox_state='terminated',sandbox_cleanup_status='terminated',reservation_status='released',updated_at=time::now() WHERE record::id(id)=$run AND sandbox_state IN ['active','termination_requested','cleanup_failed'] RETURN NONE")
                 .bind(json!({"run":run_id.to_string()})).await?.check()?;
         }
     }
@@ -443,7 +460,7 @@ async fn handle(stream: UnixStream, state: &Arc<BrokerState>) -> anyhow::Result<
         artifact,
     } = request
     {
-        let content = read_artifact(&state.db, run_id, user_id, artifact).await?;
+        let content = read_artifact(state, run_id, user_id, artifact).await?;
         let bytes = serde_json::to_vec(
             &json!({"status":"artifact","name":artifact.file_name(),"content":content}),
         )?;
@@ -506,15 +523,16 @@ async fn handle(stream: UnixStream, state: &Arc<BrokerState>) -> anyhow::Result<
 }
 
 async fn read_artifact(
-    db: &jarvis_store::Database,
+    state: &BrokerState,
     run_id: uuid::Uuid,
     user_id: uuid::Uuid,
     artifact: jarvis_codex::CodingArtifactName,
 ) -> anyhow::Result<String> {
-    if run_status(db, run_id, user_id).await? != "completed" {
+    if run_status(&state.db, run_id, user_id).await? != "completed" {
         bail!("coding run has no completed artifact");
     }
-    let path = Path::new(ARTIFACTS_ROOT)
+    let path = state
+        .artifacts_root
         .join(run_id.to_string())
         .join(artifact.file_name());
     let file = fs::OpenOptions::new()
@@ -547,14 +565,13 @@ async fn start_run(
     state: &Arc<BrokerState>,
     signed: &SignedCodingRequest,
 ) -> anyhow::Result<uuid::Uuid> {
-    let _reconcile_guard = state.reconcile_lock.lock().await;
+    let reconcile_guard = state.reconcile_lock.lock().await;
     if !state.cleanup_healthy.load(Ordering::SeqCst) {
         bail!("Codex sandbox cleanup requires recovery");
     }
-    let sandbox = state
-        .sandbox
-        .as_ref()
-        .context("Codex execution not owner-enabled")?;
+    if state.sandbox.is_none() {
+        bail!("Codex execution not owner-enabled");
+    }
     if !state.adapter.available() {
         bail!("reviewed subscription provider-only interface unavailable");
     }
@@ -564,6 +581,29 @@ async fn start_run(
         .try_acquire_owned()
         .map_err(|_| anyhow::anyhow!("Codex run capacity reached"))?;
     let (snapshot, context) = prepare_signed_run(&state.db, signed).await?;
+    let (run_id, _worker) =
+        admit_prepared_run(state, &reconcile_guard, signed, slot, snapshot, context).await?;
+    Ok(run_id)
+}
+
+/// Everything after the registry snapshot: manager availability, the single
+/// reservation lease, the durable run row and the worker. Requiring the
+/// reconcile guard keeps admission and orphan recovery mutually exclusive.
+async fn admit_prepared_run(
+    state: &Arc<BrokerState>,
+    _reconcile: &tokio::sync::MutexGuard<'_, ()>,
+    signed: &SignedCodingRequest,
+    slot: OwnedSemaphorePermit,
+    snapshot: jarvis_codex::RepositorySnapshot,
+    context: TaskContextInput,
+) -> anyhow::Result<(uuid::Uuid, tokio::task::JoinHandle<()>)> {
+    let sandbox = state
+        .sandbox
+        .as_ref()
+        .context("Codex execution not owner-enabled")?;
+    if !state.adapter.available() {
+        bail!("reviewed subscription provider-only interface unavailable");
+    }
     if sandbox.availability().await != SandboxAvailability::Available {
         bail!("OpenSandbox unavailable");
     }
@@ -633,10 +673,10 @@ async fn start_run(
         receiver,
         _slot: slot,
     };
-    tokio::spawn(async move {
+    let worker = tokio::spawn(async move {
         run_worker(state, job).await;
     });
-    Ok(run_id)
+    Ok((run_id, worker))
 }
 
 async fn run_worker(state: Arc<BrokerState>, job: RunJob) {
@@ -739,7 +779,11 @@ async fn run_worker(state: Arc<BrokerState>, job: RunJob) {
                 .chars()
                 .take(8_000)
                 .collect::<String>();
-            let saved = save_artifacts(run_id, &result.take_artifact_contents());
+            let saved = save_artifacts_in(
+                &state.artifacts_root,
+                run_id,
+                &result.take_artifact_contents(),
+            );
             if saved.is_err() {
                 let _ = mark_run_finished(
                     &state.db,
@@ -806,7 +850,7 @@ async fn run_worker(state: Arc<BrokerState>, job: RunJob) {
                 false
             };
             if !completed {
-                discard_artifacts(run_id);
+                discard_artifacts(&state.artifacts_root, run_id);
             }
         }
         _ if cancelled => {
@@ -883,15 +927,8 @@ async fn run_worker(state: Arc<BrokerState>, job: RunJob) {
     .await;
 }
 
-fn save_artifacts(
-    run_id: uuid::Uuid,
-    artifacts: &[jarvis_sandbox::CollectedArtifact],
-) -> anyhow::Result<()> {
-    save_artifacts_in(Path::new(ARTIFACTS_ROOT), run_id, artifacts)
-}
-
-fn discard_artifacts(run_id: uuid::Uuid) {
-    let dir = Path::new(ARTIFACTS_ROOT).join(run_id.to_string());
+fn discard_artifacts(root: &Path, run_id: uuid::Uuid) {
+    let dir = root.join(run_id.to_string());
     for name in ["result.json", "patch.diff"] {
         let _ = fs::remove_file(dir.join(name));
     }
@@ -1194,10 +1231,1407 @@ mod tests {
         routing::{delete, get},
         Json, Router,
     };
-    use jarvis_sandbox::CollectedArtifact;
+    use jarvis_codex::RepositoryIdentity;
+    use jarvis_sandbox::{
+        CollectedArtifact, ExecutionResult, NetworkPolicy, OwnedCodexSandbox, SandboxError,
+        SandboxTask, ScopedSecret, TaskInput,
+    };
     use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
 
     type ManagerItems = Arc<Mutex<Vec<serde_json::Value>>>;
+
+    /// Records every manager call. Any call at all is a fail-closed violation
+    /// in the default-configuration tests.
+    #[derive(Default)]
+    struct CountingManager {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl CountingManager {
+        fn record(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxProvider for CountingManager {
+        async fn availability(&self) -> SandboxAvailability {
+            self.record("availability");
+            SandboxAvailability::Available
+        }
+        async fn create(&self, _: &SandboxTask) -> Result<SandboxHandle, SandboxError> {
+            self.record("create");
+            Err(SandboxError::Unsupported)
+        }
+        async fn upload(&self, _: &SandboxHandle, _: TaskInput) -> Result<(), SandboxError> {
+            self.record("upload");
+            Err(SandboxError::Unsupported)
+        }
+        async fn set_network_policy(
+            &self,
+            _: &SandboxHandle,
+            _: &NetworkPolicy,
+        ) -> Result<(), SandboxError> {
+            self.record("network");
+            Err(SandboxError::Unsupported)
+        }
+        async fn provide_scoped_secret(
+            &self,
+            _: &SandboxHandle,
+            _: ScopedSecret,
+        ) -> Result<(), SandboxError> {
+            self.record("credential");
+            Err(SandboxError::Unsupported)
+        }
+        async fn exec(
+            &self,
+            _: &SandboxHandle,
+            _: &[String],
+        ) -> Result<ExecutionResult, SandboxError> {
+            self.record("exec");
+            Err(SandboxError::Unsupported)
+        }
+        async fn collect_artifacts(
+            &self,
+            _: &SandboxHandle,
+            _: &[String],
+        ) -> Result<Vec<CollectedArtifact>, SandboxError> {
+            self.record("artifacts");
+            Err(SandboxError::Unsupported)
+        }
+        async fn terminate(&self, _: SandboxHandle) -> Result<(), SandboxError> {
+            self.record("terminate");
+            Err(SandboxError::Unsupported)
+        }
+        async fn list_owned_codex(&self) -> Result<Vec<OwnedCodexSandbox>, SandboxError> {
+            self.record("list");
+            Err(SandboxError::Unsupported)
+        }
+    }
+
+    fn broker(
+        db: jarvis_store::Database,
+        sandbox: Option<Arc<dyn SandboxProvider>>,
+        adapter: Arc<dyn CodexSubscriptionAdapter>,
+        artifacts_root: PathBuf,
+    ) -> Arc<BrokerState> {
+        Arc::new(BrokerState {
+            db,
+            core_uid: 0,
+            sandbox,
+            adapter,
+            artifacts_root,
+            authority: Arc::new(RunCapabilityAuthority::default()),
+            active: Arc::new(Mutex::new(HashMap::new())),
+            run_slots: Arc::new(Semaphore::new(2)),
+            cleanup_healthy: Arc::new(AtomicBool::new(true)),
+            cleanup_epoch: Arc::new(AtomicU64::new(0)),
+            reconcile_lock: Arc::new(AsyncMutex::new(())),
+        })
+    }
+
+    /// A database handle that was never connected: any query fails, so a
+    /// passing test proves the code path issued none.
+    fn unconnected_db() -> jarvis_store::Database {
+        Surreal::init()
+    }
+
+    async fn disposable_db(prefix: &str) -> anyhow::Result<jarvis_store::Database> {
+        let db = Surreal::new::<Ws>(std::env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+        db.signin(Root {
+            username: &std::env::var("JARVIS_SURREAL_TEST_USER")?,
+            password: &std::env::var("JARVIS_SURREAL_TEST_PASS")?,
+        })
+        .await?;
+        db.use_ns(format!("{prefix}_{}", uuid::Uuid::now_v7().simple()))
+            .use_db("test")
+            .await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+        Ok(db)
+    }
+
+    const BASE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn signed_start(
+        user: uuid::Uuid,
+        session: uuid::Uuid,
+        reservation: uuid::Uuid,
+    ) -> SignedCodingRequest {
+        signed_start_with_timeout(user, session, reservation, 60)
+    }
+
+    fn signed_start_with_timeout(
+        user: uuid::Uuid,
+        session: uuid::Uuid,
+        reservation: uuid::Uuid,
+        timeout_secs: u64,
+    ) -> SignedCodingRequest {
+        let now = time::OffsetDateTime::now_utc();
+        SignedCodingRequest {
+            request_id: uuid::Uuid::now_v7(),
+            nonce_hex: hex::encode([7_u8; 32]),
+            user_id: user,
+            device_id: uuid::Uuid::now_v7(),
+            issued_at: now,
+            expires_at: now + time::Duration::minutes(2),
+            operation: CodingOperation::StartCodingRun {
+                coding_session_id: session,
+                repository: RepositoryIdentity {
+                    id: "fixture".into(),
+                    owner: "Example".into(),
+                    name: "Repo".into(),
+                },
+                base_commit_sha: BASE_SHA.into(),
+                worktree_label: None,
+                objective: "Fix the bounded parser".into(),
+                checkpoint: None,
+                timeout_secs,
+                budget_reservation_id: reservation,
+                max_artifacts: 2,
+                max_output_bytes: 1024,
+            },
+            signature_hex: hex::encode([0_u8; 64]),
+        }
+    }
+
+    async fn reservation_status(
+        db: &jarvis_store::Database,
+        reservation: uuid::Uuid,
+    ) -> anyhow::Result<String> {
+        let mut response = db
+            .query("SELECT status FROM coding_reservations WHERE record::id(id)=$id LIMIT 1")
+            .bind(json!({"id":reservation.to_string()}))
+            .await?
+            .check()?;
+        let rows: Vec<serde_json::Value> = response.take(0)?;
+        rows.first()
+            .and_then(|row| row["status"].as_str())
+            .map(str::to_owned)
+            .context("reservation missing")
+    }
+
+    async fn run_row(
+        db: &jarvis_store::Database,
+        run: uuid::Uuid,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let mut response = db
+            .query("SELECT status,sandbox_state,reservation_status,failure_category FROM coding_runs WHERE record::id(id)=$run LIMIT 1")
+            .bind(json!({"run":run.to_string()}))
+            .await?
+            .check()?;
+        let rows: Vec<serde_json::Value> = response.take(0)?;
+        Ok(rows.into_iter().next())
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum DeleteMode {
+        Confirmed,
+        Rejected,
+        /// The manager removes the workload but the broker never sees the
+        /// confirmation (crash or lost response during reconciliation).
+        RemovedButErrored,
+    }
+
+    /// In-process manager metadata: no socket, no host network.
+    struct ReconcileManager {
+        owned: Mutex<Vec<OwnedCodexSandbox>>,
+        delete: Mutex<DeleteMode>,
+    }
+
+    impl ReconcileManager {
+        fn new(owned: Vec<OwnedCodexSandbox>) -> Self {
+            Self {
+                owned: Mutex::new(owned),
+                delete: Mutex::new(DeleteMode::Confirmed),
+            }
+        }
+    }
+
+    fn owned(provider_id: &str, run: uuid::Uuid, session: uuid::Uuid) -> OwnedCodexSandbox {
+        OwnedCodexSandbox {
+            handle: SandboxHandle {
+                provider_id: provider_id.into(),
+                task_id: run,
+                profile: jarvis_sandbox::SandboxProfile::Codex,
+            },
+            coding_session_id: session,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxProvider for ReconcileManager {
+        async fn availability(&self) -> SandboxAvailability {
+            SandboxAvailability::Available
+        }
+        async fn create(&self, _: &SandboxTask) -> Result<SandboxHandle, SandboxError> {
+            Err(SandboxError::Unsupported)
+        }
+        async fn upload(&self, _: &SandboxHandle, _: TaskInput) -> Result<(), SandboxError> {
+            Err(SandboxError::Unsupported)
+        }
+        async fn set_network_policy(
+            &self,
+            _: &SandboxHandle,
+            _: &NetworkPolicy,
+        ) -> Result<(), SandboxError> {
+            Err(SandboxError::Unsupported)
+        }
+        async fn provide_scoped_secret(
+            &self,
+            _: &SandboxHandle,
+            _: ScopedSecret,
+        ) -> Result<(), SandboxError> {
+            Err(SandboxError::Unsupported)
+        }
+        async fn exec(
+            &self,
+            _: &SandboxHandle,
+            _: &[String],
+        ) -> Result<ExecutionResult, SandboxError> {
+            Err(SandboxError::Unsupported)
+        }
+        async fn collect_artifacts(
+            &self,
+            _: &SandboxHandle,
+            _: &[String],
+        ) -> Result<Vec<CollectedArtifact>, SandboxError> {
+            Err(SandboxError::Unsupported)
+        }
+        async fn terminate(&self, handle: SandboxHandle) -> Result<(), SandboxError> {
+            let mode = *self.delete.lock().unwrap();
+            if mode != DeleteMode::Rejected {
+                self.owned
+                    .lock()
+                    .unwrap()
+                    .retain(|item| item.handle.provider_id != handle.provider_id);
+            }
+            match mode {
+                DeleteMode::Confirmed => Ok(()),
+                _ => Err(SandboxError::ProviderRequestFailed),
+            }
+        }
+        async fn list_owned_codex(&self) -> Result<Vec<OwnedCodexSandbox>, SandboxError> {
+            Ok(self.owned.lock().unwrap().clone())
+        }
+    }
+
+    struct CrashCase {
+        name: &'static str,
+        /// None: the broker died after the lease, before CREATE coding_runs.
+        status: Option<&'static str>,
+        sandbox_id: Option<&'static str>,
+        sandbox_state: &'static str,
+        /// The manager still lists this run's workload after the crash.
+        workload: Option<&'static str>,
+        settled: bool,
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn broker_restart_in_every_durable_state_leaves_no_orphan_or_lease() -> anyhow::Result<()>
+    {
+        let db = disposable_db("codex_crash_matrix").await?;
+        let cases = [
+            CrashCase {
+                name: "leased, run row never created",
+                status: None,
+                sandbox_id: None,
+                sandbox_state: "not_created",
+                workload: None,
+                settled: false,
+            },
+            CrashCase {
+                name: "queued",
+                status: Some("queued"),
+                sandbox_id: None,
+                sandbox_state: "not_created",
+                workload: None,
+                settled: false,
+            },
+            CrashCase {
+                name: "preparing, before sandbox create",
+                status: Some("preparing"),
+                sandbox_id: None,
+                sandbox_state: "not_created",
+                workload: None,
+                settled: false,
+            },
+            CrashCase {
+                name: "preparing, after create before sandbox_id persisted",
+                status: Some("preparing"),
+                sandbox_id: None,
+                sandbox_state: "not_created",
+                workload: Some("unrecorded"),
+                settled: false,
+            },
+            CrashCase {
+                name: "running, workload live",
+                status: Some("running"),
+                sandbox_id: Some("live"),
+                sandbox_state: "active",
+                workload: Some("live"),
+                settled: false,
+            },
+            CrashCase {
+                name: "running, after DELETE before cleanup record",
+                status: Some("running"),
+                sandbox_id: Some("deleted"),
+                sandbox_state: "active",
+                workload: None,
+                settled: false,
+            },
+            CrashCase {
+                name: "cancelling, workload live",
+                status: Some("cancelling"),
+                sandbox_id: Some("cancel"),
+                sandbox_state: "active",
+                workload: Some("cancel"),
+                settled: false,
+            },
+            CrashCase {
+                name: "completed, before reservation finish",
+                status: Some("completed"),
+                sandbox_id: Some("done"),
+                sandbox_state: "terminated",
+                workload: None,
+                settled: true,
+            },
+            // Not reachable through run_worker (completion follows a recorded
+            // cleanup); covers manual repair and future write-ordering changes.
+            CrashCase {
+                name: "completed, cleanup record and finish both lost",
+                status: Some("completed"),
+                sandbox_id: Some("done-unrecorded"),
+                sandbox_state: "active",
+                workload: None,
+                settled: true,
+            },
+            CrashCase {
+                name: "failed, cleanup_failed",
+                status: Some("failed"),
+                sandbox_id: Some("stuck"),
+                sandbox_state: "cleanup_failed",
+                workload: Some("stuck"),
+                settled: false,
+            },
+            CrashCase {
+                name: "cancelled, before reservation finish",
+                status: Some("cancelled"),
+                sandbox_id: Some("gone"),
+                sandbox_state: "terminated",
+                workload: None,
+                settled: false,
+            },
+        ];
+        let mut seeded = Vec::new();
+        let mut workloads = Vec::new();
+        for case in &cases {
+            let user = uuid::Uuid::now_v7();
+            let session = uuid::Uuid::now_v7();
+            let run = uuid::Uuid::now_v7();
+            let reservation = coding_reservations::reserve(&db, user, session).await?;
+            coding_reservations::lease(&db, reservation, user, session, run, 60)
+                .await?
+                .context("lease")?;
+            if let Some(status) = case.status {
+                seed_run(
+                    &db,
+                    user,
+                    session,
+                    reservation,
+                    run,
+                    status,
+                    case.sandbox_id,
+                    case.sandbox_state,
+                )
+                .await?;
+            }
+            if let Some(id) = case.workload {
+                workloads.push(owned(id, run, session));
+            }
+            seeded.push((run, reservation));
+        }
+        let manager = Arc::new(ReconcileManager::new(workloads));
+        let state = broker(
+            db.clone(),
+            Some(manager.clone()),
+            Arc::new(UnavailableSubscriptionAdapter),
+            PathBuf::from("/nonexistent/jarvis-test-artifacts"),
+        );
+        reconcile_owned_sandboxes(&state).await?;
+        reconcile_owned_sandboxes(&state).await?; // a second restart changes nothing
+        assert!(manager.owned.lock().unwrap().is_empty());
+        for (case, (run, reservation)) in cases.iter().zip(seeded) {
+            let expected = if case.settled { "settled" } else { "released" };
+            assert_eq!(
+                reservation_status(&db, reservation).await?,
+                expected,
+                "{}",
+                case.name
+            );
+            let Some(row) = run_row(&db, run).await? else {
+                assert!(case.status.is_none(), "{}", case.name);
+                continue;
+            };
+            assert!(
+                matches!(
+                    row["status"].as_str(),
+                    Some("completed" | "failed" | "timed_out" | "cancelled")
+                ),
+                "{}: {row}",
+                case.name
+            );
+            assert!(
+                matches!(
+                    row["sandbox_state"].as_str(),
+                    Some("terminated" | "orphan_recovered")
+                ),
+                "{}: {row}",
+                case.name
+            );
+            if matches!(
+                case.status,
+                Some("queued" | "preparing" | "running" | "cancelling")
+            ) {
+                assert_eq!(row["failure_category"], "broker_restarted", "{}", case.name);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn crash_during_reconciliation_keeps_lease_until_a_later_scan_proves_cleanup(
+    ) -> anyhow::Result<()> {
+        let db = disposable_db("codex_reconcile_crash").await?;
+        let user = uuid::Uuid::now_v7();
+        let session = uuid::Uuid::now_v7();
+        let run = uuid::Uuid::now_v7();
+        let reservation = coding_reservations::reserve(&db, user, session).await?;
+        coding_reservations::lease(&db, reservation, user, session, run, 60)
+            .await?
+            .context("lease")?;
+        seed_run(
+            &db,
+            user,
+            session,
+            reservation,
+            run,
+            "running",
+            Some("live"),
+            "active",
+        )
+        .await?;
+        let manager = Arc::new(ReconcileManager::new(vec![owned("live", run, session)]));
+        let state = broker(
+            db.clone(),
+            Some(manager.clone()),
+            Arc::new(UnavailableSubscriptionAdapter),
+            PathBuf::from("/nonexistent/jarvis-test-artifacts"),
+        );
+        // Manager down: nothing may be released while the workload is listed.
+        *manager.delete.lock().unwrap() = DeleteMode::Rejected;
+        assert!(reconcile_owned_sandboxes(&state).await.is_err());
+        assert_eq!(manager.owned.lock().unwrap().len(), 1);
+        assert_eq!(reservation_status(&db, reservation).await?, "leased");
+        assert_eq!(
+            run_row(&db, run).await?.context("run")?["status"],
+            "running"
+        );
+        // DELETE lands but its confirmation is lost: still no release.
+        *manager.delete.lock().unwrap() = DeleteMode::RemovedButErrored;
+        assert!(reconcile_owned_sandboxes(&state).await.is_err());
+        assert!(manager.owned.lock().unwrap().is_empty());
+        assert_eq!(reservation_status(&db, reservation).await?, "leased");
+        // The next scan sees the workload gone and recovers both records.
+        *manager.delete.lock().unwrap() = DeleteMode::Confirmed;
+        reconcile_owned_sandboxes(&state).await?;
+        assert_eq!(reservation_status(&db, reservation).await?, "released");
+        let row = run_row(&db, run).await?.context("run")?;
+        assert_eq!(row["status"], "failed");
+        assert_eq!(row["sandbox_state"], "terminated");
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_run(
+        db: &jarvis_store::Database,
+        user: uuid::Uuid,
+        session: uuid::Uuid,
+        reservation: uuid::Uuid,
+        run: uuid::Uuid,
+        status: &str,
+        sandbox_id: Option<&str>,
+        sandbox_state: &str,
+    ) -> anyhow::Result<()> {
+        let sandbox = match sandbox_id {
+            Some(_) => "sandbox_provider='opensandbox',sandbox_id=$sandbox",
+            None => "sandbox_provider=NONE,sandbox_id=NONE",
+        };
+        let completed_at = if matches!(status, "completed" | "failed" | "timed_out" | "cancelled") {
+            "time::now()"
+        } else {
+            "NONE"
+        };
+        db.query(format!("CREATE coding_runs SET id=$run,request_id=$request,coding_session_id=$coding_session_key,user_id=$user,device_id=$device,repository_id='fixture',repository_owner='Example',repository_name='Repo',base_sha=$base,snapshot_sha256=NONE,reservation_id=$reservation,reservation_units=1,reservation_status='active',status=$status,summary=NONE,failure_category=NONE,artifacts=[],compute_class='subscription',{sandbox},sandbox_state=$sandbox_state,sandbox_created_at=NONE,sandbox_cleanup_status=NONE,created_at=time::now(),updated_at=time::now(),completed_at={completed_at} RETURN NONE"))
+            .bind(json!({"run":run.to_string(),"request":uuid::Uuid::now_v7().to_string(),"coding_session_key":session.to_string(),"user":user.to_string(),"device":uuid::Uuid::now_v7().to_string(),"base":BASE_SHA,"reservation":reservation.to_string(),"status":status,"sandbox":sandbox_id,"sandbox_state":sandbox_state}))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    /// Minimal ustar archive in the shape the trusted registry produces: a
+    /// pax global header carrying the commit, then one regular file.
+    fn snapshot_archive() -> jarvis_codex::RepositorySnapshot {
+        fn entry(out: &mut Vec<u8>, name: &str, kind: u8, body: &[u8]) {
+            let mut header = [0_u8; 512];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            header[100..108].copy_from_slice(b"0000644\0");
+            header[108..116].copy_from_slice(b"0000000\0");
+            header[116..124].copy_from_slice(b"0000000\0");
+            header[124..136].copy_from_slice(format!("{:011o}\0", body.len()).as_bytes());
+            header[136..148].copy_from_slice(b"00000000000\0");
+            header[148..156].copy_from_slice(b"        ");
+            header[156] = kind;
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+            header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+            out.extend_from_slice(&header);
+            out.extend_from_slice(body);
+            out.resize(out.len().div_ceil(512) * 512, 0);
+        }
+        let mut archive = Vec::new();
+        let pax = format!("{} comment={BASE_SHA}\n", 12 + BASE_SHA.len());
+        entry(&mut archive, "pax_global_header", b'g', pax.as_bytes());
+        entry(&mut archive, "README.md", b'0', b"safe");
+        archive.resize(archive.len() + 1024, 0);
+        jarvis_codex::RepositorySnapshot {
+            base_commit_sha: BASE_SHA.into(),
+            archive,
+        }
+    }
+
+    #[test]
+    fn fixture_snapshot_passes_the_production_archive_validation() {
+        let snapshot = snapshot_archive();
+        jarvis_codex::snapshot::validate_archive(&snapshot.archive, BASE_SHA).unwrap();
+    }
+
+    /// In-process OpenSandbox stand-in: the reviewed workload runtime runs
+    /// on a temporary directory. No socket, container, credential or host
+    /// network is involved.
+    struct WorkspaceManager {
+        root: PathBuf,
+        live: Mutex<Vec<OwnedCodexSandbox>>,
+        calls: Mutex<Vec<&'static str>>,
+        stalled_upload: Option<Arc<tokio::sync::Notify>>,
+        terminate_fails: AtomicBool,
+    }
+
+    impl WorkspaceManager {
+        fn new(root: PathBuf) -> Self {
+            Self {
+                root,
+                live: Mutex::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
+                stalled_upload: None,
+                terminate_fails: AtomicBool::new(false),
+            }
+        }
+        fn called(&self, call: &str) -> bool {
+            self.calls.lock().unwrap().contains(&call)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxProvider for WorkspaceManager {
+        async fn availability(&self) -> SandboxAvailability {
+            SandboxAvailability::Available
+        }
+        async fn create(&self, task: &SandboxTask) -> Result<SandboxHandle, SandboxError> {
+            self.calls.lock().unwrap().push("create");
+            fs::create_dir_all(self.root.join("input"))
+                .map_err(|_| SandboxError::ProviderRequestFailed)?;
+            let session = task.codex_session_id.ok_or(SandboxError::InvalidTask)?;
+            let workload = owned(&format!("workload-{}", task.task_id), task.task_id, session);
+            self.live.lock().unwrap().push(workload.clone());
+            Ok(workload.handle)
+        }
+        async fn upload(&self, _: &SandboxHandle, input: TaskInput) -> Result<(), SandboxError> {
+            if let (Some(signal), "repository.tar") = (&self.stalled_upload, input.name.as_str()) {
+                signal.notify_one();
+                std::future::pending::<()>().await;
+            }
+            fs::write(self.root.join("input").join(&input.name), input.bytes)
+                .map_err(|_| SandboxError::ProviderRequestFailed)
+        }
+        async fn set_network_policy(
+            &self,
+            _: &SandboxHandle,
+            _: &NetworkPolicy,
+        ) -> Result<(), SandboxError> {
+            Ok(())
+        }
+        async fn provide_scoped_secret(
+            &self,
+            _: &SandboxHandle,
+            _: ScopedSecret,
+        ) -> Result<(), SandboxError> {
+            self.calls.lock().unwrap().push("credential");
+            Err(SandboxError::Unsupported)
+        }
+        async fn exec(
+            &self,
+            _: &SandboxHandle,
+            _: &[String],
+        ) -> Result<ExecutionResult, SandboxError> {
+            let root = self.root.clone();
+            tokio::task::spawn_blocking(move || jarvis_codex::runtime::run_in_workspace(&root))
+                .await
+                .map_err(|_| SandboxError::ProviderRequestFailed)?
+                .map_err(|_| SandboxError::ProviderRequestFailed)?;
+            Ok(ExecutionResult {
+                exit_code: Some(0),
+                timed_out: false,
+                stdout_summary: String::new(),
+                stderr_summary: String::new(),
+                duration_ms: 1,
+            })
+        }
+        async fn collect_artifacts(
+            &self,
+            _: &SandboxHandle,
+            paths: &[String],
+        ) -> Result<Vec<CollectedArtifact>, SandboxError> {
+            paths
+                .iter()
+                .map(|path| {
+                    Ok(CollectedArtifact {
+                        path: path.clone(),
+                        contents: fs::read(self.root.join("artifacts").join(path))
+                            .map_err(|_| SandboxError::InvalidArtifact)?,
+                    })
+                })
+                .collect()
+        }
+        async fn read_codex_task_request(
+            &self,
+            _: &SandboxHandle,
+        ) -> Result<Option<Vec<u8>>, SandboxError> {
+            let path = self.root.join("channel/task-request.json");
+            if !path.exists() {
+                return Ok(None);
+            }
+            fs::read(path)
+                .map(Some)
+                .map_err(|_| SandboxError::InvalidArtifact)
+        }
+        async fn terminate(&self, handle: SandboxHandle) -> Result<(), SandboxError> {
+            self.calls.lock().unwrap().push("terminate");
+            if self.terminate_fails.load(Ordering::SeqCst) {
+                return Err(SandboxError::ProviderRequestFailed);
+            }
+            self.live
+                .lock()
+                .unwrap()
+                .retain(|item| item.handle.provider_id != handle.provider_id);
+            Ok(())
+        }
+        async fn list_owned_codex(&self) -> Result<Vec<OwnedCodexSandbox>, SandboxError> {
+            Ok(self.live.lock().unwrap().clone())
+        }
+    }
+
+    struct NoDatabase;
+
+    #[async_trait::async_trait]
+    impl SandboxOwnershipRecorder for NoDatabase {
+        async fn created(&self, _: &SandboxHandle) -> Result<(), CodingRunError> {
+            Ok(())
+        }
+        async fn cleanup(&self, _: &SandboxHandle, _: bool) -> Result<(), CodingRunError> {
+            Ok(())
+        }
+    }
+
+    /// Proves the in-process manager drives the reviewed workload runtime
+    /// end to end without a database, so the DB lifecycle tests exercise
+    /// broker state rather than fixture plumbing.
+    #[tokio::test]
+    async fn workspace_manager_runs_the_reviewed_runtime_end_to_end() {
+        let workspace = tempfile::tempdir().unwrap();
+        let manager = WorkspaceManager::new(workspace.path().join("sandbox"));
+        let adapter = FixtureAdapter::Outcome(jarvis_codex::runtime::TaskOutcome::Completed);
+        let request = signed_start(
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+        );
+        let authority = RunCapabilityAuthority::default();
+        let run_id = uuid::Uuid::now_v7();
+        let capability = authority
+            .mint(RunCapabilityClaims::from_signed_request(run_id, &request, 1).unwrap())
+            .unwrap();
+        let result = jarvis_codex::execute_in_sandbox_tracked(
+            &manager,
+            &request,
+            snapshot_archive(),
+            TaskContextInput::default(),
+            ApprovedSandboxRun {
+                adapter: &adapter,
+                authority: &authority,
+                run_id,
+                capability: Some(capability),
+            },
+            None,
+            &NoDatabase,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.stdout_summary, "Reviewed fixture");
+        assert!(manager.live.lock().unwrap().is_empty());
+        assert!(!manager.called("credential"));
+    }
+
+    /// Test-only stand-in for the future reviewed subscription adapter.
+    /// Production keeps `UnavailableSubscriptionAdapter` hard-wired in main.
+    enum FixtureAdapter {
+        Outcome(jarvis_codex::runtime::TaskOutcome),
+        Fails,
+        Sleeps(Duration),
+        Blocks(Arc<tokio::sync::Notify>),
+    }
+
+    #[async_trait::async_trait]
+    impl CodexSubscriptionAdapter for FixtureAdapter {
+        fn available(&self) -> bool {
+            true
+        }
+        async fn run_approved_task(
+            &self,
+            binding: &jarvis_codex::BrokeredCodexRequest,
+            _: &jarvis_codex::TaskEnvelope,
+        ) -> Result<jarvis_codex::runtime::TaskChannelResponse, CodingRunError> {
+            let outcome = match self {
+                Self::Outcome(outcome) => *outcome,
+                Self::Fails => return Err(CodingRunError::SandboxFailed),
+                Self::Sleeps(duration) => {
+                    tokio::time::sleep(*duration).await;
+                    return Err(CodingRunError::SandboxFailed);
+                }
+                Self::Blocks(entered) => {
+                    entered.notify_one();
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            };
+            Ok(jarvis_codex::runtime::TaskChannelResponse {
+                binding: binding.clone(),
+                outcome,
+                summary: "Reviewed fixture".into(),
+                patch_diff: String::new(),
+            })
+        }
+    }
+
+    async fn create_session(
+        db: &jarvis_store::Database,
+        user: uuid::Uuid,
+        session: uuid::Uuid,
+        state: &str,
+    ) -> anyhow::Result<()> {
+        db.query("CREATE coding_sessions SET id=$id,user_id=$user,repository='Example/Repo',base_revision=$base,objective='Fix the bounded parser',owner_constraints=[],state=$state,checkpoint=NONE,created_at=time::now(),updated_at=time::now() RETURN NONE")
+            .bind(json!({"id":session.to_string(),"user":user.to_string(),"base":BASE_SHA,"state":state}))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    struct Lifecycle {
+        db: jarvis_store::Database,
+        user: uuid::Uuid,
+        session: uuid::Uuid,
+        reservation: uuid::Uuid,
+        workspace: tempfile::TempDir,
+    }
+
+    async fn lifecycle(prefix: &str, with_session: bool) -> anyhow::Result<Lifecycle> {
+        let db = disposable_db(prefix).await?;
+        let user = uuid::Uuid::now_v7();
+        let session = uuid::Uuid::now_v7();
+        if with_session {
+            create_session(&db, user, session, "active").await?;
+        }
+        let reservation = coding_reservations::reserve(&db, user, session).await?;
+        Ok(Lifecycle {
+            db,
+            user,
+            session,
+            reservation,
+            workspace: tempfile::tempdir()?,
+        })
+    }
+
+    /// Admit one prepared run exactly as `start_run` does after the
+    /// registry snapshot, and return the worker so the test can await it.
+    async fn admit(
+        state: &Arc<BrokerState>,
+        request: &SignedCodingRequest,
+    ) -> anyhow::Result<(uuid::Uuid, tokio::task::JoinHandle<()>)> {
+        let slot = state.run_slots.clone().try_acquire_owned()?;
+        let reconcile = state.reconcile_lock.lock().await;
+        admit_prepared_run(
+            state,
+            &reconcile,
+            request,
+            slot,
+            snapshot_archive(),
+            TaskContextInput::default(),
+        )
+        .await
+    }
+
+    async fn run_to_end(
+        fixture: &Lifecycle,
+        adapter: FixtureAdapter,
+        timeout_secs: u64,
+        artifacts_root: PathBuf,
+    ) -> anyhow::Result<(Arc<BrokerState>, Arc<WorkspaceManager>, uuid::Uuid)> {
+        let manager = Arc::new(WorkspaceManager::new(
+            fixture.workspace.path().join("sandbox"),
+        ));
+        let state = broker(
+            fixture.db.clone(),
+            Some(manager.clone()),
+            Arc::new(adapter),
+            artifacts_root,
+        );
+        let request = signed_start_with_timeout(
+            fixture.user,
+            fixture.session,
+            fixture.reservation,
+            timeout_secs,
+        );
+        let (run, worker) = admit(&state, &request).await?;
+        worker.await?;
+        Ok((state, manager, run))
+    }
+
+    /// Every finished worker must leave: a terminal run, a destroyed
+    /// workload, no credential hand-off, a free slot and open admission.
+    async fn assert_finished(
+        fixture: &Lifecycle,
+        state: &BrokerState,
+        manager: &WorkspaceManager,
+        run: uuid::Uuid,
+        status: &str,
+        reservation: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let row = run_row(&fixture.db, run).await?.context("run row")?;
+        assert_eq!(row["status"], status, "{row}");
+        assert_eq!(row["sandbox_state"], "terminated", "{row}");
+        assert_eq!(
+            reservation_status(&fixture.db, fixture.reservation).await?,
+            reservation
+        );
+        assert!(manager.live.lock().unwrap().is_empty());
+        assert!(manager.called("terminate"));
+        assert!(!manager.called("credential"));
+        assert!(state.active.lock().unwrap().is_empty());
+        assert_eq!(state.run_slots.available_permits(), 2);
+        assert!(state.cleanup_healthy.load(Ordering::SeqCst));
+        Ok(row)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn disposable_lifecycle_completes_settles_and_destroys_the_sandbox() -> anyhow::Result<()>
+    {
+        let fixture = lifecycle("codex_lifecycle", true).await?;
+        let (state, manager, run) = run_to_end(
+            &fixture,
+            FixtureAdapter::Outcome(jarvis_codex::runtime::TaskOutcome::Completed),
+            60,
+            fixture.workspace.path().join("artifacts"),
+        )
+        .await?;
+        assert_finished(&fixture, &state, &manager, run, "completed", "settled").await?;
+        let mut session = fixture
+            .db
+            .query("SELECT state,checkpoint FROM coding_sessions WHERE record::id(id)=$id LIMIT 1")
+            .bind(json!({"id":fixture.session.to_string()}))
+            .await?
+            .check()?;
+        let session: Vec<serde_json::Value> = session.take(0)?;
+        assert_eq!(session[0]["state"], "suspended");
+        assert_eq!(session[0]["checkpoint"]["summary"], "Reviewed fixture");
+        let result = read_artifact(
+            &state,
+            run,
+            fixture.user,
+            jarvis_codex::CodingArtifactName::ResultJson,
+        )
+        .await?;
+        assert!(result.contains("Reviewed fixture"));
+        // Another owner can neither read the artifact nor learn the status.
+        assert!(read_artifact(
+            &state,
+            run,
+            uuid::Uuid::now_v7(),
+            jarvis_codex::CodingArtifactName::ResultJson
+        )
+        .await
+        .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn disposable_lifecycle_owner_cancel_releases_and_destroys() -> anyhow::Result<()> {
+        let fixture = lifecycle("codex_lifecycle_cancel", true).await?;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let manager = Arc::new(WorkspaceManager::new(
+            fixture.workspace.path().join("sandbox"),
+        ));
+        let state = broker(
+            fixture.db.clone(),
+            Some(manager.clone()),
+            Arc::new(FixtureAdapter::Blocks(entered.clone())),
+            fixture.workspace.path().join("artifacts"),
+        );
+        let request =
+            signed_start_with_timeout(fixture.user, fixture.session, fixture.reservation, 5);
+        let (run, worker) = admit(&state, &request).await?;
+        entered.notified().await;
+        assert_eq!(
+            run_row(&fixture.db, run).await?.context("run")?["status"],
+            "running"
+        );
+        // Only the owner may cancel.
+        assert!(cancel_run(&state, run, uuid::Uuid::now_v7()).await.is_err());
+        cancel_run(&state, run, fixture.user).await?;
+        worker.await?;
+        let row = assert_finished(&fixture, &state, &manager, run, "cancelled", "released").await?;
+        assert_eq!(row["reservation_status"], "released");
+        assert!(!fixture
+            .workspace
+            .path()
+            .join("artifacts")
+            .join(run.to_string())
+            .exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn worker_exit_paths_release_the_reservation() -> anyhow::Result<()> {
+        use jarvis_codex::runtime::TaskOutcome;
+        // (case, adapter, signed timeout, run status, failure category)
+        let cases = [
+            (
+                "provider failure",
+                FixtureAdapter::Fails,
+                5,
+                "failed",
+                "runtime_failure",
+            ),
+            (
+                "plan limit",
+                FixtureAdapter::Outcome(TaskOutcome::PlanLimit),
+                5,
+                "failed",
+                "plan_limit",
+            ),
+            (
+                "signed timeout",
+                FixtureAdapter::Sleeps(Duration::from_secs(3)),
+                1,
+                "timed_out",
+                "runtime_timeout",
+            ),
+        ];
+        for (case, adapter, timeout, status, failure) in cases {
+            let fixture = lifecycle("codex_exit_path", true).await?;
+            let (state, manager, run) = run_to_end(
+                &fixture,
+                adapter,
+                timeout,
+                fixture.workspace.path().join("artifacts"),
+            )
+            .await?;
+            let row = assert_finished(&fixture, &state, &manager, run, status, "released").await?;
+            assert_eq!(row["failure_category"], failure, "{case}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn completed_run_that_cannot_persist_releases_instead_of_settling() -> anyhow::Result<()>
+    {
+        // Artifact store is unusable: the run must not be reported completed.
+        let fixture = lifecycle("codex_artifact_failure", true).await?;
+        let blocked = fixture.workspace.path().join("not-a-directory");
+        fs::write(&blocked, b"")?;
+        let (state, manager, run) = run_to_end(
+            &fixture,
+            FixtureAdapter::Outcome(jarvis_codex::runtime::TaskOutcome::Completed),
+            5,
+            blocked,
+        )
+        .await?;
+        let row = assert_finished(&fixture, &state, &manager, run, "failed", "released").await?;
+        assert_eq!(row["failure_category"], "artifact_persistence");
+
+        // The resume checkpoint cannot be stored (session row missing).
+        let fixture = lifecycle("codex_checkpoint_failure", false).await?;
+        let artifacts = fixture.workspace.path().join("artifacts");
+        let (state, manager, run) = run_to_end(
+            &fixture,
+            FixtureAdapter::Outcome(jarvis_codex::runtime::TaskOutcome::Completed),
+            5,
+            artifacts.clone(),
+        )
+        .await?;
+        let row = assert_finished(&fixture, &state, &manager, run, "failed", "released").await?;
+        assert_eq!(row["failure_category"], "checkpoint_persistence");
+        assert!(!artifacts.join(run.to_string()).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn unconfirmed_teardown_closes_admission_until_reconciliation() -> anyhow::Result<()> {
+        let fixture = lifecycle("codex_cleanup_required", true).await?;
+        let manager = Arc::new(WorkspaceManager::new(
+            fixture.workspace.path().join("sandbox"),
+        ));
+        manager.terminate_fails.store(true, Ordering::SeqCst);
+        let state = broker(
+            fixture.db.clone(),
+            Some(manager.clone()),
+            Arc::new(FixtureAdapter::Outcome(
+                jarvis_codex::runtime::TaskOutcome::Completed,
+            )),
+            fixture.workspace.path().join("artifacts"),
+        );
+        let request =
+            signed_start_with_timeout(fixture.user, fixture.session, fixture.reservation, 5);
+        let (run, worker) = admit(&state, &request).await?;
+        worker.await?;
+        // Workload still listed: no completion, no settlement, no admission.
+        assert_eq!(manager.live.lock().unwrap().len(), 1);
+        assert!(!state.cleanup_healthy.load(Ordering::SeqCst));
+        assert_eq!(
+            reservation_status(&fixture.db, fixture.reservation).await?,
+            "leased"
+        );
+        let row = run_row(&fixture.db, run).await?.context("run")?;
+        assert_eq!(row["status"], "running");
+        assert_eq!(row["failure_category"], "cleanup_required");
+        let next = coding_reservations::reserve(&fixture.db, fixture.user, fixture.session).await?;
+        let blocked = start_run(&state, &signed_start(fixture.user, fixture.session, next)).await;
+        assert!(blocked
+            .unwrap_err()
+            .to_string()
+            .contains("cleanup requires recovery"));
+
+        manager.terminate_fails.store(false, Ordering::SeqCst);
+        reconcile_owned_sandboxes(&state).await?;
+        assert!(manager.live.lock().unwrap().is_empty());
+        assert_eq!(
+            reservation_status(&fixture.db, fixture.reservation).await?,
+            "released"
+        );
+        assert_eq!(reservation_status(&fixture.db, next).await?, "reserved");
+        let row = run_row(&fixture.db, run).await?.context("run")?;
+        assert_eq!(row["status"], "failed");
+        assert_eq!(row["failure_category"], "broker_restarted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn aborted_worker_mid_upload_is_recovered_by_reconciliation() -> anyhow::Result<()> {
+        let fixture = lifecycle("codex_worker_abort", true).await?;
+        let stalled = Arc::new(tokio::sync::Notify::new());
+        let mut manager = WorkspaceManager::new(fixture.workspace.path().join("sandbox"));
+        manager.stalled_upload = Some(stalled.clone());
+        let manager = Arc::new(manager);
+        let state = broker(
+            fixture.db.clone(),
+            Some(manager.clone()),
+            Arc::new(FixtureAdapter::Outcome(
+                jarvis_codex::runtime::TaskOutcome::Completed,
+            )),
+            fixture.workspace.path().join("artifacts"),
+        );
+        let request = signed_start(fixture.user, fixture.session, fixture.reservation);
+        let (run, worker) = admit(&state, &request).await?;
+        stalled.notified().await;
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        // The dropped worker could not tear down: admission closes.
+        assert!(!state.cleanup_healthy.load(Ordering::SeqCst));
+        assert!(state.active.lock().unwrap().is_empty());
+        assert_eq!(manager.live.lock().unwrap().len(), 1);
+        assert_eq!(
+            reservation_status(&fixture.db, fixture.reservation).await?,
+            "leased"
+        );
+
+        reconcile_owned_sandboxes(&state).await?;
+        assert!(manager.live.lock().unwrap().is_empty());
+        assert_eq!(
+            reservation_status(&fixture.db, fixture.reservation).await?,
+            "released"
+        );
+        let row = run_row(&fixture.db, run).await?.context("run")?;
+        assert_eq!(row["status"], "failed");
+        assert!(matches!(
+            row["sandbox_state"].as_str(),
+            Some("terminated" | "orphan_recovered")
+        ));
+        Ok(())
+    }
+
+    /// Reservation verification: one test per check, and every rejected
+    /// lease leaves the reservation unspent.
+    async fn reservation_fixture(
+        prefix: &str,
+    ) -> anyhow::Result<(jarvis_store::Database, uuid::Uuid, uuid::Uuid, uuid::Uuid)> {
+        let db = disposable_db(prefix).await?;
+        let user = uuid::Uuid::now_v7();
+        let session = uuid::Uuid::now_v7();
+        let reservation = coding_reservations::reserve(&db, user, session).await?;
+        Ok((db, user, session, reservation))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn reservation_lease_rejects_an_unknown_id() -> anyhow::Result<()> {
+        let (db, user, session, reservation) =
+            reservation_fixture("codex_reservation_unknown").await?;
+        let unknown = uuid::Uuid::now_v7();
+        assert!(
+            coding_reservations::lease(&db, unknown, user, session, uuid::Uuid::now_v7(), 60)
+                .await?
+                .is_none()
+        );
+        assert_eq!(reservation_status(&db, reservation).await?, "reserved");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn reservation_lease_rejects_another_owner() -> anyhow::Result<()> {
+        let (db, _, session, reservation) = reservation_fixture("codex_reservation_owner").await?;
+        let other = uuid::Uuid::now_v7();
+        assert!(coding_reservations::lease(
+            &db,
+            reservation,
+            other,
+            session,
+            uuid::Uuid::now_v7(),
+            60
+        )
+        .await?
+        .is_none());
+        assert_eq!(reservation_status(&db, reservation).await?, "reserved");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn reservation_lease_rejects_another_coding_session() -> anyhow::Result<()> {
+        let (db, user, _, reservation) = reservation_fixture("codex_reservation_session").await?;
+        let other = uuid::Uuid::now_v7();
+        assert!(coding_reservations::lease(
+            &db,
+            reservation,
+            user,
+            other,
+            uuid::Uuid::now_v7(),
+            60
+        )
+        .await?
+        .is_none());
+        assert_eq!(reservation_status(&db, reservation).await?, "reserved");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn inactive_coding_session_is_rejected_before_any_lease() -> anyhow::Result<()> {
+        let (db, user, session, reservation) =
+            reservation_fixture("codex_reservation_inactive").await?;
+        create_session(&db, user, session, "completed").await?;
+        let Err(denied) = prepare_signed_run(&db, &signed_start(user, session, reservation)).await
+        else {
+            panic!("inactive coding session was prepared");
+        };
+        assert!(denied.to_string().contains("binding mismatch"));
+        assert_eq!(reservation_status(&db, reservation).await?, "reserved");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn reservation_lease_rejects_insufficient_runtime() -> anyhow::Result<()> {
+        let (db, user, session, reservation) =
+            reservation_fixture("codex_reservation_runtime").await?;
+        let too_long = u64::from(coding_reservations::MAX_RUNTIME_SECS) + 1;
+        assert!(coding_reservations::lease(
+            &db,
+            reservation,
+            user,
+            session,
+            uuid::Uuid::now_v7(),
+            too_long
+        )
+        .await?
+        .is_none());
+        assert_eq!(reservation_status(&db, reservation).await?, "reserved");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn reservation_lease_rejects_an_expired_reservation() -> anyhow::Result<()> {
+        let (db, user, session, reservation) =
+            reservation_fixture("codex_reservation_expired").await?;
+        db.query("UPDATE coding_reservations SET expires_at=time::now()-1s WHERE record::id(id)=$id RETURN NONE")
+            .bind(json!({"id":reservation.to_string()}))
+            .await?
+            .check()?;
+        assert!(coding_reservations::lease(
+            &db,
+            reservation,
+            user,
+            session,
+            uuid::Uuid::now_v7(),
+            60
+        )
+        .await?
+        .is_none());
+        assert_eq!(reservation_status(&db, reservation).await?, "reserved");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn reservation_is_single_use_across_concurrent_and_later_leases() -> anyhow::Result<()> {
+        let db = disposable_db("codex_reservation_single_use").await?;
+        let user = uuid::Uuid::now_v7();
+        let session = uuid::Uuid::now_v7();
+        for settled in [true, false] {
+            let reservation = coding_reservations::reserve(&db, user, session).await?;
+            let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+            let (lease_a, lease_b) = tokio::join!(
+                coding_reservations::lease(&db, reservation, user, session, a, 60),
+                coding_reservations::lease(&db, reservation, user, session, b, 60),
+            );
+            let (lease_a, lease_b) = (lease_a?, lease_b?);
+            assert_eq!(
+                usize::from(lease_a.is_some()) + usize::from(lease_b.is_some()),
+                1
+            );
+            let (winner, loser) = if lease_a.is_some() { (a, b) } else { (b, a) };
+            // Only the leasing run can finish it, and only once.
+            assert!(!coding_reservations::finish(&db, reservation, loser, settled).await?);
+            assert!(coding_reservations::finish(&db, reservation, winner, settled).await?);
+            assert!(!coding_reservations::finish(&db, reservation, winner, settled).await?);
+            assert!(coding_reservations::lease(
+                &db,
+                reservation,
+                user,
+                session,
+                uuid::Uuid::now_v7(),
+                60
+            )
+            .await?
+            .is_none());
+            let expected = if settled { "settled" } else { "released" };
+            assert_eq!(reservation_status(&db, reservation).await?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn default_configuration_reads_only_the_execution_flag() {
+        for flag in [None, Some("0"), Some("true"), Some(" 1"), Some("")] {
+            let read = Mutex::new(Vec::new());
+            let sandbox = configured_sandbox(|name| {
+                read.lock().unwrap().push(name.to_owned());
+                // Every other key is present: only the flag may decide.
+                if name == "JARVIS_CODEX_EXECUTION_ENABLED" {
+                    flag.map(str::to_owned)
+                } else {
+                    Some("must-not-be-read".into())
+                }
+            })
+            .unwrap();
+            assert!(sandbox.is_none());
+            assert_eq!(
+                *read.lock().unwrap(),
+                ["JARVIS_CODEX_EXECUTION_ENABLED".to_owned()]
+            );
+        }
+        // Enabled but incomplete configuration fails closed instead of
+        // defaulting to some manager.
+        let read = Mutex::new(Vec::new());
+        let enabled_without_manager = configured_sandbox(|name| {
+            read.lock().unwrap().push(name.to_owned());
+            (name == "JARVIS_CODEX_EXECUTION_ENABLED").then(|| "1".to_owned())
+        });
+        assert!(enabled_without_manager.is_err());
+        assert!(!read
+            .lock()
+            .unwrap()
+            .contains(&"JARVIS_CODEX_OPENSANDBOX_API_KEY".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn default_configuration_admits_nothing_and_touches_nothing() {
+        let request = signed_start(
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+        );
+        // Production default: execution flag unset, so no manager at all.
+        let state = broker(
+            unconnected_db(),
+            None,
+            Arc::new(UnavailableSubscriptionAdapter),
+            PathBuf::from("/nonexistent/jarvis-test-artifacts"),
+        );
+        let denied = start_run(&state, &request).await.unwrap_err();
+        assert!(denied.to_string().contains("not owner-enabled"));
+        // Without a manager there is nothing to reconcile and no lease may
+        // be released; the unconnected database proves no query was issued.
+        reconcile_owned_sandboxes(&state).await.unwrap();
+        assert!(state.active.lock().unwrap().is_empty());
+        assert_eq!(state.run_slots.available_permits(), 2);
+
+        // Even an owner-enabled manager stays untouched while the reviewed
+        // subscription adapter is unavailable.
+        let manager = Arc::new(CountingManager::default());
+        let state = broker(
+            unconnected_db(),
+            Some(manager.clone()),
+            Arc::new(UnavailableSubscriptionAdapter),
+            PathBuf::from("/nonexistent/jarvis-test-artifacts"),
+        );
+        let denied = start_run(&state, &request).await.unwrap_err();
+        assert!(denied
+            .to_string()
+            .contains("provider-only interface unavailable"));
+        assert!(manager.calls.lock().unwrap().is_empty());
+        assert!(state.active.lock().unwrap().is_empty());
+        assert_eq!(state.run_slots.available_permits(), 2);
+    }
 
     #[derive(Clone)]
     struct ManagerFixture {
@@ -1281,19 +2715,7 @@ mod tests {
     #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
     async fn startup_reconciles_stale_and_unrecorded_owned_sandboxes_without_touching_others(
     ) -> anyhow::Result<()> {
-        let db = Surreal::new::<Ws>(std::env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
-        db.signin(Root {
-            username: &std::env::var("JARVIS_SURREAL_TEST_USER")?,
-            password: &std::env::var("JARVIS_SURREAL_TEST_PASS")?,
-        })
-        .await?;
-        db.use_ns(format!(
-            "codex_recovery_fixture_{}",
-            uuid::Uuid::now_v7().simple()
-        ))
-        .use_db("test")
-        .await?;
-        jarvis_store::apply_baseline_schema(&db).await?;
+        let db = disposable_db("codex_recovery_fixture").await?;
         let user = uuid::Uuid::now_v7();
         let session = uuid::Uuid::now_v7();
         let run = uuid::Uuid::now_v7();
@@ -1333,6 +2755,7 @@ mod tests {
             core_uid: 0,
             sandbox: Some(manager),
             adapter: Arc::new(UnavailableSubscriptionAdapter),
+            artifacts_root: PathBuf::from("/nonexistent/jarvis-test-artifacts"),
             authority: Arc::new(RunCapabilityAuthority::default()),
             active: Arc::new(Mutex::new(HashMap::new())),
             run_slots: Arc::new(Semaphore::new(2)),

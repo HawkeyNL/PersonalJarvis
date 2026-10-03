@@ -348,6 +348,11 @@ pub trait SandboxProvider: Send + Sync {
         .await
     }
     async fn terminate(&self, handle: SandboxHandle) -> Result<(), SandboxError>;
+    /// Authenticated discovery of Jarvis Codex workloads for crash recovery.
+    /// Providers without verifiable manager metadata must fail closed.
+    async fn list_owned_codex(&self) -> Result<Vec<OwnedCodexSandbox>, SandboxError> {
+        Err(SandboxError::Unsupported)
+    }
 }
 
 /// Explicit disabled/fail-closed provider for production configurations where
@@ -478,7 +483,7 @@ pub struct OpenSandboxProvider {
 impl OpenSandboxProvider {
     /// Bounded, metadata-filtered discovery for crash recovery. Incomplete or
     /// malformed manager results fail closed; callers must not start new runs.
-    pub async fn list_owned_codex(&self) -> Result<Vec<OwnedCodexSandbox>, SandboxError> {
+    async fn discover_owned_codex(&self) -> Result<Vec<OwnedCodexSandbox>, SandboxError> {
         if !self.codex_only {
             return Err(SandboxError::Unsupported);
         }
@@ -642,6 +647,9 @@ impl OpenSandboxProvider {
 
 #[async_trait]
 impl SandboxProvider for OpenSandboxProvider {
+    async fn list_owned_codex(&self) -> Result<Vec<OwnedCodexSandbox>, SandboxError> {
+        self.discover_owned_codex().await
+    }
     async fn availability(&self) -> SandboxAvailability {
         let Ok(endpoint) = self.endpoint("health") else {
             return SandboxAvailability::Unavailable;
