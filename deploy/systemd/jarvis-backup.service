@@ -1,6 +1,10 @@
 [Unit]
 Description=Jarvis encrypted disaster-recovery backup (see docs/BACKUP_AND_RESTORE.md)
 After=docker.service jarvis-surrealdb.service
+# A failed run (for example a boot catch-up before the database is ready, or
+# exit 75 while busy) retries every 10 minutes, at most 3 starts in 2 hours.
+StartLimitIntervalSec=2h
+StartLimitBurst=3
 
 # Static by design: no [Install] section. Only jarvis-backup.timer is an owner
 # opt-in; installers and the updater never enable it.
@@ -13,6 +17,8 @@ Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 UMask=0077
 # The helper may wait up to 600s for a running Core update before exporting.
 TimeoutStartSec=2h
+Restart=on-failure
+RestartSec=10min
 NoNewPrivileges=true
 # Root reads /etc/jarvis files owned by service users; nothing else is needed.
 # The database is reached through the Docker socket, which dockerd serves.

@@ -31,6 +31,8 @@ if grep -Eq '^(\[Install\]|PartOf=|WantedBy=)' "$backup_service"; then
     exit 1
 fi
 grep -Eq '^TimeoutStartSec=' "$backup_service"
+grep -Fxq 'Restart=on-failure' "$backup_service"
+grep -Fxq 'StartLimitBurst=3' "$backup_service"
 # `is-enabled --quiet` also succeeds for static units; the updater must use
 # unit_enabled, which accepts only enabled|enabled-runtime.
 if grep -Fq 'is-enabled --quiet' "$repo_dir/deploy/systemd/update-core-release.sh"; then

@@ -131,9 +131,17 @@ The timer runs daily at 06:00 local time, plus a random delay of up to
 The schedule is fixed: a drop-in that changes `OnCalendar`, `Persistent` or
 `RandomizedDelaySec` blocks Core updates until it is removed.
 
-A run that finds another backup, a Core update or a configuration change in
-progress exits with code 75. `systemctl` then shows the service as failed; the
-previous archive is kept and the next run is the following morning.
+A failed run is retried after 10 minutes, at most 3 starts within 2 hours.
+This covers a boot catch-up that starts before Docker or the database is
+ready, and a run that finds another backup, a Core update or a configuration
+change in progress (exit code 75). Each failed attempt shows the service as
+failed; the previous archive is always kept. If every attempt fails, the
+timer tries again the next morning.
+
+While a backup runs it holds the Core updater lock. A 5-minute
+`jarvis-updater.service` run that starts meanwhile exits with code 75
+("another update is running") and shows as failed. That is harmless: the
+next updater run retries.
 
 **Disable the timer before rolling back** to a Core release without scheduled
 backups. The updater refuses that rollback while the timer is enabled or
