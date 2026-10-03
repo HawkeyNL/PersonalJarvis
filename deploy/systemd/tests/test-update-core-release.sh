@@ -59,7 +59,18 @@ if [[ ${JARVIS_LAYA_STATE_FIXTURE:-false} == true || ${JARVIS_CLAUDE_STATE_FIXTU
         state="$JARVIS_UPDATER_FIXTURE/$unit"
         case ${1:-} in
             is-active) [[ -e $state.active ]]; exit ;;
-            is-enabled) [[ -e $state.enabled ]]; exit ;;
+            is-enabled)
+                if [[ -e $state.enabled ]]; then echo enabled; exit 0; fi
+                # A unit without [Install] reports "static" (exit 0) once a
+                # release has installed it, i.e. after the next daemon-reload.
+                # The marker holds the log length when it was armed.
+                marker="$JARVIS_UPDATER_FIXTURE/$unit.static-after-reload"
+                if [[ -e $marker ]] && awk -v n="$(<"$marker")" \
+                    'NR > n && $0 == "daemon-reload" { found = 1 } END { exit !found }' \
+                    "$JARVIS_UPDATER_FIXTURE/systemctl.log"; then
+                    echo static; exit 0
+                fi
+                echo disabled; exit 1 ;;
             stop)
                 rm -f -- "$state.active"
                 [[ $unit != *.socket ]] || rm -f -- "$JARVIS_UPDATER_FIXTURE/$base.service.active"
@@ -87,7 +98,8 @@ if [[ ${1:-} == restart && ${2:-} == "${JARVIS_UPDATER_SYSTEMCTL_FAIL_ONCE:-}" &
     exit 1
 fi
 case ${1:-} in
-    daemon-reload|restart|try-restart|is-enabled|stop|start) exit 0 ;;
+    is-enabled) echo enabled; exit 0 ;;
+    daemon-reload|restart|try-restart|stop|start) exit 0 ;;
     *) exit 1 ;;
 esac
 EOF
@@ -951,4 +963,15 @@ for mode in disabled inactive socket_only active; do
     [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v12.0.1 ]]
     assert_claude_state "$expected"
 done
+# Regression: the first release that installs jarvis-claude.service (no
+# [Install] section) makes `systemctl is-enabled` report "static" after the
+# daemon-reload. That is not an owner opt-in and must not fail activation.
+seed_active_release v12.0.0 "$same_migrations" true false true
+set_claude_state
+prepare_candidate v12.0.3 "$same_migrations" 12.0.3 12.0.3 12.0.3 true '' false true
+wc -l < "$fixture_dir/systemctl.log" > "$fixture_dir/jarvis-claude.service.static-after-reload"
+run_updater
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v12.0.3 ]]
+assert_claude_state ''
+rm -f -- "$fixture_dir/jarvis-claude.service.static-after-reload"
 echo "Home Node updater fixture tests passed"
