@@ -119,6 +119,10 @@ account, the owner can deliberately enable the local worker with
 `sudo systemctl enable --now jarvis-claude.socket`. The socket is never
 enabled by `accounts connect` or by a Core update. `sudo jarvis accounts
 status claude` reports login status, not a verified billing ceiling.
+Core uses a `claude-cli` model only when that exact pair is enabled in
+`policy.json`. `sudo jarvis models refresh claude-cli` records the configured
+Claude tier models (disabled); `sudo jarvis models register claude-cli <model>`
+records any other one. Then `sudo jarvis models enable claude-cli <model>`.
 
 PR #58 delivers account linking, the isolated Claude worker, compute-class
 accounting and bounded delegated-context primitives. It does not enable Codex
@@ -194,11 +198,16 @@ App Server and broker processes, so a compromised official CLI could signal
 them. The same root-installed CLI already runs under that identity. Codex
 disconnect disables the chat socket before it logs out.
 
-**Version gate.** `REVIEWED_CODEX_VERSION` in
-`crates/llm/src/codex_chat_protocol.rs` is an empty placeholder. Until it holds
-the exact version the owner reviewed, every run returns `incompatible_runtime`
-without a model call. No Codex CLI version has been verified for this worker
-yet.
+**Version gate.** The worker reads `JARVIS_CODEX_REVIEWED_VERSION` once at
+start. systemd sets it from the optional, root-owned
+`/etc/jarvis/codex-chat-worker.env` (`EnvironmentFile=-` in
+`jarvis-codex-chat.service`; systemd reads it before the sandbox applies). Before
+each run the worker requires exactly one version number in `codex --version`
+output, equal to that value. Unset, empty or malformed (for example `v1.2.3`
+or `1.2`) means every run returns `incompatible_runtime` without a model call.
+A newer CLI needs a new review and a new value; there is no "or newer". No
+Codex CLI version has been verified for this worker yet. Changing the version
+needs no code change or release.
 
 Release capability `tooling.codex_chat_worker = 1` binds the worker binary and
 both units to the release checksums. Nothing enables the socket: not the
@@ -212,15 +221,20 @@ Owner activation:
    `/usr/local/bin/codex` (not a symlink or an npm wrapper).
 2. Check that this version supports every flag and `-c` key in the invocation
    above (`codex exec --help` and the official non-interactive and config
-   documentation). Then set `REVIEWED_CODEX_VERSION` to the exact
-   `codex --version` number in a reviewed change and ship a release.
+   documentation). Then record that exact `codex --version` number, for
+   example `1.2.3`:
+   `echo 'JARVIS_CODEX_REVIEWED_VERSION=1.2.3' | sudo tee /etc/jarvis/codex-chat-worker.env`
+   (root-owned, `0644`; it is not a secret). After a CLI update, review again
+   and change the value, then `sudo systemctl try-restart
+   jarvis-codex-chat.service`.
 3. `sudo jarvis accounts connect codex`, then `sudo jarvis accounts status
    codex` must report `connected`, not `wrong_auth_mode`.
-4. Make sure the pair, for example `codex-cli gpt-6-luna`, is in `policy.json`,
-   then `sudo jarvis models enable codex-cli gpt-6-luna`. Open gap: `jarvis
-   models refresh` does not record subscription pairs (`claude-cli`,
-   `codex-cli`) as discovered. There is no supported command yet that adds
-   them, so `enable` and `route set` refuse an absent pair.
+4. Record the exact pair, then enable it:
+   `sudo jarvis models register codex-cli gpt-6-luna` and
+   `sudo jarvis models enable codex-cli gpt-6-luna` (or "Register subscription
+   model" and Enable in Core Admin's Models view). Subscriptions have no model
+   catalog, so `refresh` cannot discover Codex models; `register` adds the pair
+   to `policy.json` as discovered and disabled (`source: owner_registered`).
 5. `sudo systemctl enable --now jarvis-codex-chat.socket`.
 6. Route a tier, for example `sudo jarvis models route set hard codex-cli
    gpt-6-luna claude-cli claude-opus-5`, or use Core Admin. This restarts Core,

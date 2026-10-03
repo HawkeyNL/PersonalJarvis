@@ -50,7 +50,18 @@ sudo jarvis models list
 sudo jarvis models enable openai-api gpt-4o-mini
 sudo jarvis models disable openai-api gpt-4o
 sudo jarvis models show openai-api gpt-4o-mini
+sudo jarvis models register codex-cli gpt-6-luna
 ```
+
+Subscription providers (`claude-cli`, `codex-cli`) have no model catalog.
+`refresh` and the hourly refresh record the Claude tier models configured for
+Core (`JARVIS_LLM_MODEL`, `_HARD`, `_CHEAP`) as `claude-cli` pairs, because the
+Claude worker runs those models. Any other subscription model is added with
+`register <claude-cli|codex-cli> <model>`: one exact pair, recorded as
+discovered and disabled with source `owner_registered`. The model id must be 1
+to 80 of `A-Z a-z 0-9 . _ -` and must not start with `-` (the subscription
+worker rule). Registering never enables a model or restarts Core; `enable`
+does. Core Admin offers the same in the Models view.
 
 The policy matches the literal provider and model ID. A newly listed or renamed
 model does not inherit another model's permission. Refresh retains existing
