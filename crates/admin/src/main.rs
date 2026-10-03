@@ -254,6 +254,89 @@ enum ModelsCommand {
         model: ModelId,
         route: HfRoute,
     },
+    /// Per-tier order of discovered models and the paid API switch. Routing
+    /// never enables a model; the allowlist still decides.
+    Route {
+        #[command(subcommand)]
+        command: RouteCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RouteCommand {
+    List,
+    Show {
+        tier: RouteTier,
+    },
+    /// Ordered `<provider> <model>` pairs, first choice first (at most 9).
+    Set {
+        tier: RouteTier,
+        #[arg(required = true, num_args = 2..=18)]
+        entries: Vec<String>,
+        /// Allow a paid API after a subscription in this chain.
+        #[arg(long)]
+        metered_after_subscription: bool,
+    },
+    /// Return the tier to the built-in order.
+    Reset {
+        tier: RouteTier,
+    },
+    /// `off` removes every paid (metered) API from every tier.
+    PaidApi {
+        state: PaidApiState,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RouteTier {
+    Cheap,
+    Default,
+    Hard,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PaidApiState {
+    Allowed,
+    Off,
+}
+
+fn value_name(value: impl ValueEnum) -> String {
+    value
+        .to_possible_value()
+        .expect("route values are never skipped")
+        .get_name()
+        .to_owned()
+}
+
+/// Typed `jarvis models route` arguments for the compatibility helper.
+fn route_arguments(command: RouteCommand) -> Result<Vec<String>> {
+    let mut arguments = vec!["route".to_owned()];
+    match command {
+        RouteCommand::List => arguments.push("list".into()),
+        RouteCommand::Show { tier } => arguments.extend(["show".into(), value_name(tier)]),
+        RouteCommand::Reset { tier } => arguments.extend(["reset".into(), value_name(tier)]),
+        RouteCommand::PaidApi { state } => arguments.extend(["paid-api".into(), value_name(state)]),
+        RouteCommand::Set {
+            tier,
+            entries,
+            metered_after_subscription,
+        } => {
+            if entries.len() % 2 != 0 {
+                bail!("give one or more <provider> <model> pairs");
+            }
+            arguments.extend(["set".into(), value_name(tier)]);
+            for pair in entries.chunks(2) {
+                let provider = Provider::from_str(&pair[0], false)
+                    .map_err(|_| anyhow::anyhow!("unknown provider"))?;
+                let model = pair[1].parse::<ModelId>().map_err(anyhow::Error::msg)?;
+                arguments.extend([provider.as_str().to_owned(), model.0]);
+            }
+            if metered_after_subscription {
+                arguments.push("--metered-after-subscription".into());
+            }
+        }
+    }
+    Ok(arguments)
 }
 
 #[derive(Debug, Args)]
@@ -1533,6 +1616,7 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
                 route.0,
             ]
         }
+        ModelsCommand::Route { command } => route_arguments(command)?,
     };
     compatibility_helper(AdminHelper::Models, arguments, verbose)
 }

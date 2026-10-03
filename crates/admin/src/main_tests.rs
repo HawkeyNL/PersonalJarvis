@@ -155,6 +155,66 @@ fn huggingface_route_cli_is_typed_and_rejects_shell_or_url_input() {
     }
 }
 
+fn route_helper_arguments(argv: &[&str]) -> Result<Vec<String>> {
+    let cli = Cli::try_parse_from(["jarvis", "models", "route"].iter().chain(argv))?;
+    let Some(Commands::Models(ModelsArgs {
+        command: ModelsCommand::Route { command },
+    })) = cli.command
+    else {
+        bail!("not a route command");
+    };
+    route_arguments(command)
+}
+
+#[test]
+fn model_route_cli_is_typed_and_maps_to_the_helper() {
+    assert_eq!(
+        route_helper_arguments(&[
+            "set",
+            "cheap",
+            "zai-api",
+            "glm-5.3-flash",
+            "claude-cli",
+            "claude-haiku-4-5",
+            "--metered-after-subscription",
+        ])
+        .unwrap(),
+        [
+            "route",
+            "set",
+            "cheap",
+            "zai-api",
+            "glm-5.3-flash",
+            "claude-cli",
+            "claude-haiku-4-5",
+            "--metered-after-subscription",
+        ]
+    );
+    assert_eq!(
+        route_helper_arguments(&["paid-api", "off"]).unwrap(),
+        ["route", "paid-api", "off"]
+    );
+    assert_eq!(
+        route_helper_arguments(&["reset", "hard"]).unwrap(),
+        ["route", "reset", "hard"]
+    );
+    assert_eq!(
+        route_helper_arguments(&["list"]).unwrap(),
+        ["route", "list"]
+    );
+    for argv in [
+        &["set", "turbo", "ollama", "a"][..],
+        &["set", "default", "ollama"],
+        &["set", "default", "ollama", "a", "ollama"],
+        &["set", "default", "jev", "a"],
+        &["set", "default", "ollama", "x\ny"],
+        &["paid-api", "maybe"],
+        &["show"],
+    ] {
+        assert!(route_helper_arguments(argv).is_err(), "{argv:?}");
+    }
+}
+
 fn admin_helper_layout(
     admin_helpers: bool,
 ) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, u32, u32) {
