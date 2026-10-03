@@ -21,7 +21,7 @@ use tokio::{
 
 use jarvis_config::AppConfig;
 use jarvis_identity as identity;
-use jarvis_llm::ModelAccessPolicy;
+use jarvis_llm::{ModelAccessPolicy, ModelRouting, ROUTING_MAX_BYTES};
 use jarvis_privileged::{Operation, SignedRequest};
 
 const SOCKET: &str = "/run/jarvis-config-broker/broker.sock";
@@ -72,9 +72,10 @@ async fn main() -> anyhow::Result<()> {
         };
         let db = db.clone();
         let policy = PathBuf::from(&config.llm_model_policy_path);
+        let routing = PathBuf::from(&config.llm_model_routing_path);
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle(stream, &db, &policy).await {
+            if let Err(error) = handle(stream, &db, &policy, &routing).await {
                 tracing::warn!(%error, "privileged broker request denied");
             }
         });
@@ -115,6 +116,7 @@ async fn handle(
     stream: UnixStream,
     db: &jarvis_store::Database,
     policy_path: &Path,
+    routing_path: &Path,
 ) -> anyhow::Result<()> {
     let (read, mut write) = stream.into_split();
     let line = read_request_frame(read, std::time::Duration::from_secs(5)).await?;
@@ -140,7 +142,7 @@ async fn handle(
         .await
         .map_err(|_| anyhow::anyhow!("untrusted owner device signature"))?;
         consume_once(request.request_id)?;
-        apply(&request.operation, policy_path)
+        apply(&request.operation, policy_path, routing_path)
     }
     .await;
     let outcome = match result.as_ref() {
@@ -175,7 +177,7 @@ fn consume_once(request_id: uuid::Uuid) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("approval replay rejected"))
 }
 
-fn apply(operation: &Operation, policy_path: &Path) -> anyhow::Result<()> {
+fn apply(operation: &Operation, policy_path: &Path, routing_path: &Path) -> anyhow::Result<()> {
     // Lock the stable protected directory, not the atomically replaced file.
     // The canonical CLI helper takes the same lock for its read/modify/write.
     use std::os::fd::AsRawFd;
@@ -202,9 +204,7 @@ fn apply(operation: &Operation, policy_path: &Path) -> anyhow::Result<()> {
             if &hash != expected_policy_sha256 {
                 bail!("policy version changed");
             }
-            let mut policy: ModelAccessPolicy =
-                serde_json::from_slice(&raw).context("malformed model policy")?;
-            policy.validate().map_err(anyhow::Error::msg)?;
+            let mut policy = parse_policy(&raw)?;
             let Some(entry) = policy
                 .models
                 .iter_mut()
@@ -216,8 +216,56 @@ fn apply(operation: &Operation, policy_path: &Path) -> anyhow::Result<()> {
             let replacement = serde_json::to_vec_pretty(&policy)?;
             atomic_root_write(policy_path, &replacement, 0o640)?;
         }
+        Operation::ModelRoutingSet {
+            routing,
+            expected_routing_sha256,
+        } => {
+            // The directory lock above must cover this file too.
+            if routing_path.parent() != policy_path.parent() {
+                bail!("model routing must live in the model policy directory");
+            }
+            let current = match fs::symlink_metadata(routing_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                _ => read_protected(routing_path)?,
+            };
+            let policy = parse_policy(&read_protected(policy_path)?)?;
+            let replacement =
+                routing_replacement(&current, &policy, routing, expected_routing_sha256)?;
+            // A new file takes the policy's root:jarvis ownership.
+            atomic_root_write_like(routing_path, policy_path, &replacement, 0o640)?;
+        }
     }
     Ok(())
+}
+
+fn parse_policy(raw: &[u8]) -> anyhow::Result<ModelAccessPolicy> {
+    let policy: ModelAccessPolicy =
+        serde_json::from_slice(raw).context("malformed model policy")?;
+    policy.validate().map_err(anyhow::Error::msg)?;
+    Ok(policy)
+}
+
+/// The full replacement for `routing.json`. The approval binds the exact
+/// current bytes, valid or not, so a broken file can be repaired.
+fn routing_replacement(
+    current: &[u8],
+    policy: &ModelAccessPolicy,
+    routing: &ModelRouting,
+    expected_sha256: &str,
+) -> anyhow::Result<Vec<u8>> {
+    if hex::encode(Sha256::digest(current)) != expected_sha256 {
+        bail!("routing version changed");
+    }
+    routing.validate().map_err(anyhow::Error::msg)?;
+    if !routing.all_discovered(policy) {
+        bail!("routed model is not discovered");
+    }
+    let replacement = serde_json::to_vec_pretty(routing)?;
+    // `atomic_root_write` appends a newline.
+    if replacement.len() >= ROUTING_MAX_BYTES {
+        bail!("model routing too large");
+    }
+    Ok(replacement)
 }
 
 fn read_protected(path: &Path) -> anyhow::Result<Vec<u8>> {
@@ -244,8 +292,24 @@ fn read_protected(path: &Path) -> anyhow::Result<Vec<u8>> {
 }
 
 fn atomic_root_write(path: &Path, content: &[u8], mode: u32) -> anyhow::Result<()> {
+    atomic_root_write_like(path, path, content, mode)
+}
+
+/// Replace `path` atomically. When it does not exist yet, `template` supplies
+/// the ownership and must pass the same safety checks.
+fn atomic_root_write_like(
+    path: &Path,
+    template: &Path,
+    content: &[u8],
+    mode: u32,
+) -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
-    let previous = fs::symlink_metadata(path)?;
+    let previous = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::symlink_metadata(template)?
+        }
+        result => result?,
+    };
     if !previous.file_type().is_file()
         || previous.uid() != 0
         || previous.permissions().mode() & 0o022 != 0
@@ -388,19 +452,125 @@ mod request_tests {
             unsafe { libc::flock(competing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
-        assert!(apply(&operation, &path).is_err());
+        assert!(apply(&operation, &path, &directory.join("routing.json")).is_err());
         assert_eq!(fs::read(&path).unwrap(), initial);
         drop(competing);
-        apply(&operation, &path).unwrap();
+        apply(&operation, &path, &directory.join("routing.json")).unwrap();
         let activated = read_protected(&path).unwrap();
         let policy: ModelAccessPolicy = serde_json::from_slice(&activated).unwrap();
         assert!(policy.allows("ollama-cloud", "fixture"));
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
-        assert!(apply(&operation, &path).is_err());
+        assert!(apply(&operation, &path, &directory.join("routing.json")).is_err());
         assert_eq!(read_protected(&path).unwrap(), activated);
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires root in an isolated CI runner; fixture paths only"]
+    fn root_routing_fixture_creates_repairs_and_rejects_stale_or_concurrent_writes() {
+        use std::os::fd::AsRawFd;
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let directory =
+            std::env::temp_dir().join(format!("jarvis-model-routing-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o750)).unwrap();
+        let policy = directory.join("policy.json");
+        let routing_path = directory.join("routing.json");
+        fs::write(&policy, br#"{"version":1,"models":[{"provider":"ollama","model":"fixture","enabled":false,"source":"discovered"}]}"#).unwrap();
+        fs::set_permissions(&policy, fs::Permissions::from_mode(0o640)).unwrap();
+        let file = fs::File::open(&policy).unwrap();
+        assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), 0, 42424) }, 0);
+        let routing =
+            ModelRouting::parse(br#"{"version":1,"paid_api":"off","tiers":{"cheap":{"chain":[{"provider":"ollama","model":"fixture"}]}}}"#)
+                .unwrap();
+        let operation = |expected: &[u8]| Operation::ModelRoutingSet {
+            routing: routing.clone(),
+            expected_routing_sha256: hex::encode(Sha256::digest(expected)),
+        };
+        // Stale: the approval saw a file that is not there.
+        assert!(apply(&operation(b"{}"), &policy, &routing_path).is_err());
+        assert!(!routing_path.exists());
+        // Another writer holds the shared directory lock.
+        let competing = fs::File::open(&directory).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(competing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(apply(&operation(b""), &policy, &routing_path).is_err());
+        drop(competing);
+        // Absent file: created root:<policy group> 0640.
+        apply(&operation(b""), &policy, &routing_path).unwrap();
+        let metadata = fs::metadata(&routing_path).unwrap();
+        assert_eq!((metadata.uid(), metadata.gid()), (0, 42424));
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+        let written = read_protected(&routing_path).unwrap();
+        assert_eq!(ModelRouting::parse(&written).unwrap(), routing);
+        // The same approval cannot be applied to the new version.
+        assert!(apply(&operation(b""), &policy, &routing_path).is_err());
+        // An invalid file is repaired by an approval bound to its bytes.
+        let broken = b"{\"version\":1,\"paid_api\":\"maybe\"}\n";
+        fs::write(&routing_path, broken).unwrap();
+        apply(&operation(broken), &policy, &routing_path).unwrap();
+        assert_eq!(read_protected(&routing_path).unwrap(), written);
+        // The lock covers only the policy directory.
+        let elsewhere = std::env::temp_dir().join("jarvis-routing-elsewhere.json");
+        assert!(apply(&operation(b""), &policy, &elsewhere).is_err());
+        assert!(!elsewhere.exists());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn discovered(models: &[(&str, &str)]) -> ModelAccessPolicy {
+        ModelAccessPolicy {
+            version: 1,
+            models: models
+                .iter()
+                .map(|(provider, model)| jarvis_llm::ModelAccessEntry {
+                    provider: (*provider).into(),
+                    model: (*model).into(),
+                    enabled: false,
+                    source: "discovered".into(),
+                    route: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn routing_replacement_binds_bytes_and_requires_discovered_pairs() {
+        let policy = discovered(&[
+            ("claude-cli", "claude-opus-5"),
+            ("zai-api", "glm-5.3-flash"),
+        ]);
+        let routing = ModelRouting::parse(
+            br#"{"version":1,"tiers":{"hard":{"chain":[{"provider":"zai-api","model":"glm-5.3-flash"},{"provider":"claude-cli","model":"claude-opus-5"}]}}}"#,
+        )
+        .unwrap();
+        let hash = |raw: &[u8]| hex::encode(Sha256::digest(raw));
+        // Absent file: bound to the hash of empty bytes.
+        let replacement = routing_replacement(b"", &policy, &routing, &hash(b"")).unwrap();
+        assert_eq!(ModelRouting::parse(&replacement).unwrap(), routing);
+        // Stale: the file changed after the owner approved.
+        let error = routing_replacement(b"{}", &policy, &routing, &hash(b"")).unwrap_err();
+        assert_eq!(error.to_string(), "routing version changed");
+        // Repair: invalid current bytes are accepted when the hash matches.
+        let broken = b"not json";
+        assert!(routing_replacement(broken, &policy, &routing, &hash(broken)).is_ok());
+        // Every pair must already be discovered (exact match).
+        let partial = discovered(&[("claude-cli", "claude-opus-5")]);
+        let error = routing_replacement(b"", &partial, &routing, &hash(b"")).unwrap_err();
+        assert_eq!(error.to_string(), "routed model is not discovered");
+        // An oversized chain is refused even when built without the parser.
+        let mut oversized = routing.clone();
+        oversized.tiers.hard.as_mut().unwrap().chain = (0..10)
+            .map(|index| jarvis_llm::RouteEntry {
+                provider: "ollama".into(),
+                model: format!("m{index}"),
+            })
+            .collect();
+        assert!(routing_replacement(b"", &policy, &oversized, &hash(b"")).is_err());
     }
 
     #[test]

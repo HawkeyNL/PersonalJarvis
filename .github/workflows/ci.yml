@@ -61,6 +61,7 @@ jobs:
           test -n "$broker_test"
           sudo "$broker_test" --ignored --exact request_tests::root_model_toggle_fixture_is_atomic_and_rejects_stale_or_concurrent_writes
           sudo "$broker_test" --ignored --exact request_tests::root_policy_namespace_requires_directory_not_file_write_access
+          sudo "$broker_test" --ignored --exact request_tests::root_routing_fixture_creates_repairs_and_rejects_stale_or_concurrent_writes
       - name: Native policy layout installation and rollback fixture
         run: |
           cargo build --locked -p jarvis-api --bin jarvis-model-policy-storage

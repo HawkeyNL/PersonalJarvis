@@ -133,6 +133,21 @@ impl ModelRouting {
         Ok(())
     }
 
+    /// Every routed pair is already discovered (exact match) in the policy.
+    /// Routing never grants access; this only keeps unknown ids out.
+    pub fn all_discovered(&self, policy: &crate::ModelAccessPolicy) -> bool {
+        [&self.tiers.cheap, &self.tiers.default, &self.tiers.hard]
+            .into_iter()
+            .flatten()
+            .flat_map(|route| &route.chain)
+            .all(|entry| {
+                policy
+                    .models
+                    .iter()
+                    .any(|known| known.provider == entry.provider && known.model == entry.model)
+            })
+    }
+
     pub fn tier(&self, tier: Tier) -> Option<&TierRoute> {
         match tier {
             Tier::Cheap => self.tiers.cheap.as_ref(),
@@ -333,6 +348,34 @@ mod tests {
             ModelRouting::parse(" ".repeat(ROUTING_MAX_BYTES + 1).as_bytes()),
             Err("model routing too large")
         );
+    }
+
+    #[test]
+    fn routed_pairs_must_be_discovered_exactly() {
+        let routing = ModelRouting::parse(VALID.as_bytes()).unwrap();
+        let entry = |provider: &str, model: &str| crate::ModelAccessEntry {
+            provider: provider.into(),
+            model: model.into(),
+            enabled: false,
+            source: "fixture".into(),
+            route: None,
+        };
+        let mut policy = crate::ModelAccessPolicy {
+            version: 1,
+            models: vec![
+                entry("zai-api", "glm-5.3-flash"),
+                entry("claude-cli", "claude-haiku-4-5"),
+                entry("claude-cli", "claude-sonnet-5"),
+                entry("claude-cli", "claude-opus-5"),
+            ],
+        };
+        assert!(routing.all_discovered(&policy));
+        policy.models[3].model = "Claude-Opus-5".into();
+        assert!(!routing.all_discovered(&policy));
+        policy.models.pop();
+        assert!(!routing.all_discovered(&policy));
+        let empty = ModelRouting::parse(br#"{"version":1}"#).unwrap();
+        assert!(empty.all_discovered(&policy));
     }
 
     #[test]
