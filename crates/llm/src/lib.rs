@@ -16,6 +16,7 @@ mod model_policy;
 mod ollama;
 mod openai_compat;
 mod router;
+mod routing;
 mod stream;
 mod types;
 
@@ -34,6 +35,10 @@ pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use router::{
     always_available, is_metered_backend, Availability, CatalogModel, ModelClass, RouterProvider,
+};
+pub use routing::{
+    LiveRouting, ModelRouting, PaidApi, RouteEntry, RoutingSnapshot, TierRoute, TierRoutes,
+    ROUTING_MAX_BYTES, ROUTING_PROVIDERS,
 };
 pub use stream::TextDeltaSink;
 pub use types::{
@@ -306,14 +311,17 @@ pub fn build_router_with_policy(
         availability,
         catalog,
         Arc::new(LiveModelPolicy::new(model_policy)),
+        Arc::default(),
     )
 }
 
+/// The production router: live owner allowlist plus live owner routing.
 pub fn build_router_with_live_policy(
     cfg: ProviderConfig,
     availability: Arc<dyn Availability>,
     catalog: Vec<router::CatalogModel>,
     model_policy: Arc<LiveModelPolicy>,
+    routing: Arc<LiveRouting>,
 ) -> Arc<dyn LlmProvider> {
     let mut candidates = Vec::new();
     if let Some(ollama) = build_ollama(&cfg) {
@@ -373,12 +381,10 @@ pub fn build_router_with_live_policy(
     if candidates.is_empty() {
         return Arc::new(Unconfigured);
     }
-    Arc::new(RouterProvider::with_live_policy(
-        candidates,
-        availability,
-        catalog,
-        model_policy,
-    ))
+    Arc::new(
+        RouterProvider::with_live_policy(candidates, availability, catalog, model_policy)
+            .with_routing(routing),
+    )
 }
 
 /// A brain that always errors — when nothing is configured.

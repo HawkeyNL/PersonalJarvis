@@ -363,6 +363,7 @@ async fn main() -> anyhow::Result<()> {
         availability,
         catalog,
         model_policy.clone(),
+        Arc::default(),
     );
     tracing::info!(brain = %llm.label(), "llm brain configured");
 
