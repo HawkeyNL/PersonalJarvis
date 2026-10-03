@@ -71,6 +71,7 @@ sudo jarvis update --version v0.0.9
 sudo jarvis update --check          # non-mutating; exit 2 means available
 sudo jarvis update --status
 sudo jarvis update --rollback       # asks for confirmation
+sudo jarvis update --migrate v0.1.0 # schema-changing release; asks for the typed tag
 ```
 
 The Update Center remains open while checks and trusted updater operations run.
@@ -101,9 +102,16 @@ Only GitHub Releases that are neither draft nor prerelease are accepted. The
 existing verified-release protocol downloads the artifact and checksum over
 HTTPS, validates archive layout and release manifest, preserves the previous
 release, restarts Core, and waits for bounded readiness checks. A failed
-activation restores the previous known-good release. Automatic timer updates
-continue to refuse schema-changing releases; perform those manually with a
-backup and recovery plan.
+activation restores the previous known-good release. The timer, `--latest` and
+`--version` continue to refuse schema-changing releases; use the explicit
+migration below.
+
+`--check` and `--status` print a `Schema:` line computed from the published
+component manifest against the active release: `unchanged`, `migration
+required`, `unsupported transition` (the candidate does not list the active
+schema fingerprint) or `unknown` (the manifest predates these fields). When a
+migration is required, `--check` also prints the hint
+`sudo jarvis update --migrate vX.Y.Z` on stderr.
 
 Releases declaring `tooling.systemd_units: 1` also carry the exact ten
 Home Node unit files as immutable `systemd-<unit-name>` artifacts. They and the
@@ -347,24 +355,55 @@ Never send codes through command arguments, redirects, logs or support messages.
 The account password is separate and must be at least 15 characters. Older
 hexadecimal activation codes remain supported by the verifier and clients.
 
-### Schema-changing account-onboarding release
+### Schema-changing releases
 
 Routine `update --latest` and `update --version` intentionally refuse a changed
-database schema. The schema-8 account release has an explicit maintenance path
-for the exact reviewed schema-6/7 fingerprints declared in its release manifest.
-It is not a generic migration override and is not invoked by the timer.
+database schema. A release may authorize a migration only from the exact schema
+fingerprints listed in its manifest (`schema_migration.from_sha256`). This is
+not a generic override and is never invoked by the timer.
 
-After the candidate archive has been verified and staged in the immutable release
-directory, use **that candidate's** updater, not an older installed updater:
-
-```text
-sudo /opt/jarvis/releases/<candidate-tag>/update-core-release --migrate-staged <candidate-tag>
+```bash
+sudo jarvis update --migrate v0.1.0        # typed confirmation of the exact tag
+sudo jarvis update --migrate               # latest release; interactive only
+sudo jarvis update --migrate v0.1.0 --yes  # reviewed automation; tag required
 ```
 
-Replace both placeholders with the same verified `vMAJOR.MINOR.PATCH` tag.
-Do not copy individual binaries into the active release or bypass the candidate
-acceptance process. Schedule a maintenance window and close connected clients.
-This command stops Core and the fixed production SurrealDB service, checks that
+The command runs in two steps and does not hold the administration config lock:
+
+1. The installed updater runs `--stage vX.Y.Z`: it downloads the release over
+   the normal verified path, checks that the candidate authorizes a migration
+   from the active schema fingerprint, writes the verification marker and moves
+   the release into `/opt/jarvis/releases/vX.Y.Z` without stopping or
+   activating anything. Staging is idempotent. A same-schema release is refused
+   (use `--version`). An existing but invalid release directory is reported by
+   path and must be removed by the owner; it is never deleted automatically.
+2. After the owner types the exact tag, the CLI checks that
+   `/opt/jarvis/releases/vX.Y.Z/update-core-release` is a root-owned regular
+   file that is not group- or other-writable and resolves inside the release
+   root, then runs **that candidate's** `--migrate-staged vX.Y.Z`.
+
+Exit status 75 means another update or backup holds the updater lock; the
+release stays staged and the same command can simply be rerun. `--json` is
+refused for this mutation.
+
+The Core Admin App offers the same action when `Schema` is `migration
+required`. Its confirmation stays disabled until the exact tag is typed, and
+the migration runs through `pkexec` under the `com.hawkeynl.jarvis.core.migrate`
+PolicyKit action (`auth_admin`, never `_keep`): the OS password is requested
+again even while the application session is unlocked.
+
+Integrity caveat: the archive SHA-256 comes from the same GitHub release as the
+archive. It proves the download is intact and matches the published release,
+not that the release was signed by the owner.
+
+`/usr/local/libexec/jarvis/stage-core-release` is for fresh-host bootstrap only.
+Do not use it to stage a migration on an installed Home Node; use
+`sudo jarvis update --migrate` instead. Do not copy individual binaries into
+the active release or bypass the candidate acceptance process.
+
+Schedule a maintenance window and close connected clients. The migration checks
+free space for the snapshot before stopping anything, then stops Core and the
+fixed production SurrealDB service, checks that
 the database container stopped, creates a root-only cold snapshot, verifies the
 copied bytes, then activates matching binaries, units and PolicyKit policy.
 The database's own storage version and container image are not upgraded here.
