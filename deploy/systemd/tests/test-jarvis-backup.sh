@@ -155,11 +155,17 @@ done
 printf 'keep' > "$fixture/dest/notes.txt"
 printf 'target' > "$fixture/outside"
 ln -s "$fixture/outside" "$fixture/dest/jarvis-backup-2026-01-01.tar"
+# A future-dated archive (clock skew, manual copy) sorts first by name but must
+# never evict the archive that was just published.
+printf 'future' > "$fixture/dest/jarvis-backup-2099-01-01.tar"
 mkdir "$fixture/dest/.jarvis-backup.stale"
-prune "$fixture/dest"
+expect_fail prune "$fixture/dest" ''
+expect_fail prune "$fixture/dest" notes.txt
+prune "$fixture/dest" jarvis-backup-2026-10-03.tar
 remaining=$(find "$fixture/dest" -maxdepth 1 -name 'jarvis-backup-*.tar' -type f -printf '%f\n' | sort | tr '\n' ' ')
-[[ $remaining == "$(printf 'jarvis-backup-2026-09-0%s.tar ' 4 5 6 7 8 9)jarvis-backup-2026-10-03.tar " ]]
-[[ ! -e $fixture/dest/jarvis-backup-2026-09-03.tar && ! -e $fixture/dest/jarvis-backup-2026-09-03.tar.sha256 ]]
+[[ $remaining == "$(printf 'jarvis-backup-2026-09-0%s.tar ' 5 6 7 8 9)jarvis-backup-2026-10-03.tar jarvis-backup-2099-01-01.tar " ]]
+[[ ! -e $fixture/dest/jarvis-backup-2026-09-04.tar && ! -e $fixture/dest/jarvis-backup-2026-09-04.tar.sha256 ]]
+verify "$archive" 2>/dev/null
 [[ -e $fixture/dest/jarvis-backup-2026-10-03.tar && -e $fixture/dest/notes.txt ]]
 [[ -L $fixture/dest/jarvis-backup-2026-01-01.tar && $(cat "$fixture/outside") == target ]]
 [[ ! -e $fixture/dest/.jarvis-backup.stale ]]

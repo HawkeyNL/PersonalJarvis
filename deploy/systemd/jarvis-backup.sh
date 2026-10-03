@@ -172,15 +172,19 @@ publish() {
     printf '%s\n' "$dest/$name"
 }
 
-# Keep the newest $keep archives. Only regular files with the exact archive
+# Keep the just-published archive $2 plus the newest $keep-1 others. The
+# current archive is never a deletion candidate, so a future-dated name (clock
+# skew, manual copy) cannot evict it. Only regular files with the exact archive
 # name are considered; symlinks and other files are never touched.
 prune() {
-    local dest=$1 old
+    local dest=$1 current=$2 old
+    [[ $current =~ ^$archive_pattern$ ]] || fail 'prune needs the current archive name'
     find "$dest" -mindepth 1 -maxdepth 1 -type d -name '.jarvis-backup.*' -exec rm -rf -- {} +
     while IFS= read -r old; do
         rm -f -- "$dest/$old" "$dest/$old.sha256"
     done < <(find "$dest" -mindepth 1 -maxdepth 1 -type f -regextype posix-extended \
-        -regex ".*/$archive_pattern" -printf '%f\n' | LC_ALL=C sort -r | tail -n +$((keep + 1)))
+        -regex ".*/$archive_pattern" -printf '%f\n' | awk -v current="$current" '$0 != current' \
+        | LC_ALL=C sort -r | tail -n +"$keep")
 }
 
 # Integrity and shape check; needs no key.
@@ -344,7 +348,7 @@ create() {
     local archive
     archive=$(publish "$staging_dir" "$destination" "$day")
     verify "$archive"
-    prune "$destination"
+    prune "$destination" "${archive##*/}"
 }
 
 main() {
