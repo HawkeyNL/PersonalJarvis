@@ -6,6 +6,9 @@ bash deploy/systemd/tests/test-model-policy-activation.sh
 sudo bash deploy/systemd/tests/test-device-policy-release.sh
 sudo bash deploy/systemd/tests/test-schema-backup.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-schema-backup-surreal.sh
+bash deploy/systemd/tests/test-jarvis-backup.sh
+sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-jarvis-backup-surreal.sh
+shellcheck -x deploy/systemd/jarvis-backup.sh deploy/systemd/tests/test-jarvis-backup.sh deploy/systemd/tests/test-jarvis-backup-surreal.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-update-core-release.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-jarvis-admin-cli.sh
 bash deploy/systemd/tests/test-ui-tty.sh
