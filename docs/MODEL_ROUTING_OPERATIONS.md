@@ -91,8 +91,10 @@ the verified unit manager; failed activation restores the backed-up unit set.
 
 The Home Node contains a minimal local root broker for app model toggles. It is
 a Unix-socket service only: no HTTP listener, shell, arbitrary path,
-environment or command operation. Its sole allowlisted operation changes the
-enabled bit of an already discovered exact provider/model pair. A Bearer session
+environment or command operation. It has two allowlisted operations:
+`model.set_enabled` changes the enabled bit of an already discovered exact
+provider/model pair, and `model.routing_set` replaces the owner routing
+document (see [Owner routing](#owner-routing-routingjson)). A Bearer session
 is never sufficient. The owner device signs a domain-separated canonical
 payload containing action, payload hash, request ID, nonce, owner/device IDs,
 issue/expiry times and the current policy SHA-256. The broker independently
@@ -102,6 +104,110 @@ atomically replacing the policy; a changed policy requires a fresh signature.
 Credentials remain root-TTY-only through `jarvis credentials`. They are not
 sent through the app or broker until a separately reviewed sealed secret-transfer
 protocol exists; there is deliberately no unsafe fallback.
+
+## Owner routing (`routing.json`)
+
+`/etc/jarvis/model-policy/routing.json` (`root:jarvis 0640`, next to
+`policy.json`, same directory lock; Core setting `llm_model_routing_path`)
+lets the owner choose the exact provider/model order per tier and switch paid
+APIs off. It only orders candidates. It never enables a model: every attempt
+still has to pass the allowlist (`enabled`), the monthly cap, availability and
+health.
+
+```json
+{"version": 1,
+ "paid_api": "allowed",
+ "tiers": {
+   "cheap": {"chain": [{"provider": "zai-api", "model": "glm-5.3-flash"},
+                       {"provider": "claude-cli", "model": "claude-haiku-4-5"}],
+             "metered_after_subscription": false},
+   "hard":  {"chain": [{"provider": "claude-cli", "model": "claude-opus-5"}]}}}
+```
+
+Validation (Core, broker and CLI apply the same rules): only these fields;
+`version` is 1; at most 64 KiB; tiers are `cheap`, `default` and `hard`; a
+missing tier keeps the built-in order for that tier; a chain has 1 to 9
+entries; providers are the routable provider IDs (`anthropic-api`,
+`openai-api`, `deepseek-api`, `xai-api`, `zai-api`, `ollama`, `ollama-cloud`,
+`huggingface`, `claude-cli`); a model has 1 to 256 characters and no control
+characters; no duplicate pairs. A metered entry after a subscription entry
+(`claude-cli`) is refused unless the tier sets
+`"metered_after_subscription": true`, so a full plan never silently becomes a
+paid call. The CLI and the broker also require every routed pair to be
+discovered in `policy.json`.
+
+`paid_api` is the "subscriptions and local only" switch. `"allowed"` is the
+default when the field or the file is absent. `"off"` removes every metered
+backend (everything except local `ollama` and subscription `claude-cli`) from
+every tier, routed chains and the built-in order alike. A brain pin or
+explicit provider that selects a metered backend is then refused with a
+bounded `409 paid API is off` error instead of being rerouted. When the
+monthly cap is reached and nothing is available, Core never tries a metered
+backend anyway.
+
+Failure behaviour:
+
+| State | Behaviour |
+| --- | --- |
+| File absent | Built-in order, paid APIs allowed. |
+| Valid | Routed chains and switch as written. |
+| Invalid, oversized, unsafe owner/mode, symlink or unreadable | Built-in order **without** metered backends; logged; `routing_unavailable_reason` reports it. |
+| Signed change could not be verified | Same fail-closed state (`routing_activation_unverified`) until the owner verifies routing and restarts Core. |
+
+Core reads routing only at startup and through the signed broker path; there
+is no file watcher. `GET /v1/system/models` reports `routing`,
+`routing_sha256`, `routing_unavailable_reason` and `routing_mutation`
+(`device-signed-model-route-v1` when the broker is available and the file is
+readable, otherwise `unavailable`).
+
+### CLI
+
+```bash
+sudo jarvis models route list
+sudo jarvis models route show cheap
+sudo jarvis models route set cheap zai-api glm-5.3-flash claude-cli claude-haiku-4-5
+sudo jarvis models route set default claude-cli claude-opus-5 anthropic-api claude-opus-5 --metered-after-subscription
+sudo jarvis models route reset cheap
+sudo jarvis models route paid-api off
+```
+
+Every command takes the policy directory lock. Changes validate the complete
+result, require discovered pairs, write atomically as `root:jarvis 0640` and
+restart Core. A failed restart stops Core rather than leaving an old route
+live. The CLI refuses to edit an existing invalid or unsafe file; remove it as
+root or replace it through a signed app change.
+
+### Signed app change (`model.routing_set`)
+
+The app replaces the whole document. The approval uses the same
+`jarvis-privileged-config-v1` message as `model.set_enabled`, with action
+`model.routing_set`, the SHA-256 of the canonical payload, and as state hash
+the `routing_sha256` from `GET /v1/system/models`: SHA-256 of the exact current
+file bytes, of empty bytes when the file is absent, and also of invalid bytes,
+so a broken file can be repaired. It is `null` only when the file cannot be
+read safely.
+
+The canonical payload is compact JSON without whitespace, in this field order:
+`action`, `routing` (`version`, `paid_api`, `tiers` with `cheap`, `default`,
+`hard`; each tier `chain` of `provider`, `model`, then
+`metered_after_subscription`), `expected_routing_sha256`. An absent tier is
+omitted; `paid_api` and `metered_after_subscription` are always written. Only
+`"` and `\` are escaped; `/` and non-ASCII characters are written as UTF-8.
+Fixed vector (in `crates/client-core/src/model_control.rs`):
+
+```text
+{"action":"model_routing_set","routing":{"version":1,"paid_api":"off","tiers":{"cheap":{"chain":[{"provider":"huggingface","model":"org/modèl"},{"provider":"claude-cli","model":"claude-haiku-4-5"}],"metered_after_subscription":false},"hard":{"chain":[{"provider":"claude-cli","model":"claude-opus-5"},{"provider":"anthropic-api","model":"claude-opus-5"}],"metered_after_subscription":true}}},"expected_routing_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+SHA-256: a9c73476991bb884fbaf43378882c25f4403a8ce3daa44d1012221ce15e30a59
+```
+
+The broker checks signature, device, expiry and replay marker, takes the
+directory lock, compares the state hash, validates the document, requires
+every pair to be discovered and writes atomically (`0640`, the policy's
+group). Core forwards the request, reads the file back and activates it only
+if it is exactly the signed document and the live routing did not change
+meanwhile. A lost reply, a different read-back or a concurrent change turns
+paid APIs off (`routing_activation_unverified`). The signed request must fit
+the broker's 16 KiB frame.
 
 ## Routing, health and spend
 
@@ -192,4 +298,5 @@ Provider output is untrusted. Model routing changes no `jarvis-policy`, signed
 approval, OpenSandbox, protected persona, agent-bundle or Codex boundary.
 Provider keys must never be passed into an agent, sandbox, shell command,
 browser context, worktree or prompt.  The public release/update path does not
-write `/etc/jarvis/secrets` or `/etc/jarvis/model-policy.json`.
+write `/etc/jarvis/secrets`, `/etc/jarvis/model-policy.json` or
+`/etc/jarvis/model-policy/routing.json`.
