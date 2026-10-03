@@ -47,12 +47,16 @@ stop_database() {
 }
 # Fail before any service stops when the snapshot cannot fit. The margin
 # (10% plus 64 MiB) absorbs filesystem overhead and growth before Core stops.
+# On a shared filesystem a failed migration also restores a full copy while
+# keeping the failed tree, so twice the database size must fit.
 require_snapshot_space() {
-    local needed available required
-    needed=$(du -skx -- "$database" | awk '{print $1}')
-    available=$(df -Pk -- "$backups" | awk 'NR == 2 {print $4}')
+    local needed available required copies=1
+    # The database is still live here; du may race RocksDB file churn.
+    needed=$(du -skx -- "$database" 2>/dev/null | awk '{print $1}') || true
+    available=$(df -Pk -- "$backups" | awk 'NR == 2 {print $4}') || true
     [[ $needed =~ ^[0-9]+$ && $available =~ ^[0-9]+$ ]] || fail 'could not measure snapshot space; services were not stopped'
-    required=$((needed + needed / 10 + 65536))
+    [[ $(stat -c %d -- "$database") != "$(stat -c %d -- "$backups")" ]] || copies=2
+    required=$((copies * needed + needed / 10 + 65536))
     ((available >= required)) || \
         fail "insufficient space in $backups: need $((required / 1024)) MiB, $((available / 1024)) MiB available; services were not stopped"
 }

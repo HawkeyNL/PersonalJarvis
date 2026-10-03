@@ -23,6 +23,16 @@ fi
 grep -Fq 'insufficient space' "$fixture/lowspace.err"
 [[ ! -e $fixture/lowspace/systemctl-called ]]
 [[ -z $(find "$fixture/state/migration-backups" -mindepth 1 -print -quit) ]]
+# Database and backups share a filesystem here, so restore space counts
+# twice: 1 GiB fits once with margin (1.2 GiB free) but not twice.
+printf '#!/usr/bin/env bash\nprintf "1000000\\t%%s\\n" "$3"\n' > "$fixture/lowspace/du"
+printf '#!/usr/bin/env bash\nprintf "Filesystem 1024-blocks Used Available Capacity Mounted on\\nfixture 9000000 7800000 1200000 87%%%% /\\n"\n' > "$fixture/lowspace/df"
+chmod 0755 "$fixture/lowspace/du" "$fixture/lowspace/df"
+if PATH="$fixture/lowspace:$PATH" bash "$helper" create v1.0.0 v1.0.1 2>"$fixture/lowspace.err"; then
+    echo 'snapshot ignored restore space on a shared filesystem' >&2; exit 1
+fi
+grep -Fq 'need 2114 MiB' "$fixture/lowspace.err"
+[[ ! -e $fixture/lowspace/systemctl-called ]]
 if FIXTURE_RUNNING=true bash "$helper" create v1.0.0 v1.0.1; then echo 'running database was copied' >&2; exit 1; fi
 id=$(bash "$helper" create v1.0.0 v1.0.1)
 [[ $id =~ ^txn\.[A-Za-z0-9]{8}$ ]]
