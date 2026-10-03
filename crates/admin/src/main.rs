@@ -1044,7 +1044,8 @@ fn candidate_updater(releases_root: &Path, tag: &str, owner_uid: u32) -> Result<
     if canonical != updater {
         bail!("staged candidate updater does not resolve inside the release root");
     }
-    for (path, file) in [(&release, false), (&updater, true)] {
+    let root = releases_root.to_path_buf();
+    for (path, file) in [(&root, false), (&release, false), (&updater, true)] {
         let metadata = fs::symlink_metadata(path).context("inspect staged candidate updater")?;
         let kind_ok = if file {
             metadata.file_type().is_file() && metadata.mode() & 0o100 != 0

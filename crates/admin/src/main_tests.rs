@@ -881,6 +881,7 @@ fn typed_confirmation_requires_the_exact_tag() {
 fn candidate_updater_must_be_the_exact_owned_staged_file() {
     let directory = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(directory.path()).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
     let owner = fs::metadata(&root).unwrap().uid();
     let release = root.join("v1.2.3");
     fs::create_dir(&release).unwrap();
