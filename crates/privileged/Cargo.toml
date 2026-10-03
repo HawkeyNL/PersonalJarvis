@@ -14,6 +14,7 @@ uuid.workspace = true
 time.workspace = true
 thiserror.workspace = true
 jarvis-identity.workspace = true
+jarvis-llm.workspace = true
 
 [dev-dependencies]
 ed25519-dalek.workspace = true

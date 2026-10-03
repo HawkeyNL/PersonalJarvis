@@ -11,7 +11,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
 
-use crate::admin::{self, LogQuery, ModelMutation, ProgramOutput, UpdateMutation};
+use crate::admin::{self, LogQuery, ModelMutation, ProgramOutput, RouteMutation, UpdateMutation};
 
 const PKEXEC: &str = "/usr/bin/pkexec";
 const INSTALLED_ADMIN_APP: &str = "/usr/bin/jarvis-core-admin";
@@ -41,6 +41,8 @@ pub(crate) enum BrokerRequest {
     ModelProviders { model: String },
     Usage,
     ModelMutation { request: ModelMutation },
+    ModelRoutes,
+    ModelRouteMutation { request: RouteMutation },
     Credentials,
     Accounts,
     Devices { pending: bool },

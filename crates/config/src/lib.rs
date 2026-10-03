@@ -158,6 +158,12 @@ pub struct AppConfig {
     )]
     pub llm_model_policy_path: String,
 
+    /// Root-owned owner routing (`routing.json`): per-tier provider/model
+    /// order and the paid-API switch. Missing keeps the built-in order;
+    /// unusable fails closed to the built-in order without paid APIs.
+    #[serde(default = "default_llm_model_routing_path")]
+    pub llm_model_routing_path: String,
+
     /// Root-owned, versioned provider pricing metadata. It is not a secret;
     /// malformed/missing input falls back to conservative built-in pricing.
     #[serde(default = "default_llm_pricing_registry_path")]
@@ -453,6 +459,10 @@ fn default_ollama_model() -> String {
 
 fn default_llm_model_policy_path() -> String {
     "/etc/jarvis/model-policy/policy.json".to_string()
+}
+
+fn default_llm_model_routing_path() -> String {
+    "/etc/jarvis/model-policy/routing.json".to_string()
 }
 
 fn model_policy_path<'de, D: serde::Deserializer<'de>>(
@@ -783,6 +793,7 @@ impl fmt::Debug for AppConfig {
             .field("llm_ollama_url", &self.llm_ollama_url)
             .field("llm_ollama_model", &self.llm_ollama_model)
             .field("llm_model_policy_path", &self.llm_model_policy_path)
+            .field("llm_model_routing_path", &self.llm_model_routing_path)
             .field("llm_pricing_registry_path", &self.llm_pricing_registry_path)
             .field("privileged_broker_socket", &self.privileged_broker_socket)
             .field("codex_broker_socket", &self.codex_broker_socket)
@@ -902,6 +913,7 @@ mod tests {
             llm_ollama_url: "http://localhost:11434".to_string(),
             llm_ollama_model: "llama3.2".to_string(),
             llm_model_policy_path: "/etc/jarvis/model-policy.json".to_string(),
+            llm_model_routing_path: default_llm_model_routing_path(),
             llm_pricing_registry_path: "/etc/jarvis/pricing-registry.json".to_string(),
             privileged_broker_socket: String::new(),
             codex_broker_socket: String::new(),
@@ -1039,6 +1051,7 @@ mod tests {
             llm_ollama_url: String::new(),
             llm_ollama_model: String::new(),
             llm_model_policy_path: String::new(),
+            llm_model_routing_path: String::new(),
             llm_pricing_registry_path: String::new(),
             privileged_broker_socket: String::new(),
             codex_broker_socket: String::new(),

@@ -8,6 +8,8 @@
 mod anthropic;
 mod claude_cli;
 pub mod claude_worker_protocol;
+pub mod codex_chat_protocol;
+mod codex_cli;
 mod fallback;
 mod huggingface;
 mod huggingface_catalog;
@@ -16,6 +18,7 @@ mod model_policy;
 mod ollama;
 mod openai_compat;
 mod router;
+mod routing;
 mod stream;
 mod types;
 
@@ -25,6 +28,7 @@ use async_trait::async_trait;
 
 pub use anthropic::AnthropicProvider;
 pub use claude_cli::ClaudeCliProvider;
+pub use codex_cli::CodexCliProvider;
 pub use fallback::FallbackProvider;
 pub use huggingface::{hf_routed_model, HuggingFaceProvider, HuggingFaceRoute};
 pub use huggingface_catalog::{HuggingFaceCatalog, HuggingFaceModel, HuggingFaceProviderMetadata};
@@ -32,7 +36,13 @@ pub use live_policy::LiveModelPolicy;
 pub use model_policy::{validate_hf_route, ModelAccessEntry, ModelAccessPolicy};
 pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
-pub use router::{always_available, Availability, CatalogModel, ModelClass, RouterProvider};
+pub use router::{
+    always_available, is_metered_backend, Availability, CatalogModel, ModelClass, RouterProvider,
+};
+pub use routing::{
+    LiveRouting, ModelRouting, PaidApi, RouteEntry, RoutingSnapshot, TierRoute, TierRoutes,
+    ROUTING_MAX_BYTES, ROUTING_PROVIDERS,
+};
 pub use stream::TextDeltaSink;
 pub use types::{
     classify_task, ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, Role,
@@ -153,6 +163,7 @@ fn build_huggingface(
 
 /// Build the local Ollama brain, if the client constructs (no network yet).
 fn build_ollama(cfg: &ProviderConfig) -> Option<Arc<dyn LlmProvider>> {
+    router::record_ollama_url(&cfg.ollama_url);
     OllamaProvider::new(&cfg.ollama_url, &cfg.ollama_model)
         .ok()
         .map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
@@ -304,14 +315,17 @@ pub fn build_router_with_policy(
         availability,
         catalog,
         Arc::new(LiveModelPolicy::new(model_policy)),
+        Arc::default(),
     )
 }
 
+/// The production router: live owner allowlist plus live owner routing.
 pub fn build_router_with_live_policy(
     cfg: ProviderConfig,
     availability: Arc<dyn Availability>,
     catalog: Vec<router::CatalogModel>,
     model_policy: Arc<LiveModelPolicy>,
+    routing: Arc<LiveRouting>,
 ) -> Arc<dyn LlmProvider> {
     let mut candidates = Vec::new();
     if let Some(ollama) = build_ollama(&cfg) {
@@ -323,6 +337,12 @@ pub fn build_router_with_live_policy(
     candidates.push(router::Candidate {
         id: "claude-cli".into(),
         provider: build_claude_cli(&cfg),
+    });
+    // Not in any built-in order: reached only through an owner-routed chain
+    // or a pin, so it stays off until the owner chooses it.
+    candidates.push(router::Candidate {
+        id: "codex-cli".into(),
+        provider: Arc::new(CodexCliProvider),
     });
     if let Some(deepseek) = build_openai_compat("deepseek", "deepseek-api", &cfg.deepseek) {
         candidates.push(router::Candidate {
@@ -371,12 +391,10 @@ pub fn build_router_with_live_policy(
     if candidates.is_empty() {
         return Arc::new(Unconfigured);
     }
-    Arc::new(RouterProvider::with_live_policy(
-        candidates,
-        availability,
-        catalog,
-        model_policy,
-    ))
+    Arc::new(
+        RouterProvider::with_live_policy(candidates, availability, catalog, model_policy)
+            .with_routing(routing),
+    )
 }
 
 /// A brain that always errors — when nothing is configured.
@@ -449,6 +467,7 @@ mod tests {
                 mode: RoutingMode::Auto,
                 max_tokens: 64,
                 model: None,
+                provider: None,
             })
             .await
             .unwrap();
@@ -522,7 +541,10 @@ mod tests {
             huggingface: HuggingFaceBackend::default(),
         });
         // Registry-aware router over local + plan + API, in fixed id order.
-        assert_eq!(brain.label(), "router[ollama,claude-cli,anthropic-api]");
+        assert_eq!(
+            brain.label(),
+            "router[ollama,claude-cli,codex-cli,anthropic-api]"
+        );
     }
 
     #[test]

@@ -62,13 +62,20 @@ impl ClaudeWorkerRequest {
                 .system
                 .as_deref()
                 .is_none_or(|value| value.len() <= 12 * 1024)
-            && !self.model.is_empty()
-            && self.model.len() <= 80
-            && self
-                .model
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+            && valid_worker_model(&self.model)
     }
+}
+
+/// The model ids a subscription worker accepts. The owner's `jarvis models
+/// register` applies the same rule, so a registered pair is always usable.
+pub fn valid_worker_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 80
+        // Never let a model id read as a CLI option.
+        && !model.starts_with('-')
+        && model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -78,7 +85,14 @@ pub enum ClaudeWorkerState {
     SubscriptionUnavailable,
     PlanLimit,
     IncompatibleRuntime,
+    /// The subscription account cannot use the requested model (for example
+    /// a staged model rollout). Never a reason to try a paid API instead.
+    ModelUnavailable,
     RuntimeFailure,
+    /// The run tried a tool (command, search, MCP, file change) or emitted an
+    /// event the worker cannot prove harmless; it was stopped and its answer
+    /// discarded. Only the Codex chat worker returns this.
+    ToolUseRefused,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -126,6 +140,13 @@ mod tests {
         assert!(!ClaudeWorkerRequest {
             model: "x;sh".into(),
             ..request
+        }
+        .valid());
+        assert!(!ClaudeWorkerRequest {
+            protocol: 1,
+            model: "-c".into(),
+            system: None,
+            prompt: "hello".into(),
         }
         .valid());
     }

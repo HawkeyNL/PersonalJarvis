@@ -349,6 +349,7 @@ pub(super) async fn execute_chat(
         max_tokens: state.llm_max_tokens,
         // The router picks the concrete model per backend (ADR-028 fase 2).
         model: None,
+        provider: None,
     };
     // Explicit Deep/Research requests retain their quality-floor semantics.
     // The owner default is only applied to ordinary Auto conversation turns;
@@ -356,8 +357,17 @@ pub(super) async fn execute_chat(
     // here to fail closed after a policy reload/revocation.
     if mode == llm::RoutingMode::Auto {
         if let Some((provider, model)) = owner_brain {
+            // Never reroute a pinned paid brain silently while paid APIs are off.
+            if state.model_routing.snapshot().refuses_provider(&provider) {
+                let (status, Json(mut body)) = crate::routes::system::paid_api_off();
+                body["conversation_id"] = json!(conv_id);
+                return Err((status, Json(body)));
+            }
             if state.model_policy.allows(&provider, &model) {
+                // The pin names a provider too: a claude-cli failure must
+                // never become a call to the same model on a paid API.
                 chat.model = Some(model);
+                chat.provider = Some(provider);
             }
         }
     }

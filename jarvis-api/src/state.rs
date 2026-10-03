@@ -176,6 +176,8 @@ pub struct AppState {
     pub registry_input: Arc<registry::CollectInput>,
     /// Shared by API checks and the router; activation follows broker verification.
     pub model_policy: Arc<llm::LiveModelPolicy>,
+    /// Owner routing shared with the router; swapped only after verification.
+    pub model_routing: Arc<llm::LiveRouting>,
     pub model_control: Arc<crate::model_control::ModelControl>,
     /// Root-owned/versioned provider pricing. Missing or malformed deployment
     /// input is replaced with conservative built-in pricing at startup.

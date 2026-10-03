@@ -358,11 +358,19 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
     let model_policy = Arc::new(jarvis_llm::LiveModelPolicy::new(model_policy));
+    // Owner routing is loaded once; it changes only through a verified
+    // activation or a restart. Unusable input fails closed without paid APIs.
+    let model_routing = Arc::new(jarvis_llm::LiveRouting::new(
+        jarvis_api::model_control::startup_routing(std::path::Path::new(
+            &config.llm_model_routing_path,
+        )),
+    ));
     let llm = jarvis_llm::build_router_with_live_policy(
         provider_cfg,
         availability,
         catalog,
         model_policy.clone(),
+        model_routing.clone(),
     );
     tracing::info!(brain = %llm.label(), "llm brain configured");
 
@@ -519,10 +527,12 @@ async fn main() -> anyhow::Result<()> {
         registry,
         registry_input: Arc::new(registry_input),
         model_policy,
+        model_routing,
         model_control: Arc::new(
             jarvis_api::model_control::ModelControl::new(Some(PathBuf::from(
                 &config.llm_model_policy_path,
             )))
+            .with_routing_path(PathBuf::from(&config.llm_model_routing_path))
             .with_unavailable_hf_routes(unavailable_hf_routes),
         ),
         pricing_registry: Arc::new(pricing_registry),

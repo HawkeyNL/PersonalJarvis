@@ -14,13 +14,13 @@ refresh() {
 if refresh_configured > "$fixture/stdout" 2> "$fixture/stderr"; then
     echo "partial failure must fail the service visibly" >&2; exit 1
 fi
-[[ $(wc -l < "$fixture/calls") == 2 ]]
-grep -Fxq openai-api "$fixture/calls"
-grep -Fxq huggingface "$fixture/calls"
+# Both credentialed providers, then the configured claude-cli models.
+[[ $(<"$fixture/calls") == $'openai-api\nhuggingface\nclaude-cli' ]]
 grep -Fq 'prior model choices retained' "$fixture/stderr"
 credential_configured() { return 1; }
 refresh_configured > "$fixture/empty"
-[[ $(wc -l < "$fixture/calls") == 2 ]]
+[[ $(wc -l < "$fixture/calls") == 4 ]]
+[[ $(tail -n 1 "$fixture/calls") == claude-cli ]]
 grep -Fq 'checked 0 configured providers' "$fixture/empty"
 
 rows=$(parse_remote_model_response anthropic-api '{"data":[{"id":"claude-fixture"}],"has_more":false}' | aggregate_discovered_models)

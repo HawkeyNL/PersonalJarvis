@@ -23,17 +23,21 @@ const STATUS_LIMIT: u64 = 16 * 1024;
 pub(super) enum AccountProvider {
     Claude,
     Codex,
+    /// The text-only Codex chat worker's own ChatGPT login, separate from the
+    /// coding broker's `codex` login.
+    CodexChat,
 }
 
 impl AccountProvider {
-    fn all() -> [Self; 2] {
-        [Self::Claude, Self::Codex]
+    fn all() -> [Self; 3] {
+        [Self::Claude, Self::Codex, Self::CodexChat]
     }
 
     fn name(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::CodexChat => "codex-chat",
         }
     }
 
@@ -41,6 +45,7 @@ impl AccountProvider {
         match self {
             Self::Claude => "jarvis-claude",
             Self::Codex => "jarvis-codex",
+            Self::CodexChat => "jarvis-codex-chat",
         }
     }
 
@@ -48,34 +53,35 @@ impl AccountProvider {
         match self {
             Self::Claude => "/var/lib/jarvis-claude",
             Self::Codex => "/var/lib/jarvis-codex",
+            Self::CodexChat => "/var/lib/jarvis-codex-chat",
         }
     }
 
     fn binary(self) -> &'static str {
         match self {
             Self::Claude => "/usr/local/bin/claude",
-            Self::Codex => "/usr/local/bin/codex",
+            Self::Codex | Self::CodexChat => "/usr/local/bin/codex",
         }
     }
 
     fn status_args(self) -> &'static [&'static str] {
         match self {
             Self::Claude => &["auth", "status"],
-            Self::Codex => &["login", "status"],
+            Self::Codex | Self::CodexChat => &["login", "status"],
         }
     }
 
     fn connect_args(self) -> &'static [&'static str] {
         match self {
             Self::Claude => &["auth", "login"],
-            Self::Codex => &["login", "--device-auth"],
+            Self::Codex | Self::CodexChat => &["login", "--device-auth"],
         }
     }
 
     fn disconnect_args(self) -> &'static [&'static str] {
         match self {
             Self::Claude => &["auth", "logout"],
-            Self::Codex => &["logout"],
+            Self::Codex | Self::CodexChat => &["logout"],
         }
     }
 }
@@ -153,7 +159,7 @@ pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
                     println!("{}", serde_json::to_string(&statuses)?);
                 } else {
                     for item in statuses {
-                        println!("{:<8} {:<20} {}", item.provider, item.worker, item.state);
+                        println!("{:<11} {:<20} {}", item.provider, item.worker, item.state);
                     }
                 }
                 Ok(())
@@ -327,6 +333,10 @@ fn runtime_stop_commands(provider: AccountProvider) -> &'static [&'static [&'sta
             &["disable", "--now", "jarvis-codex-broker.service"],
             &["disable", "--now", "jarvis-codex.service"],
         ],
+        AccountProvider::CodexChat => &[
+            &["disable", "--now", "jarvis-codex-chat.socket"],
+            &["stop", "jarvis-codex-chat.service"],
+        ],
     }
 }
 
@@ -387,7 +397,7 @@ fn status(provider: AccountProvider) -> AccountStatus {
     };
     let state = match provider {
         AccountProvider::Claude => parse_claude_status(&output),
-        AccountProvider::Codex => parse_codex_status(&output),
+        AccountProvider::Codex | AccountProvider::CodexChat => parse_codex_status(&output),
     };
     let mut result = AccountStatus::new(provider, state);
     result.runtime = runtime_state(provider);
@@ -438,6 +448,15 @@ fn runtime_state(provider: AccountProvider) -> &'static str {
                 "inactive"
             }
         }
+        AccountProvider::CodexChat => {
+            if active("jarvis-codex-chat.service") {
+                "active"
+            } else if active("jarvis-codex-chat.socket") {
+                "socket_ready"
+            } else {
+                "inactive"
+            }
+        }
     }
 }
 
@@ -446,16 +465,7 @@ fn parse_claude_status(output: &str) -> &'static str {
 }
 
 fn parse_codex_status(output: &str) -> &'static str {
-    let line = output.trim().to_ascii_lowercase();
-    if line == "logged in using chatgpt" {
-        "connected"
-    } else if line.contains("api key") || line.contains("api-key") {
-        "wrong_auth_mode"
-    } else if line.contains("not logged in") {
-        "logged_out"
-    } else {
-        "unhealthy"
-    }
+    jarvis_llm::codex_chat_protocol::codex_subscription_status(output.as_bytes())
 }
 
 fn bounded_status_output(command: &mut Command) -> Result<Option<String>> {
@@ -707,6 +717,32 @@ mod tests {
         assert_eq!(
             runtime_stop_commands(AccountProvider::Codex)[0],
             ["disable", "--now", "jarvis-codex-broker.service"]
+        );
+        assert_eq!(
+            runtime_stop_commands(AccountProvider::CodexChat)[0],
+            ["disable", "--now", "jarvis-codex-chat.socket"]
+        );
+        // Each login stops only the runtime that uses it.
+        assert!(!runtime_stop_commands(AccountProvider::Codex)
+            .iter()
+            .any(|args| args.iter().any(|arg| arg.contains("chat"))));
+        assert!(!runtime_stop_commands(AccountProvider::CodexChat)
+            .iter()
+            .any(|args| args.iter().any(|arg| arg.contains("broker"))));
+    }
+
+    #[test]
+    fn codex_chat_has_its_own_identity_and_login_home() {
+        let chat = AccountProvider::from_str("codex-chat", false).unwrap();
+        assert_eq!(chat, AccountProvider::CodexChat);
+        assert_eq!(chat.user(), "jarvis-codex-chat");
+        assert_eq!(chat.home(), "/var/lib/jarvis-codex-chat");
+        assert_eq!(chat.connect_args(), ["login", "--device-auth"]);
+        assert_ne!(chat.user(), AccountProvider::Codex.user());
+        assert_ne!(chat.home(), AccountProvider::Codex.home());
+        assert_eq!(
+            AccountStatus::new(chat, "connected").billing,
+            "subscription"
         );
     }
 

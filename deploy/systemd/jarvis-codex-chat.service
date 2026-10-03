@@ -1,0 +1,75 @@
+[Unit]
+Description=Jarvis Codex chat subscription worker (text only)
+Requires=jarvis-codex-chat.socket
+After=jarvis-codex-chat.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# Dedicated identity with its own ChatGPT login home (`jarvis accounts connect
+# codex-chat`). It shares no UID or state with the jarvis-codex coding broker
+# or App Server; their state, Core's and the Claude worker's stay inaccessible.
+User=jarvis-codex-chat
+Group=jarvis-codex-chat
+ExecStart=/opt/jarvis/current/jarvis-codex-chat-worker
+WorkingDirectory=/run/jarvis-codex-chat
+# Owner-written, root-owned, optional: JARVIS_CODEX_REVIEWED_VERSION=<exact
+# reviewed `codex --version` number>. Read by systemd before the sandbox
+# applies. Absent, empty or malformed keeps every run incompatible_runtime.
+EnvironmentFile=-/etc/jarvis/codex-chat-worker.env
+UnsetEnvironment=OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN OPENAI_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN HF_TOKEN SSH_AUTH_SOCK
+StateDirectory=jarvis-codex-chat
+StateDirectoryMode=0700
+RuntimeDirectory=jarvis-codex-chat
+RuntimeDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+PrivatePIDs=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# Fine for the Rust worker and a native Codex binary. Must be dropped if the
+# reviewed CLI is a JIT runtime (for example a Node.js build): it then fails
+# to start, closed, instead of running.
+MemoryDenyWriteExecute=true
+# Nothing may execute except the worker release, the reviewed CLI and the
+# shared libraries they load. Must be verified against the real CLI: if it
+# needs another interpreter or helper path, the owner adds that path here. A
+# missing path fails closed (the run cannot start), never open. Only the
+# multiarch library directory: /usr/lib itself holds shells (initramfs busybox,
+# klibc sh) and other helpers. /usr/lib64 holds only the loader link here.
+NoExecPaths=/
+ExecPaths=/opt/jarvis/releases /usr/local/bin/codex /usr/lib/x86_64-linux-gnu -/usr/lib64
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Internet only: no loopback services (Core, Ollama), LAN, link-local,
+# CGNAT/Tailscale or ULA ranges. 127.0.0.53 is the systemd-resolved stub that
+# /etc/resolv.conf points to on the Home Node; a host without it needs its
+# resolver address here instead.
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.0.0.53
+InaccessiblePaths=/etc/jarvis /var/lib/jarvis -/var/lib/jarvis-claude -/var/lib/jarvis-codex -/var/lib/jarvis-codex-broker -/var/lib/jarvis-engineering -/var/lib/jarvis-codex-repositories -/run/jarvis-codex -/run/jarvis-codex-broker
+TasksMax=64
+MemoryMax=2G
+
+# This service is deliberately socket-activated, never enabled at boot on its
+# own. The owner enables jarvis-codex-chat.socket explicitly.

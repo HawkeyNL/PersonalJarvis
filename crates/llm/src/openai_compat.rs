@@ -286,6 +286,7 @@ mod tests {
                         mode: crate::RoutingMode::Auto,
                         max_tokens: 64,
                         model: None,
+                        provider: None,
                     },
                     Arc::new(move |text| {
                         observed.send(text.to_owned()).unwrap();

@@ -208,7 +208,7 @@ main() {
         health) (($# == 0)) || fail "health takes no arguments"; health ;;
         update) update "$@" ;;
         models)
-            [[ ${1:-} != --help && ${1:-} != -h ]] || { echo "Usage: sudo jarvis models <list|refresh|enable|disable|show|status> ..."; return; }
+            [[ ${1:-} != --help && ${1:-} != -h ]] || { echo "Usage: sudo jarvis models <list|refresh|enable|disable|show|status|route> ..."; return; }
             require_helper "$sbin/jarvis-models"
             if [[ ${1:-} == status ]]; then
                 (($# == 1)) || fail "models status takes no options"

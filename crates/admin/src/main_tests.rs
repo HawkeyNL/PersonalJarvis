@@ -155,6 +155,151 @@ fn huggingface_route_cli_is_typed_and_rejects_shell_or_url_input() {
     }
 }
 
+fn route_helper_arguments(argv: &[&str]) -> Result<Vec<String>> {
+    let cli = Cli::try_parse_from(["jarvis", "models", "route"].iter().chain(argv))?;
+    let Some(Commands::Models(ModelsArgs {
+        command: ModelsCommand::Route { command },
+    })) = cli.command
+    else {
+        bail!("not a route command");
+    };
+    route_arguments(command)
+}
+
+#[test]
+fn model_route_cli_is_typed_and_maps_to_the_helper() {
+    assert_eq!(
+        route_helper_arguments(&[
+            "set",
+            "cheap",
+            "zai-api",
+            "glm-5.3-flash",
+            "claude-cli",
+            "claude-haiku-4-5",
+            "--metered-after-subscription",
+        ])
+        .unwrap(),
+        [
+            "route",
+            "set",
+            "cheap",
+            "zai-api",
+            "glm-5.3-flash",
+            "claude-cli",
+            "claude-haiku-4-5",
+            "--metered-after-subscription",
+        ]
+    );
+    assert_eq!(
+        route_helper_arguments(&["paid-api", "off"]).unwrap(),
+        ["route", "paid-api", "off"]
+    );
+    assert_eq!(
+        route_helper_arguments(&["reset", "hard"]).unwrap(),
+        ["route", "reset", "hard"]
+    );
+    assert_eq!(
+        route_helper_arguments(&["list"]).unwrap(),
+        ["route", "list"]
+    );
+    for argv in [
+        &["set", "turbo", "ollama", "a"][..],
+        &["set", "default", "ollama"],
+        &["set", "default", "ollama", "a", "ollama"],
+        &["set", "default", "jev", "a"],
+        &["set", "default", "ollama", "x\ny"],
+        &["paid-api", "maybe"],
+        &["show"],
+    ] {
+        assert!(route_helper_arguments(argv).is_err(), "{argv:?}");
+    }
+}
+
+fn register_helper_arguments(argv: &[&str]) -> Result<Vec<String>> {
+    let cli = Cli::try_parse_from(["jarvis", "models", "register"].iter().chain(argv))?;
+    let Some(Commands::Models(ModelsArgs {
+        command: ModelsCommand::Register { provider, model },
+    })) = cli.command
+    else {
+        bail!("not a register command");
+    };
+    register_arguments(provider, model)
+}
+
+#[test]
+fn model_register_is_only_for_exact_subscription_pairs() {
+    assert_eq!(
+        register_helper_arguments(&["codex-cli", "gpt-6-luna"]).unwrap(),
+        ["register", "codex-cli", "gpt-6-luna"]
+    );
+    assert_eq!(
+        register_helper_arguments(&["claude-cli", "claude-opus-5"]).unwrap(),
+        ["register", "claude-cli", "claude-opus-5"]
+    );
+    let long = "m".repeat(81);
+    for argv in [
+        &["openai-api", "gpt-6-luna"][..],
+        &["ollama", "llama3.2"],
+        &["jev", "a"],
+        &["codex-cli", "--", "-c"],
+        &["codex-cli", "a b"],
+        &["codex-cli", "org/model"],
+        &["codex-cli", "x;sh"],
+        &["codex-cli", "modèl"],
+        &["codex-cli", ""],
+        &["codex-cli", &long],
+        &["codex-cli"],
+    ] {
+        assert!(register_helper_arguments(argv).is_err(), "{argv:?}");
+    }
+}
+
+#[test]
+fn routing_json_report_uses_core_reason_codes_and_never_echoes_content() {
+    assert_eq!(
+        routing_report_from(Ok(None)),
+        serde_json::json!({"routing": null, "routing_unavailable_reason": null})
+    );
+    let valid = routing_report_from(Ok(Some(
+        br#"{"version":1,"tiers":{"cheap":{"chain":[{"provider":"ollama","model":"llama3.2"}]}}}"#
+            .to_vec(),
+    )));
+    assert_eq!(valid["routing"]["paid_api"], "allowed");
+    assert_eq!(
+        valid["routing"]["tiers"]["cheap"]["chain"][0]["model"],
+        "llama3.2"
+    );
+    let invalid = routing_report_from(Ok(Some(br#"{"version":1,"secret":"canary"}"#.to_vec())));
+    assert_eq!(invalid["routing_unavailable_reason"], "routing_invalid");
+    assert!(!invalid.to_string().contains("canary"));
+    assert_eq!(
+        routing_report_from(Err("routing_unsafe"))["routing_unavailable_reason"],
+        "routing_unsafe"
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("routing.json");
+    assert_eq!(read_routing_file(&file), Ok(None));
+    fs::write(&file, "{}").unwrap();
+    // Owned by the unprivileged test user, not root.
+    assert_eq!(read_routing_file(&file), Err("routing_unsafe"));
+    let link = directory.path().join("link.json");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert_eq!(read_routing_file(&link), Err("routing_unsafe"));
+}
+
+#[test]
+fn json_is_refused_for_route_changes() {
+    let cli =
+        Cli::try_parse_from(["jarvis", "--json", "models", "route", "paid-api", "off"]).unwrap();
+    let Some(Commands::Models(args)) = cli.command else {
+        panic!("not a models command");
+    };
+    let presentation = Presentation::new(true, false);
+    let error = models(args, &presentation, false).unwrap_err();
+    assert!(error.to_string().contains("--json is supported only"));
+}
+
 fn admin_helper_layout(
     admin_helpers: bool,
 ) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, u32, u32) {

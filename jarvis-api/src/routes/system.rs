@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use jarvis_llm as llm;
 use jarvis_registry as registry;
 use jarvis_selfdev as selfdev;
 use jarvis_usage as usage;
@@ -83,14 +84,40 @@ pub(crate) fn validate_brain_selection(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
+    brain_selection(
+        &state.model_policy,
+        &state.model_routing.snapshot(),
+        provider,
+        model,
+    )
+}
+
+fn brain_selection(
+    policy: &llm::LiveModelPolicy,
+    routing: &llm::RoutingSnapshot,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), (StatusCode, Json<Value>)> {
     match (provider, model) {
         (None, None) => Ok(()),
-        (Some(provider), Some(model)) if state.model_policy.allows(provider, model) => Ok(()),
+        (Some(provider), Some(_)) if routing.refuses_provider(provider) => Err(paid_api_off()),
+        (Some(provider), Some(model)) if policy.allows(provider, model) => Ok(()),
         _ => Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error":"model is not owner-enabled"})),
         )),
     }
+}
+
+/// A metered brain selected while the owner turned paid APIs off.
+pub(crate) fn paid_api_off() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "paid API is off",
+            "hint": "choose a subscription or local model, or Auto",
+        })),
+    )
 }
 
 pub(crate) async fn brain_preference(db: &jarvis_store::Database, user_id: Uuid) -> Value {
@@ -173,17 +200,33 @@ pub(crate) async fn system_privileged_config(
             Json(json!({"error":"another model change is in progress"})),
         )
     })?;
+    let (provider, model, enabled, expected_policy_sha256) = match &request.operation {
+        jarvis_privileged::Operation::ModelSetEnabled {
+            provider,
+            model,
+            enabled,
+            expected_policy_sha256,
+        } => (provider, model, *enabled, expected_policy_sha256),
+        jarvis_privileged::Operation::ModelRoutingSet {
+            routing,
+            expected_routing_sha256,
+        } => {
+            return set_routing(
+                &state,
+                authed.device.id,
+                socket,
+                &request,
+                routing,
+                expected_routing_sha256,
+            )
+            .await;
+        }
+    };
     let (expected, hash) = state
         .model_control
         .read()
         .map_err(|_| model_activation_error())?;
-    let jarvis_privileged::Operation::ModelSetEnabled {
-        provider,
-        model,
-        enabled,
-        expected_policy_sha256,
-    } = &request.operation;
-    if *enabled && !state.model_control.can_enable(provider, model) {
+    if enabled && !state.model_control.can_enable(provider, model) {
         return Err((
             StatusCode::CONFLICT,
             Json(
@@ -207,7 +250,7 @@ pub(crate) async fn system_privileged_config(
                 .and_then(|(verified, _)| {
                     state
                         .model_policy
-                        .activate_verified_toggle(&expected, verified, provider, model, *enabled)
+                        .activate_verified_toggle(&expected, verified, provider, model, enabled)
                         .map_err(|_| ())
                 });
             if activated.is_err() {
@@ -249,6 +292,113 @@ pub(crate) async fn system_privileged_config(
             ))
         }
     }
+}
+
+/// Signed full replacement of `routing.json`. The approval is bound to the
+/// exact file bytes; Core activates only the signed document it reads back,
+/// and only if the live routing did not change meanwhile.
+async fn set_routing(
+    state: &AppState,
+    device_id: Uuid,
+    socket: &str,
+    request: &jarvis_privileged::SignedRequest,
+    routing: &llm::ModelRouting,
+    expected_sha256: &str,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let live = state.model_routing.snapshot();
+    let current = state.model_control.read_routing().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"model routing is unreadable; owner must repair it as root"})),
+        )
+    })?;
+    if current.sha256 != expected_sha256 {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error":"model routing changed; refresh before approving"})),
+        ));
+    }
+    if !routing.all_discovered(&state.model_policy.snapshot()) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error":"routing names a model that is not discovered"})),
+        ));
+    }
+    let forwarded = forward_to_broker(socket, request).await;
+    let readback = state.model_control.read_routing();
+    let outcome = match forwarded {
+        Ok(()) => activate_signed_routing(&state.model_routing, &live, routing, readback)
+            .map_err(|()| routing_activation_error()),
+        Err(()) => Err(refused_routing(
+            &state.model_routing,
+            expected_sha256,
+            readback,
+        )),
+    };
+    let event = if outcome.is_ok() {
+        "forwarded"
+    } else {
+        "denied"
+    };
+    record_security_event(
+        state,
+        Some(device_id),
+        "privileged_config",
+        event,
+        Some(request.operation.action()),
+    )
+    .await;
+    outcome.map(|()| Json(json!({"status":"active","restart_required":false})))
+}
+
+/// Activate exactly the signed document read back from disk, if the live
+/// routing is still what this request started from. Anything else (a
+/// piggybacked change, an unreadable file, a concurrent swap) fails closed.
+fn activate_signed_routing(
+    live: &llm::LiveRouting,
+    expected: &llm::RoutingSnapshot,
+    signed: &llm::ModelRouting,
+    readback: Result<crate::model_control::RoutingFile, &'static str>,
+) -> Result<(), ()> {
+    let verified = matches!(
+        &readback,
+        Ok(crate::model_control::RoutingFile { routing: Ok(Some(stored)), .. }) if stored == signed
+    );
+    let next = llm::RoutingSnapshot {
+        routing: Some(signed.clone()),
+        unavailable_reason: None,
+    };
+    if verified && live.swap(expected, next).is_ok() {
+        return Ok(());
+    }
+    live.fail_closed("routing_activation_unverified");
+    Err(())
+}
+
+/// A broker error or lost reply is not proof that nothing was written. Keep
+/// the live routing only if the file is provably unchanged.
+fn refused_routing(
+    live: &llm::LiveRouting,
+    expected_sha256: &str,
+    readback: Result<crate::model_control::RoutingFile, &'static str>,
+) -> (StatusCode, Json<Value>) {
+    if readback.is_ok_and(|file| file.sha256 == expected_sha256) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"privileged operation denied"})),
+        );
+    }
+    live.fail_closed("routing_activation_unverified");
+    routing_activation_error()
+}
+
+fn routing_activation_error() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(
+            json!({"error":"model routing could not be verified; paid APIs are off until the owner verifies routing and restarts Core"}),
+        ),
+    )
 }
 
 fn model_activation_error() -> (StatusCode, Json<Value>) {
@@ -445,12 +595,23 @@ pub(crate) async fn system_model_policy(
     };
     let verified = disk.ok().filter(|(disk, _)| *disk == policy);
     let mutable = verified.is_some() && state.privileged_broker_socket.is_some();
+    let routing = state.model_routing.snapshot();
+    let (routing_unavailable_reason, routing_sha256) =
+        crate::model_control::routing_status(&routing, state.model_control.read_routing());
     Json(json!({
         "version": policy.version,
         "models": crate::model_control::priced_models(&policy, &state.pricing_registry),
         "mutation_unavailable_reason": unavailable_reason,
         "mutation": if mutable { "device-signed-model-toggle-v1" } else { "unavailable" },
         "policy_sha256": verified.map(|(_, hash)| hash),
+        "routing": routing.routing,
+        "routing_sha256": routing_sha256,
+        "routing_unavailable_reason": routing_unavailable_reason,
+        "routing_mutation": if state.privileged_broker_socket.is_some() && routing_sha256.is_some() {
+            "device-signed-model-route-v1"
+        } else {
+            "unavailable"
+        },
         "user_id": authed.user.id,
         "device_id": authed.device.id,
         "server_time": time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -708,5 +869,133 @@ mod model_broker_tests {
             .await
             .is_err());
         assert!(captured.await.unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::model_control::RoutingFile;
+
+    fn routing(raw: &str) -> llm::ModelRouting {
+        llm::ModelRouting::parse(raw.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn signed_routing_activates_only_the_exact_readback() {
+        let signed = routing(r#"{"version":1,"paid_api":"off"}"#);
+        let readback = |raw: &str| Ok(RoutingFile::from_bytes(Some(raw.as_bytes())));
+        let live = llm::LiveRouting::default();
+        let start = live.snapshot();
+        activate_signed_routing(
+            &live,
+            &start,
+            &signed,
+            readback(r#"{"version":1,"paid_api":"off"}"#),
+        )
+        .unwrap();
+        assert_eq!(live.snapshot().routing, Some(signed.clone()));
+        assert!(live.snapshot().paid_api_off());
+
+        // Piggybacked change on disk, unreadable or invalid readback, or a
+        // live routing that moved meanwhile: all fail closed.
+        let piggybacked = r#"{"version":1,"paid_api":"off","tiers":{"hard":{"chain":[{"provider":"openai-api","model":"x"}]}}}"#;
+        let cases: Vec<(llm::RoutingSnapshot, Result<RoutingFile, &'static str>)> = vec![
+            (llm::RoutingSnapshot::default(), readback(piggybacked)),
+            (llm::RoutingSnapshot::default(), Err("routing_unsafe")),
+            (llm::RoutingSnapshot::default(), readback("{")),
+            (
+                llm::RoutingSnapshot::unavailable("routing_invalid"),
+                readback(r#"{"version":1,"paid_api":"off"}"#),
+            ),
+        ];
+        for (expected, disk) in cases {
+            let live = llm::LiveRouting::default();
+            assert!(activate_signed_routing(&live, &expected, &signed, disk).is_err());
+            let snapshot = live.snapshot();
+            assert_eq!(
+                snapshot.unavailable_reason,
+                Some("routing_activation_unverified")
+            );
+            assert!(snapshot.routing.is_none());
+            assert!(snapshot.refuses_provider("openai-api"));
+        }
+    }
+
+    #[test]
+    fn signed_routing_repairs_an_invalid_file() {
+        let live = llm::LiveRouting::new(llm::RoutingSnapshot::unavailable("routing_invalid"));
+        let start = live.snapshot();
+        let signed = routing(r#"{"version":1}"#);
+        activate_signed_routing(
+            &live,
+            &start,
+            &signed,
+            Ok(RoutingFile::from_bytes(Some(b"{\n  \"version\": 1\n}\n"))),
+        )
+        .unwrap();
+        assert_eq!(live.snapshot().unavailable_reason, None);
+        assert!(!live.snapshot().paid_api_off());
+    }
+
+    #[test]
+    fn refused_routing_keeps_live_state_only_when_the_file_is_unchanged() {
+        let active = llm::RoutingSnapshot {
+            routing: Some(routing(r#"{"version":1}"#)),
+            unavailable_reason: None,
+        };
+        let before = RoutingFile::from_bytes(Some(br#"{"version":1}"#));
+        let live = llm::LiveRouting::new(active.clone());
+        let (status, _) = refused_routing(&live, &before.sha256, Ok(before.clone()));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(live.snapshot(), active);
+        for readback in [
+            Ok(RoutingFile::from_bytes(Some(
+                br#"{"version":1,"paid_api":"off"}"#,
+            ))),
+            Err("routing_unreadable"),
+        ] {
+            let live = llm::LiveRouting::new(active.clone());
+            let (status, _) = refused_routing(&live, &before.sha256, readback);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(live.snapshot().paid_api_off());
+        }
+    }
+
+    #[test]
+    fn paid_api_off_refuses_metered_brain_pins_with_a_bounded_error() {
+        let policy = llm::LiveModelPolicy::new(llm::ModelAccessPolicy {
+            version: 1,
+            models: ["anthropic-api", "claude-cli"]
+                .into_iter()
+                .map(|provider| llm::ModelAccessEntry {
+                    provider: provider.into(),
+                    model: "fixture".into(),
+                    enabled: true,
+                    source: "test".into(),
+                    route: None,
+                })
+                .collect(),
+        });
+        let allowed = llm::RoutingSnapshot::default();
+        let off = llm::RoutingSnapshot {
+            routing: llm::ModelRouting::parse(br#"{"version":1,"paid_api":"off"}"#).ok(),
+            unavailable_reason: None,
+        };
+        let failed = llm::RoutingSnapshot::unavailable("routing_invalid");
+        let pin =
+            |routing, provider| brain_selection(&policy, routing, Some(provider), Some("fixture"));
+        assert!(pin(&allowed, "anthropic-api").is_ok());
+        for routing in [&off, &failed] {
+            let (status, Json(body)) = pin(routing, "anthropic-api").unwrap_err();
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["error"], "paid API is off");
+            assert!(pin(routing, "claude-cli").is_ok());
+            assert!(brain_selection(&policy, routing, None, None).is_ok());
+        }
+        // The allowlist still applies when paid APIs are allowed.
+        let (status, _) = pin(&allowed, "openai-api").unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }
