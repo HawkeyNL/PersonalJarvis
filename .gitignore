@@ -32,3 +32,6 @@ apps/**/src-tauri/target/
 .DS_Store
 .idea/
 .vscode/
+
+# Local Claude Code instructions (machine-specific, never commit)
+CLAUDE.local.md
