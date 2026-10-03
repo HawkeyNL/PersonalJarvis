@@ -189,6 +189,7 @@ remove_stale_runs
 [[ ! -e $lock_dir/jarvis-backup.AbCd1234 && -d $lock_dir/jarvis-backup-other && -f $lock_dir/jarvis-backup.lock ]]
 [[ -L $lock_dir/jarvis-backup.Zz99Zz99 && $(cat "$fixture/linked-run/export.surql") == keep ]]
 [[ $(cat "$fixture/docker.log") == $'ps -aq --filter name=^jarvis-backup-verify-\nrm -f abc123 def456' ]]
+# shellcheck disable=SC2317  # invoked through remove_stale_runs
 docker() { [[ $1 != ps ]] || return 1; }
 expect_fail remove_stale_runs
 unset -f docker
