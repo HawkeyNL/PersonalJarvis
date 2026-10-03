@@ -203,10 +203,45 @@ for defect in missing tampered symlink capability missing-backup unsupported-sch
         echo "packager accepted device policy defect: $defect" >&2
         exit 1
     fi
+    expected=
+    case $defect in
+        missing-backup-service) expected='managed unit is missing or unsafe: jarvis-backup.service' ;;
+        missing-backup-timer) expected='managed unit is missing or unsafe: jarvis-backup.timer' ;;
+        unsupported-backup-timer|undeclared-backup-timer) expected='release candidate does not declare backup-timer capability 1' ;;
+        unsafe-backup-helper) expected='backup helper permissions are unsafe' ;;
+    esac
+    if [[ -n $expected ]] && ! grep -Fq "$expected" "$fixture/policy.log"; then
+        echo "packager rejected $defect for the wrong reason" >&2
+        cat "$fixture/policy.log" >&2
+        exit 1
+    fi
     # Remove the fixture symlink before constructing the next candidate.
     [[ ! -L $policy ]] || rm -- "$policy"
     runtime="$fixture/candidate/jarvis-core-v9.8.10/jarvis-codex-runtime"
     [[ ! -L $runtime ]] || rm -- "$runtime"
+done
+# The packager's capability check stops these before the unit manager, so
+# exercise the manager directly: backup units without the declared
+# capability are unexpected, and an unknown capability version is refused.
+for defect in undeclared unsupported; do
+    write_candidate v9.8.12
+    candidate="$fixture/candidate/jarvis-core-v9.8.12"
+    case $defect in
+        undeclared) jq 'del(.tooling.backup_timer)' "$candidate/release.json" > "$fixture/manifest"
+            expected='unexpected managed unit artifact: systemd-jarvis-backup.' ;;
+        unsupported) jq '.tooling.backup_timer = 2' "$candidate/release.json" > "$fixture/manifest"
+            expected='unsupported backup-timer capability' ;;
+    esac
+    cp "$fixture/manifest" "$candidate/release.json"
+    if bash "$candidate/manage-systemd-units" validate-artifacts "$candidate" 2>"$fixture/manager.log"; then
+        echo "unit manager accepted $defect backup-timer capability" >&2
+        exit 1
+    fi
+    grep -Fq "$expected" "$fixture/manager.log" || {
+        echo "unit manager rejected $defect backup-timer capability for the wrong reason" >&2
+        cat "$fixture/manager.log" >&2
+        exit 1
+    }
 done
 # A previously verified release without the new capability remains inspectable.
 write_candidate v9.8.11

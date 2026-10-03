@@ -921,7 +921,9 @@ for mode in disabled inactive socket_only warm; do
     run_updater
     [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v11.0.1 ]]
     assert_laya_state "$expected"
-    ! grep -Eq '^(enable|disable) jarvis-laya\.' "$fixture_dir/systemctl.log"
+    if grep -Eq '^(enable|disable) jarvis-laya\.' "$fixture_dir/systemctl.log"; then
+        echo "updater changed the owner's Laya enablement" >&2; exit 1
+    fi
 
     # Failed next activation must restore the prior release AND the owner's
     # original active/enabled state, not merely restore the unit files.
@@ -965,7 +967,9 @@ for mode in disabled inactive socket_only active; do
     run_updater
     [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v12.0.1 ]]
     assert_claude_state "$expected"
-    ! grep -Eq '^(enable|disable) jarvis-claude\.' "$fixture_dir/systemctl.log"
+    if grep -Eq '^(enable|disable) jarvis-claude\.' "$fixture_dir/systemctl.log"; then
+        echo "updater changed the owner's Claude worker enablement" >&2; exit 1
+    fi
 
     prepare_candidate v12.0.2 "$same_migrations" 12.0.2 12.0.2 12.0.2 true '' false true
     rm -f -- "$fixture_dir/readyz-failed-once"
@@ -1019,7 +1023,7 @@ set_backup_state() {
     done
 }
 backup_owner_choice_untouched() {
-    if grep -Eq '^(enable|disable|start|stop|restart) jarvis-backup\.' "$fixture_dir/systemctl.log"; then
+    if grep -Eq '^(enable|disable|reenable|mask|unmask|start|stop|restart)( --[a-z-]+)* jarvis-backup\.' "$fixture_dir/systemctl.log"; then
         echo "updater changed the owner's backup timer choice" >&2; exit 1
     fi
 }
@@ -1055,7 +1059,7 @@ set_backup_state
 run_updater --rollback-version v13.0.0
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v13.0.0 ]]
 [[ ! -e $systemd_fixture/jarvis-backup.timer && ! -e $systemd_fixture/jarvis-backup.service ]]
-if grep -q '^is-enabled jarvis-backup[.]service' "$fixture_dir/systemctl.log"; then
+if grep -Eq '^is-enabled( --[a-z-]+)* jarvis-backup[.]service' "$fixture_dir/systemctl.log"; then
     echo "updater asked whether the static backup service is enabled" >&2; exit 1
 fi
 unset JARVIS_BACKUP_STATE_FIXTURE
