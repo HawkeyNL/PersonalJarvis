@@ -85,6 +85,46 @@ pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
         .await
         .map_err(StoreError::schema)?;
     let current: Option<SchemaVersion> = response.take(0).map_err(StoreError::schema)?;
+    if current.is_some_and(|v| v.version == 10) {
+        return Ok(());
+    }
+    apply_through_nine(db).await?;
+    db.query(include_str!(
+        "../../../schema/surreal/0010_coding_reservations.surql"
+    ))
+    .await
+    .map_err(StoreError::schema)?
+    .check()
+    .map_err(StoreError::schema)?;
+    Ok(())
+}
+
+async fn apply_through_nine(db: &Database) -> Result<(), StoreError> {
+    let mut response = db
+        .query("SELECT version FROM schema_version:baseline")
+        .await
+        .map_err(StoreError::schema)?;
+    let current: Option<SchemaVersion> = response.take(0).map_err(StoreError::schema)?;
+    if current.is_some_and(|v| v.version == 9) {
+        return Ok(());
+    }
+    apply_through_eight(db).await?;
+    db.query(include_str!(
+        "../../../schema/surreal/0009_coding_runs.surql"
+    ))
+    .await
+    .map_err(StoreError::schema)?
+    .check()
+    .map_err(StoreError::schema)?;
+    Ok(())
+}
+
+async fn apply_through_eight(db: &Database) -> Result<(), StoreError> {
+    let mut response = db
+        .query("SELECT version FROM schema_version:baseline")
+        .await
+        .map_err(StoreError::schema)?;
+    let current: Option<SchemaVersion> = response.take(0).map_err(StoreError::schema)?;
     if current.is_some_and(|v| v.version == 8) {
         return Ok(());
     }

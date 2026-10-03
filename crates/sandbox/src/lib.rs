@@ -141,6 +141,10 @@ pub fn profile_network_policy(profile: SandboxProfile) -> NetworkPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxTask {
     pub task_id: Uuid,
+    /// Trusted logical session binding for Codex manager metadata. Never
+    /// populated from an arbitrary public sandbox request.
+    #[serde(default)]
+    pub codex_session_id: Option<Uuid>,
     pub profile: SandboxProfile,
     pub command: Vec<String>,
     pub network_policy: NetworkPolicy,
@@ -160,6 +164,7 @@ impl SandboxTask {
         network_policy.validate()?;
         Ok(Self {
             task_id: Uuid::now_v7(),
+            codex_session_id: None,
             profile,
             command,
             network_policy,
@@ -185,6 +190,14 @@ pub struct SandboxHandle {
     pub provider_id: String,
     pub task_id: Uuid,
     pub profile: SandboxProfile,
+}
+
+/// A manager workload with verified Jarvis Codex metadata. The list endpoint
+/// is authenticated and loopback-only; unrelated workloads are omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedCodexSandbox {
+    pub handle: SandboxHandle,
+    pub coding_session_id: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,7 +321,38 @@ pub trait SandboxProvider: Send + Sync {
         handle: &SandboxHandle,
         paths: &[String],
     ) -> Result<Vec<CollectedArtifact>, SandboxError>;
+    /// Read only the fixed, transient Codex request file through the
+    /// authenticated manager-to-sandbox control plane. No sandbox network
+    /// route back to the Home Node is introduced.
+    async fn read_codex_task_request(
+        &self,
+        _: &SandboxHandle,
+    ) -> Result<Option<Vec<u8>>, SandboxError> {
+        Err(SandboxError::Unsupported)
+    }
+    async fn write_codex_task_response(
+        &self,
+        handle: &SandboxHandle,
+        bytes: Vec<u8>,
+    ) -> Result<(), SandboxError> {
+        if bytes.len() > 640 * 1024 {
+            return Err(SandboxError::InvalidInput);
+        }
+        self.upload(
+            handle,
+            TaskInput {
+                name: "task-response.json".into(),
+                bytes,
+            },
+        )
+        .await
+    }
     async fn terminate(&self, handle: SandboxHandle) -> Result<(), SandboxError>;
+    /// Authenticated discovery of Jarvis Codex workloads for crash recovery.
+    /// Providers without verifiable manager metadata must fail closed.
+    async fn list_owned_codex(&self) -> Result<Vec<OwnedCodexSandbox>, SandboxError> {
+        Err(SandboxError::Unsupported)
+    }
 }
 
 /// Explicit disabled/fail-closed provider for production configurations where
@@ -433,9 +477,84 @@ pub struct OpenSandboxProvider {
     api_key: String,
     images: OpenSandboxImages,
     client: Client,
+    codex_only: bool,
 }
 
 impl OpenSandboxProvider {
+    /// Bounded, metadata-filtered discovery for crash recovery. Incomplete or
+    /// malformed manager results fail closed; callers must not start new runs.
+    async fn discover_owned_codex(&self) -> Result<Vec<OwnedCodexSandbox>, SandboxError> {
+        if !self.codex_only {
+            return Err(SandboxError::Unsupported);
+        }
+        let endpoint = self.endpoint("v1/sandboxes")?;
+        let mut owned = Vec::new();
+        for page in 1..=10_u32 {
+            let page_value = page.to_string();
+            let response =
+                self.request_success(self.authenticated(self.client.get(endpoint.clone())).query(
+                    &[
+                        ("metadata", "jarvis.profile=codex"),
+                        ("page", page_value.as_str()),
+                        ("pageSize", "100"),
+                    ],
+                ))
+                .await?;
+            let body: Value = response
+                .json()
+                .await
+                .map_err(|_| SandboxError::InvalidProviderResponse)?;
+            let items = body
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or(SandboxError::InvalidProviderResponse)?;
+            if items.len() > 100 {
+                return Err(SandboxError::InvalidProviderResponse);
+            }
+            for item in items {
+                let metadata = item
+                    .get("metadata")
+                    .and_then(Value::as_object)
+                    .ok_or(SandboxError::InvalidProviderResponse)?;
+                if metadata.get("jarvis.profile").and_then(Value::as_str) != Some("codex") {
+                    continue;
+                }
+                let id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| is_safe_provider_id(id))
+                    .ok_or(SandboxError::InvalidProviderResponse)?;
+                let run_id = metadata
+                    .get("jarvis.run_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .ok_or(SandboxError::InvalidProviderResponse)?;
+                let coding_session_id = metadata
+                    .get("jarvis.session_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .ok_or(SandboxError::InvalidProviderResponse)?;
+                owned.push(OwnedCodexSandbox {
+                    handle: SandboxHandle {
+                        provider_id: id.to_owned(),
+                        task_id: run_id,
+                        profile: SandboxProfile::Codex,
+                    },
+                    coding_session_id,
+                });
+            }
+            let has_next = body
+                .get("pagination")
+                .and_then(|v| v.get("hasNextPage"))
+                .and_then(Value::as_bool)
+                .ok_or(SandboxError::InvalidProviderResponse)?;
+            if !has_next {
+                return Ok(owned);
+            }
+        }
+        Err(SandboxError::OutputLimitExceeded)
+    }
+
     pub fn for_home_node(config: OpenSandboxConfig) -> Result<Self, SandboxError> {
         let endpoint = validate_loopback_endpoint(&config.endpoint)?;
         if config.api_key.trim().is_empty() || !config.images.validate() {
@@ -456,7 +575,31 @@ impl OpenSandboxProvider {
             api_key: config.api_key,
             images: config.images,
             client,
+            codex_only: false,
         })
+    }
+
+    /// Restricted constructor for the Codex broker. Other profiles are
+    /// rejected even though the underlying manager supports them.
+    pub fn for_codex_broker(
+        endpoint: String,
+        api_key: String,
+        image_digest: String,
+    ) -> Result<Self, SandboxError> {
+        let images = OpenSandboxImages {
+            research: image_digest.clone(),
+            coding: image_digest.clone(),
+            browser: image_digest.clone(),
+            data_analysis: image_digest.clone(),
+            codex: image_digest,
+        };
+        let mut provider = Self::for_home_node(OpenSandboxConfig {
+            endpoint,
+            api_key,
+            images,
+        })?;
+        provider.codex_only = true;
+        Ok(provider)
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, SandboxError> {
@@ -504,6 +647,9 @@ impl OpenSandboxProvider {
 
 #[async_trait]
 impl SandboxProvider for OpenSandboxProvider {
+    async fn list_owned_codex(&self) -> Result<Vec<OwnedCodexSandbox>, SandboxError> {
+        self.discover_owned_codex().await
+    }
     async fn availability(&self) -> SandboxAvailability {
         let Ok(endpoint) = self.endpoint("health") else {
             return SandboxAvailability::Unavailable;
@@ -514,6 +660,11 @@ impl SandboxProvider for OpenSandboxProvider {
         }
     }
     async fn create(&self, task: &SandboxTask) -> Result<SandboxHandle, SandboxError> {
+        if self.codex_only
+            && (task.profile != SandboxProfile::Codex || task.codex_session_id.is_none())
+        {
+            return Err(SandboxError::InvalidTask);
+        }
         task.network_policy.validate()?;
         let endpoint = self.endpoint("v1/sandboxes")?;
         let response = self
@@ -680,7 +831,7 @@ impl SandboxProvider for OpenSandboxProvider {
                 .get(&sandbox_path)
                 .ok_or(SandboxError::InvalidProviderResponse)?;
             if file.get("type").and_then(Value::as_str) != Some("file")
-                || file.get("size").and_then(Value::as_u64) > Some(MAX_ARTIFACT_BYTES)
+                || !matches!(file.get("size").and_then(Value::as_u64), Some(size) if size <= MAX_ARTIFACT_BYTES)
             {
                 return Err(SandboxError::InvalidArtifact);
             }
@@ -706,11 +857,80 @@ impl SandboxProvider for OpenSandboxProvider {
         }
         Ok(artifacts)
     }
+    async fn read_codex_task_request(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<Option<Vec<u8>>, SandboxError> {
+        if handle.profile != SandboxProfile::Codex {
+            return Err(SandboxError::InvalidTask);
+        }
+        const PATH: &str = "/workspace/channel/task-request.json";
+        const LIMIT: usize = 48 * 1024;
+        let info_endpoint = self.proxy_endpoint(handle, "/files/info")?;
+        let response = self
+            .authenticated(self.client.get(info_endpoint))
+            .query(&[("path", PATH)])
+            .send()
+            .await
+            .map_err(|_| SandboxError::Unavailable)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let info: Value = response
+            .error_for_status()
+            .map_err(|_| SandboxError::ProviderRequestFailed)?
+            .json()
+            .await
+            .map_err(|_| SandboxError::InvalidProviderResponse)?;
+        let Some(file) = info.get(PATH) else {
+            return Ok(None);
+        };
+        if file.get("type").and_then(Value::as_str) != Some("file")
+            || !matches!(file.get("size").and_then(Value::as_u64), Some(size) if size <= LIMIT as u64)
+        {
+            return Err(SandboxError::InvalidArtifact);
+        }
+        let endpoint = self.proxy_endpoint(handle, "/files/download")?;
+        let response = self
+            .request_success(
+                self.authenticated(self.client.get(endpoint))
+                    .query(&[("path", PATH)]),
+            )
+            .await?;
+        bounded_response_bytes(response, LIMIT).await.map(Some)
+    }
     async fn terminate(&self, handle: SandboxHandle) -> Result<(), SandboxError> {
         let endpoint = self.endpoint(&format!("v1/sandboxes/{}", handle.provider_id))?;
-        self.request_success(self.authenticated(self.client.delete(endpoint)))
+        let response = self
+            .authenticated(self.client.delete(endpoint))
+            .send()
             .await
-            .map(|_| ())
+            .map_err(|_| SandboxError::Unavailable)?;
+        if !response.status().is_success()
+            && !(self.codex_only && response.status() == reqwest::StatusCode::NOT_FOUND)
+        {
+            return Err(SandboxError::ProviderRequestFailed);
+        }
+        if self.codex_only {
+            // An accepted DELETE is not proof that the manager has stopped
+            // the workload. The broker may release its durable reservation
+            // only after the owned-workload listing confirms disappearance.
+            // A failed/incomplete listing keeps admission closed for recovery.
+            for attempt in 0..3 {
+                let owned = self.list_owned_codex().await?;
+                if !owned.iter().any(|item| {
+                    item.handle.provider_id == handle.provider_id
+                        || item.handle.task_id == handle.task_id
+                }) {
+                    return Ok(());
+                }
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+            }
+            return Err(SandboxError::ProviderRequestFailed);
+        }
+        Ok(())
     }
 }
 
@@ -774,6 +994,18 @@ fn opensandbox_network_policy(policy: &NetworkPolicy) -> Value {
 
 fn opensandbox_create_payload(task: &SandboxTask, images: &OpenSandboxImages) -> Value {
     let limits = profile_limits(task.profile);
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("jarvis.task_id".into(), json!(task.task_id.to_string()));
+    metadata.insert(
+        "jarvis.profile".into(),
+        json!(sandbox_profile_name(task.profile)),
+    );
+    if task.profile == SandboxProfile::Codex {
+        metadata.insert("jarvis.run_id".into(), json!(task.task_id.to_string()));
+        if let Some(session_id) = task.codex_session_id {
+            metadata.insert("jarvis.session_id".into(), json!(session_id.to_string()));
+        }
+    }
     json!({
         "image": { "uri": images.for_profile(task.profile) },
         "entrypoint": ["tail", "-f", "/dev/null"],
@@ -783,10 +1015,7 @@ fn opensandbox_create_payload(task: &SandboxTask, images: &OpenSandboxImages) ->
             "memory": format!("{}Mi", limits.memory_mib),
         },
         "networkPolicy": opensandbox_network_policy(&task.network_policy),
-        "metadata": {
-            "jarvis.task_id": task.task_id.to_string(),
-            "jarvis.profile": sandbox_profile_name(task.profile),
-        },
+        "metadata": metadata,
     })
 }
 
@@ -1162,6 +1391,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn codex_broker_provider_refuses_every_other_profile() {
+        let provider = OpenSandboxProvider::for_codex_broker(
+            "http://127.0.0.1:8090/".into(),
+            "fixture-manager-key".into(),
+            format!("registry.example/codex@sha256:{}", "a".repeat(64)),
+        )
+        .unwrap();
+        let task = SandboxTask::new(
+            SandboxProfile::Coding,
+            vec!["/usr/local/bin/jarvis-codex-runtime".into()],
+        )
+        .unwrap();
+        assert_eq!(provider.create(&task).await, Err(SandboxError::InvalidTask));
+    }
+
     #[test]
     fn opensandbox_payload_is_deny_by_default() {
         assert_eq!(
@@ -1191,6 +1436,167 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("@sha256:"));
+    }
+
+    #[test]
+    fn codex_payload_has_independent_run_and_session_recovery_metadata() {
+        let mut task = SandboxTask::new(
+            SandboxProfile::Codex,
+            vec!["/usr/local/bin/jarvis-codex-runtime".into()],
+        )
+        .unwrap();
+        let session = Uuid::now_v7();
+        task.codex_session_id = Some(session);
+        let payload = opensandbox_create_payload(&task, &test_images());
+        assert_eq!(payload["metadata"]["jarvis.profile"], "codex");
+        assert_eq!(
+            payload["metadata"]["jarvis.run_id"],
+            task.task_id.to_string()
+        );
+        assert_eq!(
+            payload["metadata"]["jarvis.session_id"],
+            session.to_string()
+        );
+        assert!(payload["metadata"].get("capability").is_none());
+        assert!(payload.get("env").is_none());
+    }
+
+    #[tokio::test]
+    async fn authenticated_manager_listing_discovers_only_bound_codex_workloads() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let run = Uuid::now_v7();
+        let session = Uuid::now_v7();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).await.unwrap();
+            let text = std::str::from_utf8(&request[..count]).unwrap();
+            assert!(text.starts_with("GET /v1/sandboxes?"));
+            assert!(text.contains("metadata=jarvis.profile%3Dcodex"));
+            assert!(text
+                .to_ascii_lowercase()
+                .contains("open-sandbox-api-key: fixture-manager-key"));
+            let body = json!({
+                "items": [
+                    {"id":"owned-codex-1","metadata":{"jarvis.profile":"codex","jarvis.run_id":run.to_string(),"jarvis.session_id":session.to_string()}},
+                    {"id":"unrelated","metadata":{"jarvis.profile":"research"}}
+                ],
+                "pagination":{"page":1,"pageSize":100,"totalItems":2,"totalPages":1,"hasNextPage":false}
+            }).to_string();
+            let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let provider = OpenSandboxProvider::for_codex_broker(
+            format!("http://127.0.0.1:{port}/"),
+            "fixture-manager-key".into(),
+            format!("registry.example/codex@sha256:{}", "a".repeat(64)),
+        )
+        .unwrap();
+        let owned = provider.list_owned_codex().await.unwrap();
+        server.await.unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].handle.provider_id, "owned-codex-1");
+        assert_eq!(owned[0].handle.task_id, run);
+        assert_eq!(owned[0].coding_session_id, session);
+    }
+
+    #[tokio::test]
+    async fn codex_delete_requires_confirmed_manager_disappearance() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let run = Uuid::now_v7();
+        let session = Uuid::now_v7();
+        let server = tokio::spawn(async move {
+            for request_index in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).await.unwrap();
+                let request = std::str::from_utf8(&request[..count]).unwrap();
+                if request_index == 0 {
+                    assert!(request.starts_with("DELETE /v1/sandboxes/owned-codex-1 "));
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(request.starts_with("GET /v1/sandboxes?"));
+                    let body = json!({
+                        "items": [{"id":"owned-codex-1","metadata":{
+                            "jarvis.profile":"codex",
+                            "jarvis.run_id":run.to_string(),
+                            "jarvis.session_id":session.to_string()
+                        }}],
+                        "pagination":{"hasNextPage":false}
+                    })
+                    .to_string();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(reply.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let provider = OpenSandboxProvider::for_codex_broker(
+            format!("http://127.0.0.1:{port}/"),
+            "fixture-manager-key".into(),
+            format!("registry.example/codex@sha256:{}", "a".repeat(64)),
+        )
+        .unwrap();
+        let handle = SandboxHandle {
+            provider_id: "owned-codex-1".into(),
+            task_id: run,
+            profile: SandboxProfile::Codex,
+        };
+        assert_eq!(
+            provider.terminate(handle).await,
+            Err(SandboxError::ProviderRequestFailed)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_delete_is_retry_safe_when_manager_already_removed_workload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).await.unwrap();
+                let request = std::str::from_utf8(&request[..count]).unwrap();
+                let reply = if index == 0 {
+                    assert!(request.starts_with("DELETE /v1/sandboxes/owned-codex-1 "));
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned()
+                } else {
+                    assert!(request.starts_with("GET /v1/sandboxes?"));
+                    let body = json!({"items":[],"pagination":{"hasNextPage":false}}).to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let provider = OpenSandboxProvider::for_codex_broker(
+            format!("http://127.0.0.1:{port}/"),
+            "fixture-manager-key".into(),
+            format!("registry.example/codex@sha256:{}", "a".repeat(64)),
+        )
+        .unwrap();
+        let handle = SandboxHandle {
+            provider_id: "owned-codex-1".into(),
+            task_id: Uuid::now_v7(),
+            profile: SandboxProfile::Codex,
+        };
+        assert!(provider.terminate(handle).await.is_ok());
+        server.await.unwrap();
     }
 
     #[test]

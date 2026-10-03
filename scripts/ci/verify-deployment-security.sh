@@ -31,6 +31,7 @@ sudo env GITHUB_ACTIONS=true bash deploy/private/tests/test-private-installers.s
 sudo env GITHUB_ACTIONS=true bash deploy/private/tests/test-private-agent-poll.sh
 bash deploy/caddy/tests/test-caddy-template.sh
 bash deploy/opensandbox/tests/test-opensandbox-template.sh
+bash deploy/codex-workload/test-workload.sh
 
 readonly opensandbox_commit=6b2023e9b7eb80a940d88e6ae05fcbc0eb0cf23f
 sandbox_source=$(mktemp -d)

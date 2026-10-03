@@ -67,7 +67,8 @@ use routes::chat::{
 };
 use routes::coding::{
     create as coding_create, lifecycle as coding_lifecycle, list as coding_list,
-    start_or_resume as coding_start_or_resume,
+    run_artifact as coding_run_artifact, run_cancel as coding_run_cancel,
+    run_status as coding_run_status, start_or_resume as coding_start_or_resume,
 };
 use routes::portfolio::{add_holding, get_holdings, remove_holding};
 use routes::system::{
@@ -167,6 +168,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/assistant/orchestrate", post(assistant_orchestrate))
         .route("/v1/coding/sessions", get(coding_list).post(coding_create))
         .route("/v1/coding/sessions/{id}", post(coding_lifecycle))
+        .route(
+            "/v1/coding/sessions/{id}/reservations",
+            post(routes::coding::reserve_run),
+        )
+        .route("/v1/coding/runs/{id}", get(coding_run_status))
+        .route("/v1/coding/runs/{id}/cancel", post(coding_run_cancel))
+        .route(
+            "/v1/coding/runs/{id}/artifacts/{name}",
+            get(coding_run_artifact),
+        )
         .route(
             "/v1/coding/sessions/{id}/{mode}",
             post(coding_start_or_resume),

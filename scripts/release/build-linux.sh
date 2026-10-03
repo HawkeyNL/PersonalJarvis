@@ -180,6 +180,7 @@ core_admin_version=$(jq -er '.packages[] | select(.name == "jarvis-core-admin") 
 # test these exact bytes; nothing recompiles between acceptance and packaging.
 cargo build --locked --release \
   -p jarvis-api --bins \
+  -p jarvis-codex --bin jarvis-codex-runtime \
   -p jarvis-core --bin jarvis-agent-bundle \
   -p jarvis-admin --bin jarvis
 
@@ -202,6 +203,7 @@ install -m 0755 "$release_target_dir/release/jarvis-api" "$temporary_release/jar
 install -m 0755 "$release_target_dir/release/jarvis-config-broker" "$temporary_release/jarvis-config-broker"
 install -m 0755 "$release_target_dir/release/jarvis-model-policy-storage" "$temporary_release/jarvis-model-policy-storage"
 install -m 0755 "$release_target_dir/release/jarvis-codex-broker" "$temporary_release/jarvis-codex-broker"
+install -m 0755 "$release_target_dir/release/jarvis-codex-runtime" "$temporary_release/jarvis-codex-runtime"
 install -m 0755 "$release_target_dir/release/jarvis-claude-worker" "$temporary_release/jarvis-claude-worker"
 install -m 0755 "$release_target_dir/release/jarvis-agent-bundle" "$temporary_release/jarvis-agent-bundle"
 install -m 0755 "$release_target_dir/release/jarvis" "$temporary_release/jarvis"
@@ -258,6 +260,8 @@ done < <(find schema/surreal -type f -name '*.surql' -printf '%P\n' | LC_ALL=C s
 schema_sha256=$(sha256sum "$schema_manifest" | awk '{print $1}')
 schema_six_sha256=$(head -n 6 "$schema_manifest" | sha256sum | awk '{print $1}')
 schema_seven_sha256=$(head -n 7 "$schema_manifest" | sha256sum | awk '{print $1}')
+schema_eight_sha256=$(head -n 8 "$schema_manifest" | sha256sum | awk '{print $1}')
+schema_nine_sha256=$(head -n 9 "$schema_manifest" | sha256sum | awk '{print $1}')
 jq -n \
   --arg tag "$release_tag" \
   --arg revision "$release_revision" \
@@ -265,13 +269,13 @@ jq -n \
   --arg core_version "$core_version" \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
-  --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 8, from_sha256: [$schema_six, $schema_seven]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1}}' \
+  --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" --arg schema_eight "$schema_eight_sha256" --arg schema_nine "$schema_nine_sha256" \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 10, from_sha256: [$schema_six, $schema_seven, $schema_eight, $schema_nine]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1, codex_runtime: 1}}' \
   > "$temporary_release/release.json"
 
 (
   cd "$temporary_release"
-  sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-claude-worker jarvis-agent-bundle \
+  sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-codex-runtime jarvis-claude-worker jarvis-agent-bundle \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
     jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials \
     com.hawkeynl.jarvis.devices.policy \

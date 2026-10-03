@@ -13,6 +13,4 @@ thiserror.workspace = true
 uuid.workspace = true
 jarvis-policy.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
-
-[dev-dependencies]
 tokio.workspace = true

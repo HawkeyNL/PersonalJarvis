@@ -225,6 +225,15 @@ validate_artifacts() {
     policy_version=$(policy_capability "$release") || return 1
     laya_version=$(laya_capability "$release") || return 1
     subscription_version=$(subscription_capability "$release") || return 1
+    if jq -e '.tooling | has("codex_runtime")' "$release/release.json" >/dev/null; then
+        jq -e '.tooling.codex_runtime == 1' "$release/release.json" >/dev/null || fail "unsupported Codex runtime capability"
+        [[ -f $release/jarvis-codex-runtime && ! -L $release/jarvis-codex-runtime && -x $release/jarvis-codex-runtime ]] ||
+            fail "Codex sandbox runtime is missing or unsafe"
+        mode=$(stat -c '%a' "$release/jarvis-codex-runtime")
+        (( (8#$mode & 0022) == 0 )) || fail "Codex sandbox runtime permissions are unsafe"
+        matches=$(awk '$2 == "jarvis-codex-runtime" { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
+        [[ $matches == 1 ]] || fail "Codex sandbox runtime is not uniquely checksum-bound"
+    fi
     if [[ $subscription_version == 1 ]]; then
         [[ -f $release/jarvis-claude-worker && ! -L $release/jarvis-claude-worker && -x $release/jarvis-claude-worker ]] ||
             fail "Claude subscription worker is missing or unsafe"
@@ -254,8 +263,8 @@ validate_artifacts() {
     validate_device_policy "$release"
     validate_policy_storage_artifact "$release"
     if jq -e 'has("schema_migration")' "$release/release.json" >/dev/null; then
-        jq -e '.schema_migration | .version == 1 and .target == 8 and
-            (.from_sha256 | type == "array" and length > 0 and length <= 2 and
+        jq -e '.schema_migration | .version == 1 and (.target == 8 or .target == 9 or .target == 10) and
+            (.from_sha256 | type == "array" and length > 0 and length <= 4 and
                 all(type == "string" and test("^[0-9a-f]{64}$")))' "$release/release.json" >/dev/null || fail "unsupported schema migration declaration"
         [[ -f $release/schema-backup && ! -L $release/schema-backup && -x $release/schema-backup ]] || fail "schema backup helper is missing or unsafe"
         mode=$(stat -c '%a' "$release/schema-backup")

@@ -824,7 +824,7 @@ mv /opt/jarvis/releases/jarvis-core-v10.0.1 /opt/jarvis/releases/v10.0.1
 candidate=/opt/jarvis/releases/v10.0.1
 install -m 0755 "$repo_dir/deploy/systemd/schema-backup.sh" "$candidate/schema-backup"
 install -m 0644 "$repo_dir/jarvis-core-admin/packaging/com.hawkeynl.jarvis.devices.policy" "$candidate/com.hawkeynl.jarvis.devices.policy"
-jq --arg previous "$same_migrations" '.tooling.local_devices = 1 | .schema_migration = {version:1,target:8,from_sha256:[$previous]}' "$candidate/release.json" > "$fixture_dir/migration-manifest"
+jq --arg previous "$same_migrations" '.tooling.local_devices = 1 | .schema_migration = {version:1,target:9,from_sha256:[$previous]}' "$candidate/release.json" > "$fixture_dir/migration-manifest"
 install -m 0644 "$fixture_dir/migration-manifest" "$candidate/release.json"
 (cd "$candidate" && sha256sum schema-backup com.hawkeynl.jarvis.devices.policy >> artifact-binaries.sha256)
 if JARVIS_UPDATER_UNDER_TEST="$candidate/install-home-node-core" run_updater "$candidate" > "$fixture_dir/installer-migration.log" 2>&1; then

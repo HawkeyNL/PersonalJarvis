@@ -19,7 +19,10 @@ hex.workspace = true
 async-trait = "0.1"
 rand.workspace = true
 subtle.workspace = true
+tar = "0.4.46"
+tokio.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 ed25519-dalek.workspace = true
-tokio.workspace = true
+tempfile = "3"

@@ -40,6 +40,7 @@ mod agent_tree;
 mod ai_accounts;
 mod credential_setup;
 mod local_devices;
+mod sandbox_preflight;
 mod terminal_ui;
 mod tui_app;
 mod update_center;
@@ -85,6 +86,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Read-only Codex/OpenSandbox activation checks; never enables execution.
+    Sandbox {
+        #[command(subcommand)]
+        command: sandbox_preflight::SandboxCommand,
+    },
     /// Owner-only subscription account management; never exposed through Core HTTP.
     Accounts {
         #[command(subcommand)]
@@ -417,6 +423,7 @@ fn run() -> Result<()> {
         bail!("non-interactive use requires an explicit Jarvis command");
     };
     match command {
+        Commands::Sandbox { command } => sandbox_preflight::run(command, cli.json),
         Commands::Accounts { command } => ai_accounts::run(command, cli.json),
         Commands::Account { command } => account_activation::run(command, cli.json),
         Commands::Devices { command } => local_devices::run(command, cli.json),
