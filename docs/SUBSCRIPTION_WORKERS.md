@@ -135,3 +135,103 @@ bounded Claude prompt should then confirm worker routing and subscription
 telemetry with no metered-API entry. Real account login and Home Node behavior
 have not been established by mock/fixture tests. The private `Jarvis.md`
 persona remains owner-managed and is not changed by this foundation.
+
+## Codex chat worker (text only, off by default)
+
+The `codex-cli` provider lets the owner route chat to Codex models through
+the ChatGPT subscription, for example GPT-6 Luna. It is a chat brain only: it
+has no tools and is unrelated to Codex coding. It does not use, change or
+weaken the fail-closed Codex coding broker (`CODEX_OPENSANDBOX_CONTRACT.md`).
+
+Core sends a bounded recent conversation and system text over
+`/run/jarvis-codex-chat.sock` (root:jarvis 0660, socket-activated). The
+`jarvis-codex-chat-worker` checks that the peer is the `jarvis` user, allows
+two parallel runs, and before each run checks the reviewed CLI version and
+that `codex login status` reports a ChatGPT login. An API-key login is never
+treated as a subscription. Each run gets a private 0700 directory under
+`/run/jarvis-codex-chat` with an empty working directory. The system prompt
+goes into a 0600 file there (`model_instructions_file`), never into the
+arguments. The prompt is written to stdin. The CLI starts from a cleared
+environment. The worker refuses to start if any `*_API_KEY` variable is set,
+and the unit unsets `OPENAI_API_KEY` and `CODEX_API_KEY`. The exact
+invocation is:
+
+```text
+codex exec --ephemeral --skip-git-repo-check --ignore-user-config --ignore-rules
+  --sandbox read-only -m <model> -o <private answer file>
+  -c features.shell_tool=false -c features.unified_exec=false
+  -c web_search=disabled -c tools.view_image=false -c features.apps=false
+  -c features.multi_agent=false -c features.memories=false -c features.hooks=false
+  -c history.persistence=none -c analytics.enabled=false -c approval_policy=never
+  -c shell_environment_policy.inherit=none
+  [-c model_instructions_file="<private 0600 file>"] -
+```
+
+A run stops after 120 seconds. The answer file is read only if it is a
+regular file of at most 128 KiB. The CLI's diagnostics are kept to 16 KiB,
+used only to classify a failure, and then discarded. The worker returns a
+typed answer or one fixed state. `model_unavailable` covers the ChatGPT
+rejection "The '<model>' model is not supported when using Codex with a
+ChatGPT account" (openai/codex#47784, a staged Luna rollout). It is final for
+that model. The router then tries only the owner's next chain entry and never
+falls back to the paid OpenAI API. `codex-cli` is a subscription backend, not
+metered. `paid_api: "off"` keeps it, and a metered entry after it still needs
+`metered_after_subscription`. It is in no built-in order: Core reaches it only
+through an owner-routed chain or a brain pin, always with an exact model that
+is enabled in `policy.json`.
+
+**Identity.** The worker runs as `jarvis-codex` because
+`jarvis accounts connect codex` stores the ChatGPT login under that identity's
+home (`/var/lib/jarvis-codex`, `codex login --device-auth`). A separate
+identity would need a second login. The unit makes the login home its only
+writable state. The coding broker, App Server, engineering and repository
+state (`/var/lib/jarvis-codex-broker`, `/run/jarvis-codex`,
+`/run/jarvis-codex-broker`, `/var/lib/jarvis-engineering`,
+`/var/lib/jarvis-codex-repositories`), Core's state and the Claude worker are
+inaccessible to it. The unit has every hardening directive of the Claude
+worker plus `PrivateDevices`. Residual risk: the worker shares a UID with the
+App Server and broker processes, so a compromised official CLI could signal
+them. The same root-installed CLI already runs under that identity. Codex
+disconnect disables the chat socket before it logs out.
+
+**Version gate.** `REVIEWED_CODEX_VERSION` in
+`crates/llm/src/codex_chat_protocol.rs` is an empty placeholder. Until it holds
+the exact version the owner reviewed, every run returns `incompatible_runtime`
+without a model call. No Codex CLI version has been verified for this worker
+yet.
+
+Release capability `tooling.codex_chat_worker = 1` binds the worker binary and
+both units to the release checksums. Nothing enables the socket: not the
+installer, an update or account linking. An update only restarts a worker that
+is already running. A rollback to a release without the worker is refused
+while the socket or service is enabled or active.
+
+Owner activation:
+
+1. Install the official Codex CLI as a root-owned regular file at
+   `/usr/local/bin/codex` (not a symlink or an npm wrapper).
+2. Check that this version supports every flag and `-c` key in the invocation
+   above (`codex exec --help` and the official non-interactive and config
+   documentation). Then set `REVIEWED_CODEX_VERSION` to the exact
+   `codex --version` number in a reviewed change and ship a release.
+3. `sudo jarvis accounts connect codex`, then `sudo jarvis accounts status
+   codex` must report `connected`, not `wrong_auth_mode`.
+4. Make sure the pair, for example `codex-cli gpt-6-luna`, is in `policy.json`,
+   then `sudo jarvis models enable codex-cli gpt-6-luna`. Open gap: `jarvis
+   models refresh` does not record subscription pairs (`claude-cli`,
+   `codex-cli`) as discovered. There is no supported command yet that adds
+   them, so `enable` and `route set` refuse an absent pair.
+5. `sudo systemctl enable --now jarvis-codex-chat.socket`.
+6. Route a tier, for example `sudo jarvis models route set hard codex-cli
+   gpt-6-luna claude-cli claude-opus-5`, or use Core Admin. This restarts Core,
+   which then sees the socket and marks the brain available.
+7. Send one harmless prompt and confirm subscription telemetry with
+   `backend: codex-cli` and no metered-API entry. If Luna is not yet available
+   to the account, expect a `model_unavailable` error, not a paid call.
+
+Not verified here: a real ChatGPT login, a real `codex exec` run, and that the
+installed CLI accepts every flag and key above. The same applies to the
+effect of `model_instructions_file` on Codex's built-in instructions, to
+whether `codex login status` prints to stdout (the accounts CLI makes the
+same assumption), and to whether `--ignore-user-config` also skips a global
+`AGENTS.md` in the login home.

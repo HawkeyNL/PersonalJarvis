@@ -129,16 +129,17 @@ Validation (Core, broker and CLI apply the same rules): only these fields;
 missing tier keeps the built-in order for that tier; a chain has 1 to 9
 entries; providers are the routable provider IDs (`anthropic-api`,
 `openai-api`, `deepseek-api`, `xai-api`, `zai-api`, `ollama`, `ollama-cloud`,
-`huggingface`, `claude-cli`); a model has 1 to 256 characters and no control
-characters; no duplicate pairs. A metered entry after a subscription entry
-(`claude-cli`) is refused unless the tier sets
+`huggingface`, `claude-cli`, `codex-cli`); a model has 1 to 256 characters
+and no control characters; no duplicate pairs. A metered entry after a
+subscription entry (`claude-cli`, `codex-cli`) is refused unless the tier sets
 `"metered_after_subscription": true`, so a full plan never silently becomes a
 paid call. The CLI and the broker also require every routed pair to be
 discovered in `policy.json`.
 
 `paid_api` is the "subscriptions and local only" switch. `"allowed"` is the
 default when the field or the file is absent. `"off"` removes every metered
-backend (everything except local `ollama` and subscription `claude-cli`) from
+backend (everything except local `ollama` and subscriptions `claude-cli` and
+`codex-cli`) from
 every tier, routed chains and the built-in order alike. `ollama` counts as
 local only when `llm_ollama_url` points at a loopback host (127.0.0.0/8, `::1`
 or `localhost`); otherwise Core treats it as metered at runtime. Validation
