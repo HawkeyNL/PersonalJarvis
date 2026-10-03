@@ -903,6 +903,9 @@ fn candidate_updater_must_be_the_exact_owned_staged_file() {
     fs::set_permissions(&release, fs::Permissions::from_mode(0o777)).unwrap();
     assert!(candidate_updater(&root, "v1.2.3", owner).is_err());
     fs::set_permissions(&release, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(candidate_updater(&root, "v1.2.3", owner).is_err());
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
 
     // A symlinked updater or release directory never resolves to the
     // expected path, even when its target is otherwise acceptable.
@@ -912,6 +915,23 @@ fn candidate_updater_must_be_the_exact_owned_staged_file() {
     assert!(candidate_updater(&root, "v1.2.4", owner).is_err());
     std::os::unix::fs::symlink(&release, root.join("v1.2.5")).unwrap();
     assert!(candidate_updater(&root, "v1.2.5", owner).is_err());
+}
+
+#[test]
+fn migration_without_yes_requires_a_terminal_before_staging() {
+    assert!(require_confirmation_terminal(false, false).is_err());
+    assert!(require_confirmation_terminal(false, true).is_ok());
+    assert!(require_confirmation_terminal(true, false).is_ok());
+}
+
+#[test]
+fn migration_ignores_interrupts_once_services_may_stop() {
+    ignore_interrupts().unwrap();
+    for signal in [libc::SIGINT, libc::SIGHUP] {
+        // Restoring the default reports the previously installed disposition.
+        let previous = unsafe { libc::signal(signal, libc::SIG_DFL) };
+        assert_eq!(previous, libc::SIG_IGN);
+    }
 }
 
 #[test]

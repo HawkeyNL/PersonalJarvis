@@ -954,6 +954,8 @@ fn validate_update_confirmation(args: &UpdateArgs) -> Result<()> {
 /// administration config lock is deliberately not held around either step
 /// (jarvis-backup takes the updater lock first; holding both would invert).
 fn migrate_update(target: Option<String>, yes: bool, presentation: &Presentation) -> Result<()> {
+    // Refuse before anything is downloaded or staged.
+    require_confirmation_terminal(yes, io::stdin().is_terminal() && io::stdout().is_terminal())?;
     let tag = match target {
         Some(tag) => tag,
         None => {
@@ -988,11 +990,35 @@ fn migrate_update(target: Option<String>, yes: bool, presentation: &Presentation
     let mut command = trusted_command(&updater);
     load_updater_environment(&mut command)?;
     command.args(["--migrate-staged", &tag]);
+    ignore_interrupts()?;
     println!("Step 2/2: migrating to {tag}");
+    println!(
+        "Migration in progress - do not interrupt; services will restart automatically; follow with sudo jarvis logs core"
+    );
     run_migration_step(
         &mut command,
         &format!("an update or backup is running; {tag} stays staged; rerun sudo jarvis update --migrate {tag}"),
     )
+}
+
+fn require_confirmation_terminal(yes: bool, terminal: bool) -> Result<()> {
+    if !yes && !terminal {
+        bail!("refusing non-interactive migration; pass --migrate vMAJOR.MINOR.PATCH --yes after reviewing the target");
+    }
+    Ok(())
+}
+
+/// Once the candidate updater may stop services, Ctrl-C or a closed terminal
+/// must not kill this CLI and hide the outcome of a migration that keeps
+/// running. Ignored dispositions are inherited by the updater as well.
+fn ignore_interrupts() -> Result<()> {
+    for signal in [libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: installs the async-signal-safe SIG_IGN disposition only.
+        if unsafe { libc::signal(signal, libc::SIG_IGN) } == libc::SIG_ERR {
+            bail!("could not protect the migration from interruption");
+        }
+    }
+    Ok(())
 }
 
 fn run_migration_step(command: &mut ProcessCommand, busy: &str) -> Result<()> {
