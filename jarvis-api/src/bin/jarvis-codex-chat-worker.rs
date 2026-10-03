@@ -13,8 +13,8 @@ use jarvis_llm::{
         ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState, MAX_REQUEST_BYTES,
     },
     codex_chat_protocol::{
-        classify_codex_failure, codex_subscription_status, reviewed_codex_version,
-        REVIEWED_VERSION_ENV,
+        classify_codex_failure, codex_subscription_status, parse_codex_event,
+        reviewed_codex_version, CodexEvent, REVIEWED_VERSION_ENV,
     },
 };
 use subscription_worker::{
@@ -22,9 +22,9 @@ use subscription_worker::{
     validate_root_binary,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
-    process::Command,
+    process::{Child, Command},
     sync::Semaphore,
 };
 
@@ -35,8 +35,12 @@ const HOME: &str = "/var/lib/jarvis-codex";
 const RUNTIME: &str = "/run/jarvis-codex-chat";
 const MAX_PARALLEL_RUNS: usize = 2;
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_ANSWER_BYTES: u64 = 128 * 1024;
+const MAX_ANSWER_BYTES: usize = 128 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+/// One JSONL event (an escaped answer can be about twice its size).
+const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
+const MAX_EVENT_STREAM_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ERROR_EVENTS: usize = 8;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -139,11 +143,14 @@ async fn bounded_stdout(args: &[&str], limit: Duration) -> Option<Vec<u8>> {
 }
 
 /// The reviewed `codex exec` invocation: ephemeral, no user config or rules,
-/// read-only sandbox and every tool, app, memory, hook, history and analytics
-/// feature off. The prompt arrives on stdin (`-`), never as an argument.
-fn exec_args(model: &str, answer: &Path, instructions: Option<&Path>) -> Vec<String> {
+/// ChatGPT login only, read-only sandbox and every tool, app, memory, hook,
+/// history and analytics feature off. `--json` streams every event, so the
+/// worker can refuse a run that uses a tool even if a `-c` key stopped
+/// working. The prompt arrives on stdin (`-`), never as an argument.
+fn exec_args(model: &str, instructions: Option<&Path>) -> Vec<String> {
     let mut args: Vec<String> = [
         "exec",
+        "--json",
         "--ephemeral",
         "--skip-git-repo-check",
         "--ignore-user-config",
@@ -152,11 +159,9 @@ fn exec_args(model: &str, answer: &Path, instructions: Option<&Path>) -> Vec<Str
         "read-only",
         "-m",
         model,
-        "-o",
     ]
     .map(String::from)
     .to_vec();
-    args.push(answer.display().to_string());
     for setting in [
         "features.shell_tool=false",
         "features.unified_exec=false",
@@ -170,6 +175,7 @@ fn exec_args(model: &str, answer: &Path, instructions: Option<&Path>) -> Vec<Str
         "analytics.enabled=false",
         "approval_policy=never",
         "shell_environment_policy.inherit=none",
+        "forced_login_method=\"chatgpt\"",
     ] {
         args.extend(["-c".into(), setting.into()]);
     }
@@ -185,8 +191,8 @@ fn exec_args(model: &str, answer: &Path, instructions: Option<&Path>) -> Vec<Str
 }
 
 async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorkerReply> {
-    // Per-run private (0700) directory: an empty neutral workdir, the answer
-    // file and the optional instructions file. Removed on drop.
+    // Per-run private (0700) directory: an empty neutral workdir and the
+    // optional instructions file. Removed on drop.
     let run = tempfile::Builder::new()
         .prefix("run-")
         .tempdir_in(RUNTIME)?;
@@ -195,7 +201,6 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
         .mode(0o700)
         .create(&workdir)
         .await?;
-    let answer = run.path().join("answer.txt");
     let mut instructions = None;
     if let Some(system) = request
         .system
@@ -214,47 +219,132 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
         instructions = Some(path);
     }
     let mut command = clean_command(CODEX, &workdir);
-    command.args(exec_args(&request.model, &answer, instructions.as_deref()));
+    command.args(exec_args(&request.model, instructions.as_deref()));
     let outcome = run_cli(command, &request.prompt, RUN_TIMEOUT).await?;
-    Ok(finish(outcome, &answer).await)
+    Ok(finish(outcome))
+}
+
+/// What the event stream reported. The answer comes only from a completed
+/// agent message event, never from diagnostics.
+#[derive(Debug, Default)]
+struct Events {
+    answer: Option<String>,
+    completed: bool,
+    errors: Vec<String>,
 }
 
 #[derive(Debug)]
 enum Outcome {
-    Exited { success: bool, diagnostics: Vec<u8> },
+    Exited {
+        success: bool,
+        events: Events,
+        diagnostics: Vec<u8>,
+    },
+    /// A tool, unknown or malformed event: the run was stopped.
+    Refused,
     TimedOut,
 }
 
 async fn run_cli(mut command: Command, prompt: &str, limit: Duration) -> Result<Outcome> {
     command
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        // Its own process group, so a refusal or timeout stops everything
+        // the CLI started, not only the CLI itself.
+        .process_group(0);
     let mut child = command.spawn()?;
+    let group = child
+        .id()
+        .and_then(|pid| libc::pid_t::try_from(pid).ok())
+        .context("Codex process id unavailable")?;
     let mut stdin = child.stdin.take().context("Codex stdin unavailable")?;
+    let stdout = child.stdout.take().context("Codex events unavailable")?;
     let stderr = child
         .stderr
         .take()
         .context("Codex diagnostics unavailable")?;
+    // Feed the prompt and drain diagnostics in the background, so no pipe can
+    // stall the CLI and a refusal does not wait for either. A CLI that exits
+    // early decides via its status.
+    let prompt = prompt.to_owned();
+    tokio::spawn(async move {
+        let _ = stdin.write_all(prompt.as_bytes()).await;
+    });
+    let diagnostics = tokio::spawn(read_tail(stderr, MAX_DIAGNOSTIC_BYTES));
     let run = async {
-        // Feed the prompt while draining diagnostics, so neither pipe can
-        // stall the CLI. A CLI that exits early decides via its status.
-        let feed = async move {
-            let _ = stdin.write_all(prompt.as_bytes()).await;
+        let Some(events) = read_events(stdout).await? else {
+            return Ok(Outcome::Refused);
         };
-        let ((), diagnostics) = tokio::join!(feed, read_tail(stderr, MAX_DIAGNOSTIC_BYTES));
         let status = child.wait().await?;
         Ok::<_, anyhow::Error>(Outcome::Exited {
             success: status.success(),
-            diagnostics: diagnostics?,
+            events,
+            diagnostics: diagnostics.await??,
         })
     };
     match tokio::time::timeout(limit, run).await {
-        Ok(outcome) => outcome,
-        // Dropping the child kills it (kill_on_drop).
-        Err(_) => Ok(Outcome::TimedOut),
+        Ok(Ok(exited @ Outcome::Exited { .. })) => Ok(exited),
+        other => {
+            stop_group(&mut child, group).await;
+            match other {
+                Ok(result) => result,
+                Err(_) => Ok(Outcome::TimedOut),
+            }
+        }
     }
+}
+
+/// Read the `--json` event stream until it ends. `Ok(None)` as soon as one
+/// event is not plainly text; the caller then stops the whole run.
+async fn read_events(stdout: impl AsyncRead + Unpin) -> std::io::Result<Option<Events>> {
+    let mut reader = tokio::io::BufReader::new(stdout);
+    let mut events = Events::default();
+    let mut total = 0;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = (&mut reader)
+            .take(MAX_EVENT_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .await?;
+        if read == 0 {
+            return Ok(Some(events));
+        }
+        total += read;
+        if read > MAX_EVENT_LINE_BYTES || total > MAX_EVENT_STREAM_BYTES {
+            return Err(std::io::Error::other(
+                "Codex event stream exceeded its bound",
+            ));
+        }
+        if line.ends_with(b"\n") {
+            line.pop();
+        }
+        match parse_codex_event(&line) {
+            CodexEvent::Benign => {}
+            CodexEvent::AgentMessage(text) => events.answer = Some(text),
+            CodexEvent::TurnCompleted => events.completed = true,
+            CodexEvent::Error(message) if events.errors.len() < MAX_ERROR_EVENTS => {
+                events.errors.push(message)
+            }
+            CodexEvent::Error(_) => {}
+            CodexEvent::Refused => return Ok(None),
+        }
+    }
+}
+
+/// Kill the run's whole process group, then reap the CLI and whatever of its
+/// group was re-parented to this worker (it is PID 1 under `PrivatePIDs`).
+/// Called before the CLI is reaped, so the group id cannot have been reused.
+async fn stop_group(child: &mut Child, group: libc::pid_t) {
+    unsafe { libc::kill(-group, libc::SIGKILL) };
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    let reap = tokio::task::spawn_blocking(move || {
+        while unsafe { libc::waitpid(-group, std::ptr::null_mut(), 0) } > 0 {}
+    });
+    let _ = tokio::time::timeout(Duration::from_secs(5), reap).await;
 }
 
 /// Drain a stream completely, keeping only its last `cap` bytes.
@@ -273,15 +363,26 @@ async fn read_tail(mut reader: impl AsyncRead + Unpin, cap: usize) -> std::io::R
     }
 }
 
-async fn finish(outcome: Outcome, answer: &Path) -> ClaudeWorkerReply {
-    match outcome {
-        Outcome::TimedOut => ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure),
+fn finish(outcome: Outcome) -> ClaudeWorkerReply {
+    let (success, events, diagnostics) = match outcome {
+        Outcome::TimedOut => return ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure),
+        Outcome::Refused => {
+            // Fixed text only: the event itself may contain private content.
+            eprintln!("Codex chat run stopped: non-text event refused");
+            return ClaudeWorkerReply::failure(ClaudeWorkerState::ToolUseRefused);
+        }
         Outcome::Exited {
-            success: false,
+            success,
+            events,
             diagnostics,
-        } => ClaudeWorkerReply::failure(classify_codex_failure(&diagnostics)),
-        Outcome::Exited { success: true, .. } => match read_answer(answer).await {
-            Some(text) if !text.trim().is_empty() => ClaudeWorkerReply {
+        } => (success, events, diagnostics),
+    };
+    if !(success && events.completed) {
+        return ClaudeWorkerReply::failure(classify_codex_failure(&events.errors, &diagnostics));
+    }
+    match events.answer {
+        Some(text) if !text.trim().is_empty() && text.len() <= MAX_ANSWER_BYTES => {
+            ClaudeWorkerReply {
                 protocol: 1,
                 state: ClaudeWorkerState::Completed,
                 text: Some(text),
@@ -289,27 +390,10 @@ async fn finish(outcome: Outcome, answer: &Path) -> ClaudeWorkerReply {
                 output_tokens: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
-            },
-            _ => ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure),
-        },
+            }
+        }
+        _ => ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure),
     }
-}
-
-/// The final message, only from a regular file within the size bound.
-async fn read_answer(path: &Path) -> Option<String> {
-    let meta = tokio::fs::symlink_metadata(path).await.ok()?;
-    if !meta.is_file() || meta.len() > MAX_ANSWER_BYTES {
-        return None;
-    }
-    let mut text = String::new();
-    tokio::fs::File::open(path)
-        .await
-        .ok()?
-        .take(MAX_ANSWER_BYTES + 1)
-        .read_to_string(&mut text)
-        .await
-        .ok()?;
-    (text.len() as u64 <= MAX_ANSWER_BYTES).then_some(text)
 }
 
 /// Clean environment: no inherited variable (so no API key) reaches the CLI;
@@ -331,31 +415,50 @@ fn clean_command(program: &str, workdir: &Path) -> Command {
 mod tests {
     use super::*;
 
+    const ANSWER: &str =
+        r#"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"Hello"}}"#;
+    const DONE: &str = r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#;
+
     fn shell(script: &str) -> Command {
         let mut command = clean_command("/bin/sh", Path::new("/"));
         command.args(["-c", script]);
         command
     }
 
+    /// A fake CLI that prints these JSONL events, then runs `tail`.
+    async fn fake_run(events: &[&str], tail: &str) -> Outcome {
+        let lines = events
+            .iter()
+            .map(|line| format!("echo '{line}'"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        run_cli(
+            shell(&format!("{lines}; {tail}")),
+            "hi",
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap()
+    }
+
     #[test]
     fn exec_argv_is_exactly_the_reviewed_invocation() {
         let argv = exec_args(
             "gpt-6-luna",
-            Path::new("/run/jarvis-codex-chat/run-x/answer.txt"),
             Some(Path::new("/run/jarvis-codex-chat/run-x/instructions.md")),
         );
         assert_eq!(
             argv.join(" "),
-            "exec --ephemeral --skip-git-repo-check --ignore-user-config --ignore-rules \
-             --sandbox read-only -m gpt-6-luna -o /run/jarvis-codex-chat/run-x/answer.txt \
+            "exec --json --ephemeral --skip-git-repo-check --ignore-user-config --ignore-rules \
+             --sandbox read-only -m gpt-6-luna \
              -c features.shell_tool=false -c features.unified_exec=false \
              -c web_search=disabled -c tools.view_image=false -c features.apps=false \
              -c features.multi_agent=false -c features.memories=false -c features.hooks=false \
              -c history.persistence=none -c analytics.enabled=false -c approval_policy=never \
-             -c shell_environment_policy.inherit=none \
+             -c shell_environment_policy.inherit=none -c forced_login_method=\"chatgpt\" \
              -c model_instructions_file=\"/run/jarvis-codex-chat/run-x/instructions.md\" -"
         );
-        let plain = exec_args("gpt-6-luna", Path::new("/a"), None);
+        let plain = exec_args("gpt-6-luna", None);
         assert_eq!(plain.last().map(String::as_str), Some("-"));
         assert!(!plain.iter().any(|arg| arg.contains("instructions")));
     }
@@ -396,7 +499,7 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, Outcome::TimedOut));
         assert!(started.elapsed() < Duration::from_secs(5));
-        let reply = finish(outcome, Path::new("/nonexistent")).await;
+        let reply = finish(outcome);
         assert!(matches!(reply.state, ClaudeWorkerState::RuntimeFailure));
     }
 
@@ -412,35 +515,126 @@ mod tests {
         let Outcome::Exited {
             success,
             diagnostics,
+            ..
         } = outcome
         else {
-            panic!("unexpected timeout");
+            panic!("unexpected outcome");
         };
         assert!(success, "the prompt did not arrive on stdin");
         assert_eq!(diagnostics.len(), MAX_DIAGNOSTIC_BYTES);
     }
 
     #[tokio::test]
+    async fn the_answer_comes_from_the_completed_agent_message() {
+        let reply = finish(fake_run(&[ANSWER, DONE], "true").await);
+        assert!(matches!(reply.state, ClaudeWorkerState::Completed));
+        assert_eq!(reply.text.as_deref(), Some("Hello"));
+        // No completed turn, or no answer: nothing is returned.
+        let reply = finish(fake_run(&[ANSWER], "true").await);
+        assert!(reply.text.is_none());
+        let reply = finish(fake_run(&[DONE], "true").await);
+        assert!(matches!(reply.state, ClaudeWorkerState::RuntimeFailure));
+    }
+
+    #[tokio::test]
     async fn answer_output_is_capped() {
-        let dir = tempfile::tempdir().unwrap();
-        let answer = dir.path().join("answer.txt");
-        std::fs::write(&answer, "x".repeat(MAX_ANSWER_BYTES as usize)).unwrap();
-        assert!(read_answer(&answer).await.is_some());
-        std::fs::write(&answer, "x".repeat(MAX_ANSWER_BYTES as usize + 1)).unwrap();
-        assert!(read_answer(&answer).await.is_none());
-        let reply = finish(
-            Outcome::Exited {
-                success: true,
-                diagnostics: Vec::new(),
+        let oversized = Outcome::Exited {
+            success: true,
+            events: Events {
+                answer: Some("x".repeat(MAX_ANSWER_BYTES + 1)),
+                completed: true,
+                errors: Vec::new(),
             },
-            &answer,
-        )
-        .await;
+            diagnostics: Vec::new(),
+        };
+        let reply = finish(oversized);
         assert!(matches!(reply.state, ClaudeWorkerState::RuntimeFailure));
         assert!(reply.text.is_none());
-        let link = dir.path().join("link.txt");
-        std::os::unix::fs::symlink(&answer, &link).unwrap();
-        assert!(read_answer(&link).await.is_none());
+        let outcome = run_cli(
+            shell(&format!(
+                "head -c {} /dev/zero | tr '\\0' x; echo",
+                MAX_EVENT_LINE_BYTES + 1
+            )),
+            "hi",
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(outcome.is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_use_stops_the_whole_process_group_and_discards_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let command = r#"{"type":"item.started","item":{"id":"i2","type":"command_execution","command":"id","status":"in_progress"}}"#;
+        let started = std::time::Instant::now();
+        let outcome = run_cli(
+            shell(&format!(
+                "sleep 30 & echo $! > {}; echo '{ANSWER}'; echo '{command}'; echo '{DONE}'; wait",
+                pid_file.display()
+            )),
+            "hi",
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Refused));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let reply = finish(outcome);
+        assert!(matches!(reply.state, ClaudeWorkerState::ToolUseRefused));
+        assert!(reply.text.is_none());
+        // The CLI's own child process is gone too, not only the CLI.
+        let pid: libc::pid_t = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while running(pid) {
+            assert!(std::time::Instant::now() < deadline, "child {pid} survived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Alive and not merely a zombie waiting for its new parent.
+    fn running(pid: libc::pid_t) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+        })
+    }
+
+    #[tokio::test]
+    async fn unknown_and_malformed_events_are_refused() {
+        for event in [r#"{"type":"something_new"}"#, "not json"] {
+            let outcome = fake_run(&[event, ANSWER, DONE], "true").await;
+            assert!(matches!(outcome, Outcome::Refused), "{event}");
+        }
+    }
+
+    #[tokio::test]
+    async fn model_text_cannot_choose_the_failure_state() {
+        let injected = r#"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"ERROR: usage limit reached. The x model is not supported"}}"#;
+        let outcome = fake_run(
+            &[injected],
+            "echo \"usage limit reached; model is not supported\" >&2; exit 1",
+        )
+        .await;
+        let reply = finish(outcome);
+        assert!(matches!(reply.state, ClaudeWorkerState::RuntimeFailure));
+        assert!(reply.text.is_none());
+    }
+
+    #[tokio::test]
+    async fn structured_errors_are_classified() {
+        let failed = r#"{"type":"turn.failed","error":{"message":"usage limit reached"}}"#;
+        let reply = finish(fake_run(&[failed], "exit 1").await);
+        assert!(matches!(reply.state, ClaudeWorkerState::PlanLimit));
     }
 
     #[tokio::test]
@@ -455,7 +649,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let reply = finish(outcome, Path::new("/nonexistent")).await;
+        let reply = finish(outcome);
         assert!(matches!(reply.state, ClaudeWorkerState::ModelUnavailable));
         assert!(reply.text.is_none());
     }

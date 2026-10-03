@@ -161,19 +161,34 @@ and the unit unsets `OPENAI_API_KEY` and `CODEX_API_KEY`. The exact
 invocation is:
 
 ```text
-codex exec --ephemeral --skip-git-repo-check --ignore-user-config --ignore-rules
-  --sandbox read-only -m <model> -o <private answer file>
+codex exec --json --ephemeral --skip-git-repo-check --ignore-user-config --ignore-rules
+  --sandbox read-only -m <model>
   -c features.shell_tool=false -c features.unified_exec=false
   -c web_search=disabled -c tools.view_image=false -c features.apps=false
   -c features.multi_agent=false -c features.memories=false -c features.hooks=false
   -c history.persistence=none -c analytics.enabled=false -c approval_policy=never
-  -c shell_environment_policy.inherit=none
+  -c shell_environment_policy.inherit=none -c forced_login_method="chatgpt"
   [-c model_instructions_file="<private 0600 file>"] -
 ```
 
-A run stops after 120 seconds. The answer file is read only if it is a
-regular file of at most 128 KiB. The CLI's diagnostics are kept to 16 KiB,
-used only to classify a failure, and then discarded. The worker returns a
+Codex ignores an unknown `-c` key, so a renamed key could silently turn a
+tool back on. The worker therefore does not trust the `-c` settings alone. It
+reads the `--json` event stream line by line and allows only thread and turn
+lifecycle events, reasoning, agent messages and error events. Any other event
+or item type (a command, web search, MCP or tool call, file change, plan
+update), an unknown type or a line that is not JSON stops the run at once:
+the worker kills the CLI's whole process group, discards the answer and
+returns the fixed state `tool_use_refused`. Core treats that as a failed
+attempt of this entry. The answer is the last completed agent message, used
+only when the turn completed and the CLI exited successfully.
+
+The CLI runs in its own process group. A timeout or refusal kills the whole
+group. A run stops after 120 seconds. An event line is at most 512 KiB, the
+event stream at most 4 MiB and the answer at most 128 KiB. The CLI's
+diagnostics are kept to 16 KiB, used only to classify a failure, and then
+discarded. A failure is classified only from structured error events and
+diagnostic lines that start with `ERROR:`, never from model text, so a model
+answer cannot pose as a plan limit or a missing model. The worker returns a
 typed answer or one fixed state. `model_unavailable` covers the ChatGPT
 rejection "The '<model>' model is not supported when using Codex with a
 ChatGPT account" (openai/codex#47784, a staged Luna rollout). It is final for

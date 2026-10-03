@@ -166,6 +166,10 @@ impl SubscriptionWorker {
                 self.name
             ))),
             ClaudeWorkerState::RuntimeFailure => Err(self.failure()),
+            ClaudeWorkerState::ToolUseRefused => Err(LlmError::Api {
+                status: 502,
+                body: format!("{} run attempted tool use and was refused", self.name),
+            }),
             ClaudeWorkerState::Completed => {
                 let text = reply
                     .text
