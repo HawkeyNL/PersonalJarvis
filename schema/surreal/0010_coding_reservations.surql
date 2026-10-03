@@ -25,5 +25,9 @@ DEFINE FIELD IF NOT EXISTS sandbox_id ON coding_runs TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS sandbox_state ON coding_runs TYPE option<string> ASSERT $value = NONE OR $value IN ['not_created','active','termination_requested','terminated','cleanup_failed','orphan_recovered'];
 DEFINE FIELD IF NOT EXISTS sandbox_created_at ON coding_runs TYPE option<datetime>;
 DEFINE FIELD IF NOT EXISTS sandbox_cleanup_status ON coding_runs TYPE option<string>;
+-- The resume checkpoint is a structured object. A SCHEMAFULL table strips
+-- undeclared nested keys, which stored every checkpoint as {} and denied
+-- every resume.
+DEFINE FIELD OVERWRITE checkpoint ON coding_sessions FLEXIBLE TYPE option<object>;
 UPDATE schema_version:baseline SET version = 10, applied_at = time::now();
 COMMIT TRANSACTION;
