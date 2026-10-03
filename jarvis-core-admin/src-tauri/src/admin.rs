@@ -137,6 +137,11 @@ pub enum ModelMutation {
         model: String,
         route: String,
     },
+    /// Record an exact subscription pair as discovered (disabled).
+    Register {
+        provider: ModelProvider,
+        model: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -254,6 +259,30 @@ pub enum RouteMutation {
 }
 
 const MAX_ROUTE_CHAIN: usize = 9;
+
+/// Fixed `jarvis models register …` argv. Subscriptions have no model
+/// catalog, so the owner records the exact pair; it stays disabled.
+fn register_arguments(provider: ModelProvider, model: String) -> AdminResult<Vec<String>> {
+    if !matches!(provider, ModelProvider::ClaudeCli | ModelProvider::CodexCli) {
+        return Err("only claude-cli and codex-cli models can be registered".to_owned());
+    }
+    // Same rule as the subscription worker request; never option-like.
+    if model.is_empty()
+        || model.len() > 80
+        || model.starts_with('-')
+        || !model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("model identifier contains unsupported characters".to_owned());
+    }
+    Ok(vec![
+        "models".to_owned(),
+        "register".to_owned(),
+        provider.cli_name().to_owned(),
+        model,
+    ])
+}
 
 /// Fixed `jarvis models route …` argv. The trusted helper validates the full
 /// document again and requires every pair to be discovered.
@@ -1385,6 +1414,7 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
                         route,
                     ]
                 }
+                ModelMutation::Register { provider, model } => register_arguments(provider, model)?,
             };
             (ADMIN, args, Duration::from_secs(900))
         }
@@ -1752,6 +1782,43 @@ mod tests {
             request,
             ModelMutation::SetRoute { provider: ModelProvider::Huggingface, route, .. } if route == "groq"
         ));
+    }
+
+    #[test]
+    fn register_is_a_typed_subscription_only_request() {
+        let register = |payload: &str| -> AdminResult<Vec<String>> {
+            match serde_json::from_str(payload).map_err(|e| e.to_string())? {
+                ModelMutation::Register { provider, model } => register_arguments(provider, model),
+                _ => Err("not a register request".to_owned()),
+            }
+        };
+        assert_eq!(
+            register(r#"{"action":"register","provider":"codex-cli","model":"gpt-6-luna"}"#)
+                .unwrap(),
+            ["models", "register", "codex-cli", "gpt-6-luna"]
+        );
+        assert_eq!(
+            register(r#"{"action":"register","provider":"claude-cli","model":"claude-opus-5"}"#)
+                .unwrap(),
+            ["models", "register", "claude-cli", "claude-opus-5"]
+        );
+        let long = "m".repeat(81);
+        for (provider, model) in [
+            ("openai-api", "gpt-6-luna"),
+            ("ollama-local", "llama3.2"),
+            ("codex-cli", "-c"),
+            ("codex-cli", "org/model"),
+            ("codex-cli", "a b"),
+            ("codex-cli", ""),
+            ("codex-cli", long.as_str()),
+        ] {
+            let payload =
+                serde_json::json!({"action": "register", "provider": provider, "model": model});
+            assert!(
+                register(&payload.to_string()).is_err(),
+                "{provider} {model}"
+            );
+        }
     }
 
     fn route_arguments(payload: &str) -> AdminResult<Vec<String>> {

@@ -79,6 +79,17 @@ async function mutate(action: "refresh" | "enable" | "disable", row?: ModelRecor
   } catch (reason) { error.value = errorText(reason); }
   finally { busy.value = false; }
 }
+const registerProvider = ref("codex-cli");
+const registerModel = ref("");
+// Subscriptions have no model catalog: record one exact pair, disabled.
+async function registerSubscription() {
+  busy.value = true; error.value = "";
+  try {
+    result.value = await api.modelMutation({ action: "register", provider: registerProvider.value, model: registerModel.value.trim() });
+    registerModel.value = ""; await load();
+  } catch (reason) { error.value = errorText(reason); }
+  finally { busy.value = false; }
+}
 async function inspectHf(row: ModelRecord) {
   if (row.provider !== "huggingface") return;
   const request = ++routeRequest;
@@ -121,6 +132,12 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
   </PageHeader>
   <ErrorPanel v-if="error" :message="error" /><ResultPanel v-if="result" :result="result" />
   <ModelRouting :models="rows" />
+  <form class="model-toolbar" @submit.prevent="registerSubscription">
+    <select v-model="registerProvider" aria-label="Subscription provider"><option value="claude-cli">claude-cli</option><option value="codex-cli">codex-cli</option></select>
+    <input v-model="registerModel" class="search" maxlength="80" required placeholder="Subscription model, e.g. gpt-6-luna" aria-label="Subscription model" />
+    <button class="secondary" :disabled="busy">Register subscription model</button>
+  </form>
+  <p class="usage-source">Registering records the exact pair as disabled; enable it below before routing uses it.</p>
   <div class="model-toolbar">
     <input v-model="query" class="search" placeholder="Search provider, model or source…" />
     <select v-model="provider" aria-label="Provider"><option value="all">All providers</option><option v-for="item in providers" :key="item" :value="item">{{ item }}</option></select>
