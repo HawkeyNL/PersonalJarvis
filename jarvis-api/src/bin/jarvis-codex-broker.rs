@@ -2520,6 +2520,24 @@ mod tests {
         Ok(())
     }
 
+    /// SurrealDB may reject the losing concurrent lease with a retryable
+    /// transaction conflict instead of matching zero rows. Both mean "not leased";
+    /// any other error still fails the test.
+    fn lost_race(
+        result: Result<
+            Option<jarvis_usage::coding_reservations::LeasedReservation>,
+            jarvis_store::StoreError,
+        >,
+    ) -> Result<
+        Option<jarvis_usage::coding_reservations::LeasedReservation>,
+        jarvis_store::StoreError,
+    > {
+        match result {
+            Err(error) if format!("{error:?}").contains("read or write conflict") => Ok(None),
+            other => other,
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
     async fn reservation_is_single_use_across_concurrent_and_later_leases() -> anyhow::Result<()> {
@@ -2533,7 +2551,7 @@ mod tests {
                 coding_reservations::lease(&db, reservation, user, session, a, 60),
                 coding_reservations::lease(&db, reservation, user, session, b, 60),
             );
-            let (lease_a, lease_b) = (lease_a?, lease_b?);
+            let (lease_a, lease_b) = (lost_race(lease_a)?, lost_race(lease_b)?);
             assert_eq!(
                 usize::from(lease_a.is_some()) + usize::from(lease_b.is_some()),
                 1
