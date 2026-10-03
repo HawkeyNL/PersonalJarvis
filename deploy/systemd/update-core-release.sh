@@ -694,6 +694,16 @@ install_versioned_tooling() {
     [[ $agent_tooling_present == false || -x /usr/local/libexec/jarvis/private-agent-poll ]]
 }
 
+# Owner opt-in means "enabled" (or enabled-runtime). `systemctl is-enabled` also succeeds
+# for "static" units (no [Install] section), which appear as soon as a release
+# first installs them and must not read as an owner preference change.
+unit_enabled() {
+    case $(systemctl is-enabled "$1" 2>/dev/null) in
+        enabled|enabled-runtime) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 capture_laya_runtime_state() {
     laya_socket_was_active=false
     laya_service_was_active=false
@@ -701,8 +711,8 @@ capture_laya_runtime_state() {
     laya_service_was_enabled=false
     systemctl is-active --quiet jarvis-laya.socket && laya_socket_was_active=true
     systemctl is-active --quiet jarvis-laya.service && laya_service_was_active=true
-    systemctl is-enabled --quiet jarvis-laya.socket && laya_socket_was_enabled=true
-    systemctl is-enabled --quiet jarvis-laya.service && laya_service_was_enabled=true
+    unit_enabled jarvis-laya.socket && laya_socket_was_enabled=true
+    unit_enabled jarvis-laya.service && laya_service_was_enabled=true
     return 0
 }
 
@@ -713,8 +723,8 @@ capture_claude_runtime_state() {
     claude_service_was_enabled=false
     systemctl is-active --quiet jarvis-claude.socket && claude_socket_was_active=true
     systemctl is-active --quiet jarvis-claude.service && claude_service_was_active=true
-    systemctl is-enabled --quiet jarvis-claude.socket && claude_socket_was_enabled=true
-    systemctl is-enabled --quiet jarvis-claude.service && claude_service_was_enabled=true
+    unit_enabled jarvis-claude.socket && claude_socket_was_enabled=true
+    unit_enabled jarvis-claude.service && claude_service_was_enabled=true
     return 0
 }
 
@@ -738,8 +748,8 @@ restore_claude_runtime_state() {
     fi
     systemctl is-active --quiet jarvis-claude.socket && socket_active=true
     systemctl is-active --quiet jarvis-claude.service && service_active=true
-    systemctl is-enabled --quiet jarvis-claude.socket && socket_enabled=true
-    systemctl is-enabled --quiet jarvis-claude.service && service_enabled=true
+    unit_enabled jarvis-claude.socket && socket_enabled=true
+    unit_enabled jarvis-claude.service && service_enabled=true
     [[ $socket_active == true || $claude_service_was_active == false ]] || return 1
     [[ $socket_active == true || $claude_socket_was_active == false ]] || return 1
     [[ $socket_active == false || $claude_socket_was_active == true || $claude_service_was_active == true ]] || return 1
@@ -791,8 +801,8 @@ restore_laya_runtime_state() {
     fi
     systemctl is-active --quiet jarvis-laya.socket && socket_active=true
     systemctl is-active --quiet jarvis-laya.service && service_active=true
-    systemctl is-enabled --quiet jarvis-laya.socket && socket_enabled=true
-    systemctl is-enabled --quiet jarvis-laya.service && service_enabled=true
+    unit_enabled jarvis-laya.socket && socket_enabled=true
+    unit_enabled jarvis-laya.service && service_enabled=true
     [[ $socket_active == true || $laya_service_was_active == false ]] || return 1
     [[ $socket_active == true || $laya_socket_was_active == false ]] || return 1
     [[ $socket_active == false || $laya_socket_was_active == true || $laya_service_was_active == true ]] || return 1
@@ -865,9 +875,9 @@ activate_managed_release() {
         # service. The current manager understands how to remove its unit
         # after the owner has stopped/disabled it deliberately.
         if systemctl is-active --quiet jarvis-laya.service || \
-            systemctl is-enabled --quiet jarvis-laya.service || \
+            unit_enabled jarvis-laya.service || \
             systemctl is-active --quiet jarvis-laya.socket || \
-            systemctl is-enabled --quiet jarvis-laya.socket; then
+            unit_enabled jarvis-laya.socket; then
             echo 'jarvis updater: disable and stop optional jarvis-laya.service and jarvis-laya.socket before rolling back to a pre-Laya release' >&2
             return 1
         fi
@@ -876,9 +886,9 @@ activate_managed_release() {
     if jq -e '.tooling.subscription_workers == 1' "$previous/release.json" >/dev/null && \
         ! jq -e '.tooling.subscription_workers == 1' "$release/release.json" >/dev/null; then
         if systemctl is-active --quiet jarvis-claude.service || \
-            systemctl is-enabled --quiet jarvis-claude.service || \
+            unit_enabled jarvis-claude.service || \
             systemctl is-active --quiet jarvis-claude.socket || \
-            systemctl is-enabled --quiet jarvis-claude.socket; then
+            unit_enabled jarvis-claude.socket; then
             echo 'jarvis updater: disconnect and stop optional Claude worker before rolling back to a pre-subscription-worker release' >&2
             return 1
         fi
@@ -890,7 +900,7 @@ activate_managed_release() {
         # installed while the optional Codex execution broker is active or
         # owner-enabled. This is deliberately conservative for legacy targets.
         if systemctl is-active --quiet jarvis-codex-broker.service || \
-            systemctl is-enabled --quiet jarvis-codex-broker.service; then
+            unit_enabled jarvis-codex-broker.service; then
             echo 'jarvis updater: stop and disable Codex broker before rolling back to a pre-Codex-runtime release' >&2
             return 1
         fi

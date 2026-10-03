@@ -59,7 +59,14 @@ if [[ ${JARVIS_LAYA_STATE_FIXTURE:-false} == true || ${JARVIS_CLAUDE_STATE_FIXTU
         state="$JARVIS_UPDATER_FIXTURE/$unit"
         case ${1:-} in
             is-active) [[ -e $state.active ]]; exit ;;
-            is-enabled) [[ -e $state.enabled ]]; exit ;;
+            is-enabled)
+                if [[ -e $state.enabled ]]; then echo enabled; exit 0; fi
+                # Like systemd: an installed unit without [Install] is "static"
+                # (exit 0); an absent unit is not found (exit 4).
+                unit_file="${JARVIS_SYSTEMD_ROOT:?}/$unit"
+                [[ -f $unit_file ]] || { echo not-found; exit 4; }
+                if ! grep -q '^\[Install\]' "$unit_file"; then echo static; exit 0; fi
+                echo disabled; exit 1 ;;
             stop)
                 rm -f -- "$state.active"
                 [[ $unit != *.socket ]] || rm -f -- "$JARVIS_UPDATER_FIXTURE/$base.service.active"
@@ -87,7 +94,8 @@ if [[ ${1:-} == restart && ${2:-} == "${JARVIS_UPDATER_SYSTEMCTL_FAIL_ONCE:-}" &
     exit 1
 fi
 case ${1:-} in
-    daemon-reload|restart|try-restart|is-enabled|stop|start) exit 0 ;;
+    is-enabled) echo enabled; exit 0 ;;
+    daemon-reload|restart|try-restart|stop|start) exit 0 ;;
     *) exit 1 ;;
 esac
 EOF
@@ -951,4 +959,35 @@ for mode in disabled inactive socket_only active; do
     [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v12.0.1 ]]
     assert_claude_state "$expected"
 done
+# Regression (v0.0.38 -> v0.0.40 on the Home Node): the first release that
+# installs jarvis-claude.service (no [Install] section) turns it from
+# not-found into "static". That is not an owner opt-in and must not fail
+# activation, nor its failure restore.
+seed_active_release v12.0.0 "$same_migrations" true false false
+set_claude_state
+[[ ! -e $systemd_fixture/jarvis-claude.service ]]
+prepare_candidate v12.0.3 "$same_migrations" 12.0.3 12.0.3 12.0.3 true '' false true
+rm -f -- "$fixture_dir/readyz-failed-once"
+if JARVIS_UPDATER_READYZ_FAIL=true run_updater; then
+    echo "failed first-worker activation unexpectedly succeeded" >&2; exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v12.0.0 ]]
+[[ ! -e $systemd_fixture/jarvis-claude.service ]]
+prepare_candidate v12.0.4 "$same_migrations" 12.0.4 12.0.4 12.0.4 true '' false true
+run_updater
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v12.0.4 ]]
+grep -q 'ExecStart' "$systemd_fixture/jarvis-claude.service"
+assert_claude_state ''
+
+# Rollback guard: back to the pre-worker release is refused once the owner
+# enabled the worker, and allowed while it is merely installed (static
+# service, disabled socket).
+set_claude_state socket.enabled
+if run_updater --rollback-version v12.0.0; then
+    echo "rollback ignored an owner-enabled Claude worker" >&2; exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v12.0.4 ]]
+set_claude_state
+run_updater --rollback-version v12.0.0
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v12.0.0 ]]
 echo "Home Node updater fixture tests passed"
