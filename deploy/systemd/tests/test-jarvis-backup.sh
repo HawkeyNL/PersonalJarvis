@@ -172,6 +172,27 @@ verify "$archive" 2>/dev/null
 [[ -L $fixture/dest/jarvis-backup-2026-01-01.tar && $(cat "$fixture/outside") == target ]]
 [[ ! -e $fixture/dest/.jarvis-backup.stale ]]
 
+# --- Leftovers of a SIGKILLed run ---------------------------------------------------
+# Only exact run directories go; the lock file, symlinks (and their targets)
+# and other names stay. Restore containers are removed by the anchored filter.
+lock_dir="$fixture/stale"
+mkdir -p "$lock_dir/jarvis-backup.AbCd1234" "$lock_dir/jarvis-backup-other" "$fixture/linked-run"
+printf 'plaintext' > "$lock_dir/jarvis-backup.AbCd1234/export.surql"
+printf 'keep' > "$fixture/linked-run/export.surql"
+ln -s "$fixture/linked-run" "$lock_dir/jarvis-backup.Zz99Zz99"
+: > "$lock_dir/jarvis-backup.lock"
+docker() {
+    printf '%s\n' "$*" >> "$fixture/docker.log"
+    [[ $1 != ps ]] || printf 'abc123\ndef456\n'
+}
+remove_stale_runs
+[[ ! -e $lock_dir/jarvis-backup.AbCd1234 && -d $lock_dir/jarvis-backup-other && -f $lock_dir/jarvis-backup.lock ]]
+[[ -L $lock_dir/jarvis-backup.Zz99Zz99 && $(cat "$fixture/linked-run/export.surql") == keep ]]
+[[ $(cat "$fixture/docker.log") == $'ps -aq --filter name=^jarvis-backup-verify-\nrm -f abc123 def456' ]]
+docker() { [[ $1 != ps ]] || return 1; }
+expect_fail remove_stale_runs
+unset -f docker
+
 # --- Entry point refusals ---------------------------------------------------------
 if [[ $EUID != 0 ]]; then
     expect_fail bash "$repo/deploy/systemd/jarvis-backup.sh" create

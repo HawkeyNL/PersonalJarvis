@@ -278,6 +278,21 @@ cleanup() {
     [[ -z ${staging_dir:-} ]] || rm -rf -- "$staging_dir"
 }
 
+# A run killed with SIGKILL (OOM, stop timeout) skips the EXIT trap and leaves
+# its plaintext run directory and restore container behind. Call only while
+# holding the backup lock, so no live run owns them. Symlinks are never
+# followed or removed.
+remove_stale_runs() {
+    local ids
+    local -a containers=()
+    ids=$(docker ps -aq --filter 'name=^jarvis-backup-verify-') || fail 'cannot list stale restore containers'
+    if [[ -n $ids ]]; then
+        mapfile -t containers <<< "$ids"
+        docker rm -f "${containers[@]}" >/dev/null || fail 'cannot remove stale restore containers'
+    fi
+    find "$lock_dir" -mindepth 1 -maxdepth 1 -type d -name 'jarvis-backup.????????' -exec rm -rf -- {} +
+}
+
 create() {
     local tool newest need avail day parent
     [[ $EUID == 0 ]] || fail 'root required'
@@ -312,6 +327,7 @@ create() {
 
     exec 8> "$lock_dir/jarvis-backup.lock"
     flock -n 8 || { log 'another backup is running'; exit 75; }
+    remove_stale_runs
     exec 9> "$lock_dir/jarvis-updater.lock"
     flock -w 600 9 || { log 'a Core update is running'; exit 75; }
     # Writers of the protected configuration: keep the config tar consistent.
