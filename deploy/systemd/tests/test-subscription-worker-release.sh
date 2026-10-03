@@ -29,7 +29,18 @@ grep -Fxq 'SocketMode=0660' "$chat_socket"
 grep -Fxq 'User=jarvis-codex-chat' "$chat_service"
 grep -Fxq 'Group=jarvis-codex-chat' "$chat_service"
 grep -Fxq 'StateDirectory=jarvis-codex-chat' "$chat_service"
-grep -Fxq 'PrivatePIDs=true' "$chat_service"
+for directive in PrivatePIDs=true ProcSubset=pid ProtectKernelLogs=true ProtectClock=true \
+    ProtectHostname=true RestrictRealtime=true RestrictNamespaces=true \
+    SystemCallArchitectures=native SystemCallFilter=@system-service \
+    MemoryDenyWriteExecute=true NoExecPaths=/ \
+    'ExecPaths=/opt/jarvis/releases /usr/local/bin/codex /usr/lib -/usr/lib64' \
+    'IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7' \
+    IPAddressAllow=127.0.0.53; do
+    grep -Fxq "$directive" "$chat_service"
+done
+# Only the resolver stub may be reached on loopback, and no IPC is removed.
+[[ $(grep -c '^IPAddressAllow=' "$chat_service") == 1 ]]
+! grep -Eq '^RemoveIPC=' "$chat_service"
 grep -Fxq 'ExecStart=/opt/jarvis/current/jarvis-codex-chat-worker' "$chat_service"
 for directive in NoNewPrivileges=true CapabilityBoundingSet= LockPersonality=true \
     RestrictSUIDSGID=true PrivateTmp=true ProtectHome=true ProtectSystem=strict \

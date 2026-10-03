@@ -226,6 +226,28 @@ memory. `PrivatePIDs` gives it its own PID namespace. `codex-chat` disconnect
 disables the chat socket and stops the worker before it logs out; `codex`
 disconnect no longer touches the chat worker.
 
+**Unit hardening.** On top of every directive of the Claude worker and
+`PrivateDevices`, the unit sets `PrivatePIDs`, `ProcSubset=pid`,
+`ProtectKernelLogs`, `ProtectClock`, `ProtectHostname`, `RestrictRealtime`,
+`RestrictNamespaces`, `SystemCallArchitectures=native`,
+`SystemCallFilter=@system-service` and `MemoryDenyWriteExecute`.
+`NoExecPaths=/` with `ExecPaths=/opt/jarvis/releases /usr/local/bin/codex
+/usr/lib -/usr/lib64` lets only the worker release, the reviewed CLI and their
+shared libraries execute. `IPAddressDeny` blocks loopback, link-local,
+multicast, the private IPv4 ranges, CGNAT/Tailscale (`100.64.0.0/10`) and ULA
+(`fc00::/7`), so the CLI reaches only the internet and cannot reach Core,
+Ollama or the LAN. `IPAddressAllow=127.0.0.53` keeps DNS working because the
+Home Node resolves through the systemd-resolved stub (`/etc/resolv.conf` links
+to `stub-resolv.conf`); a host with another resolver must put its address
+there instead. The unit sets no `RemoveIPC`.
+
+These settings must be checked against the reviewed CLI, which has not been
+possible here. A native (Rust) Codex binary is expected to work. If the
+reviewed CLI needs another interpreter or helper path, the owner adds it to
+`ExecPaths`. If it is a JIT runtime (for example a Node.js build),
+`MemoryDenyWriteExecute` must be removed. Both fail closed: with a wrong list
+the CLI cannot start and every run fails; nothing runs with fewer limits.
+
 **Version gate.** The worker reads `JARVIS_CODEX_REVIEWED_VERSION` once at
 start. systemd sets it from the optional, root-owned
 `/etc/jarvis/codex-chat-worker.env` (`EnvironmentFile=-` in
@@ -249,7 +271,9 @@ Owner activation:
    `/usr/local/bin/codex` (not a symlink or an npm wrapper).
 2. Check that this version supports every flag and `-c` key in the invocation
    above (`codex exec --help` and the official non-interactive and config
-   documentation). Then record that exact `codex --version` number, for
+   documentation), that its `--json` events use the type names the worker
+   allows, and that it is a native binary needing nothing outside the unit's
+   `ExecPaths` (`file /usr/local/bin/codex`, `ldd`). Then record that exact `codex --version` number, for
    example `1.2.3`:
    `echo 'JARVIS_CODEX_REVIEWED_VERSION=1.2.3' | sudo tee /etc/jarvis/codex-chat-worker.env`
    (root-owned, `0644`; it is not a secret). After a CLI update, review again
@@ -274,7 +298,11 @@ Owner activation:
    to the account, expect a `model_unavailable` error, not a paid call.
 
 Not verified here: a real ChatGPT login, a real `codex exec` run, and that the
-installed CLI accepts every flag and key above. The same applies to the
+installed CLI accepts every flag and key above. The same applies to the exact
+`--json` event and item type names the worker allows (taken from the codex-rs
+`exec` JSONL events; a renamed type is refused, so a mismatch fails closed),
+and to the unit's `ExecPaths`, `MemoryDenyWriteExecute` and DNS settings with
+the real CLI. The same applies to the
 effect of `model_instructions_file` on Codex's built-in instructions, to
 whether `codex login status` prints to stdout (the accounts CLI makes the
 same assumption), and to whether `--ignore-user-config` also skips a global
