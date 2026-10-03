@@ -106,6 +106,10 @@ async fn main() -> Result<()> {
 }
 
 async fn handle(stream: &mut UnixStream, reviewed: &str) -> Result<ClaudeWorkerReply> {
+    // The run gets what is left of RUN_TIMEOUT after the request and the
+    // probes, so its own deadline (which stops the whole process group)
+    // always fires before the outer reply deadline.
+    let started = std::time::Instant::now();
     let mut bytes = Vec::new();
     stream
         .take((MAX_REQUEST_BYTES + 1) as u64)
@@ -130,7 +134,7 @@ async fn handle(stream: &mut UnixStream, reviewed: &str) -> Result<ClaudeWorkerR
             ClaudeWorkerState::SubscriptionUnavailable,
         ));
     }
-    run_official_client(request).await
+    run_official_client(request, RUN_TIMEOUT.saturating_sub(started.elapsed())).await
 }
 
 /// Non-generative status probe with bounded output and time.
@@ -203,7 +207,10 @@ fn exec_args(model: &str, instructions: Option<&Path>) -> Vec<String> {
     args
 }
 
-async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorkerReply> {
+async fn run_official_client(
+    request: ClaudeWorkerRequest,
+    limit: Duration,
+) -> Result<ClaudeWorkerReply> {
     // Per-run private (0700) directory: an empty neutral workdir and the
     // optional instructions file. Removed on drop.
     let run = tempfile::Builder::new()
@@ -233,7 +240,7 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
     }
     let mut command = clean_command(CODEX, &workdir);
     command.args(exec_args(&request.model, instructions.as_deref()));
-    let outcome = run_cli(command, &request.prompt, RUN_TIMEOUT).await?;
+    let outcome = run_cli(command, &request.prompt, limit).await?;
     Ok(finish(outcome))
 }
 
@@ -349,7 +356,9 @@ async fn read_events(stdout: impl AsyncRead + Unpin) -> std::io::Result<Option<E
 
 /// Kill the run's whole process group, then reap the CLI and whatever of its
 /// group was re-parented to this worker (it is PID 1 under `PrivatePIDs`).
-/// Called before the CLI is reaped, so the group id cannot have been reused.
+/// Either the CLI is not reaped yet, or a group member still holds its output
+/// open (the only wait after the CLI is reaped), so the group id is still in
+/// use and cannot belong to another run.
 async fn stop_group(child: &mut Child, group: libc::pid_t) {
     unsafe { libc::kill(-group, libc::SIGKILL) };
     let _ = child.start_kill();
