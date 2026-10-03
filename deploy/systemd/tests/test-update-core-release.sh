@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Linux-only CI fixture for the privileged Home Node updater. It runs the real
 # updater with fake GitHub/systemd commands and never contacts the network.
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "test-update-core-release: failed at line $LINENO" >&2' ERR
 
 [[ ${GITHUB_ACTIONS:-} == true ]] || {
     echo "refusing to run outside GitHub Actions" >&2
@@ -941,9 +942,12 @@ grep -Fq 'without authorizing a migration' "$fixture_dir/version-mismatch.err"
 [[ ! -e /opt/jarvis/releases/v10.1.1 ]]
 [[ -z $(find /opt/jarvis/releases -maxdepth 1 -name '.staging.*' -print -quit) ]]
 
-# A migration this updater cannot perform is refused before staging.
+# A migration this updater cannot perform is refused before staging. An
+# unsupported target is already rejected by the unit manager's artifact
+# validation; a release without the local-device capability passes that and
+# must be refused by the predicate --stage shares with --migrate-staged.
 prepare_migration_candidate v10.1.1 "$same_migrations"
-jq '.schema_migration.target = 99' "$fixture_dir/asset/jarvis-core-v10.1.1/release.json" > "$fixture_dir/migration-manifest"
+jq 'del(.tooling.local_devices)' "$fixture_dir/asset/jarvis-core-v10.1.1/release.json" > "$fixture_dir/migration-manifest"
 install -m 0644 "$fixture_dir/migration-manifest" "$fixture_dir/asset/jarvis-core-v10.1.1/release.json"
 tar -C "$fixture_dir/asset" -czf "$fixture_dir/jarvis-core-v10.1.1-linux-x86_64.tar.gz" jarvis-core-v10.1.1
 (cd "$fixture_dir" && sha256sum jarvis-core-v10.1.1-linux-x86_64.tar.gz > jarvis-core-v10.1.1-linux-x86_64.tar.gz.sha256)
