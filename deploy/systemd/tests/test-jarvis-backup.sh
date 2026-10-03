@@ -7,6 +7,7 @@ shopt -s inherit_errexit
 # shellcheck disable=SC2034  # globals below are consumed by the sourced script
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 fixture=$(mktemp -d)
+# shellcheck disable=SC2317  # invoked through the EXIT trap
 cleanup() {
     for home in "$fixture"/keys-*; do gpgconf --homedir "$home" --kill all >/dev/null 2>&1 || true; done
     gpgconf --homedir "$fixture/run/gnupg" --kill all >/dev/null 2>&1 || true
@@ -26,6 +27,7 @@ config() { printf '%s\n' "$@" > "$fixture/backup.conf"; }
 config '# comment' '' "destination=/var/backups/jarvis-dr" "recipients=$fpr_a,$fpr_b"
 read_config "$fixture/backup.conf"
 [[ $destination == /var/backups/jarvis-dr && ${recipients[*]} == "$fpr_a $fpr_b" ]]
+# shellcheck disable=SC2016  # literal command-substitution text is the input
 for bad in 'destination=/x;rm -rf /' 'destination=relative' 'destination=/var/../etc' \
     'recipients=abc' "recipients=$fpr_a;$fpr_b" 'rivetlink_hook=/x' 'destination =/x' '$(id)=/x'; do
     config "$bad" "destination=/var/backups/x" "recipients=$fpr_a"

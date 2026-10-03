@@ -50,7 +50,7 @@ single_value() {
 # $recipients array (40-hex primary key fingerprints).
 read_config() {
     local line key value
-    destination= recipients=()
+    destination='' recipients=()
     while IFS= read -r line || [[ -n $line ]]; do
         [[ -z $line || $line == '#'* ]] && continue
         [[ $line =~ ^([a-z_]+)=(.*)$ ]] || fail 'malformed config line'

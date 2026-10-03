@@ -107,7 +107,8 @@ export_hash=$(gpg --batch --quiet --homedir "$fixture/keys" -d "$fixture/open/su
 before=$(sha256sum "$archive")
 exec 5> "$fixture/run/jarvis-backup.lock"
 flock 5
-set +e; bash "$helper" create >/dev/null 2>&1; status=$?; set -e
+status=0
+bash "$helper" create >/dev/null 2>&1 || status=$?
 [[ $status == 75 ]]
 exec 5>&-
 
