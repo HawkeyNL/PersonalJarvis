@@ -45,6 +45,17 @@ stop_database() {
     running=$(docker compose --env-file /etc/jarvis/surrealdb.env -f /opt/jarvis/surrealdb/docker-compose.yml ps --status running -q) || return 1
     [[ -z $running ]] || fail 'database container is still running'
 }
+# Fail before any service stops when the snapshot cannot fit. The margin
+# (10% plus 64 MiB) absorbs filesystem overhead and growth before Core stops.
+require_snapshot_space() {
+    local needed available required
+    needed=$(du -skx -- "$database" | awk '{print $1}')
+    available=$(df -Pk -- "$backups" | awk 'NR == 2 {print $4}')
+    [[ $needed =~ ^[0-9]+$ && $available =~ ^[0-9]+$ ]] || fail 'could not measure snapshot space; services were not stopped'
+    required=$((needed + needed / 10 + 65536))
+    ((available >= required)) || \
+        fail "insufficient space in $backups: need $((required / 1024)) MiB, $((available / 1024)) MiB available; services were not stopped"
+}
 validate_tree() {
     local tree=$1 bad
     safe_dir "$tree"
@@ -70,6 +81,7 @@ case ${1:-} in
         [[ $# == 3 && $2 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && $3 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'expected previous and candidate release tags'
         safe_dir "$database"
         [[ $(stat -c '%a' "$database") == 700 ]] || fail 'database directory must be private'
+        require_snapshot_space
         stop_database || fail 'could not stop database for snapshot'
         validate_tree "$database"
         transaction=$(mktemp -d "$backups/txn.XXXXXXXX")

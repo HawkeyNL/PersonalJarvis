@@ -12,6 +12,17 @@ printf '#!/usr/bin/env bash\n[[ ${FIXTURE_RUNNING:-false} != true ]] || echo run
 chmod 0755 "$fixture/bin/"*
 export PATH="$fixture/bin:$PATH" GITHUB_ACTIONS=true JARVIS_SCHEMA_TEST_MODE=true JARVIS_SCHEMA_FIXTURE_ROOT="$fixture/state"
 helper="$repo/deploy/systemd/schema-backup.sh"
+# The free-space pre-flight runs before any service is stopped.
+mkdir -p "$fixture/lowspace"
+printf '#!/usr/bin/env bash\nprintf "Filesystem 1024-blocks Used Available Capacity Mounted on\\nfixture 1000 1000 0 100%%%% /\\n"\n' > "$fixture/lowspace/df"
+printf '#!/usr/bin/env bash\ntouch "%s/lowspace/systemctl-called"\nexit 1\n' "$fixture" > "$fixture/lowspace/systemctl"
+chmod 0755 "$fixture/lowspace/"*
+if PATH="$fixture/lowspace:$PATH" bash "$helper" create v1.0.0 v1.0.1 2>"$fixture/lowspace.err"; then
+    echo 'snapshot started without enough free space' >&2; exit 1
+fi
+grep -Fq 'insufficient space' "$fixture/lowspace.err"
+[[ ! -e $fixture/lowspace/systemctl-called ]]
+[[ -z $(find "$fixture/state/migration-backups" -mindepth 1 -print -quit) ]]
 if FIXTURE_RUNNING=true bash "$helper" create v1.0.0 v1.0.1; then echo 'running database was copied' >&2; exit 1; fi
 id=$(bash "$helper" create v1.0.0 v1.0.1)
 [[ $id =~ ^txn\.[A-Za-z0-9]{8}$ ]]
