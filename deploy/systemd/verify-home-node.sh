@@ -202,8 +202,12 @@ fi
 # Optional owner-enabled Codex chat worker: when its socket is on, the local
 # IPC and identity boundary is mandatory.
 if systemctl is-active --quiet jarvis-codex-chat.socket; then
-    check "Codex chat worker uses the jarvis-codex identity" bash -c \
-        '[[ $(systemctl show -p User --value jarvis-codex-chat.service) == jarvis-codex ]]'
+    check "Codex chat worker uses its own jarvis-codex-chat identity" bash -c \
+        '[[ $(systemctl show -p User --value jarvis-codex-chat.service) == jarvis-codex-chat ]]'
+    check "Codex chat identity has no Docker or extra group access" bash -c \
+        '[[ $(id -nG jarvis-codex-chat) == jarvis-codex-chat ]]'
+    check "Codex chat login home is private" bash -c \
+        '[[ -d /var/lib/jarvis-codex-chat && ! -L /var/lib/jarvis-codex-chat && $(stat -c "%U:%G:%a" /var/lib/jarvis-codex-chat) == jarvis-codex-chat:jarvis-codex-chat:700 ]]'
     check "Codex chat socket is systemd-owned and private" bash -c \
         '[[ -S /run/jarvis-codex-chat.sock && ! -L /run/jarvis-codex-chat.sock && $(stat -c "%u:%G:%a" /run/jarvis-codex-chat.sock) == 0:jarvis:660 ]]'
     ui_detail "Codex chat worker: socket enabled (optional; subscription only)"

@@ -455,7 +455,7 @@ pub struct CredentialRecord {
     pub configured: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AiAccountRecord {
     pub provider: String,
@@ -470,6 +470,8 @@ pub struct AiAccountRecord {
 pub enum AiAccountProvider {
     Claude,
     Codex,
+    #[serde(rename = "codex-chat")]
+    CodexChat,
 }
 
 impl AiAccountProvider {
@@ -477,6 +479,7 @@ impl AiAccountProvider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::CodexChat => "codex-chat",
         }
     }
 }
@@ -839,12 +842,19 @@ pub fn credentials(session: &SessionManager) -> AdminResult<Vec<CredentialRecord
 }
 
 pub fn ai_accounts(session: &SessionManager) -> AdminResult<Vec<AiAccountRecord>> {
-    let rows: Vec<AiAccountRecord> = parse_json(&session.run(BrokerRequest::Accounts)?.stdout)?;
-    if rows.len() != 2
+    validate_ai_accounts(parse_json(&session.run(BrokerRequest::Accounts)?.stdout)?)
+}
+
+/// Exactly one row per known login, each with its fixed worker identity.
+fn validate_ai_accounts(rows: Vec<AiAccountRecord>) -> AdminResult<Vec<AiAccountRecord>> {
+    let providers: std::collections::BTreeSet<&str> =
+        rows.iter().map(|row| row.provider.as_str()).collect();
+    if rows.len() != 3
+        || providers.len() != rows.len()
         || rows.iter().any(|row| {
             !matches!(
                 (row.provider.as_str(), row.worker.as_str()),
-                ("claude", "jarvis-claude") | ("codex", "jarvis-codex")
+                ("claude", "jarvis-claude") | ("codex", "jarvis-codex") | ("codex-chat", "jarvis-codex-chat")
             )
                 || !matches!(
                     row.state.as_str(),
@@ -856,7 +866,6 @@ pub fn ai_accounts(session: &SessionManager) -> AdminResult<Vec<AiAccountRecord>
                     "inactive" | "socket_ready" | "active" | "unavailable"
                 )
         })
-        || rows[0].provider == rows[1].provider
     {
         return Err("AI account status contained unexpected metadata".to_owned());
     }
@@ -911,6 +920,7 @@ pub fn ai_account_entry(action: &OsStr, provider: &OsStr) -> AdminResult<()> {
     let provider = match provider.to_str() {
         Some("claude") => AiAccountProvider::Claude,
         Some("codex") => AiAccountProvider::Codex,
+        Some("codex-chat") => AiAccountProvider::CodexChat,
         _ => return Err("unsupported AI account provider".to_owned()),
     };
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
@@ -1959,5 +1969,28 @@ mod tests {
         assert_eq!(row.billing, "overage_unverified");
         let with_token = safe.replace("\"runtime\"", "\"access_token\":\"canary-secret\",\"runtime\"");
         assert!(serde_json::from_str::<AiAccountRecord>(&with_token).is_err());
+    }
+
+    #[test]
+    fn ai_accounts_need_one_row_per_login_with_its_own_worker() {
+        let row = |provider: &str, worker: &str| AiAccountRecord {
+            provider: provider.to_owned(),
+            worker: worker.to_owned(),
+            state: "logged_out".to_owned(),
+            billing: "unverified".to_owned(),
+            runtime: "inactive".to_owned(),
+        };
+        let claude = row("claude", "jarvis-claude");
+        let codex = row("codex", "jarvis-codex");
+        let chat = row("codex-chat", "jarvis-codex-chat");
+        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone(), chat.clone()]).is_ok());
+        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone()]).is_err());
+        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone(), codex.clone()]).is_err());
+        // The chat worker never shares the coding login's identity.
+        assert!(validate_ai_accounts(vec![claude, codex, row("codex-chat", "jarvis-codex")]).is_err());
+        assert_eq!(
+            serde_json::to_string(&AiAccountProvider::CodexChat).unwrap(),
+            "\"codex-chat\""
+        );
     }
 }

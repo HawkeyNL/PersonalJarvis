@@ -141,7 +141,7 @@ export type CredentialProvider =
   | "huggingface"
   | "jev";
 export interface CredentialRecord { provider: CredentialProvider; configured: boolean }
-export type AiAccountProvider = "claude" | "codex";
+export type AiAccountProvider = "claude" | "codex" | "codex-chat";
 export type AiAccountAction = "connect" | "test" | "reconnect" | "disconnect";
 export interface AiAccountRecord {
   provider: AiAccountProvider;

@@ -17,16 +17,19 @@ grep -Fxq 'InaccessiblePaths=/etc/jarvis /var/lib/jarvis /var/lib/jarvis-codex' 
 ! grep -Eq '^SupplementaryGroups=|^EnvironmentFile=.*(anthropic|openai|core[.]env)' "$service"
 ! grep -Eq '^Listen(Stream|Datagram)=[0-9]|^Listen(Stream|Datagram)=127[.]' "$socket"
 
-# Codex chat worker: own socket, the jarvis-codex login identity, and every
-# hardening directive of the Claude worker, never weaker.
+# Codex chat worker: own socket, its own jarvis-codex-chat login identity
+# (never the coding broker's jarvis-codex), and every hardening directive of
+# the Claude worker, never weaker.
 chat_service="$repo/deploy/systemd/jarvis-codex-chat.service"
 chat_socket="$repo/deploy/systemd/jarvis-codex-chat.socket"
 grep -Fxq 'ListenStream=/run/jarvis-codex-chat.sock' "$chat_socket"
 grep -Fxq 'SocketUser=root' "$chat_socket"
 grep -Fxq 'SocketGroup=jarvis' "$chat_socket"
 grep -Fxq 'SocketMode=0660' "$chat_socket"
-grep -Fxq 'User=jarvis-codex' "$chat_service"
-grep -Fxq 'Group=jarvis-codex' "$chat_service"
+grep -Fxq 'User=jarvis-codex-chat' "$chat_service"
+grep -Fxq 'Group=jarvis-codex-chat' "$chat_service"
+grep -Fxq 'StateDirectory=jarvis-codex-chat' "$chat_service"
+grep -Fxq 'PrivatePIDs=true' "$chat_service"
 grep -Fxq 'ExecStart=/opt/jarvis/current/jarvis-codex-chat-worker' "$chat_service"
 for directive in NoNewPrivileges=true CapabilityBoundingSet= LockPersonality=true \
     RestrictSUIDSGID=true PrivateTmp=true ProtectHome=true ProtectSystem=strict \
@@ -36,7 +39,7 @@ for directive in NoNewPrivileges=true CapabilityBoundingSet= LockPersonality=tru
     grep -Fxq "$directive" "$service"
     grep -Fxq "$directive" "$chat_service"
 done
-grep -Eq '^InaccessiblePaths=/etc/jarvis /var/lib/jarvis .*-/var/lib/jarvis-claude .*-/var/lib/jarvis-codex-broker .*-/var/lib/jarvis-engineering ' "$chat_service"
+grep -Eq '^InaccessiblePaths=/etc/jarvis /var/lib/jarvis .*-/var/lib/jarvis-claude .*-/var/lib/jarvis-codex .*-/var/lib/jarvis-codex-broker .*-/var/lib/jarvis-engineering ' "$chat_service"
 grep -Eq '^UnsetEnvironment=.*OPENAI_API_KEY .*CODEX_API_KEY ' "$chat_service"
 ! grep -Eq '^SupplementaryGroups=|^Environment=|^ReadWritePaths=|^\[Install\]' "$chat_service"
 # The only environment source is the optional owner-reviewed version file.

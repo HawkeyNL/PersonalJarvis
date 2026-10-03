@@ -1,6 +1,6 @@
 //! Finite, text-only Codex chat worker for subscription models (for example
-//! GPT-6 Luna through a ChatGPT plan). The official CLI runs as jarvis-codex
-//! with every tool off, in an empty private directory, never inside Core and
+//! GPT-6 Luna through a ChatGPT plan). The official CLI runs as the dedicated
+//! jarvis-codex-chat identity with every tool off, in an empty private directory, never inside Core and
 //! never with an API key. It does not touch the Codex coding broker.
 
 mod subscription_worker;
@@ -29,9 +29,11 @@ use tokio::{
 };
 
 const CODEX: &str = "/usr/local/bin/codex";
-/// Login home written by `jarvis accounts connect codex`
-/// (`codex login --device-auth` as jarvis-codex).
-const HOME: &str = "/var/lib/jarvis-codex";
+/// Login home written by `jarvis accounts connect codex-chat`
+/// (`codex login --device-auth` as jarvis-codex-chat). It is separate from
+/// the jarvis-codex login of the coding broker and App Server.
+const IDENTITY: &str = "jarvis-codex-chat";
+const HOME: &str = "/var/lib/jarvis-codex-chat";
 const RUNTIME: &str = "/run/jarvis-codex-chat";
 const MAX_PARALLEL_RUNS: usize = 2;
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
@@ -44,10 +46,15 @@ const MAX_ERROR_EVENTS: usize = 8;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let worker_uid = named_uid("jarvis-codex")?;
+    // Prompts and answers pass through this process: no core dumps and no
+    // ptrace or /proc memory access by other processes of the same UID.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        bail!("Codex chat worker could not disable core dumps");
+    }
+    let worker_uid = named_uid(IDENTITY)?;
     let core_uid = named_uid("jarvis")?;
     if unsafe { libc::geteuid() } != worker_uid {
-        bail!("Codex chat worker must run as the jarvis-codex identity");
+        bail!("Codex chat worker must run as the jarvis-codex-chat identity");
     }
     // A paid API key must never be reachable, not even by accident.
     if std::env::vars_os().any(|(key, _)| key.to_string_lossy().ends_with("_API_KEY")) {
@@ -63,8 +70,14 @@ async fn main() -> Result<()> {
     validate_private_dir(RUNTIME, worker_uid)?;
     let listener = inherited_listener()?;
     let permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_RUNS));
+    // Under PrivatePIDs this process is PID 1 of its namespace, which ignores
+    // SIGTERM without a handler; stop promptly when systemd asks.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let (mut stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            _ = terminate.recv() => return Ok(()),
+        };
         if !authorized_peer(&stream, core_uid) {
             continue;
         }
@@ -403,8 +416,8 @@ fn clean_command(program: &str, workdir: &Path) -> Command {
     command
         .env_clear()
         .env("HOME", HOME)
-        .env("USER", "jarvis-codex")
-        .env("LOGNAME", "jarvis-codex")
+        .env("USER", IDENTITY)
+        .env("LOGNAME", IDENTITY)
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("LANG", "C.UTF-8")
         .current_dir(workdir);
@@ -476,7 +489,9 @@ mod tests {
         let env = String::from_utf8(output.stdout).unwrap();
         assert!(!env.contains("API_KEY"), "{env}");
         assert!(!env.contains("canary"), "{env}");
-        assert!(env.lines().any(|line| line == "HOME=/var/lib/jarvis-codex"));
+        assert!(env
+            .lines()
+            .any(|line| line == "HOME=/var/lib/jarvis-codex-chat"));
     }
 
     #[tokio::test]

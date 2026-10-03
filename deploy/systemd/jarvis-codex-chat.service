@@ -6,10 +6,11 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-# Shares only the ChatGPT login home of the jarvis-codex identity. The
-# coding broker's, App Server's and engineering state stay inaccessible.
-User=jarvis-codex
-Group=jarvis-codex
+# Dedicated identity with its own ChatGPT login home (`jarvis accounts connect
+# codex-chat`). It shares no UID or state with the jarvis-codex coding broker
+# or App Server; their state, Core's and the Claude worker's stay inaccessible.
+User=jarvis-codex-chat
+Group=jarvis-codex-chat
 ExecStart=/opt/jarvis/current/jarvis-codex-chat-worker
 WorkingDirectory=/run/jarvis-codex-chat
 # Owner-written, root-owned, optional: JARVIS_CODEX_REVIEWED_VERSION=<exact
@@ -17,7 +18,7 @@ WorkingDirectory=/run/jarvis-codex-chat
 # applies. Absent, empty or malformed keeps every run incompatible_runtime.
 EnvironmentFile=-/etc/jarvis/codex-chat-worker.env
 UnsetEnvironment=OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN OPENAI_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN HF_TOKEN SSH_AUTH_SOCK
-StateDirectory=jarvis-codex
+StateDirectory=jarvis-codex-chat
 StateDirectoryMode=0700
 RuntimeDirectory=jarvis-codex-chat
 RuntimeDirectoryMode=0700
@@ -38,8 +39,9 @@ ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectProc=invisible
+PrivatePIDs=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-InaccessiblePaths=/etc/jarvis /var/lib/jarvis -/var/lib/jarvis-claude -/var/lib/jarvis-codex-broker -/var/lib/jarvis-engineering -/var/lib/jarvis-codex-repositories -/run/jarvis-codex -/run/jarvis-codex-broker
+InaccessiblePaths=/etc/jarvis /var/lib/jarvis -/var/lib/jarvis-claude -/var/lib/jarvis-codex -/var/lib/jarvis-codex-broker -/var/lib/jarvis-engineering -/var/lib/jarvis-codex-repositories -/run/jarvis-codex -/run/jarvis-codex-broker
 TasksMax=64
 MemoryMax=2G
 

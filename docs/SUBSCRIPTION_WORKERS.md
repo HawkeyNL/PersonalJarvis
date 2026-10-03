@@ -87,7 +87,14 @@ sudo jarvis accounts status codex
 sudo jarvis accounts connect codex
 sudo jarvis accounts test codex
 sudo jarvis accounts disconnect codex
+sudo jarvis accounts status codex-chat
+sudo jarvis accounts connect codex-chat
+sudo jarvis accounts test codex-chat
+sudo jarvis accounts disconnect codex-chat
 ```
+
+`codex-chat` is the separate ChatGPT login of the text-only Codex chat worker
+(identity `jarvis-codex-chat`, see below); `codex` is the coding login.
 
 `runtime_missing` means the reviewed official binary or dedicated identity is
 missing or its protected state layout failed validation. `wrong_auth_mode` means subscription/ChatGPT authentication
@@ -199,19 +206,25 @@ metered. `paid_api: "off"` keeps it, and a metered entry after it still needs
 through an owner-routed chain or a brain pin, always with an exact model that
 is enabled in `policy.json`.
 
-**Identity.** The worker runs as `jarvis-codex` because
-`jarvis accounts connect codex` stores the ChatGPT login under that identity's
-home (`/var/lib/jarvis-codex`, `codex login --device-auth`). A separate
-identity would need a second login. The unit makes the login home its only
-writable state. The coding broker, App Server, engineering and repository
-state (`/var/lib/jarvis-codex-broker`, `/run/jarvis-codex`,
+**Identity.** The worker runs as its own system user `jarvis-codex-chat`
+with its own ChatGPT login home `/var/lib/jarvis-codex-chat`
+(`StateDirectory=jarvis-codex-chat`). The owner links it separately with
+`sudo jarvis accounts connect codex-chat`, which runs
+`codex login --device-auth` under that identity. It shares no UID, login or
+state with the `jarvis-codex` identity of the coding broker and App Server, so
+a compromised chat CLI cannot signal those processes or read their login. The
+prepare and install scripts create the identity like the other worker
+identities (nologin shell, own group, no Docker group, private 0700 home). The
+unit makes the login home its only writable state. The `jarvis-codex` login
+home, the coding broker, App Server, engineering and repository state
+(`/var/lib/jarvis-codex`, `/var/lib/jarvis-codex-broker`, `/run/jarvis-codex`,
 `/run/jarvis-codex-broker`, `/var/lib/jarvis-engineering`,
 `/var/lib/jarvis-codex-repositories`), Core's state and the Claude worker are
-inaccessible to it. The unit has every hardening directive of the Claude
-worker plus `PrivateDevices`. Residual risk: the worker shares a UID with the
-App Server and broker processes, so a compromised official CLI could signal
-them. The same root-installed CLI already runs under that identity. Codex
-disconnect disables the chat socket before it logs out.
+inaccessible to it. The worker sets `PR_SET_DUMPABLE` to 0 at start, so it
+writes no core dump and processes of the same UID cannot ptrace it or read its
+memory. `PrivatePIDs` gives it its own PID namespace. `codex-chat` disconnect
+disables the chat socket and stops the worker before it logs out; `codex`
+disconnect no longer touches the chat worker.
 
 **Version gate.** The worker reads `JARVIS_CODEX_REVIEWED_VERSION` once at
 start. systemd sets it from the optional, root-owned
@@ -242,8 +255,10 @@ Owner activation:
    (root-owned, `0644`; it is not a secret). After a CLI update, review again
    and change the value, then `sudo systemctl try-restart
    jarvis-codex-chat.service`.
-3. `sudo jarvis accounts connect codex`, then `sudo jarvis accounts status
-   codex` must report `connected`, not `wrong_auth_mode`.
+3. `sudo jarvis accounts connect codex-chat` (or Connect on the "Codex chat"
+   card in Core Admin → AI Accounts), then `sudo jarvis accounts status
+   codex-chat` must report `connected`, not `wrong_auth_mode`. This is a
+   separate login from `codex`; linking one never links the other.
 4. Record the exact pair, then enable it:
    `sudo jarvis models register codex-cli gpt-6-luna` and
    `sudo jarvis models enable codex-cli gpt-6-luna` (or "Register subscription
