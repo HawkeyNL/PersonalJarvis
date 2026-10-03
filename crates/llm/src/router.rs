@@ -8,7 +8,11 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    net::IpAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -37,10 +41,44 @@ pub fn always_available() -> Arc<dyn Availability> {
     Arc::new(AlwaysAvailable)
 }
 
-/// Whether a backend bills per call. Fails closed: only the known local and
-/// subscription backends are unmetered; anything else is treated as paid.
-pub fn is_metered_backend(backend_id: &str) -> bool {
+/// Whether the configured Ollama endpoint is off this host. Set once when the
+/// Ollama brain is built; a remote Ollama may bill and is treated as metered.
+static OLLAMA_REMOTE: AtomicBool = AtomicBool::new(false);
+
+/// Record the configured Ollama URL. Only a loopback host (127.0.0.0/8, ::1,
+/// `localhost`) keeps `ollama` unmetered; anything else, including an
+/// unparsable URL, fails closed to metered.
+pub(crate) fn record_ollama_url(url: &str) {
+    OLLAMA_REMOTE.store(!is_loopback_url(url), Ordering::Relaxed);
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Static classification by provider id, independent of runtime config, so
+/// the broker, the CLI and Core validate `routing.json` identically.
+pub(crate) fn is_metered_provider_id(backend_id: &str) -> bool {
     !matches!(backend_id, "ollama" | "claude-cli")
+}
+
+/// Whether a backend bills per call. Fails closed: only the known local and
+/// subscription backends are unmetered, and Ollama only on loopback; anything
+/// else is treated as paid.
+pub fn is_metered_backend(backend_id: &str) -> bool {
+    is_metered_provider_id(backend_id)
+        || (backend_id == "ollama" && OLLAMA_REMOTE.load(Ordering::Relaxed))
 }
 
 /// What a model is good for — mirrors `jarvis_registry::ModelClass` so the router
@@ -1407,5 +1445,29 @@ mod tests {
             .with_routing(live);
         assert!(router.chat(&ask(Tier::Default, None)).await.is_err());
         assert_eq!(zai_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn only_a_loopback_ollama_url_counts_as_local() {
+        for url in [
+            "http://127.0.0.1:11434",
+            "http://127.8.9.10:11434/",
+            "http://localhost:11434",
+            "http://LOCALHOST",
+            "http://[::1]:11434",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in [
+            "http://192.168.1.20:11434",
+            "https://ollama.example.com",
+            "http://localhost.example.com",
+            "http://127.0.0.1.nip.io",
+            "http://[::ffff:c0a8:114]",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "{url}");
+        }
     }
 }

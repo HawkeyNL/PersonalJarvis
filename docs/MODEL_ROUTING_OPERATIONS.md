@@ -139,7 +139,10 @@ discovered in `policy.json`.
 `paid_api` is the "subscriptions and local only" switch. `"allowed"` is the
 default when the field or the file is absent. `"off"` removes every metered
 backend (everything except local `ollama` and subscription `claude-cli`) from
-every tier, routed chains and the built-in order alike. The switch is
+every tier, routed chains and the built-in order alike. `ollama` counts as
+local only when `llm_ollama_url` points at a loopback host (127.0.0.0/8, `::1`
+or `localhost`); otherwise Core treats it as metered at runtime. Validation
+classifies by provider ID only, so Core, broker and CLI agree. The switch is
 re-checked before every attempt, so turning it off also stops a request that
 is already falling back. A brain pin or explicit provider that selects a
 metered backend is then refused with a bounded `409 paid API is off` error

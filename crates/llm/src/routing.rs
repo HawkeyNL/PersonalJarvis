@@ -7,7 +7,10 @@ use std::{collections::BTreeSet, sync::RwLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{router::is_metered_backend, Tier};
+use crate::{
+    router::{is_metered_backend, is_metered_provider_id},
+    Tier,
+};
 
 /// Upper bound for the raw document, checked before parsing.
 pub const ROUTING_MAX_BYTES: usize = 64 * 1024;
@@ -122,7 +125,7 @@ impl ModelRouting {
                     return Err("model routing chain has a duplicate entry");
                 }
                 if after_subscription
-                    && is_metered_backend(&entry.provider)
+                    && is_metered_provider_id(&entry.provider)
                     && !route.metered_after_subscription
                 {
                     return Err("metered entry after a subscription needs explicit approval");

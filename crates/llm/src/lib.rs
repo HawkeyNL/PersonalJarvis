@@ -160,6 +160,7 @@ fn build_huggingface(
 
 /// Build the local Ollama brain, if the client constructs (no network yet).
 fn build_ollama(cfg: &ProviderConfig) -> Option<Arc<dyn LlmProvider>> {
+    router::record_ollama_url(&cfg.ollama_url);
     OllamaProvider::new(&cfg.ollama_url, &cfg.ollama_model)
         .ok()
         .map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
