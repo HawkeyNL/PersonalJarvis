@@ -139,6 +139,18 @@ schema_transition() {
     ' "$manifest" 2>/dev/null || printf 'unknown'
 }
 
+# The one migration contract this updater supports. --stage and
+# --migrate-staged share it, so staging never accepts a candidate that the
+# migration would refuse after the owner confirmed it.
+candidate_migration_supported() {
+    jq -e --arg previous "$current_schema_sha256" '
+        .schema_migration.version == 1 and (.schema_migration.target == 8 or .schema_migration.target == 9 or .schema_migration.target == 10) and
+        (.schema_migration.from_sha256 | type == "array") and
+        (.schema_migration.from_sha256 | index($previous) != null) and
+        .tooling.systemd_units == 1 and .tooling.local_devices == 1
+    ' "$1" >/dev/null 2>&1
+}
+
 # Releases before the admin_helpers capability legitimately used the global
 # compatibility scripts. Once capability version 1 is declared, both helpers
 # are immutable release contents and their inner artifact checksums are
@@ -1051,7 +1063,7 @@ if [[ $mode == migrate_staged ]]; then
     # relay output through a reader that keeps draining, so no write can raise
     # SIGPIPE or fail with EPIPE.
     trap '' INT HUP
-    exec > >(trap '' INT HUP PIPE; while IFS= read -r line; do printf '%s\n' "$line" 2>/dev/null || true; done) 2>&1
+    exec > >(trap '' INT HUP PIPE; while IFS= read -r line || [[ -n $line ]]; do printf '%s\n' "$line" 2>/dev/null || true; done) 2>&1
     [[ $current_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "active release identity unavailable"
     inspect_release "$current_tag"
     [[ $inspected_verified == true ]] || fail "active release must be verified before migration"
@@ -1059,12 +1071,7 @@ if [[ $mode == migrate_staged ]]; then
     [[ $inspected_verified == true ]] || fail "staged migration candidate is invalid: $inspected_reason"
     candidate="$releases_dir/$requested_tag"
     [[ $requested_tag != "$current_tag" ]] || fail "migration requires a different candidate release"
-    jq -e --arg previous "$current_schema_sha256" '
-        .schema_migration.version == 1 and (.schema_migration.target == 8 or .schema_migration.target == 9 or .schema_migration.target == 10) and
-        (.schema_migration.from_sha256 | type == "array") and
-        (.schema_migration.from_sha256 | index($previous) != null) and
-        .tooling.systemd_units == 1 and .tooling.local_devices == 1
-    ' "$candidate/release.json" >/dev/null || fail "candidate does not authorize this exact schema transition"
+    candidate_migration_supported "$candidate/release.json" || fail "candidate does not authorize this exact schema transition"
     schema_backup_helper="$candidate/schema-backup"
     [[ -f $schema_backup_helper && ! -L $schema_backup_helper && -x $schema_backup_helper ]] || fail "verified schema backup helper is missing"
     [[ $(awk '$2 == "schema-backup" { n++ } END { print n+0 }' "$candidate/artifact-binaries.sha256") == 1 ]] || fail "schema backup helper is not checksum-bound"
@@ -1094,7 +1101,10 @@ fi
 # migration from the active schema; same-schema releases use --version.
 require_stageable_schema() {
     case $(schema_transition "$1") in
-        'migration required') ;;
+        'migration required')
+            candidate_migration_supported "$1" || \
+                fail "$requested_tag declares a migration this updater does not support (schema target, managed units or local devices)"
+            ;;
         unchanged) fail "$requested_tag does not change the database schema; use --version $requested_tag" ;;
         *) fail "$requested_tag does not authorize a migration from the active schema" ;;
     esac

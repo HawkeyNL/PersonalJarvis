@@ -941,6 +941,19 @@ grep -Fq 'without authorizing a migration' "$fixture_dir/version-mismatch.err"
 [[ ! -e /opt/jarvis/releases/v10.1.1 ]]
 [[ -z $(find /opt/jarvis/releases -maxdepth 1 -name '.staging.*' -print -quit) ]]
 
+# A migration this updater cannot perform is refused before staging.
+prepare_migration_candidate v10.1.1 "$same_migrations"
+jq '.schema_migration.target = 99' "$fixture_dir/asset/jarvis-core-v10.1.1/release.json" > "$fixture_dir/migration-manifest"
+install -m 0644 "$fixture_dir/migration-manifest" "$fixture_dir/asset/jarvis-core-v10.1.1/release.json"
+tar -C "$fixture_dir/asset" -czf "$fixture_dir/jarvis-core-v10.1.1-linux-x86_64.tar.gz" jarvis-core-v10.1.1
+(cd "$fixture_dir" && sha256sum jarvis-core-v10.1.1-linux-x86_64.tar.gz > jarvis-core-v10.1.1-linux-x86_64.tar.gz.sha256)
+write_components "$fixture_dir/asset/jarvis-core-v10.1.1/release.json" v10.1.1
+if run_updater --stage v10.1.1 2>"$fixture_dir/stage-target.err"; then
+    echo 'stage accepted an unsupported migration target' >&2; exit 1
+fi
+grep -Fq 'declares a migration this updater does not support' "$fixture_dir/stage-target.err"
+[[ ! -e /opt/jarvis/releases/v10.1.1 ]]
+
 # Same-schema releases are routine updates, not migrations.
 prepare_candidate v10.1.2 "$same_migrations"
 if run_updater --stage v10.1.2 2>"$fixture_dir/stage-same.err"; then
@@ -977,6 +990,14 @@ rm -f -- "$fixture_dir/migrated-once"
 run_updater --migrate-staged v10.1.1
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v10.1.1 ]]
 cmp <(printf 'candidate database\n') "$JARVIS_SCHEMA_FIXTURE_ROOT/surrealdb/CURRENT"
+# Staging only ever targets a newer release than the active one.
+for stale in v10.1.0 v10.1.1; do
+    if run_updater --stage "$stale" 2>"$fixture_dir/stage-stale.err"; then
+        echo "stage accepted a non-newer release $stale" >&2; exit 1
+    fi
+    grep -Fq 'staging requires a release newer than the active v10.1.1' "$fixture_dir/stage-stale.err"
+done
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v10.1.1 ]]
 
 # Optional Laya lifecycle: fake systemd deliberately drops the service when
 # its required socket restarts. The updater must explicitly restore warmness.
