@@ -36,13 +36,13 @@ write_candidate() {
         jarvis-updater.service jarvis-updater.timer \
         jarvis-private-agent-updater.service jarvis-private-agent-updater.timer \
         jarvis-model-catalog.service jarvis-model-catalog.timer jarvis-laya.service jarvis-laya.socket \
-        jarvis-claude.service jarvis-claude.socket; do
+        jarvis-claude.service jarvis-claude.socket jarvis-backup.service jarvis-backup.timer; do
         cp "$repo_dir/deploy/systemd/$unit" "$release/systemd-$unit"
         chmod 0644 "$release/systemd-$unit"
     done
     install -m 0644 "$repo_dir/deploy/systemd/pricing-registry.json" "$release/pricing-registry.json"
     jq -n --arg tag "$tag" --arg revision "$revision" \
-        '{tag:$tag,revision:$revision,schema_migration:{version:1,target:10,from_sha256:[("a" * 64)]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1,model_policy_directory:1,model_catalog:1,laya_runtime:1,subscription_workers:1,codex_runtime:1}}' \
+        '{tag:$tag,revision:$revision,schema_migration:{version:1,target:10,from_sha256:[("a" * 64)]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1,model_policy_directory:1,model_catalog:1,laya_runtime:1,subscription_workers:1,codex_runtime:1,backup_timer:1}}' \
         > "$release/release.json"
     (
         cd "$release"
@@ -67,6 +67,7 @@ for member in jarvis-models jarvis-credentials jarvis-backup jarvis-model-policy
     systemd-jarvis-model-catalog.service systemd-jarvis-model-catalog.timer \
     systemd-jarvis-laya.service systemd-jarvis-laya.socket \
     systemd-jarvis-claude.service systemd-jarvis-claude.socket \
+    systemd-jarvis-backup.service systemd-jarvis-backup.timer \
     systemd-jarvis-config-broker.service com.hawkeynl.jarvis.devices.policy; do
     grep -Fxq "jarvis-core-$tag/$member" "$fixture/archive-members.txt" || {
         echo "release archive is missing required member: $member" >&2
@@ -93,6 +94,7 @@ jq -e '.tooling.systemd_units == 1' \
 jq -e '.tooling.model_catalog == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
 jq -e '.tooling.laya_runtime == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
 jq -e '.tooling.subscription_workers == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
+jq -e '.tooling.backup_timer == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
 
 bad_tag=v9.8.8
 write_candidate "$bad_tag"
@@ -133,7 +135,7 @@ fi
 grep -Fq 'managed unit is missing or unsafe: jarvis-config-broker.service' \
     "$fixture/bad-unit.stderr"
 
-for defect in missing tampered symlink capability missing-backup unsupported-schema missing-migration unsafe-migration unsupported-layout missing-catalog-service missing-catalog-timer unsupported-catalog missing-laya-unit missing-laya-socket missing-laya-wrapper unsupported-laya missing-claude-worker missing-claude-socket unsupported-subscription missing-codex-runtime tampered-codex-runtime symlink-codex-runtime unsupported-codex-runtime; do
+for defect in missing tampered symlink capability missing-backup unsupported-schema missing-migration unsafe-migration unsupported-layout missing-catalog-service missing-catalog-timer unsupported-catalog missing-laya-unit missing-laya-socket missing-laya-wrapper unsupported-laya missing-claude-worker missing-claude-socket unsupported-subscription missing-codex-runtime tampered-codex-runtime symlink-codex-runtime unsupported-codex-runtime missing-backup-service missing-backup-timer unsupported-backup-timer undeclared-backup-timer unsafe-backup-helper; do
     write_candidate v9.8.10
     policy="$fixture/candidate/jarvis-core-v9.8.10/com.hawkeynl.jarvis.devices.policy"
     case $defect in
@@ -162,6 +164,18 @@ for defect in missing tampered symlink capability missing-backup unsupported-sch
             jq '.tooling.codex_runtime = 2' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
             cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
             ;;
+        missing-backup-service) rm -- "$fixture/candidate/jarvis-core-v9.8.10/systemd-jarvis-backup.service" ;;
+        missing-backup-timer) rm -- "$fixture/candidate/jarvis-core-v9.8.10/systemd-jarvis-backup.timer" ;;
+        unsupported-backup-timer)
+            jq '.tooling.backup_timer = 2' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
+            cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
+            ;;
+        undeclared-backup-timer)
+            # Unit artifacts without the declared capability are unexpected.
+            jq 'del(.tooling.backup_timer)' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
+            cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
+            ;;
+        unsafe-backup-helper) chmod 0777 "$fixture/candidate/jarvis-core-v9.8.10/jarvis-backup" ;;
         missing-claude-socket) rm -- "$fixture/candidate/jarvis-core-v9.8.10/systemd-jarvis-claude.socket" ;;
         unsupported-subscription)
             jq '.tooling.subscription_workers = 2' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
@@ -197,12 +211,13 @@ done
 # A previously verified release without the new capability remains inspectable.
 write_candidate v9.8.11
 legacy="$fixture/candidate/jarvis-core-v9.8.11"
-jq 'del(.tooling.model_catalog, .tooling.laya_runtime, .tooling.subscription_workers, .tooling.codex_runtime)' "$legacy/release.json" > "$fixture/manifest"
+jq 'del(.tooling.model_catalog, .tooling.laya_runtime, .tooling.subscription_workers, .tooling.codex_runtime, .tooling.backup_timer)' "$legacy/release.json" > "$fixture/manifest"
 cp "$fixture/manifest" "$legacy/release.json"
 rm -- "$legacy/systemd-jarvis-model-catalog.service" "$legacy/systemd-jarvis-model-catalog.timer" \
     "$legacy/systemd-jarvis-laya.service" "$legacy/systemd-jarvis-laya.socket" "$legacy/laya-offline.py" "$legacy/provision-laya" \
-    "$legacy/systemd-jarvis-claude.service" "$legacy/systemd-jarvis-claude.socket" "$legacy/jarvis-claude-worker" "$legacy/jarvis-codex-runtime"
-sed -e '/systemd-jarvis-model-catalog[.]/d' -e '/systemd-jarvis-laya[.]service/d' -e '/systemd-jarvis-laya[.]socket/d' \
+    "$legacy/systemd-jarvis-claude.service" "$legacy/systemd-jarvis-claude.socket" "$legacy/jarvis-claude-worker" "$legacy/jarvis-codex-runtime" \
+    "$legacy/systemd-jarvis-backup.service" "$legacy/systemd-jarvis-backup.timer"
+sed -e '/systemd-jarvis-model-catalog[.]/d' -e '/systemd-jarvis-backup[.]/d' -e '/systemd-jarvis-laya[.]service/d' -e '/systemd-jarvis-laya[.]socket/d' \
     -e '/ laya-offline[.]py$/d' -e '/ provision-laya$/d' -e '/jarvis-claude/d' -e '/jarvis-codex-runtime/d' \
     "$legacy/artifact-binaries.sha256" > "$fixture/checksums"
 cp "$fixture/checksums" "$legacy/artifact-binaries.sha256"
