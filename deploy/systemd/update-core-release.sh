@@ -132,7 +132,8 @@ schema_transition() {
     jq -r --arg current "$current_schema_sha256" '
         if (.schema_sha256 | type) != "string" or (.schema_sha256 | test("^[0-9a-f]{64}$") | not) then "unknown"
         elif .schema_sha256 == $current then "unchanged"
-        elif .schema_migration.version? == 1 and (.schema_migration.from_sha256 | type) == "array" and
+        elif (.schema_migration | type) == "object" and .schema_migration.version == 1 and
+            (.schema_migration.from_sha256 | type) == "array" and
             (.schema_migration.from_sha256 | index($current) != null) then "migration required"
         else "unsupported transition" end
     ' "$manifest" 2>/dev/null || printf 'unknown'
@@ -1045,6 +1046,12 @@ fi
 if [[ $mode == migrate_staged ]]; then
     # Explicit owner-only maintenance, never selected by --latest or a timer.
     # The candidate must already be staged by the verified archive path.
+    # Services stop below. Ctrl-C, a closed terminal or an exited GUI must not
+    # kill the transaction half-way: ignore INT/HUP (inherited by helpers) and
+    # relay output through a reader that keeps draining, so no write can raise
+    # SIGPIPE or fail with EPIPE.
+    trap '' INT HUP
+    exec > >(trap '' INT HUP PIPE; while IFS= read -r line; do printf '%s\n' "$line" 2>/dev/null || true; done) 2>&1
     [[ $current_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "active release identity unavailable"
     inspect_release "$current_tag"
     [[ $inspected_verified == true ]] || fail "active release must be verified before migration"
@@ -1238,7 +1245,8 @@ checksum_url=$(asset_url "$checksum") || fail "release is missing $checksum"
 [[ $artifact_url == https://github.com/* && $checksum_url == https://github.com/* ]] || \
     fail "release asset URL is not a GitHub HTTPS URL"
 
-[[ ! -e $releases_dir/$tag ]] || fail "release directory already exists: $tag"
+[[ ! -e $releases_dir/$tag ]] || \
+    fail "release directory already exists: $tag; if it was staged for a schema migration, run: sudo jarvis update --migrate $tag"
 staging_dir=$(mktemp -d "$releases_dir/.staging.XXXXXXXX")
 archive="$staging_dir/$artifact"
 
@@ -1331,6 +1339,8 @@ echo "jarvis updater: archive and release manifest validated"
 if [[ $mode == stage ]]; then
     require_stageable_schema "$release_dir/release.json"
 elif [[ $current_schema_sha256 != "$candidate_schema_sha256" ]]; then
+    [[ $(schema_transition "$release_dir/release.json") == 'migration required' ]] || \
+        fail "release $tag changes the database schema without authorizing a migration from the active schema; update refused"
     fail "release $tag changes the database schema; automatic update refused; run: sudo jarvis update --migrate $tag"
 fi
 

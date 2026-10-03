@@ -934,6 +934,10 @@ if run_updater --stage v10.1.1 2>"$fixture_dir/stage-mismatch.err"; then
     echo 'stage accepted an unauthorized schema transition' >&2; exit 1
 fi
 grep -Fq 'does not authorize a migration from the active schema' "$fixture_dir/stage-mismatch.err"
+if run_updater --version v10.1.1 2>"$fixture_dir/version-mismatch.err"; then
+    echo 'routine update applied an unauthorized schema change' >&2; exit 1
+fi
+grep -Fq 'without authorizing a migration' "$fixture_dir/version-mismatch.err"
 [[ ! -e /opt/jarvis/releases/v10.1.1 ]]
 [[ -z $(find /opt/jarvis/releases -maxdepth 1 -name '.staging.*' -print -quit) ]]
 
@@ -951,7 +955,7 @@ run_updater --stage v10.1.1
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v10.1.0 ]]
 grep -Eqx '[0-9a-f]{64}  jarvis-core-v10.1.1-linux-x86_64.tar.gz' /opt/jarvis/releases/v10.1.1/release.verification
 [[ $(stat -c '%U:%G:%a' /opt/jarvis/releases/v10.1.1/release.verification) == root:root:644 ]]
-if grep -Eq '^(stop|start|restart|try-restart|daemon-reload)( |$)' "$fixture_dir/systemctl.log"; then
+if grep -Evq '^(is-active|is-enabled)( |$)' "$fixture_dir/systemctl.log"; then
     echo 'stage changed service state' >&2; exit 1
 fi
 grep -Fq 'already staged' <<< "$(run_updater --stage v10.1.1)"
