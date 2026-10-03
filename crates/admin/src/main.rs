@@ -1474,6 +1474,65 @@ fn read_model_policy() -> Result<ModelPolicy> {
     Ok(policy)
 }
 
+/// Read `routing.json` like Core does at startup: no links, root-owned, not
+/// group/world-writable, bounded. `Ok(None)` means absent (built-in order).
+/// Errors are Core's stable reason codes.
+fn read_routing_file(path: &Path) -> std::result::Result<Option<Vec<u8>>, &'static str> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Err("routing_unsafe"),
+        Err(_) => return Err("routing_unreadable"),
+    };
+    let metadata = file.metadata().map_err(|_| "routing_unreadable")?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err("routing_unsafe");
+    }
+    let mut raw = Vec::new();
+    file.take(jarvis_llm::ROUTING_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| "routing_unreadable")?;
+    if raw.len() > jarvis_llm::ROUTING_MAX_BYTES {
+        return Err("routing_too_large");
+    }
+    Ok(Some(raw))
+}
+
+/// `{"routing", "routing_unavailable_reason"}` for an unusable or absent file
+/// as well as a valid one. Core fails closed on an unusable file.
+fn routing_report_from(
+    file: std::result::Result<Option<Vec<u8>>, &'static str>,
+) -> serde_json::Value {
+    let routing = file.and_then(|raw| {
+        raw.map(|raw| jarvis_llm::ModelRouting::parse(&raw).map_err(|_| "routing_invalid"))
+            .transpose()
+    });
+    match routing {
+        Ok(routing) => serde_json::json!({"routing": routing, "routing_unavailable_reason": null}),
+        Err(reason) => serde_json::json!({"routing": null, "routing_unavailable_reason": reason}),
+    }
+}
+
+fn routing_report() -> Result<serde_json::Value> {
+    let policy = admin_helpers::resolve_model_policy_path(
+        Path::new("/opt/jarvis/current"),
+        Path::new("/opt/jarvis/releases"),
+        Path::new("/usr/local/sbin"),
+        0,
+        0,
+    )?;
+    if policy.file_name() != Some(OsStr::new("policy.json")) {
+        bail!("the active release has no model routing");
+    }
+    Ok(routing_report_from(read_routing_file(
+        &policy.with_file_name("routing.json"),
+    )))
+}
+
 fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Result<()> {
     if presentation.json
         && !matches!(
@@ -1481,9 +1540,16 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
             ModelsCommand::List { .. }
                 | ModelsCommand::Show { .. }
                 | ModelsCommand::Providers { .. }
+                | ModelsCommand::Route {
+                    command: RouteCommand::List
+                }
         )
     {
         bail!("--json is supported only for read-only models list/show");
+    }
+    if presentation.json && matches!(&args.command, ModelsCommand::Route { .. }) {
+        println!("{}", routing_report()?);
+        return Ok(());
     }
     if let ModelsCommand::List { provider } = &args.command {
         let mut policy = read_model_policy()?;

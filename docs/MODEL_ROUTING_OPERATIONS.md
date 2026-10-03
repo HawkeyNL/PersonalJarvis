@@ -164,6 +164,7 @@ readable, otherwise `unavailable`).
 
 ```bash
 sudo jarvis models route list
+sudo jarvis --json models route list   # stored document and reason code
 sudo jarvis models route show cheap
 sudo jarvis models route set cheap zai-api glm-5.3-flash claude-cli claude-haiku-4-5
 sudo jarvis models route set default claude-cli claude-opus-5 anthropic-api claude-opus-5 --metered-after-subscription

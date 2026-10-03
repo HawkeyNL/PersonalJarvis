@@ -215,6 +215,52 @@ fn model_route_cli_is_typed_and_maps_to_the_helper() {
     }
 }
 
+#[test]
+fn routing_json_report_uses_core_reason_codes_and_never_echoes_content() {
+    assert_eq!(
+        routing_report_from(Ok(None)),
+        serde_json::json!({"routing": null, "routing_unavailable_reason": null})
+    );
+    let valid = routing_report_from(Ok(Some(
+        br#"{"version":1,"tiers":{"cheap":{"chain":[{"provider":"ollama","model":"llama3.2"}]}}}"#
+            .to_vec(),
+    )));
+    assert_eq!(valid["routing"]["paid_api"], "allowed");
+    assert_eq!(
+        valid["routing"]["tiers"]["cheap"]["chain"][0]["model"],
+        "llama3.2"
+    );
+    let invalid = routing_report_from(Ok(Some(br#"{"version":1,"secret":"canary"}"#.to_vec())));
+    assert_eq!(invalid["routing_unavailable_reason"], "routing_invalid");
+    assert!(!invalid.to_string().contains("canary"));
+    assert_eq!(
+        routing_report_from(Err("routing_unsafe"))["routing_unavailable_reason"],
+        "routing_unsafe"
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("routing.json");
+    assert_eq!(read_routing_file(&file), Ok(None));
+    fs::write(&file, "{}").unwrap();
+    // Owned by the unprivileged test user, not root.
+    assert_eq!(read_routing_file(&file), Err("routing_unsafe"));
+    let link = directory.path().join("link.json");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert_eq!(read_routing_file(&link), Err("routing_unsafe"));
+}
+
+#[test]
+fn json_is_refused_for_route_changes() {
+    let cli =
+        Cli::try_parse_from(["jarvis", "--json", "models", "route", "paid-api", "off"]).unwrap();
+    let Some(Commands::Models(args)) = cli.command else {
+        panic!("not a models command");
+    };
+    let presentation = Presentation::new(true, false);
+    let error = models(args, &presentation, false).unwrap_err();
+    assert!(error.to_string().contains("--json is supported only"));
+}
+
 fn admin_helper_layout(
     admin_helpers: bool,
 ) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, u32, u32) {
