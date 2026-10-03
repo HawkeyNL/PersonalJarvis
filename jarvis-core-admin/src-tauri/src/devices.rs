@@ -171,6 +171,8 @@ mod tests {
             2
         );
         assert!(policy.contains(r#"<action id="com.hawkeynl.jarvis.core.migrate">"#));
+        // pkexec expands this, so the dialog names the real command.
+        assert_eq!(policy.matches("$(command_line)</message>").count(), 2);
         assert!(!policy.contains("auth_admin_keep"));
     }
 }

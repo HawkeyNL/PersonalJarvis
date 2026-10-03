@@ -24,9 +24,10 @@ const PKEXEC: &str = "/usr/bin/pkexec";
 const PTYXIS: &str = "/usr/bin/ptyxis";
 const GNOME_TERMINAL: &str = "/usr/bin/gnome-terminal";
 const OUTPUT_LIMIT: usize = 1_048_576;
-// Staging, the cold snapshot and the migration itself can be slow on a large
-// database; the updater owns the transaction, this only bounds the wait.
-const MIGRATE_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
+// Deliberately unbounded in practice: after pkexec the child runs as root, so
+// this unprivileged app cannot kill it (EPERM) and a timeout would only
+// misreport a migration that keeps running. The updater bounds its own steps.
+const MIGRATE_WAIT: Duration = Duration::from_secs(u32::MAX as u64);
 
 type AdminResult<T> = Result<T, String>;
 
@@ -505,7 +506,7 @@ fn migrate(session: &SessionManager, version: &str) -> AdminResult<OperationResu
     verify_root_executable(ADMIN)?;
     devices::verify_installed_policy()?;
     operation(
-        run_checked_command(PKEXEC, &args, MIGRATE_TIMEOUT)?,
+        run_checked_command(PKEXEC, &args, MIGRATE_WAIT)?,
         "Core schema migration completed",
     )
 }
