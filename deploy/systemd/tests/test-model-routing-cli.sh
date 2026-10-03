@@ -140,6 +140,7 @@ for document in '{"version":1}' '{"version":1,"paid_api":"off"}' '{"version":1,"
     "$(chain '[{"provider":"anthropic-api","model":"a"},{"provider":"claude-cli","model":"a"}]')" \
     "$(chain '[{"provider":"claude-cli","model":"a"},{"provider":"ollama","model":"b"}]')" \
     "$(chain '[{"provider":"claude-cli","model":"a"},{"provider":"claude-cli","model":"b"}]')" \
+    "$(chain '[{"provider":"codex-cli","model":"gpt-6-luna"},{"provider":"claude-cli","model":"a"}]')" \
     "$(chain "[{\"provider\":\"ollama\",\"model\":\"$long_model\"}]")" \
     "$(chain "$nine")" \
     "$(printf '{"version":1}%65522s' '')"; do
@@ -163,6 +164,7 @@ for document in '' '[]' '{"tiers":{}}' '{"version":2}' '{"version":"1"}' '{"vers
     "$(chain '[{"provider":"ollama","model":"a"},{"provider":"ollama","model":"a"}]')" \
     "$(chain '[{"provider":"claude-cli","model":"a"},{"provider":"anthropic-api","model":"a"}]')" \
     "$(chain '[{"provider":"claude-cli","model":"a"},{"provider":"ollama","model":"b"},{"provider":"zai-api","model":"c"}]')" \
+    "$(chain '[{"provider":"codex-cli","model":"gpt-6-luna"},{"provider":"openai-api","model":"gpt-6-luna"}]')" \
     "$(printf '{"version":1}%65523s' '')"; do
     if valid_routing "$document"; then echo "accepted invalid routing: ${document:0:120}" >&2; exit 1; fi
 done

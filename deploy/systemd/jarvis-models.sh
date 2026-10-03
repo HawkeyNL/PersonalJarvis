@@ -46,7 +46,7 @@ EOF
 }
 
 valid_provider() {
-    [[ $1 =~ ^(anthropic-api|openai-api|deepseek-api|xai-api|zai-api|ollama|ollama-cloud|claude-cli|huggingface)$ ]]
+    [[ $1 =~ ^(anthropic-api|openai-api|deepseek-api|xai-api|zai-api|ollama|ollama-cloud|claude-cli|codex-cli|huggingface)$ ]]
 }
 
 # Older pre-release installs could leave /etc/jarvis or model-policy.json with
@@ -494,7 +494,7 @@ show_model() {
 # and then fails closed (built-in order without metered backends).
 readonly routing_validator='
   def fields($allowed): type == "object" and all(keys[]; IN($allowed[]));
-  def metered: IN("ollama", "claude-cli") | not;
+  def metered: IN("ollama", "claude-cli", "codex-cli") | not;
   def entry_ok:
     fields(["provider", "model"]) and has("provider") and has("model")
     and (.provider | type == "string" and IN($providers[]))
@@ -505,7 +505,7 @@ readonly routing_validator='
     and (map([.provider, .model]) | length == (unique | length))
     and ($approved or (reduce .[] as $entry ({subscription: false, ok: true};
           .ok = (.ok and ((.subscription and ($entry.provider | metered)) | not))
-          | .subscription = (.subscription or $entry.provider == "claude-cli")) | .ok));
+          | .subscription = (.subscription or ($entry.provider | IN("claude-cli", "codex-cli")))) | .ok));
   def tier_ok:
     . == null or (fields(["chain", "metered_after_subscription"]) and has("chain")
       and ((has("metered_after_subscription") | not) or (.metered_after_subscription | type == "boolean"))
@@ -516,7 +516,7 @@ readonly routing_validator='
     and ((has("paid_api") | not) or (.paid_api | IN("allowed", "off")))
     and ((has("tiers") | not)
          or (.tiers | fields(["cheap", "default", "hard"]) and all(.[]; tier_ok))))'
-readonly routing_providers='["anthropic-api","openai-api","deepseek-api","xai-api","zai-api","ollama","ollama-cloud","huggingface","claude-cli"]'
+readonly routing_providers='["anthropic-api","openai-api","deepseek-api","xai-api","zai-api","ollama","ollama-cloud","huggingface","claude-cli","codex-cli"]'
 
 valid_routing() {
     local document=$1
