@@ -211,6 +211,9 @@ pub struct ChatRequest {
     /// Explicit model override chosen by the router (ADR-028 fase 2). `None` ⇒
     /// the provider picks its own model for `tier`.
     pub model: Option<String>,
+    /// The owner's pinned provider for `model`. When set, the router tries
+    /// exactly this provider and never falls back to another one.
+    pub provider: Option<String>,
 }
 
 /// Token usage for a reply, when the provider reports it.

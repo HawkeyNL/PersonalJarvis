@@ -457,6 +457,7 @@ mod tests {
                 mode: RoutingMode::Auto,
                 max_tokens: 64,
                 model: None,
+                provider: None,
             })
             .await
             .unwrap();

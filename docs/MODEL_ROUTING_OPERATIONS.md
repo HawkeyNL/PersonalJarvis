@@ -139,11 +139,11 @@ discovered in `policy.json`.
 `paid_api` is the "subscriptions and local only" switch. `"allowed"` is the
 default when the field or the file is absent. `"off"` removes every metered
 backend (everything except local `ollama` and subscription `claude-cli`) from
-every tier, routed chains and the built-in order alike. A brain pin or
-explicit provider that selects a metered backend is then refused with a
-bounded `409 paid API is off` error instead of being rerouted. When the
-monthly cap is reached and nothing is available, Core never tries a metered
-backend anyway.
+every tier, routed chains and the built-in order alike. A brain pin or explicit provider that selects a
+metered backend is then refused with a bounded `409 paid API is off` error
+instead of being rerouted. A brain pin names its provider: it is tried on that
+provider only and never falls back to another one. When the monthly cap is
+reached and nothing is available, Core never tries a metered backend anyway.
 
 Failure behaviour:
 

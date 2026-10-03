@@ -349,6 +349,7 @@ pub(super) async fn execute_chat(
         max_tokens: state.llm_max_tokens,
         // The router picks the concrete model per backend (ADR-028 fase 2).
         model: None,
+        provider: None,
     };
     // Explicit Deep/Research requests retain their quality-floor semantics.
     // The owner default is only applied to ordinary Auto conversation turns;
@@ -363,7 +364,10 @@ pub(super) async fn execute_chat(
                 return Err((status, Json(body)));
             }
             if state.model_policy.allows(&provider, &model) {
+                // The pin names a provider too: a claude-cli failure must
+                // never become a call to the same model on a paid API.
                 chat.model = Some(model);
+                chat.provider = Some(provider);
             }
         }
     }

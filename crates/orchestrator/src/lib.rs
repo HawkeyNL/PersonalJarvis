@@ -123,6 +123,7 @@ async fn chat_once(
         },
         max_tokens: MAX_TOKENS,
         model: None,
+        provider: None,
     };
     llm.chat(&req).await
 }

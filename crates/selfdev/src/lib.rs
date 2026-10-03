@@ -80,6 +80,7 @@ pub async fn propose(
         mode: RoutingMode::Deep,
         max_tokens: MAX_TOKENS,
         model: None,
+        provider: None,
     };
     let reply = llm.chat(&req).await?;
     let (summary, proposals) = parse_report(&reply.text);

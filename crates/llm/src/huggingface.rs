@@ -317,6 +317,7 @@ mod tests {
                 mode: RoutingMode::Auto,
                 max_tokens: 16,
                 model: Some(model.clone()),
+                provider: None,
             })
             .await
             .unwrap();
@@ -446,6 +447,7 @@ mod tests {
                 mode: RoutingMode::Auto,
                 max_tokens: 16,
                 model: Some(model.into()),
+                provider: None,
             })
             .await
             .unwrap();
@@ -504,6 +506,7 @@ mod tests {
                 mode: RoutingMode::Auto,
                 max_tokens: 16,
                 model: Some(model.into()),
+                provider: None,
             })
             .await;
         assert!(matches!(result, Err(LlmError::NotConfigured(_))));

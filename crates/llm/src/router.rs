@@ -294,22 +294,31 @@ impl RouterProvider {
     /// revoked credential or 429 into an unbounded request-by-request retry.
     /// The safety net never includes metered backends: the monthly cap is
     /// enforced through availability, so "nothing available" must not become
-    /// a paid call.
-    fn plan(&self, tier: Tier, routed: bool) -> Vec<(&Candidate, Option<String>)> {
+    /// a paid call. A pinned provider (`only`) is the whole plan: a pin never
+    /// falls back to another provider.
+    fn plan(
+        &self,
+        tier: Tier,
+        routed: bool,
+        only: Option<&str>,
+    ) -> Vec<(&Candidate, Option<String>)> {
         let routing = self.routing.snapshot();
         let find = |id: &str| self.candidates.iter().find(|c| c.id == id);
-        let ordered: Vec<(&Candidate, Option<String>)> = match routing.tier(tier).filter(|_| routed)
-        {
-            Some(route) => route
-                .chain
-                .iter()
-                .filter_map(|entry| find(&entry.provider).map(|c| (c, Some(entry.model.clone()))))
-                .collect(),
-            None => Self::policy(tier)
-                .iter()
-                .filter_map(|id| find(id).map(|c| (c, None)))
-                .collect(),
-        };
+        let ordered: Vec<(&Candidate, Option<String>)> =
+            match (only, routing.tier(tier).filter(|_| routed)) {
+                (Some(provider), _) => find(provider).map(|c| (c, None)).into_iter().collect(),
+                (None, Some(route)) => route
+                    .chain
+                    .iter()
+                    .filter_map(|entry| {
+                        find(&entry.provider).map(|c| (c, Some(entry.model.clone())))
+                    })
+                    .collect(),
+                (None, None) => Self::policy(tier)
+                    .iter()
+                    .filter_map(|id| find(id).map(|c| (c, None)))
+                    .collect(),
+            };
         let ordered: Vec<_> = ordered
             .into_iter()
             .filter(|(c, _)| !routing.refuses_provider(&c.id))
@@ -384,10 +393,12 @@ impl LlmProvider for RouterProvider {
     }
 
     fn can_serve_tier(&self, tier: Tier) -> bool {
-        self.plan(tier, true).iter().any(|(candidate, pinned)| {
-            self.choose_model(&candidate.id, pinned.as_deref(), None, tier)
-                .is_some()
-        })
+        self.plan(tier, true, None)
+            .iter()
+            .any(|(candidate, pinned)| {
+                self.choose_model(&candidate.id, pinned.as_deref(), None, tier)
+                    .is_some()
+            })
     }
 
     async fn chat_stream(
@@ -395,7 +406,8 @@ impl LlmProvider for RouterProvider {
         req: &ChatRequest,
         sink: crate::TextDeltaSink,
     ) -> Result<ChatReply, LlmError> {
-        for (candidate, pinned) in self.plan(req.tier, req.model.is_none()) {
+        for (candidate, pinned) in self.plan(req.tier, req.model.is_none(), req.provider.as_deref())
+        {
             let chosen = self.choose_model(
                 &candidate.id,
                 pinned.as_deref(),
@@ -423,7 +435,7 @@ impl LlmProvider for RouterProvider {
     }
 
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
-        let plan = self.plan(req.tier, req.model.is_none());
+        let plan = self.plan(req.tier, req.model.is_none(), req.provider.as_deref());
         if plan.is_empty() {
             return Err(LlmError::NotConfigured(
                 "no capable brain for this tier".into(),
@@ -607,6 +619,7 @@ mod tests {
             mode: crate::RoutingMode::Auto,
             max_tokens: 16,
             model: Some("fixture".into()),
+            provider: None,
         };
         assert!(router.chat(&request).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -708,6 +721,7 @@ mod tests {
             mode: crate::RoutingMode::Auto,
             max_tokens: 16,
             model: None,
+            provider: None,
         };
         assert_eq!(
             r.chat(&ask(Tier::Default)).await.unwrap().model,
@@ -723,7 +737,7 @@ mod tests {
     fn cheap_prefers_local_then_plan_then_api() {
         let r = RouterProvider::new(all(), always_available(), vec![]);
         assert_eq!(
-            ids(r.plan(Tier::Cheap, true)),
+            ids(r.plan(Tier::Cheap, true, None)),
             ["ollama", "claude-cli", "anthropic-api"]
         );
     }
@@ -732,7 +746,7 @@ mod tests {
     fn default_prefers_plan_then_api_then_local() {
         let r = RouterProvider::new(all(), always_available(), vec![]);
         assert_eq!(
-            ids(r.plan(Tier::Default, true)),
+            ids(r.plan(Tier::Default, true, None)),
             ["claude-cli", "anthropic-api", "ollama"]
         );
     }
@@ -741,7 +755,7 @@ mod tests {
     fn hard_is_strong_only() {
         let r = RouterProvider::new(all(), always_available(), vec![]);
         assert_eq!(
-            ids(r.plan(Tier::Hard, true)),
+            ids(r.plan(Tier::Hard, true, None)),
             ["claude-cli", "anthropic-api"]
         );
     }
@@ -758,7 +772,7 @@ mod tests {
         let r = RouterProvider::new(fleet, always_available(), vec![]);
         // Cheap: free first, then the cheapest metered.
         assert_eq!(
-            ids(r.plan(Tier::Cheap, true)),
+            ids(r.plan(Tier::Cheap, true, None)),
             [
                 "ollama",
                 "claude-cli",
@@ -769,7 +783,7 @@ mod tests {
         );
         // Default: plan first, strong APIs, then cheap/local last.
         assert_eq!(
-            ids(r.plan(Tier::Default, true)),
+            ids(r.plan(Tier::Default, true, None)),
             [
                 "claude-cli",
                 "anthropic-api",
@@ -780,7 +794,7 @@ mod tests {
         );
         // Hard: strong brains only (no deepseek/ollama).
         assert_eq!(
-            ids(r.plan(Tier::Hard, true)),
+            ids(r.plan(Tier::Hard, true, None)),
             ["claude-cli", "anthropic-api", "openai-api"]
         );
     }
@@ -788,12 +802,15 @@ mod tests {
     #[test]
     fn availability_filters_but_keeps_a_safety_net() {
         let r = RouterProvider::new(all(), Arc::new(Only("anthropic-api")), vec![]);
-        assert_eq!(ids(r.plan(Tier::Default, true)), ["anthropic-api"]);
+        assert_eq!(ids(r.plan(Tier::Default, true, None)), ["anthropic-api"]);
 
         // If the registry claims nothing is up, still try the unmetered
         // backends (ordered) rather than fail, but never a paid one.
         let r2 = RouterProvider::new(all(), Arc::new(Nothing), vec![]);
-        assert_eq!(ids(r2.plan(Tier::Default, true)), ["claude-cli", "ollama"]);
+        assert_eq!(
+            ids(r2.plan(Tier::Default, true, None)),
+            ["claude-cli", "ollama"]
+        );
     }
 
     struct Nothing;
@@ -835,6 +852,7 @@ mod tests {
             mode: crate::RoutingMode::Auto,
             max_tokens: 16,
             model: model.map(str::to_string),
+            provider: None,
         }
     }
 
@@ -881,7 +899,7 @@ mod tests {
             c.clone(),
             allow_catalog(&c),
         );
-        assert!(r.plan(Tier::Default, true).is_empty());
+        assert!(r.plan(Tier::Default, true, None).is_empty());
         assert!(r.chat(&ask(Tier::Default, Some("gpt"))).await.is_err());
         assert_eq!(paid_calls.load(Ordering::SeqCst), 0);
     }
@@ -936,6 +954,7 @@ mod tests {
                 mode: crate::RoutingMode::Auto,
                 max_tokens: 16,
                 model: None,
+                provider: None,
             })
             .await
             .unwrap();
@@ -943,7 +962,7 @@ mod tests {
         // The malformed first response receives a bounded health cooldown, so
         // the next request does not repeatedly hit the same failing backend.
         assert_eq!(
-            ids(r.plan(Tier::Default, true)),
+            ids(r.plan(Tier::Default, true, None)),
             ["anthropic-api", "ollama"]
         );
     }
@@ -984,6 +1003,7 @@ mod tests {
             mode: crate::RoutingMode::Auto,
             max_tokens: 16,
             model: None,
+            provider: None,
         };
         assert!(router.chat(&request).await.is_err());
         assert!(!router.requested_model_is_allowed("openai-api", "fixture-discovered"));
@@ -1034,6 +1054,7 @@ mod tests {
                 mode: crate::RoutingMode::Auto,
                 max_tokens: 16,
                 model: Some("claude-test".into()),
+                provider: None,
             })
             .await;
         assert!(matches!(result, Err(LlmError::NotConfigured(_))));
@@ -1135,12 +1156,12 @@ mod tests {
             &[],
         );
         assert_eq!(
-            ids(f.router.plan(Tier::Cheap, true)),
+            ids(f.router.plan(Tier::Cheap, true, None)),
             ["zai-api", "claude-cli"]
         );
         // A tier without a chain keeps the built-in order.
         assert_eq!(
-            ids(f.router.plan(Tier::Default, true)),
+            ids(f.router.plan(Tier::Default, true, None)),
             ["claude-cli", "anthropic-api", "zai-api", "ollama"]
         );
         // The pinned model is used even though the catalog has no zai entry.
@@ -1175,7 +1196,7 @@ mod tests {
             Arc::new(Only("claude-cli")),
             &[],
         );
-        assert_eq!(ids(f.router.plan(Tier::Cheap, true)), ["claude-cli"]);
+        assert_eq!(ids(f.router.plan(Tier::Cheap, true, None)), ["claude-cli"]);
         f.router.chat(&ask(Tier::Cheap, None)).await.unwrap();
         assert_eq!(f.calls("zai-api"), 0);
 
@@ -1191,7 +1212,7 @@ mod tests {
         );
         let reply = f.router.chat(&ask(Tier::Cheap, None)).await.unwrap();
         assert_eq!(reply.text, "claude-cli");
-        assert_eq!(ids(f.router.plan(Tier::Cheap, true)), ["claude-cli"]);
+        assert_eq!(ids(f.router.plan(Tier::Cheap, true, None)), ["claude-cli"]);
         assert_eq!(f.calls("zai-api"), 1);
 
         // Nothing routable: the chain does not silently widen to other backends.
@@ -1217,16 +1238,16 @@ mod tests {
             always_available(),
             &[],
         );
-        assert_eq!(ids(f.router.plan(Tier::Cheap, true)), ["claude-cli"]);
+        assert_eq!(ids(f.router.plan(Tier::Cheap, true, None)), ["claude-cli"]);
         for tier in [Tier::Default, Tier::Hard] {
             assert!(f
                 .router
-                .plan(tier, true)
+                .plan(tier, true, None)
                 .iter()
                 .all(|(c, _)| !is_metered_backend(&c.id)));
         }
         assert_eq!(
-            ids(f.router.plan(Tier::Default, false)),
+            ids(f.router.plan(Tier::Default, false, None)),
             ["claude-cli", "ollama"]
         );
         // An explicitly requested metered model is not reached either.
@@ -1248,14 +1269,14 @@ mod tests {
             &[],
         );
         assert_eq!(
-            ids(f.router.plan(Tier::Default, true)),
+            ids(f.router.plan(Tier::Default, true, None)),
             ["claude-cli", "ollama"]
         );
         assert_eq!(
-            ids(f.router.plan(Tier::Cheap, true)),
+            ids(f.router.plan(Tier::Cheap, true, None)),
             ["ollama", "claude-cli"]
         );
-        assert_eq!(ids(f.router.plan(Tier::Hard, true)), ["claude-cli"]);
+        assert_eq!(ids(f.router.plan(Tier::Hard, true, None)), ["claude-cli"]);
     }
 
     #[tokio::test]
@@ -1279,12 +1300,55 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(ids(router.plan(Tier::Default, true)), ["claude-cli"]);
+        assert_eq!(ids(router.plan(Tier::Default, true, None)), ["claude-cli"]);
         // An explicit model is more specific than the tier chain.
         let reply = router
             .chat(&ask(Tier::Default, Some("claude-sonnet-5")))
             .await
             .unwrap();
         assert_eq!(reply.text, "anthropic-api");
+    }
+
+    #[tokio::test]
+    async fn pinned_provider_never_falls_back_to_another_provider() {
+        let enabled = [
+            ("claude-cli", "claude-opus-5"),
+            ("anthropic-api", "claude-opus-5"),
+        ];
+        let pin = |provider: &str| ChatRequest {
+            provider: Some(provider.into()),
+            ..ask(Tier::Hard, Some("claude-opus-5"))
+        };
+        let f = fleet(
+            RoutingSnapshot::default(),
+            &enabled,
+            always_available(),
+            &["claude-cli"],
+        );
+        assert!(f.router.chat(&pin("claude-cli")).await.is_err());
+        assert_eq!(f.calls("claude-cli"), 1);
+        assert_eq!(f.calls("anthropic-api"), 0);
+
+        let f = fleet(
+            RoutingSnapshot::default(),
+            &enabled,
+            always_available(),
+            &[],
+        );
+        let reply = f.router.chat(&pin("claude-cli")).await.unwrap();
+        assert_eq!(
+            (reply.text.as_str(), reply.model.as_str()),
+            ("claude-cli", "claude-opus-5")
+        );
+
+        // A metered pin is refused while paid APIs are off, never rerouted.
+        let f = fleet(
+            routing(r#"{"version":1,"paid_api":"off"}"#),
+            &enabled,
+            always_available(),
+            &[],
+        );
+        assert!(f.router.chat(&pin("anthropic-api")).await.is_err());
+        assert_eq!(f.calls("anthropic-api") + f.calls("claude-cli"), 0);
     }
 }
