@@ -13,6 +13,7 @@ use std::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use wait_timeout::ChildExt;
 
+use crate::devices;
 use crate::logs::{parse_lines, sanitize, LogRecord};
 use crate::session::{BrokerRequest, SessionManager};
 
@@ -23,6 +24,9 @@ const PKEXEC: &str = "/usr/bin/pkexec";
 const PTYXIS: &str = "/usr/bin/ptyxis";
 const GNOME_TERMINAL: &str = "/usr/bin/gnome-terminal";
 const OUTPUT_LIMIT: usize = 1_048_576;
+// Staging, the cold snapshot and the migration itself can be slow on a large
+// database; the updater owns the transaction, this only bounds the wait.
+const MIGRATE_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
 type AdminResult<T> = Result<T, String>;
 
@@ -72,11 +76,12 @@ pub struct RuntimeStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UpdateMutation {
     Latest,
     InstallVersion { version: String },
     Rollback,
+    Migrate { version: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -481,10 +486,33 @@ pub fn update_mutation(
     session: &SessionManager,
     request: UpdateMutation,
 ) -> AdminResult<OperationResult> {
+    if let UpdateMutation::Migrate { version } = &request {
+        return migrate(session, version);
+    }
     operation(
         session.run(BrokerRequest::UpdateMutation { request })?,
         "Core operation completed",
     )
+}
+
+/// A schema migration never uses the retained broker grant: like device
+/// management it starts a fresh PolicyKit authentication (`auth_admin`, never
+/// `_keep`), even while this application's session is unlocked.
+fn migrate(session: &SessionManager, version: &str) -> AdminResult<OperationResult> {
+    root_guard()?;
+    session.require_active()?;
+    let args = migrate_arguments(version)?;
+    verify_root_executable(ADMIN)?;
+    devices::verify_installed_policy()?;
+    operation(
+        run_checked_command(PKEXEC, &args, MIGRATE_TIMEOUT)?,
+        "Core schema migration completed",
+    )
+}
+
+fn migrate_arguments(version: &str) -> AdminResult<Vec<&str>> {
+    validate_version(version)?;
+    Ok(vec![ADMIN, "update", "--migrate", version, "--yes"])
 }
 
 pub fn agents(session: &SessionManager) -> AdminResult<AgentsResponse> {
@@ -1089,6 +1117,11 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
                     "--rollback".to_owned(),
                     "--yes".to_owned(),
                 ],
+                UpdateMutation::Migrate { .. } => {
+                    return Err(
+                        "schema migration requires fresh administrator authentication".to_owned(),
+                    )
+                }
             };
             (ADMIN, args, Duration::from_secs(1_800))
         }
@@ -1443,6 +1476,34 @@ mod tests {
         assert!(validate_model("model\n--flag").is_err());
         assert!(validate_hf_route("groq").is_ok());
         assert!(validate_hf_route("https://evil").is_err());
+    }
+
+    #[test]
+    fn migrate_maps_to_fixed_arguments_and_never_runs_on_the_session_grant() {
+        let request: UpdateMutation =
+            serde_json::from_str(r#"{"action":"migrate","version":"v1.2.3"}"#).unwrap();
+        let UpdateMutation::Migrate { version } = &request else {
+            panic!("expected migrate request");
+        };
+        assert_eq!(
+            migrate_arguments(version).unwrap(),
+            vec![ADMIN, "update", "--migrate", "v1.2.3", "--yes"]
+        );
+        for version in ["v1.2", "latest", "v1.2.3 --latest", "--help"] {
+            assert!(migrate_arguments(version).is_err(), "{version}");
+        }
+        assert!(run_broker_request(BrokerRequest::UpdateMutation { request }).is_err());
+        for payload in [
+            r#"{"action":"shell","command":"id"}"#,
+            r#"{"action":"migrate"}"#,
+            r#"{"action":"migrate","version":"v1.2.3","password":"x"}"#,
+            r#"{"action":"migrate_staged","version":"v1.2.3"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<UpdateMutation>(payload).is_err(),
+                "{payload}"
+            );
+        }
     }
 
     #[test]

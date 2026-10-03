@@ -117,19 +117,27 @@ pub fn mutate(session: &SessionManager, request: DeviceAction) -> Result<(), Str
     session.require_active()?;
     let args = request.arguments()?;
     admin::verify_root_executable("/usr/local/sbin/jarvis")?;
+    verify_installed_policy()?;
+    // No password parameter/stdin; the desktop system authentication agent owns
+    // the prompt. auth_admin (not auth_admin_keep) requires fresh authorization.
+    admin::run_checked_command("/usr/bin/pkexec", &args, Duration::from_secs(120))?;
+    Ok(())
+}
+
+/// The installed PolicyKit actions must be exactly the reviewed bytes this
+/// application ships, so pkexec always demands fresh `auth_admin`.
+pub(crate) fn verify_installed_policy() -> Result<(), String> {
     let info = fs::symlink_metadata(POLICY)
-        .map_err(|_| "install the matching Core Admin package before managing devices")?;
+        .map_err(|_| "install the matching Core Admin package and Core release first")?;
     if !info.is_file()
         || info.uid() != 0
         || info.mode() & 0o022 != 0
         || info.len() != POLICY_BYTES.len() as u64
-        || fs::read(POLICY).map_err(|_| "device authorization policy unavailable")? != POLICY_BYTES
+        || fs::read(POLICY).map_err(|_| "administrator authorization policy unavailable")?
+            != POLICY_BYTES
     {
-        return Err("unsafe or mismatched device authorization policy".into());
+        return Err("unsafe or mismatched administrator authorization policy".into());
     }
-    // No password parameter/stdin; the desktop system authentication agent owns
-    // the prompt. auth_admin (not auth_admin_keep) requires fresh authorization.
-    admin::run_checked_command("/usr/bin/pkexec", &args, Duration::from_secs(120))?;
     Ok(())
 }
 
@@ -156,7 +164,13 @@ mod tests {
         )
         .is_err());
         let policy = std::str::from_utf8(POLICY_BYTES).unwrap();
-        assert!(policy.contains("<allow_active>auth_admin</allow_active>"));
+        assert_eq!(
+            policy
+                .matches("<allow_active>auth_admin</allow_active>")
+                .count(),
+            2
+        );
+        assert!(policy.contains(r#"<action id="com.hawkeynl.jarvis.core.migrate">"#));
         assert!(!policy.contains("auth_admin_keep"));
     }
 }
