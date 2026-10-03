@@ -247,7 +247,8 @@ restore_test() {
     # Full import errors can quote exported statements; show one short line.
     if ! docker exec "$verify_container" /surreal import --endpoint http://127.0.0.1:8000 \
         --namespace restoretest --database restoretest /restore/export.surql >/dev/null 2>"$run/import.err"; then
-        fail "export does not import into a disposable database: $(head -n 1 "$run/import.err" | cut -c1-200)"
+        fail "export does not import into a disposable database: $(sed 's/\x1b\[[0-9;]*m//g' "$run/import.err" \
+            | grep -v '^[[:space:]]*$' | tail -n 2 | cut -c1-240 | tr '\n' ' ')"
     fi
     table_counts verify_sql "$run/restored.json"
     [[ $(jq -c 'keys' "$run/restored.json") == "$(jq -c 'keys' "$run/live-before.json")" ]] \
