@@ -203,7 +203,18 @@ struct UpdateArgs {
     status: bool,
     #[arg(long, conflicts_with_all = ["latest", "version", "check", "status"])]
     rollback: bool,
-    #[arg(long, requires = "rollback")]
+    /// Stage and migrate a schema-changing release; without a tag, the latest
+    /// release is used (interactive only). Never used by the timer.
+    #[arg(
+        long,
+        value_name = "vMAJOR.MINOR.PATCH",
+        num_args = 0..=1,
+        value_parser = parse_release_tag,
+        conflicts_with_all = ["latest", "version", "check", "status", "rollback"]
+    )]
+    migrate: Option<Option<String>>,
+    /// Skip the confirmation of --rollback, or of --migrate with an explicit tag.
+    #[arg(long)]
     yes: bool,
 }
 
@@ -829,6 +840,7 @@ fn logs(args: LogsArgs, presentation: &Presentation) -> Result<()> {
 }
 
 fn update(args: UpdateArgs, presentation: &Presentation, verbose: bool) -> Result<()> {
+    validate_update_confirmation(&args)?;
     let invocation = UpdateInvocation::from_args(&args);
     if matches!(invocation, UpdateInvocation::Center) {
         if presentation.json {
@@ -849,6 +861,9 @@ fn update(args: UpdateArgs, presentation: &Presentation, verbose: bool) -> Resul
         )
     {
         bail!("--json is supported only for non-mutating update --check/--status");
+    }
+    if let UpdateInvocation::Migrate(target) = invocation {
+        return migrate_update(target, args.yes, presentation);
     }
     if matches!(invocation, UpdateInvocation::Rollback) && !args.yes {
         confirm("Rollback Core to the previous verified release?")?;
@@ -871,7 +886,7 @@ fn update(args: UpdateArgs, presentation: &Presentation, verbose: bool) -> Resul
         UpdateInvocation::Rollback => {
             command.arg("--rollback");
         }
-        UpdateInvocation::Center => unreachable!("handled above"),
+        UpdateInvocation::Center | UpdateInvocation::Migrate(_) => unreachable!("handled above"),
     }
 
     if matches!(
@@ -899,6 +914,16 @@ fn update(args: UpdateArgs, presentation: &Presentation, verbose: bool) -> Resul
         } else {
             io::stdout().write_all(&output.stdout)?;
             io::stderr().write_all(&output.stderr)?;
+            // Keep stdout strictly key/value; the hint goes to stderr.
+            let mut summary = UpdateSummary::default();
+            if summary
+                .merge_helper_output(&String::from_utf8_lossy(&output.stdout))
+                .is_ok()
+            {
+                if let Ok(tag) = migration_target(&summary) {
+                    eprintln!("Schema migration required: run sudo jarvis update --migrate {tag}");
+                }
+            }
             if check_available {
                 io::stdout().flush()?;
                 io::stderr().flush()?;
@@ -909,6 +934,155 @@ fn update(args: UpdateArgs, presentation: &Presentation, verbose: bool) -> Resul
     }
 
     run_command(&mut command, SubprocessMode::from_verbose(verbose))
+}
+
+/// `--yes` skips owner confirmation only where the target is explicit.
+fn validate_update_confirmation(args: &UpdateArgs) -> Result<()> {
+    if !args.yes {
+        return Ok(());
+    }
+    match &args.migrate {
+        Some(Some(_)) => Ok(()),
+        Some(None) => bail!("--migrate --yes requires an explicit vMAJOR.MINOR.PATCH tag"),
+        None if args.rollback => Ok(()),
+        None => bail!("--yes is accepted only with --rollback or --migrate vMAJOR.MINOR.PATCH"),
+    }
+}
+
+/// Explicit owner-only schema migration: stage with the installed updater,
+/// confirm, then migrate with the staged candidate's own updater. The
+/// administration config lock is deliberately not held around either step
+/// (jarvis-backup takes the updater lock first; holding both would invert).
+fn migrate_update(target: Option<String>, yes: bool, presentation: &Presentation) -> Result<()> {
+    // Refuse before anything is downloaded or staged.
+    require_confirmation_terminal(yes, io::stdin().is_terminal() && io::stdout().is_terminal())?;
+    let tag = match target {
+        Some(tag) => tag,
+        None => {
+            if !presentation.interactive || !io::stdin().is_terminal() {
+                bail!("non-interactive --migrate requires an explicit vMAJOR.MINOR.PATCH tag");
+            }
+            let output = trusted_updater_command()?
+                .arg("--check")
+                .stdin(Stdio::null())
+                .output()
+                .context("start trusted updater")?;
+            if !output.status.success() && output.status.code() != Some(2) {
+                io::stderr().write_all(&output.stderr)?;
+                ensure_success(output.status)?;
+            }
+            let mut summary = UpdateSummary::default();
+            summary.merge_helper_output(&String::from_utf8(output.stdout)?)?;
+            migration_target(&summary)?
+        }
+    };
+
+    println!("Step 1/2: downloading and verifying {tag}; nothing is stopped or activated");
+    run_migration_step(
+        trusted_updater_command()?.args(["--stage", &tag]),
+        &format!("an update or backup is running; rerun sudo jarvis update --migrate {tag}"),
+    )?;
+    println!("{}", migration_notice(&tag));
+    if !yes {
+        confirm_typed(&format!("Type {tag} to start the migration:"), &tag)?;
+    }
+    let updater = candidate_updater(Path::new(RELEASES_ROOT), &tag, 0)?;
+    let mut command = trusted_command(&updater);
+    load_updater_environment(&mut command)?;
+    command.args(["--migrate-staged", &tag]);
+    ignore_interrupts()?;
+    println!("Step 2/2: migrating to {tag}");
+    println!(
+        "Migration in progress - do not interrupt; services will restart automatically; follow with sudo jarvis logs core"
+    );
+    run_migration_step(
+        &mut command,
+        &format!("an update or backup is running; {tag} stays staged; rerun sudo jarvis update --migrate {tag}"),
+    )
+}
+
+fn require_confirmation_terminal(yes: bool, terminal: bool) -> Result<()> {
+    if !yes && !terminal {
+        bail!("refusing non-interactive migration; pass --migrate vMAJOR.MINOR.PATCH --yes after reviewing the target");
+    }
+    Ok(())
+}
+
+/// Once the candidate updater may stop services, Ctrl-C or a closed terminal
+/// must not kill this CLI and hide the outcome of a migration that keeps
+/// running. Ignored dispositions are inherited by the updater as well.
+fn ignore_interrupts() -> Result<()> {
+    for signal in [libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: installs the async-signal-safe SIG_IGN disposition only.
+        if unsafe { libc::signal(signal, libc::SIG_IGN) } == libc::SIG_ERR {
+            bail!("could not protect the migration from interruption");
+        }
+    }
+    Ok(())
+}
+
+fn run_migration_step(command: &mut ProcessCommand, busy: &str) -> Result<()> {
+    let status = command
+        .stdin(Stdio::null())
+        .status()
+        .context("start trusted updater")?;
+    if status.code() == Some(75) {
+        bail!("{busy}");
+    }
+    ensure_success(status)
+}
+
+fn migration_target(summary: &UpdateSummary) -> Result<String> {
+    match (summary.schema.as_deref(), summary.latest.as_deref()) {
+        (Some("migration required"), Some(latest)) if valid_release_tag(latest) => {
+            Ok(latest.to_owned())
+        }
+        (schema, latest) => bail!(
+            "latest release {} offers no supported schema migration (schema: {}); use sudo jarvis update --latest for routine updates",
+            latest.unwrap_or("unavailable"),
+            schema.unwrap_or("unknown")
+        ),
+    }
+}
+
+fn migration_notice(tag: &str) -> String {
+    format!(
+        "{tag} changes the database schema. Migrating will:\n\
+         - stop Jarvis Core and SurrealDB; connected clients disconnect until Core is ready again;\n\
+         - write a cold database snapshot to /var/backups/jarvis-migrations;\n\
+         - activate {tag}, which migrates the database on first start;\n\
+         - on failure, restore the snapshot and restart the previous release.\n\
+         After a successful migration, a binary-only rollback across the schema change is refused."
+    )
+}
+
+/// The candidate updater runs as root, so it must be the exact staged file:
+/// canonical below the release root, and a regular file in a directory that
+/// only `owner_uid` (root in production) can modify.
+fn candidate_updater(releases_root: &Path, tag: &str, owner_uid: u32) -> Result<PathBuf> {
+    if !valid_release_tag(tag) {
+        bail!("invalid release tag");
+    }
+    let release = releases_root.join(tag);
+    let updater = release.join("update-core-release");
+    let canonical =
+        fs::canonicalize(&updater).context("staged candidate updater is unavailable")?;
+    if canonical != updater {
+        bail!("staged candidate updater does not resolve inside the release root");
+    }
+    let root = releases_root.to_path_buf();
+    for (path, file) in [(&root, false), (&release, false), (&updater, true)] {
+        let metadata = fs::symlink_metadata(path).context("inspect staged candidate updater")?;
+        let kind_ok = if file {
+            metadata.file_type().is_file() && metadata.mode() & 0o100 != 0
+        } else {
+            metadata.file_type().is_dir()
+        };
+        if !kind_ok || metadata.uid() != owner_uid || metadata.mode() & 0o022 != 0 {
+            bail!("staged candidate updater is not a root-owned, non-writable regular executable");
+        }
+    }
+    Ok(canonical)
 }
 
 fn run_process_tui(
@@ -1623,6 +1797,21 @@ fn agents(args: AgentsArgs, presentation: &Presentation, verbose: bool) -> Resul
 }
 
 fn confirm(prompt: &str) -> Result<()> {
+    if !confirmation_answer(&read_confirmation(&format!("{prompt} [y/N]"))?) {
+        bail!("unchanged");
+    }
+    Ok(())
+}
+
+/// Require the owner to type the exact release tag before a schema change.
+fn confirm_typed(prompt: &str, expected: &str) -> Result<()> {
+    if !typed_confirmation_matches(&read_confirmation(prompt)?, expected) {
+        bail!("unchanged; the typed text did not match {expected}");
+    }
+    Ok(())
+}
+
+fn read_confirmation(prompt: &str) -> Result<String> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("refusing non-interactive mutation; pass --yes after reviewing the target");
     }
@@ -1634,20 +1823,21 @@ fn confirm(prompt: &str) -> Result<()> {
         .write(true)
         .open("/dev/tty")
         .context("open controlling terminal for confirmation")?;
-    write!(tty, "{prompt} [y/N] ")?;
+    write!(tty, "{prompt} ")?;
     tty.flush()?;
     let mut answer = String::new();
     io::BufReader::new(&tty)
         .read_line(&mut answer)
         .context("read confirmation")?;
-    if !confirmation_answer(&answer) {
-        bail!("unchanged");
-    }
-    Ok(())
+    Ok(answer)
 }
 
 fn confirmation_answer(answer: &str) -> bool {
     matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
+}
+
+fn typed_confirmation_matches(answer: &str, expected: &str) -> bool {
+    answer.trim_end_matches(['\n', '\r']) == expected
 }
 
 fn mutation_lock(path: impl AsRef<Path>) -> Result<File> {

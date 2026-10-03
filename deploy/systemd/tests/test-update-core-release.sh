@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Linux-only CI fixture for the privileged Home Node updater. It runs the real
 # updater with fake GitHub/systemd commands and never contacts the network.
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "test-update-core-release: failed at line $LINENO" >&2' ERR
 
 [[ ${GITHUB_ACTIONS:-} == true ]] || {
     echo "refusing to run outside GitHub Actions" >&2
@@ -346,6 +347,15 @@ seed_active_release() {
         /usr/local/sbin/jarvis-private-update
 }
 
+write_components() {
+    local manifest=$1 tag=$2 fields=${3:-'{tag, revision, components, schema_sha256, schema_migration}'}
+    jq "$fields" "$manifest" > "$fixture_dir/jarvis-core-$tag-components.json"
+    (
+        cd "$fixture_dir"
+        sha256sum "jarvis-core-$tag-components.json" > "jarvis-core-$tag-components.json.sha256"
+    )
+}
+
 prepare_candidate() {
     local tag=$1
     local schema_sha256=$2
@@ -375,12 +385,7 @@ prepare_candidate() {
         cd "$fixture_dir"
         sha256sum "$artifact" > "$artifact.sha256"
     )
-    jq '{tag, revision, components}' "$asset_root/jarvis-core-$tag/release.json" \
-        > "$fixture_dir/jarvis-core-$tag-components.json"
-    (
-        cd "$fixture_dir"
-        sha256sum "jarvis-core-$tag-components.json" > "jarvis-core-$tag-components.json.sha256"
-    )
+    write_components "$asset_root/jarvis-core-$tag/release.json" "$tag"
     jq -n --arg tag "$tag" '
         {
           tag_name: $tag,
@@ -423,6 +428,23 @@ run_updater() {
 
 same_migrations=$(printf 'a%.0s' {1..64})
 changed_migrations=$(printf 'b%.0s' {1..64})
+unrelated_migrations=$(printf 'c%.0s' {1..64})
+
+# Publish a schema-changing candidate that authorizes migration from $2.
+prepare_migration_candidate() {
+    local tag=$1 from=$2 asset="$fixture_dir/asset/jarvis-core-$1"
+    prepare_candidate "$tag" "$changed_migrations"
+    install -m 0755 "$repo_dir/deploy/systemd/schema-backup.sh" "$asset/schema-backup"
+    install -m 0644 "$repo_dir/jarvis-core-admin/packaging/com.hawkeynl.jarvis.devices.policy" \
+        "$asset/com.hawkeynl.jarvis.devices.policy"
+    jq --arg previous "$from" '.tooling.local_devices = 1 | .schema_migration = {version:1,target:10,from_sha256:[$previous]}' \
+        "$asset/release.json" > "$fixture_dir/migration-manifest"
+    install -m 0644 "$fixture_dir/migration-manifest" "$asset/release.json"
+    (cd "$asset" && sha256sum schema-backup com.hawkeynl.jarvis.devices.policy >> artifact-binaries.sha256)
+    tar -C "$fixture_dir/asset" -czf "$fixture_dir/jarvis-core-$tag-linux-x86_64.tar.gz" "jarvis-core-$tag"
+    (cd "$fixture_dir" && sha256sum "jarvis-core-$tag-linux-x86_64.tar.gz" > "jarvis-core-$tag-linux-x86_64.tar.gz.sha256")
+    write_components "$asset/release.json" "$tag"
+}
 
 # First managed-unit activation starts with no canonical Jarvis units (the same
 # relevant condition as a fresh host/legacy install) and installs the complete
@@ -878,6 +900,108 @@ find "$JARVIS_SCHEMA_FIXTURE_ROOT/migration-backups" -name committed | grep -q .
 if run_updater --rollback-version v10.0.0; then
     echo 'post-migration binary-only rollback unexpectedly succeeded' >&2; exit 1
 fi
+
+# Owner migration path: --check reports the schema transition, the timer and
+# --version still refuse with the explicit command, and --stage downloads and
+# verifies the candidate without stopping or activating anything.
+seed_active_release v10.1.0 "$same_migrations"
+prepare_migration_candidate v10.1.1 "$same_migrations"
+check_status=0
+check_output=$(run_updater --check) || check_status=$?
+[[ $check_status == 2 ]]
+grep -Fxq 'Schema:   migration required' <<< "$check_output"
+grep -Fxq 'Schema:   migration required' <<< "$(run_updater --status)"
+write_components "$fixture_dir/asset/jarvis-core-v10.1.1/release.json" v10.1.1 '{tag, revision, components}'
+check_status=0
+check_output=$(run_updater --check) || check_status=$?
+[[ $check_status == 2 ]]
+grep -Fxq 'Schema:   unknown' <<< "$check_output"
+prepare_migration_candidate v10.1.1 "$same_migrations"
+for refused in --latest --version; do
+    refused_args=("$refused")
+    [[ $refused == --latest ]] || refused_args+=(v10.1.1)
+    if run_updater "${refused_args[@]}" 2>"$fixture_dir/refused-migration.err"; then
+        echo "routine update $refused applied a schema change" >&2; exit 1
+    fi
+    grep -Fq 'run: sudo jarvis update --migrate v10.1.1' "$fixture_dir/refused-migration.err"
+    [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v10.1.0 ]]
+    [[ ! -e /opt/jarvis/releases/v10.1.1 ]]
+done
+
+# A manifest that does not list the active fingerprint is refused before
+# anything is moved into the release root.
+prepare_migration_candidate v10.1.1 "$unrelated_migrations"
+if run_updater --stage v10.1.1 2>"$fixture_dir/stage-mismatch.err"; then
+    echo 'stage accepted an unauthorized schema transition' >&2; exit 1
+fi
+grep -Fq 'does not authorize a migration from the active schema' "$fixture_dir/stage-mismatch.err"
+if run_updater --version v10.1.1 2>"$fixture_dir/version-mismatch.err"; then
+    echo 'routine update applied an unauthorized schema change' >&2; exit 1
+fi
+grep -Fq 'without authorizing a migration' "$fixture_dir/version-mismatch.err"
+[[ ! -e /opt/jarvis/releases/v10.1.1 ]]
+[[ -z $(find /opt/jarvis/releases -maxdepth 1 -name '.staging.*' -print -quit) ]]
+
+# A migration this updater cannot perform is refused before staging. An
+# unsupported target is already rejected by the unit manager's artifact
+# validation; a release without the local-device capability passes that and
+# must be refused by the predicate --stage shares with --migrate-staged.
+prepare_migration_candidate v10.1.1 "$same_migrations"
+jq 'del(.tooling.local_devices)' "$fixture_dir/asset/jarvis-core-v10.1.1/release.json" > "$fixture_dir/migration-manifest"
+install -m 0644 "$fixture_dir/migration-manifest" "$fixture_dir/asset/jarvis-core-v10.1.1/release.json"
+tar -C "$fixture_dir/asset" -czf "$fixture_dir/jarvis-core-v10.1.1-linux-x86_64.tar.gz" jarvis-core-v10.1.1
+(cd "$fixture_dir" && sha256sum jarvis-core-v10.1.1-linux-x86_64.tar.gz > jarvis-core-v10.1.1-linux-x86_64.tar.gz.sha256)
+write_components "$fixture_dir/asset/jarvis-core-v10.1.1/release.json" v10.1.1
+if run_updater --stage v10.1.1 2>"$fixture_dir/stage-target.err"; then
+    echo 'stage accepted an unsupported migration target' >&2; exit 1
+fi
+grep -Fq 'declares a migration this updater does not support' "$fixture_dir/stage-target.err"
+[[ ! -e /opt/jarvis/releases/v10.1.1 ]]
+
+# Same-schema releases are routine updates, not migrations.
+prepare_candidate v10.1.2 "$same_migrations"
+if run_updater --stage v10.1.2 2>"$fixture_dir/stage-same.err"; then
+    echo 'stage accepted a release without a schema change' >&2; exit 1
+fi
+grep -Fq 'use --version v10.1.2' "$fixture_dir/stage-same.err"
+[[ ! -e /opt/jarvis/releases/v10.1.2 ]]
+
+prepare_migration_candidate v10.1.1 "$same_migrations"
+: > "$fixture_dir/systemctl.log"
+run_updater --stage v10.1.1
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v10.1.0 ]]
+grep -Eqx '[0-9a-f]{64}  jarvis-core-v10.1.1-linux-x86_64.tar.gz' /opt/jarvis/releases/v10.1.1/release.verification
+[[ $(stat -c '%U:%G:%a' /opt/jarvis/releases/v10.1.1/release.verification) == root:root:644 ]]
+if grep -Evq '^(is-active|is-enabled)( |$)' "$fixture_dir/systemctl.log"; then
+    echo 'stage changed service state' >&2; exit 1
+fi
+grep -Fq 'already staged' <<< "$(run_updater --stage v10.1.1)"
+
+# A directory with the stale full-path marker is named for manual removal and
+# never deleted automatically.
+cp /opt/jarvis/releases/v10.1.1/release.verification "$fixture_dir/staged-marker"
+printf '%064d  /opt/jarvis/releases/.staging.fixture/jarvis-core-v10.1.1-linux-x86_64.tar.gz\n' 0 \
+    > /opt/jarvis/releases/v10.1.1/release.verification
+if run_updater --stage v10.1.1 2>"$fixture_dir/stage-marker.err"; then
+    echo 'stage accepted a full-path verification marker' >&2; exit 1
+fi
+grep -Fq '/opt/jarvis/releases/v10.1.1 exists but is not a verified release' "$fixture_dir/stage-marker.err"
+[[ -d /opt/jarvis/releases/v10.1.1 ]]
+install -m 0644 "$fixture_dir/staged-marker" /opt/jarvis/releases/v10.1.1/release.verification
+
+printf 'old database\n' > "$JARVIS_SCHEMA_FIXTURE_ROOT/surrealdb/CURRENT"
+rm -f -- "$fixture_dir/migrated-once"
+run_updater --migrate-staged v10.1.1
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v10.1.1 ]]
+cmp <(printf 'candidate database\n') "$JARVIS_SCHEMA_FIXTURE_ROOT/surrealdb/CURRENT"
+# Staging only ever targets a newer release than the active one.
+for stale in v10.1.0 v10.1.1; do
+    if run_updater --stage "$stale" 2>"$fixture_dir/stage-stale.err"; then
+        echo "stage accepted a non-newer release $stale" >&2; exit 1
+    fi
+    grep -Fq 'staging requires a release newer than the active v10.1.1' "$fixture_dir/stage-stale.err"
+done
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v10.1.1 ]]
 
 # Optional Laya lifecycle: fake systemd deliberately drops the service when
 # its required socket restarts. The updater must explicitly restore warmness.

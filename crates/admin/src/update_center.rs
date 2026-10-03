@@ -10,6 +10,7 @@ pub(super) enum UpdateInvocation {
     Latest,
     Version(String),
     Rollback,
+    Migrate(Option<String>),
 }
 
 impl UpdateInvocation {
@@ -24,6 +25,8 @@ impl UpdateInvocation {
             Self::Version(version.clone())
         } else if args.rollback {
             Self::Rollback
+        } else if let Some(target) = &args.migrate {
+            Self::Migrate(target.clone())
         } else {
             Self::Center
         }
@@ -49,6 +52,7 @@ pub(super) struct UpdateSummary {
     pub(super) cli_latest: Option<String>,
     pub(super) core_app_current: Option<String>,
     pub(super) core_app_latest: Option<String>,
+    pub(super) schema: Option<String>,
 }
 
 impl UpdateSummary {
@@ -65,6 +69,7 @@ impl UpdateSummary {
             ("cli_latest", &mut self.cli_latest),
             ("core_app_current", &mut self.core_app_current),
             ("core_app_latest", &mut self.core_app_latest),
+            ("schema", &mut self.schema),
         ] {
             if let Some(value) = values.get(key) {
                 *destination = (value != "unavailable").then(|| value.clone());
@@ -366,6 +371,7 @@ impl UpdateCenter {
             cli_latest: Some("0.1.0".to_owned()),
             core_app_current: Some("0.1.0".to_owned()),
             core_app_latest: Some("0.2.0".to_owned()),
+            schema: Some("unchanged".to_owned()),
         };
         center.last_result = Some("Fixture data only · no administrative capability".to_owned());
         center

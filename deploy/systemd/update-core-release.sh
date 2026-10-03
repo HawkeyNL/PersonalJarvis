@@ -32,7 +32,9 @@ usage() {
 Usage: update-core-release [--latest|--version vMAJOR.MINOR.PATCH|--check|--status|--rollback|--rollback-candidates|--rollback-version vMAJOR.MINOR.PATCH]
 
 No argument is equivalent to --latest and is used by the systemd timer.
-Explicit offline migration: --migrate-staged vMAJOR.MINOR.PATCH (verified staged release only).
+Explicit schema migration, owner-only and never selected by the timer:
+  --stage vMAJOR.MINOR.PATCH           download, verify and stage without activating
+  --migrate-staged vMAJOR.MINOR.PATCH  migrate to a verified staged release
 EOF
     exit 64
 }
@@ -120,6 +122,33 @@ valid_component_version() {
 
 schema_fingerprint() {
     jq -er '.schema_sha256 | strings | select(test("^[0-9a-f]{64}$"))' "$1"
+}
+
+# Classify a manifest's schema against the active release: unchanged,
+# migration required, unsupported transition, or unknown (fields missing).
+schema_transition() {
+    local manifest=$1
+    [[ -s $manifest && -n $current_schema_sha256 ]] || { printf 'unknown'; return 0; }
+    jq -r --arg current "$current_schema_sha256" '
+        if (.schema_sha256 | type) != "string" or (.schema_sha256 | test("^[0-9a-f]{64}$") | not) then "unknown"
+        elif .schema_sha256 == $current then "unchanged"
+        elif (.schema_migration | type) == "object" and .schema_migration.version == 1 and
+            (.schema_migration.from_sha256 | type) == "array" and
+            (.schema_migration.from_sha256 | index($current) != null) then "migration required"
+        else "unsupported transition" end
+    ' "$manifest" 2>/dev/null || printf 'unknown'
+}
+
+# The one migration contract this updater supports. --stage and
+# --migrate-staged share it, so staging never accepts a candidate that the
+# migration would refuse after the owner confirmed it.
+candidate_migration_supported() {
+    jq -e --arg previous "$current_schema_sha256" '
+        .schema_migration.version == 1 and (.schema_migration.target == 8 or .schema_migration.target == 9 or .schema_migration.target == 10) and
+        (.schema_migration.from_sha256 | type == "array") and
+        (.schema_migration.from_sha256 | index($previous) != null) and
+        .tooling.systemd_units == 1 and .tooling.local_devices == 1
+    ' "$1" >/dev/null 2>&1
 }
 
 # Releases before the admin_helpers capability legitimately used the global
@@ -232,6 +261,7 @@ case ${1:-} in
     --latest) [[ $# == 1 ]] || usage ;;
     --version) [[ $# == 2 && $2 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage; mode=version; requested_tag=$2 ;;
     --migrate-staged) [[ $# == 2 && $2 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage; mode=migrate_staged; requested_tag=$2 ;;
+    --stage) [[ $# == 2 && $2 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage; mode=stage; requested_tag=$2 ;;
     --check) [[ $# == 1 ]] || usage; mode=check ;;
     --status) [[ $# == 1 ]] || usage; mode=status ;;
     --rollback) [[ $# == 1 ]] || usage; mode=rollback ;;
@@ -1016,7 +1046,7 @@ rollback() {
     fail "rollback target or its tooling failed activation; restored $current_tag"
 }
 
-if [[ $mode == latest || $mode == version || $mode == rollback || $mode == rollback_version ]]; then
+if [[ $mode == latest || $mode == version || $mode == stage || $mode == rollback || $mode == rollback_version ]]; then
     [[ -z $current_tag ]] || migrate_legacy_release_verification "$current_target" "$current_tag"
 fi
 
@@ -1028,6 +1058,12 @@ fi
 if [[ $mode == migrate_staged ]]; then
     # Explicit owner-only maintenance, never selected by --latest or a timer.
     # The candidate must already be staged by the verified archive path.
+    # Services stop below. Ctrl-C, a closed terminal or an exited GUI must not
+    # kill the transaction half-way: ignore INT/HUP (inherited by helpers) and
+    # relay output through a reader that keeps draining, so no write can raise
+    # SIGPIPE or fail with EPIPE.
+    trap '' INT HUP
+    exec > >(trap '' INT HUP PIPE; while IFS= read -r line || [[ -n $line ]]; do printf '%s\n' "$line" 2>/dev/null || true; done) 2>&1
     [[ $current_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "active release identity unavailable"
     inspect_release "$current_tag"
     [[ $inspected_verified == true ]] || fail "active release must be verified before migration"
@@ -1035,12 +1071,7 @@ if [[ $mode == migrate_staged ]]; then
     [[ $inspected_verified == true ]] || fail "staged migration candidate is invalid: $inspected_reason"
     candidate="$releases_dir/$requested_tag"
     [[ $requested_tag != "$current_tag" ]] || fail "migration requires a different candidate release"
-    jq -e --arg previous "$current_schema_sha256" '
-        .schema_migration.version == 1 and (.schema_migration.target == 8 or .schema_migration.target == 9 or .schema_migration.target == 10) and
-        (.schema_migration.from_sha256 | type == "array") and
-        (.schema_migration.from_sha256 | index($previous) != null) and
-        .tooling.systemd_units == 1 and .tooling.local_devices == 1
-    ' "$candidate/release.json" >/dev/null || fail "candidate does not authorize this exact schema transition"
+    candidate_migration_supported "$candidate/release.json" || fail "candidate does not authorize this exact schema transition"
     schema_backup_helper="$candidate/schema-backup"
     [[ -f $schema_backup_helper && ! -L $schema_backup_helper && -x $schema_backup_helper ]] || fail "verified schema backup helper is missing"
     [[ $(awk '$2 == "schema-backup" { n++ } END { print n+0 }' "$candidate/artifact-binaries.sha256") == 1 ]] || fail "schema backup helper is not checksum-bound"
@@ -1066,6 +1097,36 @@ if [[ $mode == rollback || $mode == rollback_version ]]; then
     rollback
 fi
 
+# Staging only accepts a newer release whose manifest explicitly authorizes a
+# migration from the active schema; same-schema releases use --version.
+require_stageable_schema() {
+    case $(schema_transition "$1") in
+        'migration required')
+            candidate_migration_supported "$1" || \
+                fail "$requested_tag declares a migration this updater does not support (schema target, managed units or local devices)"
+            ;;
+        unchanged) fail "$requested_tag does not change the database schema; use --version $requested_tag" ;;
+        *) fail "$requested_tag does not authorize a migration from the active schema" ;;
+    esac
+}
+
+if [[ $mode == stage ]]; then
+    [[ $current_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "active release identity unavailable"
+    [[ -n $current_schema_sha256 ]] || fail "active release lacks a schema fingerprint"
+    version_is_newer "$requested_tag" "$current_tag" || \
+        fail "staging requires a release newer than the active $current_tag"
+    if [[ -e $releases_dir/$requested_tag || -L $releases_dir/$requested_tag ]]; then
+        # Never delete an existing directory automatically: it may be the
+        # owner's only copy of evidence about an earlier failed attempt.
+        inspect_release "$requested_tag"
+        [[ $inspected_verified == true ]] || \
+            fail "$releases_dir/$requested_tag exists but is not a verified release ($inspected_reason); remove that directory and stage again"
+        require_stageable_schema "$releases_dir/$requested_tag/release.json"
+        echo "jarvis updater: $requested_tag is already staged and verified"
+        exit 0
+    fi
+fi
+
 previous_tag=$(find_verified_previous || true)
 
 metadata=$(mktemp)
@@ -1075,7 +1136,7 @@ staging_dir=
 trap 'rm -f -- "$metadata" "$remote_components" "$remote_components_checksum"; cleanup' EXIT
 
 metadata_path="/repos/$repository/releases/latest"
-[[ $mode != version ]] || metadata_path="/repos/$repository/releases/tags/$requested_tag"
+[[ $mode != version && $mode != stage ]] || metadata_path="/repos/$repository/releases/tags/$requested_tag"
 curl "${curl_args[@]}" \
     -H 'Accept: application/vnd.github+json' \
     "$api_url$metadata_path" > "$metadata"
@@ -1087,6 +1148,7 @@ prerelease=$(jq -r '.prerelease' "$metadata") || fail "release prerelease state 
 [[ $prerelease == true || $prerelease == false ]] || fail "release prerelease state is invalid"
 [[ $draft == false && $prerelease == false ]] || fail "latest release is not a stable release"
 [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "release tag must use stable vMAJOR.MINOR.PATCH form"
+[[ $mode != stage || $tag == "$requested_tag" ]] || fail "resolved release $tag does not match requested $requested_tag"
 echo "jarvis updater: resolved stable release $tag"
 asset_url() {
     jq -er --arg name "$1" '.assets[] | select(.name == $name) | .browser_download_url' "$metadata"
@@ -1149,19 +1211,20 @@ if [[ $current_has_managed_units == true ]]; then
         installed_unit_state=repair-required
     fi
 fi
+schema_state=$(schema_transition "$remote_components")
 if [[ $mode == status ]]; then
-    printf 'Current:  %s\nPrevious: %s\nLatest:   %s\nCore current: %s\nCore latest: %s\nCLI current: %s\nCLI latest: %s\nCore app current: %s\nCore app latest: %s\nSystemd units: %s\nUpdater:  %s\n' \
+    printf 'Current:  %s\nPrevious: %s\nLatest:   %s\nCore current: %s\nCore latest: %s\nCLI current: %s\nCLI latest: %s\nCore app current: %s\nCore app latest: %s\nSchema:   %s\nSystemd units: %s\nUpdater:  %s\n' \
         "${current_tag:-unavailable}" "${previous_tag:-unavailable}" "$tag" \
         "$current_core_version" "$latest_core_version" "$current_cli_version" \
-        "$latest_cli_version" "$current_core_admin_version" "$latest_core_admin_version" "$installed_unit_state" \
+        "$latest_cli_version" "$current_core_admin_version" "$latest_core_admin_version" "$schema_state" "$installed_unit_state" \
         "$(systemctl is-enabled jarvis-updater.timer 2>/dev/null || printf unavailable)"
     exit 0
 fi
 if [[ $mode == check ]]; then
-    printf 'Current:  %s\nLatest:   %s\nCore current: %s\nCore latest: %s\nCLI current: %s\nCLI latest: %s\nCore app current: %s\nCore app latest: %s\nUpdate:   ' \
+    printf 'Current:  %s\nLatest:   %s\nCore current: %s\nCore latest: %s\nCLI current: %s\nCLI latest: %s\nCore app current: %s\nCore app latest: %s\nSchema:   %s\nUpdate:   ' \
         "${current_tag:-unavailable}" "$tag" "$current_core_version" "$latest_core_version" \
         "$current_cli_version" "$latest_cli_version" "$current_core_admin_version" \
-        "$latest_core_admin_version"
+        "$latest_core_admin_version" "$schema_state"
     if [[ $installed_unit_state == repair-required ]]; then printf 'repair required\n'; exit 2; fi
     if [[ $component_update_available == false && -n $current_tag && $current_tag == "$tag" ]]; then printf 'not available\n'; exit 0; fi
     if [[ $component_update_available == false && -n $current_tag ]] && ! version_is_newer "$tag" "$current_tag"; then printf 'not available\n'; exit 0; fi
@@ -1192,7 +1255,8 @@ checksum_url=$(asset_url "$checksum") || fail "release is missing $checksum"
 [[ $artifact_url == https://github.com/* && $checksum_url == https://github.com/* ]] || \
     fail "release asset URL is not a GitHub HTTPS URL"
 
-[[ ! -e $releases_dir/$tag ]] || fail "release directory already exists: $tag"
+[[ ! -e $releases_dir/$tag ]] || \
+    fail "release directory already exists: $tag; if it was staged for a schema migration, run: sudo jarvis update --migrate $tag"
 staging_dir=$(mktemp -d "$releases_dir/.staging.XXXXXXXX")
 archive="$staging_dir/$artifact"
 
@@ -1282,8 +1346,13 @@ echo "jarvis updater: archive and release manifest validated"
 # explicitly staged, tagged baseline and refuse schema changes from the timer.
 [[ -n $current_schema_sha256 ]] || \
     fail "active release lacks a schema fingerprint; stage a tagged baseline manually before enabling automatic updates"
-[[ $current_schema_sha256 == "$candidate_schema_sha256" ]] || \
-    fail "release changes the database schema; automatic update refused, deploy manually with backup and recovery verification"
+if [[ $mode == stage ]]; then
+    require_stageable_schema "$release_dir/release.json"
+elif [[ $current_schema_sha256 != "$candidate_schema_sha256" ]]; then
+    [[ $(schema_transition "$release_dir/release.json") == 'migration required' ]] || \
+        fail "release $tag changes the database schema without authorizing a migration from the active schema; update refused"
+    fail "release $tag changes the database schema; automatic update refused; run: sudo jarvis update --migrate $tag"
+fi
 
 # Bind the immutable installed directory to the archive that passed the
 # published SHA-256 check. Rollback never accepts an auto-installed release
@@ -1302,6 +1371,10 @@ mv --no-target-directory "$release_dir" "$releases_dir/$tag"
 cleanup
 staging_dir=
 echo "jarvis updater: immutable release staged"
+if [[ $mode == stage ]]; then
+    echo "jarvis updater: $tag staged for an explicit schema migration; not activated"
+    exit 0
+fi
 
 previous_target=$current_target
 if [[ $release_has_managed_units == true ]]; then

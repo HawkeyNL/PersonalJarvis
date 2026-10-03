@@ -122,7 +122,9 @@ if [[ "$mode" == package ]]; then
   tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
     -C "$stage_root" -czf "$artifact" "$release_name"
   (cd "$output_root" && sha256sum "$(basename "$artifact")" > "$(basename "$artifact").sha256")
-  jq '{tag, revision, components}' "$release_dir/release.json" > "$components_asset"
+  # The schema fields let installed updaters report whether the published
+  # release needs an explicit owner migration before downloading the archive.
+  jq '{tag, revision, components, schema_sha256, schema_migration}' "$release_dir/release.json" > "$components_asset"
   (cd "$output_root" && sha256sum "$(basename "$components_asset")" > "$(basename "$components_asset").sha256")
   echo "Packaged tested candidate: $artifact"
   exit 0

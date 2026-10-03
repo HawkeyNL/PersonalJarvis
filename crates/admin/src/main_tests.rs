@@ -814,3 +814,143 @@ fn failed_legacy_migration_rolls_back_only_new_configuration() {
     assert!(!created.exists());
     assert_eq!(fs::read_to_string(existing).unwrap(), "existing");
 }
+
+fn update_args<const N: usize>(extra: [&str; N]) -> UpdateArgs {
+    let cli = Cli::try_parse_from(["jarvis", "update"].into_iter().chain(extra)).unwrap();
+    let Some(Commands::Update(args)) = cli.command else {
+        panic!("expected update command");
+    };
+    args
+}
+
+#[test]
+fn migrate_is_exclusive_and_takes_only_a_strict_tag() {
+    for other in [
+        &["--latest"][..],
+        &["--check"],
+        &["--status"],
+        &["--rollback"],
+        &["--version", "v1.2.3"],
+    ] {
+        let args = ["jarvis", "update", "--migrate", "v1.2.4"]
+            .into_iter()
+            .chain(other.iter().copied());
+        assert!(Cli::try_parse_from(args).is_err(), "{other:?}");
+    }
+    for tag in ["v1.2", "1.2.3", "v1.2.3;id"] {
+        assert!(Cli::try_parse_from(["jarvis", "update", "--migrate", tag]).is_err());
+    }
+    assert_eq!(
+        UpdateInvocation::from_args(&update_args(["--migrate", "v1.2.3"])),
+        UpdateInvocation::Migrate(Some("v1.2.3".to_owned()))
+    );
+    assert_eq!(
+        UpdateInvocation::from_args(&update_args(["--migrate"])),
+        UpdateInvocation::Migrate(None)
+    );
+}
+
+#[test]
+fn yes_skips_confirmation_only_for_an_explicit_target() {
+    assert!(validate_update_confirmation(&update_args(["--migrate", "v1.2.3", "--yes"])).is_ok());
+    assert!(validate_update_confirmation(&update_args(["--rollback", "--yes"])).is_ok());
+    assert!(validate_update_confirmation(&update_args(["--migrate", "--yes"])).is_err());
+    assert!(validate_update_confirmation(&update_args(["--latest", "--yes"])).is_err());
+    assert!(validate_update_confirmation(&update_args(["--yes"])).is_err());
+    assert!(validate_update_confirmation(&update_args(["--migrate"])).is_ok());
+}
+
+#[test]
+fn typed_confirmation_requires_the_exact_tag() {
+    assert!(typed_confirmation_matches("v1.2.3\n", "v1.2.3"));
+    assert!(typed_confirmation_matches("v1.2.3\r\n", "v1.2.3"));
+    for answer in [
+        "",
+        "\n",
+        "y\n",
+        "yes\n",
+        " v1.2.3\n",
+        "v1.2.30\n",
+        "v1.2.3 \n",
+    ] {
+        assert!(!typed_confirmation_matches(answer, "v1.2.3"), "{answer:?}");
+    }
+}
+
+#[test]
+fn candidate_updater_must_be_the_exact_owned_staged_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(directory.path()).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    let owner = fs::metadata(&root).unwrap().uid();
+    let release = root.join("v1.2.3");
+    fs::create_dir(&release).unwrap();
+    fs::set_permissions(&release, fs::Permissions::from_mode(0o755)).unwrap();
+    let updater = release.join("update-core-release");
+    fs::write(&updater, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&updater, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(candidate_updater(&root, "v1.2.3", owner).unwrap(), updater);
+    assert!(candidate_updater(&root, "v1.2.3", owner + 1).is_err());
+    assert!(candidate_updater(&root, "../v1.2.3", owner).is_err());
+    assert!(candidate_updater(&root, "v9.9.9", owner).is_err());
+
+    fs::set_permissions(&updater, fs::Permissions::from_mode(0o775)).unwrap();
+    assert!(candidate_updater(&root, "v1.2.3", owner).is_err());
+    fs::set_permissions(&updater, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(candidate_updater(&root, "v1.2.3", owner).is_err());
+    fs::set_permissions(&updater, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&release, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(candidate_updater(&root, "v1.2.3", owner).is_err());
+    fs::set_permissions(&release, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(candidate_updater(&root, "v1.2.3", owner).is_err());
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // A symlinked updater or release directory never resolves to the
+    // expected path, even when its target is otherwise acceptable.
+    let linked = root.join("v1.2.4");
+    fs::create_dir(&linked).unwrap();
+    std::os::unix::fs::symlink(&updater, linked.join("update-core-release")).unwrap();
+    assert!(candidate_updater(&root, "v1.2.4", owner).is_err());
+    std::os::unix::fs::symlink(&release, root.join("v1.2.5")).unwrap();
+    assert!(candidate_updater(&root, "v1.2.5", owner).is_err());
+}
+
+#[test]
+fn migration_without_yes_requires_a_terminal_before_staging() {
+    assert!(require_confirmation_terminal(false, false).is_err());
+    assert!(require_confirmation_terminal(false, true).is_ok());
+    assert!(require_confirmation_terminal(true, false).is_ok());
+}
+
+#[test]
+fn migration_ignores_interrupts_once_services_may_stop() {
+    ignore_interrupts().unwrap();
+    for signal in [libc::SIGINT, libc::SIGHUP] {
+        // Restoring the default reports the previously installed disposition.
+        let previous = unsafe { libc::signal(signal, libc::SIG_DFL) };
+        assert_eq!(previous, libc::SIG_IGN);
+    }
+}
+
+#[test]
+fn update_summary_parses_schema_and_derives_the_migration_target() {
+    let mut summary = UpdateSummary::default();
+    summary
+        .merge_helper_output(
+            "Current: v0.0.15\nLatest: v0.0.16\nSchema:   migration required\nUpdate: available\n",
+        )
+        .unwrap();
+    assert_eq!(summary.schema.as_deref(), Some("migration required"));
+    assert_eq!(migration_target(&summary).unwrap(), "v0.0.16");
+    for schema in ["unchanged", "unsupported transition", "unknown"] {
+        summary
+            .merge_helper_output(&format!(
+                "Current: v0.0.15\nLatest: v0.0.16\nSchema: {schema}\nUpdate: available\n"
+            ))
+            .unwrap();
+        assert!(migration_target(&summary).is_err(), "{schema}");
+    }
+    assert!(migration_target(&UpdateSummary::default()).is_err());
+}
