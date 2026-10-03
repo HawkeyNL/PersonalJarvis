@@ -113,9 +113,13 @@ bash "$helper" create >/dev/null 2>&1 || status=$?
 exec 5>&-
 
 # An export that does not restore to the live counts is never published.
-if FIXTURE_TRUNCATE_EXPORT=true bash "$helper" create >/dev/null 2>&1; then
+if truncated=$(FIXTURE_TRUNCATE_EXPORT=true bash "$helper" create 2>&1); then
     echo 'truncated export was published' >&2; exit 1
 fi
+# Failure messages never quote exported data (records or password hashes).
+for leaked in argon2 PASSHASH phone laptop hello "$canary"; do
+    if [[ $truncated == *"$leaked"* ]]; then echo "failure output quoted exported data: $leaked" >&2; exit 1; fi
+done
 [[ $(sha256sum "$archive") == "$before" ]]
 [[ -z $(find "$fixture/run" "$fixture/dest" -mindepth 1 -maxdepth 1 -name '*jarvis-backup.*' -type d) ]]
 [[ -z $("$real_docker" ps -aq --filter 'name=jarvis-backup-verify-') ]]

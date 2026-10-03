@@ -244,11 +244,14 @@ restore_test() {
         (( attempt < 30 )) || fail 'disposable restore container did not become ready'
         sleep 1
     done
-    # Full import errors can quote exported statements; show one short line.
-    if ! docker exec "$verify_container" /surreal import --endpoint http://127.0.0.1:8000 \
+    # Import errors quote exported statements (password hashes, user data).
+    # Report only the error class and position, never the quoted text.
+    if ! docker exec "$verify_container" /surreal import --log error --endpoint http://127.0.0.1:8000 \
         --namespace restoretest --database restoretest /restore/export.surql >/dev/null 2>"$run/import.err"; then
-        fail "export does not import into a disposable database: $(sed 's/\x1b\[[0-9;]*m//g' "$run/import.err" \
-            | grep -v '^[[:space:]]*$' | tail -n 2 | cut -c1-240 | tr '\n' ' ')"
+        local reason
+        reason=$(grep -oE '(Parse|Thrown|Database|IO|Api) error|-->[[:space:]]*\[[0-9]+:[0-9]+\]' "$run/import.err" \
+            | head -n 2 | LC_ALL=C tr -cd '[:alnum:] :[]>\n-' | tr '\n' ' ') || true
+        fail "export does not import into a disposable database (${reason:-unclassified error})"
     fi
     table_counts verify_sql "$run/restored.json"
     [[ $(jq -c 'keys' "$run/restored.json") == "$(jq -c 'keys' "$run/live-before.json")" ]] \
@@ -329,10 +332,12 @@ create() {
     # Bounded: /run is a shared tmpfs and the restore test has 1 GiB. The CLI
     # writes info-level logs to stdout, which would corrupt the export stream.
     ( ulimit -f "$max_export_kib"
-      compose_exec /surreal export --log warn --endpoint http://127.0.0.1:8000 --auth-level root \
+      compose_exec /surreal export --log error --endpoint http://127.0.0.1:8000 --auth-level root \
           --namespace "$namespace" --database "$database" > "$run_dir/export.surql" ) \
         || fail 'SurrealDB export failed or exceeded 1 GiB'
     [[ -s $run_dir/export.surql ]] || fail 'SurrealDB export is empty'
+    # Terminal escapes mean log output leaked into the stream.
+    if grep -q $'\x1b' "$run_dir/export.surql"; then fail 'SurrealDB export contains log output'; fi
     table_counts live_sql "$run_dir/live-after.json"
     restore_test "$run_dir"
     build_members "$staging_dir" "$run_dir" "$etc_parent"

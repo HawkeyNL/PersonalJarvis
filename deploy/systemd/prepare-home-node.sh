@@ -72,7 +72,9 @@ install -o root -g root -m 0755 \
     "$repo_dir/deploy/systemd/jarvis-credentials.sh" \
     /usr/local/sbin/jarvis-credentials
 # jarvis-backup ships inside each verified Core release; the command always
-# runs the active release's copy instead of a checkout snapshot.
+# runs the active release's copy instead of a checkout snapshot. This path is
+# deliberately a symlink: never add it to the updater's tooling_targets, which
+# refuse symlinked targets.
 ln -sfn /opt/jarvis/current/jarvis-backup /usr/local/sbin/jarvis-backup
 # Owner backup config and recipient public keys; see docs/BACKUP_AND_RESTORE.md.
 install -d -o root -g root -m 0700 /etc/jarvis-backup
