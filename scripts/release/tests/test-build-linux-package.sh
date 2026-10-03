@@ -14,7 +14,7 @@ revision=0123456789abcdef0123456789abcdef01234567
 write_candidate() {
     local tag=$1 release="$fixture/candidate/jarvis-core-$1" helper unit
     mkdir -p "$release"
-    for helper in jarvis-models jarvis-credentials jarvis-model-policy-storage jarvis-claude-worker jarvis-codex-runtime; do
+    for helper in jarvis-models jarvis-credentials jarvis-backup jarvis-model-policy-storage jarvis-claude-worker jarvis-codex-runtime; do
         printf '#!/usr/bin/env bash\nprintf "%s fixture\\n"\n' "$helper" > "$release/$helper"
         chmod 0755 "$release/$helper"
     done
@@ -46,7 +46,7 @@ write_candidate() {
         > "$release/release.json"
     (
         cd "$release"
-        sha256sum jarvis-models jarvis-credentials jarvis-model-policy-storage jarvis-claude-worker jarvis-codex-runtime pricing-registry.json \
+        sha256sum jarvis-models jarvis-credentials jarvis-backup jarvis-model-policy-storage jarvis-claude-worker jarvis-codex-runtime pricing-registry.json \
             com.hawkeynl.jarvis.devices.policy \
             schema-backup laya-offline.py provision-laya \
             manage-systemd-units verify-home-node install-home-node-core ui.sh \
@@ -63,7 +63,7 @@ archive="$fixture/jarvis-core-$tag-linux-x86_64.tar.gz"
 # Consume the complete listing before assertions: grep -q on a pipe can close
 # early and make a healthy tar fail with SIGPIPE/write error under pipefail.
 tar -tzf "$archive" > "$fixture/archive-members.txt"
-for member in jarvis-models jarvis-credentials jarvis-model-policy-storage jarvis-claude-worker jarvis-codex-runtime pricing-registry.json laya-offline.py provision-laya \
+for member in jarvis-models jarvis-credentials jarvis-backup jarvis-model-policy-storage jarvis-claude-worker jarvis-codex-runtime pricing-registry.json laya-offline.py provision-laya \
     systemd-jarvis-model-catalog.service systemd-jarvis-model-catalog.timer \
     systemd-jarvis-laya.service systemd-jarvis-laya.socket \
     systemd-jarvis-claude.service systemd-jarvis-claude.socket \
@@ -80,6 +80,8 @@ cmp "$fixture/candidate/jarvis-core-$tag/jarvis-models" \
     "$extracted/jarvis-core-$tag/jarvis-models"
 cmp "$fixture/candidate/jarvis-core-$tag/jarvis-credentials" \
     "$extracted/jarvis-core-$tag/jarvis-credentials"
+cmp "$fixture/candidate/jarvis-core-$tag/jarvis-backup" \
+    "$extracted/jarvis-core-$tag/jarvis-backup"
 cmp "$repo_dir/deploy/systemd/pricing-registry.json" \
     "$extracted/jarvis-core-$tag/pricing-registry.json"
 jq -e 'any(.models[]; .provider == "openai-api" and .model == "gpt-6-astra" and .input_per_million_usd == 10)' \
@@ -103,6 +105,20 @@ fi
 grep -Fq 'release candidate is missing executable jarvis-credentials' "$fixture/bad.stderr" || {
     echo "release packager did not explain the missing admin helper" >&2
     cat "$fixture/bad.stderr" >&2
+    exit 1
+}
+
+backup_tag=v9.8.6
+write_candidate "$backup_tag"
+rm -f -- "$fixture/candidate/jarvis-core-$backup_tag/jarvis-backup"
+if bash "$builder" package "$backup_tag" "$revision" "$fixture" \
+    >"$fixture/backup.stdout" 2>"$fixture/backup.stderr"; then
+    echo "release packager accepted a release without the backup helper" >&2
+    exit 1
+fi
+grep -Fq 'release candidate is missing executable jarvis-backup' "$fixture/backup.stderr" || {
+    echo "release packager did not explain the missing backup helper" >&2
+    cat "$fixture/backup.stderr" >&2
     exit 1
 }
 

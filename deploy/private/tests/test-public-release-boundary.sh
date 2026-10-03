@@ -48,6 +48,9 @@ require_literal "$release_builder" \
     'install -m 0755 deploy/systemd/jarvis-credentials.sh "$temporary_release/jarvis-credentials"' \
     "canonical release builder must stage the reviewed credential helper as jarvis-credentials"
 require_literal "$release_builder" \
+    'install -m 0755 deploy/systemd/jarvis-backup.sh "$temporary_release/jarvis-backup"' \
+    "canonical release builder must stage the reviewed backup helper as jarvis-backup"
+require_literal "$release_builder" \
     'install -m 0755 deploy/private/install-agent-bundle.sh "$temporary_release/install-agent-bundle"' \
     "canonical release builder must stage the public private-agent bundler without private content"
 require_literal "$release_builder" \
