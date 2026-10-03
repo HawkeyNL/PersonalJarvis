@@ -326,6 +326,9 @@ fn runtime_stop_commands(provider: AccountProvider) -> &'static [&'static [&'sta
         AccountProvider::Codex => &[
             &["disable", "--now", "jarvis-codex-broker.service"],
             &["disable", "--now", "jarvis-codex.service"],
+            // The text-only chat worker shares this login; stop it before logout.
+            &["disable", "--now", "jarvis-codex-chat.socket"],
+            &["stop", "jarvis-codex-chat.service"],
         ],
     }
 }
@@ -446,16 +449,7 @@ fn parse_claude_status(output: &str) -> &'static str {
 }
 
 fn parse_codex_status(output: &str) -> &'static str {
-    let line = output.trim().to_ascii_lowercase();
-    if line == "logged in using chatgpt" {
-        "connected"
-    } else if line.contains("api key") || line.contains("api-key") {
-        "wrong_auth_mode"
-    } else if line.contains("not logged in") {
-        "logged_out"
-    } else {
-        "unhealthy"
-    }
+    jarvis_llm::codex_chat_protocol::codex_subscription_status(output.as_bytes())
 }
 
 fn bounded_status_output(command: &mut Command) -> Result<Option<String>> {
@@ -708,6 +702,8 @@ mod tests {
             runtime_stop_commands(AccountProvider::Codex)[0],
             ["disable", "--now", "jarvis-codex-broker.service"]
         );
+        assert!(runtime_stop_commands(AccountProvider::Codex)
+            .contains(&&["disable", "--now", "jarvis-codex-chat.socket"][..]));
     }
 
     #[test]
