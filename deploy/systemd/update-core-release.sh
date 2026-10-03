@@ -892,7 +892,7 @@ activate_managed_release() {
         if unit_enabled jarvis-backup.timer || \
             systemctl is-active --quiet jarvis-backup.timer || \
             systemctl is-active --quiet jarvis-backup.service; then
-            echo 'jarvis updater: disable jarvis-backup.timer before rolling back to a release without scheduled backups' >&2
+            echo 'jarvis updater: run `systemctl disable --now jarvis-backup.timer` and wait for jarvis-backup.service to finish before rolling back to a release without scheduled backups' >&2
             return 1
         fi
         unit_manager="$previous/manage-systemd-units"

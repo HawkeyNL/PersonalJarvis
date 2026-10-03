@@ -1046,7 +1046,8 @@ for state in timer.enabled timer.active service.active; do
     if run_updater --rollback-version v13.0.0 2>"$fixture_dir/backup-rollback.err"; then
         echo "rollback ignored backup timer state: $state" >&2; exit 1
     fi
-    grep -Fq 'disable jarvis-backup.timer before rolling back' "$fixture_dir/backup-rollback.err"
+    grep -Fq 'systemctl disable --now jarvis-backup.timer` and wait for jarvis-backup.service to finish' \
+        "$fixture_dir/backup-rollback.err"
     [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v13.0.2 ]]
     [[ -f $systemd_fixture/jarvis-backup.timer && -f $systemd_fixture/jarvis-backup.service ]]
 done

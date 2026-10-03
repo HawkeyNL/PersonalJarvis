@@ -424,7 +424,7 @@ check_installed() {
         source="$release/systemd-$unit"
         target="$systemd_root/$unit"
         if ! unit_required "$release" "$unit"; then
-            [[ ! -e $target && ! -L $target ]] || fail "legacy release has incompatible catalog unit installed: $unit"
+            [[ ! -e $target && ! -L $target ]] || fail "legacy release has incompatible managed unit installed: $unit"
             continue
         fi
         [[ -f $target && ! -L $target ]] || fail "installed managed unit is missing or unsafe: $unit"
