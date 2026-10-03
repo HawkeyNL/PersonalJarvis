@@ -70,7 +70,7 @@ fn is_loopback_url(url: &str) -> bool {
 /// Static classification by provider id, independent of runtime config, so
 /// the broker, the CLI and Core validate `routing.json` identically.
 pub(crate) fn is_metered_provider_id(backend_id: &str) -> bool {
-    !matches!(backend_id, "ollama" | "claude-cli")
+    !matches!(backend_id, "ollama" | "claude-cli" | "codex-cli")
 }
 
 /// Whether a backend bills per call. Fails closed: only the known local and
@@ -416,10 +416,13 @@ impl RouterProvider {
             && self.model_policy.allows(backend, model)
     }
 
+    /// Backends without static tier models: an owner-enabled exact policy
+    /// entry is their model. `codex-cli` has no configured default at all.
     fn dynamic_cloud_backend(backend: &str) -> bool {
         matches!(
             backend,
-            "openai-api"
+            "codex-cli"
+                | "openai-api"
                 | "anthropic-api"
                 | "deepseek-api"
                 | "xai-api"
@@ -1152,9 +1155,26 @@ mod tests {
         availability: Arc<dyn Availability>,
         failing: &[&str],
     ) -> Fleet {
+        fleet_of(
+            &["ollama", "claude-cli", "zai-api", "anthropic-api"],
+            routing,
+            enabled,
+            availability,
+            failing,
+        )
+    }
+
+    fn fleet_of(
+        ids: &[&'static str],
+        routing: RoutingSnapshot,
+        enabled: &[(&str, &str)],
+        availability: Arc<dyn Availability>,
+        failing: &[&str],
+    ) -> Fleet {
         let mut calls = BTreeMap::new();
-        let candidates = ["ollama", "claude-cli", "zai-api", "anthropic-api"]
-            .into_iter()
+        let candidates = ids
+            .iter()
+            .copied()
             .map(|id| {
                 let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 calls.insert(id, counter.clone());
@@ -1400,6 +1420,87 @@ mod tests {
         );
         assert!(f.router.chat(&pin("anthropic-api")).await.is_err());
         assert_eq!(f.calls("anthropic-api") + f.calls("claude-cli"), 0);
+    }
+
+    #[tokio::test]
+    async fn codex_subscription_never_falls_back_to_the_paid_openai_api() {
+        let backends = ["codex-cli", "openai-api", "claude-cli", "ollama"];
+        let enabled = [
+            ("codex-cli", "gpt-6-luna"),
+            ("openai-api", "gpt-6-luna"),
+            ("claude-cli", "claude-haiku-4-5"),
+        ];
+        let luna = r#"{"version":1,"tiers":{"default":{"chain":[
+            {"provider":"codex-cli","model":"gpt-6-luna"}]}}}"#;
+        // A failing Codex subscription (e.g. Luna not yet rolled out to the
+        // account) ends the routed chain; the paid OpenAI API is never tried.
+        let f = fleet_of(
+            &backends,
+            routing(luna),
+            &enabled,
+            always_available(),
+            &["codex-cli"],
+        );
+        assert!(f.router.chat(&ask(Tier::Default, None)).await.is_err());
+        assert_eq!((f.calls("codex-cli"), f.calls("openai-api")), (1, 0));
+
+        // A pin never falls back either, and never needs a configured default.
+        let pin = ChatRequest {
+            provider: Some("codex-cli".into()),
+            ..ask(Tier::Default, None)
+        };
+        assert!(f.router.chat(&pin).await.is_err());
+        assert_eq!(f.calls("openai-api"), 0);
+
+        // The owner's next subscription entry is used; the reply is unmetered.
+        let f = fleet_of(
+            &backends,
+            routing(
+                r#"{"version":1,"tiers":{"default":{"chain":[
+                {"provider":"codex-cli","model":"gpt-6-luna"},
+                {"provider":"claude-cli","model":"claude-haiku-4-5"}]}}}"#,
+            ),
+            &enabled,
+            always_available(),
+            &["codex-cli"],
+        );
+        let reply = f.router.chat(&ask(Tier::Default, None)).await.unwrap();
+        assert_eq!(reply.text, "claude-cli");
+        assert_eq!(f.calls("openai-api"), 0);
+        assert!(!is_metered_backend("codex-cli"));
+
+        // Built-in order never reaches codex-cli: it is off until routed.
+        assert!(!ids_of_policy().contains(&"codex-cli"));
+    }
+
+    #[tokio::test]
+    async fn paid_api_off_keeps_the_codex_subscription() {
+        let backends = ["codex-cli", "openai-api"];
+        let enabled = [("codex-cli", "gpt-6-luna"), ("openai-api", "gpt-6-luna")];
+        let f = fleet_of(
+            &backends,
+            routing(
+                r#"{"version":1,"paid_api":"off","tiers":{"hard":{"chain":[
+                {"provider":"codex-cli","model":"gpt-6-luna"}]}}}"#,
+            ),
+            &enabled,
+            always_available(),
+            &[],
+        );
+        assert_eq!(ids(f.router.plan(Tier::Hard, true, None)), ["codex-cli"]);
+        let reply = f.router.chat(&ask(Tier::Hard, None)).await.unwrap();
+        assert_eq!(
+            (reply.text.as_str(), reply.model.as_str()),
+            ("codex-cli", "gpt-6-luna")
+        );
+        assert_eq!(f.calls("openai-api"), 0);
+    }
+
+    fn ids_of_policy() -> Vec<&'static str> {
+        [Tier::Cheap, Tier::Default, Tier::Hard]
+            .into_iter()
+            .flat_map(|tier| RouterProvider::policy(tier).iter().copied())
+            .collect()
     }
 
     #[tokio::test]

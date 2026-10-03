@@ -8,6 +8,8 @@
 mod anthropic;
 mod claude_cli;
 pub mod claude_worker_protocol;
+pub mod codex_chat_protocol;
+mod codex_cli;
 mod fallback;
 mod huggingface;
 mod huggingface_catalog;
@@ -26,6 +28,7 @@ use async_trait::async_trait;
 
 pub use anthropic::AnthropicProvider;
 pub use claude_cli::ClaudeCliProvider;
+pub use codex_cli::CodexCliProvider;
 pub use fallback::FallbackProvider;
 pub use huggingface::{hf_routed_model, HuggingFaceProvider, HuggingFaceRoute};
 pub use huggingface_catalog::{HuggingFaceCatalog, HuggingFaceModel, HuggingFaceProviderMetadata};
@@ -335,6 +338,12 @@ pub fn build_router_with_live_policy(
         id: "claude-cli".into(),
         provider: build_claude_cli(&cfg),
     });
+    // Not in any built-in order: reached only through an owner-routed chain
+    // or a pin, so it stays off until the owner chooses it.
+    candidates.push(router::Candidate {
+        id: "codex-cli".into(),
+        provider: Arc::new(CodexCliProvider),
+    });
     if let Some(deepseek) = build_openai_compat("deepseek", "deepseek-api", &cfg.deepseek) {
         candidates.push(router::Candidate {
             id: "deepseek-api".into(),
@@ -532,7 +541,10 @@ mod tests {
             huggingface: HuggingFaceBackend::default(),
         });
         // Registry-aware router over local + plan + API, in fixed id order.
-        assert_eq!(brain.label(), "router[ollama,claude-cli,anthropic-api]");
+        assert_eq!(
+            brain.label(),
+            "router[ollama,claude-cli,codex-cli,anthropic-api]"
+        );
     }
 
     #[test]

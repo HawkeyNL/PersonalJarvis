@@ -64,6 +64,8 @@ impl ClaudeWorkerRequest {
                 .is_none_or(|value| value.len() <= 12 * 1024)
             && !self.model.is_empty()
             && self.model.len() <= 80
+            // Never let a model id read as a CLI option.
+            && !self.model.starts_with('-')
             && self
                 .model
                 .bytes()
@@ -78,6 +80,9 @@ pub enum ClaudeWorkerState {
     SubscriptionUnavailable,
     PlanLimit,
     IncompatibleRuntime,
+    /// The subscription account cannot use the requested model (for example
+    /// a staged model rollout). Never a reason to try a paid API instead.
+    ModelUnavailable,
     RuntimeFailure,
 }
 
@@ -126,6 +131,13 @@ mod tests {
         assert!(!ClaudeWorkerRequest {
             model: "x;sh".into(),
             ..request
+        }
+        .valid());
+        assert!(!ClaudeWorkerRequest {
+            protocol: 1,
+            model: "-c".into(),
+            system: None,
+            prompt: "hello".into(),
         }
         .valid());
     }

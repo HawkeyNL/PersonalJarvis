@@ -201,7 +201,14 @@ pub async fn collect(input: &CollectInput) -> Registry {
         },
     ];
 
-    let brains = derive_brains(input, claude_ver.is_some(), &ollama_models);
+    // The Codex chat worker socket exists only after the owner enabled it.
+    let codex_chat_present = std::path::Path::new(CODEX_CHAT_SOCKET).exists();
+    let brains = derive_brains(
+        input,
+        claude_ver.is_some(),
+        codex_chat_present,
+        &ollama_models,
+    );
     let models = derive_models(input, claude_ver.is_some(), &ollama_models);
 
     Registry {
@@ -377,10 +384,14 @@ fn derive_models(
     out
 }
 
+/// Mirrors `jarvis_llm::codex_chat_protocol::SOCKET`.
+const CODEX_CHAT_SOCKET: &str = "/run/jarvis-codex-chat.sock";
+
 /// Build the brain list (pure — testable) from config + probe results.
 fn derive_brains(
     input: &CollectInput,
     claude_present: bool,
+    codex_chat_present: bool,
     ollama_models: &[String],
 ) -> Vec<Brain> {
     let ollama_available = !ollama_models.is_empty();
@@ -394,6 +405,17 @@ fn derive_brains(
                 "headless `claude` CLI (plan)".into()
             } else {
                 format!("`{}` niet gevonden", input.claude_cli_bin)
+            },
+        },
+        Brain {
+            id: "codex-cli".into(),
+            label: "ChatGPT-abonnement (Codex)".into(),
+            cost: CostTier::Plan,
+            available: codex_chat_present,
+            note: if codex_chat_present {
+                "lokale Codex-chatworker (abonnement, alleen tekst)".into()
+            } else {
+                "Codex-chatworker niet ingeschakeld".into()
             },
         },
         Brain {
@@ -607,7 +629,7 @@ mod tests {
 
     #[test]
     fn brains_reflect_availability_and_cost() {
-        let brains = derive_brains(&input(), true, &["llama3.2:latest".to_string()]);
+        let brains = derive_brains(&input(), true, true, &["llama3.2:latest".to_string()]);
         let cli = brain(&brains, "claude-cli");
         assert_eq!(cli.cost, CostTier::Plan);
         assert!(cli.available);
@@ -617,6 +639,8 @@ mod tests {
         assert!(brain(&brains, "deepseek-api").available); // has_deepseek_key
         assert_eq!(brain(&brains, "ollama").cost, CostTier::Local);
         assert!(brain(&brains, "ollama").available); // one ollama model present
+        assert_eq!(brain(&brains, "codex-cli").cost, CostTier::Plan);
+        assert!(brain(&brains, "codex-cli").available); // worker socket enabled
     }
 
     #[test]
@@ -625,8 +649,9 @@ mod tests {
         i.has_api_key = false;
         i.has_openai_key = false;
         i.has_deepseek_key = false;
-        let brains = derive_brains(&i, false, &[]);
+        let brains = derive_brains(&i, false, false, &[]);
         assert!(!brain(&brains, "claude-cli").available); // no claude binary
+        assert!(!brain(&brains, "codex-cli").available); // worker socket off
         assert!(brain(&brains, "claude-cli").note.contains("niet gevonden"));
         assert!(!brain(&brains, "anthropic-api").available); // no api key
         assert!(!brain(&brains, "openai-api").available); // no openai key
@@ -673,7 +698,7 @@ mod tests {
         let mut i = input();
         i.claude_cli_bin = "definitely-not-a-real-binary-xyz".into();
         let reg = collect(&i).await;
-        assert_eq!(reg.brains.len(), 9);
+        assert_eq!(reg.brains.len(), 10);
         assert!(reg.brains.iter().any(|brain| brain.id == "huggingface"));
         assert!(reg.host.cpu_cores >= 1);
         assert!(!reg.host.os.is_empty());

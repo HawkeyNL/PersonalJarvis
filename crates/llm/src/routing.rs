@@ -17,7 +17,7 @@ pub const ROUTING_MAX_BYTES: usize = 64 * 1024;
 
 /// Providers a routed chain may name. Keep in sync with the provider list of
 /// `jarvis_privileged::Operation::validate` (jarvis-api tests both).
-pub const ROUTING_PROVIDERS: [&str; 9] = [
+pub const ROUTING_PROVIDERS: [&str; 10] = [
     "anthropic-api",
     "openai-api",
     "deepseek-api",
@@ -27,6 +27,7 @@ pub const ROUTING_PROVIDERS: [&str; 9] = [
     "ollama-cloud",
     "huggingface",
     "claude-cli",
+    "codex-cli",
 ];
 
 const MAX_CHAIN: usize = 9;
@@ -82,7 +83,7 @@ pub struct ModelRouting {
 }
 
 fn is_subscription_backend(provider: &str) -> bool {
-    provider == "claude-cli"
+    matches!(provider, "claude-cli" | "codex-cli")
 }
 
 impl ModelRouting {
@@ -284,6 +285,7 @@ mod tests {
             chain(&[("anthropic-api", "a"), ("claude-cli", "a")], false),
             chain(&[("claude-cli", "a"), ("ollama", "llama3.2")], false),
             chain(&[("claude-cli", "a"), ("claude-cli", "b")], false),
+            chain(&[("codex-cli", "gpt-6-luna"), ("claude-cli", "a")], false),
             chain(&[("ollama", &"m".repeat(256))], false),
             chain(&models(9), false),
         ];
@@ -340,6 +342,10 @@ mod tests {
                 "metered after subscription via local",
             ),
             (
+                chain(&[("codex-cli", "gpt-6-luna"), ("openai-api", "gpt-6-luna")], false),
+                "paid OpenAI API after the Codex subscription",
+            ),
+            (
                 format!(r#"{{"version":1,"pad":"{}"}}"#, " ".repeat(ROUTING_MAX_BYTES)),
                 "too large",
             ),
@@ -388,6 +394,7 @@ mod tests {
         assert!(failed.paid_api_off());
         assert!(failed.refuses_provider("openai-api"));
         assert!(!failed.refuses_provider("claude-cli"));
+        assert!(!failed.refuses_provider("codex-cli"));
         assert!(!failed.refuses_provider("ollama"));
         assert!(failed.tier(Tier::Default).is_none());
     }

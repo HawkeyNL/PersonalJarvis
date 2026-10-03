@@ -369,6 +369,8 @@ enum Provider {
     OllamaCloud,
     #[value(name = "claude-cli")]
     ClaudeCli,
+    #[value(name = "codex-cli")]
+    CodexCli,
     Huggingface,
 }
 impl Provider {
@@ -382,6 +384,7 @@ impl Provider {
             Self::Ollama => "ollama",
             Self::OllamaCloud => "ollama-cloud",
             Self::ClaudeCli => "claude-cli",
+            Self::CodexCli => "codex-cli",
             Self::Huggingface => "huggingface",
         }
     }

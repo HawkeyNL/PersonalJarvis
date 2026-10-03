@@ -56,6 +56,7 @@ impl ModelToggleApproval {
                 | "ollama-cloud"
                 | "huggingface"
                 | "claude-cli"
+                | "codex-cli"
         ) || self.model.is_empty()
             || self.model.len() > 256
             || self.model.chars().any(char::is_control)

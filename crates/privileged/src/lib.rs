@@ -81,6 +81,7 @@ impl Operation {
                         | "ollama-cloud"
                         | "huggingface"
                         | "claude-cli"
+                        | "codex-cli"
                 ) || model.is_empty()
                     || model.len() > 256
                     || model.chars().any(char::is_control)
