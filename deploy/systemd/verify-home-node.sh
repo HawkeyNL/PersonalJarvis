@@ -199,6 +199,18 @@ else
     ui_detail "Laya classifier: inactive (optional; Jev/Auto fallback remains available)"
 fi
 
+# Optional owner-enabled Codex chat worker: when its socket is on, the local
+# IPC and identity boundary is mandatory.
+if systemctl is-active --quiet jarvis-codex-chat.socket; then
+    check "Codex chat worker uses the jarvis-codex identity" bash -c \
+        '[[ $(systemctl show -p User --value jarvis-codex-chat.service) == jarvis-codex ]]'
+    check "Codex chat socket is systemd-owned and private" bash -c \
+        '[[ -S /run/jarvis-codex-chat.sock && ! -L /run/jarvis-codex-chat.sock && $(stat -c "%u:%G:%a" /run/jarvis-codex-chat.sock) == 0:jarvis:660 ]]'
+    ui_detail "Codex chat worker: socket enabled (optional; subscription only)"
+else
+    ui_detail "Codex chat worker: inactive (optional)"
+fi
+
 if ((failures)); then
     ui_error "Security verification: $passed passed, $failures failed. Do not enable public ingress."
     exit 1

@@ -1,0 +1,13 @@
+[Unit]
+Description=Jarvis Codex chat subscription worker socket
+
+[Socket]
+ListenStream=/run/jarvis-codex-chat.sock
+SocketUser=root
+SocketGroup=jarvis
+SocketMode=0660
+RemoveOnStop=yes
+Service=jarvis-codex-chat.service
+
+[Install]
+WantedBy=sockets.target

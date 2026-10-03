@@ -1,0 +1,43 @@
+[Unit]
+Description=Jarvis Codex chat subscription worker (text only)
+Requires=jarvis-codex-chat.socket
+After=jarvis-codex-chat.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# Shares only the ChatGPT login home of the jarvis-codex identity. The
+# coding broker's, App Server's and engineering state stay inaccessible.
+User=jarvis-codex
+Group=jarvis-codex
+ExecStart=/opt/jarvis/current/jarvis-codex-chat-worker
+WorkingDirectory=/run/jarvis-codex-chat
+UnsetEnvironment=OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN OPENAI_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN HF_TOKEN SSH_AUTH_SOCK
+StateDirectory=jarvis-codex
+StateDirectoryMode=0700
+RuntimeDirectory=jarvis-codex-chat
+RuntimeDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+InaccessiblePaths=/etc/jarvis /var/lib/jarvis -/var/lib/jarvis-claude -/var/lib/jarvis-codex-broker -/var/lib/jarvis-engineering -/var/lib/jarvis-codex-repositories -/run/jarvis-codex -/run/jarvis-codex-broker
+TasksMax=64
+MemoryMax=2G
+
+# This service is deliberately socket-activated, never enabled at boot on its
+# own. The owner enables jarvis-codex-chat.socket explicitly.

@@ -25,6 +25,8 @@ readonly -a managed_units=(
     jarvis-laya.socket
     jarvis-claude.service
     jarvis-claude.socket
+    jarvis-codex-chat.service
+    jarvis-codex-chat.socket
     jarvis-backup.service
     jarvis-backup.timer
 )
@@ -37,6 +39,17 @@ subscription_capability() {
     fi
     jq -e '.tooling.subscription_workers == 1 and (.tooling.subscription_workers | type) == "number" and .tooling.systemd_units == 1' "$release/release.json" >/dev/null ||
         fail "unsupported subscription-worker capability"
+    echo 1
+}
+
+codex_chat_capability() {
+    local release=$1
+    if ! jq -e '.tooling | has("codex_chat_worker")' "$release/release.json" >/dev/null; then
+        echo legacy
+        return
+    fi
+    jq -e '.tooling.codex_chat_worker == 1 and (.tooling.codex_chat_worker | type) == "number" and .tooling.systemd_units == 1' "$release/release.json" >/dev/null ||
+        fail "unsupported Codex chat worker capability"
     echo 1
 }
 
@@ -83,6 +96,8 @@ unit_required() {
             [[ $(laya_capability "$1") == 1 ]] ;;
         jarvis-claude.service|jarvis-claude.socket)
             [[ $(subscription_capability "$1") == 1 ]] ;;
+        jarvis-codex-chat.service|jarvis-codex-chat.socket)
+            [[ $(codex_chat_capability "$1") == 1 ]] ;;
         *) return 0 ;;
     esac
 }
@@ -234,12 +249,13 @@ validate_checksum_manifest() {
 }
 
 validate_artifacts() {
-    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version laya_version subscription_version backup_version
+    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version laya_version subscription_version codex_chat_version backup_version
     managed_version=$(capability "$release") || return 1
     device_version=$(device_capability "$release") || return 1
     policy_version=$(policy_capability "$release") || return 1
     laya_version=$(laya_capability "$release") || return 1
     subscription_version=$(subscription_capability "$release") || return 1
+    codex_chat_version=$(codex_chat_capability "$release") || return 1
     backup_version=$(backup_capability "$release") || return 1
     if jq -e '.tooling | has("codex_runtime")' "$release/release.json" >/dev/null; then
         jq -e '.tooling.codex_runtime == 1' "$release/release.json" >/dev/null || fail "unsupported Codex runtime capability"
@@ -257,6 +273,14 @@ validate_artifacts() {
         (( (8#$mode & 0022) == 0 )) || fail "Claude subscription worker permissions are unsafe"
         matches=$(awk '$2 == "jarvis-claude-worker" { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
         [[ $matches == 1 ]] || fail "Claude subscription worker is not uniquely checksum-bound"
+    fi
+    if [[ $codex_chat_version == 1 ]]; then
+        [[ -f $release/jarvis-codex-chat-worker && ! -L $release/jarvis-codex-chat-worker && -x $release/jarvis-codex-chat-worker ]] ||
+            fail "Codex chat worker is missing or unsafe"
+        mode=$(stat -c '%a' "$release/jarvis-codex-chat-worker")
+        (( (8#$mode & 0022) == 0 )) || fail "Codex chat worker permissions are unsafe"
+        matches=$(awk '$2 == "jarvis-codex-chat-worker" { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
+        [[ $matches == 1 ]] || fail "Codex chat worker is not uniquely checksum-bound"
     fi
     if [[ $laya_version == 1 ]]; then
         [[ -f $release/laya-offline.py && ! -L $release/laya-offline.py ]] || fail "Laya runtime wrapper is missing or unsafe"
@@ -281,6 +305,7 @@ validate_artifacts() {
         [[ $device_version == legacy ]] || fail "local-device capability requires managed systemd policy"
         [[ $policy_version == legacy ]] || fail "model-policy directory capability requires managed systemd policy"
         [[ $subscription_version == legacy ]] || fail "subscription workers require managed systemd policy"
+        [[ $codex_chat_version == legacy ]] || fail "Codex chat worker requires managed systemd policy"
         return 0
     fi
     validate_checksum_manifest "$release"
