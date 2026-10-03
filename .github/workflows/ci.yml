@@ -111,7 +111,9 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Check dependency-exception expiry
-        run: test "$(date -u +%F)" \< "2026-10-01"
+        # RUSTSEC-2026-0235 (rkyv 0.7) is locked through rust_decimal's
+        # optional dependency but compiled for no target or feature set.
+        run: test "$(date -u +%F)" \< "2026-12-31"
       - run: cargo audit
 
   # Desktop, Android, and iOS CI live in HawkeyNL/PersonalJarvisApp.
