@@ -18,7 +18,7 @@ umask 077
 
 readonly archive_pattern='jarvis-backup-[0-9]{4}-[0-9]{2}-[0-9]{2}\.tar'
 readonly members=(etc-jarvis.tar.zst.gpg manifest.json.gpg surrealdb.surql.zst.gpg)
-readonly keep=7
+readonly keep=1
 # The disposable restore container has 1 GiB; a larger export cannot be tested.
 readonly max_export_kib=$((1024 * 1024))
 

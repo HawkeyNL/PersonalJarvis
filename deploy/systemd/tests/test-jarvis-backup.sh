@@ -163,8 +163,10 @@ expect_fail prune "$fixture/dest" ''
 expect_fail prune "$fixture/dest" notes.txt
 prune "$fixture/dest" jarvis-backup-2026-10-03.tar
 remaining=$(find "$fixture/dest" -maxdepth 1 -name 'jarvis-backup-*.tar' -type f -printf '%f\n' | sort | tr '\n' ' ')
-[[ $remaining == "$(printf 'jarvis-backup-2026-09-0%s.tar ' 5 6 7 8 9)jarvis-backup-2026-10-03.tar jarvis-backup-2099-01-01.tar " ]]
-[[ ! -e $fixture/dest/jarvis-backup-2026-09-04.tar && ! -e $fixture/dest/jarvis-backup-2026-09-04.tar.sha256 ]]
+# Only the current archive is kept.
+[[ $remaining == 'jarvis-backup-2026-10-03.tar ' ]]
+[[ ! -e $fixture/dest/jarvis-backup-2099-01-01.tar && ! -e $fixture/dest/jarvis-backup-2026-09-09.tar.sha256 ]]
+[[ -e $fixture/dest/jarvis-backup-2026-10-03.tar.sha256 ]]
 verify "$archive" 2>/dev/null
 [[ -e $fixture/dest/jarvis-backup-2026-10-03.tar && -e $fixture/dest/notes.txt ]]
 [[ -L $fixture/dest/jarvis-backup-2026-01-01.tar && $(cat "$fixture/outside") == target ]]
