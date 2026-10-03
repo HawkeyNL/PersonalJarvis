@@ -39,6 +39,9 @@ install -o root -g jarvis -m 0640 /dev/stdin /etc/jarvis/Jarvis.md <<'EOF'
 Synthetic protected persona.
 EOF
 install -o root -g root -m 0600 /dev/null /etc/jarvis/surrealdb.env
+install -d -o root -g jarvis -m 0750 /etc/jarvis/model-policy
+printf '%s' '{"version":1,"paid_api":"off"}' \
+    | install -o root -g jarvis -m 0640 /dev/stdin /etc/jarvis/model-policy/routing.json
 install -d -o root -g jarvis -m 0750 /var/lib/jarvis/agents/releases
 bundle=/var/lib/jarvis/agents/releases/bundle-ci-protected-inputs
 install -d -o root -g jarvis -m 0750 "$bundle/agents"
@@ -54,6 +57,8 @@ runuser -u jarvis -- test -r /var/lib/jarvis/agents/current/manifest.json
 runuser -u jarvis -- test ! -w /etc/jarvis/Jarvis.md
 runuser -u jarvis -- test ! -w /var/lib/jarvis/agents/current/manifest.json
 runuser -u jarvis -- test ! -r /etc/jarvis/surrealdb.env
+runuser -u jarvis -- test -r /etc/jarvis/model-policy/routing.json
+runuser -u jarvis -- test ! -w /etc/jarvis/model-policy/routing.json
 
 # Match production's database-scoped Core identity rather than granting this
 # fixture the provisioning-only root account.
@@ -83,6 +88,7 @@ curl --fail --silent http://127.0.0.1:18080/livez >/dev/null
 curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null
 grep -Fq 'Jarvis persona loaded' "$fixture/api.log"
 grep -Fq 'private AgentRegistry loaded' "$fixture/api.log"
+grep -Fq 'model routing loaded' "$fixture/api.log"
 [[ -S /run/jarvis-core-admin/devices.sock && ! -L /run/jarvis-core-admin/devices.sock ]]
 [[ $(stat -c '%U:%a' /run/jarvis-core-admin/devices.sock) == jarvis:600 ]]
 python3 - <<'PY'

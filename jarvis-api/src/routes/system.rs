@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use jarvis_llm as llm;
 use jarvis_registry as registry;
 use jarvis_selfdev as selfdev;
 use jarvis_usage as usage;
@@ -83,14 +84,40 @@ pub(crate) fn validate_brain_selection(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
+    brain_selection(
+        &state.model_policy,
+        &state.model_routing.snapshot(),
+        provider,
+        model,
+    )
+}
+
+fn brain_selection(
+    policy: &llm::LiveModelPolicy,
+    routing: &llm::RoutingSnapshot,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), (StatusCode, Json<Value>)> {
     match (provider, model) {
         (None, None) => Ok(()),
-        (Some(provider), Some(model)) if state.model_policy.allows(provider, model) => Ok(()),
+        (Some(provider), Some(_)) if routing.refuses_provider(provider) => Err(paid_api_off()),
+        (Some(provider), Some(model)) if policy.allows(provider, model) => Ok(()),
         _ => Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error":"model is not owner-enabled"})),
         )),
     }
+}
+
+/// A metered brain selected while the owner turned paid APIs off.
+pub(crate) fn paid_api_off() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "paid API is off",
+            "hint": "choose a subscription or local model, or Auto",
+        })),
+    )
 }
 
 pub(crate) async fn brain_preference(db: &jarvis_store::Database, user_id: Uuid) -> Value {
@@ -445,12 +472,18 @@ pub(crate) async fn system_model_policy(
     };
     let verified = disk.ok().filter(|(disk, _)| *disk == policy);
     let mutable = verified.is_some() && state.privileged_broker_socket.is_some();
+    let routing = state.model_routing.snapshot();
+    let (routing_unavailable_reason, routing_sha256) =
+        crate::model_control::routing_status(&routing, state.model_control.read_routing());
     Json(json!({
         "version": policy.version,
         "models": crate::model_control::priced_models(&policy, &state.pricing_registry),
         "mutation_unavailable_reason": unavailable_reason,
         "mutation": if mutable { "device-signed-model-toggle-v1" } else { "unavailable" },
         "policy_sha256": verified.map(|(_, hash)| hash),
+        "routing": routing.routing,
+        "routing_sha256": routing_sha256,
+        "routing_unavailable_reason": routing_unavailable_reason,
         "user_id": authed.user.id,
         "device_id": authed.device.id,
         "server_time": time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -708,5 +741,46 @@ mod model_broker_tests {
             .await
             .is_err());
         assert!(captured.await.unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paid_api_off_refuses_metered_brain_pins_with_a_bounded_error() {
+        let policy = llm::LiveModelPolicy::new(llm::ModelAccessPolicy {
+            version: 1,
+            models: ["anthropic-api", "claude-cli"]
+                .into_iter()
+                .map(|provider| llm::ModelAccessEntry {
+                    provider: provider.into(),
+                    model: "fixture".into(),
+                    enabled: true,
+                    source: "test".into(),
+                    route: None,
+                })
+                .collect(),
+        });
+        let allowed = llm::RoutingSnapshot::default();
+        let off = llm::RoutingSnapshot {
+            routing: llm::ModelRouting::parse(br#"{"version":1,"paid_api":"off"}"#).ok(),
+            unavailable_reason: None,
+        };
+        let failed = llm::RoutingSnapshot::unavailable("routing_invalid");
+        let pin =
+            |routing, provider| brain_selection(&policy, routing, Some(provider), Some("fixture"));
+        assert!(pin(&allowed, "anthropic-api").is_ok());
+        for routing in [&off, &failed] {
+            let (status, Json(body)) = pin(routing, "anthropic-api").unwrap_err();
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["error"], "paid API is off");
+            assert!(pin(routing, "claude-cli").is_ok());
+            assert!(brain_selection(&policy, routing, None, None).is_ok());
+        }
+        // The allowlist still applies when paid APIs are allowed.
+        let (status, _) = pin(&allowed, "openai-api").unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }

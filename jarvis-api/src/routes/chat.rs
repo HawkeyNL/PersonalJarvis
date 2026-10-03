@@ -356,6 +356,12 @@ pub(super) async fn execute_chat(
     // here to fail closed after a policy reload/revocation.
     if mode == llm::RoutingMode::Auto {
         if let Some((provider, model)) = owner_brain {
+            // Never reroute a pinned paid brain silently while paid APIs are off.
+            if state.model_routing.snapshot().refuses_provider(&provider) {
+                let (status, Json(mut body)) = crate::routes::system::paid_api_off();
+                body["conversation_id"] = json!(conv_id);
+                return Err((status, Json(body)));
+            }
             if state.model_policy.allows(&provider, &model) {
                 chat.model = Some(model);
             }

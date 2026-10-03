@@ -143,6 +143,11 @@ if [[ -e /etc/jarvis/model-policy/policy.json ]]; then
     check "Model policy readable by Core" jarvis_reads /etc/jarvis/model-policy/policy.json
     check "Model policy read-only to Core" jarvis_cannot_write /etc/jarvis/model-policy/policy.json
 fi
+if [[ -e /etc/jarvis/model-policy/routing.json ]]; then
+    check "Model routing permissions" expect_mode /etc/jarvis/model-policy/routing.json root:jarvis:640
+    check "Model routing readable by Core" jarvis_reads /etc/jarvis/model-policy/routing.json
+    check "Model routing read-only to Core" jarvis_cannot_write /etc/jarvis/model-policy/routing.json
+fi
 if [[ -e /etc/jarvis/huggingface-catalog.json ]]; then
     check "Hugging Face catalog permissions" expect_mode /etc/jarvis/huggingface-catalog.json root:jarvis:640
     check "Hugging Face catalog readable by Core" jarvis_reads /etc/jarvis/huggingface-catalog.json
