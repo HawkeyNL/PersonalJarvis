@@ -17,7 +17,7 @@ verify_admin_helper_candidate() {
     echo "release candidate artifact checksum manifest is missing or unsafe" >&2
     exit 1
   }
-  for helper in jarvis-models jarvis-credentials; do
+  for helper in jarvis-models jarvis-credentials jarvis-backup; do
     [[ -f "$release/$helper" && ! -L "$release/$helper" && -x "$release/$helper" ]] || {
       echo "release candidate is missing executable $helper" >&2
       exit 1
@@ -225,6 +225,7 @@ printf '%s\n' "$core_admin_version" > "$temporary_release/jarvis-core-admin.vers
 install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update-core-release"
 install -m 0755 deploy/systemd/jarvis-models.sh "$temporary_release/jarvis-models"
 install -m 0755 deploy/systemd/jarvis-credentials.sh "$temporary_release/jarvis-credentials"
+install -m 0755 deploy/systemd/jarvis-backup.sh "$temporary_release/jarvis-backup"
 install -m 0755 deploy/systemd/manage-systemd-units.sh "$temporary_release/manage-systemd-units"
 install -m 0755 deploy/systemd/schema-backup.sh "$temporary_release/schema-backup"
 install -m 0755 deploy/systemd/verify-home-node.sh "$temporary_release/verify-home-node"
@@ -277,7 +278,7 @@ jq -n \
   cd "$temporary_release"
   sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-codex-runtime jarvis-claude-worker jarvis-agent-bundle \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
-    jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials \
+    jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials jarvis-backup \
     com.hawkeynl.jarvis.devices.policy \
     manage-systemd-units jarvis-model-policy-storage schema-backup verify-home-node install-home-node-core ui.sh laya-offline.py provision-laya \
     pricing-registry.json \

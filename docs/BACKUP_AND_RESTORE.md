@@ -76,10 +76,22 @@ private key. The run refuses anything else.
 
 ## Running a backup
 
+`jarvis-backup` ships inside every verified Core release as
+`/opt/jarvis/current/jarvis-backup`. `prepare-home-node.sh` links
+`/usr/local/sbin/jarvis-backup` to it. On a Home Node that was prepared
+before this, create the link once:
+
 ```bash
-sudo jarvis-backup create      # or: sudo bash deploy/systemd/jarvis-backup.sh create
+sudo ln -sfn /opt/jarvis/current/jarvis-backup /usr/local/sbin/jarvis-backup
+```
+
+```bash
+sudo jarvis-backup create
 sudo jarvis-backup verify /var/backups/jarvis-dr/jarvis-backup-YYYY-MM-DD.tar
 ```
+
+After a rollback to a release older than the one that introduced it, the
+command is absent until the next update; existing archives are unaffected.
 
 Exit code 75 means another backup, a Core update or a configuration change
 was running. Retry later.

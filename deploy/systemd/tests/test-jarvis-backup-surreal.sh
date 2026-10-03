@@ -3,8 +3,9 @@
 # whose root password is a canary: the export authenticates from the container
 # environment, the disposable restore test imports it, and the canary never
 # reaches output, the archive or leftover files.
-set -euo pipefail
+set -Eeuo pipefail
 shopt -s inherit_errexit
+trap 'echo "test-jarvis-backup-surreal: failed at line $LINENO" >&2' ERR
 [[ $EUID == 0 && ${GITHUB_ACTIONS:-} == true ]] || { echo 'CI root fixture only' >&2; exit 1; }
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 fixture=$(mktemp -d)
@@ -82,8 +83,10 @@ export FIXTURE_DOCKER="$real_docker" FIXTURE_CONTAINER="$name" FIXTURE_ROOT="$fi
 export PATH="$fixture/bin:$PATH" GITHUB_ACTIONS=true JARVIS_BACKUP_TEST_MODE=true JARVIS_BACKUP_FIXTURE_ROOT="$fixture"
 helper="$repo/deploy/systemd/jarvis-backup.sh"
 
-output=$(bash "$helper" create 2>&1)
+status=0
+output=$(bash "$helper" create 2>&1) || status=$?
 if grep -qF "$canary" <<< "$output"; then echo 'secret printed during backup' >&2; exit 1; fi
+(( status == 0 )) || { printf 'create failed (%s):\n%s\n' "$status" "$output" >&2; exit 1; }
 archive=$(find "$fixture/dest" -maxdepth 1 -name 'jarvis-backup-*.tar' -type f)
 [[ -n $archive && $(stat -c '%u:%g:%a' "$archive") == 0:0:600 && $(stat -c '%a' "$archive.sha256") == 600 ]]
 bash "$helper" verify "$archive" 2>/dev/null
