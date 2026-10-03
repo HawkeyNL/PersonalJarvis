@@ -51,10 +51,12 @@ cat > "$fake_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "$JARVIS_UPDATER_FIXTURE/systemctl.log"
-if [[ ${JARVIS_LAYA_STATE_FIXTURE:-false} == true || ${JARVIS_CLAUDE_STATE_FIXTURE:-false} == true ]]; then
+if [[ ${JARVIS_LAYA_STATE_FIXTURE:-false} == true || ${JARVIS_CLAUDE_STATE_FIXTURE:-false} == true || \
+    ${JARVIS_BACKUP_STATE_FIXTURE:-false} == true ]]; then
     unit=${3:-}
-    [[ $unit == jarvis-laya.* || $unit == jarvis-claude.* ]] || unit=${2:-}
-    if [[ $unit == jarvis-laya.socket || $unit == jarvis-laya.service || $unit == jarvis-claude.socket || $unit == jarvis-claude.service ]]; then
+    [[ $unit == jarvis-laya.* || $unit == jarvis-claude.* || $unit == jarvis-backup.* ]] || unit=${2:-}
+    if [[ $unit == jarvis-laya.socket || $unit == jarvis-laya.service || $unit == jarvis-claude.socket || $unit == jarvis-claude.service || \
+        $unit == jarvis-backup.timer || $unit == jarvis-backup.service ]]; then
         base=${unit%.*}
         state="$JARVIS_UPDATER_FIXTURE/$unit"
         case ${1:-} in
@@ -161,6 +163,8 @@ write_release() {
     local systemd_units=${8:-$admin_helpers}
     local laya_runtime=${9:-false}
     local subscription_workers=${10:-false}
+    # An environment toggle keeps the positional call sites unchanged.
+    local backup_timer=${JARVIS_FIXTURE_BACKUP_TIMER:-false}
     mkdir -p "$root/jarvis-core-$tag"
     chmod 0755 "$root/jarvis-core-$tag"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-api"
@@ -235,6 +239,14 @@ write_release() {
             chmod 0644 "$root/jarvis-core-$tag/systemd-$unit"
         done
     fi
+    if [[ $backup_timer == true ]]; then
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$root/jarvis-core-$tag/jarvis-backup"
+        chmod 0755 "$root/jarvis-core-$tag/jarvis-backup"
+        for unit in jarvis-backup.service jarvis-backup.timer; do
+            cp "$repo_dir/deploy/systemd/$unit" "$root/jarvis-core-$tag/systemd-$unit"
+            chmod 0644 "$root/jarvis-core-$tag/systemd-$unit"
+        done
+    fi
     jq -n \
         --arg tag "$tag" \
         --arg schema_sha256 "$schema_sha256" \
@@ -245,7 +257,8 @@ write_release() {
         --argjson systemd_units "$systemd_units" \
         --argjson laya_runtime "$laya_runtime" \
         --argjson subscription_workers "$subscription_workers" \
-        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}, tooling: ({private_agents: 1} + if $admin_helpers then {admin_helpers: 1} else {} end + if $systemd_units then {systemd_units: 1} else {} end + if $laya_runtime then {laya_runtime: 1} else {} end + if $subscription_workers then {subscription_workers: 1} else {} end)}' \
+        --argjson backup_timer "$backup_timer" \
+        '{tag: $tag, revision: "0123456789abcdef0123456789abcdef01234567", schema_sha256: $schema_sha256, components: {core: $core_version, cli: $cli_version, core_admin: $app_version}, tooling: ({private_agents: 1} + if $admin_helpers then {admin_helpers: 1} else {} end + if $systemd_units then {systemd_units: 1} else {} end + if $laya_runtime then {laya_runtime: 1} else {} end + if $subscription_workers then {subscription_workers: 1} else {} end + if $backup_timer then {backup_timer: 1} else {} end)}' \
         > "$root/jarvis-core-$tag/release.json"
     chmod 0644 "$root/jarvis-core-$tag/release.json"
     local -a checksummed=(
@@ -271,6 +284,9 @@ write_release() {
     fi
     if [[ $subscription_workers == true ]]; then
         checksummed+=(jarvis-claude-worker systemd-jarvis-claude.service systemd-jarvis-claude.socket)
+    fi
+    if [[ $backup_timer == true ]]; then
+        checksummed+=(jarvis-backup systemd-jarvis-backup.service systemd-jarvis-backup.timer)
     fi
     (
         cd "$root/jarvis-core-$tag"
@@ -990,4 +1006,56 @@ fi
 set_claude_state
 run_updater --rollback-version v12.0.0
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v12.0.0 ]]
+
+# Optional daily backup timer: updates install it disabled and never change
+# the owner's choice; rolling back to a release without it is refused while
+# the owner uses it. The static service is never asked whether it is enabled.
+unset JARVIS_CLAUDE_STATE_FIXTURE
+export JARVIS_BACKUP_STATE_FIXTURE=true
+set_backup_state() {
+    rm -f -- "$fixture_dir"/jarvis-backup.{timer,service}.{active,enabled}
+    for state in "$@"; do
+        touch "$fixture_dir/jarvis-backup.$state"
+    done
+}
+backup_owner_choice_untouched() {
+    if grep -Eq '^(enable|disable|start|stop|restart) jarvis-backup\.' "$fixture_dir/systemctl.log"; then
+        echo "updater changed the owner's backup timer choice" >&2; exit 1
+    fi
+}
+seed_active_release v13.0.0 "$same_migrations"
+set_backup_state
+: > "$fixture_dir/systemctl.log"
+JARVIS_FIXTURE_BACKUP_TIMER=true prepare_candidate v13.0.1 "$same_migrations"
+run_updater
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v13.0.1 ]]
+for unit in jarvis-backup.service jarvis-backup.timer; do
+    cmp "/opt/jarvis/current/systemd-$unit" "$systemd_fixture/$unit"
+done
+grep -Fxq 'try-restart jarvis-backup.timer' "$fixture_dir/systemctl.log"
+[[ ! -e $fixture_dir/jarvis-backup.timer.enabled ]]
+backup_owner_choice_untouched
+set_backup_state timer.enabled timer.active
+JARVIS_FIXTURE_BACKUP_TIMER=true prepare_candidate v13.0.2 "$same_migrations"
+run_updater
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v13.0.2 ]]
+[[ -e $fixture_dir/jarvis-backup.timer.enabled && -e $fixture_dir/jarvis-backup.timer.active ]]
+backup_owner_choice_untouched
+for state in timer.enabled timer.active service.active; do
+    set_backup_state "$state"
+    if run_updater --rollback-version v13.0.0 2>"$fixture_dir/backup-rollback.err"; then
+        echo "rollback ignored backup timer state: $state" >&2; exit 1
+    fi
+    grep -Fq 'disable jarvis-backup.timer before rolling back' "$fixture_dir/backup-rollback.err"
+    [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v13.0.2 ]]
+    [[ -f $systemd_fixture/jarvis-backup.timer && -f $systemd_fixture/jarvis-backup.service ]]
+done
+set_backup_state
+run_updater --rollback-version v13.0.0
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v13.0.0 ]]
+[[ ! -e $systemd_fixture/jarvis-backup.timer && ! -e $systemd_fixture/jarvis-backup.service ]]
+if grep -q '^is-enabled jarvis-backup[.]service' "$fixture_dir/systemctl.log"; then
+    echo "updater asked whether the static backup service is enabled" >&2; exit 1
+fi
+unset JARVIS_BACKUP_STATE_FIXTURE
 echo "Home Node updater fixture tests passed"
