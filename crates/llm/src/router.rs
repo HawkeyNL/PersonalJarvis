@@ -363,6 +363,12 @@ impl RouterProvider {
         }
     }
 
+    /// The plan is a snapshot; the owner may switch paid APIs off while a
+    /// request is in flight. Re-check right before every attempt.
+    fn paid_api_now_refuses(&self, backend: &str) -> bool {
+        self.routing.snapshot().refuses_provider(backend)
+    }
+
     fn requested_model_is_allowed(&self, backend: &str, model: &str) -> bool {
         (Self::dynamic_cloud_backend(backend)
             || self
@@ -408,6 +414,9 @@ impl LlmProvider for RouterProvider {
     ) -> Result<ChatReply, LlmError> {
         for (candidate, pinned) in self.plan(req.tier, req.model.is_none(), req.provider.as_deref())
         {
+            if self.paid_api_now_refuses(&candidate.id) {
+                continue;
+            }
             let chosen = self.choose_model(
                 &candidate.id,
                 pinned.as_deref(),
@@ -457,6 +466,9 @@ impl LlmProvider for RouterProvider {
             let Some(chosen) = chosen else {
                 continue;
             };
+            if self.paid_api_now_refuses(&candidate.id) {
+                continue;
+            }
             let attempt = ChatRequest {
                 model: Some(chosen),
                 ..req.clone()
@@ -1350,5 +1362,50 @@ mod tests {
         );
         assert!(f.router.chat(&pin("anthropic-api")).await.is_err());
         assert_eq!(f.calls("anthropic-api") + f.calls("claude-cli"), 0);
+    }
+
+    #[tokio::test]
+    async fn paid_api_switched_off_mid_request_stops_metered_attempts() {
+        struct SwitchOffThenFail(Arc<LiveRouting>);
+        #[async_trait]
+        impl LlmProvider for SwitchOffThenFail {
+            fn label(&self) -> &str {
+                "claude-cli"
+            }
+            async fn chat(&self, _req: &ChatRequest) -> Result<ChatReply, LlmError> {
+                let current = self.0.snapshot();
+                let mut next = current.clone();
+                next.routing.as_mut().unwrap().paid_api = crate::PaidApi::Off;
+                self.0.swap(&current, next).unwrap();
+                Err(LlmError::Empty)
+            }
+        }
+        let live = Arc::new(LiveRouting::new(routing(
+            r#"{"version":1,"tiers":{"default":{"chain":[
+            {"provider":"claude-cli","model":"claude-haiku-4-5"},
+            {"provider":"zai-api","model":"glm-5.3-flash"}],
+            "metered_after_subscription":true}}}"#,
+        )));
+        let (zai, zai_calls) = counted("zai-api");
+        let candidates = vec![
+            Candidate {
+                id: "claude-cli".into(),
+                provider: Arc::new(SwitchOffThenFail(live.clone())),
+            },
+            zai,
+        ];
+        let c = catalog();
+        let mut policy = allow_catalog(&c);
+        policy.models.push(crate::ModelAccessEntry {
+            provider: "zai-api".into(),
+            model: "glm-5.3-flash".into(),
+            enabled: true,
+            source: "test".into(),
+            route: None,
+        });
+        let router = RouterProvider::with_policy(candidates, always_available(), c, policy)
+            .with_routing(live);
+        assert!(router.chat(&ask(Tier::Default, None)).await.is_err());
+        assert_eq!(zai_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
