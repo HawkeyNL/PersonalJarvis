@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { api, errorText, type HfProvidersResponse, type ModelRecord, type OperationResult } from "../admin";
 import ConfirmDialog from "../components/ConfirmDialog.vue";
 import ErrorPanel from "../components/ErrorPanel.vue";
+import ModelRouting from "../components/ModelRouting.vue";
 import PageHeader from "../components/PageHeader.vue";
 import ResultPanel from "../components/ResultPanel.vue";
 import StatusBadge from "../components/StatusBadge.vue";
@@ -119,6 +120,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
     <button class="secondary" @click="load">Refresh view</button><button @click="mutate('refresh')">Refresh catalog</button>
   </PageHeader>
   <ErrorPanel v-if="error" :message="error" /><ResultPanel v-if="result" :result="result" />
+  <ModelRouting :models="rows" />
   <div class="model-toolbar">
     <input v-model="query" class="search" placeholder="Search provider, model or source…" />
     <select v-model="provider" aria-label="Provider"><option value="all">All providers</option><option v-for="item in providers" :key="item" :value="item">{{ item }}</option></select>

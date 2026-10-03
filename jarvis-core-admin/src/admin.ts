@@ -86,6 +86,18 @@ export interface HfProvidersResponse {
   routes: string[];
   providers: HfProviderRecord[];
 }
+export type RouteTier = "cheap" | "default" | "hard";
+export type PaidApi = "allowed" | "off";
+export interface RouteEntry { provider: string; model: string }
+export interface TierRoute { chain: RouteEntry[]; metered_after_subscription: boolean }
+export interface RoutingReport {
+  routing: { version: number; paid_api: PaidApi; tiers: Partial<Record<RouteTier, TierRoute>> } | null;
+  routing_unavailable_reason: string | null;
+}
+export type RouteMutation =
+  | { action: "set"; tier: RouteTier; chain: RouteEntry[]; metered_after_subscription: boolean }
+  | { action: "reset"; tier: RouteTier }
+  | { action: "paid_api"; state: PaidApi };
 export interface UsageRow {
   backend: string;
   model: string | null;
@@ -188,6 +200,9 @@ export const api = {
   usage: () => invoke<UsageReport>("usage"),
   modelMutation: (request: Record<string, string>) =>
     invoke<OperationResult>("model_mutation", { request }),
+  modelRoutes: () => invoke<RoutingReport>("model_routes"),
+  modelRouteMutation: (request: RouteMutation) =>
+    invoke<OperationResult>("model_route_mutation", { request }),
   credentials: () => invoke<CredentialRecord[]>("credentials"),
   aiAccounts: () => invoke<AiAccountRecord[]>("ai_accounts"),
   aiAccountAction: (provider: AiAccountProvider, action: AiAccountAction) =>
