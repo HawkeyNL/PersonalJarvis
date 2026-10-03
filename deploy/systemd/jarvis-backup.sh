@@ -326,9 +326,10 @@ create() {
     prepare_keyring "$gnupg_home" "$config_dir/recipients.asc"
 
     table_counts live_sql "$run_dir/live-before.json"
-    # Bounded: /run is a shared tmpfs and the restore test has 1 GiB.
+    # Bounded: /run is a shared tmpfs and the restore test has 1 GiB. The CLI
+    # writes info-level logs to stdout, which would corrupt the export stream.
     ( ulimit -f "$max_export_kib"
-      compose_exec /surreal export --endpoint http://127.0.0.1:8000 --auth-level root \
+      compose_exec /surreal export --log warn --endpoint http://127.0.0.1:8000 --auth-level root \
           --namespace "$namespace" --database "$database" > "$run_dir/export.surql" ) \
         || fail 'SurrealDB export failed or exceeded 1 GiB'
     [[ -s $run_dir/export.surql ]] || fail 'SurrealDB export is empty'
