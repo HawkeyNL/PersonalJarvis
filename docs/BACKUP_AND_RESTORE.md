@@ -1,8 +1,13 @@
 # Home Node backup and restore
 
 `jarvis-backup` writes one encrypted archive per run for disaster recovery.
-The owner runs it as root and copies archives off the machine by hand.
-Nothing is uploaded.
+The owner runs it as root, by hand or with the opt-in daily timer, and copies
+archives off the machine by hand. Nothing is uploaded.
+
+> **Only one archive stays on the host.** Each successful run replaces the
+> previous archive. A disk failure, a compromised host or a backup of already
+> damaged data leaves you with nothing older. Copy archives off the machine
+> regularly (see [Copying off the machine](#copying-off-the-machine)).
 
 ## What is in an archive
 
@@ -32,16 +37,18 @@ Not included, by design:
    and each restored count must lie between the two live counts. The live
    database is never written.
 3. It encrypts, writes the archive atomically, verifies the checksum and
-   member layout, then keeps the newest 7 archives.
+   member layout, and only then removes the previous archive. The archive it
+   just published is never removed, even when another archive carries a later
+   date (clock skew or a manual copy).
 
-If any step fails before publishing, nothing is published, older archives are
-untouched, and the temporary files are removed. A second run on the same day
+If any step fails before publishing, nothing is published, the previous
+archive is untouched, and the temporary files are removed. A second run on the same day
 replaces that day's archive and checksum, each with an atomic rename. The
 plaintext export, capped at 1 GiB, exists only on tmpfs below `/run` during
 the run. tmpfs can be swapped to disk.
 
-The run holds the Core updater lock. Do not schedule it at the same time as
-the updater timer.
+The run holds the Core updater lock and waits up to 10 minutes for a running
+update.
 
 ## One-time setup
 
@@ -95,6 +102,42 @@ command is absent until the next update; existing archives are unaffected.
 
 Exit code 75 means another backup, a Core update or a configuration change
 was running. Retry later.
+
+## Daily schedule
+
+Core releases ship `jarvis-backup.timer`, **disabled**. Installers and updates
+never enable it. Finish the one-time setup first: without
+`/etc/jarvis-backup/backup.conf` every run fails and points to this document.
+The destination must not be below `/usr`, `/boot`, `/etc`, `/home` or `/root`; the
+service sees those read-only.
+
+Test one run, then enable the timer:
+
+```bash
+sudo systemctl start jarvis-backup.service
+journalctl -u jarvis-backup --since today
+sudo systemctl enable --now jarvis-backup.timer
+systemctl list-timers jarvis-backup.timer
+```
+
+To stop scheduled backups:
+
+```bash
+sudo systemctl disable --now jarvis-backup.timer
+```
+
+The timer runs daily at 06:00 local time, plus a random delay of up to
+15 minutes. A run missed while the machine was off runs at the next boot.
+The schedule is fixed: a drop-in that changes `OnCalendar`, `Persistent` or
+`RandomizedDelaySec` blocks Core updates until it is removed.
+
+A run that finds another backup, a Core update or a configuration change in
+progress exits with code 75. `systemctl` then shows the service as failed; the
+previous archive is kept and the next run is the following morning.
+
+**Disable the timer before rolling back** to a Core release without scheduled
+backups. The updater refuses that rollback while the timer is enabled or
+active, or a backup is running.
 
 ## Copying off the machine
 

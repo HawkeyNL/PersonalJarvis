@@ -23,7 +23,7 @@ PrivateTmp=true
 PrivateDevices=true
 # Not strict: the destination is owner configuration. The helper writes below
 # /run and the destination, which therefore must not live under /usr, /boot,
-# /efi, /etc or /home.
+# /efi, /etc, /home or /root.
 ProtectSystem=full
 ProtectHome=read-only
 ProtectControlGroups=true
