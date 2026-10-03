@@ -215,6 +215,45 @@ fn model_route_cli_is_typed_and_maps_to_the_helper() {
     }
 }
 
+fn register_helper_arguments(argv: &[&str]) -> Result<Vec<String>> {
+    let cli = Cli::try_parse_from(["jarvis", "models", "register"].iter().chain(argv))?;
+    let Some(Commands::Models(ModelsArgs {
+        command: ModelsCommand::Register { provider, model },
+    })) = cli.command
+    else {
+        bail!("not a register command");
+    };
+    register_arguments(provider, model)
+}
+
+#[test]
+fn model_register_is_only_for_exact_subscription_pairs() {
+    assert_eq!(
+        register_helper_arguments(&["codex-cli", "gpt-6-luna"]).unwrap(),
+        ["register", "codex-cli", "gpt-6-luna"]
+    );
+    assert_eq!(
+        register_helper_arguments(&["claude-cli", "claude-opus-5"]).unwrap(),
+        ["register", "claude-cli", "claude-opus-5"]
+    );
+    let long = "m".repeat(81);
+    for argv in [
+        &["openai-api", "gpt-6-luna"][..],
+        &["ollama", "llama3.2"],
+        &["jev", "a"],
+        &["codex-cli", "--", "-c"],
+        &["codex-cli", "a b"],
+        &["codex-cli", "org/model"],
+        &["codex-cli", "x;sh"],
+        &["codex-cli", "modèl"],
+        &["codex-cli", ""],
+        &["codex-cli", &long],
+        &["codex-cli"],
+    ] {
+        assert!(register_helper_arguments(argv).is_err(), "{argv:?}");
+    }
+}
+
 #[test]
 fn routing_json_report_uses_core_reason_codes_and_never_echoes_content() {
     assert_eq!(

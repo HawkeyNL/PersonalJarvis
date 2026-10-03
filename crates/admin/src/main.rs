@@ -233,6 +233,12 @@ enum ModelsCommand {
     List {
         provider: Option<Provider>,
     },
+    /// Record one exact subscription pair (claude-cli or codex-cli) as
+    /// discovered and disabled; subscriptions have no model catalog.
+    Register {
+        provider: Provider,
+        model: ModelId,
+    },
     Enable {
         provider: Provider,
         model: ModelId,
@@ -337,6 +343,21 @@ fn route_arguments(command: RouteCommand) -> Result<Vec<String>> {
         }
     }
     Ok(arguments)
+}
+
+/// Typed `jarvis models register` arguments; the helper checks them again.
+fn register_arguments(provider: Provider, model: ModelId) -> Result<Vec<String>> {
+    if !matches!(provider, Provider::ClaudeCli | Provider::CodexCli) {
+        bail!("register is only for subscription providers (claude-cli, codex-cli)");
+    }
+    if !jarvis_llm::claude_worker_protocol::valid_worker_model(&model.0) {
+        bail!("invalid model: use 1 to 80 of A-Z a-z 0-9 . _ - and do not start with -");
+    }
+    Ok(vec![
+        "register".to_owned(),
+        provider.as_str().to_owned(),
+        model.0,
+    ])
 }
 
 #[derive(Debug, Args)]
@@ -1658,6 +1679,7 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
             .into_iter()
             .chain(provider.map(|value| value.as_str().to_owned()))
             .collect(),
+        ModelsCommand::Register { provider, model } => register_arguments(provider, model)?,
         ModelsCommand::Enable { provider, model } => {
             vec!["enable".to_owned(), provider.as_str().to_owned(), model.0]
         }

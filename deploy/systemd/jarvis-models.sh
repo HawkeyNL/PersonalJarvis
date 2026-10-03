@@ -23,6 +23,7 @@ usage() {
     cat >&2 <<'EOF'
 Usage:
   sudo jarvis-models refresh [provider]
+  sudo jarvis-models register <claude-cli|codex-cli> <model>
   sudo jarvis-models list [provider]
   sudo jarvis-models enable <provider> <model>
   sudo jarvis-models disable <provider> <model>
@@ -37,7 +38,9 @@ Usage:
 
 `refresh` records configured models as discovered but leaves every remote or
 subscription-backed model disabled. Local Ollama remains enabled by default;
-all model choices remain exact provider/model matches.
+all model choices remain exact provider/model matches. Subscription providers
+have no model catalog: `refresh` records the configured Claude models for
+claude-cli, and `register` records one exact subscription pair, disabled.
 
 `route` orders already-discovered models per tier and switches paid (metered)
 APIs off or on. It never enables a model: the allowlist still decides.
@@ -152,6 +155,7 @@ configured_models() {
           ["xai-api", $xai_default], ["xai-api", $xai_hard], ["xai-api", $xai_cheap],
           ["zai-api", $zai_default], ["zai-api", $zai_hard], ["zai-api", $zai_cheap],
           ["ollama-cloud", $ollama_cloud_default], ["ollama-cloud", $ollama_cloud_hard], ["ollama-cloud", $ollama_cloud_cheap],
+          ["claude-cli", $anthropic_default], ["claude-cli", $anthropic_hard], ["claude-cli", $anthropic_cheap],
           ["huggingface", $huggingface_default], ["huggingface", $huggingface_hard], ["huggingface", $huggingface_cheap],
           ["ollama", $ollama]
         ] | map(select(.[1] != "")) | unique'
@@ -358,6 +362,12 @@ refresh_configured() {
             failed=1
         fi
     done
+    # The Claude worker runs the configured Claude tier models; record them
+    # (disabled) so the owner can enable or route them.
+    if ! (refresh claude-cli); then
+        echo "jarvis-models: claude-cli refresh failed; prior model choices retained" >&2
+        failed=1
+    fi
     echo "jarvis-models: checked $count configured providers; no models enabled"
     return "$failed"
 }
@@ -390,6 +400,30 @@ refresh() {
     jq -e '.models | length <= 2000' <<<"$merged" >/dev/null || fail "model policy size limit exceeded; previous policy retained"
     atomic_write "$merged" || fail "model policy replacement failed; previous policy retained"
     echo "jarvis-models: refreshed policy; new remote models remain disabled."
+}
+
+# Subscription providers have no model catalog to discover. The owner records
+# one exact pair as discovered; it stays disabled until `enable`.
+register_subscription_model() {
+    local provider=$1 model=$2 old updated
+    [[ $provider == claude-cli || $provider == codex-cli ]] ||
+        fail "register is only for subscription providers (claude-cli, codex-cli)"
+    # Same rule as the subscription worker request (valid_worker_model).
+    [[ -n $model && ${#model} -le 80 && $model != -* && $model != *[!A-Za-z0-9._-]* ]] ||
+        fail "invalid model: use 1 to 80 of A-Z a-z 0-9 . _ - and do not start with -"
+    normalize_model_policy_boundary
+    old=$(if [[ -f $policy_file ]]; then cat "$policy_file"; else empty_policy; fi)
+    jq -e '.version == 1 and (.models | type == "array")' <<<"$old" >/dev/null || fail "existing policy is malformed"
+    if jq -e --arg provider "$provider" --arg model "$model" \
+        'any(.models[]; .provider == $provider and .model == $model)' <<<"$old" >/dev/null; then
+        echo "jarvis-models: $provider/$model is already discovered; access unchanged."
+        return 0
+    fi
+    updated=$(merge_model_policy "$old" "$(jq -cn --arg provider "$provider" --arg model "$model" \
+        '[[$provider, $model, "owner_registered"]]')")
+    jq -e '.models | length <= 2000' <<<"$updated" >/dev/null || fail "model policy size limit exceeded; previous policy retained"
+    atomic_write "$updated" || fail "model policy replacement failed; previous policy retained"
+    echo "jarvis-models: $provider/$model recorded as discovered and disabled; enable it with 'sudo jarvis models enable $provider $model'."
 }
 
 require_huggingface_catalog() {
@@ -670,7 +704,7 @@ main() {
     # The root broker locks this same stable directory inode. Locking the JSON
     # file itself is insufficient because every writer replaces it atomically.
     case ${1:-} in
-        refresh|refresh-configured|enable|disable|set-route|route)
+        refresh|refresh-configured|register|enable|disable|set-route|route)
             local migration_lock
             exec {migration_lock}</etc/jarvis
             flock --exclusive --wait 10 "$migration_lock" || fail "policy migration is in progress"
@@ -684,6 +718,7 @@ main() {
     case ${1:-} in
         refresh-configured) (($# == 1)) || usage; refresh_configured ;;
         refresh) (($# == 1 || $# == 2)) || usage; refresh "${2:-}" ;;
+        register) (($# == 3)) || usage; register_subscription_model "$2" "$3" ;;
         list) (($# == 1 || $# == 2)) || usage; list_models "${2:-}" ;;
         enable) (($# == 3)) || usage; set_state "$2" "$3" true ;;
         disable) (($# == 3)) || usage; set_state "$2" "$3" false ;;

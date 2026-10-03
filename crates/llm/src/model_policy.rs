@@ -14,8 +14,9 @@ pub struct ModelAccessEntry {
     pub provider: String,
     pub model: String,
     pub enabled: bool,
-    /// `local`, `configured`, or `discovered`.  Informational only: routing
-    /// always uses the explicit `enabled` bit.
+    /// `local`, `configured`, `discovered`, `provider_api` or
+    /// `owner_registered` (a subscription pair the owner recorded).
+    /// Informational only: routing always uses the explicit `enabled` bit.
     #[serde(default = "default_source")]
     pub source: String,
     /// Hugging Face execution route. This is deliberately separate from the
@@ -198,5 +199,16 @@ mod tests {
         .unwrap();
         assert!(policy.validate().is_ok());
         assert_eq!(policy.models[0].route, None);
+    }
+
+    #[test]
+    fn owner_registered_subscription_pair_is_a_disabled_policy_entry() {
+        // Written by `jarvis models register`; Core and the broker load it as
+        // any other entry, and the source survives a broker rewrite.
+        let raw = r#"{"version":1,"models":[{"provider":"codex-cli","model":"gpt-6-luna","enabled":false,"source":"owner_registered"}]}"#;
+        let policy: ModelAccessPolicy = serde_json::from_str(raw).unwrap();
+        assert!(policy.validate().is_ok());
+        assert!(!policy.allows("codex-cli", "gpt-6-luna"));
+        assert_eq!(serde_json::to_string(&policy).unwrap(), raw);
     }
 }

@@ -127,6 +127,56 @@ mv "$policy_file" "$fixture/policy.json"
 refused 'no policy' route_command set default ollama llama3.2
 mv "$fixture/policy.json" "$policy_file"
 
+# Register: subscription pairs only, the worker's model rule, recorded
+# disabled, written atomically and flushed, and Core is not restarted.
+policy_unchanged_after_refusal() {
+    local expected=$1 before
+    shift
+    before=$(<"$policy_file")
+    if (normalize_model_policy_boundary() { :; }; register_subscription_model "$@") > "$fixture/out" 2>&1; then
+        echo "accepted register: $*" >&2; exit 1
+    fi
+    grep -Fq -- "$expected" "$fixture/out" || { cat "$fixture/out" >&2; exit 1; }
+    [[ $(<"$policy_file") == "$before" ]]
+    [[ $(find "$policy_dir" -name '.model-policy.*' | wc -l) == 0 ]]
+}
+: > "$fixture/calls"
+: > "$fixture/synced"
+(normalize_model_policy_boundary() { :; }; register_subscription_model codex-cli gpt-6-luna) > "$fixture/out"
+grep -Fq 'recorded as discovered and disabled' "$fixture/out"
+jq -e '[.models[] | select(.provider == "codex-cli")]
+    == [{provider: "codex-cli", model: "gpt-6-luna", enabled: false, source: "owner_registered"}]' "$policy_file" >/dev/null
+[[ $(stat -c %a "$policy_file") == 640 ]]
+grep -q '/\.model-policy\.' "$fixture/synced"
+[[ ! -s $fixture/calls ]]
+# The registered pair is now routable (still disabled until `enable`).
+route_command set hard codex-cli gpt-6-luna claude-cli claude-opus-5 > /dev/null
+jq -e '.tiers.hard.chain[0] == {provider: "codex-cli", model: "gpt-6-luna"}' "$routing_file" >/dev/null
+# Registering an existing pair never changes its access.
+before=$(<"$policy_file")
+(normalize_model_policy_boundary() { :; }; register_subscription_model claude-cli claude-opus-5) | grep -Fq 'already discovered'
+[[ $(<"$policy_file") == "$before" ]]
+policy_unchanged_after_refusal 'only for subscription providers' openai-api gpt-6-luna
+policy_unchanged_after_refusal 'only for subscription providers' ollama llama3.2
+policy_unchanged_after_refusal 'only for subscription providers' Codex-CLI gpt-6-luna
+for model in -c --model '' 'a b' org/model 'x;sh' modèl $'a\nb' "$(printf 'm%.0s' $(seq 81))"; do
+    policy_unchanged_after_refusal 'invalid model' codex-cli "$model"
+done
+(normalize_model_policy_boundary() { :; }; register_subscription_model codex-cli "$(printf 'm%.0s' $(seq 80))") > /dev/null
+mv "$policy_file" "$fixture/policy.json"
+printf '%s\n' '{"version":2,"models":[]}' > "$policy_file"
+policy_unchanged_after_refusal 'malformed' codex-cli gpt-6-luna
+mv "$fixture/policy.json" "$policy_file"
+
+# Refresh records the Claude tier models the claude-cli worker runs; it does
+# not touch other providers when scoped to claude-cli.
+printf '%s\n' 'JARVIS_LLM_MODEL=claude-sonnet-5' 'JARVIS_LLM_MODEL_CHEAP=claude-haiku-4-5' \
+    'JARVIS_LLM_OPENAI_MODEL=gpt-fixture' > "$core_env"
+(normalize_model_policy_boundary() { :; }; refresh claude-cli) > /dev/null
+jq -e 'any(.models[]; . == {provider: "claude-cli", model: "claude-sonnet-5", enabled: false, source: "configured"})
+    and any(.models[]; . == {provider: "claude-cli", model: "claude-haiku-4-5", enabled: true, source: "fixture"})
+    and ([.models[] | select(.provider == "openai-api")] | length == 0)' "$policy_file" >/dev/null
+
 # Validator parity with jarvis_llm::ModelRouting::parse.
 long_model=$(printf 'm%.0s' $(seq 256))
 nine=$(jq -cn '[range(9) | {provider: "ollama", model: ("m" + tostring)}]')
@@ -170,6 +220,7 @@ for document in '' '[]' '{"tiers":{}}' '{"version":2}' '{"version":"1"}' '{"vers
 done
 
 # Both dispatchers route `models route` under the shared policy-directory lock.
-grep -Fq 'refresh|refresh-configured|enable|disable|set-route|route)' "$repo/deploy/systemd/jarvis-models.sh"
+grep -Fq 'refresh|refresh-configured|register|enable|disable|set-route|route)' "$repo/deploy/systemd/jarvis-models.sh"
+grep -Fq 'register) (($# == 3)) || usage; register_subscription_model "$2" "$3" ;;' "$repo/deploy/systemd/jarvis-models.sh"
 grep -Fq 'route) shift; route_command "$@" ;;' "$repo/deploy/systemd/jarvis-models.sh"
 echo 'Model routing CLI tests passed'
