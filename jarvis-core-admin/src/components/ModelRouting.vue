@@ -11,8 +11,9 @@ const TIERS: { tier: RouteTier; label: string }[] = [
   { tier: "default", label: "Default" },
   { tier: "hard", label: "Hard" },
 ];
-// jarvis_llm::ROUTING_PROVIDERS. Only claude-cli (subscription) and ollama (local) are not metered.
-const ROUTE_PROVIDERS = ["anthropic-api", "openai-api", "deepseek-api", "xai-api", "zai-api", "ollama", "ollama-cloud", "huggingface", "claude-cli"];
+// jarvis_llm::ROUTING_PROVIDERS. Only the subscriptions and ollama (local) are not metered.
+const ROUTE_PROVIDERS = ["anthropic-api", "openai-api", "deepseek-api", "xai-api", "zai-api", "ollama", "ollama-cloud", "huggingface", "claude-cli", "codex-cli"];
+const SUBSCRIPTIONS = ["claude-cli", "codex-cli"];
 const MAX_CHAIN = 9;
 const REASONS: Record<string, string> = {
   routing_invalid: "routing.json is invalid.",
@@ -37,11 +38,11 @@ const locked = computed(() => busy.value || !report.value || !!unavailable.value
 
 function blank(): Draft { return { chain: [], metered: false, pick: "" }; }
 const key = (entry: RouteEntry) => `${entry.provider}/${entry.model}`;
-const kind = (provider: string) => provider === "claude-cli" ? "subscription" : provider === "ollama" ? "local" : "paid API";
+const kind = (provider: string) => SUBSCRIPTIONS.includes(provider) ? "subscription" : provider === "ollama" ? "local" : "paid API";
 const stored = (tier: RouteTier) => report.value?.routing?.tiers[tier] ?? null;
 const enabled = (entry: RouteEntry) => props.models.some((row) => key(row) === key(entry) && row.enabled);
 function paidAfterSubscription(chain: RouteEntry[]): boolean {
-  const first = chain.findIndex((entry) => entry.provider === "claude-cli");
+  const first = chain.findIndex((entry) => kind(entry.provider) === "subscription");
   return first >= 0 && chain.slice(first + 1).some((entry) => kind(entry.provider) === "paid API");
 }
 function dirty(tier: RouteTier): boolean {
@@ -93,7 +94,7 @@ onMounted(() => { void load(); });
         <button v-else class="small secondary" :disabled="locked" @click="confirmPaid = true">Allow</button>
       </div>
     </div>
-    <p class="usage-source">Paid APIs off keeps only subscriptions (claude-cli) and local Ollama in every tier. Routing only orders models: a model still has to be enabled, and disabled models are skipped. Every change restarts Jarvis Core.</p>
+    <p class="usage-source">Paid APIs off keeps only subscriptions (claude-cli, codex-cli) and local Ollama in every tier. Routing only orders models: a model still has to be enabled, and disabled models are skipped. Every change restarts Jarvis Core.</p>
     <ErrorPanel v-if="unavailable" :message="`${REASONS[unavailable] ?? 'Routing is unavailable.'} Jarvis uses the built-in order without paid APIs until it is fixed as root (${unavailable}).`" />
     <ErrorPanel v-if="error" :message="error" /><ResultPanel v-if="result" :result="result" />
     <div v-if="report" class="routing-grid">

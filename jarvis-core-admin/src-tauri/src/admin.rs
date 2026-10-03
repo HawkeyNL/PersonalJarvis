@@ -170,6 +170,7 @@ pub enum RouteProvider {
     OllamaCloud,
     Huggingface,
     ClaudeCli,
+    CodexCli,
 }
 
 impl RouteProvider {
@@ -184,6 +185,7 @@ impl RouteProvider {
             Self::OllamaCloud => "ollama-cloud",
             Self::Huggingface => "huggingface",
             Self::ClaudeCli => "claude-cli",
+            Self::CodexCli => "codex-cli",
         }
     }
 }
@@ -1770,6 +1772,13 @@ mod tests {
             ]
         );
         assert_eq!(
+            route_arguments(
+                r#"{"action":"set","tier":"hard","chain":[{"provider":"codex-cli","model":"gpt-6-luna"}],"metered_after_subscription":false}"#
+            )
+            .unwrap(),
+            ["models", "route", "set", "hard", "codex-cli", "gpt-6-luna"]
+        );
+        assert_eq!(
             route_arguments(r#"{"action":"reset","tier":"hard"}"#).unwrap(),
             ["models", "route", "reset", "hard"]
         );
@@ -1791,7 +1800,7 @@ mod tests {
         let ten = chain(10);
         for payload in [
             r#"{"action":"set","tier":"turbo","chain":[{"provider":"ollama","model":"a"}],"metered_after_subscription":false}"#.to_owned(),
-            r#"{"action":"set","tier":"cheap","chain":[{"provider":"codex-cli","model":"a"}],"metered_after_subscription":false}"#.to_owned(),
+            r#"{"action":"set","tier":"cheap","chain":[{"provider":"jev","model":"a"}],"metered_after_subscription":false}"#.to_owned(),
             r#"{"action":"set","tier":"cheap","chain":[{"provider":"ollama-local","model":"a"}],"metered_after_subscription":false}"#.to_owned(),
             r#"{"action":"set","tier":"cheap","chain":[],"metered_after_subscription":false}"#.to_owned(),
             format!(r#"{{"action":"set","tier":"cheap","chain":[{ten}],"metered_after_subscription":false}}"#),
