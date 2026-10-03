@@ -232,8 +232,10 @@ disconnect no longer touches the chat worker.
 `RestrictNamespaces`, `SystemCallArchitectures=native`,
 `SystemCallFilter=@system-service` and `MemoryDenyWriteExecute`.
 `NoExecPaths=/` with `ExecPaths=/opt/jarvis/releases /usr/local/bin/codex
-/usr/lib -/usr/lib64` lets only the worker release, the reviewed CLI and their
-shared libraries execute. `IPAddressDeny` blocks loopback, link-local,
+/usr/lib/x86_64-linux-gnu -/usr/lib64` lets only the worker release, the
+reviewed CLI and their shared libraries (with the dynamic loader) execute.
+`/usr/lib` itself is not listed: it holds shells such as the initramfs busybox
+and klibc `sh`. `IPAddressDeny` blocks loopback, link-local,
 multicast, the private IPv4 ranges, CGNAT/Tailscale (`100.64.0.0/10`) and ULA
 (`fc00::/7`), so the CLI reaches only the internet and cannot reach Core,
 Ollama or the LAN. `IPAddressAllow=127.0.0.53` keeps DNS working because the

@@ -55,9 +55,11 @@ MemoryDenyWriteExecute=true
 # Nothing may execute except the worker release, the reviewed CLI and the
 # shared libraries they load. Must be verified against the real CLI: if it
 # needs another interpreter or helper path, the owner adds that path here. A
-# missing path fails closed (the run cannot start), never open.
+# missing path fails closed (the run cannot start), never open. Only the
+# multiarch library directory: /usr/lib itself holds shells (initramfs busybox,
+# klibc sh) and other helpers. /usr/lib64 holds only the loader link here.
 NoExecPaths=/
-ExecPaths=/opt/jarvis/releases /usr/local/bin/codex /usr/lib -/usr/lib64
+ExecPaths=/opt/jarvis/releases /usr/local/bin/codex /usr/lib/x86_64-linux-gnu -/usr/lib64
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # Internet only: no loopback services (Core, Ollama), LAN, link-local,
 # CGNAT/Tailscale or ULA ranges. 127.0.0.53 is the systemd-resolved stub that

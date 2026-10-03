@@ -33,11 +33,13 @@ for directive in PrivatePIDs=true ProcSubset=pid ProtectKernelLogs=true ProtectC
     ProtectHostname=true RestrictRealtime=true RestrictNamespaces=true \
     SystemCallArchitectures=native SystemCallFilter=@system-service \
     MemoryDenyWriteExecute=true NoExecPaths=/ \
-    'ExecPaths=/opt/jarvis/releases /usr/local/bin/codex /usr/lib -/usr/lib64' \
+    'ExecPaths=/opt/jarvis/releases /usr/local/bin/codex /usr/lib/x86_64-linux-gnu -/usr/lib64' \
     'IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7' \
     IPAddressAllow=127.0.0.53; do
     grep -Fxq "$directive" "$chat_service"
 done
+# Shared libraries only: /lib and /usr/lib hold shells (busybox, klibc sh).
+! grep -Eq '^ExecPaths=(.* )?-?(/usr)?/lib/?( |$)' "$chat_service"
 # Only the resolver stub may be reached on loopback, and no IPC is removed.
 [[ $(grep -c '^IPAddressAllow=' "$chat_service") == 1 ]]
 ! grep -Eq '^RemoveIPC=' "$chat_service"
