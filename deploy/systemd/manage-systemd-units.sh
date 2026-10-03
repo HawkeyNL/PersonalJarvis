@@ -25,6 +25,8 @@ readonly -a managed_units=(
     jarvis-laya.socket
     jarvis-claude.service
     jarvis-claude.socket
+    jarvis-backup.service
+    jarvis-backup.timer
 )
 
 subscription_capability() {
@@ -60,8 +62,21 @@ catalog_capability() {
     echo 1
 }
 
+backup_capability() {
+    local release=$1
+    if ! jq -e '.tooling | has("backup_timer")' "$release/release.json" >/dev/null; then
+        echo legacy
+        return
+    fi
+    jq -e '.tooling.backup_timer == 1 and (.tooling.backup_timer | type) == "number" and .tooling.admin_helpers == 1 and .tooling.systemd_units == 1' "$release/release.json" >/dev/null ||
+        fail "unsupported backup-timer capability"
+    echo 1
+}
+
 unit_required() {
     case $2 in
+        jarvis-backup.service|jarvis-backup.timer)
+            [[ $(backup_capability "$1") == 1 ]] ;;
         jarvis-model-catalog.service|jarvis-model-catalog.timer)
             [[ $(catalog_capability "$1") == 1 ]] ;;
         jarvis-laya.service|jarvis-laya.socket)
@@ -219,12 +234,13 @@ validate_checksum_manifest() {
 }
 
 validate_artifacts() {
-    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version laya_version subscription_version
+    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version laya_version subscription_version backup_version
     managed_version=$(capability "$release") || return 1
     device_version=$(device_capability "$release") || return 1
     policy_version=$(policy_capability "$release") || return 1
     laya_version=$(laya_capability "$release") || return 1
     subscription_version=$(subscription_capability "$release") || return 1
+    backup_version=$(backup_capability "$release") || return 1
     if jq -e '.tooling | has("codex_runtime")' "$release/release.json" >/dev/null; then
         jq -e '.tooling.codex_runtime == 1' "$release/release.json" >/dev/null || fail "unsupported Codex runtime capability"
         [[ -f $release/jarvis-codex-runtime && ! -L $release/jarvis-codex-runtime && -x $release/jarvis-codex-runtime ]] ||
@@ -251,6 +267,14 @@ validate_artifacts() {
         [[ -f $release/provision-laya && ! -L $release/provision-laya && -x $release/provision-laya ]] || fail "Laya provisioner is missing or unsafe"
         matches=$(awk '$2 == "provision-laya" { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
         [[ $matches == 1 ]] || fail "Laya provisioner is not uniquely checksum-bound"
+    fi
+    if [[ $backup_version == 1 ]]; then
+        [[ -f $release/jarvis-backup && ! -L $release/jarvis-backup && -x $release/jarvis-backup ]] ||
+            fail "backup helper is missing or unsafe"
+        mode=$(stat -c '%a' "$release/jarvis-backup")
+        (( (8#$mode & 0022) == 0 )) || fail "backup helper permissions are unsafe"
+        matches=$(awk '$2 == "jarvis-backup" { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
+        [[ $matches == 1 ]] || fail "backup helper is not uniquely checksum-bound"
     fi
     catalog_capability "$release" >/dev/null || return 1
     if [[ $managed_version != 1 ]]; then
@@ -328,6 +352,9 @@ validate_release() {
         metadata=$(stat -c '%u:%g:%a' "$release/provision-laya")
         [[ $metadata == 0:0:* ]] && (( (8#${metadata##*:} & 0022) == 0 && (8#${metadata##*:} & 0111) != 0 )) || fail "Laya provisioner permissions are unsafe"
     fi
+    if [[ $(backup_capability "$release") == 1 ]]; then
+        [[ $(stat -c '%u:%g' "$release/jarvis-backup") == 0:0 ]] || fail "backup helper is not root-owned"
+    fi
     if jq -e 'has("schema_migration")' "$release/release.json" >/dev/null; then
         [[ $(stat -c '%u:%g' "$release/schema-backup") == 0:0 ]] || fail "schema backup helper is not root-owned"
     fi
@@ -397,7 +424,7 @@ check_installed() {
         source="$release/systemd-$unit"
         target="$systemd_root/$unit"
         if ! unit_required "$release" "$unit"; then
-            [[ ! -e $target && ! -L $target ]] || fail "legacy release has incompatible catalog unit installed: $unit"
+            [[ ! -e $target && ! -L $target ]] || fail "legacy release has incompatible managed unit installed: $unit"
             continue
         fi
         [[ -f $target && ! -L $target ]] || fail "installed managed unit is missing or unsafe: $unit"

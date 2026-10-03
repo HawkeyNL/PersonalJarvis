@@ -1,0 +1,42 @@
+[Unit]
+Description=Jarvis encrypted disaster-recovery backup (see docs/BACKUP_AND_RESTORE.md)
+After=docker.service jarvis-surrealdb.service
+# A failed run (for example a boot catch-up before the database is ready, or
+# exit 75 while busy) retries every 10 minutes, at most 3 starts in 2 hours.
+StartLimitIntervalSec=2h
+StartLimitBurst=3
+
+# Static by design: no [Install] section. Only jarvis-backup.timer is an owner
+# opt-in; installers and the updater never enable it.
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/jarvis/current/jarvis-backup create
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+UMask=0077
+# The helper may wait up to 600s for a running Core update before exporting.
+TimeoutStartSec=2h
+Restart=on-failure
+RestartSec=10min
+NoNewPrivileges=true
+# Root reads /etc/jarvis files owned by service users; nothing else is needed.
+# The database is reached through the Docker socket, which dockerd serves.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+PrivateDevices=true
+# Not strict: the destination is owner configuration. The helper writes below
+# /run and the destination, which therefore must not live under /usr, /boot,
+# /efi, /etc, /home or /root.
+ProtectSystem=full
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+RestrictAddressFamilies=AF_UNIX
+# The plaintext export (up to 1 GiB) lives on tmpfs below /run and is charged
+# to this unit, so the limit leaves room for it plus gpg, zstd and the CLI.
+MemoryMax=2G

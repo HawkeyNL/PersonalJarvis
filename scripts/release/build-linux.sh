@@ -68,6 +68,11 @@ verify_systemd_unit_candidate() {
     echo "release candidate does not declare model-policy directory capability 1" >&2
     exit 1
   }
+  jq -e '.tooling.backup_timer == 1 and (.tooling.backup_timer | type) == "number"' \
+    "$release/release.json" >/dev/null || {
+    echo "release candidate does not declare backup-timer capability 1" >&2
+    exit 1
+  }
   jq -e '.tooling.systemd_units == 1 and (.tooling.systemd_units | type) == "number"' \
     "$release/release.json" >/dev/null || {
     echo "release candidate does not declare managed-systemd capability 1" >&2
@@ -246,7 +251,8 @@ for unit in \
   jarvis-private-agent-updater.timer \
   jarvis-model-catalog.service jarvis-model-catalog.timer \
   jarvis-laya.service jarvis-laya.socket \
-  jarvis-claude.service jarvis-claude.socket; do
+  jarvis-claude.service jarvis-claude.socket \
+  jarvis-backup.service jarvis-backup.timer; do
   install -m 0644 "deploy/systemd/$unit" "$temporary_release/systemd-$unit"
 done
 install -m 0644 deploy/systemd/pricing-registry.json "$temporary_release/pricing-registry.json"
@@ -271,7 +277,7 @@ jq -n \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
   --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" --arg schema_eight "$schema_eight_sha256" --arg schema_nine "$schema_nine_sha256" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 10, from_sha256: [$schema_six, $schema_seven, $schema_eight, $schema_nine]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1, codex_runtime: 1}}' \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 10, from_sha256: [$schema_six, $schema_seven, $schema_eight, $schema_nine]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1, codex_runtime: 1, backup_timer: 1}}' \
   > "$temporary_release/release.json"
 
 (

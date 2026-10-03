@@ -830,6 +830,7 @@ restart_managed_services() {
         http://127.0.0.1:8080/readyz >/dev/null || return 1
     systemctl try-restart jarvis-updater.timer >/dev/null 2>&1 || true
     systemctl try-restart jarvis-private-agent-updater.timer >/dev/null 2>&1 || true
+    systemctl try-restart jarvis-backup.timer >/dev/null 2>&1 || true
 }
 
 restore_release_transaction() {
@@ -879,6 +880,19 @@ activate_managed_release() {
             systemctl is-active --quiet jarvis-laya.socket || \
             unit_enabled jarvis-laya.socket; then
             echo 'jarvis updater: disable and stop optional jarvis-laya.service and jarvis-laya.socket before rolling back to a pre-Laya release' >&2
+            return 1
+        fi
+        unit_manager="$previous/manage-systemd-units"
+    fi
+    if jq -e '.tooling.backup_timer == 1' "$previous/release.json" >/dev/null && \
+        ! jq -e '.tooling.backup_timer == 1' "$release/release.json" >/dev/null; then
+        # The target cannot run the timer, so never remove it beneath an owner
+        # opt-in or a running backup. jarvis-backup.service is static: only
+        # its active state is meaningful.
+        if unit_enabled jarvis-backup.timer || \
+            systemctl is-active --quiet jarvis-backup.timer || \
+            systemctl is-active --quiet jarvis-backup.service; then
+            echo 'jarvis updater: run `systemctl disable --now jarvis-backup.timer` and wait for jarvis-backup.service to finish before rolling back to a release without scheduled backups' >&2
             return 1
         fi
         unit_manager="$previous/manage-systemd-units"

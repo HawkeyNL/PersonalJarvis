@@ -155,14 +155,44 @@ done
 printf 'keep' > "$fixture/dest/notes.txt"
 printf 'target' > "$fixture/outside"
 ln -s "$fixture/outside" "$fixture/dest/jarvis-backup-2026-01-01.tar"
+# A future-dated archive (clock skew, manual copy) sorts first by name but must
+# never evict the archive that was just published.
+printf 'future' > "$fixture/dest/jarvis-backup-2099-01-01.tar"
 mkdir "$fixture/dest/.jarvis-backup.stale"
-prune "$fixture/dest"
+expect_fail prune "$fixture/dest" ''
+expect_fail prune "$fixture/dest" notes.txt
+prune "$fixture/dest" jarvis-backup-2026-10-03.tar
 remaining=$(find "$fixture/dest" -maxdepth 1 -name 'jarvis-backup-*.tar' -type f -printf '%f\n' | sort | tr '\n' ' ')
-[[ $remaining == "$(printf 'jarvis-backup-2026-09-0%s.tar ' 4 5 6 7 8 9)jarvis-backup-2026-10-03.tar " ]]
-[[ ! -e $fixture/dest/jarvis-backup-2026-09-03.tar && ! -e $fixture/dest/jarvis-backup-2026-09-03.tar.sha256 ]]
+# Only the current archive is kept.
+[[ $remaining == 'jarvis-backup-2026-10-03.tar ' ]]
+[[ ! -e $fixture/dest/jarvis-backup-2099-01-01.tar && ! -e $fixture/dest/jarvis-backup-2026-09-09.tar.sha256 ]]
+[[ -e $fixture/dest/jarvis-backup-2026-10-03.tar.sha256 ]]
+verify "$archive" 2>/dev/null
 [[ -e $fixture/dest/jarvis-backup-2026-10-03.tar && -e $fixture/dest/notes.txt ]]
 [[ -L $fixture/dest/jarvis-backup-2026-01-01.tar && $(cat "$fixture/outside") == target ]]
 [[ ! -e $fixture/dest/.jarvis-backup.stale ]]
+
+# --- Leftovers of a SIGKILLed run ---------------------------------------------------
+# Only exact run directories go; the lock file, symlinks (and their targets)
+# and other names stay. Restore containers are removed by the anchored filter.
+lock_dir="$fixture/stale"
+mkdir -p "$lock_dir/jarvis-backup.AbCd1234" "$lock_dir/jarvis-backup-other" "$fixture/linked-run"
+printf 'plaintext' > "$lock_dir/jarvis-backup.AbCd1234/export.surql"
+printf 'keep' > "$fixture/linked-run/export.surql"
+ln -s "$fixture/linked-run" "$lock_dir/jarvis-backup.Zz99Zz99"
+: > "$lock_dir/jarvis-backup.lock"
+docker() {
+    printf '%s\n' "$*" >> "$fixture/docker.log"
+    [[ $1 != ps ]] || printf 'abc123\ndef456\n'
+}
+remove_stale_runs
+[[ ! -e $lock_dir/jarvis-backup.AbCd1234 && -d $lock_dir/jarvis-backup-other && -f $lock_dir/jarvis-backup.lock ]]
+[[ -L $lock_dir/jarvis-backup.Zz99Zz99 && $(cat "$fixture/linked-run/export.surql") == keep ]]
+[[ $(cat "$fixture/docker.log") == $'ps -aq --filter name=^jarvis-backup-verify-\nrm -f abc123 def456' ]]
+# shellcheck disable=SC2317  # invoked through remove_stale_runs
+docker() { [[ $1 != ps ]] || return 1; }
+expect_fail remove_stale_runs
+unset -f docker
 
 # --- Entry point refusals ---------------------------------------------------------
 if [[ $EUID != 0 ]]; then

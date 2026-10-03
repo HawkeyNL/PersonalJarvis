@@ -18,7 +18,7 @@ umask 077
 
 readonly archive_pattern='jarvis-backup-[0-9]{4}-[0-9]{2}-[0-9]{2}\.tar'
 readonly members=(etc-jarvis.tar.zst.gpg manifest.json.gpg surrealdb.surql.zst.gpg)
-readonly keep=7
+readonly keep=1
 # The disposable restore container has 1 GiB; a larger export cannot be tested.
 readonly max_export_kib=$((1024 * 1024))
 
@@ -172,15 +172,19 @@ publish() {
     printf '%s\n' "$dest/$name"
 }
 
-# Keep the newest $keep archives. Only regular files with the exact archive
+# Keep the just-published archive $2 plus the newest $keep-1 others. The
+# current archive is never a deletion candidate, so a future-dated name (clock
+# skew, manual copy) cannot evict it. Only regular files with the exact archive
 # name are considered; symlinks and other files are never touched.
 prune() {
-    local dest=$1 old
+    local dest=$1 current=$2 old
+    [[ $current =~ ^$archive_pattern$ ]] || fail 'prune needs the current archive name'
     find "$dest" -mindepth 1 -maxdepth 1 -type d -name '.jarvis-backup.*' -exec rm -rf -- {} +
     while IFS= read -r old; do
         rm -f -- "$dest/$old" "$dest/$old.sha256"
     done < <(find "$dest" -mindepth 1 -maxdepth 1 -type f -regextype posix-extended \
-        -regex ".*/$archive_pattern" -printf '%f\n' | LC_ALL=C sort -r | tail -n +$((keep + 1)))
+        -regex ".*/$archive_pattern" -printf '%f\n' | awk -v current="$current" '$0 != current' \
+        | LC_ALL=C sort -r | tail -n +"$keep")
 }
 
 # Integrity and shape check; needs no key.
@@ -274,6 +278,21 @@ cleanup() {
     [[ -z ${staging_dir:-} ]] || rm -rf -- "$staging_dir"
 }
 
+# A run killed with SIGKILL (OOM, stop timeout) skips the EXIT trap and leaves
+# its plaintext run directory and restore container behind. Call only while
+# holding the backup lock, so no live run owns them. Symlinks are never
+# followed or removed.
+remove_stale_runs() {
+    local ids
+    local -a containers=()
+    ids=$(docker ps -aq --filter 'name=^jarvis-backup-verify-') || fail 'cannot list stale restore containers'
+    if [[ -n $ids ]]; then
+        mapfile -t containers <<< "$ids"
+        docker rm -f "${containers[@]}" >/dev/null || fail 'cannot remove stale restore containers'
+    fi
+    find "$lock_dir" -mindepth 1 -maxdepth 1 -type d -name 'jarvis-backup.????????' -exec rm -rf -- {} +
+}
+
 create() {
     local tool newest need avail day parent
     [[ $EUID == 0 ]] || fail 'root required'
@@ -281,6 +300,8 @@ create() {
     for tool in docker gpg gpgconf zstd jq tar sha256sum flock find stat df; do
         command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
     done
+    [[ -e $config_dir/backup.conf || -L $config_dir/backup.conf ]] \
+        || fail "not configured: $config_dir/backup.conf is missing (see docs/BACKUP_AND_RESTORE.md)"
     safe_dir "$config_dir"
     private_root_file "$config_dir/backup.conf" 'backup.conf'
     [[ -f $config_dir/recipients.asc && ! -L $config_dir/recipients.asc && \
@@ -306,6 +327,7 @@ create() {
 
     exec 8> "$lock_dir/jarvis-backup.lock"
     flock -n 8 || { log 'another backup is running'; exit 75; }
+    remove_stale_runs
     exec 9> "$lock_dir/jarvis-updater.lock"
     flock -w 600 9 || { log 'a Core update is running'; exit 75; }
     # Writers of the protected configuration: keep the config tar consistent.
@@ -344,7 +366,7 @@ create() {
     local archive
     archive=$(publish "$staging_dir" "$destination" "$day")
     verify "$archive"
-    prune "$destination"
+    prune "$destination" "${archive##*/}"
 }
 
 main() {

@@ -130,6 +130,13 @@ if bash "$helper" create >/dev/null 2>&1; then echo 'backup succeeded without a 
 [[ $(sha256sum "$archive") == "$before" ]]
 [[ -z $(find "$fixture/run" "$fixture/dest" -mindepth 1 -maxdepth 1 -name '*jarvis-backup.*' -type d) ]]
 
+# Without backup.conf (e.g. the timer enabled before setup) the run fails
+# closed and points at the setup documentation.
+mv "$fixture/etc/jarvis-backup/backup.conf" "$fixture/backup.conf.aside"
+if missing=$(bash "$helper" create 2>&1); then echo 'backup ran without configuration' >&2; exit 1; fi
+[[ $missing == *'not configured'*'docs/BACKUP_AND_RESTORE.md'* ]]
+mv "$fixture/backup.conf.aside" "$fixture/etc/jarvis-backup/backup.conf"
+
 # Non-root callers are refused before anything is read.
 if setpriv --reuid=65534 --regid=65534 --clear-groups bash "$helper" create >/dev/null 2>&1; then
     echo 'non-root backup was allowed' >&2; exit 1

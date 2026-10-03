@@ -13,9 +13,40 @@ grep -Fq 'RuntimeDirectoryMode=0750' "$broker"
 grep -Fq 'StateDirectory=jarvis/config-broker' "$broker"
 grep -Fq 'StateDirectoryMode=0700' "$broker"
 grep -Fxq 'ReadWritePaths=/etc/jarvis/model-policy' "$broker"
-! grep -Eq '^ReadWritePaths=.*(/run/jarvis-config-broker|/var/lib/jarvis/config-broker)' "$broker"
+if grep -Eq '^ReadWritePaths=.*(/run/jarvis-config-broker|/var/lib/jarvis/config-broker)' "$broker"; then
+    echo "config broker runtime and state directories must not be ReadWritePaths" >&2
+    exit 1
+fi
 if grep -Fq 'mkdir /run/jarvis-config-broker' "$prepare"; then
     echo "config broker runtime directory must be systemd-managed" >&2
+    exit 1
+fi
+
+# The daily backup is an owner opt-in: only the timer is installable, and the
+# service is static so it never follows Core restarts or reads as enabled.
+backup_service="$repo_dir/deploy/systemd/jarvis-backup.service"
+backup_timer="$repo_dir/deploy/systemd/jarvis-backup.timer"
+grep -Fxq '[Install]' "$backup_timer"
+grep -Fxq 'WantedBy=timers.target' "$backup_timer"
+grep -Fxq 'Persistent=true' "$backup_timer"
+if grep -Eq '^(\[Install\]|PartOf=|WantedBy=)' "$backup_service"; then
+    echo "jarvis-backup.service must stay static and independent of Core" >&2
+    exit 1
+fi
+grep -Eq '^TimeoutStartSec=' "$backup_service"
+grep -Fxq 'Restart=on-failure' "$backup_service"
+grep -Fxq 'StartLimitBurst=3' "$backup_service"
+# `is-enabled --quiet` also succeeds for static units; the updater must use
+# unit_enabled, which accepts only enabled|enabled-runtime.
+if grep -Fq 'is-enabled --quiet' "$repo_dir/deploy/systemd/update-core-release.sh"; then
+    echo "update-core-release.sh must use unit_enabled instead of is-enabled --quiet" >&2
+    exit 1
+fi
+# jarvis-backup.service is static by design: asking whether it is enabled,
+# with any flags or through unit_enabled, is always a mistake.
+if grep -Eq '(is-enabled( +--?[a-z-]+)*|unit_enabled) +"?jarvis-backup[.]service' \
+    "$repo_dir/deploy/systemd/update-core-release.sh"; then
+    echo "update-core-release.sh must never query whether jarvis-backup.service is enabled" >&2
     exit 1
 fi
 
