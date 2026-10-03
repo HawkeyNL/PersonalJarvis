@@ -285,6 +285,8 @@ create() {
     for tool in docker gpg gpgconf zstd jq tar sha256sum flock find stat df; do
         command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
     done
+    [[ -e $config_dir/backup.conf || -L $config_dir/backup.conf ]] \
+        || fail "not configured: $config_dir/backup.conf is missing (see docs/BACKUP_AND_RESTORE.md)"
     safe_dir "$config_dir"
     private_root_file "$config_dir/backup.conf" 'backup.conf'
     [[ -f $config_dir/recipients.asc && ! -L $config_dir/recipients.asc && \

@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Jarvis encrypted disaster-recovery backup (owner opt-in)
+
+# Disabled by default. Release-owned: a drop-in that changes the schedule
+# blocks Core updates.
+[Timer]
+OnCalendar=*-*-* 06:00:00
+RandomizedDelaySec=15min
+Persistent=true
+Unit=jarvis-backup.service
+
+[Install]
+WantedBy=timers.target
