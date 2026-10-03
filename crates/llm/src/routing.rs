@@ -86,6 +86,23 @@ fn is_subscription_backend(provider: &str) -> bool {
     matches!(provider, "claude-cli" | "codex-cli")
 }
 
+impl TierRoute {
+    /// The chain as Core routes it. Validation classifies providers by id, so
+    /// a non-loopback Ollama passes it as local; at runtime it is metered and,
+    /// like any metered entry, skipped after a subscription entry unless the
+    /// tier sets `metered_after_subscription`.
+    pub fn runtime_chain(&self) -> impl Iterator<Item = &RouteEntry> {
+        let mut after_subscription = false;
+        self.chain.iter().filter(move |entry| {
+            let skip = after_subscription
+                && !self.metered_after_subscription
+                && is_metered_backend(&entry.provider);
+            after_subscription |= is_subscription_backend(&entry.provider);
+            !skip
+        })
+    }
+}
+
 impl ModelRouting {
     /// Validate raw `routing.json` bytes. The error is a fixed string that
     /// never echoes file content. It does not check the enabled bit: the

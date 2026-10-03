@@ -346,8 +346,7 @@ impl RouterProvider {
             match (only, routing.tier(tier).filter(|_| routed)) {
                 (Some(provider), _) => find(provider).map(|c| (c, None)).into_iter().collect(),
                 (None, Some(route)) => route
-                    .chain
-                    .iter()
+                    .runtime_chain()
                     .filter_map(|entry| {
                         find(&entry.provider).map(|c| (c, Some(entry.model.clone())))
                     })

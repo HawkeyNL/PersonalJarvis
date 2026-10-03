@@ -154,7 +154,14 @@ backend (everything except local `ollama` and subscriptions `claude-cli` and
 every tier, routed chains and the built-in order alike. `ollama` counts as
 local only when `llm_ollama_url` points at a loopback host (127.0.0.0/8, `::1`
 or `localhost`); otherwise Core treats it as metered at runtime. Validation
-classifies by provider ID only, so Core, broker and CLI agree. The switch is
+classifies by provider ID only, so Core, broker and CLI agree. A routed chain
+may therefore list `ollama` after a subscription entry; with a non-loopback
+URL Core skips that entry at runtime unless the tier sets
+`metered_after_subscription`, and `paid_api: "off"` refuses it. Known gap:
+usage accounting still counts every `ollama` call as local and free, so a
+remote Ollama's spend does not count toward the monthly cap. Use
+`ollama-cloud` for a billed remote Ollama, or keep `llm_ollama_url` on
+loopback. The switch is
 re-checked before every attempt, so turning it off also stops a request that
 is already falling back. A brain pin or explicit provider that selects a
 metered backend is then refused with a bounded `409 paid API is off` error
