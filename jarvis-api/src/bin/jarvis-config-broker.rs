@@ -220,10 +220,7 @@ fn apply(operation: &Operation, policy_path: &Path, routing_path: &Path) -> anyh
             routing,
             expected_routing_sha256,
         } => {
-            // The directory lock above must cover this file too.
-            if routing_path.parent() != policy_path.parent() {
-                bail!("model routing must live in the model policy directory");
-            }
+            check_routing_path(policy_path, routing_path)?;
             let current = match fs::symlink_metadata(routing_path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
                 _ => read_protected(routing_path)?,
@@ -234,6 +231,20 @@ fn apply(operation: &Operation, policy_path: &Path, routing_path: &Path) -> anyh
             // A new file takes the policy's root:jarvis ownership.
             atomic_root_write_like(routing_path, policy_path, &replacement, 0o640)?;
         }
+    }
+    Ok(())
+}
+
+/// The directory lock must cover the routing file, and a routing write must
+/// never replace the policy (or any other file) by a misconfigured path.
+fn check_routing_path(policy_path: &Path, routing_path: &Path) -> anyhow::Result<()> {
+    if routing_path.parent() != policy_path.parent() {
+        bail!("model routing must live in the model policy directory");
+    }
+    if routing_path == policy_path
+        || routing_path.file_name() != Some(std::ffi::OsStr::new("routing.json"))
+    {
+        bail!("model routing must be routing.json next to the model policy");
     }
     Ok(())
 }
@@ -571,6 +582,25 @@ mod request_tests {
             })
             .collect();
         assert!(routing_replacement(b"", &policy, &oversized, &hash(b"")).is_err());
+    }
+
+    #[test]
+    fn routing_path_must_be_routing_json_next_to_the_policy() {
+        let policy = Path::new("/srv/model-policy/policy.json");
+        assert!(check_routing_path(policy, Path::new("/srv/model-policy/routing.json")).is_ok());
+        for routing in [
+            "/srv/model-policy/policy.json",
+            "/srv/model-policy/other.json",
+            "/srv/model-policy/routing.json.bak",
+            "/srv/elsewhere/routing.json",
+        ] {
+            assert!(
+                check_routing_path(policy, Path::new(routing)).is_err(),
+                "{routing}"
+            );
+        }
+        let same = Path::new("/srv/model-policy/routing.json");
+        assert!(check_routing_path(same, same).is_err());
     }
 
     #[test]
