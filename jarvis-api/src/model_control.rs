@@ -16,6 +16,26 @@ pub fn routing_sha256(raw: &[u8]) -> String {
     hex::encode(Sha256::digest(raw))
 }
 
+/// What `routing.json` holds right now. The hash covers the exact bytes even
+/// when they are invalid, so a signed full replacement can repair the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingFile {
+    pub sha256: String,
+    /// `Ok(None)`: absent, the built-in order applies.
+    pub routing: Result<Option<ModelRouting>, &'static str>,
+}
+
+impl RoutingFile {
+    pub fn from_bytes(raw: Option<&[u8]>) -> Self {
+        Self {
+            sha256: routing_sha256(raw.unwrap_or_default()),
+            routing: raw
+                .map(|raw| ModelRouting::parse(raw).map_err(|_| "routing_invalid"))
+                .transpose(),
+        }
+    }
+}
+
 /// Read the root-owned `routing.json` without following links. `Ok(None)`
 /// means the file is absent. Errors are stable, non-sensitive reason codes.
 pub fn read_routing_bytes(path: &Path) -> Result<Option<Vec<u8>>, &'static str> {
@@ -38,25 +58,23 @@ pub fn read_routing_bytes(path: &Path) -> Result<Option<Vec<u8>>, &'static str> 
     file.take(ROUTING_MAX_BYTES as u64 + 1)
         .read_to_end(&mut raw)
         .map_err(|_| "routing_unreadable")?;
+    // A truncated read cannot yield the state hash the broker computes.
+    if raw.len() > ROUTING_MAX_BYTES {
+        return Err("routing_too_large");
+    }
     Ok(Some(raw))
 }
 
-/// Validated routing document (or `None` when absent) and its state hash.
-pub fn load_routing(path: &Path) -> Result<(Option<ModelRouting>, String), &'static str> {
-    match read_routing_bytes(path)? {
-        None => Ok((None, routing_sha256(&[]))),
-        Some(raw) => {
-            let routing = ModelRouting::parse(&raw).map_err(|_| "routing_invalid")?;
-            Ok((Some(routing), routing_sha256(&raw)))
-        }
-    }
+/// Current `routing.json` state. `Err` only when it cannot be read safely.
+pub fn load_routing(path: &Path) -> Result<RoutingFile, &'static str> {
+    read_routing_bytes(path).map(|raw| RoutingFile::from_bytes(raw.as_deref()))
 }
 
 /// What the router should use at startup: missing keeps the built-in order;
 /// anything unusable fails closed (built-in order without metered backends).
 pub fn startup_routing(path: &Path) -> RoutingSnapshot {
-    match load_routing(path) {
-        Ok((routing, _)) => {
+    match load_routing(path).and_then(|file| file.routing) {
+        Ok(routing) => {
             if let Some(routing) = &routing {
                 tracing::info!(paid_api = ?routing.paid_api, "model routing loaded");
             }
@@ -115,18 +133,20 @@ pub(crate) fn priced_models(
 }
 
 /// `(routing_unavailable_reason, routing_sha256)` for the owner view. The
-/// hash is published only when the live routing is exactly what is on disk,
-/// so a later signed change binds to the active state.
+/// hash is published whenever the file is readable, even when it is invalid or
+/// not active, so a signed full replacement can repair it.
 pub(crate) fn routing_status(
     live: &RoutingSnapshot,
-    disk: Result<(Option<ModelRouting>, String), &'static str>,
+    disk: Result<RoutingFile, &'static str>,
 ) -> (Option<&'static str>, Option<String>) {
     let reason = live.unavailable_reason.or(match &disk {
-        Ok((stored, _)) if *stored == live.routing => None,
+        Ok(RoutingFile {
+            routing: Ok(stored),
+            ..
+        }) if *stored == live.routing => None,
         _ => Some("routing_reload_required"),
     });
-    let hash = disk.ok().filter(|_| reason.is_none()).map(|(_, hash)| hash);
-    (reason, hash)
+    (reason, disk.ok().map(|file| file.sha256))
 }
 
 pub struct ModelControl {
@@ -156,7 +176,7 @@ impl ModelControl {
         self
     }
 
-    pub(crate) fn read_routing(&self) -> Result<(Option<ModelRouting>, String), &'static str> {
+    pub(crate) fn read_routing(&self) -> Result<RoutingFile, &'static str> {
         load_routing(self.routing_path.as_deref().ok_or("routing_unavailable")?)
     }
 
@@ -207,10 +227,10 @@ mod tests {
     fn missing_routing_keeps_builtin_order_and_hashes_empty_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routing.json");
-        let (routing, hash) = load_routing(&path).unwrap();
-        assert!(routing.is_none());
+        let file = load_routing(&path).unwrap();
+        assert_eq!(file.routing, Ok(None));
         assert_eq!(
-            hash,
+            file.sha256,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
         let snapshot = startup_routing(&path);
@@ -246,31 +266,52 @@ mod tests {
     }
 
     #[test]
-    fn routing_hash_is_published_only_for_the_active_routing() {
-        let off = ModelRouting::parse(br#"{"version":1,"paid_api":"off"}"#).unwrap();
+    fn routing_hash_is_published_whenever_the_file_is_readable() {
+        let off_bytes = br#"{"version":1,"paid_api":"off"}"#;
+        let off = ModelRouting::parse(off_bytes).unwrap();
         let active = RoutingSnapshot {
             routing: Some(off.clone()),
             unavailable_reason: None,
         };
-        let hash = routing_sha256(b"fixture");
+        let stored = RoutingFile::from_bytes(Some(off_bytes));
+        assert_eq!(stored.sha256, routing_sha256(off_bytes));
         assert_eq!(
-            routing_status(&active, Ok((Some(off.clone()), hash.clone()))),
-            (None, Some(hash.clone()))
+            routing_status(&active, Ok(stored.clone())),
+            (None, Some(stored.sha256.clone()))
         );
+        let absent = RoutingFile::from_bytes(None);
+        assert_eq!(absent.sha256, routing_sha256(b""));
         assert_eq!(
-            routing_status(&RoutingSnapshot::default(), Ok((None, hash.clone()))),
-            (None, Some(hash.clone()))
+            routing_status(&RoutingSnapshot::default(), Ok(absent.clone())),
+            (None, Some(absent.sha256.clone()))
         );
-        for disk in [Ok((None, hash.clone())), Err("routing_invalid")] {
-            assert_eq!(
-                routing_status(&active, disk),
-                (Some("routing_reload_required"), None)
-            );
-        }
+        // Disk differs from the active routing: still hashed, never silent.
+        assert_eq!(
+            routing_status(&active, Ok(absent.clone())),
+            (Some("routing_reload_required"), Some(absent.sha256))
+        );
+        // Unreadable or unsafe: no state to bind a signed change to.
+        assert_eq!(
+            routing_status(&active, Err("routing_unsafe")),
+            (Some("routing_reload_required"), None)
+        );
         let failed = RoutingSnapshot::unavailable("routing_unsafe");
         assert_eq!(
-            routing_status(&failed, Ok((Some(off), hash))),
-            (Some("routing_unsafe"), None)
+            routing_status(&failed, Ok(stored)),
+            (Some("routing_unsafe"), Some(routing_sha256(off_bytes)))
+        );
+    }
+
+    #[test]
+    fn invalid_routing_bytes_are_hashed_so_a_signed_replacement_can_repair_them() {
+        let broken = br#"{"version":1,"paid_api":"maybe"}"#;
+        let file = RoutingFile::from_bytes(Some(broken));
+        assert_eq!(file.routing, Err("routing_invalid"));
+        assert_eq!(file.sha256, routing_sha256(broken));
+        let live = RoutingSnapshot::unavailable("routing_invalid");
+        assert_eq!(
+            routing_status(&live, Ok(file)),
+            (Some("routing_invalid"), Some(routing_sha256(broken)))
         );
     }
 
