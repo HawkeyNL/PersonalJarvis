@@ -3,8 +3,8 @@
 //! Per request it orders the backends by a *sensible* policy — cheapest for
 //! trivial tasks, quality-first for real work, strong-only for the hardest — and
 //! tries them in order, skipping ones the registry marks unavailable (with a
-//! safety net: if the registry says none are up, try them anyway). Falls through
-//! on any error except a genuine refusal.
+//! safety net: if the registry says none are up, try the unmetered ones anyway).
+//! Falls through on any error except a genuine refusal.
 
 use std::{
     collections::BTreeMap,
@@ -35,6 +35,12 @@ impl Availability for AlwaysAvailable {
 /// An availability source that considers every backend up (no registry).
 pub fn always_available() -> Arc<dyn Availability> {
     Arc::new(AlwaysAvailable)
+}
+
+/// Whether a backend bills per call. Fails closed: only the known local and
+/// subscription backends are unmetered; anything else is treated as paid.
+pub fn is_metered_backend(backend_id: &str) -> bool {
+    !matches!(backend_id, "ollama" | "claude-cli")
 }
 
 /// What a model is good for — mirrors `jarvis_registry::ModelClass` so the router
@@ -273,6 +279,9 @@ impl RouterProvider {
     /// preferring registry-available ones. A recent health cooldown is never
     /// overridden by the old "try everything" safety net: that would turn a
     /// revoked credential or 429 into an unbounded request-by-request retry.
+    /// The safety net never includes metered backends: the monthly cap is
+    /// enforced through availability, so "nothing available" must not become
+    /// a paid call.
     fn plan(&self, tier: Tier) -> Vec<&Candidate> {
         let ordered: Vec<&Candidate> = Self::policy(tier)
             .iter()
@@ -285,6 +294,9 @@ impl RouterProvider {
             .collect();
         let base = if available.is_empty() {
             ordered
+                .into_iter()
+                .filter(|candidate| !is_metered_backend(&candidate.id))
+                .collect()
         } else {
             available
         };
@@ -727,18 +739,115 @@ mod tests {
         let r = RouterProvider::new(all(), Arc::new(Only("anthropic-api")), vec![]);
         assert_eq!(ids(r.plan(Tier::Default)), ["anthropic-api"]);
 
-        // If the registry claims nothing is up, still try (ordered) rather than fail.
-        struct None_;
-        impl Availability for None_ {
-            fn is_available(&self, _: &str) -> bool {
-                false
-            }
+        // If the registry claims nothing is up, still try the unmetered
+        // backends (ordered) rather than fail, but never a paid one.
+        let r2 = RouterProvider::new(all(), Arc::new(Nothing), vec![]);
+        assert_eq!(ids(r2.plan(Tier::Default)), ["claude-cli", "ollama"]);
+    }
+
+    struct Nothing;
+    impl Availability for Nothing {
+        fn is_available(&self, _: &str) -> bool {
+            false
         }
-        let r2 = RouterProvider::new(all(), Arc::new(None_), vec![]);
-        assert_eq!(
-            ids(r2.plan(Tier::Default)),
-            ["claude-cli", "anthropic-api", "ollama"]
+    }
+
+    /// Counts calls; always fails so the router would fall through.
+    struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl LlmProvider for Counting {
+        fn label(&self) -> &str {
+            "counting"
+        }
+        async fn chat(&self, _req: &ChatRequest) -> Result<ChatReply, LlmError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(LlmError::Empty)
+        }
+    }
+
+    fn counted(id: &str) -> (Candidate, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Candidate {
+                id: id.into(),
+                provider: Arc::new(Counting(calls.clone())),
+            },
+            calls,
+        )
+    }
+
+    fn ask(tier: Tier, model: Option<&str>) -> ChatRequest {
+        ChatRequest {
+            system: None,
+            messages: vec![ChatMessage::user("fixture")],
+            tier,
+            mode: crate::RoutingMode::Auto,
+            max_tokens: 16,
+            model: model.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn cap_reached_and_nothing_available_never_attempts_a_metered_backend() {
+        use std::sync::atomic::Ordering;
+        let (paid, paid_calls) = counted("anthropic-api");
+        let (plan, plan_calls) = counted("claude-cli");
+        let c = vec![
+            CatalogModel {
+                backend: "anthropic-api".into(),
+                id: "paid".into(),
+                class: ModelClass::Light,
+            },
+            CatalogModel {
+                backend: "claude-cli".into(),
+                id: "plan".into(),
+                class: ModelClass::Light,
+            },
+        ];
+        let r = RouterProvider::with_policy(
+            vec![paid, plan],
+            Arc::new(Nothing),
+            c.clone(),
+            allow_catalog(&c),
         );
+        for tier in [Tier::Cheap, Tier::Default, Tier::Hard] {
+            assert!(r.chat(&ask(tier, None)).await.is_err());
+            assert!(r.chat(&ask(tier, Some("paid"))).await.is_err());
+        }
+        assert_eq!(paid_calls.load(Ordering::SeqCst), 0);
+        assert!(plan_calls.load(Ordering::SeqCst) > 0);
+
+        // Only metered backends configured: nothing is attempted at all.
+        let (paid, paid_calls) = counted("openai-api");
+        let c = vec![CatalogModel {
+            backend: "openai-api".into(),
+            id: "gpt".into(),
+            class: ModelClass::Mid,
+        }];
+        let r = RouterProvider::with_policy(
+            vec![paid],
+            Arc::new(Nothing),
+            c.clone(),
+            allow_catalog(&c),
+        );
+        assert!(r.plan(Tier::Default).is_empty());
+        assert!(r.chat(&ask(Tier::Default, Some("gpt"))).await.is_err());
+        assert_eq!(paid_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unknown_backends_are_treated_as_metered() {
+        assert!(!is_metered_backend("ollama"));
+        assert!(!is_metered_backend("claude-cli"));
+        for id in [
+            "anthropic-api",
+            "openai-api",
+            "zai-api",
+            "huggingface",
+            "new",
+        ] {
+            assert!(is_metered_backend(id));
+        }
     }
 
     #[tokio::test]

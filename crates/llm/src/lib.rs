@@ -32,7 +32,9 @@ pub use live_policy::LiveModelPolicy;
 pub use model_policy::{validate_hf_route, ModelAccessEntry, ModelAccessPolicy};
 pub use ollama::OllamaProvider;
 pub use openai_compat::OpenAiCompatProvider;
-pub use router::{always_available, Availability, CatalogModel, ModelClass, RouterProvider};
+pub use router::{
+    always_available, is_metered_backend, Availability, CatalogModel, ModelClass, RouterProvider,
+};
 pub use stream::TextDeltaSink;
 pub use types::{
     classify_task, ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, Role,
