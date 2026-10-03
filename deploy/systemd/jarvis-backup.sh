@@ -244,9 +244,11 @@ restore_test() {
         (( attempt < 30 )) || fail 'disposable restore container did not become ready'
         sleep 1
     done
-    docker exec "$verify_container" /surreal import --endpoint http://127.0.0.1:8000 \
-        --namespace restoretest --database restoretest /restore/export.surql >/dev/null 2>&1 \
-        || fail 'export does not import into a disposable database'
+    # Full import errors can quote exported statements; show one short line.
+    if ! docker exec "$verify_container" /surreal import --endpoint http://127.0.0.1:8000 \
+        --namespace restoretest --database restoretest /restore/export.surql >/dev/null 2>"$run/import.err"; then
+        fail "export does not import into a disposable database: $(head -n 1 "$run/import.err" | cut -c1-200)"
+    fi
     table_counts verify_sql "$run/restored.json"
     [[ $(jq -c 'keys' "$run/restored.json") == "$(jq -c 'keys' "$run/live-before.json")" ]] \
         || fail 'restored tables differ from the live database'
