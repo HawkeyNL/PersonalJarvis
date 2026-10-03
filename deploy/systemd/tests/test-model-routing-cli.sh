@@ -15,6 +15,8 @@ source "$fixture/jarvis-models.sh"
 # Rootless stand-ins: the fixture user plays root:jarvis; systemd is recorded.
 protected_file_state() { printf 'root:jarvis:%s\n' "$(stat -c %a "$1")"; }
 chown() { :; }
+# Records each flushed file; it must still be the staged file, not yet renamed.
+sync() { [[ -f ${!#} ]] && printf '%s\n' "${!#}" >> "$fixture/synced"; }
 restart=ok
 systemctl() {
     printf '%s\n' "$*" >> "$fixture/calls"
@@ -61,9 +63,14 @@ jq -e '.version == 1 and .paid_api == "allowed"
                          metered_after_subscription: false}
     and (.tiers | keys == ["cheap"])' "$routing_file" >/dev/null
 [[ $(<"$fixture/calls") == 'try-restart jarvis-core.service' ]]
+grep -q '/\.routing\.' "$fixture/synced"
 route_command show cheap | jq -e '.chain | length == 2' >/dev/null
 route_command list > "$fixture/out"
 grep -Eq '^cheap +2 +claude-cli +claude-haiku-4-5$' "$fixture/out"
+
+# The policy writer flushes its staged file before the rename too.
+(normalize_model_policy_boundary() { :; }; atomic_write "$(<"$policy_file")")
+grep -q '/\.model-policy\.' "$fixture/synced"
 
 # Every safety rule refuses without touching the file or Core.
 refused 'metered entry after a subscription' \
@@ -138,7 +145,8 @@ for document in '{"version":1}' '{"version":1,"paid_api":"off"}' '{"version":1,"
     "$(printf '{"version":1}%65522s' '')"; do
     valid_routing "$document" || { echo "rejected valid routing: ${document:0:120}" >&2; exit 1; }
 done
-for document in '' '[]' '{"tiers":{}}' '{"version":2}' '{"version":"1"}' '{"version":1,"extra":true}' \
+for document in '' '[]' '{"tiers":{}}' '{"version":2}' '{"version":"1"}' '{"version":1.0}' \
+    '{"version":1.00}' '{"version":1,"extra":true}' \
     '{"version":1,"paid_api":"maybe"}' '{"version":1,"paid_api":"OFF"}' '{"version":1,"paid_api":null}' \
     '{"version":1}{"version":1}' '{"version":1,"tiers":null}' \
     '{"version":1,"tiers":{"turbo":{"chain":[]}}}' \

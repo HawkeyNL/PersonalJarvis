@@ -89,7 +89,7 @@ atomic_write() (
     umask 077
     printf '%s\n' "$content" > "$tmp" &&
         chown root:jarvis "$tmp" && chmod 0640 "$tmp" &&
-        jq -e '.version == 1 and (.models | type == "array")' "$tmp" >/dev/null &&
+        jq -e '.version == 1 and (.models | type == "array")' "$tmp" >/dev/null && sync -- "$tmp" &&
         mv -f -- "$tmp" "$policy_file" || fail "model policy replacement failed"
 )
 
@@ -488,6 +488,10 @@ show_model() {
 # 1-9 entries, routable providers, 1-256 non-control model characters, no
 # duplicate pairs and no metered entry after a subscription entry unless the
 # tier sets `metered_after_subscription`. Size is checked separately.
+# `version` must be the integer 1: Core reads it as u32, so 1.0 is refused (jq
+# canonicalizes 1e0 to 1; Core refuses it and fails closed). jq keeps the last
+# of duplicate object keys and cannot detect them; Core rejects duplicate keys
+# and then fails closed (built-in order without metered backends).
 readonly routing_validator='
   def fields($allowed): type == "object" and all(keys[]; IN($allowed[]));
   def metered: IN("ollama", "claude-cli") | not;
@@ -508,7 +512,7 @@ readonly routing_validator='
       and (.metered_after_subscription as $approved | .chain | chain_ok($approved == true)));
   length == 1 and (.[0] |
     fields(["version", "paid_api", "tiers"]) and has("version")
-    and (.version | type == "number" and . == 1)
+    and (.version | type == "number" and tostring == "1")
     and ((has("paid_api") | not) or (.paid_api | IN("allowed", "off")))
     and ((has("tiers") | not)
          or (.tiers | fields(["cheap", "default", "hard"]) and all(.[]; tier_ok))))'
@@ -563,7 +567,7 @@ atomic_write_routing() (
     umask 077
     printf '%s\n' "$content" > "$tmp" &&
         chown root:jarvis "$tmp" && chmod 0640 "$tmp" &&
-        valid_routing "$(<"$tmp")" &&
+        valid_routing "$(<"$tmp")" && sync -- "$tmp" &&
         mv -f -- "$tmp" "$routing_file" || fail "routing replacement failed; previous routing retained"
 )
 
