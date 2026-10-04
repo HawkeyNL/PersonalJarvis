@@ -415,6 +415,17 @@ impl RouterProvider {
             && self.model_policy.allows(backend, model)
     }
 
+    /// A failed research run (a timeout, a refused search event) says nothing
+    /// about ordinary chat on the same subscription. Only a revoked login or
+    /// a full plan applies to both; a cooldown for anything else could push
+    /// chat onto a paid API.
+    fn research_failure_affects_chat(failure: ProviderFailure) -> bool {
+        matches!(
+            failure,
+            ProviderFailure::Authentication | ProviderFailure::RateLimited
+        )
+    }
+
     /// Backends without static tier models: an owner-enabled exact policy
     /// entry is their model. `codex-cli` has no configured default at all.
     fn dynamic_cloud_backend(backend: &str) -> bool {
@@ -546,6 +557,10 @@ impl LlmProvider for RouterProvider {
             if !crate::routing::is_subscription_backend(&candidate.id) {
                 continue;
             }
+            // The owner may switch research off while a request is in flight.
+            if !self.routing.snapshot().research_web_search_on() {
+                return Err(LlmError::NotConfigured("research web search is off".into()));
+            }
             let Some(model) = self.choose_model(&candidate.id, pinned.as_deref(), None, Tier::Hard)
             else {
                 continue;
@@ -560,7 +575,9 @@ impl LlmProvider for RouterProvider {
                 Err(LlmError::Refused) => return Err(LlmError::Refused),
                 Err(error) => {
                     let failure = error.failure_category();
-                    self.record_failure(&candidate.id, failure);
+                    if Self::research_failure_affects_chat(failure) {
+                        self.record_failure(&candidate.id, failure);
+                    }
                     tracing::warn!(backend = %candidate.id, failure = ?failure, "research failed; routing to next");
                     last = Some(error);
                 }
@@ -1660,6 +1677,105 @@ mod tests {
         );
         assert!(f.router.research(&question()).await.is_err());
         assert_eq!(research_calls(&f), [0, 0, 0, 0]);
+    }
+
+    struct ResearchFails(u16);
+    #[async_trait]
+    impl LlmProvider for ResearchFails {
+        fn label(&self) -> &str {
+            "claude-cli"
+        }
+        async fn chat(&self, _req: &ChatRequest) -> Result<ChatReply, LlmError> {
+            Err(LlmError::Empty)
+        }
+        async fn research(&self, _req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+            Err(LlmError::Api {
+                status: self.0,
+                body: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn research_failures_cool_down_chat_only_for_auth_or_plan_limit() {
+        for (status, cooled) in [
+            (504, false),
+            (503, false),
+            (502, false),
+            (429, true),
+            (401, true),
+        ] {
+            let c = catalog();
+            let router = RouterProvider::with_policy(
+                vec![Candidate {
+                    id: "claude-cli".into(),
+                    provider: Arc::new(ResearchFails(status)),
+                }],
+                always_available(),
+                c.clone(),
+                allow_catalog(&c),
+            )
+            .with_routing(Arc::new(LiveRouting::new(routing(
+                r#"{"version":1,"research_web_search":"on"}"#,
+            ))));
+            assert!(router.research(&question()).await.is_err());
+            assert_eq!(router.is_healthy("claude-cli"), !cooled, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn research_switched_off_mid_request_stops_further_attempts() {
+        struct SwitchOffThenFail(Arc<LiveRouting>);
+        #[async_trait]
+        impl LlmProvider for SwitchOffThenFail {
+            fn label(&self) -> &str {
+                "claude-cli"
+            }
+            async fn chat(&self, _req: &ChatRequest) -> Result<ChatReply, LlmError> {
+                Err(LlmError::Empty)
+            }
+            async fn research(&self, _req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+                let current = self.0.snapshot();
+                let mut next = current.clone();
+                next.routing.as_mut().unwrap().research_web_search = crate::ResearchWebSearch::Off;
+                self.0.swap(&current, next).unwrap();
+                Err(LlmError::Empty)
+            }
+        }
+        let live = Arc::new(LiveRouting::new(routing(
+            r#"{"version":1,"research_web_search":"on","tiers":{"hard":{"chain":[
+            {"provider":"claude-cli","model":"claude-opus-5"},
+            {"provider":"codex-cli","model":"gpt-6-luna"}]}}}"#,
+        )));
+        let codex_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let codex = Candidate {
+            id: "codex-cli".into(),
+            provider: Arc::new(EchoAs("codex-cli", codex_calls.clone(), true)),
+        };
+        let c = catalog();
+        let mut policy = allow_catalog(&c);
+        policy.models.push(crate::ModelAccessEntry {
+            provider: "codex-cli".into(),
+            model: "gpt-6-luna".into(),
+            enabled: true,
+            source: "test".into(),
+            route: None,
+        });
+        let router = RouterProvider::with_policy(
+            vec![
+                Candidate {
+                    id: "claude-cli".into(),
+                    provider: Arc::new(SwitchOffThenFail(live.clone())),
+                },
+                codex,
+            ],
+            always_available(),
+            c,
+            policy,
+        )
+        .with_routing(live);
+        assert!(router.research(&question()).await.is_err());
+        assert_eq!(codex_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
