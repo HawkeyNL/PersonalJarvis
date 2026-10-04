@@ -1,11 +1,9 @@
 <script setup lang="ts">
 import NavIcon, { type IconName } from "../NavIcon.vue";
 
-// Honest empty state for features the Core does not offer (yet). Never shows
-// sample data. `kind` picks the copy: a feature that does not exist yet, or a
-// Core that is too old for an existing feature.
-withDefaults(defineProps<{ title: string; kind?: "planned" | "core-update" | "error"; detail?: string; icon?: IconName }>(), {
-  kind: "planned",
+// Honest empty state for data the Core does not report (yet). Never shows
+// sample data: a dimension Core does not measure yet, or an older Core omits.
+withDefaults(defineProps<{ title: string; detail?: string; icon?: IconName }>(), {
   icon: "spark",
 });
 </script>
@@ -15,9 +13,7 @@ withDefaults(defineProps<{ title: string; kind?: "planned" | "core-update" | "er
     <span class="icon" aria-hidden="true"><NavIcon :name="icon" /></span>
     <div>
       <p class="title">{{ title }}</p>
-      <p class="kind">
-        {{ kind === "core-update" ? "Requires newer Core" : kind === "error" ? "Could not load" : "Not yet available" }}
-      </p>
+      <p class="kind">Not measured yet</p>
       <p v-if="detail" class="detail">{{ detail }}</p>
     </div>
   </div>
