@@ -10,21 +10,19 @@ use std::{path::Path, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use jarvis_llm::{
-    claude_worker_protocol::{
-        ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState, MAX_REQUEST_BYTES,
-    },
+    claude_worker_protocol::{ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState},
     codex_chat_protocol::{
         classify_codex_failure, codex_subscription_status, parse_codex_event,
         reviewed_codex_version, CodexEvent, REVIEWED_VERSION_ENV,
     },
 };
 use subscription_worker::{
-    authorized_peer, inherited_listener, named_uid, send, validate_private_dir,
-    validate_root_binary,
+    authorized_peer, inherited_listener, named_uid, read_request, reply_deadline, research_slot,
+    run_timeout, send, validate_private_dir, validate_root_binary, MAX_PARALLEL_RESEARCH_RUNS,
+    MAX_PARALLEL_RUNS, REQUEST_READ_TIMEOUT,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
     process::{Child, Command},
     sync::Semaphore,
 };
@@ -36,10 +34,6 @@ const CODEX: &str = "/usr/local/bin/codex";
 const IDENTITY: &str = "jarvis-codex";
 const HOME: &str = "/var/lib/jarvis-codex";
 const RUNTIME: &str = "/run/jarvis-codex-chat";
-const MAX_PARALLEL_RUNS: usize = 2;
-const RUN_TIMEOUT: Duration = Duration::from_secs(120);
-/// An owner-enabled research run searches the web first.
-const RESEARCH_RUN_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ANSWER_BYTES: usize = 128 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 /// Bound on everything one status probe prints.
@@ -75,6 +69,7 @@ async fn main() -> Result<()> {
     validate_private_dir(RUNTIME, worker_uid)?;
     let listener = inherited_listener()?;
     let permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_RUNS));
+    let research_permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_RESEARCH_RUNS));
     // Under PrivatePIDs this process is PID 1 of its namespace, which ignores
     // SIGTERM without a handler; stop promptly when systemd asks.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -94,39 +89,35 @@ async fn main() -> Result<()> {
             .await;
             continue;
         };
+        let research_permits = research_permits.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let reply = match tokio::time::timeout(
-                RESEARCH_RUN_TIMEOUT + Duration::from_secs(5),
-                handle(&mut stream, reviewed),
-            )
-            .await
-            {
-                Ok(Ok(reply)) => reply,
-                _ => ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure),
-            };
+            let failure = || ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure);
+            let reply =
+                match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request(&mut stream)).await {
+                    Ok(Ok(request)) => match research_slot(request.research, &research_permits) {
+                        Some(_research_permit) => {
+                            let deadline = reply_deadline(request.research);
+                            match tokio::time::timeout(deadline, handle(request, reviewed)).await {
+                                Ok(Ok(reply)) => reply,
+                                _ => failure(),
+                            }
+                        }
+                        // The one research slot is busy: refuse, never queue.
+                        None => failure(),
+                    },
+                    _ => failure(),
+                };
             let _ = send(&mut stream, reply).await;
         });
     }
 }
 
-async fn handle(stream: &mut UnixStream, reviewed: &str) -> Result<ClaudeWorkerReply> {
-    // The run gets what is left of its run timeout after the request and the
-    // probes, so its own deadline (which stops the whole process group)
-    // always fires before the outer reply deadline.
+async fn handle(request: ClaudeWorkerRequest, reviewed: &str) -> Result<ClaudeWorkerReply> {
+    // The run gets what is left of its run timeout after the probes, so its
+    // own deadline (which stops the whole process group) always fires before
+    // the outer reply deadline.
     let started = std::time::Instant::now();
-    let mut bytes = Vec::new();
-    stream
-        .take((MAX_REQUEST_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await?;
-    if bytes.len() > MAX_REQUEST_BYTES || !bytes.ends_with(b"\n") {
-        bail!("invalid bounded Codex chat request");
-    }
-    let request: ClaudeWorkerRequest = serde_json::from_slice(&bytes)?;
-    if !request.valid() {
-        bail!("invalid Codex chat request shape");
-    }
     let version = bounded_probe(&["--version"], Duration::from_secs(3), false).await;
     if !version.is_some_and(|output| reviewed_codex_version(&output, reviewed)) {
         return Ok(ClaudeWorkerReply::failure(
@@ -140,12 +131,8 @@ async fn handle(stream: &mut UnixStream, reviewed: &str) -> Result<ClaudeWorkerR
             ClaudeWorkerState::SubscriptionUnavailable,
         ));
     }
-    let limit = if request.research {
-        RESEARCH_RUN_TIMEOUT
-    } else {
-        RUN_TIMEOUT
-    };
-    run_official_client(request, limit.saturating_sub(started.elapsed())).await
+    let limit = run_timeout(request.research).saturating_sub(started.elapsed());
+    run_official_client(request, limit).await
 }
 
 /// Non-generative status probe of the official CLI.
@@ -634,7 +621,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("worker.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let _client = UnixStream::connect(&path).await.unwrap();
+        let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
         let me = unsafe { libc::geteuid() };
         assert!(authorized_peer(&stream, me));

@@ -8,16 +8,16 @@ use std::{ffi::OsString, fs, os::unix::fs::PermissionsExt, path::Path, time::Dur
 use anyhow::{bail, Context, Result};
 use jarvis_llm::claude_worker_protocol::{
     claude_subscription_status, reviewed_claude_version, ClaudeWorkerReply, ClaudeWorkerRequest,
-    ClaudeWorkerState, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
+    ClaudeWorkerState, MAX_REPLY_BYTES,
 };
 use serde::Deserialize;
 use subscription_worker::{
-    authorized_peer, inherited_listener, named_uid, send, validate_private_dir,
-    validate_root_binary,
+    authorized_peer, inherited_listener, named_uid, read_request, reply_deadline, research_slot,
+    run_timeout, send, validate_private_dir, validate_root_binary, MAX_PARALLEL_RESEARCH_RUNS,
+    MAX_PARALLEL_RUNS, REQUEST_READ_TIMEOUT,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
     process::Command,
     sync::Semaphore,
 };
@@ -25,10 +25,6 @@ use tokio::{
 const CLAUDE: &str = "/usr/local/bin/claude";
 const HOME: &str = "/var/lib/jarvis-claude";
 const RUNTIME: &str = "/run/jarvis-claude";
-const MAX_PARALLEL_RUNS: usize = 2;
-const RUN_TIMEOUT: Duration = Duration::from_secs(120);
-/// An owner-enabled research run searches the web first.
-const RESEARCH_RUN_TIMEOUT: Duration = Duration::from_secs(300);
 /// Search, read results, answer: enough turns for a few searches, bounded.
 const RESEARCH_MAX_TURNS: &str = "8";
 
@@ -67,6 +63,7 @@ async fn main() -> Result<()> {
     validate_private_dir(RUNTIME, worker_uid)?;
     let listener = inherited_listener()?;
     let permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_RUNS));
+    let research_permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_RESEARCH_RUNS));
     loop {
         let (mut stream, _) = listener.accept().await?;
         if !authorized_peer(&stream, core_uid) {
@@ -80,35 +77,31 @@ async fn main() -> Result<()> {
             .await;
             continue;
         };
+        let research_permits = research_permits.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let reply = match tokio::time::timeout(
-                RESEARCH_RUN_TIMEOUT + Duration::from_secs(5),
-                handle(&mut stream),
-            )
-            .await
-            {
-                Ok(Ok(reply)) => reply,
-                _ => ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure),
-            };
+            let failure = || ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure);
+            let reply =
+                match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request(&mut stream)).await {
+                    Ok(Ok(request)) => match research_slot(request.research, &research_permits) {
+                        Some(_research_permit) => {
+                            let deadline = reply_deadline(request.research);
+                            match tokio::time::timeout(deadline, handle(request)).await {
+                                Ok(Ok(reply)) => reply,
+                                _ => failure(),
+                            }
+                        }
+                        // The one research slot is busy: refuse, never queue.
+                        None => failure(),
+                    },
+                    _ => failure(),
+                };
             let _ = send(&mut stream, reply).await;
         });
     }
 }
 
-async fn handle(stream: &mut UnixStream) -> Result<ClaudeWorkerReply> {
-    let mut bytes = Vec::new();
-    stream
-        .take((MAX_REQUEST_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await?;
-    if bytes.len() > MAX_REQUEST_BYTES || !bytes.ends_with(b"\n") {
-        bail!("invalid bounded Claude worker request");
-    }
-    let request: ClaudeWorkerRequest = serde_json::from_slice(&bytes)?;
-    if !request.valid() {
-        bail!("invalid Claude worker request shape");
-    }
+async fn handle(request: ClaudeWorkerRequest) -> Result<ClaudeWorkerReply> {
     if !supported_runtime().await {
         return Ok(ClaudeWorkerReply::failure(
             ClaudeWorkerState::IncompatibleRuntime,
@@ -214,12 +207,7 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
     drop(stdin);
     let stdout = child.stdout.take().context("Claude stdout unavailable")?;
     let mut bytes = Vec::new();
-    let limit = if request.research {
-        RESEARCH_RUN_TIMEOUT
-    } else {
-        RUN_TIMEOUT
-    };
-    let output = tokio::time::timeout(limit, async {
+    let output = tokio::time::timeout(run_timeout(request.research), async {
         stdout
             .take((MAX_REPLY_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
