@@ -83,6 +83,7 @@ onMounted(load);
       <StatusBadge :state="row.state" />
       <p>Worker: {{ row.worker }}<br>Billing: {{ row.billing === "overage_unverified" ? "Extra usage setting not verified" : row.billing }}<br>Runtime: {{ row.runtime }}</p>
       <p v-if="row.state === 'incompatible_runtime'">The installed Claude CLI is outside the reviewed version contract. Recheck after an owner-reviewed CLI update before enabling the worker socket.</p>
+      <p v-if="row.state === 'host_unsupported'">A host system tool the worker runs through (systemd-run or env) failed the root-ownership check. Connect reports which one.</p>
       <template v-if="row.provider === 'claude'">
         <p v-if="runtime">Official runtime: {{ runtime.installed ? (runtime.version ?? "installed, version unknown") : "not installed" }}<template v-if="runtime.installed"> · {{ runtime.gate_ok ? "reviewed version" : "outside reviewed version contract" }} · {{ runtime.safe_ownership ? "root-owned" : "unsafe ownership" }}</template><br>Latest stable: {{ runtime.latest_stable ?? "unavailable" }}<template v-if="runtime.update_available"> (update available)</template></p>
         <p v-else-if="runtimeError">Runtime status unavailable: {{ runtimeError }}</p>
