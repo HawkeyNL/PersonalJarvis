@@ -107,28 +107,42 @@ sudo jarvis laya enable             # turn it back on without downloading
 ```
 
 - **install** needs CPython 3.14 on x86_64 with `ensurepip` (Ubuntu package
-  `python3.14-venv`) and 8 GB free; it downloads about 1.78 GB and uses about
-  4.3 GB on disk (staging 1.78 GB, venv 1.2 GB, model copy 1.52 GB). Each file
-  is fetched with curl over HTTPS only (redirects only to HTTPS, size-bounded,
-  timed out), then its SHA-256 (and for wheels the exact size) is checked
-  against the compiled-in pins before it is moved into root-owned staging.
-  Already verified files are kept, so an interrupted install resumes; an
-  unpinned, linked or writable staging entry stops the install for review.
-  The active release's unchanged `provision-laya` then installs offline. An
-  already provisioned runtime is not downloaded again.
-- **enable** enables `jarvis-laya.socket`, starts the service and requires a
+  `python3.14-venv`) and at least 8 GiB free (headroom). It downloads about
+  1.78 GB and keeps about 4.5 GB on disk (staging 1.78 GB, venv 1.2 GB, model
+  copy 1.52 GB), plus a temporary 0.25 GB wheel copy while provisioning. Each
+  file is fetched with curl over HTTPS only, size-bounded and timed out. PyPI
+  and the PyTorch CPU index serve wheels directly and redirects are refused;
+  Hugging Face redirects are followed by hand, at most four hops, and only to
+  `https://huggingface.co/` or `https://*.hf.co/`. Then the file's SHA-256
+  (and for wheels the exact size) is checked against the compiled-in pins
+  before it is moved into root-owned staging. Already verified files are
+  kept, so an interrupted install resumes; work directories it left behind
+  (`/var/cache/jarvis-laya/.download.XXXXXX`) are removed; an unpinned,
+  linked or writable staging entry stops the install for review. The active
+  release's unchanged `provision-laya` then installs offline. An already
+  provisioned runtime is not downloaded again.
+- **enable** runs `systemctl enable --now jarvis-laya.socket
+  jarvis-laya.service`, so the service also starts at boot and keeps both
+  checkpoints resident (a cold first request would exceed Core's bounded Laya
+  timeout; the service is limited to 6 GB of memory). It then requires a
   healthy `/health` with both checkpoints loaded (up to 180 s). A failed probe
   disables both units again. Mode `off` becomes `shadow`; another mode is kept.
-- **disable** first restarts Core with `JARVIS_LAYA_MODE=off`, then runs
-  `systemctl disable --now jarvis-laya.service jarvis-laya.socket`. Installed
-  files stay. If Core does not become ready, the previous mode is restored
-  and the units are left unchanged.
+- **disable** first restarts Core with `JARVIS_LAYA_MODE=off`, then always
+  runs `systemctl disable --now jarvis-laya.service jarvis-laya.socket`.
+  Installed files stay. Turning off is never undone: if Core does not report
+  ready within 60 s, `off` stays saved, the units are still stopped, and the
+  command reports the Core problem separately (`sudo jarvis health`).
 - **mode** replaces only the `JARVIS_LAYA_MODE` line of `/etc/jarvis/core.env`
   (same directory temporary file, ownership and 0640 kept, atomic rename),
-  restarts Core and waits up to 60 s for `/readyz`; otherwise the previous
-  file is restored and Core restarted. `shadow` and `primary` require an
-  enabled socket and a healthy probe. No other configuration value is read
-  out or printed.
+  restarts Core and waits up to 60 s for `/readyz`. A switch to `shadow` or
+  `primary` that leaves Core not ready is undone (previous file restored,
+  Core restarted); `off` is kept. `shadow` and `primary` require an enabled
+  socket and a healthy probe. The value must be written exactly as
+  `JARVIS_LAYA_MODE=off|shadow|primary` at the start of a line: any other
+  spelling systemd would also accept (surrounding whitespace, quotes,
+  escapes, a continued or multi-line value) or a duplicate makes the command
+  refuse, so the CLI never disagrees with what Core receives. No other
+  configuration value is read out or printed.
 
 Mutations hold the administration configuration lock and the Core updater
 lock, and record `authpriv.notice` events tagged `jarvis-laya`
@@ -140,11 +154,26 @@ artifacts: stage the reviewed files as above, then run
 
 ```bash
 sudo /opt/jarvis/current/provision-laya
-sudo systemctl enable --now jarvis-laya.socket
+sudo systemctl enable --now jarvis-laya.socket jarvis-laya.service
 curl --fail --silent --unix-socket /run/jarvis-laya.sock http://jarvis-laya.local/health
 ```
 
 and set `JARVIS_LAYA_MODE` in Core's configuration as described below.
+
+**Recovery after interrupted provisioning.** `provision-laya` moves the new
+runtime to `/opt/jarvis/laya/releases/laya-0.3.20-<revision>` and only then
+switches `/opt/jarvis/laya/current`. If it stopped in between, the CLI reports
+Laya as not installed and the provisioner refuses to overwrite the existing
+release directory. Make sure Laya is off (`sudo jarvis laya disable`), check
+that `current` is absent or still points at another release, then remove only
+that incomplete release and install again; the verified staging is reused, so
+nothing is downloaded:
+
+```bash
+sudo readlink /opt/jarvis/laya/current
+sudo rm -rf --one-file-system /opt/jarvis/laya/releases/laya-0.3.20-55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851
+sudo jarvis laya install
+```
 
 The provisioner requires pre-staged reviewed bytes and does **not** fetch
 anything itself. It creates `jarvis-laya` as a separate unprivileged identity,

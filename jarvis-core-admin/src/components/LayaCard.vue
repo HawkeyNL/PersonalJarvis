@@ -48,15 +48,15 @@ function dialog(request: LayaMutation): { title: string; detail: string; label: 
     case "install":
       return {
         title: "Install Laya locally?",
-        detail: `Downloads ${gb(status.value?.download_bytes ?? 0)} over HTTPS: 44 hash-pinned Python wheels (CPU-only PyTorch from download.pytorch.org, the rest from PyPI) and the English and multilingual Laya checkpoints from Hugging Face at the pinned revision ${status.value?.model_revision.slice(0, 12) ?? ""}. Every file's SHA-256 (and each wheel's exact size) is checked against the pins compiled into the jarvis CLI before it is staged; nothing from the model repository is executed. provision-laya then installs offline as the unprivileged jarvis-laya user without network access. Needs about 5 GB of disk and CPython 3.14 with venv support. Afterwards the local socket is enabled and Core restarts in shadow mode.`,
+        detail: `Downloads ${gb(status.value?.download_bytes ?? 0)} over HTTPS: 44 hash-pinned Python wheels (CPU-only PyTorch from download.pytorch.org, the rest from PyPI) and the English and multilingual Laya checkpoints from Hugging Face at the pinned revision ${status.value?.model_revision.slice(0, 12) ?? ""}. Every file's SHA-256 (and each wheel's exact size) is checked against the pins compiled into the jarvis CLI before it is staged; nothing from the model repository is executed. provision-laya then installs offline as the unprivileged jarvis-laya user without network access. Keeps about 4.5 GB on disk and needs 8 GiB free, plus CPython 3.14 with venv support. Afterwards the Laya socket and service are enabled (started at boot, models kept in memory) and Core restarts in shadow mode.`,
         label: "Download and install",
       };
     case "enable":
-      return { title: "Enable Laya?", detail: "Enables jarvis-laya.socket, starts the service and probes its health (loading both checkpoints can take a minute). If Core's mode is off it becomes shadow and Core restarts. A failed probe turns Laya off again.", label: "Enable" };
+      return { title: "Enable Laya?", detail: "Enables and starts jarvis-laya.socket and jarvis-laya.service (also at boot, keeping both checkpoints in memory) and probes its health; loading can take a minute. If Core's mode is off it becomes shadow and Core restarts. A failed probe turns Laya off again.", label: "Enable" };
     case "disable":
-      return { title: "Turn Laya off?", detail: "Core restarts with Laya mode off, then jarvis-laya.socket and jarvis-laya.service are stopped and disabled. Installed files stay on disk; Enable turns it back on without downloading.", label: "Turn off" };
+      return { title: "Turn Laya off?", detail: "Core restarts with Laya mode off, then jarvis-laya.socket and jarvis-laya.service are always stopped and disabled, even if Core is slow to report ready. Installed files stay on disk; Enable turns it back on without downloading.", label: "Turn off" };
     case "mode":
-      return { title: `Switch Laya to ${request.mode}?`, detail: `${explanations[request.mode]} Core restarts and must report ready; otherwise the previous mode is restored.`, label: `Use ${request.mode}` };
+      return { title: `Switch Laya to ${request.mode}?`, detail: `${explanations[request.mode]} ${request.mode === "off" ? "Core restarts; off stays saved even if Core is slow to report ready." : "Core restarts and must report ready; otherwise the previous mode is restored."}`, label: `Use ${request.mode}` };
   }
 }
 
