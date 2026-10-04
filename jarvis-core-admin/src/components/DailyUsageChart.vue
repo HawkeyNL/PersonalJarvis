@@ -31,10 +31,10 @@ function renderChart() {
     data: {
       labels: rows.map((row) => row.day.slice(8)),
       datasets: [
-        { label: "Input", data: rows.map((row) => row.input_tokens), backgroundColor: "#34f5a0" },
-        { label: "Output", data: rows.map((row) => row.output_tokens), backgroundColor: "#7dffc0" },
-        { label: "Cache read", data: rows.map((row) => row.cache_read_tokens), backgroundColor: "#277b59" },
-        { label: "Cache write", data: rows.map((row) => row.cache_write_tokens), backgroundColor: "#f4c76b" },
+        { label: "Input", data: rows.map((row) => row.input_tokens), backgroundColor: "#2ee6a2" },
+        { label: "Output", data: rows.map((row) => row.output_tokens), backgroundColor: "#9bffd6" },
+        { label: "Cache read", data: rows.map((row) => row.cache_read_tokens), backgroundColor: "#1f7a5a" },
+        { label: "Cache write", data: rows.map((row) => row.cache_write_tokens), backgroundColor: "#f5b84a" },
       ],
     },
     options: {
@@ -46,20 +46,20 @@ function renderChart() {
         legend: {
           position: "bottom",
           labels: {
-            color: "#7d9a8e",
+            color: "#8fb3a3",
             boxWidth: 9,
             boxHeight: 9,
             padding: 14,
             usePointStyle: true,
-            font: { family: "monospace", size: 10 },
+            font: { family: "Exo 2", size: 11 },
           },
         },
         tooltip: {
-          backgroundColor: "#09130f",
-          borderColor: "#17402e",
+          backgroundColor: "#04201a",
+          borderColor: "rgba(46, 230, 162, 0.3)",
           borderWidth: 1,
-          titleColor: "#dff3e8",
-          bodyColor: "#dff3e8",
+          titleColor: "#e6f4ee",
+          bodyColor: "#e6f4ee",
           callbacks: {
             title(items) {
               const index = items[0]?.dataIndex;
@@ -81,16 +81,16 @@ function renderChart() {
           stacked: true,
           border: { display: false },
           grid: { display: false },
-          ticks: { color: "#7d9a8e", maxTicksLimit: 16, font: { family: "monospace", size: 10 } },
+          ticks: { color: "#8fb3a3", maxTicksLimit: 16, font: { family: "Exo 2", size: 11 } },
         },
         y: {
           stacked: true,
           beginAtZero: true,
           border: { display: false },
-          grid: { color: "rgba(52, 245, 160, 0.08)" },
+          grid: { color: "rgba(46, 230, 162, 0.08)" },
           ticks: {
-            color: "#7d9a8e",
-            font: { family: "monospace", size: 10 },
+            color: "#8fb3a3",
+            font: { family: "Exo 2", size: 11 },
             callback(value) { return Intl.NumberFormat(undefined, { notation: "compact" }).format(Number(value)); },
           },
         },

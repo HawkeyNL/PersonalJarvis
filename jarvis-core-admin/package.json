@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build --features custom-protocol --bundles deb"
+    "tauri:build": "tauri build --features custom-protocol --bundles deb",
+    "test:unit": "node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

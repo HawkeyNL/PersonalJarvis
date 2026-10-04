@@ -132,7 +132,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
   </PageHeader>
   <ErrorPanel v-if="error" :message="error" /><ResultPanel v-if="result" :result="result" />
   <ModelRouting :models="rows" />
-  <form class="model-toolbar" @submit.prevent="registerSubscription">
+  <form class="model-toolbar register-form" @submit.prevent="registerSubscription">
     <select v-model="registerProvider" aria-label="Subscription provider"><option value="claude-cli">claude-cli</option><option value="codex-cli">codex-cli</option></select>
     <input v-model="registerModel" class="search" maxlength="80" required placeholder="Subscription model, e.g. gpt-6-luna" aria-label="Subscription model" />
     <button class="secondary" :disabled="busy">Register subscription model</button>

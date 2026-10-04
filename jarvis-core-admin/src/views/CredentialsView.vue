@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { api, errorText, type CredentialProvider, type CredentialRecord, type OperationResult } from "../admin";
+import { api, credentialLabels, errorText, type CredentialProvider, type CredentialRecord, type OperationResult } from "../admin";
 import ErrorPanel from "../components/ErrorPanel.vue";
 import PageHeader from "../components/PageHeader.vue";
 import ResultPanel from "../components/ResultPanel.vue";
@@ -17,9 +17,6 @@ async function setCredential(provider: CredentialProvider) {
     busy.value = false; activeProvider.value = null;
   }
 }
-function providerLabel(provider: CredentialProvider): string {
-  return ({ anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", xai: "xAI", zai: "Z.ai", "ollama-cloud": "Ollama Cloud", huggingface: "Hugging Face", jev: "TypeSafe Jev" })[provider];
-}
 onMounted(load);
 </script>
 <template>
@@ -28,7 +25,7 @@ onMounted(load);
   <ResultPanel v-if="result" :result="result" />
   <section class="credential-grid">
     <article v-for="row in rows" :key="row.provider" class="metric-card credential-card">
-      <span class="card-label">{{ providerLabel(row.provider) }}</span>
+      <span class="card-label">{{ credentialLabels[row.provider] }}</span>
       <StatusBadge :state="row.configured ? 'configured' : 'not configured'" />
       <button class="small secondary" :disabled="busy" @click="setCredential(row.provider)">{{ activeProvider === row.provider ? 'Terminal open…' : (row.configured ? 'Replace' : 'Set credential') }}</button>
     </article>

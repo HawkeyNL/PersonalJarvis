@@ -108,8 +108,37 @@ export interface UsageRow {
   cache_read_tokens: number;
   cache_write_tokens: number;
   total_tokens: number;
+  /** null = not measured (older Core or not instrumented yet), never zero. */
+  failures: number | null;
+  fallbacks: number | null;
+  /** Per backend only. */
+  latency_p50_ms: number | null;
+  latency_p95_ms: number | null;
 }
-export interface DailyUsageRow extends Omit<UsageRow, "backend" | "model"> { day: string }
+export interface DailyUsageRow {
+  day: string;
+  spent_eur: number;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  total_tokens: number;
+}
+export interface AgentUsageRow {
+  agent_id: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  spent_eur: number;
+  failures: number | null;
+  fallbacks: number | null;
+  latency_p50_ms: number | null;
+  latency_p95_ms: number | null;
+  last_used: string | null;
+}
+export interface FailureCountRow { category: string; requests: number }
 export interface UsageReport {
   period: string;
   generated_at_unix: number;
@@ -129,6 +158,12 @@ export interface UsageReport {
   by_backend: UsageRow[];
   by_model: UsageRow[];
   daily: DailyUsageRow[];
+  failures: number | null;
+  fallbacks: number | null;
+  latency_p50_ms: number | null;
+  latency_p95_ms: number | null;
+  by_agent: AgentUsageRow[] | null;
+  failures_by_category: FailureCountRow[] | null;
   pricing: { source: string; updated_at: string };
 }
 export type CredentialProvider =
@@ -141,12 +176,14 @@ export type CredentialProvider =
   | "huggingface"
   | "jev";
 export interface CredentialRecord { provider: CredentialProvider; configured: boolean }
+export const credentialLabels: Record<CredentialProvider, string> = { anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", xai: "xAI", zai: "Z.ai", "ollama-cloud": "Ollama Cloud", huggingface: "Hugging Face", jev: "TypeSafe Jev" };
 export type AiAccountProvider = "claude" | "codex" | "codex-chat";
 export type AiAccountAction = "connect" | "test" | "reconnect" | "disconnect";
+export const aiAccountLabels: Record<AiAccountProvider, string> = { claude: "Claude Code", codex: "Codex (coding)", "codex-chat": "Codex chat" };
 export interface AiAccountRecord {
   provider: AiAccountProvider;
   worker: string;
-  state: "connected" | "logged_out" | "runtime_missing" | "wrong_auth_mode" | "unhealthy";
+  state: "connected" | "logged_out" | "runtime_missing" | "wrong_auth_mode" | "incompatible_runtime" | "unhealthy";
   billing: "subscription" | "unverified" | "overage_unverified";
   runtime: "inactive" | "socket_ready" | "active" | "unavailable";
 }
@@ -224,4 +261,14 @@ export function healthy(state: string): boolean {
   return ["active", "enabled", "passed", "healthy", "configured", "known", "local"].includes(
     state.toLowerCase(),
   );
+}
+
+/** Status colour; the text label next to it always carries the meaning. */
+export type Tone = "ok" | "idle" | "warn" | "error";
+
+export function toneOf(state: string): Tone {
+  const value = state.toLowerCase();
+  if (healthy(value) || value === "yes" || value === "available") return "ok";
+  if (["failed", "error", "inactive", "disabled", "unavailable"].some((v) => value.includes(v))) return "error";
+  return "warn";
 }
