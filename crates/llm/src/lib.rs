@@ -40,8 +40,8 @@ pub use router::{
     always_available, is_metered_backend, Availability, CatalogModel, ModelClass, RouterProvider,
 };
 pub use routing::{
-    LiveRouting, ModelRouting, PaidApi, RouteEntry, RoutingSnapshot, TierRoute, TierRoutes,
-    ROUTING_MAX_BYTES, ROUTING_PROVIDERS,
+    LiveRouting, ModelRouting, PaidApi, ResearchWebSearch, RouteEntry, RoutingSnapshot, TierRoute,
+    TierRoutes, ROUTING_MAX_BYTES, ROUTING_PROVIDERS,
 };
 pub use stream::TextDeltaSink;
 pub use types::{

@@ -87,6 +87,8 @@ refused 'invalid route' route_command set default ollama $'llama\t3.2'
 refused 'invalid route' route_command set default ollama "$(printf 'm%.0s' $(seq 257))"
 refused 'invalid route' route_command set default ollama ''
 refused 'allowed or off' route_command paid-api maybe
+refused 'on or off' route_command research-web-search maybe
+refused 'on or off' route_command research-web-search ON
 refused 'unknown tier' route_command reset turbo
 
 # The owner can explicitly approve a paid fallback after a subscription.
@@ -98,6 +100,21 @@ route_command paid-api off > /dev/null
 jq -e '.paid_api == "off" and (.tiers | keys == ["cheap", "default"])' "$routing_file" >/dev/null
 route_command reset cheap > /dev/null
 jq -e '.paid_api == "off" and (.tiers | keys == ["default"])' "$routing_file" >/dev/null
+
+# Research web search: off by default, written only when on, kept by edits.
+route_command list > "$fixture/out"
+grep -Fxq 'research web search: off' "$fixture/out"
+jq -e 'has("research_web_search") | not' "$routing_file" >/dev/null
+route_command research-web-search on > /dev/null
+jq -e '.research_web_search == "on" and .paid_api == "off"' "$routing_file" >/dev/null
+route_command list > "$fixture/out"
+grep -Fxq 'research web search: on' "$fixture/out"
+route_command reset default > /dev/null
+jq -e '.research_web_search == "on" and .tiers == {}' "$routing_file" >/dev/null
+route_command research-web-search off > /dev/null
+jq -e 'has("research_web_search") | not' "$routing_file" >/dev/null
+route_command set default claude-cli claude-opus-5 anthropic-api claude-opus-5 \
+    --metered-after-subscription > /dev/null
 
 # A failed activation stops Core instead of keeping an old route live.
 restart=failed

@@ -303,6 +303,11 @@ enum RouteCommand {
     PaidApi {
         state: PaidApiState,
     },
+    /// `on` lets explicit Research requests use the provider-hosted web search
+    /// of an enabled subscription (claude-cli, codex-cli). Off by default.
+    ResearchWebSearch {
+        state: OnOff,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -310,6 +315,12 @@ enum RouteTier {
     Cheap,
     Default,
     Hard,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -334,6 +345,9 @@ fn route_arguments(command: RouteCommand) -> Result<Vec<String>> {
         RouteCommand::Show { tier } => arguments.extend(["show".into(), value_name(tier)]),
         RouteCommand::Reset { tier } => arguments.extend(["reset".into(), value_name(tier)]),
         RouteCommand::PaidApi { state } => arguments.extend(["paid-api".into(), value_name(state)]),
+        RouteCommand::ResearchWebSearch { state } => {
+            arguments.extend(["research-web-search".into(), value_name(state)])
+        }
         RouteCommand::Set {
             tier,
             entries,

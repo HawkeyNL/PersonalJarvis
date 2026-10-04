@@ -664,6 +664,7 @@ pub(crate) async fn system_model_policy(
         "routing": routing.routing,
         "routing_sha256": routing_sha256,
         "routing_unavailable_reason": routing_unavailable_reason,
+        "research_web_search": if routing.research_web_search_on() { "on" } else { "off" },
         "routing_mutation": if state.privileged_broker_socket.is_some() && routing_sha256.is_some() {
             "device-signed-model-route-v1"
         } else {
