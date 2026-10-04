@@ -26,6 +26,8 @@ grep -Fxq 'ListenStream=/run/jarvis-codex-chat.sock' "$chat_socket"
 grep -Fxq 'SocketUser=root' "$chat_socket"
 grep -Fxq 'SocketGroup=jarvis' "$chat_socket"
 grep -Fxq 'SocketMode=0660' "$chat_socket"
+grep -Fxq 'Conflicts=jarvis-codex.service jarvis-codex-broker.service' "$chat_service"
+grep -Fxq 'Conflicts=jarvis-codex.service jarvis-codex-broker.service' "$chat_socket"
 grep -Fxq 'User=jarvis-codex' "$chat_service"
 grep -Fxq 'Group=jarvis-codex' "$chat_service"
 grep -Fxq 'StateDirectory=jarvis-codex' "$chat_service"
@@ -67,6 +69,25 @@ grep -Eq '^UnsetEnvironment=.*OPENAI_API_KEY .*CODEX_API_KEY ' "$chat_service"
 # The only environment source is the optional owner-reviewed version file.
 [[ $(grep -E '^EnvironmentFile=' "$chat_service") == 'EnvironmentFile=-/etc/jarvis/codex-chat-worker.env' ]]
 ! grep -Eq '^Listen(Stream|Datagram)=[0-9]|^Listen(Stream|Datagram)=127[.]' "$chat_socket"
+
+# verify-home-node hard-fails when the chat worker and a coding unit are both
+# enabled or running (a static unit is not an owner opt-in).
+eval "$(sed -n -e '/^unit_in_use() {/,/^}/p' -e '/^codex_chat_and_coding_apart() {/,/^}/p' \
+    "$repo/deploy/systemd/verify-home-node.sh")"
+systemctl() {
+    case $1 in
+        is-active) [[ " $active " == *" $3 "* ]] ;;
+        is-enabled) if [[ " $enabled " == *" $2 "* ]]; then echo enabled; else echo static; fi ;;
+        *) return 1 ;;
+    esac
+}
+active= enabled='jarvis-codex-chat.socket'; codex_chat_and_coding_apart
+active= enabled='jarvis-codex.service jarvis-codex-broker.service'; codex_chat_and_coding_apart
+active= enabled=; codex_chat_and_coding_apart
+active= enabled='jarvis-codex-chat.socket jarvis-codex-broker.service'; ! codex_chat_and_coding_apart
+active='jarvis-codex.service' enabled='jarvis-codex-chat.socket'; ! codex_chat_and_coding_apart
+active='jarvis-codex-chat.service' enabled='jarvis-codex.service'; ! codex_chat_and_coding_apart
+unset -f systemctl unit_in_use codex_chat_and_coding_apart
 
 fixture=$(mktemp -d /tmp/jarvis-subscription-release.XXXXXXXX)
 trap 'rm -rf -- "$fixture"' EXIT

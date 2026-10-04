@@ -3,6 +3,9 @@ Description=Jarvis Codex chat subscription worker (text only)
 Requires=jarvis-codex-chat.socket
 After=jarvis-codex-chat.socket network-online.target
 Wants=network-online.target
+# The coding path shares this login and stays off until the shared-token
+# design is re-reviewed: starting the chat worker stops it, and vice versa.
+Conflicts=jarvis-codex.service jarvis-codex-broker.service
 
 [Service]
 Type=exec

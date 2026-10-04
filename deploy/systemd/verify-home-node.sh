@@ -29,6 +29,25 @@ expect_mode() {
     actual=$(stat -c '%U:%G:%a' "$path" 2>/dev/null || true)
     [[ $actual == "$expected" ]]
 }
+# Owner opt-in or running; `is-enabled` alone also accepts static units.
+unit_in_use() {
+    systemctl is-active --quiet "$1" && return 0
+    case $(systemctl is-enabled "$1" 2>/dev/null) in
+        enabled|enabled-runtime) return 0 ;;
+    esac
+    return 1
+}
+codex_chat_and_coding_apart() {
+    local chat=false unit
+    for unit in jarvis-codex-chat.socket jarvis-codex-chat.service; do
+        unit_in_use "$unit" && chat=true
+    done
+    $chat || return 0
+    for unit in jarvis-codex.service jarvis-codex-broker.service; do
+        unit_in_use "$unit" && return 1
+    done
+    return 0
+}
 managed_units_match_active_release() {
     local active manifest capability manager expected actual matches
     [[ -L /opt/jarvis/current ]] || return 1
@@ -199,6 +218,9 @@ else
     ui_detail "Laya classifier: inactive (optional; Jev/Auto fallback remains available)"
 fi
 
+# The chat worker and the coding path share the one Codex login; until the
+# shared-token design is re-reviewed they must never be enabled together.
+check "Codex chat worker and Codex coding units are not enabled together" codex_chat_and_coding_apart
 # Optional owner-enabled Codex chat worker: when its socket is on, the local
 # IPC and identity boundary is mandatory.
 if systemctl is-active --quiet jarvis-codex-chat.socket; then

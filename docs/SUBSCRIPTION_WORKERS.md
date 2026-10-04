@@ -211,7 +211,7 @@ and the checksum with `sha256sum`, then
 
 ## Installing the Codex CLI runtime
 
-Core Admin → AI Accounts shows, on the Codex (coding) card, the installed Codex
+Core Admin → AI Accounts shows, on the Codex card, the installed Codex
 version, whether its ownership is safe, the latest GitHub release, whether a
 rollback copy exists and whether `cosign` is installed. **Install / update
 runtime** (latest release or an exact version) and **Roll back runtime** send a
@@ -227,12 +227,14 @@ sudo jarvis accounts runtime rollback codex
 Owner steps:
 
 1. `sudo apt install cosign` (once). Without it the installer refuses to start.
-2. Install the runtime from Core Admin (or the command above).
-3. Review that exact version for the chat worker and set
+2. Before the first install, check once that this cosign really rejects what
+   it must (see [Checking cosign](#checking-cosign-before-the-first-install)).
+3. Install the runtime from Core Admin (or the command above).
+4. Review that exact version for the chat worker and set
    `JARVIS_CODEX_REVIEWED_VERSION` (see
    [Codex chat worker](#codex-chat-worker-text-only-off-by-default)); the
    installer never changes the reviewed version.
-4. `sudo jarvis accounts connect codex` (the one Codex login), or Connect in
+5. `sudo jarvis accounts connect codex` (the one Codex login), or Connect in
    Core Admin.
 
 The installer only uses `https://api.github.com/repos/openai/codex/releases`
@@ -257,9 +259,7 @@ inside the root-only `/usr/local/lib/jarvis` (never `$TMPDIR`):
    regular file `codex-<arch>-unknown-linux-musl` (at most 400 MiB) followed by
    zero padding: links, other or `..`/absolute paths, extension headers and
    extra members are refused.
-5. Check that the bundle's Rekor `hashedrekord` entry records the extracted
-   binary's SHA-256, then run, with a clean environment, a private `HOME` and a
-   3-minute bound:
+5. Run, with a clean environment, a private `HOME` and a 3-minute bound:
 
    ```sh
    cosign verify-blob --offline=true --bundle codex-<arch>-unknown-linux-musl.sigstore \
@@ -281,9 +281,34 @@ Rollback restores, unverified, whatever binary the last install replaced.
 Each install and rollback writes fixed `provider/action/version/outcome`
 events to `authpriv` syslog.
 
+cosign itself runs as root (it reads the root-only work directory) with no
+other input than the two files and the fixed arguments above.
+
 Not verified on the Home Node yet: a real install with the Ubuntu cosign 2.6.2
 package (the tests use a fake cosign), including how it fetches the TUF
 trusted root.
+
+### Checking cosign before the first install
+
+Run this once as your normal user (no `sudo`) in an empty directory. It
+downloads the published 0.160.0 x86_64 release (about 110 MB) and must print
+`ok` three times; any `UNEXPECTED` means do not use the installer.
+
+```sh
+base=https://github.com/openai/codex/releases/download/rust-v0.160.0
+asset=codex-x86_64-unknown-linux-musl
+curl -fsSLO "$base/$asset.tar.gz" && curl -fsSLO "$base/$asset.sigstore"
+tar -xzf "$asset.tar.gz" "$asset"
+sha256sum "$asset"   # 12eb3e81114588aca3b7998f4f19e8997b056aca08e57a7ca7c8a3ec8c652aad
+id=https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v
+verify() { cosign verify-blob --offline=true --bundle "$asset.sigstore" \
+    --certificate-identity "$1" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com "$2"; }
+verify "${id}0.160.0" "$asset" && echo ok || echo UNEXPECTED
+cp "$asset" tampered && printf x >> tampered
+verify "${id}0.160.0" tampered && echo UNEXPECTED || echo ok
+verify "${id}0.159.0" "$asset" && echo UNEXPECTED || echo ok
+```
 
 ## Production activation
 
@@ -377,12 +402,24 @@ socket and stops the worker before it logs out.
 **Hard requirement before the coding path is enabled.** The text-only chat
 worker and the coding path share the one `jarvis-codex` ChatGPT login. Before
 the Codex broker or App Server is ever enabled, this shared-token design must
-be re-reviewed: a single owner of the token and its refresh (the chat worker
-and the App Server could otherwise refresh `auth.json` concurrently and
-invalidate each other), refresh races and lock-out on the Home Node, and the
-reach of a prompt-injected chat run into coding sessions and their history
-(same UID, same login home). Until that review is done and recorded, the
-coding path stays off.
+be re-reviewed, covering at least:
+
+- a single owner of the token and its refresh (the chat worker and the App
+  Server could otherwise refresh `auth.json` concurrently and invalidate each
+  other), refresh races and lock-out on the Home Node;
+- the reach of a prompt-injected chat run into coding sessions and their
+  history (same UID, same login home);
+- config poisoning through the shared, writable login home: a chat run that
+  writes `~/.codex/config.toml`, `AGENTS.md`, `rules/`, `skills/`, MCP server
+  or `notify` commands would change what the coding path loads and executes;
+- same-UID abstract Unix sockets, which file permissions and
+  `InaccessiblePaths` do not cover.
+
+Until that review is done and recorded, the coding path stays off. The units
+enforce it: `jarvis-codex-chat.socket` and `.service` declare
+`Conflicts=jarvis-codex.service jarvis-codex-broker.service`, so starting one
+side stops the other, and `verify-home-node.sh` fails when the chat worker and
+a coding unit are enabled or running together.
 
 ### Retired jarvis-codex-chat identity
 
