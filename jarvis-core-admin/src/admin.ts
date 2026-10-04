@@ -146,7 +146,7 @@ export type AiAccountAction = "connect" | "test" | "reconnect" | "disconnect";
 export interface AiAccountRecord {
   provider: AiAccountProvider;
   worker: string;
-  state: "connected" | "logged_out" | "runtime_missing" | "wrong_auth_mode" | "unhealthy";
+  state: "connected" | "logged_out" | "runtime_missing" | "wrong_auth_mode" | "incompatible_runtime" | "unhealthy";
   billing: "subscription" | "unverified" | "overage_unverified";
   runtime: "inactive" | "socket_ready" | "active" | "unavailable";
 }

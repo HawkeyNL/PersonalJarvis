@@ -858,7 +858,12 @@ fn validate_ai_accounts(rows: Vec<AiAccountRecord>) -> AdminResult<Vec<AiAccount
             )
                 || !matches!(
                     row.state.as_str(),
-                    "connected" | "logged_out" | "runtime_missing" | "wrong_auth_mode" | "unhealthy"
+                    "connected"
+                        | "logged_out"
+                        | "runtime_missing"
+                        | "wrong_auth_mode"
+                        | "incompatible_runtime"
+                        | "unhealthy"
                 )
                 || !matches!(row.billing.as_str(), "subscription" | "unverified" | "overage_unverified")
                 || !matches!(
@@ -1986,6 +1991,17 @@ mod tests {
         assert!(validate_ai_accounts(vec![claude.clone(), codex.clone(), chat.clone()]).is_ok());
         assert!(validate_ai_accounts(vec![claude.clone(), codex.clone()]).is_err());
         assert!(validate_ai_accounts(vec![claude.clone(), codex.clone(), codex.clone()]).is_err());
+        // A Claude CLI outside the reviewed contract is a state, not an error.
+        let incompatible = AiAccountRecord {
+            state: "incompatible_runtime".to_owned(),
+            ..claude.clone()
+        };
+        assert!(validate_ai_accounts(vec![incompatible, codex.clone(), chat.clone()]).is_ok());
+        let unknown = AiAccountRecord {
+            state: "surprise".to_owned(),
+            ..claude.clone()
+        };
+        assert!(validate_ai_accounts(vec![unknown, codex.clone(), chat.clone()]).is_err());
         // The chat worker never shares the coding login's identity.
         assert!(validate_ai_accounts(vec![claude, codex, row("codex-chat", "jarvis-codex")]).is_err());
         assert_eq!(
