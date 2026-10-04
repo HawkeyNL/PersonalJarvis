@@ -390,19 +390,23 @@ async fn main() -> anyhow::Result<()> {
     // private checkout and uses the generic Core only.
     let agent_bundle_path = std::env::var("JARVIS_AGENT_BUNDLE_PATH")
         .unwrap_or_else(|_| "/var/lib/jarvis/agents/current".to_string());
-    match jarvis_core::AgentRegistry::load(&agent_bundle_path) {
-        Ok(agent_registry) => tracing::info!(
-            bundle = %agent_registry.bundle_id(),
-            agent_count = agent_registry.agents().len(),
-            "private AgentRegistry loaded"
-        ),
+    let agent_registry = match jarvis_core::AgentRegistry::load(&agent_bundle_path) {
+        Ok(agent_registry) => {
+            tracing::info!(
+                bundle = %agent_registry.bundle_id(),
+                agent_count = agent_registry.agents().len(),
+                "private AgentRegistry loaded"
+            );
+            Some(Arc::new(agent_registry))
+        }
         Err(error) if config.environment.eq_ignore_ascii_case("production") => {
             anyhow::bail!("protected AgentRegistry is unavailable: {error}");
         }
         Err(error) => {
-            tracing::warn!(path = %agent_bundle_path, %error, "private AgentRegistry unavailable in development")
+            tracing::warn!(path = %agent_bundle_path, %error, "private AgentRegistry unavailable in development");
+            None
         }
-    }
+    };
 
     // Record the resolved brain for display (Status "AI-RESOURCES") and refresh.
     let active_brain = llm.label().to_string();
@@ -548,6 +552,7 @@ async fn main() -> anyhow::Result<()> {
         budget_book,
         eur_per_usd: config.llm_eur_per_usd,
         agent_enabled: config.agent_enabled,
+        agent_registry,
         agent_sandbox,
         rate_limiter: std::sync::Arc::new(jarvis_api::RateLimiter::new()),
         auth_limits: jarvis_api::AuthLimits {

@@ -5,6 +5,7 @@
 
 pub(crate) mod account;
 pub(crate) mod agent;
+pub(crate) mod agents;
 pub(crate) mod app_updates;
 pub(crate) mod auth;
 pub(crate) mod broker;
@@ -13,5 +14,6 @@ mod chat_context;
 pub(crate) mod coding;
 pub(crate) mod portfolio;
 pub(crate) mod runs;
+pub(crate) mod services;
 pub(crate) mod system;
 pub(crate) mod voice;

@@ -194,6 +194,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/system/registry", get(system_registry))
         .route("/v1/system/registry/refresh", post(system_registry_refresh))
         .route("/v1/system/usage", get(system_usage))
+        .route("/v1/system/services", get(routes::services::status))
         .route("/v1/system/models", get(system_model_policy))
         .route("/v1/system/brain", get(system_brain).put(system_brain_set))
         .route("/v1/system/budget/preflight", post(system_budget_preflight))
@@ -202,6 +203,7 @@ pub fn build_router(state: AppState) -> Router {
             post(system_privileged_config),
         )
         .route("/v1/system/self-improve", post(system_self_improve))
+        .route("/v1/agents", get(routes::agents::list))
         .route("/v1/agent/action", post(agent_action))
         .route("/v1/agent/pending", get(agent_pending))
         .route(

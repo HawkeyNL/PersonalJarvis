@@ -80,6 +80,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         )),
         eur_per_usd: 0.92,
         agent_enabled: sandbox.is_some(),
+        agent_registry: None,
         agent_sandbox: sandbox.map(Arc::new),
         rate_limiter: Arc::new(RateLimiter::new()),
         auth_limits: AuthLimits::default(),
@@ -257,6 +258,80 @@ async fn every_application_update_route_requires_authentication_before_storage_a
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
     }
+}
+
+/// Owner read models for the app share the `Authed` gate of `/v1/system/*`.
+const OWNER_READ_MODELS: [&str; 2] = ["/v1/agents", "/v1/system/services"];
+
+#[tokio::test]
+async fn owner_read_models_refuse_missing_or_invalid_sessions() {
+    // An unconnected database cannot authenticate any token.
+    let app = build_router(state(jarvis_store::Database::init(), None).await);
+    for path in OWNER_READ_MODELS {
+        for authorization in [None, Some("Bearer not-a-session"), Some("Basic b3duZXI=")] {
+            let mut request = Request::builder().uri(path);
+            if let Some(value) = authorization {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} {authorization:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn owner_read_models_answer_an_owner_session() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db, None).await);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let get = |path: &'static str| {
+        app.clone().oneshot(
+            Request::builder()
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+
+    // No bundle (development): an empty list with a reason, never a 500.
+    let agents = get("/v1/agents").await?;
+    assert_eq!(agents.status(), StatusCode::OK);
+    let agents = json_body(agents).await;
+    assert_eq!(agents["agents"], json!([]));
+    assert_eq!(agents["agent_count"], 0);
+    assert_eq!(agents["unavailable_reason"], "agent_bundle_unavailable");
+
+    // Fixed labels in a fixed order, whatever the runner's systemd says.
+    let services = get("/v1/system/services").await?;
+    assert_eq!(services.status(), StatusCode::OK);
+    let services = json_body(services).await;
+    assert_eq!(services["services"][0]["label"], "Core");
+    assert_eq!(services["services"].as_array().map(Vec::len), Some(7));
+    assert_eq!(services["disks"][0]["label"], "system");
+    assert_eq!(services["disks"][1]["label"], "data");
+    Ok(())
 }
 
 async fn enroll_login(app: &axum::Router, signing: &SigningKey) -> (String, Vec<u8>) {
@@ -558,5 +633,97 @@ async fn current_month_usage_aggregates_work_before_and_after_first_call(
         Some("fixture-model")
     );
     assert_eq!(populated.daily.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn month_statistics_break_down_agents_latency_failures_and_fallbacks(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_usage_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+
+    // A pre-telemetry row has none of the routing fields and must not break
+    // the aggregate (NONE latency, failure category and fallback count).
+    db.query(
+        "CREATE llm_usage SET id = $id, ts = time::now(), backend = 'ollama-cloud', model = 'legacy', \
+         input_tokens = 1, output_tokens = 1, cache_read_tokens = 0, cache_write_tokens = 0, cost_eur = 0.0",
+    )
+    .bind(json!({"id": uuid::Uuid::now_v7().to_string()}))
+    .await?
+    .check()?;
+    let entry = |agent: Option<&str>, latency_ms, failure: Option<&str>, fallback_count| {
+        jarvis_usage::UsageEntry {
+            request_id: uuid::Uuid::now_v7().to_string(),
+            backend: "ollama-cloud".to_owned(),
+            model: "fixture-model".to_owned(),
+            requested_route: None,
+            actual_provider: None,
+            cost_estimate_classification: "known".to_owned(),
+            routing_mode: "test".to_owned(),
+            quality_tier: "test".to_owned(),
+            agent_id: agent.map(str::to_owned),
+            latency_ms,
+            status: if failure.is_some() {
+                "failed"
+            } else {
+                "succeeded"
+            }
+            .to_owned(),
+            failure_category: failure.map(str::to_owned),
+            fallback_count,
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_eur: 0.01,
+        }
+    };
+    for row in [
+        entry(Some("researcher"), 100, None, 0),
+        entry(Some("researcher"), 300, Some("timeout"), 2),
+        // Unmeasured internal call: counted, but excluded from latency.
+        entry(None, 0, None, 0),
+    ] {
+        jarvis_usage::record(&db, &row).await?;
+    }
+
+    let stats = jarvis_usage::month_statistics(&db).await?;
+    assert_eq!(stats.totals.requests, 4);
+    assert_eq!(stats.totals.failures, 1);
+    assert_eq!(stats.totals.fallbacks, 2);
+    let p50 = stats.totals.latency_p50_ms.ok_or("missing p50")?;
+    let p95 = stats.totals.latency_p95_ms.ok_or("missing p95")?;
+    assert!((100..=300).contains(&p50) && (p50..=300).contains(&p95));
+    assert_eq!(stats.by_backend.len(), 1);
+    assert_eq!(stats.by_backend[0].totals.failures, 1);
+    assert!(stats.by_backend[0].totals.latency_p95_ms.is_some());
+
+    let agents = jarvis_usage::month_agent_statistics(&db).await?;
+    assert_eq!(agents.len(), 1);
+    let agent = &agents[0];
+    assert_eq!(agent.agent_id, "researcher");
+    assert_eq!((agent.totals.requests, agent.totals.total_tokens), (2, 30));
+    assert_eq!((agent.totals.failures, agent.totals.fallbacks), (1, 2));
+    assert!(agent.totals.latency_p50_ms.is_some());
+    // RFC 3339 text from `time::format(.., '%+')`, e.g. 2026-10-04T11:07:31.123+00:00.
+    let last_used = agent.last_used.as_deref().ok_or("missing last_used")?;
+    assert_eq!(last_used.as_bytes().get(10), Some(&b'T'), "{last_used}");
+    assert!(last_used.ends_with("+00:00"), "{last_used}");
+
+    assert_eq!(stats.failures_by_category.len(), 1);
+    assert_eq!(stats.failures_by_category[0].category, "timeout");
+    assert_eq!(stats.failures_by_category[0].requests, 1);
     Ok(())
 }
