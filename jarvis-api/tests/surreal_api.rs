@@ -12,6 +12,7 @@ use axum::{
 use ed25519_dalek::{Signer, SigningKey};
 use jarvis_agent::Sandbox;
 use serde_json::{json, Value};
+use sha2::Digest as _;
 use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
 use tower::ServiceExt;
 
@@ -388,53 +389,166 @@ async fn signed_agent_approval_is_single_use_and_core_stays_denied(
     jarvis_store::apply_baseline_schema(&db).await?;
     let root = std::env::temp_dir().join(format!("jarvis_surreal_agent_{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&root)?;
-    let app = build_router(state(db, Some(Sandbox::new(&root)?)).await);
+    let app = build_router(state(db.clone(), Some(Sandbox::new(&root)?)).await);
     let signing = SigningKey::from_bytes(&rand::random());
     let (token, _) = enroll_login(&app, &signing).await;
-    let pending = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/agent/action")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .body(Body::from(
-                    serde_json::to_vec(
-                        &json!({"type":"write_file","path":"note.txt","content":"ok"}),
-                    )
+    let device_id = {
+        let me = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/auth/me")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
                     .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(pending.status(), StatusCode::OK);
-    let pending = json_body(pending).await;
-    let id = pending["pending_id"].as_str().unwrap();
-    let signature = hex::encode(
-        signing
-            .sign(&hex::decode(pending["nonce"].as_str().unwrap())?)
-            .to_bytes(),
-    );
-    let approve = || {
+            )
+            .await
+            .unwrap();
+        uuid::Uuid::parse_str(json_body(me).await["device_id"].as_str().unwrap())?
+    };
+    let post = |uri: String, body: Value| {
         Request::builder()
             .method("POST")
-            .uri(format!("/v1/agent/pending/{id}/approve"))
+            .uri(uri)
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .body(Body::from(
-                serde_json::to_vec(&json!({"signature": signature})).unwrap(),
-            ))
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
     };
+    let propose = |content: &str| {
+        post(
+            "/v1/agent/action".into(),
+            json!({"type":"write_file","path":"note.txt","content":content}),
+        )
+    };
+    let approve = |id: &str, signature: &str| {
+        post(
+            format!("/v1/agent/pending/{id}/approve"),
+            json!({ "signature": signature }),
+        )
+    };
+    // Sign exactly what `GET /v1/agent/pending` lists for `id`.
+    let list = || {
+        Request::builder()
+            .uri("/v1/agent/pending")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let listed = json_body(app.clone().oneshot(list()).await.unwrap()).await;
+    assert_eq!(listed["pending"].as_array().map(Vec::len), Some(0));
+    let sign_listed = |listed: &Value, id: &str| -> String {
+        let entry = listed["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["pending_id"] == id)
+            .unwrap();
+        assert_eq!(entry["approval_message"], "agent-approval-v1");
+        let message = jarvis_client_core::agent_approval_message(
+            uuid::Uuid::parse_str(id).unwrap(),
+            &hex::decode(entry["nonce"].as_str().unwrap()).unwrap(),
+            &hex::decode(entry["action_sha256"].as_str().unwrap()).unwrap(),
+            device_id,
+        )
+        .unwrap();
+        hex::encode(signing.sign(&message).to_bytes())
+    };
+
+    let a = json_body(app.clone().oneshot(propose("ok")).await.unwrap()).await;
+    let a_id = a["pending_id"].as_str().unwrap().to_string();
+    let b = json_body(app.clone().oneshot(propose("other")).await.unwrap()).await;
+    let b_id = b["pending_id"].as_str().unwrap().to_string();
+    let listed = json_body(app.clone().oneshot(list()).await.unwrap()).await;
+    let a_entry = listed["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["pending_id"] == a_id.as_str())
+        .unwrap();
     assert_eq!(
-        app.clone().oneshot(approve()).await.unwrap().status(),
+        a_entry["action_sha256"],
+        hex::encode(sha2::Sha256::digest(
+            br#"{"type":"write_file","path":"note.txt","content":"ok"}"#
+        ))
+    );
+    let a_signature = sign_listed(&listed, &a_id);
+    let b_signature = sign_listed(&listed, &b_id);
+
+    // A login/unlock-style raw nonce signature is refused.
+    let raw = hex::encode(
+        signing
+            .sign(&hex::decode(a["nonce"].as_str().unwrap())?)
+            .to_bytes(),
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(approve(&a_id, &raw))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // A signature for action A never approves action B.
+    assert_eq!(
+        app.clone()
+            .oneshot(approve(&b_id, &a_signature))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // The kill switch refuses approval before anything runs.
+    let mut disabled = state(db.clone(), Some(Sandbox::new(&root)?)).await;
+    disabled.agent_enabled = false;
+    assert_eq!(
+        build_router(disabled)
+            .oneshot(approve(&a_id, &a_signature))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    // A stored action changed after it was listed no longer matches its hash.
+    db.query("UPDATE agent_pending_actions SET action = $action WHERE record::id(id) = $id")
+        .bind(json!({
+            "id": b_id,
+            "action": r#"{"type":"write_file","path":"note.txt","content":"tampered"}"#,
+        }))
+        .await?
+        .check()?;
+    assert_eq!(
+        app.clone()
+            .oneshot(approve(&b_id, &b_signature))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // Deny still needs no signature.
+    let denied = app
+        .clone()
+        .oneshot(post(format!("/v1/agent/pending/{b_id}/deny"), json!({})))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::OK);
+    assert_eq!(json_body(denied).await["status"], "denied");
+
+    assert_eq!(
+        app.clone()
+            .oneshot(approve(&a_id, &a_signature))
+            .await
+            .unwrap()
+            .status(),
         StatusCode::OK
     );
     assert_eq!(std::fs::read_to_string(root.join("note.txt"))?, "ok");
     assert_eq!(
-        app.clone().oneshot(approve()).await.unwrap().status(),
+        app.clone()
+            .oneshot(approve(&a_id, &a_signature))
+            .await
+            .unwrap()
+            .status(),
         StatusCode::NOT_FOUND
     );
     let core = app
