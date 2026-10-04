@@ -27,22 +27,25 @@ const STATUS_LIMIT: u64 = 16 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(super) enum AccountProvider {
     Claude,
+    /// One ChatGPT login under `jarvis-codex`, used by the text-only chat
+    /// worker and, once re-reviewed and enabled, the coding path.
     Codex,
-    /// The text-only Codex chat worker's own ChatGPT login, separate from the
-    /// coding broker's `codex` login.
-    CodexChat,
 }
 
+/// The former separate chat worker identity. It is no longer used and never
+/// removed automatically; status reports it so the owner can delete it.
+const LEGACY_CODEX_CHAT_USER: &str = "jarvis-codex-chat";
+const LEGACY_CODEX_CHAT_HOME: &str = "/var/lib/jarvis-codex-chat";
+
 impl AccountProvider {
-    fn all() -> [Self; 3] {
-        [Self::Claude, Self::Codex, Self::CodexChat]
+    fn all() -> [Self; 2] {
+        [Self::Claude, Self::Codex]
     }
 
     fn name(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::CodexChat => "codex-chat",
         }
     }
 
@@ -50,7 +53,6 @@ impl AccountProvider {
         match self {
             Self::Claude => "jarvis-claude",
             Self::Codex => "jarvis-codex",
-            Self::CodexChat => "jarvis-codex-chat",
         }
     }
 
@@ -58,35 +60,34 @@ impl AccountProvider {
         match self {
             Self::Claude => "/var/lib/jarvis-claude",
             Self::Codex => "/var/lib/jarvis-codex",
-            Self::CodexChat => "/var/lib/jarvis-codex-chat",
         }
     }
 
     fn binary(self) -> &'static str {
         match self {
             Self::Claude => "/usr/local/bin/claude",
-            Self::Codex | Self::CodexChat => "/usr/local/bin/codex",
+            Self::Codex => "/usr/local/bin/codex",
         }
     }
 
     fn status_args(self) -> &'static [&'static str] {
         match self {
             Self::Claude => &["auth", "status"],
-            Self::Codex | Self::CodexChat => &["login", "status"],
+            Self::Codex => &["login", "status"],
         }
     }
 
     fn connect_args(self) -> &'static [&'static str] {
         match self {
             Self::Claude => &["auth", "login"],
-            Self::Codex | Self::CodexChat => &["login", "--device-auth"],
+            Self::Codex => &["login", "--device-auth"],
         }
     }
 
     fn disconnect_args(self) -> &'static [&'static str] {
         match self {
             Self::Claude => &["auth", "logout"],
-            Self::Codex | Self::CodexChat => &["logout"],
+            Self::Codex => &["logout"],
         }
     }
 }
@@ -128,6 +129,8 @@ struct AccountStatus {
     state: &'static str,
     billing: &'static str,
     runtime: &'static str,
+    /// Codex only: the unused `jarvis-codex-chat` identity or state remains.
+    legacy_identity: bool,
 }
 
 impl AccountStatus {
@@ -146,8 +149,19 @@ impl AccountStatus {
                 "unverified"
             },
             runtime: "inactive",
+            legacy_identity: provider == AccountProvider::Codex && legacy_codex_chat_present(),
         }
     }
+}
+
+/// Read-only: the identity or its login home still exists.
+fn legacy_codex_chat_present() -> bool {
+    let Ok(name) = CString::new(LEGACY_CODEX_CHAT_USER) else {
+        return false;
+    };
+    // Fixed compile-time name; nothing is read from the old login home.
+    !unsafe { libc::getpwnam(name.as_ptr()) }.is_null()
+        || fs::symlink_metadata(LEGACY_CODEX_CHAT_HOME).is_ok()
 }
 
 pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
@@ -171,9 +185,10 @@ pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
                 if json {
                     println!("{}", serde_json::to_string(&statuses)?);
                 } else {
-                    for item in statuses {
+                    for item in &statuses {
                         println!("{:<11} {:<20} {}", item.provider, item.worker, item.state);
                     }
+                    print_legacy_notice(&statuses);
                 }
                 Ok(())
             }
@@ -183,6 +198,7 @@ pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
                     println!("{}", serde_json::to_string(&result)?);
                 } else {
                     println!("{}: {} ({})", result.provider, result.state, result.billing);
+                    print_legacy_notice(std::slice::from_ref(&result));
                 }
                 Ok(())
             }
@@ -282,6 +298,14 @@ pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
     result
 }
 
+fn print_legacy_notice(statuses: &[AccountStatus]) {
+    if statuses.iter().any(|status| status.legacy_identity) {
+        println!(
+            "legacy: the {LEGACY_CODEX_CHAT_USER} identity or {LEGACY_CODEX_CHAT_HOME} is no longer used and can be removed (see docs/SUBSCRIPTION_WORKERS.md)"
+        );
+    }
+}
+
 fn audit_account_event(provider: AccountProvider, action: &str, outcome: &str) -> Result<()> {
     audit_record(&format!(
         "provider={} action={} outcome={}",
@@ -347,13 +371,12 @@ fn runtime_stop_commands(provider: AccountProvider) -> &'static [&'static [&'sta
             &["disable", "--now", "jarvis-claude.socket"],
             &["stop", "jarvis-claude.service"],
         ],
+        // The chat worker and the coding path share the one Codex login.
         AccountProvider::Codex => &[
-            &["disable", "--now", "jarvis-codex-broker.service"],
-            &["disable", "--now", "jarvis-codex.service"],
-        ],
-        AccountProvider::CodexChat => &[
             &["disable", "--now", "jarvis-codex-chat.socket"],
             &["stop", "jarvis-codex-chat.service"],
+            &["disable", "--now", "jarvis-codex-broker.service"],
+            &["disable", "--now", "jarvis-codex.service"],
         ],
     }
 }
@@ -419,7 +442,7 @@ fn status(provider: AccountProvider) -> AccountStatus {
     };
     let state = match provider {
         AccountProvider::Claude => parse_claude_status(&output),
-        AccountProvider::Codex | AccountProvider::CodexChat => parse_codex_status(&output),
+        AccountProvider::Codex => parse_codex_status(&output),
     };
     let mut result = AccountStatus::new(provider, state);
     result.runtime = runtime_state(provider);
@@ -473,14 +496,7 @@ fn runtime_state(provider: AccountProvider) -> &'static str {
             }
         }
         AccountProvider::Codex => {
-            if active("jarvis-codex.service") {
-                "active"
-            } else {
-                "inactive"
-            }
-        }
-        AccountProvider::CodexChat => {
-            if active("jarvis-codex-chat.service") {
+            if active("jarvis-codex.service") || active("jarvis-codex-chat.service") {
                 "active"
             } else if active("jarvis-codex-chat.socket") {
                 "socket_ready"
@@ -824,36 +840,32 @@ mod tests {
             runtime_stop_commands(AccountProvider::Claude)[0],
             ["disable", "--now", "jarvis-claude.socket"]
         );
+        // The one Codex login serves the chat worker and the coding path:
+        // its disconnect blocks new chat runs first, then stops both.
         assert_eq!(
-            runtime_stop_commands(AccountProvider::Codex)[0],
-            ["disable", "--now", "jarvis-codex-broker.service"]
+            runtime_stop_commands(AccountProvider::Codex),
+            [
+                &["disable", "--now", "jarvis-codex-chat.socket"][..],
+                &["stop", "jarvis-codex-chat.service"],
+                &["disable", "--now", "jarvis-codex-broker.service"],
+                &["disable", "--now", "jarvis-codex.service"],
+            ]
         );
-        assert_eq!(
-            runtime_stop_commands(AccountProvider::CodexChat)[0],
-            ["disable", "--now", "jarvis-codex-chat.socket"]
-        );
-        // Each login stops only the runtime that uses it.
-        assert!(!runtime_stop_commands(AccountProvider::Codex)
-            .iter()
-            .any(|args| args.iter().any(|arg| arg.contains("chat"))));
-        assert!(!runtime_stop_commands(AccountProvider::CodexChat)
-            .iter()
-            .any(|args| args.iter().any(|arg| arg.contains("broker"))));
     }
 
     #[test]
-    fn codex_chat_has_its_own_identity_and_login_home() {
-        let chat = AccountProvider::from_str("codex-chat", false).unwrap();
-        assert_eq!(chat, AccountProvider::CodexChat);
-        assert_eq!(chat.user(), "jarvis-codex-chat");
-        assert_eq!(chat.home(), "/var/lib/jarvis-codex-chat");
-        assert_eq!(chat.connect_args(), ["login", "--device-auth"]);
-        assert_ne!(chat.user(), AccountProvider::Codex.user());
-        assert_ne!(chat.home(), AccountProvider::Codex.home());
+    fn codex_has_one_login_for_chat_and_coding() {
+        assert!(AccountProvider::from_str("codex-chat", false).is_err());
+        assert_eq!(AccountProvider::all().len(), 2);
+        let codex = AccountProvider::Codex;
+        assert_eq!(codex.user(), "jarvis-codex");
+        assert_eq!(codex.home(), "/var/lib/jarvis-codex");
+        assert_eq!(codex.connect_args(), ["login", "--device-auth"]);
         assert_eq!(
-            AccountStatus::new(chat, "connected").billing,
+            AccountStatus::new(codex, "connected").billing,
             "subscription"
         );
+        assert!(!AccountStatus::new(AccountProvider::Claude, "connected").legacy_identity);
     }
 
     #[test]

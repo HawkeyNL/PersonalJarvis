@@ -220,7 +220,7 @@ if ! getent passwd jarvis >/dev/null; then
     useradd --system --user-group --home-dir /var/lib/jarvis --shell /usr/sbin/nologin jarvis
 fi
 install -d -o jarvis -g jarvis -m 0750 /var/lib/jarvis
-for worker in jarvis-claude jarvis-codex jarvis-codex-chat; do
+for worker in jarvis-claude jarvis-codex; do
     if ! getent passwd "$worker" >/dev/null; then
         useradd --system --user-group --home-dir "/var/lib/$worker" --shell /usr/sbin/nologin "$worker"
     fi

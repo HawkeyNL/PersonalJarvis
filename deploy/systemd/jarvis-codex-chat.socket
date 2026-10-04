@@ -1,5 +1,8 @@
 [Unit]
 Description=Jarvis Codex chat subscription worker socket
+# The coding path shares this login and stays off until the shared-token
+# design is re-reviewed: starting the chat worker stops it, and vice versa.
+Conflicts=jarvis-codex.service jarvis-codex-broker.service
 
 [Socket]
 ListenStream=/run/jarvis-codex-chat.sock

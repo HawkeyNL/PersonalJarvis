@@ -13,10 +13,10 @@ dedicated `jarvis-claude` identity. Codex uses `codex login --device-auth`,
 `codex login status` and `codex logout` under `jarvis-codex`. These are distinct
 from Anthropic/OpenAI API keys. The root-owned official CLI executables must be
 installed at `/usr/local/bin/claude` and `/usr/local/bin/codex` before linking.
-Claude Code can be installed by the owner from Core Admin or the admin CLI (see
-[Installing the Claude Code runtime](#installing-the-claude-code-runtime));
-Codex is installed manually for now. No updater or worker ever downloads a
-moving CLI version automatically.
+Both can be installed by the owner from Core Admin or the admin CLI (see
+[Installing the Claude Code runtime](#installing-the-claude-code-runtime) and
+[Installing the Codex CLI runtime](#installing-the-codex-cli-runtime)). No
+updater or worker ever downloads a moving CLI version automatically.
 Neither worker uses the owner's home or browser profile. An administrator must
 verify the installed CLI version and its supported login/runtime flags against
 the [Claude Code authentication documentation](https://code.claude.com/docs/en/authentication),
@@ -90,14 +90,13 @@ sudo jarvis accounts status codex
 sudo jarvis accounts connect codex
 sudo jarvis accounts test codex
 sudo jarvis accounts disconnect codex
-sudo jarvis accounts status codex-chat
-sudo jarvis accounts connect codex-chat
-sudo jarvis accounts test codex-chat
-sudo jarvis accounts disconnect codex-chat
 ```
 
-`codex-chat` is the separate ChatGPT login of the text-only Codex chat worker
-(identity `jarvis-codex-chat`, see below); `codex` is the coding login.
+`codex` is the one ChatGPT login under `jarvis-codex`. The text-only Codex
+chat worker uses it today; the coding path shares it once it is re-reviewed and
+enabled (see [Codex chat worker](#codex-chat-worker-text-only-off-by-default)).
+Earlier releases had a separate `codex-chat` login under `jarvis-codex-chat`;
+see [Retired jarvis-codex-chat identity](#retired-jarvis-codex-chat-identity).
 
 `runtime_missing` means the reviewed official binary or dedicated identity is
 missing or its protected state layout failed validation. `wrong_auth_mode` means subscription/ChatGPT authentication
@@ -124,8 +123,9 @@ not prove that it is disabled. Therefore production worker activation remains
 an explicit owner-operated acceptance step after verifying that setting (or a
 provider-documented machine-readable no-overage control is available).
 Disconnect disables the socket and stops active Claude runs before logout.
-Codex disconnect disables/stops its broker and App Server before invoking the
-official logout command.
+Codex disconnect disables the chat worker socket, stops the chat worker and
+disables/stops its broker and App Server before invoking the official logout
+command.
 Neither worker owns a TCP listener.
 
 After a reviewed release is installed, the official CLI is verified and the
@@ -209,6 +209,107 @@ signature with `gpgv --keyring <dearmored deploy/keys/claude-code-release.asc>`
 and the checksum with `sha256sum`, then
 `sudo install -o root -g root -m 0755 claude /usr/local/bin/claude`.
 
+## Installing the Codex CLI runtime
+
+Core Admin → AI Accounts shows, on the Codex card, the installed Codex
+version, whether its ownership is safe, the latest GitHub release, whether a
+rollback copy exists and whether `cosign` is installed. **Install / update
+runtime** (latest release or an exact version) and **Roll back runtime** send a
+fixed typed request through the existing privileged session; the host-local
+equivalents are:
+
+```sh
+sudo jarvis accounts runtime status codex
+sudo jarvis accounts runtime install codex --channel latest   # or --version 0.160.0
+sudo jarvis accounts runtime rollback codex
+```
+
+Owner steps:
+
+1. `sudo apt install cosign` (once). Without it the installer refuses to start.
+2. Before the first install, check once that this cosign really rejects what
+   it must (see [Checking cosign](#checking-cosign-before-the-first-install)).
+3. Install the runtime from Core Admin (or the command above).
+4. Review that exact version for the chat worker and set
+   `JARVIS_CODEX_REVIEWED_VERSION` (see
+   [Codex chat worker](#codex-chat-worker-text-only-off-by-default)); the
+   installer never changes the reviewed version.
+5. `sudo jarvis accounts connect codex` (the one Codex login), or Connect in
+   Core Admin.
+
+The installer only uses `https://api.github.com/repos/openai/codex/releases`
+and `https://github.com/openai/codex/releases/download` (HTTPS only, bounded
+size and time) and fails closed at every step, in a private work directory
+inside the root-only `/usr/local/lib/jarvis` (never `$TMPDIR`):
+
+1. Refuse an unsafe destination (as for Claude: `/usr/local/bin/codex` may not
+   be a symlink or foreign-owned, no unsafe ancestor) and a missing or
+   non-root-controlled `/usr/bin/cosign`.
+2. Resolve `--version` (strict `MAJOR.MINOR.PATCH`) or the latest release from
+   the API; the release tag must be exactly `rust-v<version>`. There is no
+   version floor here: the chat worker's owner-set reviewed version is the
+   gate for use.
+3. Download `codex-<arch>-unknown-linux-musl.sigstore` and
+   `codex-<arch>-unknown-linux-musl.tar.gz`. GitHub answers with one redirect;
+   the installer follows exactly that hop by hand and only to
+   `https://objects.githubusercontent.com/` or
+   `https://release-assets.githubusercontent.com/`. Each file must match the
+   size and SHA-256 `digest` that the GitHub API publishes for it.
+4. Decompress with `/usr/bin/gzip` and accept only one ustar/GNU header for the
+   regular file `codex-<arch>-unknown-linux-musl` (at most 400 MiB) followed by
+   zero padding: links, other or `..`/absolute paths, extension headers and
+   extra members are refused.
+5. Run, with a clean environment, a private `HOME` and a 3-minute bound:
+
+   ```sh
+   cosign verify-blob --offline=true --bundle codex-<arch>-unknown-linux-musl.sigstore \
+     --certificate-identity https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v<version> \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com codex
+   ```
+
+   The identity is matched exactly (no regular expression). `--offline` only
+   forbids an online Rekor search; the bundle's signed entry timestamp is still
+   checked against the Rekor key in Sigstore's TUF trusted root, which cosign
+   refreshes from its embedded root.
+6. If the installed binary is already identical, stop without changes.
+   Otherwise keep it as `/usr/local/lib/jarvis/codex.previous` and atomically
+   install the verified binary as `root:root 0755`, exactly as for Claude.
+
+The candidate is never executed as root: `runtime status` runs
+`codex --version` only as `jarvis-codex` in the hardened transient service.
+Rollback restores, unverified, whatever binary the last install replaced.
+Each install and rollback writes fixed `provider/action/version/outcome`
+events to `authpriv` syslog.
+
+cosign itself runs as root (it reads the root-only work directory) with no
+other input than the two files and the fixed arguments above.
+
+Not verified on the Home Node yet: a real install with the Ubuntu cosign 2.6.2
+package (the tests use a fake cosign), including how it fetches the TUF
+trusted root.
+
+### Checking cosign before the first install
+
+Run this once as your normal user (no `sudo`) in an empty directory. It
+downloads the published 0.160.0 x86_64 release (about 110 MB) and must print
+`ok` three times; any `UNEXPECTED` means do not use the installer.
+
+```sh
+base=https://github.com/openai/codex/releases/download/rust-v0.160.0
+asset=codex-x86_64-unknown-linux-musl
+curl -fsSLO "$base/$asset.tar.gz" && curl -fsSLO "$base/$asset.sigstore"
+tar -xzf "$asset.tar.gz" "$asset"
+sha256sum "$asset"   # 12eb3e81114588aca3b7998f4f19e8997b056aca08e57a7ca7c8a3ec8c652aad
+id=https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v
+verify() { cosign verify-blob --offline=true --bundle "$asset.sigstore" \
+    --certificate-identity "$1" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com "$2"; }
+verify "${id}0.160.0" "$asset" && echo ok || echo UNEXPECTED
+cp "$asset" tampered && printf x >> tampered
+verify "${id}0.160.0" tampered && echo UNEXPECTED || echo ok
+verify "${id}0.159.0" "$asset" && echo UNEXPECTED || echo ok
+```
+
 ## Production activation
 
 Before production activation, the owner must install and review the official
@@ -279,25 +380,63 @@ metered. `paid_api: "off"` keeps it, and a metered entry after it still needs
 through an owner-routed chain or a brain pin, always with an exact model that
 is enabled in `policy.json`.
 
-**Identity.** The worker runs as its own system user `jarvis-codex-chat`
-with its own ChatGPT login home `/var/lib/jarvis-codex-chat`
-(`StateDirectory=jarvis-codex-chat`). The owner links it separately with
-`sudo jarvis accounts connect codex-chat`, which runs
-`codex login --device-auth` under that identity. It shares no UID, login or
-state with the `jarvis-codex` identity of the coding broker and App Server, so
-a compromised chat CLI cannot signal those processes or read their login. The
-prepare and install scripts create the identity like the other worker
-identities (nologin shell, own group, no Docker group, private 0700 home). The
-unit makes the login home its only writable state. The `jarvis-codex` login
-home, the coding broker, App Server, engineering and repository state
-(`/var/lib/jarvis-codex`, `/var/lib/jarvis-codex-broker`, `/run/jarvis-codex`,
-`/run/jarvis-codex-broker`, `/var/lib/jarvis-engineering`,
-`/var/lib/jarvis-codex-repositories`), Core's state and the Claude worker are
-inaccessible to it. The worker sets `PR_SET_DUMPABLE` to 0 at start, so it
-writes no core dump and processes of the same UID cannot ptrace it or read its
-memory. `PrivatePIDs` gives it its own PID namespace. `codex-chat` disconnect
-disables the chat socket and stops the worker before it logs out; `codex`
-disconnect no longer touches the chat worker.
+**Identity.** The worker runs as `jarvis-codex` with its ChatGPT login home
+`/var/lib/jarvis-codex` (`StateDirectory=jarvis-codex`), the one Codex login
+that `sudo jarvis accounts connect codex` links with `codex login
+--device-auth`. The login home is the unit's only writable state, so the CLI
+can refresh its token. The coding broker, App Server, engineering and
+repository state (`/var/lib/jarvis-codex-broker`, `/run/jarvis-codex` with the
+App Server socket, `/run/jarvis-codex-broker`, `/var/lib/jarvis-engineering`,
+`/var/lib/jarvis-codex-repositories`), the App Server's session history inside
+the login home (`.codex/sessions`, `.codex/archived_sessions`,
+`.codex/history.jsonl`; only paths that exist when the unit starts can be
+hidden), Core's state, the Claude worker and the retired
+`/var/lib/jarvis-codex-chat` are inaccessible to it. `--ephemeral` keeps chat
+runs out of the session history, and `--ignore-user-config` ignores the shared
+`config.toml`. The worker sets `PR_SET_DUMPABLE` to 0 at start, so it writes no
+core dump and processes of the same UID cannot ptrace it or read its memory.
+`PrivatePIDs` and `ProtectProc=invisible` keep the App Server and broker
+processes of the same UID out of its view. `codex` disconnect disables the chat
+socket and stops the worker before it logs out.
+
+**Hard requirement before the coding path is enabled.** The text-only chat
+worker and the coding path share the one `jarvis-codex` ChatGPT login. Before
+the Codex broker or App Server is ever enabled, this shared-token design must
+be re-reviewed, covering at least:
+
+- a single owner of the token and its refresh (the chat worker and the App
+  Server could otherwise refresh `auth.json` concurrently and invalidate each
+  other), refresh races and lock-out on the Home Node;
+- the reach of a prompt-injected chat run into coding sessions and their
+  history (same UID, same login home);
+- config poisoning through the shared, writable login home: a chat run that
+  writes `~/.codex/config.toml`, `AGENTS.md`, `rules/`, `skills/`, MCP server
+  or `notify` commands would change what the coding path loads and executes;
+- same-UID abstract Unix sockets, which file permissions and
+  `InaccessiblePaths` do not cover.
+
+Until that review is done and recorded, the coding path stays off. The units
+enforce it: `jarvis-codex-chat.socket` and `.service` declare
+`Conflicts=jarvis-codex.service jarvis-codex-broker.service`, so starting one
+side stops the other, and `verify-home-node.sh` fails when the chat worker and
+a coding unit are enabled or running together.
+
+### Retired jarvis-codex-chat identity
+
+Earlier releases ran the chat worker as a separate `jarvis-codex-chat` user
+with its own login in `/var/lib/jarvis-codex-chat`. Nothing uses it any more
+and nothing removes it automatically. `sudo jarvis accounts status codex`,
+Core Admin and `verify-home-node.sh` report it as legacy while it exists. After
+updating, connect the one Codex login (`sudo jarvis accounts connect codex`),
+then remove the old identity and its login home:
+
+```sh
+sudo userdel jarvis-codex-chat
+sudo rm -rf --one-file-system /var/lib/jarvis-codex-chat
+```
+
+This deletes the old login token from the host only. To also end that session
+at OpenAI, sign it out in your ChatGPT account's security settings.
 
 **Unit hardening.** On top of every directive of the Claude worker and
 `PrivateDevices`, the unit sets `PrivatePIDs`, `ProcSubset=pid`,
@@ -342,8 +481,8 @@ while the socket or service is enabled or active.
 
 Owner activation:
 
-1. Install the official Codex CLI as a root-owned regular file at
-   `/usr/local/bin/codex` (not a symlink or an npm wrapper).
+1. Install the official Codex CLI at `/usr/local/bin/codex` with the verified
+   installer ([Installing the Codex CLI runtime](#installing-the-codex-cli-runtime)).
 2. Check that this version supports every flag and `-c` key in the invocation
    above (`codex exec --help` and the official non-interactive and config
    documentation), that its `--json` events use the type names the worker
@@ -354,10 +493,10 @@ Owner activation:
    (root-owned, `0644`; it is not a secret). After a CLI update, review again
    and change the value, then `sudo systemctl try-restart
    jarvis-codex-chat.service`.
-3. `sudo jarvis accounts connect codex-chat` (or Connect on the "Codex chat"
-   card in Core Admin → AI Accounts), then `sudo jarvis accounts status
-   codex-chat` must report `connected`, not `wrong_auth_mode`. This is a
-   separate login from `codex`; linking one never links the other.
+3. `sudo jarvis accounts connect codex` (or Connect on the "Codex" card in
+   Core Admin → AI Accounts), then `sudo jarvis accounts status codex` must
+   report `connected`, not `wrong_auth_mode`. This is the same login the
+   coding path will use; it stays off (see the hard requirement above).
 4. Record the exact pair, then enable it:
    `sudo jarvis models register codex-cli gpt-6-luna` and
    `sudo jarvis models enable codex-cli gpt-6-luna` (or "Register subscription

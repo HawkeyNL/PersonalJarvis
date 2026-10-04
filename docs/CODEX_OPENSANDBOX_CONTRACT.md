@@ -87,6 +87,30 @@ revoke outstanding tokens. The broker does not expose model selection, a
 generic OpenAI endpoint, credential inspection, arbitrary request bodies or
 general command execution.
 
+### Shared login with the chat worker
+
+The text-only Codex chat worker (`jarvis-codex-chat.service`) runs as the same
+`jarvis-codex` identity with the same ChatGPT login home. **Hard requirement:**
+before the Codex broker or App Server is ever enabled, this shared-token
+design must be re-reviewed, covering at least:
+
+- a single owner of the token and its refresh (the chat worker and the App
+  Server could otherwise refresh `auth.json` concurrently and invalidate each
+  other), refresh races and lock-out on the Home Node;
+- the reach of a prompt-injected chat run into coding sessions and their
+  history (same UID, same login home);
+- config poisoning through the shared, writable login home: a chat run that
+  writes `~/.codex/config.toml`, `AGENTS.md`, `rules/`, `skills/`, MCP server
+  or `notify` commands would change what the coding path loads and executes;
+- same-UID abstract Unix sockets, which file permissions and
+  `InaccessiblePaths` do not cover.
+
+Until that review is done and recorded, the coding path stays off. The units
+enforce it: `jarvis-codex-chat.socket` and `.service` declare
+`Conflicts=jarvis-codex.service jarvis-codex-broker.service`, so starting one
+side stops the other, and `verify-home-node.sh` fails when the chat worker and
+a coding unit are enabled or running together.
+
 ## Current execution path and remaining activation gate
 
 The sandbox never opens a host/private-network connection. The fixed

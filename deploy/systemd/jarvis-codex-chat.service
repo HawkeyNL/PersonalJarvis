@@ -3,14 +3,20 @@ Description=Jarvis Codex chat subscription worker (text only)
 Requires=jarvis-codex-chat.socket
 After=jarvis-codex-chat.socket network-online.target
 Wants=network-online.target
+# The coding path shares this login and stays off until the shared-token
+# design is re-reviewed: starting the chat worker stops it, and vice versa.
+Conflicts=jarvis-codex.service jarvis-codex-broker.service
 
 [Service]
 Type=exec
-# Dedicated identity with its own ChatGPT login home (`jarvis accounts connect
-# codex-chat`). It shares no UID or state with the jarvis-codex coding broker
-# or App Server; their state, Core's and the Claude worker's stay inaccessible.
-User=jarvis-codex-chat
-Group=jarvis-codex-chat
+# The one Codex identity and ChatGPT login (`jarvis accounts connect codex`).
+# Its login home is writable for token refresh. The coding broker and App
+# Server state (their own directories and sockets, and the App Server's
+# session history inside the login home), Core's state, the Claude worker and
+# the retired jarvis-codex-chat login stay inaccessible. Re-review this
+# shared-token design before the coding path is ever enabled.
+User=jarvis-codex
+Group=jarvis-codex
 ExecStart=/opt/jarvis/current/jarvis-codex-chat-worker
 WorkingDirectory=/run/jarvis-codex-chat
 # Owner-written, root-owned, optional: JARVIS_CODEX_REVIEWED_VERSION=<exact
@@ -18,7 +24,7 @@ WorkingDirectory=/run/jarvis-codex-chat
 # applies. Absent, empty or malformed keeps every run incompatible_runtime.
 EnvironmentFile=-/etc/jarvis/codex-chat-worker.env
 UnsetEnvironment=OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN OPENAI_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN HF_TOKEN SSH_AUTH_SOCK
-StateDirectory=jarvis-codex-chat
+StateDirectory=jarvis-codex
 StateDirectoryMode=0700
 RuntimeDirectory=jarvis-codex-chat
 RuntimeDirectoryMode=0700
@@ -67,7 +73,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # resolver address here instead.
 IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
 IPAddressAllow=127.0.0.53
-InaccessiblePaths=/etc/jarvis /var/lib/jarvis -/var/lib/jarvis-claude -/var/lib/jarvis-codex -/var/lib/jarvis-codex-broker -/var/lib/jarvis-engineering -/var/lib/jarvis-codex-repositories -/run/jarvis-codex -/run/jarvis-codex-broker
+InaccessiblePaths=/etc/jarvis /var/lib/jarvis -/var/lib/jarvis-claude -/var/lib/jarvis-codex-chat -/var/lib/jarvis-codex-broker -/var/lib/jarvis-engineering -/var/lib/jarvis-codex-repositories -/run/jarvis-codex -/run/jarvis-codex-broker -/var/lib/jarvis-codex/.codex/sessions -/var/lib/jarvis-codex/.codex/archived_sessions -/var/lib/jarvis-codex/.codex/history.jsonl
 TasksMax=64
 MemoryMax=2G
 
