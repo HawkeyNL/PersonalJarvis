@@ -57,7 +57,7 @@ pub(crate) enum LayaCommand {
     /// Download and verify the pinned wheels and model files, provision offline,
     /// then enable Laya in shadow mode.
     Install,
-    /// Enable the socket, start and probe the service; mode off becomes shadow.
+    /// Enable and start the socket and service, probe health; mode off becomes shadow.
     Enable,
     /// Set Core's mode to off, then stop and disable the socket and service.
     Disable,
@@ -242,9 +242,10 @@ fn enable(layout: &Layout, host: &dyn Host) -> Result<String> {
         provisioned(layout)?,
         "Laya is not installed; run: sudo jarvis laya install"
     );
-    host.systemctl(&["enable", "--now", SOCKET])?;
+    // Both units start at boot so the checkpoints stay resident; a cold
+    // socket activation would exceed Core's bounded Laya timeout.
     let started = host
-        .systemctl(&["start", SERVICE])
+        .systemctl(&["enable", "--now", SOCKET, SERVICE])
         .and_then(|()| probe(layout, host));
     if let Err(error) = started {
         let _ = host.systemctl(&["disable", "--now", SERVICE, SOCKET]);
@@ -260,9 +261,11 @@ fn enable(layout: &Layout, host: &dyn Host) -> Result<String> {
 }
 
 fn disable(layout: &Layout, host: &dyn Host) -> Result<String> {
-    // Core first stops consulting Laya; a failed restart leaves units as-is.
-    set_mode(layout, host, LayaMode::Off)?;
+    // Core first stops consulting Laya. Turning off always completes: a Core
+    // that is slow to become ready is reported, never a reason to keep Laya on.
+    let core = set_mode(layout, host, LayaMode::Off);
     host.systemctl(&["disable", "--now", SERVICE, SOCKET])?;
+    core.context("Laya was stopped and disabled")?;
     Ok("Laya stopped and disabled; Core mode: off".into())
 }
 
@@ -481,6 +484,7 @@ fn stage_artifacts(layout: &Layout, host: &dyn Host, artifacts: &[Artifact]) -> 
     expected.extend(directories.iter().cloned());
     check_tree(layout, &stage, Path::new(""), &expected)?;
 
+    remove_stale_work(layout)?;
     // Never `$TMPDIR`: a root-only work directory beside staging.
     let work = tempfile::Builder::new()
         .prefix(".download.")
@@ -509,6 +513,44 @@ fn stage_artifacts(layout: &Layout, host: &dyn Host, artifacts: &[Artifact]) -> 
     )?;
     write_atomic(&stage.join("models.sha256"), MODELS.as_bytes(), 0o644, None)?;
     Ok(downloaded)
+}
+
+/// Removes work directories an interrupted install left behind: only real
+/// `.download.XXXXXX` directories owned by the expected owner directly below
+/// the fixed cache directory. `remove_dir_all` never follows symlinks.
+fn remove_stale_work(layout: &Layout) -> Result<()> {
+    for entry in fs::read_dir(&layout.cache)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let stale = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".download."))
+            .is_some_and(|suffix| {
+                suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            });
+        let metadata = entry.metadata()?;
+        if stale && metadata.is_dir() && metadata.uid() == layout.owner {
+            fs::remove_dir_all(entry.path())
+                .with_context(|| format!("remove stale {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Hugging Face redirects `resolve/` to its own API or CDN hosts
+/// (`huggingface.co`, `*.hf.co`). No userinfo, port or other scheme.
+fn model_redirect_allowed(target: &str) -> bool {
+    let Some(rest) = target.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or_default();
+    rest.contains('/')
+        && rest.bytes().all(|byte| byte.is_ascii_graphic())
+        && !host.is_empty()
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b".-".contains(&byte))
+        && (host == "huggingface.co" || (host.ends_with(".hf.co") && !host.starts_with('.')))
 }
 
 /// `true` when an already staged file matches its pin; a differing regular
@@ -687,21 +729,96 @@ fn read_env(layout: &Layout) -> Result<CoreEnv> {
 
 const MODE_KEY: &[u8] = b"JARVIS_LAYA_MODE=";
 
-fn mode_in(bytes: &[u8]) -> Result<LayaMode> {
-    let mut values = bytes
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| line.strip_prefix(MODE_KEY));
-    let value = values.next();
-    ensure!(
-        values.next().is_none(),
-        "protected Core configuration contains duplicate JARVIS_LAYA_MODE"
-    );
-    match value {
-        None | Some(b"off") => Ok(LayaMode::Off),
-        Some(b"shadow") => Ok(LayaMode::Shadow),
-        Some(b"primary") => Ok(LayaMode::Primary),
-        Some(_) => bail!("protected Core configuration has an unsupported JARVIS_LAYA_MODE"),
+/// For each physical line, whether systemd's EnvironmentFile parser starts a
+/// new assignment there (not inside a multi-line quoted value or a backslash
+/// continuation). `None` when the file ends inside such a value.
+fn assignment_starts(bytes: &[u8]) -> Option<Vec<bool>> {
+    let odd_backslashes =
+        |line: &[u8]| line.iter().rev().take_while(|byte| **byte == b'\\').count() % 2 == 1;
+    // `Some(b'\\')` is a continued unquoted value, otherwise the open quote.
+    let mut open: Option<u8> = None;
+    let mut starts = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        starts.push(open.is_none());
+        let rest = match open {
+            Some(b'\\') => {
+                open = odd_backslashes(line).then_some(b'\\');
+                continue;
+            }
+            Some(quote) => {
+                open = Some(quote);
+                line
+            }
+            None => {
+                let trimmed = line.trim_ascii_start();
+                let Some(index) = trimmed.iter().position(|byte| *byte == b'=') else {
+                    continue;
+                };
+                if trimmed.starts_with(b"#") || trimmed.starts_with(b";") {
+                    continue;
+                }
+                let value = trimmed[index + 1..].trim_ascii_start();
+                match value.first() {
+                    Some(quote @ (b'\'' | b'"')) => {
+                        open = Some(*quote);
+                        &value[1..]
+                    }
+                    _ => {
+                        open = odd_backslashes(value).then_some(b'\\');
+                        continue;
+                    }
+                }
+            }
+        };
+        let quote = open.unwrap_or_default();
+        let mut escaped = false;
+        for byte in rest {
+            if escaped {
+                escaped = false;
+            } else if quote == b'"' && *byte == b'\\' {
+                escaped = true;
+            } else if *byte == quote {
+                open = None;
+                break;
+            }
+        }
     }
+    open.is_none().then_some(starts)
+}
+
+/// Reads the mode the way Core receives it. Any other spelling systemd might
+/// accept (whitespace, quotes, escapes, continuation) is refused so the CLI
+/// state can never diverge from Core's.
+fn mode_in(bytes: &[u8]) -> Result<LayaMode> {
+    let starts = assignment_starts(bytes)
+        .context("protected Core configuration ends inside a quoted or continued value")?;
+    let mut value = None;
+    for (line, starts) in bytes.split(|byte| *byte == b'\n').zip(starts) {
+        let trimmed = line.trim_ascii_start();
+        let comment = trimmed.starts_with(b"#") || trimmed.starts_with(b";");
+        if !line
+            .windows(MODE_KEY.len() - 1)
+            .any(|part| part == &MODE_KEY[..MODE_KEY.len() - 1])
+            || (starts && comment)
+        {
+            continue;
+        }
+        let mode = match line.strip_prefix(MODE_KEY).filter(|_| starts) {
+            Some(b"off") => LayaMode::Off,
+            Some(b"shadow") => LayaMode::Shadow,
+            Some(b"primary") => LayaMode::Primary,
+            _ => bail!(
+                "protected Core configuration has a non-canonical JARVIS_LAYA_MODE line; \
+                 normalise it to JARVIS_LAYA_MODE=off|shadow|primary"
+            ),
+        };
+        ensure!(
+            value.replace(mode).is_none(),
+            "protected Core configuration contains duplicate JARVIS_LAYA_MODE"
+        );
+    }
+    Ok(value.unwrap_or(LayaMode::Off))
 }
 
 fn with_mode(bytes: &[u8], mode: LayaMode) -> Vec<u8> {
@@ -734,8 +851,9 @@ fn read_mode(layout: &Layout) -> Result<LayaMode> {
 }
 
 /// Atomically replaces JARVIS_LAYA_MODE, restarts Core and waits for
-/// readiness; on failure the previous bytes are restored and Core restarted.
-/// Returns whether anything changed.
+/// readiness. If Core is not ready, a switch to shadow or primary is undone
+/// (previous bytes restored, Core restarted); off is kept. Returns whether
+/// anything changed.
 fn set_mode(layout: &Layout, host: &dyn Host, mode: LayaMode) -> Result<bool> {
     let original = read_env(layout)?;
     if mode_in(&original.bytes)? == mode {
@@ -749,6 +867,12 @@ fn set_mode(layout: &Layout, host: &dyn Host, mode: LayaMode) -> Result<bool> {
         ownership,
     )?;
     if let Err(error) = host.restart_core() {
+        // Off is the safe direction: never undo it because Core was slow.
+        if mode == LayaMode::Off {
+            return Err(error.context(
+                "Laya mode off is saved, but Core did not report ready (run: sudo jarvis health)",
+            ));
+        }
         write_atomic(&layout.core_env, &original.bytes, 0o640, ownership)
             .context("Core is not ready and the previous configuration could not be restored")?;
         let recovered = host.restart_core();
@@ -901,33 +1025,57 @@ impl Host for System {
 
     fn fetch(&self, url: &str, output: &Path, limit: u64) -> Result<()> {
         validate_system_executable(CURL)?;
-        // `-q` (first) ignores any curlrc. Hugging Face serves weights via an
-        // HTTPS redirect; every byte is hash-verified after the download.
-        let status = trusted_command(CURL)
-            .args(["-q", "--fail", "--silent", "--show-error", "--location"])
-            .args(["--proto", "=https", "--proto-redir", "=https", "--tlsv1.2"])
-            .args([
-                "--max-redirs",
-                "5",
-                "--connect-timeout",
-                "20",
-                "--max-time",
-                "1800",
-            ])
-            .args(["--max-filesize", &limit.to_string(), "--output"])
-            .arg(output)
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .status()
-            .context("start Laya download")?;
-        ensure!(status.success(), "download failed: {url}");
-        Ok(())
+        let output = output.to_str().context("download path is not UTF-8")?;
+        let limit = limit.to_string();
+        // PyPI and the PyTorch index serve wheels directly. Hugging Face
+        // answers with a redirect, which is followed by hand and only to its
+        // own hosts; every byte is hash-verified afterwards anyway.
+        let mut current = url.to_owned();
+        for _ in 0..4 {
+            // `-q` (first) ignores any curlrc; curl never follows redirects.
+            let (ok, written) = Self::output(
+                CURL,
+                &[
+                    "-q",
+                    "--fail",
+                    "--silent",
+                    "--proto",
+                    "=https",
+                    "--tlsv1.2",
+                    "--connect-timeout",
+                    "20",
+                    "--max-time",
+                    "1800",
+                    "--max-filesize",
+                    &limit,
+                    "--write-out",
+                    "%{http_code} %{redirect_url}",
+                    "--output",
+                    output,
+                    &current,
+                ],
+                4096,
+            )?;
+            ensure!(ok, "download failed: {url}");
+            let written = String::from_utf8(written).context("download status is malformed")?;
+            let (code, target) = written.split_once(' ').unwrap_or((&written, ""));
+            if code == "200" {
+                return Ok(());
+            }
+            ensure!(
+                code.starts_with('3')
+                    && url.starts_with(MODEL_SOURCE)
+                    && model_redirect_allowed(target),
+                "download of {url} answered {code} with an unexpected redirect"
+            );
+            current = target.to_owned();
+        }
+        bail!("download of {url} redirected too often")
     }
 
     fn provision(&self) -> Result<()> {
-        // The provisioner of the active verified release, resolved through
-        // the same ownership and checksum-bound trust path as admin helpers.
+        // The active release's provisioner, resolved with the same
+        // root-ownership and active-release checks as the admin helpers.
         let status = trusted_admin_helper_command(AdminHelper::LayaProvisioner)?
             .stdin(Stdio::null())
             .status()
@@ -1328,6 +1476,24 @@ mod tests {
             "work directory removed"
         );
 
+        // Stale work directories of an interrupted run are removed; look-alike
+        // names and links are left alone and never followed.
+        let outside = layout.cache.with_file_name("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"keep").unwrap();
+        fs::create_dir(layout.cache.join(".download.abc123")).unwrap();
+        symlink(&outside, layout.cache.join(".download.abc123/link")).unwrap();
+        symlink(&outside, layout.cache.join(".download.zzzzzz")).unwrap();
+        fs::create_dir(layout.cache.join(".download.toolong7")).unwrap();
+        assert_eq!(stage_artifacts(&layout, &fake, &artifacts).unwrap(), 1);
+        assert!(!layout.cache.join(".download.abc123").exists());
+        assert!(fs::symlink_metadata(layout.cache.join(".download.zzzzzz")).is_ok());
+        assert!(layout.cache.join(".download.toolong7").is_dir());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"keep");
+        fs::remove_file(layout.cache.join(".download.zzzzzz")).unwrap();
+        fs::remove_dir(layout.cache.join(".download.toolong7")).unwrap();
+        fs::remove_file(&wheel).unwrap();
+
         // Unpinned, linked or writable entries stop staging before any fetch.
         let calls = fake.calls().len();
         fs::write(stage.join("wheels/extra-1-py3-none-any.whl"), b"x").unwrap();
@@ -1401,28 +1567,122 @@ mod tests {
     }
 
     #[test]
-    fn disable_turns_core_off_before_stopping_units() {
+    fn disable_turns_core_off_and_always_stops_units() {
         let (_directory, layout) = fixture();
         write_env(&layout, &ENV.replace("MODE=off", "MODE=primary"));
         let fake = Fake::default();
         fake.socket_enabled.set(true);
-        fake.restarts.borrow_mut().extend([false, true]);
-        assert!(disable(&layout, &fake).is_err());
-        assert!(
-            fake.socket_enabled.get(),
-            "units untouched when Core is not ready"
-        );
-        assert!(env(&layout).contains("MODE=primary"));
-
         disable(&layout, &fake).unwrap();
         assert_eq!(read_mode(&layout).unwrap(), LayaMode::Off);
         assert_eq!(
-            fake.calls()[2..],
+            fake.calls(),
             [
                 "restart",
                 "systemctl disable --now jarvis-laya.service jarvis-laya.socket"
             ]
         );
+
+        // A Core that misses /readyz never undoes "off" or keeps Laya running.
+        write_env(&layout, &ENV.replace("MODE=off", "MODE=shadow"));
+        fake.socket_enabled.set(true);
+        fake.restarts.borrow_mut().push_back(false);
+        let error = disable(&layout, &fake).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("mode off is saved"),
+            "{error:#}"
+        );
+        assert_eq!(read_mode(&layout).unwrap(), LayaMode::Off);
+        assert!(!fake.socket_enabled.get());
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| *call == "restart")
+                .count(),
+            2
+        );
+
+        // Even an unreadable configuration does not keep Laya running.
+        write_env(&layout, "JARVIS_LAYA_MODE=on\n");
+        fake.socket_enabled.set(true);
+        assert!(disable(&layout, &fake).is_err());
+        assert!(!fake.socket_enabled.get());
+        assert_eq!(env(&layout), "JARVIS_LAYA_MODE=on\n");
+    }
+
+    #[test]
+    fn mode_parsing_matches_systemd_or_fails_closed() {
+        for (contents, mode) in [
+            ("JARVIS_A=1\n", LayaMode::Off),
+            (
+                "# JARVIS_LAYA_MODE=primary\n ; JARVIS_LAYA_MODE=primary\n",
+                LayaMode::Off,
+            ),
+            ("JARVIS_LAYA_MODE=shadow", LayaMode::Shadow),
+            (
+                "PASSWORD=ab\"c\nJARVIS_LAYA_MODE=shadow\n",
+                LayaMode::Shadow,
+            ),
+            (
+                "A=\"x\\\"y\"\nJARVIS_LAYA_MODE=primary\n",
+                LayaMode::Primary,
+            ),
+            (
+                "A='multi\nline'\nJARVIS_LAYA_MODE=primary\n",
+                LayaMode::Primary,
+            ),
+            (
+                "A=continued\\\nB\nJARVIS_LAYA_MODE=shadow\n",
+                LayaMode::Shadow,
+            ),
+        ] {
+            assert_eq!(mode_in(contents.as_bytes()).unwrap(), mode, "{contents:?}");
+        }
+        for contents in [
+            " JARVIS_LAYA_MODE=primary\n",
+            "\tJARVIS_LAYA_MODE=primary\n",
+            "JARVIS_LAYA_MODE =primary\n",
+            "JARVIS_LAYA_MODE= primary\n",
+            "JARVIS_LAYA_MODE=primary \n",
+            "JARVIS_LAYA_MODE=primary\r\n",
+            "JARVIS_LAYA_MODE=\"primary\"\n",
+            "JARVIS_LAYA_MODE='primary'\n",
+            "JARVIS_LAYA_MODE=prim\\ary\n",
+            "export JARVIS_LAYA_MODE=primary\n",
+            "JARVIS_LAYA_MODE=off\nJARVIS_LAYA_MODE=off\n",
+            "A=x\\\nJARVIS_LAYA_MODE=primary\n",
+            "A=\"open\nJARVIS_LAYA_MODE=primary\"\n",
+            "A='open\nJARVIS_LAYA_MODE=off\n",
+            "A='never closed\n",
+            "X=1 # JARVIS_LAYA_MODE=off\n",
+        ] {
+            assert!(mode_in(contents.as_bytes()).is_err(), "{contents:?}");
+        }
+    }
+
+    #[test]
+    fn only_hugging_face_hosts_are_redirect_targets() {
+        for target in [
+            "https://us.aws.cdn.hf.co/xet-bridge-us/abc/def?X-Amz-Signature=1",
+            "https://cas-bridge.xethub.hf.co/x",
+            "https://huggingface.co/api/resolve-cache/models/convaiinnovations/laya/x",
+        ] {
+            assert!(model_redirect_allowed(target), "{target}");
+        }
+        for target in [
+            "",
+            "http://us.aws.cdn.hf.co/x",
+            "https://evil.example/x",
+            "https://hf.co.evil.example/x",
+            "https://evilhf.co/x",
+            "https://huggingface.co.evil.example/x",
+            "https://user@huggingface.co/x",
+            "https://huggingface.co:444/x",
+            "https://huggingface.co",
+            "https://huggingface.co/a b",
+            "https://.hf.co/x",
+        ] {
+            assert!(!model_redirect_allowed(target), "{target}");
+        }
     }
 
     #[test]
