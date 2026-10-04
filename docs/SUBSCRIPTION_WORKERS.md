@@ -12,8 +12,11 @@ The official clients own authentication. Claude Code uses
 dedicated `jarvis-claude` identity. Codex uses `codex login --device-auth`,
 `codex login status` and `codex logout` under `jarvis-codex`. These are distinct
 from Anthropic/OpenAI API keys. The root-owned official CLI executables must be
-reviewed and installed at `/usr/local/bin/claude` and `/usr/local/bin/codex`
-before linking; no updater downloads a moving CLI version automatically.
+installed at `/usr/local/bin/claude` and `/usr/local/bin/codex` before linking.
+Claude Code can be installed by the owner from Core Admin or the admin CLI (see
+[Installing the Claude Code runtime](#installing-the-claude-code-runtime));
+Codex is installed manually for now. No updater or worker ever downloads a
+moving CLI version automatically.
 Neither worker uses the owner's home or browser profile. An administrator must
 verify the installed CLI version and its supported login/runtime flags against
 the [Claude Code authentication documentation](https://code.claude.com/docs/en/authentication),
@@ -137,6 +140,71 @@ coding execution. A separate execution PR must implement the reviewed
 OpenSandbox workload, task-scoped proxy, repository snapshot authority and run
 lifecycle before that path can be activated. This missing execution layer does
 not block merging the fail-closed foundation.
+
+## Installing the Claude Code runtime
+
+Core Admin → AI Accounts shows the installed Claude Code version, whether it
+is inside the reviewed version contract, whether its ownership is safe, the
+current stable release and whether a rollback copy exists. **Install / update
+runtime** (channel `stable` or `latest`) and **Roll back runtime** send a fixed
+typed request through the existing privileged session; the host-local
+equivalents are:
+
+```sh
+sudo jarvis accounts runtime status claude
+sudo jarvis accounts runtime install claude --channel stable   # or --channel latest / --version 2.1.285
+sudo jarvis accounts runtime rollback claude
+```
+
+The installer only uses Anthropic's official release service
+(`https://downloads.claude.ai/claude-code-releases`, HTTPS only, no redirects,
+bounded size and time) and fails closed at every step, in a private work
+directory inside the root-only `/usr/local/lib/jarvis` (never `$TMPDIR`):
+
+1. Refuse an unsafe destination: `/usr/local/bin/claude` may not be a symlink
+   or foreign-owned, and no ancestor of it or of the rollback directory may be
+   group/other-writable or non-root-owned.
+2. Resolve the channel pointer (or `--version`) to a strict `MAJOR.MINOR.PATCH`
+   version and refuse anything outside the reviewed 2.1.248+ (2.1 line)
+   contract before any manifest or binary is downloaded.
+3. Verify `manifest.json.sig` with `gpgv` against the Anthropic Claude Code
+   release key pinned in the Jarvis binary (`deploy/keys/claude-code-release.asc`,
+   fingerprint `31DD DE24 DDFA B679 F42D 7BD2 BAA9 29FF 1A7E CACE`; it is never
+   fetched at install time). The signed manifest must name the requested
+   version.
+4. Download the binary for this platform (`linux-x64`, `linux-arm64` or their
+   `-musl` variants), bounded by the signed size (at most 400 MiB), and compare
+   its SHA-256 with the signed checksum.
+5. If the installed binary already matches the signed checksum, stop without
+   changes. Otherwise copy the current binary to
+   `/usr/local/lib/jarvis/claude.previous` (root-only `0700` directory), stage
+   the new one as `root:root 0755` beside the target, fsync it and rename it
+   over `/usr/local/bin/claude`. Leftovers of an interrupted install are
+   removed by the next install or rollback.
+
+The candidate is not executed during installation. Linux Claude Code binaries
+are not individually code-signed, so the signed manifest plus checksum is the
+integrity proof, and the version is bound by that signature. The binary first
+runs through the existing hardened paths (`accounts status`, Connect and the
+worker), always as `jarvis-claude` in a transient sandbox that re-checks the
+version contract before any use. Rollback restores, unverified, whatever
+binary the last install replaced (which may predate this installer) and
+removes the copy; its version is gated like any other before use. Each install and rollback writes fixed
+`provider/action/version/outcome` events to `authpriv` syslog.
+
+Every Claude invocation (worker runs and the accounts login/status/logout
+services) sets `DISABLE_UPDATES=1` and `DISABLE_AUTOUPDATER=1`, so the CLI
+never updates itself into the worker's writable home; only this owner-triggered
+installer changes the runtime.
+
+Manual fallback (for example without Core Admin): download the same
+`manifest.json`, `manifest.json.sig` and `linux-x64/claude` from
+`https://downloads.claude.ai/claude-code-releases/<version>/`, verify the
+signature with `gpgv --keyring <dearmored deploy/keys/claude-code-release.asc>`
+and the checksum with `sha256sum`, then
+`sudo install -o root -g root -m 0755 claude /usr/local/bin/claude`.
+
+## Production activation
 
 Before production activation, the owner must install and review the official
 CLIs at their pinned host paths, verify/disable Claude extra usage in the

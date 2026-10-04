@@ -15,6 +15,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
 
+mod runtime;
+
 const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const STATUS_LIMIT: u64 = 16 * 1024;
@@ -109,6 +111,11 @@ pub(super) enum AccountsCommand {
     Disconnect {
         provider: AccountProvider,
     },
+    /// Inspect, install or roll back the official provider CLI runtime.
+    Runtime {
+        #[command(subcommand)]
+        command: runtime::RuntimeCommand,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -146,7 +153,10 @@ pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
         AccountsCommand::Reconnect { provider } => Some((*provider, "reconnect")),
         AccountsCommand::Disconnect { provider } => Some((*provider, "disconnect")),
         AccountsCommand::Test { provider } => Some((*provider, "test")),
-        AccountsCommand::List | AccountsCommand::Status { .. } => None,
+        // Runtime commands record their own version-bearing audit events.
+        AccountsCommand::List
+        | AccountsCommand::Status { .. }
+        | AccountsCommand::Runtime { .. } => None,
     };
     if let Some((provider, action)) = audit {
         audit_account_event(provider, action, "initiated")?;
@@ -214,6 +224,7 @@ pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
                 println!("{} subscription connection verified", provider.name());
                 Ok(())
             }
+            AccountsCommand::Runtime { command } => runtime::run(command, json),
             AccountsCommand::Disconnect { provider } => {
                 if json {
                     bail!("account disconnection requires a trusted interactive terminal");
@@ -269,13 +280,17 @@ pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
 }
 
 fn audit_account_event(provider: AccountProvider, action: &str, outcome: &str) -> Result<()> {
-    validate_root_executable("/usr/bin/logger")?;
-    let record = format!(
+    audit_record(&format!(
         "provider={} action={} outcome={}",
         provider.name(),
         action,
         outcome
-    );
+    ))
+}
+
+/// Records only fixed, caller-validated `key=value` fields.
+fn audit_record(record: &str) -> Result<()> {
+    validate_root_executable("/usr/bin/logger")?;
     let result = Command::new("/usr/bin/logger")
         .args([
             "--tag",
@@ -283,7 +298,7 @@ fn audit_account_event(provider: AccountProvider, action: &str, outcome: &str) -
             "--priority",
             "authpriv.notice",
             "--",
-            &record,
+            record,
         ])
         .env_clear()
         .stdin(Stdio::null())
