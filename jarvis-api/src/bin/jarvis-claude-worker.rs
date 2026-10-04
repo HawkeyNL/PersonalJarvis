@@ -267,6 +267,9 @@ fn clean_command() -> Command {
         .env("CLAUDE_CONFIG_DIR", format!("{HOME}/.claude"))
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("LANG", "C.UTF-8")
+        // Only the root-installed runtime may run; never self-update into HOME.
+        .env("DISABLE_UPDATES", "1")
+        .env("DISABLE_AUTOUPDATER", "1")
         .current_dir(HOME);
     command
 }
@@ -285,6 +288,24 @@ mod tests {
             "connected"
         );
         assert_eq!(claude_subscription_status(br#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}"#), "connected");
+    }
+
+    #[test]
+    fn cli_environment_disables_self_updates() {
+        let command = clean_command();
+        let environment = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_str().unwrap(),
+                    value.and_then(|value| value.to_str()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(environment.get("DISABLE_UPDATES"), Some(&Some("1")));
+        assert_eq!(environment.get("DISABLE_AUTOUPDATER"), Some(&Some("1")));
+        assert!(!environment.contains_key("ANTHROPIC_API_KEY"));
     }
 
     #[test]

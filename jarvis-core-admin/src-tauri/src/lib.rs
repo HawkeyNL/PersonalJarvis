@@ -216,6 +216,26 @@ async fn ai_accounts(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+async fn claude_runtime(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+) -> Result<admin::ClaudeRuntimeStatus, String> {
+    with_session(session, |session| admin::claude_runtime(&session)).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn claude_runtime_mutation(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+    request: admin::ClaudeRuntimeMutation,
+) -> Result<admin::OperationResult, String> {
+    with_session(session, move |session| {
+        admin::claude_runtime_mutation(&session, request)
+    })
+    .await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 async fn ai_account_action(
     session: tauri::State<'_, Arc<session::SessionManager>>,
     provider: admin::AiAccountProvider,
@@ -307,6 +327,8 @@ pub fn run() {
             credentials,
             ai_accounts,
             ai_account_action,
+            claude_runtime,
+            claude_runtime_mutation,
             credential_set,
             devices_overview,
             device_action,
