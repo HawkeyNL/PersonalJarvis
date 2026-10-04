@@ -31,17 +31,30 @@ pub fn reviewed_codex_version(output: &[u8], reviewed: &str) -> bool {
 }
 
 /// Conservative projection of `codex login status`. Only a ChatGPT login is a
-/// subscription; an API-key login would bill the paid API and never counts.
+/// subscription; any other login (API key, Bedrock, access token) would not
+/// use the plan and never counts. The CLI writes its status line to stderr,
+/// possibly after `WARNING:` lines, so callers pass stdout and stderr and the
+/// lines are judged one by one.
 pub fn codex_subscription_status(output: &[u8]) -> &'static str {
     let Ok(text) = std::str::from_utf8(output) else {
         return "unhealthy";
     };
-    let line = text.trim().to_ascii_lowercase();
-    if line == "logged in using chatgpt" {
-        "connected"
-    } else if line.contains("api key") || line.contains("api-key") {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| line.trim().to_ascii_lowercase())
+        .filter(|line| !line.is_empty() && !line.starts_with("warning:"))
+        .collect();
+    let chatgpt = |line: &String| line == "logged in using chatgpt";
+    if lines.iter().any(|line| {
+        !chatgpt(line)
+            && (line.starts_with("logged in using")
+                || line.contains("api key")
+                || line.contains("api-key"))
+    }) {
         "wrong_auth_mode"
-    } else if line.contains("not logged in") {
+    } else if lines.iter().any(chatgpt) {
+        "connected"
+    } else if lines.iter().any(|line| line == "not logged in") {
         "logged_out"
     } else {
         "unhealthy"
@@ -169,6 +182,51 @@ mod tests {
         );
         assert_eq!(codex_subscription_status(b"Not logged in"), "logged_out");
         assert_eq!(codex_subscription_status(b""), "unhealthy");
+        assert_eq!(
+            codex_subscription_status(b"Logged in using Amazon Bedrock API key\n"),
+            "wrong_auth_mode"
+        );
+        assert_eq!(
+            codex_subscription_status(b"Logged in using access token\n"),
+            "wrong_auth_mode"
+        );
+        assert_eq!(
+            codex_subscription_status(b"Logged in using ChatGPT, probably"),
+            "wrong_auth_mode"
+        );
+    }
+
+    #[test]
+    fn status_is_read_per_line_after_warnings() {
+        // codex-cli 0.160.0: stdout empty, warnings then the status on stderr.
+        let warning = "WARNING: proceeding, even though we could not create PATH aliases: \
+                       Read-only file system (os error 30)\n";
+        let sample = |status: &str| format!("{warning}{status}\n");
+        assert_eq!(
+            codex_subscription_status(sample("Logged in using ChatGPT").as_bytes()),
+            "connected"
+        );
+        assert_eq!(
+            codex_subscription_status(sample("  logged in using chatgpt  ").as_bytes()),
+            "connected"
+        );
+        assert_eq!(
+            codex_subscription_status(sample("Not logged in").as_bytes()),
+            "logged_out"
+        );
+        assert_eq!(
+            codex_subscription_status(sample("Logged in using an API key - sk-***").as_bytes()),
+            "wrong_auth_mode"
+        );
+        assert_eq!(codex_subscription_status(warning.as_bytes()), "unhealthy");
+        // A second, non-ChatGPT login line is never outvoted.
+        assert_eq!(
+            codex_subscription_status(
+                b"Logged in using ChatGPT\nLogged in using an API key - sk-***\n"
+            ),
+            "wrong_auth_mode"
+        );
+        assert_eq!(codex_subscription_status(b"\xff\n"), "unhealthy");
     }
 
     #[test]

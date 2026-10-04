@@ -517,7 +517,8 @@ installed CLI accepts every flag and key above. The same applies to the exact
 `exec` JSONL events; a renamed type is refused, so a mismatch fails closed),
 and to the unit's `ExecPaths`, `MemoryDenyWriteExecute` and DNS settings with
 the real CLI. The same applies to the
-effect of `model_instructions_file` on Codex's built-in instructions, to
-whether `codex login status` prints to stdout (the accounts CLI makes the
-same assumption), and to whether `--ignore-user-config` also skips a global
-`AGENTS.md` in the login home.
+effect of `model_instructions_file` on Codex's built-in instructions and to
+whether `--ignore-user-config` also skips a global `AGENTS.md` in the login
+home. `codex login status` prints its status line to stderr, possibly after
+`WARNING:` lines, and exits 1 when logged out (verified with codex-cli
+0.160.0); the worker and the accounts CLI read both streams line by line.
