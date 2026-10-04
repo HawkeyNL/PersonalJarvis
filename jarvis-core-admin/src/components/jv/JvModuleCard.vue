@@ -28,7 +28,7 @@ const accessibleName = computed(() => [props.title, props.value, ...props.lines]
 
 <style scoped>
 .jv-card {
-  position: relative; display: flex; flex-direction: column; align-items: stretch; gap: 14px;
+  position: relative; display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 14px;
   box-sizing: border-box; min-width: 0; min-height: 87px; padding: 14px 30px 14px 20px;
   border-radius: var(--r-22); border: 1px solid var(--line); background: var(--card-bg);
   color: inherit; font: inherit; font-weight: 400; text-align: left; cursor: pointer;

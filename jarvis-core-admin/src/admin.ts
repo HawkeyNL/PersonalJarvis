@@ -176,8 +176,10 @@ export type CredentialProvider =
   | "huggingface"
   | "jev";
 export interface CredentialRecord { provider: CredentialProvider; configured: boolean }
+export const credentialLabels: Record<CredentialProvider, string> = { anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", xai: "xAI", zai: "Z.ai", "ollama-cloud": "Ollama Cloud", huggingface: "Hugging Face", jev: "TypeSafe Jev" };
 export type AiAccountProvider = "claude" | "codex" | "codex-chat";
 export type AiAccountAction = "connect" | "test" | "reconnect" | "disconnect";
+export const aiAccountLabels: Record<AiAccountProvider, string> = { claude: "Claude Code", codex: "Codex (coding)", "codex-chat": "Codex chat" };
 export interface AiAccountRecord {
   provider: AiAccountProvider;
   worker: string;

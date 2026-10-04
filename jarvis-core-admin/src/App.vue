@@ -145,7 +145,7 @@ onBeforeUnmount(() => {
 </script>
 <template>
   <div class="app-shell" @pointermove="recordActivity" @pointerdown="recordActivity" @mouseenter="recordActivity" @wheel="recordActivity" @touchstart="recordActivity" @keydown="recordActivity" @focusin="recordActivity">
-    <JvBackdrop glow-y="34%" horizon="64px" />
+    <JvBackdrop glow-y="34%" horizon="28px" />
     <nav class="rail" aria-label="Administration nodes">
       <button v-for="item in nodes" :key="item.id" type="button" :disabled="locked" :class="{ on: !locked && node.id === item.id }" :aria-current="!locked && node.id === item.id ? 'page' : undefined" @click="active = item.views[0].id">
         <span class="rail-icon" aria-hidden="true"><NavIcon :name="item.icon" /></span>

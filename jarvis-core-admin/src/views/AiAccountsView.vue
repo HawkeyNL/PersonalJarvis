@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { api, errorText, type AiAccountAction, type AiAccountProvider, type AiAccountRecord, type OperationResult } from "../admin";
+import { aiAccountLabels as labels, api, errorText, type AiAccountAction, type AiAccountProvider, type AiAccountRecord, type OperationResult } from "../admin";
 import ErrorPanel from "../components/ErrorPanel.vue";
 import PageHeader from "../components/PageHeader.vue";
 import ResultPanel from "../components/ResultPanel.vue";
@@ -10,7 +10,6 @@ const rows = ref<AiAccountRecord[]>([]);
 const busy = ref(false);
 const error = ref("");
 const result = ref<OperationResult | null>(null);
-const labels: Record<AiAccountProvider, string> = { claude: "Claude Code", codex: "Codex (coding)", "codex-chat": "Codex chat" };
 
 async function load() {
   busy.value = true;
