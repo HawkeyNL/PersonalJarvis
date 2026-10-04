@@ -202,17 +202,21 @@ fi
 # Optional owner-enabled Codex chat worker: when its socket is on, the local
 # IPC and identity boundary is mandatory.
 if systemctl is-active --quiet jarvis-codex-chat.socket; then
-    check "Codex chat worker uses its own jarvis-codex-chat identity" bash -c \
-        '[[ $(systemctl show -p User --value jarvis-codex-chat.service) == jarvis-codex-chat ]]'
-    check "Codex chat identity has no Docker or extra group access" bash -c \
-        '[[ $(id -nG jarvis-codex-chat) == jarvis-codex-chat ]]'
-    check "Codex chat login home is private" bash -c \
-        '[[ -d /var/lib/jarvis-codex-chat && ! -L /var/lib/jarvis-codex-chat && $(stat -c "%U:%G:%a" /var/lib/jarvis-codex-chat) == jarvis-codex-chat:jarvis-codex-chat:700 ]]'
+    check "Codex chat worker uses the jarvis-codex login identity" bash -c \
+        '[[ $(systemctl show -p User --value jarvis-codex-chat.service) == jarvis-codex ]]'
+    check "Codex identity has no Docker or extra group access" bash -c \
+        '[[ $(id -nG jarvis-codex) == jarvis-codex ]]'
+    check "Codex login home is private" bash -c \
+        '[[ -d /var/lib/jarvis-codex && ! -L /var/lib/jarvis-codex && $(stat -c "%U:%G:%a" /var/lib/jarvis-codex) == jarvis-codex:jarvis-codex:700 ]]'
     check "Codex chat socket is systemd-owned and private" bash -c \
         '[[ -S /run/jarvis-codex-chat.sock && ! -L /run/jarvis-codex-chat.sock && $(stat -c "%u:%G:%a" /run/jarvis-codex-chat.sock) == 0:jarvis:660 ]]'
     ui_detail "Codex chat worker: socket enabled (optional; subscription only)"
 else
     ui_detail "Codex chat worker: inactive (optional)"
+fi
+# Never removed automatically: the owner deletes the retired chat login.
+if getent passwd jarvis-codex-chat >/dev/null || [[ -e /var/lib/jarvis-codex-chat || -L /var/lib/jarvis-codex-chat ]]; then
+    ui_warning "legacy jarvis-codex-chat identity or /var/lib/jarvis-codex-chat is no longer used and can be removed (docs/SUBSCRIPTION_WORKERS.md)"
 fi
 
 # Optional owner-enabled disk housekeeping: its record is root-written and

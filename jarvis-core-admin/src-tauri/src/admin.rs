@@ -514,6 +514,9 @@ pub struct AiAccountRecord {
     pub state: String,
     pub billing: String,
     pub runtime: String,
+    /// The retired `jarvis-codex-chat` identity or state still exists.
+    #[serde(default)]
+    pub legacy_identity: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -521,8 +524,6 @@ pub struct AiAccountRecord {
 pub enum AiAccountProvider {
     Claude,
     Codex,
-    #[serde(rename = "codex-chat")]
-    CodexChat,
 }
 
 impl AiAccountProvider {
@@ -530,7 +531,6 @@ impl AiAccountProvider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::CodexChat => "codex-chat",
         }
     }
 }
@@ -953,13 +953,13 @@ pub fn ai_accounts(session: &SessionManager) -> AdminResult<Vec<AiAccountRecord>
 fn validate_ai_accounts(rows: Vec<AiAccountRecord>) -> AdminResult<Vec<AiAccountRecord>> {
     let providers: std::collections::BTreeSet<&str> =
         rows.iter().map(|row| row.provider.as_str()).collect();
-    if rows.len() != 3
+    if rows.len() != 2
         || providers.len() != rows.len()
         || rows.iter().any(|row| {
             !matches!(
                 (row.provider.as_str(), row.worker.as_str()),
-                ("claude", "jarvis-claude") | ("codex", "jarvis-codex") | ("codex-chat", "jarvis-codex-chat")
-            )
+                ("claude", "jarvis-claude") | ("codex", "jarvis-codex")
+            ) || (row.legacy_identity && row.provider != "codex")
                 || !matches!(
                     row.state.as_str(),
                     "connected"
@@ -970,7 +970,10 @@ fn validate_ai_accounts(rows: Vec<AiAccountRecord>) -> AdminResult<Vec<AiAccount
                         | "host_unsupported"
                         | "unhealthy"
                 )
-                || !matches!(row.billing.as_str(), "subscription" | "unverified" | "overage_unverified")
+                || !matches!(
+                    row.billing.as_str(),
+                    "subscription" | "unverified" | "overage_unverified"
+                )
                 || !matches!(
                     row.runtime.as_str(),
                     "inactive" | "socket_ready" | "active" | "unavailable"
@@ -1146,7 +1149,6 @@ pub fn ai_account_entry(action: &OsStr, provider: &OsStr) -> AdminResult<()> {
     let provider = match provider.to_str() {
         Some("claude") => AiAccountProvider::Claude,
         Some("codex") => AiAccountProvider::Codex,
-        Some("codex-chat") => AiAccountProvider::CodexChat,
         _ => return Err("unsupported AI account provider".to_owned()),
     };
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
@@ -2499,35 +2501,45 @@ mod tests {
             state: "logged_out".to_owned(),
             billing: "unverified".to_owned(),
             runtime: "inactive".to_owned(),
+            legacy_identity: false,
         };
         let claude = row("claude", "jarvis-claude");
         let codex = row("codex", "jarvis-codex");
-        let chat = row("codex-chat", "jarvis-codex-chat");
-        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone(), chat.clone()]).is_ok());
-        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone()]).is_err());
+        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone()]).is_ok());
+        assert!(validate_ai_accounts(vec![claude.clone()]).is_err());
         assert!(validate_ai_accounts(vec![claude.clone(), codex.clone(), codex.clone()]).is_err());
+        // The retired separate chat login is no longer a row.
+        let chat = row("codex-chat", "jarvis-codex-chat");
+        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone(), chat]).is_err());
+        // Only the Codex row may report the retired identity.
+        let legacy = AiAccountRecord {
+            legacy_identity: true,
+            ..codex.clone()
+        };
+        assert!(validate_ai_accounts(vec![claude.clone(), legacy.clone()]).is_ok());
+        let wrong = AiAccountRecord {
+            legacy_identity: true,
+            ..claude.clone()
+        };
+        assert!(validate_ai_accounts(vec![wrong, codex.clone()]).is_err());
         // A Claude CLI outside the reviewed contract is a state, not an error.
         let incompatible = AiAccountRecord {
             state: "incompatible_runtime".to_owned(),
             ..claude.clone()
         };
-        assert!(validate_ai_accounts(vec![incompatible, codex.clone(), chat.clone()]).is_ok());
+        assert!(validate_ai_accounts(vec![incompatible, codex.clone()]).is_ok());
         // So is a host tool that the account helper refuses to run.
         let host = AiAccountRecord {
             state: "host_unsupported".to_owned(),
             ..claude.clone()
         };
-        assert!(validate_ai_accounts(vec![host, codex.clone(), chat.clone()]).is_ok());
+        assert!(validate_ai_accounts(vec![host, codex.clone()]).is_ok());
         let unknown = AiAccountRecord {
             state: "surprise".to_owned(),
             ..claude.clone()
         };
-        assert!(validate_ai_accounts(vec![unknown, codex.clone(), chat.clone()]).is_err());
-        // The chat worker never shares the coding login's identity.
-        assert!(validate_ai_accounts(vec![claude, codex, row("codex-chat", "jarvis-codex")]).is_err());
-        assert_eq!(
-            serde_json::to_string(&AiAccountProvider::CodexChat).unwrap(),
-            "\"codex-chat\""
-        );
+        assert!(validate_ai_accounts(vec![unknown, codex.clone()]).is_err());
+        assert!(validate_ai_accounts(vec![claude, row("codex", "jarvis-codex-chat")]).is_err());
+        assert!(serde_json::from_str::<AiAccountProvider>("\"codex-chat\"").is_err());
     }
 }

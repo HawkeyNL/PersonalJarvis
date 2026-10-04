@@ -177,15 +177,16 @@ export type CredentialProvider =
   | "jev";
 export interface CredentialRecord { provider: CredentialProvider; configured: boolean }
 export const credentialLabels: Record<CredentialProvider, string> = { anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", xai: "xAI", zai: "Z.ai", "ollama-cloud": "Ollama Cloud", huggingface: "Hugging Face", jev: "TypeSafe Jev" };
-export type AiAccountProvider = "claude" | "codex" | "codex-chat";
+export type AiAccountProvider = "claude" | "codex";
 export type AiAccountAction = "connect" | "test" | "reconnect" | "disconnect";
-export const aiAccountLabels: Record<AiAccountProvider, string> = { claude: "Claude Code", codex: "Codex (coding)", "codex-chat": "Codex chat" };
+export const aiAccountLabels: Record<AiAccountProvider, string> = { claude: "Claude Code", codex: "Codex" };
 export interface AiAccountRecord {
   provider: AiAccountProvider;
   worker: string;
   state: "connected" | "logged_out" | "runtime_missing" | "wrong_auth_mode" | "incompatible_runtime" | "host_unsupported" | "unhealthy";
   billing: "subscription" | "unverified" | "overage_unverified";
   runtime: "inactive" | "socket_ready" | "active" | "unavailable";
+  legacy_identity?: boolean;
 }
 export interface ClaudeRuntimeStatus {
   provider: "claude";

@@ -120,7 +120,7 @@ onMounted(load);
           <button v-if="runtime?.rollback_available" class="small secondary" :disabled="busy" @click="confirmRuntime = { action: 'rollback' }">Roll back runtime…</button>
         </div>
       </template>
-      <template v-else-if="row.provider === 'codex'">
+      <template v-else>
         <p v-if="codexRuntime">Official runtime: {{ codexRuntime.installed ? (codexRuntime.version ?? "installed, version unknown") : "not installed" }}<template v-if="codexRuntime.installed"> · {{ codexRuntime.safe_ownership ? "root-owned" : "unsafe ownership" }}</template><br>Latest release: {{ codexRuntime.latest ?? "unavailable" }}<template v-if="codexRuntime.update_available"> (update available)</template><br>cosign: {{ codexRuntime.cosign_available ? "installed" : "missing — run sudo apt install cosign" }}</p>
         <p v-else-if="codexRuntimeError">Runtime status unavailable: {{ codexRuntimeError }}</p>
         <div class="dialog-actions">
@@ -130,7 +130,7 @@ onMounted(load);
           <button v-if="codexRuntime?.rollback_available" class="small secondary" :disabled="busy" @click="confirmCodexRuntime = { action: 'rollback' }">Roll back runtime…</button>
         </div>
       </template>
-      <p v-else>Official runtime: the shared <code>/usr/local/bin/codex</code>, installed from the Codex (coding) card.</p>
+      <p v-if="row.legacy_identity">The retired <code>jarvis-codex-chat</code> identity or <code>/var/lib/jarvis-codex-chat</code> still exists. It is no longer used and can be removed (see <code>docs/SUBSCRIPTION_WORKERS.md</code>).</p>
       <p v-if="row.provider === 'claude' && row.state === 'connected'">Claude login is linked. Verify extra usage is disabled or capped at zero in your provider account before explicitly enabling the worker socket.</p>
       <div class="dialog-actions">
         <button v-if="row.state !== 'connected'" class="small secondary" :disabled="busy" @click="act(row.provider, 'connect')">Connect</button>
@@ -145,5 +145,5 @@ onMounted(load);
   </section>
   <ConfirmDialog v-if="confirmRuntime" :title="runtimeDialog(confirmRuntime).title" :detail="runtimeDialog(confirmRuntime).detail" :confirm-label="runtimeDialog(confirmRuntime).label" @cancel="confirmRuntime = null" @confirm="runtimeAction(api.claudeRuntimeMutation, confirmRuntime)" />
   <ConfirmDialog v-if="confirmCodexRuntime" :title="codexRuntimeDialog(confirmCodexRuntime).title" :detail="codexRuntimeDialog(confirmCodexRuntime).detail" :confirm-label="codexRuntimeDialog(confirmCodexRuntime).label" @cancel="confirmCodexRuntime = null" @confirm="runtimeAction(api.codexRuntimeMutation, confirmCodexRuntime)" />
-  <ConfirmDialog v-if="confirmDisconnect" :title="`Disconnect ${labels[confirmDisconnect]}?`" detail="Active runs may fail. Reconnecting opens a trusted terminal and requires system administrator authorization again." confirm-label="Disconnect" @cancel="confirmDisconnect = null" @confirm="act(confirmDisconnect, 'disconnect')" />
+  <ConfirmDialog v-if="confirmDisconnect" :title="`Disconnect ${labels[confirmDisconnect]}?`" :detail="`${confirmDisconnect === 'codex' ? 'Also disables the Codex chat worker socket, which uses this login. ' : ''}Active runs may fail. Reconnecting opens a trusted terminal and requires system administrator authorization again.`" confirm-label="Disconnect" @cancel="confirmDisconnect = null" @confirm="act(confirmDisconnect, 'disconnect')" />
 </template>
