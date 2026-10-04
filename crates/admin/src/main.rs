@@ -39,6 +39,7 @@ mod admin_helpers;
 mod agent_tree;
 mod ai_accounts;
 mod credential_setup;
+mod laya;
 mod local_devices;
 mod sandbox_preflight;
 mod terminal_ui;
@@ -123,6 +124,12 @@ enum Commands {
     Services {
         #[command(subcommand)]
         command: ServicesCommand,
+    },
+    /// Optional local Laya classifier: install, turn on/off and Core mode;
+    /// see docs/LAYA_INTENT_ROUTING.md.
+    Laya {
+        #[command(subcommand)]
+        command: laya::LayaCommand,
     },
     /// Deterministic disk housekeeping; see docs/HOUSEKEEPING.md.
     Housekeeping {
@@ -575,6 +582,7 @@ fn run() -> Result<()> {
         Commands::Services {
             command: ServicesCommand::Status,
         } => services(&presentation),
+        Commands::Laya { command } => laya::run(command, cli.json),
         Commands::Housekeeping { command } => {
             let mut helper = trusted_admin_helper_command(AdminHelper::Housekeeping)?;
             helper.args(housekeeping_arguments(&command, cli.json));

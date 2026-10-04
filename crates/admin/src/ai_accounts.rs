@@ -625,7 +625,7 @@ fn validate_root_executable(path: &str) -> Result<()> {
 /// directory on the chain must be root-controlled, so no non-root user can
 /// redirect it between this check and exec. Callers execute the original path:
 /// multi-call binaries dispatch on argv[0].
-fn validate_system_executable(path: &str) -> Result<()> {
+pub(crate) fn validate_system_executable(path: &str) -> Result<()> {
     resolve_trusted_executable(Path::new("/"), Path::new(path), 0, SYSTEM_LINK_HOPS)
         .map(|_| ())
         .with_context(|| format!("system executable {path} is not root-controlled"))

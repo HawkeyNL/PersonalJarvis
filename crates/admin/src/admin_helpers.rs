@@ -7,6 +7,7 @@ pub(super) enum AdminHelper {
     Models,
     Credentials,
     Housekeeping,
+    LayaProvisioner,
 }
 
 impl AdminHelper {
@@ -15,6 +16,7 @@ impl AdminHelper {
             Self::Models => "jarvis-models",
             Self::Credentials => "jarvis-credentials",
             Self::Housekeeping => "jarvis-housekeeping",
+            Self::LayaProvisioner => "provision-laya",
         }
     }
 
@@ -24,6 +26,7 @@ impl AdminHelper {
             "jarvis-models" => Ok(Self::Models),
             "jarvis-credentials" => Ok(Self::Credentials),
             "jarvis-housekeeping" => Ok(Self::Housekeeping),
+            "provision-laya" => Ok(Self::LayaProvisioner),
             _ => bail!("unsupported internal helper"),
         }
     }

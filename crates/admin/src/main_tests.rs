@@ -1121,3 +1121,27 @@ fn update_summary_parses_schema_and_derives_the_migration_target() {
     }
     assert!(migration_target(&UpdateSummary::default()).is_err());
 }
+
+#[test]
+fn laya_cli_accepts_only_fixed_modes_and_no_paths() {
+    for args in [
+        &["jarvis", "laya", "status"][..],
+        &["jarvis", "laya", "install"],
+        &["jarvis", "laya", "enable"],
+        &["jarvis", "laya", "disable"],
+        &["jarvis", "laya", "mode", "off"],
+        &["jarvis", "laya", "mode", "shadow"],
+        &["jarvis", "laya", "mode", "primary"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
+    }
+    for args in [
+        &["jarvis", "laya", "mode", "on"][..],
+        &["jarvis", "laya", "mode"],
+        &["jarvis", "laya", "install", "/tmp/wheels"],
+        &["jarvis", "laya", "install", "--url", "https://example.com"],
+        &["jarvis", "laya", "uninstall"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+    }
+}
