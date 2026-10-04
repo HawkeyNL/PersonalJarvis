@@ -15,6 +15,6 @@ onMounted(() => load(false));
   <ErrorPanel v-if="error" :message="error" />
   <section v-if="data" class="card-list">
     <article v-for="(state, name) in data.checks" :key="name" class="row-card"><strong>{{ name }}</strong><StatusBadge :state="state" /></article>
-    <article class="detail-card"><span class="card-label">DEPLOYMENT VERIFIER</span><StatusBadge :state="data.verification ?? 'not run this session'" /></article>
+    <article class="row-card"><strong>Deployment verifier</strong><StatusBadge :state="data.verification ?? 'not run this session'" /></article>
   </section>
 </template>

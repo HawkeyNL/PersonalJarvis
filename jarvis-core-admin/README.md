@@ -92,6 +92,8 @@ Run native tests and lints independently of the server workspace:
 cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
+npm run build
+npm run test:unit
 ```
 
 ## Debian package
@@ -128,13 +130,20 @@ an update when Core, CLI, the graphical app, or multiple components changed.
 
 ## Scope
 
-The categorized navigation contains Overview, Health, Services, Logs, Agents,
-Models, Usage & Costs, Credentials, Update and System/About. The Models view
+The app uses the Jarvis redesign's visual language (bundled OFL fonts, no
+remote assets) and groups its views into four nodes: Overview, Operations
+(Health, Services, Logs), Intelligence (Agents, Models, Usage & Costs) and
+Administration (Devices, AI Accounts, Credentials, Update, System). Overview
+is a read-only dashboard of service health, release and update state, monthly
+spend, latency and reliability, models and routing, agents, devices, AI
+accounts and credentials; each card opens its detail view. The Models view
 can filter and sort exact reviewed per-million-token prices, shows at most 25
 rows per page and presents Hugging Face route selection in a focused modal;
 unknown remote prices remain visibly unknown. Usage & Costs shows bounded
-current-month request, token and estimated-cost aggregates by day, provider
-and model. Its responsive stacked daily token chart uses a narrowly registered
+current-month request, token and estimated-cost aggregates by day, provider,
+model and agent, with latency p50/p95, failures and fallbacks. A dimension
+that an older Core omits or does not instrument yet reads "Not measured yet",
+never 0. Its responsive stacked daily token chart uses a narrowly registered
 Chart.js build; budget and provider progress indicators remain native
 application UI. No prompt, reply, credential or request identifier enters
 either view. Credential values are never shown or stored by the GUI. Logs are

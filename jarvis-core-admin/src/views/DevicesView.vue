@@ -37,12 +37,16 @@ onMounted(load);
   <section v-if="data" class="card-list">
     <h2>Waiting for approval</h2>
     <p v-if="!data.requests.length">No pending device requests.</p>
-    <article v-for="request in data.requests" :key="request.id" class="detail-card">
-      <strong>{{ request.name }} · {{ request.platform }}</strong>
-      <p class="fingerprint">Fingerprint: {{ request.fingerprint }}</p>
-      <p>Expires: {{ new Date(request.expires_at * 1000).toLocaleString() }}</p>
+    <article v-for="request in data.requests" :key="request.id" class="detail-card device-request">
+      <div>
+        <strong>{{ request.name }} · {{ request.platform }}</strong>
+        <p class="fingerprint">Fingerprint: {{ request.fingerprint }}</p>
+        <p>Expires: {{ new Date(request.expires_at * 1000).toLocaleString() }}</p>
+      </div>
+      <div class="action-row">
       <button :disabled="busy" @click="selection = { request: {action: 'approve', request_id: request.id, fingerprint: request.fingerprint}, title: `Allow ${request.name}?`, detail: `Confirm that this is your device. Fingerprint: ${request.fingerprint}` }">Allow…</button>
       <button class="secondary" :disabled="busy" @click="selection = { request: {action: 'deny', request_id: request.id}, title: `Deny ${request.name}?`, detail: 'This pending request will be rejected.' }">Deny…</button>
+      </div>
     </article>
     <h2>Trusted devices</h2>
     <p v-if="!data.devices.length">No active devices. First-device activation uses the local one-time code.</p>
@@ -53,4 +57,9 @@ onMounted(load);
   </section>
   <ConfirmDialog v-if="selection" :title="selection.title" :detail="selection.detail" confirm-label="Continue to system authorization" @cancel="selection = null" @confirm="apply" />
 </template>
-<style scoped>.fingerprint { overflow-wrap: anywhere; font-family: monospace; }</style>
+<style scoped>
+.device-request { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.device-request strong { font-weight: 500; color: var(--text-0); }
+.device-request p { margin: 6px 0 0; color: var(--text-4); font-size: var(--fs-13); }
+.fingerprint { overflow-wrap: anywhere; font-family: var(--mono); }
+</style>

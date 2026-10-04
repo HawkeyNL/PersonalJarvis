@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { aiAccountLabels as labels, api, errorText, type AiAccountAction, type AiAccountProvider, type AiAccountRecord, type OperationResult } from "../admin";
+import ConfirmDialog from "../components/ConfirmDialog.vue";
 import ErrorPanel from "../components/ErrorPanel.vue";
 import PageHeader from "../components/PageHeader.vue";
 import ResultPanel from "../components/ResultPanel.vue";
@@ -10,6 +11,7 @@ const rows = ref<AiAccountRecord[]>([]);
 const busy = ref(false);
 const error = ref("");
 const result = ref<OperationResult | null>(null);
+const confirmDisconnect = ref<AiAccountProvider | null>(null);
 
 async function load() {
   busy.value = true;
@@ -20,7 +22,7 @@ async function load() {
 }
 
 async function act(provider: AiAccountProvider, action: AiAccountAction) {
-  if (action === "disconnect" && !window.confirm(`Disconnect the ${provider} subscription? Active runs may fail.`)) return;
+  confirmDisconnect.value = null;
   busy.value = true;
   error.value = "";
   result.value = null;
@@ -45,16 +47,18 @@ onMounted(load);
       <span class="card-label">{{ labels[row.provider] }}</span>
       <StatusBadge :state="row.state" />
       <p>Worker: {{ row.worker }}<br>Billing: {{ row.billing === "overage_unverified" ? "Extra usage setting not verified" : row.billing }}<br>Runtime: {{ row.runtime }}</p>
+      <p v-if="row.state === 'incompatible_runtime'">The installed Claude CLI is outside the reviewed version contract. Recheck after an owner-reviewed CLI update before enabling the worker socket.</p>
       <p v-if="row.provider === 'claude' && row.state === 'connected'">Claude login is linked. Verify extra usage is disabled or capped at zero in your provider account before explicitly enabling the worker socket.</p>
       <div class="dialog-actions">
         <button v-if="row.state !== 'connected'" class="small secondary" :disabled="busy" @click="act(row.provider, 'connect')">Connect</button>
         <template v-else>
           <button class="small secondary" :disabled="busy" @click="act(row.provider, 'test')">Test</button>
           <button class="small secondary" :disabled="busy" @click="act(row.provider, 'reconnect')">Reconnect</button>
-          <button class="small secondary" :disabled="busy" @click="act(row.provider, 'disconnect')">Disconnect</button>
+          <button class="small danger" :disabled="busy" @click="confirmDisconnect = row.provider">Disconnect…</button>
         </template>
       </div>
     </article>
     <article class="security-card"><strong>Separate trust boundary</strong><p>Connect and disconnect open a trusted terminal and require system administrator authorization. The official provider client handles browser authentication. No token or provider cookie enters this webview, Jarvis Core or its database. A connected login does not by itself enable coding runs or model access.</p></article>
   </section>
+  <ConfirmDialog v-if="confirmDisconnect" :title="`Disconnect ${labels[confirmDisconnect]}?`" detail="Active runs may fail. Reconnecting opens a trusted terminal and requires system administrator authorization again." confirm-label="Disconnect" @cancel="confirmDisconnect = null" @confirm="act(confirmDisconnect, 'disconnect')" />
 </template>
