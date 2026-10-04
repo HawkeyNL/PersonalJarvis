@@ -568,6 +568,10 @@ fn provider_process_environment(provider: AccountProvider) -> Vec<String> {
     ];
     if provider == AccountProvider::Claude {
         environment.push(format!("CLAUDE_CONFIG_DIR={}/.claude", provider.home()));
+        // The root-installed runtime is the only one Jarvis runs; the CLI must
+        // never self-update into the worker's writable home.
+        environment.push("DISABLE_UPDATES=1".to_owned());
+        environment.push("DISABLE_AUTOUPDATER=1".to_owned());
     }
     environment
 }
@@ -698,6 +702,8 @@ mod tests {
                     "PATH=",
                     "LANG=",
                     "CLAUDE_CONFIG_DIR=",
+                    "DISABLE_UPDATES=1",
+                    "DISABLE_AUTOUPDATER=1",
                 ]
                 .iter()
                 .any(|prefix| entry.starts_with(prefix))
@@ -706,6 +712,9 @@ mod tests {
                 !entry.contains("API_KEY") && !entry.contains("TOKEN") && !entry.contains("PROXY")
             }));
         }
+        let claude = provider_process_environment(AccountProvider::Claude);
+        assert!(claude.contains(&"DISABLE_UPDATES=1".to_owned()));
+        assert!(claude.contains(&"DISABLE_AUTOUPDATER=1".to_owned()));
     }
 
     #[test]
