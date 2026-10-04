@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { api, errorText, type ViewName } from "./admin";
-import NavIcon from "./components/NavIcon.vue";
+import NavIcon, { type IconName } from "./components/NavIcon.vue";
 import AgentsView from "./views/AgentsView.vue";
 import CredentialsView from "./views/CredentialsView.vue";
 import AiAccountsView from "./views/AiAccountsView.vue";
@@ -27,6 +27,11 @@ const navSections: { label: string; items: { id: ViewName; label: string }[] }[]
     { id: "devices", label: "Devices" }, { id: "ai-accounts", label: "AI Accounts" }, { id: "credentials", label: "Credentials" }, { id: "update", label: "Update" }, { id: "system", label: "System" },
   ] },
 ];
+const icons: Record<ViewName, IconName> = {
+  overview: "core", health: "pulse", services: "layers", logs: "lines",
+  agents: "agents", models: "chip", usage: "chart",
+  devices: "monitor", "ai-accounts": "link-2", credentials: "key", update: "download", system: "gear",
+};
 const items = navSections.flatMap((section) => section.items);
 const views = { overview: OverviewView, health: HealthView, services: ServicesView, update: UpdateView, agents: AgentsView, models: ModelsView, usage: UsageView, credentials: CredentialsView, "ai-accounts": AiAccountsView, devices: DevicesView, logs: LogsView, system: SystemView };
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -133,7 +138,7 @@ onBeforeUnmount(() => {
   <div class="app-shell" @pointermove="recordActivity" @pointerdown="recordActivity" @mouseenter="recordActivity" @wheel="recordActivity" @touchstart="recordActivity" @keydown="recordActivity" @focusin="recordActivity">
     <aside class="sidebar">
       <div class="brand"><div class="brand-mark"><i /></div><div><strong>JARVIS</strong><span>CORE ADMIN</span></div></div>
-      <nav aria-label="Administration sections"><div v-for="section in navSections" :key="section.label" class="nav-section"><span class="nav-category">{{ section.label }}</span><button v-for="item in section.items" :key="item.id" :disabled="locked" :class="{ active: active === item.id }" @click="active = item.id"><NavIcon :name="item.id" /><span>{{ item.label }}</span></button></div></nav>
+      <nav aria-label="Administration sections"><div v-for="section in navSections" :key="section.label" class="nav-section"><span class="nav-category">{{ section.label }}</span><button v-for="item in section.items" :key="item.id" :disabled="locked" :class="{ active: active === item.id }" @click="active = item.id"><NavIcon :name="icons[item.id]" /><span>{{ item.label }}</span></button></div></nav>
       <div class="security-boundary"><span :class="['status-light', { locked }]" />{{ locked ? "Administration locked" : "Authenticated session" }}<small>{{ locked ? "Unlock through system authorization" : `Locks after inactivity · ${idleSeconds}s` }}</small></div>
     </aside>
     <div class="main-shell">
@@ -146,7 +151,7 @@ onBeforeUnmount(() => {
           <h1>Jarvis Core is locked</h1>
           <p>Authenticate once through the GNOME system dialog. Your password is never handled by this application.</p>
           <div v-if="authError" class="lock-error">{{ authError }}</div>
-          <button :disabled="authBusy" @click="unlock">{{ authBusy ? "Waiting for system authorization…" : "Unlock administration" }}</button>
+          <button class="primary" :disabled="authBusy" @click="unlock">{{ authBusy ? "Waiting for system authorization…" : "Unlock administration" }}</button>
           <small>The session locks after five minutes without pointer or keyboard activity.</small>
         </section>
       </main>
@@ -157,7 +162,7 @@ onBeforeUnmount(() => {
         <h2 id="restart-title">Restart Jarvis Core Administration</h2>
         <p>The trusted update completed and replaced administration components. This older application process cannot continue safely.</p>
         <p v-if="restartError" class="restart-error">{{ restartError }}</p>
-        <div class="dialog-actions"><button :disabled="restartBusy" @click="restartNow">{{ restartBusy ? "Restarting…" : "Restart now" }}</button></div>
+        <div class="dialog-actions"><button class="primary" :disabled="restartBusy" @click="restartNow">{{ restartBusy ? "Restarting…" : "Restart now" }}</button></div>
       </section>
     </div>
   </div>

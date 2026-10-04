@@ -225,3 +225,13 @@ export function healthy(state: string): boolean {
     state.toLowerCase(),
   );
 }
+
+/** Status colour; the text label next to it always carries the meaning. */
+export type Tone = "ok" | "idle" | "warn" | "error";
+
+export function toneOf(state: string): Tone {
+  const value = state.toLowerCase();
+  if (healthy(value) || value === "yes" || value === "available") return "ok";
+  if (["failed", "error", "inactive", "disabled", "unavailable"].some((v) => value.includes(v))) return "error";
+  return "warn";
+}
