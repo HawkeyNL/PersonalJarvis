@@ -102,6 +102,11 @@ sudo jarvis accounts disconnect codex-chat
 `runtime_missing` means the reviewed official binary or dedicated identity is
 missing or its protected state layout failed validation. `wrong_auth_mode` means subscription/ChatGPT authentication
 could not be proven; an API-key/PAYG login is not treated as subscription.
+`host_unsupported` means a fixed host tool the worker runs through
+(`systemd-run`, `env`) is not root-controlled: the tool, every symlink on its
+chain and every directory on the way must be root-owned and not group/other
+writable (distribution symlinks such as Ubuntu's uutils `/usr/bin/env` are
+accepted). Connect prints which tool failed.
 `incompatible_runtime` means the installed Claude CLI is outside the reviewed
 version/flag contract. Recheck it after an owner-reviewed CLI update before
 enabling the worker socket.

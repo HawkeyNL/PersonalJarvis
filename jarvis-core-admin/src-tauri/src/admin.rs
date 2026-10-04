@@ -944,6 +944,7 @@ fn validate_ai_accounts(rows: Vec<AiAccountRecord>) -> AdminResult<Vec<AiAccount
                         | "runtime_missing"
                         | "wrong_auth_mode"
                         | "incompatible_runtime"
+                        | "host_unsupported"
                         | "unhealthy"
                 )
                 || !matches!(row.billing.as_str(), "subscription" | "unverified" | "overage_unverified")
@@ -2331,6 +2332,12 @@ mod tests {
             ..claude.clone()
         };
         assert!(validate_ai_accounts(vec![incompatible, codex.clone(), chat.clone()]).is_ok());
+        // So is a host tool that the account helper refuses to run.
+        let host = AiAccountRecord {
+            state: "host_unsupported".to_owned(),
+            ..claude.clone()
+        };
+        assert!(validate_ai_accounts(vec![host, codex.clone(), chat.clone()]).is_ok());
         let unknown = AiAccountRecord {
             state: "surprise".to_owned(),
             ..claude.clone()

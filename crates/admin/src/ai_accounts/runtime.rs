@@ -19,7 +19,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    audit_record, bounded_status_output, validate_root_executable, worker_command, AccountProvider,
+    audit_record, bounded_status_output, validate_root_executable, validate_system_executable,
+    worker_command, AccountProvider,
 };
 
 const CURL: &str = "/usr/bin/curl";
@@ -441,7 +442,7 @@ fn owned_regular_file(layout: &Layout, path: &Path) -> Result<()> {
 }
 
 fn fetch(layout: &Layout, path: &str, output: &Path, limit: u64, seconds: u32) -> Result<()> {
-    validate_root_executable(CURL)?;
+    validate_system_executable(CURL)?;
     // `-q` (first) ignores any curlrc; redirects are never followed.
     let status = Command::new(CURL)
         .args([
@@ -478,8 +479,8 @@ fn fetch(layout: &Layout, path: &str, output: &Path, limit: u64, seconds: u32) -
 }
 
 fn verify_signature(layout: &Layout, work: &Path, manifest: &Path, signature: &Path) -> Result<()> {
-    validate_root_executable(GPG)?;
-    validate_root_executable(GPGV)?;
+    validate_system_executable(GPG)?;
+    validate_system_executable(GPGV)?;
     let home = work.join("gnupg");
     DirBuilder::new().mode(0o700).create(&home)?;
     let armored = work.join("release-key.asc");

@@ -183,7 +183,7 @@ export const aiAccountLabels: Record<AiAccountProvider, string> = { claude: "Cla
 export interface AiAccountRecord {
   provider: AiAccountProvider;
   worker: string;
-  state: "connected" | "logged_out" | "runtime_missing" | "wrong_auth_mode" | "incompatible_runtime" | "unhealthy";
+  state: "connected" | "logged_out" | "runtime_missing" | "wrong_auth_mode" | "incompatible_runtime" | "host_unsupported" | "unhealthy";
   billing: "subscription" | "unverified" | "overage_unverified";
   runtime: "inactive" | "socket_ready" | "active" | "unavailable";
 }

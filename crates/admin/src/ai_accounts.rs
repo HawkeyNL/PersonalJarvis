@@ -1,11 +1,11 @@
 //! Owner-operated subscription login. This module deliberately has no Core API,
 //! agent, MCP or sandbox entry point. Official clients own their auth stores.
 use std::{
-    ffi::{CStr, CString},
+    ffi::{CStr, CString, OsString},
     fs,
     io::{self, IsTerminal, Read},
     os::unix::fs::{MetadataExt, PermissionsExt},
-    path::Path,
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -18,6 +18,9 @@ use serde::Serialize;
 mod runtime;
 
 const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+const ENV: &str = "/usr/bin/env";
+/// Bound on symlink hops while resolving a fixed system executable.
+const SYSTEM_LINK_HOPS: usize = 8;
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const STATUS_LIMIT: u64 = 16 * 1024;
 
@@ -202,8 +205,8 @@ pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
                 require_tty()?;
                 validate_root_executable(provider.binary())?;
                 ensure_service_identity(provider)?;
-                if provider == AccountProvider::Claude && !claude_runtime_compatible() {
-                    bail!("Claude runtime version is incompatible with the reviewed worker flags");
+                if provider == AccountProvider::Claude {
+                    ensure_claude_runtime_compatible()?;
                 }
                 let mut child = worker_command(provider, provider.connect_args(), true)?;
                 child
@@ -290,7 +293,7 @@ fn audit_account_event(provider: AccountProvider, action: &str, outcome: &str) -
 
 /// Records only fixed, caller-validated `key=value` fields.
 fn audit_record(record: &str) -> Result<()> {
-    validate_root_executable("/usr/bin/logger")?;
+    validate_system_executable("/usr/bin/logger")?;
     let result = Command::new("/usr/bin/logger")
         .args([
             "--tag",
@@ -319,7 +322,7 @@ fn require_tty() -> Result<()> {
 }
 
 fn stop_subscription_runtime(provider: AccountProvider) -> Result<()> {
-    validate_root_executable("/usr/bin/systemctl")?;
+    validate_system_executable("/usr/bin/systemctl")?;
     for args in runtime_stop_commands(provider) {
         let result = Command::new("/usr/bin/systemctl")
             .args(*args)
@@ -357,7 +360,7 @@ fn runtime_stop_commands(provider: AccountProvider) -> &'static [&'static [&'sta
 
 fn ensure_service_identity(provider: AccountProvider) -> Result<()> {
     if service_identity(provider).is_err() {
-        validate_root_executable("/usr/sbin/useradd")?;
+        validate_system_executable("/usr/sbin/useradd")?;
         let result = Command::new("/usr/sbin/useradd")
             .args([
                 "--system",
@@ -396,6 +399,10 @@ fn ensure_service_identity(provider: AccountProvider) -> Result<()> {
 }
 
 fn status(provider: AccountProvider) -> AccountStatus {
+    // A rejected host tool is not a missing provider runtime.
+    if validate_worker_host().is_err() {
+        return AccountStatus::new(provider, "host_unsupported");
+    }
     if provider == AccountProvider::Claude {
         let Ok(command) = worker_command(provider, &["--version"], false) else {
             return AccountStatus::new(provider, "runtime_missing");
@@ -419,9 +426,18 @@ fn status(provider: AccountProvider) -> AccountStatus {
     result
 }
 
-fn claude_runtime_compatible() -> bool {
-    worker_command(AccountProvider::Claude, &["--version"], false)
-        .is_ok_and(claude_version_command_compatible)
+/// Reports why connect cannot proceed: a worker that cannot be prepared or
+/// run is not a CLI outside the reviewed version contract.
+fn ensure_claude_runtime_compatible() -> Result<()> {
+    let mut command = worker_command(AccountProvider::Claude, &["--version"], false)
+        .context("Claude worker could not be prepared")?;
+    let output = bounded_status_output(&mut command)
+        .context("Claude version check could not run")?
+        .context("Claude version check did not complete")?;
+    if !jarvis_llm::claude_worker_protocol::reviewed_claude_version(output.as_bytes()) {
+        bail!("Claude runtime version is incompatible with the reviewed worker flags");
+    }
+    Ok(())
 }
 
 fn claude_version_command_compatible(mut command: Command) -> bool {
@@ -434,7 +450,7 @@ fn claude_version_command_compatible(mut command: Command) -> bool {
 }
 
 fn runtime_state(provider: AccountProvider) -> &'static str {
-    if validate_root_executable("/usr/bin/systemctl").is_err() {
+    if validate_system_executable("/usr/bin/systemctl").is_err() {
         return "unavailable";
     }
     let active = |unit: &str| {
@@ -520,8 +536,7 @@ fn bounded_status_output(command: &mut Command) -> Result<Option<String>> {
 }
 
 fn worker_command(provider: AccountProvider, args: &[&str], interactive: bool) -> Result<Command> {
-    validate_root_executable(SYSTEMD_RUN)?;
-    validate_root_executable("/usr/bin/env")?;
+    validate_worker_host()?;
     validate_root_executable(provider.binary())?;
     let (uid, gid) = service_identity(provider)?;
     validate_state_directory(provider.home(), uid, gid)?;
@@ -567,10 +582,16 @@ fn worker_command(provider: AccountProvider, args: &[&str], interactive: bool) -
     // A system manager may inject DefaultEnvironment even when this caller's
     // environment is empty. The provider process itself must start from -i.
     command
-        .args(["--", "/usr/bin/env", "-i"])
+        .args(["--", ENV, "-i"])
         .args(provider_process_environment(provider));
     command.arg(provider.binary()).args(args).env_clear();
     Ok(command)
+}
+
+/// Fixed host tools every provider command runs through.
+fn validate_worker_host() -> Result<()> {
+    validate_system_executable(SYSTEMD_RUN)?;
+    validate_system_executable(ENV)
 }
 
 fn provider_process_environment(provider: AccountProvider) -> Vec<String> {
@@ -591,31 +612,96 @@ fn provider_process_environment(provider: AccountProvider) -> Vec<String> {
     environment
 }
 
+/// The official provider runtime: a root-owned regular file, never a link.
+/// The installer writes a regular file, so a link here means tampering.
 fn validate_root_executable(path: &str) -> Result<()> {
-    let path = Path::new(path);
-    if !path.is_absolute() {
-        bail!("official provider runtime path is not absolute");
+    resolve_trusted_executable(Path::new("/"), Path::new(path), 0, 0)
+        .map(|_| ())
+        .context("official provider runtime is not a root-owned regular executable")
+}
+
+/// Fixed host tools may be distribution symlinks (Ubuntu 26.04 ships
+/// `/usr/bin/env -> ../lib/cargo/bin/coreutils/env`). Every link and every
+/// directory on the chain must be root-controlled, so no non-root user can
+/// redirect it between this check and exec. Callers execute the original path:
+/// multi-call binaries dispatch on argv[0].
+fn validate_system_executable(path: &str) -> Result<()> {
+    resolve_trusted_executable(Path::new("/"), Path::new(path), 0, SYSTEM_LINK_HOPS)
+        .map(|_| ())
+        .with_context(|| format!("system executable {path} is not root-controlled"))
+}
+
+/// Resolves absolute `path` below `root` component by component, following at
+/// most `max_hops` symlinks. Every directory walked (including `root`) and the
+/// final regular file must be owned by `owner` without group/other write, the
+/// file must be executable, and every symlink must be owned by `owner`. Only
+/// tests pass a `root` other than `/` or an `owner` other than root.
+fn resolve_trusted_executable(
+    root: &Path,
+    path: &Path,
+    owner: u32,
+    max_hops: usize,
+) -> Result<PathBuf> {
+    fn push_components(pending: &mut Vec<OsString>, path: &Path) {
+        // Reversed: the stack pops the next component first.
+        pending.extend(path.components().rev().filter_map(|part| match part {
+            Component::Normal(name) => Some(name.to_owned()),
+            Component::ParentDir => Some("..".into()),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+        }));
     }
-    for parent in path.ancestors().skip(1) {
-        let metadata = fs::symlink_metadata(parent).context("inspect runtime path parent")?;
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != 0
-            || metadata.permissions().mode() & 0o022 != 0
-        {
-            bail!("official provider runtime parent is unsafe");
+    let trusted = |metadata: &fs::Metadata| metadata.uid() == owner && metadata.mode() & 0o022 == 0;
+    if !path.is_absolute() {
+        bail!("path is not absolute");
+    }
+    let metadata = fs::symlink_metadata(root).context("inspect root directory")?;
+    if !metadata.is_dir() || !trusted(&metadata) {
+        bail!("unsafe directory {}", root.display());
+    }
+    let mut pending = Vec::new();
+    push_components(&mut pending, path);
+    let mut resolved = PathBuf::new();
+    let mut hops = 0;
+    while let Some(name) = pending.pop() {
+        if name == ".." {
+            // Every ancestor of `resolved` was already checked.
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&name);
+        let full = root.join(&candidate);
+        let metadata =
+            fs::symlink_metadata(&full).with_context(|| format!("inspect {}", full.display()))?;
+        if metadata.file_type().is_symlink() {
+            hops += 1;
+            if hops > max_hops {
+                bail!("{} is a symlink beyond the allowed chain", full.display());
+            }
+            if metadata.uid() != owner {
+                bail!("symlink {} has an unsafe owner", full.display());
+            }
+            let target =
+                fs::read_link(&full).with_context(|| format!("read {}", full.display()))?;
+            if target.is_absolute() {
+                resolved.clear();
+            }
+            push_components(&mut pending, &target);
+        } else if pending.is_empty() {
+            if !metadata.is_file() || !trusted(&metadata) || metadata.mode() & 0o111 == 0 {
+                bail!(
+                    "{} has unsafe type, ownership or permissions",
+                    full.display()
+                );
+            }
+            return Ok(full);
+        } else {
+            if !metadata.is_dir() || !trusted(&metadata) {
+                bail!("unsafe directory {}", full.display());
+            }
+            resolved = candidate;
         }
     }
-    let metadata = fs::symlink_metadata(path).context("official provider runtime is missing")?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != 0
-        || metadata.permissions().mode() & 0o022 != 0
-        || metadata.permissions().mode() & 0o111 == 0
-    {
-        bail!("official provider runtime has unsafe ownership or permissions");
-    }
-    Ok(())
+    bail!("path does not name a file")
 }
 
 fn service_identity(provider: AccountProvider) -> Result<(u32, u32)> {
@@ -779,5 +865,111 @@ mod tests {
         assert!(!encoded.contains("email"));
         let incompatible = AccountStatus::new(AccountProvider::Claude, "incompatible_runtime");
         assert_eq!(incompatible.billing, "unverified");
+    }
+
+    /// A `/`-like tree owned by the test user: `usr/bin/env` is a relative
+    /// link to the multi-call `usr/lib/coreutils/env`, as on Ubuntu 26.04.
+    fn host_tree() -> (tempfile::TempDir, u32) {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        // The tree root stands in for `/`; it must not inherit a lax umask.
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        for dir in ["usr", "usr/bin", "usr/lib", "usr/lib/coreutils"] {
+            fs::create_dir(root.path().join(dir)).unwrap();
+            fs::set_permissions(root.path().join(dir), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let binary = root.path().join("usr/lib/coreutils/env");
+        fs::write(&binary, b"multi-call").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("../lib/coreutils/env", root.path().join("usr/bin/env")).unwrap();
+        (root, unsafe { libc::geteuid() })
+    }
+
+    fn resolve(root: &Path, path: &str, owner: u32) -> Result<PathBuf> {
+        resolve_trusted_executable(root, Path::new(path), owner, SYSTEM_LINK_HOPS)
+    }
+
+    #[test]
+    fn system_executable_accepts_an_owned_symlink_chain() {
+        let (root, uid) = host_tree();
+        let binary = root.path().join("usr/lib/coreutils/env");
+        assert_eq!(resolve(root.path(), "/usr/bin/env", uid).unwrap(), binary);
+        // Absolute targets resolve from the same root; chains are followed.
+        std::os::unix::fs::symlink("/usr/bin/env", root.path().join("usr/bin/printenv")).unwrap();
+        assert_eq!(
+            resolve(root.path(), "/usr/bin/printenv", uid).unwrap(),
+            binary
+        );
+        assert_eq!(
+            resolve(root.path(), "/usr/lib/coreutils/env", uid).unwrap(),
+            binary
+        );
+        // Another owner is not trusted.
+        assert!(resolve(root.path(), "/usr/bin/env", uid.wrapping_add(1)).is_err());
+    }
+
+    #[test]
+    fn system_executable_rejects_writable_directories_and_targets() {
+        let mode = |path: &str, mode| {
+            fs::set_permissions(Path::new(path), fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let (root, uid) = host_tree();
+        let at = |rel: &str| root.path().join(rel).to_str().unwrap().to_owned();
+        // The link's own directory.
+        mode(&at("usr/bin"), 0o775);
+        assert!(resolve(root.path(), "/usr/bin/env", uid).is_err());
+        mode(&at("usr/bin"), 0o755);
+        // A directory on the resolved target path.
+        mode(&at("usr/lib"), 0o757);
+        assert!(resolve(root.path(), "/usr/bin/env", uid).is_err());
+        mode(&at("usr/lib"), 0o755);
+        // The final target: writable, then not executable.
+        mode(&at("usr/lib/coreutils/env"), 0o775);
+        assert!(resolve(root.path(), "/usr/bin/env", uid).is_err());
+        mode(&at("usr/lib/coreutils/env"), 0o644);
+        assert!(resolve(root.path(), "/usr/bin/env", uid).is_err());
+        mode(&at("usr/lib/coreutils/env"), 0o755);
+        assert!(resolve(root.path(), "/usr/bin/env", uid).is_ok());
+    }
+
+    #[test]
+    fn system_executable_rejects_loops_long_chains_and_dangling_links() {
+        use std::os::unix::fs::symlink;
+        let (root, uid) = host_tree();
+        let bin = root.path().join("usr/bin");
+        symlink("b", bin.join("a")).unwrap();
+        symlink("a", bin.join("b")).unwrap();
+        assert!(resolve(root.path(), "/usr/bin/a", uid).is_err());
+        symlink("missing", bin.join("dangling")).unwrap();
+        assert!(resolve(root.path(), "/usr/bin/dangling", uid).is_err());
+        // SYSTEM_LINK_HOPS links are fine; one more is not.
+        symlink("env", bin.join("link0")).unwrap();
+        for hop in 1..=SYSTEM_LINK_HOPS {
+            symlink(format!("link{}", hop - 1), bin.join(format!("link{hop}"))).unwrap();
+        }
+        assert!(resolve(
+            root.path(),
+            &format!("/usr/bin/link{}", SYSTEM_LINK_HOPS - 2),
+            uid
+        )
+        .is_ok());
+        assert!(resolve(
+            root.path(),
+            &format!("/usr/bin/link{}", SYSTEM_LINK_HOPS - 1),
+            uid
+        )
+        .is_err());
+        // A directory or relative path never qualifies.
+        assert!(resolve(root.path(), "/usr/bin", uid).is_err());
+        assert!(resolve(root.path(), "/usr/bin/..", uid).is_err());
+        assert!(resolve(root.path(), "usr/bin/env", uid).is_err());
+    }
+
+    #[test]
+    fn provider_runtime_still_rejects_any_symlink() {
+        let (root, uid) = host_tree();
+        let strict = |path: &str| resolve_trusted_executable(root.path(), Path::new(path), uid, 0);
+        assert!(strict("/usr/lib/coreutils/env").is_ok());
+        assert!(strict("/usr/bin/env").is_err());
     }
 }
