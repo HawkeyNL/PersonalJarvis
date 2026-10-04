@@ -6,7 +6,11 @@
 //! command lines, environments, paths or arbitrary units.
 
 use std::{collections::HashMap, ffi::CString, os::unix::ffi::OsStrExt, path::Path};
-use std::{process::Stdio, time::Duration};
+use std::{
+    process::Stdio,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use axum::Json;
 use serde_json::{json, Value};
@@ -16,6 +20,8 @@ use crate::Authed;
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+/// Polling clients share one `systemctl` call per window.
+const CACHE_TTL: Duration = Duration::from_secs(5);
 /// Same units as the Core Admin services view.
 const SERVICE_UNITS: [(&str, &str); 7] = [
     ("Core", "jarvis-core.service"),
@@ -39,12 +45,14 @@ const ACTIVE_STATES: [&str; 8] = [
 ];
 const DISKS: [(&str, &str); 2] = [("system", "/"), ("data", "/var/lib/jarvis")];
 
+static CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
+
 pub(crate) async fn status(_authed: Authed) -> Json<Value> {
-    let output = tokio::time::timeout(TIMEOUT, systemctl_show())
-        .await
-        .ok()
-        .flatten();
-    let states = output.as_deref().map(parse_show).unwrap_or_default();
+    if let Some((at, value)) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if at.elapsed() < CACHE_TTL {
+            return Json(value.clone());
+        }
+    }
     let disks = tokio::time::timeout(
         TIMEOUT,
         tokio::task::spawn_blocking(|| {
@@ -56,14 +64,25 @@ pub(crate) async fn status(_authed: Authed) -> Json<Value> {
         Ok(Ok(disks)) => disks,
         _ => DISKS.map(|(label, _)| unknown_disk(label)),
     };
-    Json(json!({
-        "services": services_value(&states),
+    let value = json!({
+        "services": services_status(SYSTEMCTL, TIMEOUT).await,
         "disks": disks,
-    }))
+    });
+    *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), value.clone()));
+    Json(value)
 }
 
-async fn systemctl_show() -> Option<String> {
-    let output = tokio::process::Command::new(SYSTEMCTL)
+/// Every unit is `unknown` when the call fails, times out or misbehaves.
+async fn services_status(program: &str, timeout: Duration) -> Vec<Value> {
+    let output = tokio::time::timeout(timeout, systemctl_show(program))
+        .await
+        .ok()
+        .flatten();
+    services_value(&output.as_deref().map(parse_show).unwrap_or_default())
+}
+
+async fn systemctl_show(program: &str) -> Option<String> {
+    let output = tokio::process::Command::new(program)
         .args([
             "show",
             "--no-pager",
@@ -210,6 +229,31 @@ mod tests {
     fn missing_systemctl_output_reports_every_unit_unknown() {
         let services = services_value(&parse_show(""));
         assert!(services.iter().all(|service| service["state"] == "unknown"));
+    }
+
+    #[tokio::test]
+    async fn failed_or_hanging_systemctl_reports_every_unit_unknown() {
+        let all_unknown = |services: Vec<Value>| {
+            services.len() == SERVICE_UNITS.len()
+                && services.iter().all(|service| service["state"] == "unknown")
+        };
+        assert!(all_unknown(
+            services_status("/nonexistent/systemctl", TIMEOUT).await
+        ));
+        assert!(all_unknown(services_status("/bin/false", TIMEOUT).await));
+
+        let dir = tempfile::tempdir().unwrap();
+        let hanging = dir.path().join("systemctl");
+        std::fs::write(&hanging, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(
+            &hanging,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let services = services_status(hanging.to_str().unwrap(), Duration::from_millis(200)).await;
+        assert!(all_unknown(services));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
