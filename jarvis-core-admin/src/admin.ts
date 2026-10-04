@@ -199,6 +199,20 @@ export interface ClaudeRuntimeStatus {
 }
 export type RuntimeChannel = "stable" | "latest";
 export type ClaudeRuntimeMutation = { action: "install"; channel: RuntimeChannel } | { action: "rollback" };
+export type LayaMode = "off" | "shadow" | "primary";
+export interface LayaStatus {
+  installed: boolean;
+  laya_version: string;
+  model_revision: string;
+  socket_enabled: string;
+  socket_active: string;
+  service_active: string;
+  mode: LayaMode | "unreadable";
+  last_probe: { at: number; ok: boolean } | null;
+  download_bytes: number;
+  disk_bytes: number;
+}
+export type LayaMutation = { action: "install" } | { action: "enable" } | { action: "disable" } | { action: "mode"; mode: LayaMode };
 export type LogService =
   | "core"
   | "surrealdb"
@@ -259,6 +273,9 @@ export const api = {
   claudeRuntime: () => invoke<ClaudeRuntimeStatus>("claude_runtime"),
   claudeRuntimeMutation: (request: ClaudeRuntimeMutation) =>
     invoke<OperationResult>("claude_runtime_mutation", { request }),
+  laya: () => invoke<LayaStatus>("laya"),
+  layaMutation: (request: LayaMutation) =>
+    invoke<OperationResult>("laya_mutation", { request }),
   credentialSet: (provider: CredentialProvider) =>
     invoke<OperationResult>("credential_set", { provider }),
   logs: (service: LogService, lines = 500) =>

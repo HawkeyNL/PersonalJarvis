@@ -236,6 +236,26 @@ async fn claude_runtime_mutation(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+async fn laya(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+) -> Result<admin::LayaStatus, String> {
+    with_session(session, |session| admin::laya(&session)).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn laya_mutation(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+    request: admin::LayaMutation,
+) -> Result<admin::OperationResult, String> {
+    with_session(session, move |session| {
+        admin::laya_mutation(&session, request)
+    })
+    .await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 async fn ai_account_action(
     session: tauri::State<'_, Arc<session::SessionManager>>,
     provider: admin::AiAccountProvider,
@@ -329,6 +349,8 @@ pub fn run() {
             ai_account_action,
             claude_runtime,
             claude_runtime_mutation,
+            laya,
+            laya_mutation,
             credential_set,
             devices_overview,
             device_action,
