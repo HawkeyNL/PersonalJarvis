@@ -58,6 +58,7 @@ impl LlmProvider for PausedFake {
             backend: Some("ollama".into()),
             requested_route: None,
             actual_provider: None,
+            fallback_count: 0,
             stop_reason: Some("stop".into()),
             usage: None,
         })
@@ -81,6 +82,7 @@ impl LlmProvider for Fake {
             backend: Some("ollama".into()),
             requested_route: None,
             actual_provider: None,
+            fallback_count: 0,
             stop_reason: Some("stop".into()),
             usage: Some(jarvis_llm::Usage {
                 input_tokens: 3,
@@ -703,6 +705,16 @@ async fn disconnect_and_provider_failure_never_repeat_or_lose_the_user_message(
             history["messages"].as_array().unwrap().len(),
             if fail { 1 } else { 2 }
         );
+        // A failed call is one zero-token, zero-cost row with a fixed category.
+        let usage = jarvis_usage::month_statistics(&db).await?;
+        assert_eq!(usage.totals.requests, 1);
+        assert_eq!(usage.totals.failures, u64::from(fail));
+        if fail {
+            assert_eq!(usage.totals.total_tokens, 0);
+            assert_eq!(usage.totals.cost_eur, 0.0);
+            assert_eq!(usage.failures_by_category[0].category, "other");
+            assert_eq!(usage.by_backend[0].backend, "router");
+        }
         let retry = post(&app, &token, "/v1/assistant/runs", request.clone()).await;
         assert_eq!(retry.1["state"], if fail { "failed" } else { "completed" });
         assert_eq!(count.load(Ordering::SeqCst), 1);

@@ -46,7 +46,7 @@ pub use routing::{
 pub use stream::TextDeltaSink;
 pub use types::{
     classify_task, ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, Role,
-    RoutingMode, TaskRequirements, Tier, Usage,
+    RoutingMode, TaskRequirements, Tier, Usage, USAGE_FAILURE_CATEGORIES,
 };
 
 /// A swappable brain: given a conversation, produce a reply.
@@ -434,6 +434,7 @@ impl LlmProvider for Echo {
             backend: Some("stub".into()),
             requested_route: None,
             actual_provider: None,
+            fallback_count: 0,
             stop_reason: Some("end_turn".into()),
             usage: None,
         })

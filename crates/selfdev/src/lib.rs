@@ -202,6 +202,7 @@ mod tests {
                 backend: Some("fake".into()),
                 requested_route: None,
                 actual_provider: None,
+                fallback_count: 0,
                 stop_reason: Some("end_turn".into()),
                 usage: None,
             })

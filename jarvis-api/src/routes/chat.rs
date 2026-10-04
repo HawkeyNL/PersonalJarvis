@@ -21,7 +21,7 @@ use jarvis_llm as llm;
 use jarvis_orchestrator as orchestrator;
 
 use crate::error::bad_request;
-use crate::metering::{record_usage, record_usage_with_metadata};
+use crate::metering::{record_failure, record_usage, record_usage_with_metadata};
 use crate::rate_limit::allow_authenticated_device;
 use crate::routes::system::{validate_brain_selection, BrainPreferenceReq};
 use crate::validation;
@@ -399,6 +399,17 @@ pub(super) async fn execute_chat(
     } else {
         state.llm.chat(&chat).await
     };
+    let metadata = jarvis_usage::UsageMetadata {
+        request_id,
+        routing_mode: format!("{mode:?}").to_ascii_lowercase(),
+        quality_tier: format!("{:?}", requirements.tier).to_ascii_lowercase(),
+        latency_ms: llm_started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+        ..Default::default()
+    };
+    if let Err(error) = &reply {
+        let pinned = chat.provider.as_deref().zip(chat.model.as_deref());
+        record_failure(&state, pinned, error, metadata.clone()).await;
+    }
     match reply {
         Ok(mut reply) => {
             let estimated_usage = reply.backend.is_some() && reply.usage.is_none();
@@ -424,17 +435,13 @@ pub(super) async fn execute_chat(
                 &state,
                 &reply,
                 jarvis_usage::UsageMetadata {
-                    request_id,
-                    routing_mode: format!("{mode:?}").to_ascii_lowercase(),
-                    quality_tier: format!("{:?}", requirements.tier).to_ascii_lowercase(),
-                    latency_ms: llm_started.elapsed().as_millis().min(i64::MAX as u128) as i64,
                     status: if estimated_usage {
                         "succeeded_estimated_usage"
                     } else {
                         "succeeded"
                     }
                     .into(),
-                    ..Default::default()
+                    ..metadata
                 },
             )
             .await;
@@ -815,7 +822,11 @@ pub(crate) async fn assistant_orchestrate(
     if task.len() > validation::MAX_TASK_LEN {
         return Err(bad_request("task too long"));
     }
-    match orchestrator::plan_and_execute(&state.llm, task, &state.jarvis_system).await {
+    let result = orchestrator::plan_and_execute(&state.llm, task, &state.jarvis_system).await;
+    if let Err(error) = &result {
+        record_failure(&state, None, error, Default::default()).await;
+    }
+    match result {
         Ok(run) => {
             for reply in &run.calls {
                 record_usage(&state, reply).await;
