@@ -3,7 +3,9 @@ use uuid::Uuid;
 
 use jarvis_store::Database;
 
-use super::{DailyUsage, UsageDimension, UsageEntry, UsageStatistics, UsageTotals};
+use super::{
+    AgentUsage, DailyUsage, FailureCount, UsageDimension, UsageEntry, UsageStatistics, UsageTotals,
+};
 
 const CURRENT_MONTH_START: &str = "time::group(time::now(), 'month')";
 
@@ -80,7 +82,7 @@ pub async fn month_breakdown(
         .collect())
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 struct AggregateRow {
     #[serde(default)]
     backend: Option<String>,
@@ -88,6 +90,12 @@ struct AggregateRow {
     model: Option<String>,
     #[serde(default)]
     day: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    failure_category: Option<String>,
+    #[serde(default)]
+    last_used: Option<String>,
     #[serde(default)]
     requests: Option<i64>,
     #[serde(default)]
@@ -100,6 +108,14 @@ struct AggregateRow {
     cache_write_tokens: Option<i64>,
     #[serde(default)]
     cost_eur: Option<f64>,
+    #[serde(default)]
+    failures: Option<i64>,
+    #[serde(default)]
+    fallbacks: Option<i64>,
+    #[serde(default)]
+    latency_p50_ms: Option<f64>,
+    #[serde(default)]
+    latency_p95_ms: Option<f64>,
 }
 
 fn totals(row: &AggregateRow) -> UsageTotals {
@@ -118,19 +134,48 @@ fn totals(row: &AggregateRow) -> UsageTotals {
             .saturating_add(cache_read_tokens)
             .saturating_add(cache_write_tokens),
         cost_eur: row.cost_eur.unwrap_or_default().max(0.0),
+        failures: row.failures.unwrap_or_default().max(0) as u64,
+        fallbacks: row.fallbacks.unwrap_or_default().max(0) as u64,
+        latency_p50_ms: None,
+        latency_p95_ms: None,
     }
 }
 
+fn latency_ms(value: Option<f64>) -> Option<u64> {
+    value
+        .filter(|ms| ms.is_finite() && *ms >= 0.0)
+        .map(|ms| ms.round() as u64)
+}
+
+/// Latency comes from a separate filtered query: legacy rows have no latency
+/// and unmeasured internal calls record zero, which would skew percentiles.
+fn with_latency(mut totals: UsageTotals, latency: Option<&AggregateRow>) -> UsageTotals {
+    if let Some(row) = latency {
+        totals.latency_p50_ms = latency_ms(row.latency_p50_ms);
+        totals.latency_p95_ms = latency_ms(row.latency_p95_ms);
+    }
+    totals
+}
+
 /// Bounded monthly aggregates only. Prompts, responses and request identifiers
-/// never leave the database through this statistics boundary.
+/// never leave the database through this statistics boundary. Agent IDs and
+/// failure categories are Core-assigned identifiers, never free text.
 fn month_statistics_query() -> String {
-    const FIELDS: &str = "count() AS requests, math::sum(input_tokens) AS input_tokens, math::sum(output_tokens) AS output_tokens, math::sum(cache_read_tokens) AS cache_read_tokens, math::sum(cache_write_tokens) AS cache_write_tokens, math::sum(cost_eur) AS cost_eur";
+    const FIELDS: &str = "count() AS requests, math::sum(input_tokens) AS input_tokens, math::sum(output_tokens) AS output_tokens, math::sum(cache_read_tokens) AS cache_read_tokens, math::sum(cache_write_tokens) AS cache_write_tokens, math::sum(cost_eur) AS cost_eur, count(failure_category != NONE) AS failures, math::sum(fallback_count ?? 0) AS fallbacks";
+    const LATENCY: &str = "math::percentile(latency_ms, 50) AS latency_p50_ms, math::percentile(latency_ms, 95) AS latency_p95_ms";
     let since = format!("ts >= {CURRENT_MONTH_START}");
+    let measured = format!("{since} AND latency_ms > 0");
+    let agent = "agent_id != NONE";
     format!(
         "SELECT {FIELDS} FROM llm_usage WHERE {since} GROUP ALL; \
          SELECT backend, {FIELDS} FROM llm_usage WHERE {since} GROUP BY backend ORDER BY cost_eur DESC; \
          SELECT backend, model, {FIELDS} FROM llm_usage WHERE {since} GROUP BY backend, model ORDER BY cost_eur DESC; \
-         SELECT time::format(ts, '%Y-%m-%d') AS day, {FIELDS} FROM llm_usage WHERE {since} GROUP BY day ORDER BY day ASC"
+         SELECT time::format(ts, '%Y-%m-%d') AS day, {FIELDS} FROM llm_usage WHERE {since} GROUP BY day ORDER BY day ASC; \
+         SELECT agent_id, {FIELDS}, time::max(ts) AS last_used FROM llm_usage WHERE {since} AND {agent} GROUP BY agent_id ORDER BY cost_eur DESC; \
+         SELECT failure_category, count() AS requests FROM llm_usage WHERE {since} AND failure_category != NONE GROUP BY failure_category ORDER BY requests DESC; \
+         SELECT {LATENCY} FROM llm_usage WHERE {measured} GROUP ALL; \
+         SELECT backend, {LATENCY} FROM llm_usage WHERE {measured} GROUP BY backend; \
+         SELECT agent_id, {LATENCY} FROM llm_usage WHERE {measured} AND {agent} GROUP BY agent_id"
     )
 }
 
@@ -139,23 +184,36 @@ pub async fn month_statistics(db: &Database) -> Result<UsageStatistics, jarvis_s
         .query(month_statistics_query())
         .await
         .map_err(jarvis_store::StoreError::schema)?;
-    let total_rows: Vec<AggregateRow> =
-        response.take(0).map_err(jarvis_store::StoreError::schema)?;
-    let backend_rows: Vec<AggregateRow> =
-        response.take(1).map_err(jarvis_store::StoreError::schema)?;
-    let model_rows: Vec<AggregateRow> =
-        response.take(2).map_err(jarvis_store::StoreError::schema)?;
-    let daily_rows: Vec<AggregateRow> =
-        response.take(3).map_err(jarvis_store::StoreError::schema)?;
+    let mut take = |index: usize| -> Result<Vec<AggregateRow>, jarvis_store::StoreError> {
+        response
+            .take(index)
+            .map_err(jarvis_store::StoreError::schema)
+    };
+    let total_rows = take(0)?;
+    let backend_rows = take(1)?;
+    let model_rows = take(2)?;
+    let daily_rows = take(3)?;
+    let agent_rows = take(4)?;
+    let failure_rows = take(5)?;
+    let total_latency = take(6)?;
+    let backend_latency = take(7)?;
+    let agent_latency = take(8)?;
     Ok(UsageStatistics {
-        totals: total_rows.first().map(totals).unwrap_or_default(),
+        totals: with_latency(
+            total_rows.first().map(totals).unwrap_or_default(),
+            total_latency.first(),
+        ),
         by_backend: backend_rows
             .into_iter()
             .filter_map(|row| {
+                let backend = row.backend.clone()?;
+                let latency = backend_latency
+                    .iter()
+                    .find(|latency| latency.backend.as_ref() == Some(&backend));
                 Some(UsageDimension {
-                    backend: row.backend.clone()?,
+                    totals: with_latency(totals(&row), latency),
+                    backend,
                     model: None,
-                    totals: totals(&row),
                 })
             })
             .collect(),
@@ -175,6 +233,29 @@ pub async fn month_statistics(db: &Database) -> Result<UsageStatistics, jarvis_s
                 Some(DailyUsage {
                     day: row.day.clone()?,
                     totals: totals(&row),
+                })
+            })
+            .collect(),
+        by_agent: agent_rows
+            .into_iter()
+            .filter_map(|row| {
+                let agent_id = row.agent_id.clone()?;
+                let latency = agent_latency
+                    .iter()
+                    .find(|latency| latency.agent_id.as_ref() == Some(&agent_id));
+                Some(AgentUsage {
+                    totals: with_latency(totals(&row), latency),
+                    last_used: row.last_used,
+                    agent_id,
+                })
+            })
+            .collect(),
+        failures_by_category: failure_rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(FailureCount {
+                    category: row.failure_category?,
+                    requests: row.requests.unwrap_or_default().max(0) as u64,
                 })
             })
             .collect(),
@@ -229,11 +310,13 @@ mod tests {
     #[test]
     fn aggregate_query_selects_only_bounded_non_secret_dimensions() {
         let query = month_statistics_query();
+        // Agent IDs and failure categories are owner-approved bounded
+        // dimensions; free-text and per-request fields stay out.
         for forbidden in [
             "request_id",
-            "agent_id",
             "routing_mode",
-            "failure_category",
+            "requested_route",
+            "actual_provider",
             "prompt",
             "response",
         ] {
@@ -241,6 +324,11 @@ mod tests {
         }
         assert!(query.contains("GROUP BY backend, model"));
         assert!(query.contains("GROUP BY day"));
+        assert!(query.contains("GROUP BY agent_id"));
+        assert!(query.contains("GROUP BY failure_category"));
+        // Unmeasured (zero/legacy NONE) latencies never enter a percentile.
+        assert_eq!(query.matches("latency_ms > 0").count(), 3);
+        assert_eq!(query.matches("math::percentile(").count(), 6);
         assert!(query.contains("time::group(time::now(), 'month')"));
         assert!(!query.contains("1mo"));
     }
@@ -255,5 +343,27 @@ mod tests {
             assert!(query.contains(CURRENT_MONTH_START));
             assert!(!query.contains("1mo"));
         }
+    }
+
+    #[test]
+    fn aggregates_map_failures_fallbacks_and_only_finite_latency() {
+        let row = AggregateRow {
+            requests: Some(4),
+            failures: Some(1),
+            fallbacks: Some(3),
+            latency_p50_ms: Some(120.4),
+            latency_p95_ms: Some(f64::NAN),
+            ..Default::default()
+        };
+        let mapped = with_latency(totals(&row), Some(&row));
+        assert_eq!(
+            (mapped.requests, mapped.failures, mapped.fallbacks),
+            (4, 1, 3)
+        );
+        assert_eq!(mapped.latency_p50_ms, Some(120));
+        assert_eq!(mapped.latency_p95_ms, None);
+        assert_eq!(latency_ms(Some(f64::NAN)), None);
+        assert_eq!(latency_ms(Some(-1.0)), None);
+        assert_eq!(with_latency(totals(&row), None).latency_p50_ms, None);
     }
 }

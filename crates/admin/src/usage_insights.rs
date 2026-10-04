@@ -73,6 +73,18 @@ pub(super) struct UsageReport {
     pub(super) by_model: Vec<UsageRow>,
     #[serde(default)]
     pub(super) daily: Vec<DailyUsageRow>,
+    #[serde(default)]
+    pub(super) failures: u64,
+    #[serde(default)]
+    pub(super) fallbacks: u64,
+    #[serde(default)]
+    pub(super) latency_p50_ms: Option<u64>,
+    #[serde(default)]
+    pub(super) latency_p95_ms: Option<u64>,
+    #[serde(default)]
+    pub(super) by_agent: Vec<AgentUsageRow>,
+    #[serde(default)]
+    pub(super) failures_by_category: Vec<FailureCountRow>,
     pub(super) pricing: PricingSummary,
 }
 
@@ -88,6 +100,35 @@ pub(super) struct UsageRow {
     pub(super) cache_read_tokens: u64,
     pub(super) cache_write_tokens: u64,
     pub(super) total_tokens: u64,
+    #[serde(default)]
+    pub(super) failures: u64,
+    #[serde(default)]
+    pub(super) fallbacks: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) latency_p50_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) latency_p95_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct AgentUsageRow {
+    pub(super) agent_id: String,
+    pub(super) requests: u64,
+    pub(super) input_tokens: u64,
+    pub(super) output_tokens: u64,
+    pub(super) total_tokens: u64,
+    pub(super) spent_eur: f64,
+    pub(super) failures: u64,
+    pub(super) fallbacks: u64,
+    pub(super) latency_p50_ms: Option<u64>,
+    pub(super) latency_p95_ms: Option<u64>,
+    pub(super) last_used: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct FailureCountRow {
+    pub(super) category: String,
+    pub(super) requests: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -426,6 +467,8 @@ pub(super) fn read_usage_report() -> Result<UsageReport> {
         || report.by_backend.len() > 32
         || report.by_model.len() > 250
         || report.daily.len() > 32
+        || report.by_agent.len() > 100
+        || report.failures_by_category.len() > 32
         || !report.spent_eur.is_finite()
         || !report.budget_eur.is_finite()
     {
@@ -605,5 +648,21 @@ mod tests {
         assert!(!serialized.contains("prompt"));
         assert!(!serialized.contains("api_key"));
         assert!(!serialized.contains("must-not-be-retained"));
+        // Snapshots from older Core releases lack the analysis fields.
+        assert_eq!(report.failures, 0);
+        assert!(report.by_agent.is_empty());
+    }
+
+    #[test]
+    fn usage_report_keeps_agent_latency_and_failure_analysis() {
+        let report: UsageReport = serde_json::from_str(
+            r#"{"period":"current_calendar_month","generated_at_unix":1,"budget_eur":20.0,"spent_eur":1.0,"remaining_eur":19.0,"over_budget":false,"requests":3,"input_tokens":2,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":5,"failures":1,"fallbacks":2,"latency_p50_ms":120,"latency_p95_ms":900,"by_backend":[{"backend":"ollama-cloud","spent_eur":1.0,"requests":3,"input_tokens":2,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":5,"failures":1,"fallbacks":2,"latency_p50_ms":120,"latency_p95_ms":900}],"by_agent":[{"agent_id":"researcher","requests":3,"input_tokens":2,"output_tokens":3,"total_tokens":5,"spent_eur":1.0,"failures":1,"fallbacks":2,"latency_p50_ms":120,"latency_p95_ms":900,"last_used":"2026-10-01T10:00:00Z"}],"failures_by_category":[{"category":"timeout","requests":1}],"pricing":{"source":"fixture","updated_at":"2026-09-01"}}"#,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["latency_p95_ms"], 900);
+        assert_eq!(value["by_backend"][0]["fallbacks"], 2);
+        assert_eq!(value["by_agent"][0]["agent_id"], "researcher");
+        assert_eq!(value["failures_by_category"][0]["category"], "timeout");
     }
 }

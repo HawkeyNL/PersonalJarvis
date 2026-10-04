@@ -96,7 +96,7 @@ enum Snapshot {
     Status(std::result::Result<StatusReport, String>),
     Agents(std::result::Result<Option<AgentTreeSnapshot>, String>),
     Models(std::result::Result<Vec<usage_insights::PricedModelRecord>, String>),
-    Usage(std::result::Result<usage_insights::UsageReport, String>),
+    Usage(Box<std::result::Result<usage_insights::UsageReport, String>>),
     Credentials(Vec<CredentialView>),
     Services(Vec<ServiceView>),
     System(Vec<(String, String)>),
@@ -586,7 +586,7 @@ impl JarvisApp {
         let sender = self.sender.clone();
         thread::spawn(move || {
             let result = usage_insights::read_usage_report().map_err(|error| format!("{error:#}"));
-            let _ = sender.send(Snapshot::Usage(result));
+            let _ = sender.send(Snapshot::Usage(Box::new(result)));
         });
     }
 
@@ -688,7 +688,7 @@ impl JarvisApp {
                 }
                 Snapshot::Usage(result) => {
                     self.loading.retain(|view| *view != AppView::Usage);
-                    match result {
+                    match *result {
                         Ok(usage) => self.usage = Some(usage),
                         Err(error) => self.error = Some(safe_error(&error)),
                     }
@@ -2865,6 +2865,10 @@ fn fixture_usage_report() -> usage_insights::UsageReport {
             cache_read_tokens: 12_000,
             cache_write_tokens: 500,
             total_tokens: 64_000,
+            failures: 0,
+            fallbacks: 0,
+            latency_p50_ms: None,
+            latency_p95_ms: None,
         }],
         by_model: vec![usage_insights::UsageRow {
             backend: "ollama-cloud".to_owned(),
@@ -2876,6 +2880,10 @@ fn fixture_usage_report() -> usage_insights::UsageReport {
             cache_read_tokens: 12_000,
             cache_write_tokens: 500,
             total_tokens: 64_000,
+            failures: 0,
+            fallbacks: 0,
+            latency_p50_ms: None,
+            latency_p95_ms: None,
         }],
         daily: vec![usage_insights::DailyUsageRow {
             day: "2026-09-02".to_owned(),
@@ -2887,6 +2895,12 @@ fn fixture_usage_report() -> usage_insights::UsageReport {
             cache_write_tokens: 500,
             total_tokens: 64_000,
         }],
+        failures: 0,
+        fallbacks: 0,
+        latency_p50_ms: None,
+        latency_p95_ms: None,
+        by_agent: Vec::new(),
+        failures_by_category: Vec::new(),
         pricing: usage_insights::PricingSummary {
             source: "fixture pricing".to_owned(),
             updated_at: "2026-09-01".to_owned(),

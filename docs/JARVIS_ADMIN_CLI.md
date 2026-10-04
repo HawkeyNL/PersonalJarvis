@@ -303,8 +303,9 @@ sudo jarvis usage
 sudo jarvis --json usage
 ```
 
-It includes request and token totals, daily/provider/model breakdowns and
-estimated spend. The same data is available as the persistent Costs view in
+It includes request and token totals, daily/provider/model/agent breakdowns,
+estimated spend, failure counts by category, router fallbacks and latency
+p50/p95 (over calls with a measured latency). The same data is available as the persistent Costs view in
 `sudo jarvis`. Core refreshes the snapshot at startup, after metered requests
 and periodically so a temporary database failure can recover without an extra
 model call. The snapshot is bounded, root-controlled and contains no

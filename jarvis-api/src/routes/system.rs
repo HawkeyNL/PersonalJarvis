@@ -454,6 +454,17 @@ pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store:
     let reservation = state.budget_book.snapshot();
     let mut statistics = usage::month_statistics(&state.db).await?;
     statistics.by_model.truncate(250);
+    statistics.by_agent.truncate(MAX_USAGE_AGENTS);
+    statistics.failures_by_category.truncate(32);
+    let by_agent: Vec<Value> = statistics
+        .by_agent
+        .iter()
+        .map(|row| {
+            let mut value = agent_usage_value(row);
+            value["agent_id"] = json!(row.agent_id);
+            value
+        })
+        .collect();
     let by_backend: Vec<Value> = statistics
         .by_backend
         .into_iter()
@@ -467,6 +478,10 @@ pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store:
                 "cache_read_tokens": row.totals.cache_read_tokens,
                 "cache_write_tokens": row.totals.cache_write_tokens,
                 "total_tokens": row.totals.total_tokens,
+                "failures": row.totals.failures,
+                "fallbacks": row.totals.fallbacks,
+                "latency_p50_ms": row.totals.latency_p50_ms,
+                "latency_p95_ms": row.totals.latency_p95_ms,
             })
         })
         .collect();
@@ -484,6 +499,8 @@ pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store:
                 "cache_read_tokens": row.totals.cache_read_tokens,
                 "cache_write_tokens": row.totals.cache_write_tokens,
                 "total_tokens": row.totals.total_tokens,
+                "failures": row.totals.failures,
+                "fallbacks": row.totals.fallbacks,
             })
         })
         .collect();
@@ -521,11 +538,35 @@ pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store:
         "by_backend": by_backend,
         "by_model": by_model,
         "daily": daily,
+        "failures": statistics.totals.failures,
+        "fallbacks": statistics.totals.fallbacks,
+        "latency_p50_ms": statistics.totals.latency_p50_ms,
+        "latency_p95_ms": statistics.totals.latency_p95_ms,
+        "by_agent": by_agent,
+        "failures_by_category": statistics.failures_by_category,
         "pricing": {
             "source": state.pricing_registry.source,
             "updated_at": state.pricing_registry.updated_at,
         },
     }))
+}
+
+const MAX_USAGE_AGENTS: usize = 100;
+
+/// One agent's monthly usage, shared by `/v1/system/usage` and `/v1/agents`.
+pub(crate) fn agent_usage_value(row: &usage::AgentUsage) -> Value {
+    json!({
+        "requests": row.totals.requests,
+        "input_tokens": row.totals.input_tokens,
+        "output_tokens": row.totals.output_tokens,
+        "total_tokens": row.totals.total_tokens,
+        "spent_eur": row.totals.cost_eur,
+        "failures": row.totals.failures,
+        "fallbacks": row.totals.fallbacks,
+        "latency_p50_ms": row.totals.latency_p50_ms,
+        "latency_p95_ms": row.totals.latency_p95_ms,
+        "last_used": row.last_used,
+    })
 }
 
 pub(crate) async fn system_usage(

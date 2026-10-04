@@ -446,3 +446,91 @@ async fn current_month_usage_aggregates_work_before_and_after_first_call(
     assert_eq!(populated.daily.len(), 1);
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn month_statistics_break_down_agents_latency_failures_and_fallbacks(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_usage_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+
+    // A pre-telemetry row has none of the routing fields and must not break
+    // the aggregate (NONE latency, failure category and fallback count).
+    db.query(
+        "CREATE llm_usage SET id = $id, ts = time::now(), backend = 'ollama-cloud', model = 'legacy', \
+         input_tokens = 1, output_tokens = 1, cache_read_tokens = 0, cache_write_tokens = 0, cost_eur = 0.0",
+    )
+    .bind(json!({"id": uuid::Uuid::now_v7().to_string()}))
+    .await?
+    .check()?;
+    let entry = |agent: Option<&str>, latency_ms, failure: Option<&str>, fallback_count| {
+        jarvis_usage::UsageEntry {
+            request_id: uuid::Uuid::now_v7().to_string(),
+            backend: "ollama-cloud".to_owned(),
+            model: "fixture-model".to_owned(),
+            requested_route: None,
+            actual_provider: None,
+            cost_estimate_classification: "known".to_owned(),
+            routing_mode: "test".to_owned(),
+            quality_tier: "test".to_owned(),
+            agent_id: agent.map(str::to_owned),
+            latency_ms,
+            status: if failure.is_some() {
+                "failed"
+            } else {
+                "succeeded"
+            }
+            .to_owned(),
+            failure_category: failure.map(str::to_owned),
+            fallback_count,
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_eur: 0.01,
+        }
+    };
+    for row in [
+        entry(Some("researcher"), 100, None, 0),
+        entry(Some("researcher"), 300, Some("timeout"), 2),
+        // Unmeasured internal call: counted, but excluded from latency.
+        entry(None, 0, None, 0),
+    ] {
+        jarvis_usage::record(&db, &row).await?;
+    }
+
+    let stats = jarvis_usage::month_statistics(&db).await?;
+    assert_eq!(stats.totals.requests, 4);
+    assert_eq!(stats.totals.failures, 1);
+    assert_eq!(stats.totals.fallbacks, 2);
+    let p50 = stats.totals.latency_p50_ms.ok_or("missing p50")?;
+    let p95 = stats.totals.latency_p95_ms.ok_or("missing p95")?;
+    assert!((100..=300).contains(&p50) && (p50..=300).contains(&p95));
+    assert_eq!(stats.by_backend.len(), 1);
+    assert_eq!(stats.by_backend[0].totals.failures, 1);
+    assert!(stats.by_backend[0].totals.latency_p95_ms.is_some());
+
+    assert_eq!(stats.by_agent.len(), 1);
+    let agent = &stats.by_agent[0];
+    assert_eq!(agent.agent_id, "researcher");
+    assert_eq!((agent.totals.requests, agent.totals.total_tokens), (2, 30));
+    assert_eq!((agent.totals.failures, agent.totals.fallbacks), (1, 2));
+    assert!(agent.totals.latency_p50_ms.is_some());
+    assert!(agent.last_used.is_some());
+
+    assert_eq!(stats.failures_by_category.len(), 1);
+    assert_eq!(stats.failures_by_category[0].category, "timeout");
+    assert_eq!(stats.failures_by_category[0].requests, 1);
+    Ok(())
+}

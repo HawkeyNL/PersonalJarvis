@@ -515,6 +515,33 @@ pub struct UsageTotals {
     pub cache_write_tokens: u64,
     pub total_tokens: u64,
     pub cost_eur: f64,
+    /// Calls recorded with a failure category.
+    #[serde(default)]
+    pub failures: u64,
+    /// Sum of router fallbacks taken before the recorded call.
+    #[serde(default)]
+    pub fallbacks: u64,
+    /// Latency percentiles over calls with a measured (non-zero) latency.
+    #[serde(default)]
+    pub latency_p50_ms: Option<u64>,
+    #[serde(default)]
+    pub latency_p95_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentUsage {
+    pub agent_id: String,
+    /// RFC 3339 timestamp of the most recent call this month.
+    #[serde(default)]
+    pub last_used: Option<String>,
+    #[serde(flatten)]
+    pub totals: UsageTotals,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureCount {
+    pub category: String,
+    pub requests: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -539,6 +566,10 @@ pub struct UsageStatistics {
     pub by_backend: Vec<UsageDimension>,
     pub by_model: Vec<UsageDimension>,
     pub daily: Vec<DailyUsage>,
+    #[serde(default)]
+    pub by_agent: Vec<AgentUsage>,
+    #[serde(default)]
+    pub failures_by_category: Vec<FailureCount>,
 }
 
 /// EUR-cent limits for the current calendar month.  Zero is a real hard stop,
