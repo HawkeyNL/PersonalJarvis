@@ -200,6 +200,20 @@ export interface ClaudeRuntimeStatus {
 }
 export type RuntimeChannel = "stable" | "latest";
 export type ClaudeRuntimeMutation = { action: "install"; channel: RuntimeChannel } | { action: "rollback" };
+export type LayaMode = "off" | "shadow" | "primary";
+export interface LayaStatus {
+  installed: boolean;
+  laya_version: string;
+  model_revision: string;
+  socket_enabled: string;
+  socket_active: string;
+  service_active: string;
+  mode: LayaMode | "unreadable";
+  last_probe: { at: number; ok: boolean } | null;
+  download_bytes: number;
+  disk_bytes: number;
+}
+export type LayaMutation = { action: "install" } | { action: "enable" } | { action: "disable" } | { action: "mode"; mode: LayaMode };
 export interface CodexRuntimeStatus {
   provider: "codex";
   installed: boolean;
@@ -273,6 +287,9 @@ export const api = {
   claudeRuntime: () => invoke<ClaudeRuntimeStatus>("claude_runtime"),
   claudeRuntimeMutation: (request: ClaudeRuntimeMutation) =>
     invoke<OperationResult>("claude_runtime_mutation", { request }),
+  laya: () => invoke<LayaStatus>("laya"),
+  layaMutation: (request: LayaMutation) =>
+    invoke<OperationResult>("laya_mutation", { request }),
   codexRuntime: () => invoke<CodexRuntimeStatus>("codex_runtime"),
   codexRuntimeMutation: (request: CodexRuntimeMutation) =>
     invoke<OperationResult>("codex_runtime_mutation", { request }),

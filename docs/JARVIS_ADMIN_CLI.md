@@ -347,6 +347,12 @@ is never rendered by the TUI or emitted in JSON.
 
 ## Diagnostics
 
+### Local Laya classifier
+
+`sudo jarvis laya status|install|enable|disable|mode <off|shadow|primary>`
+installs the hash-pinned local Laya runtime and turns it on or off. Details,
+sizes and the trust rules are in [LAYA_INTENT_ROUTING.md](LAYA_INTENT_ROUTING.md).
+
 ### Disk housekeeping
 
 `sudo jarvis housekeeping status [--json]` shows which old Core releases and

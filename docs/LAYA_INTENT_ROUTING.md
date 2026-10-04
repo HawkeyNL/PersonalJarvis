@@ -47,10 +47,23 @@ checkpoint is intentionally excluded; its training workflows are not Jarvis
 intent data. The wrapper defaults uncertain Latin-language input to the
 multilingual checkpoint and only auto-selects English when Laya identifies it.
 
-The package's transitive requirements are not fully pinned by upstream.
-Before provisioning, the owner must create and review a complete hash-pinned
-`requirements.lock` and matching offline wheelhouse for this Ubuntu/Python
-platform; do not install `latest`. Place those root-owned artifacts at:
+The package's transitive requirements are not fully pinned by upstream, so
+the repository carries the reviewed pins:
+
+- `deploy/laya/requirements.lock`: `laya[serve]==0.3.20` and its 44
+  transitive wheels for CPython 3.14 on manylinux x86_64 (binary wheels only,
+  252 MB). torch is the CPU-only `2.14.1+cpu` build from the official PyTorch
+  CPU index; everything else comes from PyPI. Each `name==version
+  --hash=sha256:` pin is preceded by a comment naming its single HTTPS source
+  and exact byte size.
+- `deploy/laya/models.sha256`: the ten config/tokenizer JSON and
+  `.safetensors` files of the English root and `multilingual/` checkpoints
+  (1.52 GB), cross-checked against the Hugging Face LFS SHA-256 and git blob
+  ids. `typed-decisions/`, Python files, images and evaluation data are not
+  listed.
+
+Both files are compiled into the `jarvis` CLI. Changing a pin is a reviewed
+pull request; nothing resolves `latest`. The staging layout is:
 
 ```text
 /var/cache/jarvis-laya/staging/requirements.lock
@@ -59,11 +72,11 @@ platform; do not install `latest`. Place those root-owned artifacts at:
 /var/cache/jarvis-laya/staging/models.sha256
 ```
 
-Obtain the English root and multilingual subdirectory from the exact bundle
-revision above and allow only
-configuration/tokenizer text or JSON and `.safetensors` files. Review the
-generated checksum manifest before moving the snapshot into root-owned
-staging. No Python model repository code, pickle `.bin` file, symlink, or
+`sudo jarvis laya install` fills this layout itself (see below). For the
+manual path, obtain the English root and multilingual subdirectory from the
+exact bundle revision above, allow only configuration/tokenizer text or JSON
+and `.safetensors` files, and verify them against the reviewed manifest
+before moving the snapshot into root-owned staging. No Python model repository code, pickle `.bin` file, symlink, or
 world-writable artifact is accepted by the provisioner. Reviewed staging stays
 root:root and unchanged across retries; a temporary root:jarvis-laya read-only
 wheelhouse/lockfile copy is deleted on success or failure.
@@ -77,12 +90,89 @@ with a controlled environment, using `pip --no-index --require-hashes
 pip runs. This is independent of firewall and proxy settings. Normal service startup has
 `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` and needs no network.
 
-After a verified Core release contains these artifacts, the owner can run:
+## Install and turn on or off (Core Admin and CLI)
+
+Core Admin shows a Laya card on **Intelligence → Models** with the installed
+pins, socket/service state, Core mode, last health probe and disk use. Its
+buttons run fixed `jarvis laya` commands through the root broker after
+administrator authentication; the only free input is the mode, chosen from
+Off / Shadow / Primary. The same flow from a terminal:
+
+```bash
+sudo jarvis laya status             # read-only; --json for Core Admin
+sudo jarvis laya install            # download, verify, provision, enable in shadow
+sudo jarvis laya mode shadow        # off | shadow | primary
+sudo jarvis laya disable            # turn Laya off
+sudo jarvis laya enable             # turn it back on without downloading
+```
+
+- **install** needs CPython 3.14 on x86_64 with `ensurepip` (Ubuntu package
+  `python3.14-venv`) and at least 8 GiB free (headroom). It downloads about
+  1.78 GB and keeps about 4.5 GB on disk (staging 1.78 GB, venv 1.2 GB, model
+  copy 1.52 GB), plus a temporary 0.25 GB wheel copy while provisioning. Each
+  file is fetched with curl over HTTPS only, size-bounded and timed out. PyPI
+  and the PyTorch CPU index serve wheels directly and redirects are refused;
+  Hugging Face redirects are followed by hand, at most four hops, and only to
+  `https://huggingface.co/` or `https://*.hf.co/`. Then the file's SHA-256
+  (and for wheels the exact size) is checked against the compiled-in pins
+  before it is moved into root-owned staging. Already verified files are
+  kept, so an interrupted install resumes; work directories it left behind
+  (`/var/cache/jarvis-laya/.download.XXXXXX`) are removed; an unpinned,
+  linked or writable staging entry stops the install for review. The active
+  release's unchanged `provision-laya` then installs offline. An already
+  provisioned runtime is not downloaded again.
+- **enable** runs `systemctl enable --now jarvis-laya.socket
+  jarvis-laya.service`, so the service also starts at boot and keeps both
+  checkpoints resident (a cold first request would exceed Core's bounded Laya
+  timeout; the service is limited to 6 GB of memory). It then requires a
+  healthy `/health` with both checkpoints loaded (up to 180 s). A failed probe
+  disables both units again. Mode `off` becomes `shadow`; another mode is kept.
+- **disable** first restarts Core with `JARVIS_LAYA_MODE=off`, then always
+  runs `systemctl disable --now jarvis-laya.service jarvis-laya.socket`.
+  Installed files stay. Turning off is never undone: if Core does not report
+  ready within 60 s, `off` stays saved, the units are still stopped, and the
+  command reports the Core problem separately (`sudo jarvis health`).
+- **mode** replaces only the `JARVIS_LAYA_MODE` line of `/etc/jarvis/core.env`
+  (same directory temporary file, ownership and 0640 kept, atomic rename),
+  restarts Core and waits up to 60 s for `/readyz`. A switch to `shadow` or
+  `primary` that leaves Core not ready is undone (previous file restored,
+  Core restarted); `off` is kept. `shadow` and `primary` require an enabled
+  socket and a healthy probe. The value must be written exactly as
+  `JARVIS_LAYA_MODE=off|shadow|primary` at the start of a line: any other
+  spelling systemd would also accept (surrounding whitespace, quotes,
+  escapes, a continued or multi-line value) or a duplicate makes the command
+  refuse, so the CLI never disagrees with what Core receives. No other
+  configuration value is read out or printed.
+
+Mutations hold the administration configuration lock and the Core updater
+lock, and record `authpriv.notice` events tagged `jarvis-laya`
+(`sudo journalctl -t jarvis-laya`). An event that cannot be recorded aborts the
+action before anything changes.
+
+The manual path stays available after a verified Core release contains the
+artifacts: stage the reviewed files as above, then run
 
 ```bash
 sudo /opt/jarvis/current/provision-laya
-sudo systemctl enable --now jarvis-laya.service
+sudo systemctl enable --now jarvis-laya.socket jarvis-laya.service
 curl --fail --silent --unix-socket /run/jarvis-laya.sock http://jarvis-laya.local/health
+```
+
+and set `JARVIS_LAYA_MODE` in Core's configuration as described below.
+
+**Recovery after interrupted provisioning.** `provision-laya` moves the new
+runtime to `/opt/jarvis/laya/releases/laya-0.3.20-<revision>` and only then
+switches `/opt/jarvis/laya/current`. If it stopped in between, the CLI reports
+Laya as not installed and the provisioner refuses to overwrite the existing
+release directory. Make sure Laya is off (`sudo jarvis laya disable`), check
+that `current` is absent or still points at another release, then remove only
+that incomplete release and install again; the verified staging is reused, so
+nothing is downloaded:
+
+```bash
+sudo readlink /opt/jarvis/laya/current
+sudo rm -rf --one-file-system /opt/jarvis/laya/releases/laya-0.3.20-55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851
+sudo jarvis laya install
 ```
 
 The provisioner requires pre-staged reviewed bytes and does **not** fetch
@@ -134,14 +224,14 @@ calls paid Jev directly or bypasses Core's budget. Public upstream benchmark
 scores are not Jarvis acceptance evidence; upstream also cautions that base
 checkpoints can be overconfident or weak on unfamiliar typed decisions.
 
-For an accepted shadow trial, set `JARVIS_LAYA_MODE=shadow` through trusted
-root-managed Core configuration and restart Core. Review safe structured
+For an accepted shadow trial, set `JARVIS_LAYA_MODE=shadow` (`sudo jarvis laya
+mode shadow`, or trusted root-managed Core configuration and a Core restart). Review safe structured
 comparison logs and benchmark accuracy/coverage before explicitly setting
 `JARVIS_LAYA_MODE=primary`. Do not enable primary on an unmeasured Home Node.
 `/readyz` remains independent of this optional classifier; a stopped service
 degrades to Jev or normal Auto routing. Rollback to a pre-Laya Core release
 requires the owner to stop and disable `jarvis-laya.service` and
-`jarvis-laya.socket` first; the updater
+`jarvis-laya.socket` first (`sudo jarvis laya disable`); the updater
 refuses to remove a running/enabled service definition. Rollback then removes
 the release-owned unit, while the separately provisioned weights/venv remain
 inert for owner-managed cleanup.

@@ -10,7 +10,10 @@ fn main() {
         }
         jarvis_core_admin_lib::run_credential_entry(&arguments[2]);
     }
-    if arguments.get(1).is_some_and(|value| value == "--account-entry") {
+    if arguments
+        .get(1)
+        .is_some_and(|value| value == "--account-entry")
+    {
         if arguments.len() != 4 {
             eprintln!("jarvis-core-admin: AI account entry requires a typed action and provider");
             std::process::exit(2);

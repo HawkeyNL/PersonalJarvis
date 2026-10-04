@@ -585,6 +585,38 @@ pub enum ClaudeRuntimeMutation {
     Rollback {},
 }
 
+/// `jarvis --json laya status`. The CLI compiles in the reviewed pins, so
+/// unknown fields and unexpected values are rejected.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LayaStatus {
+    pub installed: bool,
+    pub laya_version: String,
+    pub model_revision: String,
+    pub socket_enabled: String,
+    pub socket_active: String,
+    pub service_active: String,
+    pub mode: String,
+    pub last_probe: Option<LayaProbe>,
+    pub download_bytes: u64,
+    pub disk_bytes: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LayaProbe {
+    pub at: u64,
+    pub ok: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayaMode {
+    Off,
+    Shadow,
+    Primary,
+}
+
 /// Sanitized official Codex CLI runtime state; versions are strict
 /// `MAJOR.MINOR.PATCH` and nothing else from the release service is kept.
 #[derive(Debug, Deserialize, Serialize)]
@@ -598,6 +630,16 @@ pub struct CodexRuntimeStatus {
     pub update_available: bool,
     pub rollback_available: bool,
     pub cosign_available: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LayaMutation {
+    // Struct variants so `deny_unknown_fields` also rejects extra fields.
+    Install {},
+    Enable {},
+    Disable {},
+    Mode { mode: LayaMode },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1048,6 +1090,41 @@ fn claude_runtime_arguments(request: &ClaudeRuntimeMutation) -> (Vec<String>, Du
     }
 }
 
+pub fn laya(session: &SessionManager) -> AdminResult<LayaStatus> {
+    validate_laya(parse_json(&session.run(BrokerRequest::Laya)?.stdout)?)
+}
+
+fn validate_laya(status: LayaStatus) -> AdminResult<LayaStatus> {
+    let state = |value: &str| {
+        (1..=32).contains(&value.len())
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+    };
+    let valid = (1..=16).contains(&status.laya_version.len())
+        && status
+            .laya_version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        && status.model_revision.len() == 40
+        && status
+            .model_revision
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && [
+            &status.socket_enabled,
+            &status.socket_active,
+            &status.service_active,
+        ]
+        .into_iter()
+        .all(|value| state(value))
+        && ["off", "shadow", "primary", "unreadable"].contains(&status.mode.as_str());
+    if !valid {
+        return Err("Laya status contained unexpected metadata".to_owned());
+    }
+    Ok(status)
+}
+
 pub fn codex_runtime(session: &SessionManager) -> AdminResult<CodexRuntimeStatus> {
     validate_codex_runtime(parse_json(
         &session.run(BrokerRequest::CodexRuntime)?.stdout,
@@ -1060,6 +1137,22 @@ fn validate_codex_runtime(status: CodexRuntimeStatus) -> AdminResult<CodexRuntim
         return Err("Codex runtime status contained unexpected metadata".to_owned());
     }
     Ok(status)
+}
+
+pub fn laya_mutation(
+    session: &SessionManager,
+    request: LayaMutation,
+) -> AdminResult<OperationResult> {
+    let summary = match request {
+        LayaMutation::Install {} => "Laya installed, verified and enabled",
+        LayaMutation::Enable {} => "Laya enabled",
+        LayaMutation::Disable {} => "Laya turned off",
+        LayaMutation::Mode { .. } => "Laya routing mode updated",
+    };
+    operation(
+        session.run(BrokerRequest::LayaMutation { request })?,
+        summary,
+    )
 }
 
 pub fn codex_runtime_mutation(
@@ -1076,6 +1169,29 @@ pub fn codex_runtime_mutation(
         session.run(BrokerRequest::CodexRuntimeMutation { request })?,
         summary,
     )
+}
+
+/// Fixed argv for each typed Laya request; the mode is the only input.
+fn laya_arguments(request: &LayaMutation) -> (Vec<String>, Duration) {
+    let fixed = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    match request {
+        // About 1.8 GB of downloads (each bounded by curl) plus provisioning.
+        LayaMutation::Install {} => (fixed(&["laya", "install"]), Duration::from_secs(3_600)),
+        LayaMutation::Enable {} => (fixed(&["laya", "enable"]), Duration::from_secs(600)),
+        LayaMutation::Disable {} => (fixed(&["laya", "disable"]), Duration::from_secs(600)),
+        LayaMutation::Mode { mode } => (
+            fixed(&[
+                "laya",
+                "mode",
+                match mode {
+                    LayaMode::Off => "off",
+                    LayaMode::Shadow => "shadow",
+                    LayaMode::Primary => "primary",
+                },
+            ]),
+            Duration::from_secs(600),
+        ),
+    }
 }
 
 /// Fixed argv for each typed runtime request; a strict version is the only
@@ -1116,18 +1232,39 @@ pub fn ai_account_action(
     ];
     let (program, mut terminal_args) = if Path::new(PTYXIS).exists() {
         verify_root_executable(PTYXIS)?;
-        (PTYXIS, vec![OsString::from("--title=Jarvis AI account"), OsString::from("--")])
+        (
+            PTYXIS,
+            vec![
+                OsString::from("--title=Jarvis AI account"),
+                OsString::from("--"),
+            ],
+        )
     } else if Path::new(GNOME_TERMINAL).exists() {
         verify_root_executable(GNOME_TERMINAL)?;
-        (GNOME_TERMINAL, vec![OsString::from("--wait"), OsString::from("--title=Jarvis AI account"), OsString::from("--")])
+        (
+            GNOME_TERMINAL,
+            vec![
+                OsString::from("--wait"),
+                OsString::from("--title=Jarvis AI account"),
+                OsString::from("--"),
+            ],
+        )
     } else {
         return Err("no supported GNOME account terminal is installed".to_owned());
     };
     terminal_args.append(&mut args);
     let mut command = Command::new(program);
-    command.args(terminal_args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    command
+        .args(terminal_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     configure_desktop_environment(&mut command);
-    if !command.status().map_err(|_| "could not open trusted account terminal".to_owned())?.success() {
+    if !command
+        .status()
+        .map_err(|_| "could not open trusted account terminal".to_owned())?
+        .success()
+    {
         return Err("AI account operation was cancelled or did not complete".to_owned());
     }
     Ok(OperationResult {
@@ -1156,7 +1293,11 @@ pub fn ai_account_entry(action: &OsStr, provider: &OsStr) -> AdminResult<()> {
     }
     verify_root_executable(PKEXEC)?;
     verify_root_executable(ADMIN)?;
-    println!("Jarvis AI account · {} · {}", provider.cli_name(), action.cli_name());
+    println!(
+        "Jarvis AI account · {} · {}",
+        provider.cli_name(),
+        action.cli_name()
+    );
     println!("Provider authentication stays inside the dedicated worker identity.");
     let status = Command::new(PKEXEC)
         .arg(ADMIN)
@@ -1685,7 +1826,11 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
         ),
         BrokerRequest::Accounts => (
             ADMIN,
-            vec!["--json".to_owned(), "accounts".to_owned(), "list".to_owned()],
+            vec![
+                "--json".to_owned(),
+                "accounts".to_owned(),
+                "list".to_owned(),
+            ],
             Duration::from_secs(30),
         ),
         BrokerRequest::ClaudeRuntime => (
@@ -1701,6 +1846,15 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
         ),
         BrokerRequest::ClaudeRuntimeMutation { request } => {
             let (args, timeout) = claude_runtime_arguments(&request);
+            (ADMIN, args, timeout)
+        }
+        BrokerRequest::Laya => (
+            ADMIN,
+            vec!["--json".to_owned(), "laya".to_owned(), "status".to_owned()],
+            Duration::from_secs(60),
+        ),
+        BrokerRequest::LayaMutation { request } => {
+            let (args, timeout) = laya_arguments(&request);
             (ADMIN, args, timeout)
         }
         BrokerRequest::CodexRuntime => (
@@ -2029,6 +2183,48 @@ mod tests {
         assert!(validate_model("model\n--flag").is_err());
         assert!(validate_hf_route("groq").is_ok());
         assert!(validate_hf_route("https://evil").is_err());
+    }
+
+    #[test]
+    fn laya_requests_map_to_fixed_arguments() {
+        let parse = |json: &str| serde_json::from_str::<LayaMutation>(json);
+        assert_eq!(
+            laya_arguments(&parse(r#"{"action":"install"}"#).unwrap()).0,
+            ["laya", "install"]
+        );
+        assert_eq!(
+            laya_arguments(&parse(r#"{"action":"disable"}"#).unwrap()).0,
+            ["laya", "disable"]
+        );
+        assert_eq!(
+            laya_arguments(&parse(r#"{"action":"mode","mode":"primary"}"#).unwrap()).0,
+            ["laya", "mode", "primary"]
+        );
+        for invalid in [
+            r#"{"action":"mode","mode":"on"}"#,
+            r#"{"action":"mode"}"#,
+            r#"{"action":"install","url":"https://example.com"}"#,
+            r#"{"action":"uninstall"}"#,
+        ] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn laya_status_is_strict() {
+        let valid = r#"{"installed":true,"laya_version":"0.3.20","model_revision":"55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851","socket_enabled":"enabled","socket_active":"active","service_active":"active","mode":"shadow","last_probe":{"at":1,"ok":true},"download_bytes":1,"disk_bytes":2}"#;
+        assert!(validate_laya(serde_json::from_str(valid).unwrap()).is_ok());
+        for invalid in [
+            valid.replace(r#""mode":"shadow""#, r#""mode":"<b>x</b>""#),
+            valid.replace(r#""socket_active":"active""#, r#""socket_active":"Active""#),
+            valid.replace("55cf4c4e", "zzzzzzzz"),
+        ] {
+            assert!(validate_laya(serde_json::from_str(&invalid).unwrap()).is_err());
+        }
+        assert!(serde_json::from_str::<LayaStatus>(
+            &valid.replace(r#""disk_bytes":2"#, r#""disk_bytes":2,"token":"x""#)
+        )
+        .is_err());
     }
 
     #[test]
@@ -2489,7 +2685,10 @@ mod tests {
         let safe = r#"{"provider":"claude","worker":"jarvis-claude","state":"connected","billing":"overage_unverified","runtime":"inactive"}"#;
         let row: AiAccountRecord = serde_json::from_str(safe).unwrap();
         assert_eq!(row.billing, "overage_unverified");
-        let with_token = safe.replace("\"runtime\"", "\"access_token\":\"canary-secret\",\"runtime\"");
+        let with_token = safe.replace(
+            "\"runtime\"",
+            "\"access_token\":\"canary-secret\",\"runtime\"",
+        );
         assert!(serde_json::from_str::<AiAccountRecord>(&with_token).is_err());
     }
 
