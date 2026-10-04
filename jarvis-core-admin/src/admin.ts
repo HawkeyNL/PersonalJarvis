@@ -187,6 +187,18 @@ export interface AiAccountRecord {
   billing: "subscription" | "unverified" | "overage_unverified";
   runtime: "inactive" | "socket_ready" | "active" | "unavailable";
 }
+export interface ClaudeRuntimeStatus {
+  provider: "claude";
+  installed: boolean;
+  version: string | null;
+  gate_ok: boolean;
+  safe_ownership: boolean;
+  latest_stable: string | null;
+  update_available: boolean;
+  rollback_available: boolean;
+}
+export type RuntimeChannel = "stable" | "latest";
+export type ClaudeRuntimeMutation = { action: "install"; channel: RuntimeChannel } | { action: "rollback" };
 export type LogService =
   | "core"
   | "surrealdb"
@@ -244,6 +256,9 @@ export const api = {
   aiAccounts: () => invoke<AiAccountRecord[]>("ai_accounts"),
   aiAccountAction: (provider: AiAccountProvider, action: AiAccountAction) =>
     invoke<OperationResult>("ai_account_action", { provider, action }),
+  claudeRuntime: () => invoke<ClaudeRuntimeStatus>("claude_runtime"),
+  claudeRuntimeMutation: (request: ClaudeRuntimeMutation) =>
+    invoke<OperationResult>("claude_runtime_mutation", { request }),
   credentialSet: (provider: CredentialProvider) =>
     invoke<OperationResult>("credential_set", { provider }),
   logs: (service: LogService, lines = 500) =>

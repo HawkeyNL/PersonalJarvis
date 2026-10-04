@@ -554,6 +554,36 @@ impl AiAccountAction {
     }
 }
 
+/// Sanitized official Claude Code runtime state; versions are strict
+/// `MAJOR.MINOR.PATCH` and nothing else from the release service is kept.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeRuntimeStatus {
+    pub provider: String,
+    pub installed: bool,
+    pub version: Option<String>,
+    pub gate_ok: bool,
+    pub safe_ownership: bool,
+    pub latest_stable: Option<String>,
+    pub update_available: bool,
+    pub rollback_available: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeChannel {
+    Stable,
+    Latest,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClaudeRuntimeMutation {
+    Install { channel: RuntimeChannel },
+    // A struct variant so `deny_unknown_fields` also rejects extra fields here.
+    Rollback {},
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CredentialProvider {
@@ -925,6 +955,68 @@ fn validate_ai_accounts(rows: Vec<AiAccountRecord>) -> AdminResult<Vec<AiAccount
         return Err("AI account status contained unexpected metadata".to_owned());
     }
     Ok(rows)
+}
+
+pub fn claude_runtime(session: &SessionManager) -> AdminResult<ClaudeRuntimeStatus> {
+    validate_claude_runtime(parse_json(
+        &session.run(BrokerRequest::ClaudeRuntime)?.stdout,
+    )?)
+}
+
+fn validate_claude_runtime(status: ClaudeRuntimeStatus) -> AdminResult<ClaudeRuntimeStatus> {
+    let strict = |version: &Option<String>| {
+        version.as_deref().is_none_or(|version| {
+            let parts = version.split('.').collect::<Vec<_>>();
+            parts.len() == 3
+                && parts.iter().all(|part| {
+                    (1..=9).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
+    };
+    if status.provider != "claude" || !strict(&status.version) || !strict(&status.latest_stable) {
+        return Err("Claude runtime status contained unexpected metadata".to_owned());
+    }
+    Ok(status)
+}
+
+pub fn claude_runtime_mutation(
+    session: &SessionManager,
+    request: ClaudeRuntimeMutation,
+) -> AdminResult<OperationResult> {
+    let summary = match request {
+        ClaudeRuntimeMutation::Install { .. } => "Claude Code runtime installed and verified",
+        ClaudeRuntimeMutation::Rollback {} => "Previous Claude Code runtime restored",
+    };
+    operation(
+        session.run(BrokerRequest::ClaudeRuntimeMutation { request })?,
+        summary,
+    )
+}
+
+/// Fixed argv for each typed runtime request; the channel is the only input.
+fn claude_runtime_arguments(request: &ClaudeRuntimeMutation) -> (Vec<String>, Duration) {
+    let fixed = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    match request {
+        ClaudeRuntimeMutation::Install { channel } => (
+            fixed(&[
+                "accounts",
+                "runtime",
+                "install",
+                "claude",
+                "--channel",
+                match channel {
+                    RuntimeChannel::Stable => "stable",
+                    RuntimeChannel::Latest => "latest",
+                },
+            ]),
+            // Download (bounded by curl at 15 minutes) plus verification and copy.
+            Duration::from_secs(1_200),
+        ),
+        ClaudeRuntimeMutation::Rollback {} => (
+            fixed(&["accounts", "runtime", "rollback", "claude"]),
+            Duration::from_secs(300),
+        ),
+    }
 }
 
 pub fn ai_account_action(
@@ -1512,6 +1604,21 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
             vec!["--json".to_owned(), "accounts".to_owned(), "list".to_owned()],
             Duration::from_secs(30),
         ),
+        BrokerRequest::ClaudeRuntime => (
+            ADMIN,
+            vec![
+                "--json".to_owned(),
+                "accounts".to_owned(),
+                "runtime".to_owned(),
+                "status".to_owned(),
+                "claude".to_owned(),
+            ],
+            Duration::from_secs(60),
+        ),
+        BrokerRequest::ClaudeRuntimeMutation { request } => {
+            let (args, timeout) = claude_runtime_arguments(&request);
+            (ADMIN, args, timeout)
+        }
         BrokerRequest::Logs { query } => {
             if !(1..=2_000).contains(&query.lines) {
                 return Err("log line count must be between 1 and 2000".to_owned());
@@ -1756,6 +1863,75 @@ mod tests {
         assert!(validate_model("model\n--flag").is_err());
         assert!(validate_hf_route("groq").is_ok());
         assert!(validate_hf_route("https://evil").is_err());
+    }
+
+    #[test]
+    fn claude_runtime_requests_map_to_fixed_arguments() {
+        let install: ClaudeRuntimeMutation =
+            serde_json::from_str(r#"{"action":"install","channel":"latest"}"#).unwrap();
+        assert_eq!(
+            claude_runtime_arguments(&install).0,
+            [
+                "accounts",
+                "runtime",
+                "install",
+                "claude",
+                "--channel",
+                "latest"
+            ]
+        );
+        let rollback: ClaudeRuntimeMutation =
+            serde_json::from_str(r#"{"action":"rollback"}"#).unwrap();
+        assert_eq!(
+            claude_runtime_arguments(&rollback).0,
+            ["accounts", "runtime", "rollback", "claude"]
+        );
+        for payload in [
+            r#"{"action":"install"}"#,
+            r#"{"action":"install","channel":"beta"}"#,
+            r#"{"action":"install","channel":"stable","version":"2.1.300"}"#,
+            r#"{"action":"install","channel":"stable --version 9.9.9"}"#,
+            r#"{"action":"rollback","provider":"codex"}"#,
+            r#"{"action":"remove"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ClaudeRuntimeMutation>(payload).is_err(),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_runtime_status_keeps_only_strict_versions() {
+        let status = |version: Option<&str>, latest: Option<&str>| ClaudeRuntimeStatus {
+            provider: "claude".to_owned(),
+            installed: version.is_some(),
+            version: version.map(str::to_owned),
+            gate_ok: true,
+            safe_ownership: true,
+            latest_stable: latest.map(str::to_owned),
+            update_available: false,
+            rollback_available: false,
+        };
+        assert!(validate_claude_runtime(status(Some("2.1.285"), Some("2.1.289"))).is_ok());
+        assert!(validate_claude_runtime(status(None, None)).is_ok());
+        for bad in ["2.1", "2.1.285 (Claude Code)", "2.1.x", "<b>2.1.285</b>"] {
+            assert!(
+                validate_claude_runtime(status(Some(bad), None)).is_err(),
+                "{bad}"
+            );
+            assert!(
+                validate_claude_runtime(status(None, Some(bad))).is_err(),
+                "{bad}"
+            );
+        }
+        let mut other = status(None, None);
+        other.provider = "codex".to_owned();
+        assert!(validate_claude_runtime(other).is_err());
+        assert!(serde_json::from_str::<ClaudeRuntimeStatus>(
+            r#"{"provider":"claude","installed":false,"version":null,"gate_ok":false,"safe_ownership":false,"latest_stable":null,"update_available":false,"rollback_available":false,"path":"/x"}"#
+        )
+        .is_err());
     }
 
     #[test]
