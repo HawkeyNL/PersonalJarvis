@@ -40,6 +40,8 @@ const MAX_PARALLEL_RUNS: usize = 2;
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ANSWER_BYTES: usize = 128 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+/// Bound on everything one status probe prints.
+const PROBE_LIMIT: usize = 16 * 1024;
 /// One JSONL event (an escaped answer can be about twice its size).
 const MAX_EVENT_LINE_BYTES: usize = 512 * 1024;
 const MAX_EVENT_STREAM_BYTES: usize = 4 * 1024 * 1024;
@@ -123,13 +125,14 @@ async fn handle(stream: &mut UnixStream, reviewed: &str) -> Result<ClaudeWorkerR
     if !request.valid() {
         bail!("invalid Codex chat request shape");
     }
-    let version = bounded_stdout(&["--version"], Duration::from_secs(3)).await;
+    let version = bounded_probe(&["--version"], Duration::from_secs(3), false).await;
     if !version.is_some_and(|output| reviewed_codex_version(&output, reviewed)) {
         return Ok(ClaudeWorkerReply::failure(
             ClaudeWorkerState::IncompatibleRuntime,
         ));
     }
-    let login = bounded_stdout(&["login", "status"], Duration::from_secs(5)).await;
+    // `codex login status` prints its status on stderr.
+    let login = bounded_probe(&["login", "status"], Duration::from_secs(5), true).await;
     if !login.is_some_and(|output| codex_subscription_status(&output) == "connected") {
         return Ok(ClaudeWorkerReply::failure(
             ClaudeWorkerState::SubscriptionUnavailable,
@@ -138,26 +141,60 @@ async fn handle(stream: &mut UnixStream, reviewed: &str) -> Result<ClaudeWorkerR
     run_official_client(request, RUN_TIMEOUT.saturating_sub(started.elapsed())).await
 }
 
-/// Non-generative status probe with bounded output and time.
-async fn bounded_stdout(args: &[&str], limit: Duration) -> Option<Vec<u8>> {
+/// Non-generative status probe of the official CLI.
+async fn bounded_probe(args: &[&str], limit: Duration, with_stderr: bool) -> Option<Vec<u8>> {
     let mut command = clean_command(CODEX, Path::new(RUNTIME));
+    command.args(args);
+    bounded_output(command, limit, with_stderr).await
+}
+
+/// Output of a probe that exited successfully within one time bound and one
+/// size bound over everything it printed. `with_stderr` also captures stderr,
+/// after stdout. The output is for parsing only, never for logs or replies.
+async fn bounded_output(
+    mut command: Command,
+    limit: Duration,
+    with_stderr: bool,
+) -> Option<Vec<u8>> {
     command
-        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(if with_stderr {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .kill_on_drop(true);
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take();
     let mut bytes = Vec::new();
+    let mut errors = Vec::new();
     let status = tokio::time::timeout(limit, async {
-        stdout.take(16 * 1024 + 1).read_to_end(&mut bytes).await?;
+        let read_errors = async {
+            match stderr {
+                Some(stderr) => stderr
+                    .take(PROBE_LIMIT as u64 + 1)
+                    .read_to_end(&mut errors)
+                    .await
+                    .map(drop),
+                None => Ok(()),
+            }
+        };
+        let mut stdout = stdout.take(PROBE_LIMIT as u64 + 1);
+        let (out, err) = tokio::join!(stdout.read_to_end(&mut bytes), read_errors);
+        out?;
+        err?;
         child.wait().await
     })
     .await
     .ok()?
     .ok()?;
-    (status.success() && bytes.len() <= 16 * 1024).then_some(bytes)
+    if !errors.is_empty() {
+        bytes.push(b'\n');
+        bytes.extend(errors);
+    }
+    (status.success() && bytes.len() <= PROBE_LIMIT).then_some(bytes)
 }
 
 /// The reviewed `codex exec` invocation: ephemeral, no user config or rules,
@@ -512,6 +549,27 @@ mod tests {
         let me = unsafe { libc::geteuid() };
         assert!(authorized_peer(&stream, me));
         assert!(!authorized_peer(&stream, me.wrapping_add(1)));
+    }
+
+    #[tokio::test]
+    async fn login_status_is_read_from_stderr() {
+        // Real shape of codex-cli 0.160.0: stdout empty, status on stderr.
+        let probe = |script: &str| bounded_output(shell(script), Duration::from_secs(5), true);
+        let output =
+            probe("echo 'WARNING: no PATH aliases' >&2; echo 'Logged in using ChatGPT' >&2")
+                .await
+                .unwrap();
+        assert_eq!(codex_subscription_status(&output), "connected");
+        assert!(probe("echo 'Not logged in' >&2; exit 1").await.is_none());
+        assert!(probe("head -c 20000 /dev/zero >&2").await.is_none());
+        let stdout_only = bounded_output(
+            shell("echo out; echo err >&2"),
+            Duration::from_secs(5),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout_only, b"out\n");
     }
 
     #[tokio::test]

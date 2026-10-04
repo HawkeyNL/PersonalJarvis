@@ -437,12 +437,17 @@ fn status(provider: AccountProvider) -> AccountStatus {
     let Ok(mut command) = worker_command(provider, provider.status_args(), false) else {
         return AccountStatus::new(provider, "runtime_missing");
     };
-    let Ok(Some(output)) = bounded_status_output(&mut command) else {
-        return AccountStatus::new(provider, "unhealthy");
-    };
     let state = match provider {
-        AccountProvider::Claude => parse_claude_status(&output),
-        AccountProvider::Codex => parse_codex_status(&output),
+        AccountProvider::Claude => match bounded_status_output(&mut command) {
+            Ok(Some(output)) => parse_claude_status(&output),
+            _ => "unhealthy",
+        },
+        // `codex login status` prints its status on stderr and exits 1 when
+        // logged out, so both streams are read and any exit is parsed.
+        AccountProvider::Codex => match bounded_output(&mut command, true) {
+            Ok(Some((success, output))) => codex_status_state(success, &output),
+            _ => "unhealthy",
+        },
     };
     let mut result = AccountStatus::new(provider, state);
     result.runtime = runtime_state(provider);
@@ -515,40 +520,75 @@ fn parse_codex_status(output: &str) -> &'static str {
     jarvis_llm::codex_chat_protocol::codex_subscription_status(output.as_bytes())
 }
 
+/// A failed probe can still report a logout or a wrong login, but never a
+/// usable subscription.
+fn codex_status_state(success: bool, output: &str) -> &'static str {
+    match parse_codex_status(output) {
+        "connected" if !success => "unhealthy",
+        state => state,
+    }
+}
+
+/// Stdout of a status probe that exited successfully within its bounds.
 fn bounded_status_output(command: &mut Command) -> Result<Option<String>> {
+    Ok(bounded_output(command, false)?.and_then(|(success, output)| success.then_some(output)))
+}
+
+/// Runs a status probe with one time bound and one size bound over everything
+/// it prints. `with_stderr` also captures stderr, after stdout. `None` when the
+/// deadline stopped the probe; otherwise whether it exited successfully, and
+/// its output. The output is for parsing only, never for logs or replies.
+fn bounded_output(command: &mut Command, with_stderr: bool) -> Result<Option<(bool, String)>> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(if with_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .spawn()?;
-    let stdout = child.stdout.take().context("missing status output")?;
-    let reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.take(STATUS_LIMIT + 1).read_to_end(&mut bytes)?;
-        Ok::<_, io::Error>(bytes)
-    });
+    let stdout = read_bounded(child.stdout.take().context("missing status output")?);
+    let stderr = child.stderr.take().map(read_bounded);
     let deadline = Instant::now() + STATUS_TIMEOUT;
-    let success = loop {
+    let exit = loop {
         if let Some(result) = child.try_wait()? {
-            break result.success();
+            break Some(result.success());
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            break false;
+            break None;
         }
         thread::sleep(Duration::from_millis(20));
     };
-    let bytes = reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("status reader failed"))??;
-    if !success {
+    let join = |reader: thread::JoinHandle<io::Result<Vec<u8>>>| {
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("status reader failed"))?
+            .map_err(anyhow::Error::from)
+    };
+    let mut bytes = join(stdout)?;
+    let stderr = stderr.map(join).transpose()?.unwrap_or_default();
+    let Some(success) = exit else {
         return Ok(None);
+    };
+    if !stderr.is_empty() {
+        bytes.push(b'\n');
+        bytes.extend(stderr);
     }
     if bytes.len() as u64 > STATUS_LIMIT {
         bail!("provider status exceeded safe bound");
     }
-    Ok(Some(String::from_utf8(bytes)?))
+    Ok(Some((success, String::from_utf8(bytes)?)))
+}
+
+fn read_bounded<R: Read + Send + 'static>(stream: R) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stream.take(STATUS_LIMIT + 1).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
 }
 
 fn worker_command(provider: AccountProvider, args: &[&str], interactive: bool) -> Result<Command> {
@@ -790,6 +830,54 @@ mod tests {
             "wrong_auth_mode"
         );
         assert_eq!(parse_codex_status("Logged in using ChatGPT"), "connected");
+    }
+
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.env_clear().args(["-c", script]);
+        command
+    }
+
+    fn codex_probe(script: &str) -> &'static str {
+        match bounded_output(&mut shell(script), true) {
+            Ok(Some((success, output))) => codex_status_state(success, &output),
+            _ => "unhealthy",
+        }
+    }
+
+    #[test]
+    fn codex_status_is_read_from_stderr_whatever_the_exit_code() {
+        // Real shape of codex-cli 0.160.0: stdout empty, status on stderr.
+        let warn = "echo 'WARNING: proceeding, even though we could not create PATH aliases' >&2";
+        assert_eq!(
+            codex_probe(&format!("{warn}; echo 'Not logged in' >&2; exit 1")),
+            "logged_out"
+        );
+        assert_eq!(
+            codex_probe(&format!("{warn}; echo 'Logged in using ChatGPT' >&2")),
+            "connected"
+        );
+        assert_eq!(
+            codex_probe("echo 'Logged in using ChatGPT' >&2; exit 1"),
+            "unhealthy"
+        );
+        assert_eq!(
+            codex_probe("echo 'Logged in using an API key - sk-***' >&2"),
+            "wrong_auth_mode"
+        );
+        assert_eq!(codex_probe("head -c 20000 /dev/zero >&2"), "unhealthy");
+    }
+
+    #[test]
+    fn plain_status_output_is_successful_stdout_only() {
+        assert_eq!(
+            bounded_status_output(&mut shell("echo out; echo err >&2")).unwrap(),
+            Some("out\n".into())
+        );
+        assert_eq!(
+            bounded_status_output(&mut shell("echo out; exit 1")).unwrap(),
+            None
+        );
     }
 
     #[test]
