@@ -95,12 +95,12 @@ classify() {
     while IFS= read -r tag; do
         [[ -n $tag ]] || continue
         if [[ $tag == "$active" ]]; then reason=active
-        elif newer "$tag" "$active"; then reason=newer-than-active
-        elif in_list "$tag" "$rollback"; then reason=rollback-target
-        elif in_list "$tag" "$newest"; then reason=recent-release
-        elif in_list "$tag" "$referenced"; then reason=symlink-referenced
-        elif ! owned_dir "$dir/$tag"; then reason=unexpected-owner
-        elif recent "$dir/$tag"; then reason=recently-installed
+        elif newer "$tag" "$active"; then reason='newer-than-active'
+        elif in_list "$tag" "$rollback"; then reason='rollback-target'
+        elif in_list "$tag" "$newest"; then reason='recent-release'
+        elif in_list "$tag" "$referenced"; then reason='symlink-referenced'
+        elif ! owned_dir "$dir/$tag"; then reason='unexpected-owner'
+        elif recent "$dir/$tag"; then reason='recently-installed'
         else reason=
         fi
         if [[ -n $reason ]]; then
