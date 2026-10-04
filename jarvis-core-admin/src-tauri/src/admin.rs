@@ -415,6 +415,21 @@ pub struct UsageReport {
     pub by_backend: Vec<UsageRow>,
     pub by_model: Vec<UsageRow>,
     pub daily: Vec<DailyUsageRow>,
+    /// Analysis fields from newer Core releases. `None` (absent on an older
+    /// Core, or `null` for a dimension Core does not instrument yet) means
+    /// "not measured", never a measured zero.
+    #[serde(default)]
+    pub failures: Option<u64>,
+    #[serde(default)]
+    pub fallbacks: Option<u64>,
+    #[serde(default)]
+    pub latency_p50_ms: Option<u64>,
+    #[serde(default)]
+    pub latency_p95_ms: Option<u64>,
+    #[serde(default)]
+    pub by_agent: Option<Vec<AgentUsageRow>>,
+    #[serde(default)]
+    pub failures_by_category: Option<Vec<FailureCountRow>>,
     pub pricing: PricingSummary,
 }
 
@@ -429,6 +444,41 @@ pub struct UsageRow {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub failures: Option<u64>,
+    #[serde(default)]
+    pub fallbacks: Option<u64>,
+    /// Per backend only; model rows carry no latency.
+    #[serde(default)]
+    pub latency_p50_ms: Option<u64>,
+    #[serde(default)]
+    pub latency_p95_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AgentUsageRow {
+    pub agent_id: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub spent_eur: f64,
+    #[serde(default)]
+    pub failures: Option<u64>,
+    #[serde(default)]
+    pub fallbacks: Option<u64>,
+    #[serde(default)]
+    pub latency_p50_ms: Option<u64>,
+    #[serde(default)]
+    pub latency_p95_ms: Option<u64>,
+    #[serde(default)]
+    pub last_used: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FailureCountRow {
+    pub category: String,
+    pub requests: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1965,6 +2015,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.total_tokens, 18);
+        // An older Core omits the analysis fields: not measured, never zero.
+        assert_eq!(report.failures, None);
+        assert_eq!(report.latency_p50_ms, None);
+        assert!(report.by_agent.is_none());
+        let value = serde_json::to_value(&report).unwrap();
+        for field in [
+            "failures",
+            "fallbacks",
+            "latency_p95_ms",
+            "by_agent",
+            "failures_by_category",
+        ] {
+            assert_eq!(value[field], serde_json::Value::Null, "{field}");
+        }
+    }
+
+    #[test]
+    fn usage_report_keeps_uninstrumented_dimensions_null_and_measured_values() {
+        let report: UsageReport = serde_json::from_str(
+            r#"{"period":"current_calendar_month","generated_at_unix":1,"budget_eur":20.0,"spent_eur":1.0,"remaining_eur":19.0,"over_budget":false,"reserved_eur":0.0,"remaining_hard_eur":19.0,"above_soft_budget":false,"requests":3,"input_tokens":2,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":5,"failures":null,"fallbacks":null,"latency_p50_ms":120,"latency_p95_ms":900,"by_backend":[{"backend":"ollama-cloud","spent_eur":1.0,"requests":3,"input_tokens":2,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":5,"failures":null,"fallbacks":null,"latency_p50_ms":120,"latency_p95_ms":900}],"by_model":[{"backend":"ollama-cloud","model":"m","spent_eur":1.0,"requests":3,"input_tokens":2,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":5,"failures":0,"fallbacks":2}],"daily":[],"by_agent":[{"agent_id":"researcher","requests":3,"input_tokens":2,"output_tokens":3,"total_tokens":5,"spent_eur":1.0,"failures":null,"fallbacks":null,"latency_p50_ms":120,"latency_p95_ms":null,"last_used":"2026-10-04T10:00:00+00:00"}],"failures_by_category":[{"category":"timeout","requests":4}],"pricing":{"source":"fixture","updated_at":"2026-09-01"}}"#,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["failures"], serde_json::Value::Null);
+        assert_eq!(value["latency_p50_ms"], 120);
+        assert_eq!(value["by_backend"][0]["failures"], serde_json::Value::Null);
+        assert_eq!(value["by_backend"][0]["latency_p95_ms"], 900);
+        // A measured zero stays a zero.
+        assert_eq!(value["by_model"][0]["failures"], 0);
+        assert_eq!(value["by_model"][0]["fallbacks"], 2);
+        assert_eq!(value["by_agent"][0]["agent_id"], "researcher");
+        assert_eq!(value["by_agent"][0]["fallbacks"], serde_json::Value::Null);
+        assert_eq!(value["failures_by_category"][0]["category"], "timeout");
     }
 
     #[test]
