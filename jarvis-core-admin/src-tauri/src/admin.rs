@@ -514,6 +514,9 @@ pub struct AiAccountRecord {
     pub state: String,
     pub billing: String,
     pub runtime: String,
+    /// The retired `jarvis-codex-chat` identity or state still exists.
+    #[serde(default)]
+    pub legacy_identity: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -521,8 +524,6 @@ pub struct AiAccountRecord {
 pub enum AiAccountProvider {
     Claude,
     Codex,
-    #[serde(rename = "codex-chat")]
-    CodexChat,
 }
 
 impl AiAccountProvider {
@@ -530,7 +531,6 @@ impl AiAccountProvider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::CodexChat => "codex-chat",
         }
     }
 }
@@ -617,6 +617,21 @@ pub enum LayaMode {
     Primary,
 }
 
+/// Sanitized official Codex CLI runtime state; versions are strict
+/// `MAJOR.MINOR.PATCH` and nothing else from the release service is kept.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexRuntimeStatus {
+    pub provider: String,
+    pub installed: bool,
+    pub version: Option<String>,
+    pub safe_ownership: bool,
+    pub latest: Option<String>,
+    pub update_available: bool,
+    pub rollback_available: bool,
+    pub cosign_available: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LayaMutation {
@@ -625,6 +640,14 @@ pub enum LayaMutation {
     Enable {},
     Disable {},
     Mode { mode: LayaMode },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CodexRuntimeMutation {
+    InstallLatest {},
+    InstallVersion { version: String },
+    Rollback {},
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -972,30 +995,31 @@ pub fn ai_accounts(session: &SessionManager) -> AdminResult<Vec<AiAccountRecord>
 fn validate_ai_accounts(rows: Vec<AiAccountRecord>) -> AdminResult<Vec<AiAccountRecord>> {
     let providers: std::collections::BTreeSet<&str> =
         rows.iter().map(|row| row.provider.as_str()).collect();
-    if rows.len() != 3
+    if rows.len() != 2
         || providers.len() != rows.len()
         || rows.iter().any(|row| {
             !matches!(
                 (row.provider.as_str(), row.worker.as_str()),
-                ("claude", "jarvis-claude")
-                    | ("codex", "jarvis-codex")
-                    | ("codex-chat", "jarvis-codex-chat")
-            ) || !matches!(
-                row.state.as_str(),
-                "connected"
-                    | "logged_out"
-                    | "runtime_missing"
-                    | "wrong_auth_mode"
-                    | "incompatible_runtime"
-                    | "host_unsupported"
-                    | "unhealthy"
-            ) || !matches!(
-                row.billing.as_str(),
-                "subscription" | "unverified" | "overage_unverified"
-            ) || !matches!(
-                row.runtime.as_str(),
-                "inactive" | "socket_ready" | "active" | "unavailable"
-            )
+                ("claude", "jarvis-claude") | ("codex", "jarvis-codex")
+            ) || (row.legacy_identity && row.provider != "codex")
+                || !matches!(
+                    row.state.as_str(),
+                    "connected"
+                        | "logged_out"
+                        | "runtime_missing"
+                        | "wrong_auth_mode"
+                        | "incompatible_runtime"
+                        | "host_unsupported"
+                        | "unhealthy"
+                )
+                || !matches!(
+                    row.billing.as_str(),
+                    "subscription" | "unverified" | "overage_unverified"
+                )
+                || !matches!(
+                    row.runtime.as_str(),
+                    "inactive" | "socket_ready" | "active" | "unavailable"
+                )
         })
     {
         return Err("AI account status contained unexpected metadata".to_owned());
@@ -1009,16 +1033,17 @@ pub fn claude_runtime(session: &SessionManager) -> AdminResult<ClaudeRuntimeStat
     )?)
 }
 
-fn validate_claude_runtime(status: ClaudeRuntimeStatus) -> AdminResult<ClaudeRuntimeStatus> {
-    let strict = |version: &Option<String>| {
-        version.as_deref().is_none_or(|version| {
-            let parts = version.split('.').collect::<Vec<_>>();
-            parts.len() == 3
-                && parts.iter().all(|part| {
-                    (1..=9).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit())
-                })
+/// `MAJOR.MINOR.PATCH`, ASCII digits only.
+fn strict_runtime_version(version: &str) -> bool {
+    let parts = version.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            (1..=9).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit())
         })
-    };
+}
+
+fn validate_claude_runtime(status: ClaudeRuntimeStatus) -> AdminResult<ClaudeRuntimeStatus> {
+    let strict = |version: &Option<String>| version.as_deref().is_none_or(strict_runtime_version);
     if status.provider != "claude" || !strict(&status.version) || !strict(&status.latest_stable) {
         return Err("Claude runtime status contained unexpected metadata".to_owned());
     }
@@ -1100,6 +1125,20 @@ fn validate_laya(status: LayaStatus) -> AdminResult<LayaStatus> {
     Ok(status)
 }
 
+pub fn codex_runtime(session: &SessionManager) -> AdminResult<CodexRuntimeStatus> {
+    validate_codex_runtime(parse_json(
+        &session.run(BrokerRequest::CodexRuntime)?.stdout,
+    )?)
+}
+
+fn validate_codex_runtime(status: CodexRuntimeStatus) -> AdminResult<CodexRuntimeStatus> {
+    let strict = |version: &Option<String>| version.as_deref().is_none_or(strict_runtime_version);
+    if status.provider != "codex" || !strict(&status.version) || !strict(&status.latest) {
+        return Err("Codex runtime status contained unexpected metadata".to_owned());
+    }
+    Ok(status)
+}
+
 pub fn laya_mutation(
     session: &SessionManager,
     request: LayaMutation,
@@ -1112,6 +1151,22 @@ pub fn laya_mutation(
     };
     operation(
         session.run(BrokerRequest::LayaMutation { request })?,
+        summary,
+    )
+}
+
+pub fn codex_runtime_mutation(
+    session: &SessionManager,
+    request: CodexRuntimeMutation,
+) -> AdminResult<OperationResult> {
+    let summary = match request {
+        CodexRuntimeMutation::InstallLatest {} | CodexRuntimeMutation::InstallVersion { .. } => {
+            "Codex CLI runtime installed and verified"
+        }
+        CodexRuntimeMutation::Rollback {} => "Previous Codex CLI runtime restored",
+    };
+    operation(
+        session.run(BrokerRequest::CodexRuntimeMutation { request })?,
         summary,
     )
 }
@@ -1137,6 +1192,29 @@ fn laya_arguments(request: &LayaMutation) -> (Vec<String>, Duration) {
             Duration::from_secs(600),
         ),
     }
+}
+
+/// Fixed argv for each typed runtime request; a strict version is the only
+/// input, re-checked here because the request crosses the broker boundary.
+fn codex_runtime_arguments(request: &CodexRuntimeMutation) -> AdminResult<(Vec<String>, Duration)> {
+    let mut args = ["accounts", "runtime"].map(str::to_owned).to_vec();
+    match request {
+        CodexRuntimeMutation::InstallLatest {} => {
+            args.extend(["install", "codex", "--channel", "latest"].map(str::to_owned));
+        }
+        CodexRuntimeMutation::InstallVersion { version } => {
+            if !strict_runtime_version(version) {
+                return Err("Codex version must be MAJOR.MINOR.PATCH".to_owned());
+            }
+            args.extend(["install", "codex", "--version", version].map(str::to_owned));
+        }
+        CodexRuntimeMutation::Rollback {} => {
+            args.extend(["rollback", "codex"].map(str::to_owned));
+            return Ok((args, Duration::from_secs(300)));
+        }
+    }
+    // Downloads (bounded by curl at 15 minutes), cosign (3 minutes) and copy.
+    Ok((args, Duration::from_secs(1_500)))
 }
 
 pub fn ai_account_action(
@@ -1208,7 +1286,6 @@ pub fn ai_account_entry(action: &OsStr, provider: &OsStr) -> AdminResult<()> {
     let provider = match provider.to_str() {
         Some("claude") => AiAccountProvider::Claude,
         Some("codex") => AiAccountProvider::Codex,
-        Some("codex-chat") => AiAccountProvider::CodexChat,
         _ => return Err("unsupported AI account provider".to_owned()),
     };
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
@@ -1780,6 +1857,17 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
             let (args, timeout) = laya_arguments(&request);
             (ADMIN, args, timeout)
         }
+        BrokerRequest::CodexRuntime => (
+            ADMIN,
+            ["--json", "accounts", "runtime", "status", "codex"]
+                .map(str::to_owned)
+                .to_vec(),
+            Duration::from_secs(60),
+        ),
+        BrokerRequest::CodexRuntimeMutation { request } => {
+            let (args, timeout) = codex_runtime_arguments(&request)?;
+            (ADMIN, args, timeout)
+        }
         BrokerRequest::Logs { query } => {
             if !(1..=2_000).contains(&query.lines) {
                 return Err("log line count must be between 1 and 2000".to_owned());
@@ -2176,6 +2264,98 @@ mod tests {
     }
 
     #[test]
+    fn codex_runtime_requests_map_to_fixed_arguments() {
+        let parse = |payload: &str| serde_json::from_str::<CodexRuntimeMutation>(payload);
+        let args = |payload: &str| codex_runtime_arguments(&parse(payload).unwrap());
+        assert_eq!(
+            args(r#"{"action":"install_latest"}"#).unwrap().0,
+            [
+                "accounts",
+                "runtime",
+                "install",
+                "codex",
+                "--channel",
+                "latest"
+            ]
+        );
+        assert_eq!(
+            args(r#"{"action":"install_version","version":"0.160.0"}"#)
+                .unwrap()
+                .0,
+            [
+                "accounts",
+                "runtime",
+                "install",
+                "codex",
+                "--version",
+                "0.160.0"
+            ]
+        );
+        assert_eq!(
+            args(r#"{"action":"rollback"}"#).unwrap().0,
+            ["accounts", "runtime", "rollback", "codex"]
+        );
+        for version in [
+            "0.160",
+            "v0.160.0",
+            "0.160.0-alpha.1",
+            "0.160.0 --channel",
+            "--channel",
+        ] {
+            let payload = serde_json::json!({ "action": "install_version", "version": version });
+            assert!(args(&payload.to_string()).is_err(), "{version}");
+        }
+        for payload in [
+            r#"{"action":"install"}"#,
+            r#"{"action":"install_version"}"#,
+            r#"{"action":"install_latest","version":"0.160.0"}"#,
+            r#"{"action":"install_latest","channel":"stable"}"#,
+            r#"{"action":"rollback","provider":"claude"}"#,
+            r#"{"action":"remove"}"#,
+        ] {
+            assert!(parse(payload).is_err(), "{payload}");
+        }
+    }
+
+    #[test]
+    fn codex_runtime_status_keeps_only_strict_versions() {
+        let status = |version: Option<&str>, latest: Option<&str>| CodexRuntimeStatus {
+            provider: "codex".to_owned(),
+            installed: version.is_some(),
+            version: version.map(str::to_owned),
+            safe_ownership: true,
+            latest: latest.map(str::to_owned),
+            update_available: false,
+            rollback_available: false,
+            cosign_available: true,
+        };
+        assert!(validate_codex_runtime(status(Some("0.160.0"), Some("0.161.0"))).is_ok());
+        assert!(validate_codex_runtime(status(None, None)).is_ok());
+        for bad in [
+            "0.160",
+            "codex-cli 0.160.0",
+            "rust-v0.160.0",
+            "<b>0.160.0</b>",
+        ] {
+            assert!(
+                validate_codex_runtime(status(Some(bad), None)).is_err(),
+                "{bad}"
+            );
+            assert!(
+                validate_codex_runtime(status(None, Some(bad))).is_err(),
+                "{bad}"
+            );
+        }
+        let mut other = status(None, None);
+        other.provider = "claude".to_owned();
+        assert!(validate_codex_runtime(other).is_err());
+        assert!(serde_json::from_str::<CodexRuntimeStatus>(
+            r#"{"provider":"codex","installed":false,"version":null,"safe_ownership":false,"latest":null,"update_available":false,"rollback_available":false,"cosign_available":false,"url":"/x"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn claude_runtime_status_keeps_only_strict_versions() {
         let status = |version: Option<&str>, latest: Option<&str>| ClaudeRuntimeStatus {
             provider: "claude".to_owned(),
@@ -2520,37 +2700,45 @@ mod tests {
             state: "logged_out".to_owned(),
             billing: "unverified".to_owned(),
             runtime: "inactive".to_owned(),
+            legacy_identity: false,
         };
         let claude = row("claude", "jarvis-claude");
         let codex = row("codex", "jarvis-codex");
-        let chat = row("codex-chat", "jarvis-codex-chat");
-        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone(), chat.clone()]).is_ok());
-        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone()]).is_err());
+        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone()]).is_ok());
+        assert!(validate_ai_accounts(vec![claude.clone()]).is_err());
         assert!(validate_ai_accounts(vec![claude.clone(), codex.clone(), codex.clone()]).is_err());
+        // The retired separate chat login is no longer a row.
+        let chat = row("codex-chat", "jarvis-codex-chat");
+        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone(), chat]).is_err());
+        // Only the Codex row may report the retired identity.
+        let legacy = AiAccountRecord {
+            legacy_identity: true,
+            ..codex.clone()
+        };
+        assert!(validate_ai_accounts(vec![claude.clone(), legacy.clone()]).is_ok());
+        let wrong = AiAccountRecord {
+            legacy_identity: true,
+            ..claude.clone()
+        };
+        assert!(validate_ai_accounts(vec![wrong, codex.clone()]).is_err());
         // A Claude CLI outside the reviewed contract is a state, not an error.
         let incompatible = AiAccountRecord {
             state: "incompatible_runtime".to_owned(),
             ..claude.clone()
         };
-        assert!(validate_ai_accounts(vec![incompatible, codex.clone(), chat.clone()]).is_ok());
+        assert!(validate_ai_accounts(vec![incompatible, codex.clone()]).is_ok());
         // So is a host tool that the account helper refuses to run.
         let host = AiAccountRecord {
             state: "host_unsupported".to_owned(),
             ..claude.clone()
         };
-        assert!(validate_ai_accounts(vec![host, codex.clone(), chat.clone()]).is_ok());
+        assert!(validate_ai_accounts(vec![host, codex.clone()]).is_ok());
         let unknown = AiAccountRecord {
             state: "surprise".to_owned(),
             ..claude.clone()
         };
-        assert!(validate_ai_accounts(vec![unknown, codex.clone(), chat.clone()]).is_err());
-        // The chat worker never shares the coding login's identity.
-        assert!(
-            validate_ai_accounts(vec![claude, codex, row("codex-chat", "jarvis-codex")]).is_err()
-        );
-        assert_eq!(
-            serde_json::to_string(&AiAccountProvider::CodexChat).unwrap(),
-            "\"codex-chat\""
-        );
+        assert!(validate_ai_accounts(vec![unknown, codex.clone()]).is_err());
+        assert!(validate_ai_accounts(vec![claude, row("codex", "jarvis-codex-chat")]).is_err());
+        assert!(serde_json::from_str::<AiAccountProvider>("\"codex-chat\"").is_err());
     }
 }

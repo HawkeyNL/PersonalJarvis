@@ -177,15 +177,16 @@ export type CredentialProvider =
   | "jev";
 export interface CredentialRecord { provider: CredentialProvider; configured: boolean }
 export const credentialLabels: Record<CredentialProvider, string> = { anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", xai: "xAI", zai: "Z.ai", "ollama-cloud": "Ollama Cloud", huggingface: "Hugging Face", jev: "TypeSafe Jev" };
-export type AiAccountProvider = "claude" | "codex" | "codex-chat";
+export type AiAccountProvider = "claude" | "codex";
 export type AiAccountAction = "connect" | "test" | "reconnect" | "disconnect";
-export const aiAccountLabels: Record<AiAccountProvider, string> = { claude: "Claude Code", codex: "Codex (coding)", "codex-chat": "Codex chat" };
+export const aiAccountLabels: Record<AiAccountProvider, string> = { claude: "Claude Code", codex: "Codex" };
 export interface AiAccountRecord {
   provider: AiAccountProvider;
   worker: string;
   state: "connected" | "logged_out" | "runtime_missing" | "wrong_auth_mode" | "incompatible_runtime" | "host_unsupported" | "unhealthy";
   billing: "subscription" | "unverified" | "overage_unverified";
   runtime: "inactive" | "socket_ready" | "active" | "unavailable";
+  legacy_identity?: boolean;
 }
 export interface ClaudeRuntimeStatus {
   provider: "claude";
@@ -213,6 +214,19 @@ export interface LayaStatus {
   disk_bytes: number;
 }
 export type LayaMutation = { action: "install" } | { action: "enable" } | { action: "disable" } | { action: "mode"; mode: LayaMode };
+export interface CodexRuntimeStatus {
+  provider: "codex";
+  installed: boolean;
+  version: string | null;
+  safe_ownership: boolean;
+  latest: string | null;
+  update_available: boolean;
+  rollback_available: boolean;
+  cosign_available: boolean;
+}
+export type CodexRuntimeMutation = { action: "install_latest" } | { action: "install_version"; version: string } | { action: "rollback" };
+/** Strict `MAJOR.MINOR.PATCH`, as the broker and the installer require. */
+export const strictRuntimeVersion = (version: string): boolean => /^\d{1,9}\.\d{1,9}\.\d{1,9}$/.test(version);
 export type LogService =
   | "core"
   | "surrealdb"
@@ -276,6 +290,9 @@ export const api = {
   laya: () => invoke<LayaStatus>("laya"),
   layaMutation: (request: LayaMutation) =>
     invoke<OperationResult>("laya_mutation", { request }),
+  codexRuntime: () => invoke<CodexRuntimeStatus>("codex_runtime"),
+  codexRuntimeMutation: (request: CodexRuntimeMutation) =>
+    invoke<OperationResult>("codex_runtime_mutation", { request }),
   credentialSet: (provider: CredentialProvider) =>
     invoke<OperationResult>("credential_set", { provider }),
   logs: (service: LogService, lines = 500) =>

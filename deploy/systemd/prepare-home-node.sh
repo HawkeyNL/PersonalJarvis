@@ -21,12 +21,9 @@ if ! getent passwd jarvis-claude >/dev/null; then
     useradd --system --user-group --home-dir /var/lib/jarvis-claude --shell /usr/sbin/nologin jarvis-claude
 fi
 id -nG jarvis-claude | tr ' ' '\n' | grep -qx docker && fail "jarvis-claude must not be a Docker-group member"
-# The text-only Codex chat worker has its own login, separate from jarvis-codex.
-if ! getent passwd jarvis-codex-chat >/dev/null; then
-    useradd --system --user-group --home-dir /var/lib/jarvis-codex-chat --shell /usr/sbin/nologin jarvis-codex-chat
-fi
-id -nG jarvis-codex-chat | tr ' ' '\n' | grep -qx docker && fail "jarvis-codex-chat must not be a Docker-group member"
-for worker in jarvis-claude jarvis-codex jarvis-codex-chat; do
+# The Codex chat worker uses the jarvis-codex login. A jarvis-codex-chat
+# identity from an earlier release is left alone; verify reports it.
+for worker in jarvis-claude jarvis-codex; do
     worker_state="/var/lib/$worker"
     if [[ -e $worker_state || -L $worker_state ]]; then
         [[ -d $worker_state && ! -L $worker_state &&

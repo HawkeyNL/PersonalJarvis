@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
 
 use crate::admin::{
-    self, ClaudeRuntimeMutation, LayaMutation, LogQuery, ModelMutation, ProgramOutput,
-    RouteMutation, UpdateMutation,
+    self, ClaudeRuntimeMutation, CodexRuntimeMutation, LayaMutation, LogQuery, ModelMutation,
+    ProgramOutput, RouteMutation, UpdateMutation,
 };
 
 const PKEXEC: &str = "/usr/bin/pkexec";
@@ -52,6 +52,8 @@ pub(crate) enum BrokerRequest {
     ClaudeRuntimeMutation { request: ClaudeRuntimeMutation },
     Laya,
     LayaMutation { request: LayaMutation },
+    CodexRuntime,
+    CodexRuntimeMutation { request: CodexRuntimeMutation },
     Devices { pending: bool },
     Logs { query: LogQuery },
 }
