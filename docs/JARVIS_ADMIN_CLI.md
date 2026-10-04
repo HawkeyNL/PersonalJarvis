@@ -303,10 +303,13 @@ sudo jarvis usage
 sudo jarvis --json usage
 ```
 
-It includes request and token totals, daily/provider/model/agent breakdowns,
-estimated spend, failure counts by category, router fallbacks and latency
-p50/p95 (over calls with a measured latency). The same data is available as the persistent Costs view in
-`sudo jarvis`. Core refreshes the snapshot at startup, after metered requests
+It includes request and token totals, daily/provider/model breakdowns,
+estimated spend and latency p50/p95 (over calls with a measured latency). The
+report also has fields for per-agent usage (`by_agent`), failure counts
+(`failures`, `failures_by_category`) and router fallbacks (`fallbacks`); Core
+does not record these yet, so they are `null` ("not measured"), never a
+measured zero, until it does. The same data is available as the persistent
+Costs view in `sudo jarvis`. Core refreshes the snapshot at startup, after metered requests
 and periodically so a temporary database failure can recover without an extra
 model call. The snapshot is bounded, root-controlled and contains no
 prompts, replies, credentials or request identifiers. Provider invoices remain

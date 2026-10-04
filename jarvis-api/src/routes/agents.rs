@@ -25,31 +25,37 @@ pub(crate) async fn list(_authed: Authed, State(state): State<AppState>) -> Json
             "usage_period": "current_calendar_month",
         }));
     };
-    let usage = match usage::month_statistics(&state.db).await {
-        Ok(statistics) => Some(statistics.by_agent),
-        Err(error) => {
-            tracing::warn!(%error, "agent usage aggregates unavailable");
-            None
-        }
+    // Until Core records which agent made a call, per-agent usage would be
+    // all zeros: report it as not measured instead.
+    let usage = if !usage::AGENT_USAGE_INSTRUMENTED {
+        Err("agent_usage_not_instrumented")
+    } else {
+        usage::month_agent_statistics(&state.db)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "agent usage aggregates unavailable");
+                "usage_query_failed"
+            })
     };
     Json(agents_value(
         registry.bundle_id(),
         registry.agents(),
-        usage.as_deref(),
+        usage.as_deref().map_err(|reason| *reason),
     ))
 }
 
 /// Explicit field allowlist: a new `AgentDefinition` field is never exposed
-/// unless it is added here.
+/// unless it is added here. Without usage rows every agent's `usage` is
+/// `null` and `usage_unavailable_reason` says why.
 fn agents_value(
     bundle_id: &str,
     agents: &[AgentDefinition],
-    usage: Option<&[usage::AgentUsage]>,
+    usage: Result<&[usage::AgentUsage], &'static str>,
 ) -> Value {
     let agents: Vec<Value> = agents
         .iter()
         .map(|agent| {
-            let usage = usage.map(|rows| {
+            let usage = usage.ok().map(|rows| {
                 match rows.iter().find(|row| row.agent_id == agent.id) {
                     Some(row) => agent_usage_value(&row.totals, row.last_used.as_deref()),
                     None => agent_usage_value(&usage::UsageTotals::default(), None),
@@ -80,7 +86,7 @@ fn agents_value(
         "agents": agents,
         "unavailable_reason": null,
         "usage_period": "current_calendar_month",
-        "usage_unavailable_reason": usage.is_none().then_some("usage_query_failed"),
+        "usage_unavailable_reason": usage.err(),
     })
 }
 
@@ -110,7 +116,7 @@ mod tests {
 
     #[test]
     fn only_allowlisted_agent_fields_are_exposed() {
-        let value = agents_value("bundle-1", &[agent("researcher")], Some(&[]));
+        let value = agents_value("bundle-1", &[agent("researcher")], Ok(&[]));
         let text = value.to_string();
         for secret in [
             "SECRET-INSTRUCTIONS",
@@ -164,7 +170,7 @@ mod tests {
         let value = agents_value(
             "bundle-1",
             &[agent("researcher"), agent("trader")],
-            Some(&[used]),
+            Ok(&[used]),
         );
         assert_eq!(value["agents"][0]["usage"]["requests"], 3);
         assert_eq!(value["agents"][0]["usage"]["spent_eur"], 0.12);
@@ -172,12 +178,22 @@ mod tests {
             value["agents"][0]["usage"]["last_used"],
             "2026-10-03T09:00:00Z"
         );
+        // Not measured yet: null, never a zero.
+        assert_eq!(value["agents"][0]["usage"]["failures"], Value::Null);
+        assert_eq!(value["agents"][0]["usage"]["fallbacks"], Value::Null);
         assert_eq!(value["agents"][1]["usage"]["requests"], 0);
         assert_eq!(value["agents"][1]["usage"]["last_used"], Value::Null);
         assert_eq!(value["usage_unavailable_reason"], Value::Null);
 
-        let degraded = agents_value("bundle-1", &[agent("researcher")], None);
+        let degraded = agents_value(
+            "bundle-1",
+            &[agent("researcher")],
+            Err("agent_usage_not_instrumented"),
+        );
         assert_eq!(degraded["agents"][0]["usage"], Value::Null);
-        assert_eq!(degraded["usage_unavailable_reason"], "usage_query_failed");
+        assert_eq!(
+            degraded["usage_unavailable_reason"],
+            "agent_usage_not_instrumented"
+        );
     }
 }

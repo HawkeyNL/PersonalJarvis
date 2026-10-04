@@ -503,8 +503,19 @@ pub fn estimate_task_cost_with_registry(
 /// SurrealDB persistence functions. Failures remain best-effort at the caller,
 /// so metering cannot break an assistant reply.
 pub use surreal::{
-    month_breakdown, month_statistics, month_total_eur, record, release_task, reserve_task,
+    month_agent_statistics, month_breakdown, month_statistics, month_total_eur, record,
+    release_task, reserve_task,
 };
+
+/// Which optional `llm_usage` dimensions Core's writers populate today. The
+/// aggregates still compute them, but reports show a dimension whose flag is
+/// `false` as `null` ("not measured"), never as a measured zero. Flip a flag
+/// in the change that starts recording that dimension.
+pub const AGENT_USAGE_INSTRUMENTED: bool = false;
+/// Failed calls are not recorded yet (only replies with usage are metered).
+pub const FAILURES_INSTRUMENTED: bool = false;
+/// The router does not report how many candidates it tried yet.
+pub const FALLBACKS_INSTRUMENTED: bool = false;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageTotals {
@@ -566,8 +577,6 @@ pub struct UsageStatistics {
     pub by_backend: Vec<UsageDimension>,
     pub by_model: Vec<UsageDimension>,
     pub daily: Vec<DailyUsage>,
-    #[serde(default)]
-    pub by_agent: Vec<AgentUsage>,
     #[serde(default)]
     pub failures_by_category: Vec<FailureCount>,
 }

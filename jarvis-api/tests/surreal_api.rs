@@ -596,13 +596,17 @@ async fn month_statistics_break_down_agents_latency_failures_and_fallbacks(
     assert_eq!(stats.by_backend[0].totals.failures, 1);
     assert!(stats.by_backend[0].totals.latency_p95_ms.is_some());
 
-    assert_eq!(stats.by_agent.len(), 1);
-    let agent = &stats.by_agent[0];
+    let agents = jarvis_usage::month_agent_statistics(&db).await?;
+    assert_eq!(agents.len(), 1);
+    let agent = &agents[0];
     assert_eq!(agent.agent_id, "researcher");
     assert_eq!((agent.totals.requests, agent.totals.total_tokens), (2, 30));
     assert_eq!((agent.totals.failures, agent.totals.fallbacks), (1, 2));
     assert!(agent.totals.latency_p50_ms.is_some());
-    assert!(agent.last_used.is_some());
+    // RFC 3339 text from `time::format(.., '%+')`, e.g. 2026-10-04T11:07:31.123+00:00.
+    let last_used = agent.last_used.as_deref().ok_or("missing last_used")?;
+    assert_eq!(last_used.as_bytes().get(10), Some(&b'T'), "{last_used}");
+    assert!(last_used.ends_with("+00:00"), "{last_used}");
 
     assert_eq!(stats.failures_by_category.len(), 1);
     assert_eq!(stats.failures_by_category[0].category, "timeout");

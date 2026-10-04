@@ -454,17 +454,23 @@ pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store:
     let reservation = state.budget_book.snapshot();
     let mut statistics = usage::month_statistics(&state.db).await?;
     statistics.by_model.truncate(250);
-    statistics.by_agent.truncate(MAX_USAGE_AGENTS);
     statistics.failures_by_category.truncate(32);
-    let by_agent: Vec<Value> = statistics
-        .by_agent
-        .iter()
-        .map(|row| {
-            let mut value = agent_usage_value(&row.totals, row.last_used.as_deref());
-            value["agent_id"] = json!(row.agent_id);
-            value
-        })
-        .collect();
+    // Not-yet-instrumented dimensions are `null`, never a measured zero.
+    let by_agent: Option<Vec<Value>> = if usage::AGENT_USAGE_INSTRUMENTED {
+        let mut rows = usage::month_agent_statistics(&state.db).await?;
+        rows.truncate(MAX_USAGE_AGENTS);
+        Some(
+            rows.iter()
+                .map(|row| {
+                    let mut value = agent_usage_value(&row.totals, row.last_used.as_deref());
+                    value["agent_id"] = json!(row.agent_id);
+                    value
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
     let by_backend: Vec<Value> = statistics
         .by_backend
         .into_iter()
@@ -478,8 +484,8 @@ pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store:
                 "cache_read_tokens": row.totals.cache_read_tokens,
                 "cache_write_tokens": row.totals.cache_write_tokens,
                 "total_tokens": row.totals.total_tokens,
-                "failures": row.totals.failures,
-                "fallbacks": row.totals.fallbacks,
+                "failures": failures(&row.totals),
+                "fallbacks": fallbacks(&row.totals),
                 "latency_p50_ms": row.totals.latency_p50_ms,
                 "latency_p95_ms": row.totals.latency_p95_ms,
             })
@@ -499,8 +505,8 @@ pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store:
                 "cache_read_tokens": row.totals.cache_read_tokens,
                 "cache_write_tokens": row.totals.cache_write_tokens,
                 "total_tokens": row.totals.total_tokens,
-                "failures": row.totals.failures,
-                "fallbacks": row.totals.fallbacks,
+                "failures": failures(&row.totals),
+                "fallbacks": fallbacks(&row.totals),
             })
         })
         .collect();
@@ -538,12 +544,12 @@ pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store:
         "by_backend": by_backend,
         "by_model": by_model,
         "daily": daily,
-        "failures": statistics.totals.failures,
-        "fallbacks": statistics.totals.fallbacks,
+        "failures": failures(&statistics.totals),
+        "fallbacks": fallbacks(&statistics.totals),
         "latency_p50_ms": statistics.totals.latency_p50_ms,
         "latency_p95_ms": statistics.totals.latency_p95_ms,
         "by_agent": by_agent,
-        "failures_by_category": statistics.failures_by_category,
+        "failures_by_category": usage::FAILURES_INSTRUMENTED.then_some(statistics.failures_by_category),
         "pricing": {
             "source": state.pricing_registry.source,
             "updated_at": state.pricing_registry.updated_at,
@@ -553,6 +559,16 @@ pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store:
 
 const MAX_USAGE_AGENTS: usize = 100;
 
+/// `null` ("not measured") until Core records failed calls.
+fn failures(totals: &usage::UsageTotals) -> Option<u64> {
+    usage::FAILURES_INSTRUMENTED.then_some(totals.failures)
+}
+
+/// `null` ("not measured") until the router reports its fallbacks.
+fn fallbacks(totals: &usage::UsageTotals) -> Option<u64> {
+    usage::FALLBACKS_INSTRUMENTED.then_some(totals.fallbacks)
+}
+
 /// One agent's monthly usage, shared by `/v1/system/usage` and `/v1/agents`.
 pub(crate) fn agent_usage_value(totals: &usage::UsageTotals, last_used: Option<&str>) -> Value {
     json!({
@@ -561,8 +577,8 @@ pub(crate) fn agent_usage_value(totals: &usage::UsageTotals, last_used: Option<&
         "output_tokens": totals.output_tokens,
         "total_tokens": totals.total_tokens,
         "spent_eur": totals.cost_eur,
-        "failures": totals.failures,
-        "fallbacks": totals.fallbacks,
+        "failures": failures(totals),
+        "fallbacks": fallbacks(totals),
         "latency_p50_ms": totals.latency_p50_ms,
         "latency_p95_ms": totals.latency_p95_ms,
         "last_used": last_used,

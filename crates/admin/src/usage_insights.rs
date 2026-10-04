@@ -73,18 +73,20 @@ pub(super) struct UsageReport {
     pub(super) by_model: Vec<UsageRow>,
     #[serde(default)]
     pub(super) daily: Vec<DailyUsageRow>,
+    /// `None` = not measured by this Core (older release or not yet
+    /// instrumented), never a measured zero.
     #[serde(default)]
-    pub(super) failures: u64,
+    pub(super) failures: Option<u64>,
     #[serde(default)]
-    pub(super) fallbacks: u64,
+    pub(super) fallbacks: Option<u64>,
     #[serde(default)]
     pub(super) latency_p50_ms: Option<u64>,
     #[serde(default)]
     pub(super) latency_p95_ms: Option<u64>,
     #[serde(default)]
-    pub(super) by_agent: Vec<AgentUsageRow>,
+    pub(super) by_agent: Option<Vec<AgentUsageRow>>,
     #[serde(default)]
-    pub(super) failures_by_category: Vec<FailureCountRow>,
+    pub(super) failures_by_category: Option<Vec<FailureCountRow>>,
     pub(super) pricing: PricingSummary,
 }
 
@@ -101,9 +103,9 @@ pub(super) struct UsageRow {
     pub(super) cache_write_tokens: u64,
     pub(super) total_tokens: u64,
     #[serde(default)]
-    pub(super) failures: u64,
+    pub(super) failures: Option<u64>,
     #[serde(default)]
-    pub(super) fallbacks: u64,
+    pub(super) fallbacks: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) latency_p50_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,8 +120,8 @@ pub(super) struct AgentUsageRow {
     pub(super) output_tokens: u64,
     pub(super) total_tokens: u64,
     pub(super) spent_eur: f64,
-    pub(super) failures: u64,
-    pub(super) fallbacks: u64,
+    pub(super) failures: Option<u64>,
+    pub(super) fallbacks: Option<u64>,
     pub(super) latency_p50_ms: Option<u64>,
     pub(super) latency_p95_ms: Option<u64>,
     pub(super) last_used: Option<String>,
@@ -467,8 +469,8 @@ pub(super) fn read_usage_report() -> Result<UsageReport> {
         || report.by_backend.len() > 32
         || report.by_model.len() > 250
         || report.daily.len() > 32
-        || report.by_agent.len() > 100
-        || report.failures_by_category.len() > 32
+        || report.by_agent.as_ref().map_or(0, Vec::len) > 100
+        || report.failures_by_category.as_ref().map_or(0, Vec::len) > 32
         || !report.spent_eur.is_finite()
         || !report.budget_eur.is_finite()
     {
@@ -649,8 +651,8 @@ mod tests {
         assert!(!serialized.contains("api_key"));
         assert!(!serialized.contains("must-not-be-retained"));
         // Snapshots from older Core releases lack the analysis fields.
-        assert_eq!(report.failures, 0);
-        assert!(report.by_agent.is_empty());
+        assert_eq!(report.failures, None);
+        assert!(report.by_agent.is_none());
     }
 
     #[test]
@@ -664,5 +666,16 @@ mod tests {
         assert_eq!(value["by_backend"][0]["fallbacks"], 2);
         assert_eq!(value["by_agent"][0]["agent_id"], "researcher");
         assert_eq!(value["failures_by_category"][0]["category"], "timeout");
+
+        // Not-yet-instrumented dimensions arrive as null and stay null.
+        let report: UsageReport = serde_json::from_str(
+            r#"{"period":"current_calendar_month","generated_at_unix":1,"budget_eur":20.0,"spent_eur":1.0,"remaining_eur":19.0,"over_budget":false,"requests":3,"input_tokens":2,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":5,"failures":null,"fallbacks":null,"latency_p50_ms":120,"latency_p95_ms":900,"by_backend":[{"backend":"ollama-cloud","spent_eur":1.0,"requests":3,"input_tokens":2,"output_tokens":3,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":5,"failures":null,"fallbacks":null}],"by_agent":null,"failures_by_category":null,"pricing":{"source":"fixture","updated_at":"2026-09-01"}}"#,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&report).unwrap();
+        for field in ["failures", "fallbacks", "by_agent", "failures_by_category"] {
+            assert_eq!(value[field], serde_json::Value::Null, "{field}");
+        }
+        assert_eq!(value["by_backend"][0]["failures"], serde_json::Value::Null);
     }
 }
