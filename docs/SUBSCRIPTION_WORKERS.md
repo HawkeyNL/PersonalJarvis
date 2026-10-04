@@ -462,11 +462,23 @@ collab tool, file change, plan update), a web search with an unknown or
 `other` action, a web search in an ordinary run, and any unknown event still
 stops the whole run with `tool_use_refused`.
 
-**Bounds.** A research run stops after 300 seconds (Core waits 310 seconds);
-ordinary runs keep 120 seconds. The output bounds are unchanged (Claude: 256
-KiB CLI result; Codex: 512 KiB per event, 4 MiB stream, 128 KiB answer). The
-two parallel runs per worker are shared with ordinary chat, so two long
-research runs can make chat wait for a free slot.
+`codex exec` may add its own environment context to the prompt, such as the
+time zone or the empty working directory; the worker cannot remove it. Newer
+codex-rs releases also have a standalone search path in which the CLI itself
+POSTs the query to an OpenAI search endpoint from the host. Both, and the
+`web_search` event and item names above, must be re-checked against the exact
+CLI version before `JARVIS_CODEX_REVIEWED_VERSION` is bumped.
+
+**Bounds.** A research run stops after 300 seconds and its reply deadline is
+305 seconds (Core waits 310 seconds). Ordinary runs keep 120 seconds and a
+125-second reply deadline. Each worker runs at most two requests at once and
+at most one of them may be a research run; a second research request while
+one runs is refused (`runtime_failure`), never queued, so one slot always
+stays free for chat. A research failure does not put the subscription into
+the router's cooldown for chat, except an authentication failure or a plan
+limit. The output bounds are unchanged (Claude: 256 KiB CLI result; Codex:
+512 KiB per event, 4 MiB stream, 128 KiB answer). The worker reads Core's
+request within 5 seconds.
 
 **Prompt injection.** Search results can contain instructions. The research
 instruction tells the model to treat web content as data, and the worker

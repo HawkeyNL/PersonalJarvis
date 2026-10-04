@@ -276,8 +276,12 @@ the subscription provider (Anthropic for `claude-cli`, OpenAI for
 search queries, which can contain words from the question, to its search
 partners. The Home Node itself fetches nothing: no browser, no local fetch.
 The answer, with the source URLs the model reports, is stored in the
-conversation like any other answer; the app shows links through its safe
-Markdown renderer (https only). Web content is untrusted: the model is told to
+conversation like any other answer. Source URLs come from the web and are
+untrusted: clients must render them only as plain text or as https links the
+owner clicks (the safe Markdown renderer), never load them automatically (no
+link previews, images, prefetch or embeds), so viewing an answer contacts no
+third party. Turning the switch off also stops a research request that is
+about to try its next subscription. Web content is untrusted: the model is told to
 ignore instructions in it, and it cannot trigger any other tool (see
 `SUBSCRIPTION_WORKERS.md`, "Research runs").
 
