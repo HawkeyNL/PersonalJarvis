@@ -180,6 +180,26 @@ async fn model_mutation(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+async fn model_routes(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+) -> Result<admin::RoutingReport, String> {
+    with_session(session, |session| admin::model_routes(&session)).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn model_route_mutation(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+    request: admin::RouteMutation,
+) -> Result<admin::OperationResult, String> {
+    with_session(session, move |session| {
+        admin::model_route_mutation(&session, request)
+    })
+    .await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 async fn credentials(
     session: tauri::State<'_, Arc<session::SessionManager>>,
 ) -> Result<Vec<admin::CredentialRecord>, String> {
@@ -282,6 +302,8 @@ pub fn run() {
             model_providers,
             usage,
             model_mutation,
+            model_routes,
+            model_route_mutation,
             credentials,
             ai_accounts,
             ai_account_action,

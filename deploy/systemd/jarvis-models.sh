@@ -13,6 +13,9 @@ readonly ollama_cloud_tags_url=https://ollama.com/api/tags
 readonly huggingface_default_base_url=https://router.huggingface.co/v1
 readonly huggingface_catalog_file=/etc/jarvis/huggingface-catalog.json
 readonly max_huggingface_catalog_bytes=8388608
+# Owner routing lives next to the policy and shares its directory lock.
+readonly routing_file=$policy_dir/routing.json
+readonly max_routing_bytes=65536
 
 fail() { echo "jarvis-models: $*" >&2; exit 1; }
 
@@ -20,22 +23,33 @@ usage() {
     cat >&2 <<'EOF'
 Usage:
   sudo jarvis-models refresh [provider]
+  sudo jarvis-models register <claude-cli|codex-cli> <model>
   sudo jarvis-models list [provider]
   sudo jarvis-models enable <provider> <model>
   sudo jarvis-models disable <provider> <model>
   sudo jarvis-models show <provider> <model>
   sudo jarvis-models providers huggingface <model>
   sudo jarvis-models set-route huggingface <model> <route>
+  sudo jarvis-models route list
+  sudo jarvis-models route show <cheap|default|hard>
+  sudo jarvis-models route set <tier> <provider> <model> [<provider> <model>...] [--metered-after-subscription]
+  sudo jarvis-models route reset <tier>
+  sudo jarvis-models route paid-api <allowed|off>
 
 `refresh` records configured models as discovered but leaves every remote or
 subscription-backed model disabled. Local Ollama remains enabled by default;
-all model choices remain exact provider/model matches.
+all model choices remain exact provider/model matches. Subscription providers
+have no model catalog: `refresh` records the configured Claude models for
+claude-cli, and `register` records one exact subscription pair, disabled.
+
+`route` orders already-discovered models per tier and switches paid (metered)
+APIs off or on. It never enables a model: the allowlist still decides.
 EOF
     exit 64
 }
 
 valid_provider() {
-    [[ $1 =~ ^(anthropic-api|openai-api|deepseek-api|xai-api|zai-api|ollama|ollama-cloud|claude-cli|huggingface)$ ]]
+    [[ $1 =~ ^(anthropic-api|openai-api|deepseek-api|xai-api|zai-api|ollama|ollama-cloud|claude-cli|codex-cli|huggingface)$ ]]
 }
 
 # Older pre-release installs could leave /etc/jarvis or model-policy.json with
@@ -78,7 +92,7 @@ atomic_write() (
     umask 077
     printf '%s\n' "$content" > "$tmp" &&
         chown root:jarvis "$tmp" && chmod 0640 "$tmp" &&
-        jq -e '.version == 1 and (.models | type == "array")' "$tmp" >/dev/null &&
+        jq -e '.version == 1 and (.models | type == "array")' "$tmp" >/dev/null && sync -- "$tmp" &&
         mv -f -- "$tmp" "$policy_file" || fail "model policy replacement failed"
 )
 
@@ -141,6 +155,7 @@ configured_models() {
           ["xai-api", $xai_default], ["xai-api", $xai_hard], ["xai-api", $xai_cheap],
           ["zai-api", $zai_default], ["zai-api", $zai_hard], ["zai-api", $zai_cheap],
           ["ollama-cloud", $ollama_cloud_default], ["ollama-cloud", $ollama_cloud_hard], ["ollama-cloud", $ollama_cloud_cheap],
+          ["claude-cli", $anthropic_default], ["claude-cli", $anthropic_hard], ["claude-cli", $anthropic_cheap],
           ["huggingface", $huggingface_default], ["huggingface", $huggingface_hard], ["huggingface", $huggingface_cheap],
           ["ollama", $ollama]
         ] | map(select(.[1] != "")) | unique'
@@ -347,6 +362,12 @@ refresh_configured() {
             failed=1
         fi
     done
+    # The Claude worker runs the configured Claude tier models; record them
+    # (disabled) so the owner can enable or route them.
+    if ! (refresh claude-cli); then
+        echo "jarvis-models: claude-cli refresh failed; prior model choices retained" >&2
+        failed=1
+    fi
     echo "jarvis-models: checked $count configured providers; no models enabled"
     return "$failed"
 }
@@ -379,6 +400,30 @@ refresh() {
     jq -e '.models | length <= 2000' <<<"$merged" >/dev/null || fail "model policy size limit exceeded; previous policy retained"
     atomic_write "$merged" || fail "model policy replacement failed; previous policy retained"
     echo "jarvis-models: refreshed policy; new remote models remain disabled."
+}
+
+# Subscription providers have no model catalog to discover. The owner records
+# one exact pair as discovered; it stays disabled until `enable`.
+register_subscription_model() {
+    local provider=$1 model=$2 old updated
+    [[ $provider == claude-cli || $provider == codex-cli ]] ||
+        fail "register is only for subscription providers (claude-cli, codex-cli)"
+    # Same rule as the subscription worker request (valid_worker_model).
+    [[ -n $model && ${#model} -le 80 && $model != -* && $model != *[!A-Za-z0-9._-]* ]] ||
+        fail "invalid model: use 1 to 80 of A-Z a-z 0-9 . _ - and do not start with -"
+    normalize_model_policy_boundary
+    old=$(if [[ -f $policy_file ]]; then cat "$policy_file"; else empty_policy; fi)
+    jq -e '.version == 1 and (.models | type == "array")' <<<"$old" >/dev/null || fail "existing policy is malformed"
+    if jq -e --arg provider "$provider" --arg model "$model" \
+        'any(.models[]; .provider == $provider and .model == $model)' <<<"$old" >/dev/null; then
+        echo "jarvis-models: $provider/$model is already discovered; access unchanged."
+        return 0
+    fi
+    updated=$(merge_model_policy "$old" "$(jq -cn --arg provider "$provider" --arg model "$model" \
+        '[[$provider, $model, "owner_registered"]]')")
+    jq -e '.models | length <= 2000' <<<"$updated" >/dev/null || fail "model policy size limit exceeded; previous policy retained"
+    atomic_write "$updated" || fail "model policy replacement failed; previous policy retained"
+    echo "jarvis-models: $provider/$model recorded as discovered and disabled; enable it with 'sudo jarvis models enable $provider $model'."
 }
 
 require_huggingface_catalog() {
@@ -472,6 +517,185 @@ show_model() {
         '.models[] | select(.provider == $provider and .model == $model)' "$policy_file"
 }
 
+# Owner model routing (`routing.json`). The jq program mirrors
+# `jarvis_llm::ModelRouting::parse`: known fields only, version 1, known tiers,
+# 1-9 entries, routable providers, 1-256 non-control model characters, no
+# duplicate pairs and no metered entry after a subscription entry unless the
+# tier sets `metered_after_subscription`. Size is checked separately.
+# `version` must be the integer 1: Core reads it as u32, so 1.0 is refused (jq
+# canonicalizes 1e0 to 1; Core refuses it and fails closed). jq keeps the last
+# of duplicate object keys and cannot detect them; Core rejects duplicate keys
+# and then fails closed (built-in order without metered backends).
+readonly routing_validator='
+  def fields($allowed): type == "object" and all(keys[]; IN($allowed[]));
+  def metered: IN("ollama", "claude-cli", "codex-cli") | not;
+  def entry_ok:
+    fields(["provider", "model"]) and has("provider") and has("model")
+    and (.provider | type == "string" and IN($providers[]))
+    and (.model | type == "string" and length >= 1 and length <= 256
+         and all(explode[]; . >= 32 and (. < 127 or . > 159)));
+  def chain_ok($approved):
+    type == "array" and length >= 1 and length <= 9 and all(.[]; entry_ok)
+    and (map([.provider, .model]) | length == (unique | length))
+    and ($approved or (reduce .[] as $entry ({subscription: false, ok: true};
+          .ok = (.ok and ((.subscription and ($entry.provider | metered)) | not))
+          | .subscription = (.subscription or ($entry.provider | IN("claude-cli", "codex-cli")))) | .ok));
+  def tier_ok:
+    . == null or (fields(["chain", "metered_after_subscription"]) and has("chain")
+      and ((has("metered_after_subscription") | not) or (.metered_after_subscription | type == "boolean"))
+      and (.metered_after_subscription as $approved | .chain | chain_ok($approved == true)));
+  length == 1 and (.[0] |
+    fields(["version", "paid_api", "tiers"]) and has("version")
+    and (.version | type == "number" and tostring == "1")
+    and ((has("paid_api") | not) or (.paid_api | IN("allowed", "off")))
+    and ((has("tiers") | not)
+         or (.tiers | fields(["cheap", "default", "hard"]) and all(.[]; tier_ok))))'
+readonly routing_providers='["anthropic-api","openai-api","deepseek-api","xai-api","zai-api","ollama","ollama-cloud","huggingface","claude-cli","codex-cli"]'
+
+valid_routing() {
+    local document=$1
+    [[ $(printf '%s\n' "$document" | wc -c) -le $max_routing_bytes ]] || return 1
+    jq -se --argjson providers "$routing_providers" "$routing_validator" <<<"$document" >/dev/null 2>&1
+}
+
+valid_tier() { [[ $1 =~ ^(cheap|default|hard)$ ]]; }
+
+# Separate so the rootless fixture can map its own uid to the root owner.
+protected_file_state() { stat -c '%U:%G:%a' "$1"; }
+
+# Print the current routing document; absent means built-in order everywhere.
+read_routing() {
+    if [[ ! -e $routing_file && ! -L $routing_file ]]; then
+        printf '%s\n' '{"version":1,"paid_api":"allowed","tiers":{}}'
+        return
+    fi
+    [[ -f $routing_file && ! -L $routing_file ]] || fail "routing file is not a safe regular file"
+    [[ $(protected_file_state "$routing_file") == root:jarvis:640 ]] || fail "routing permissions are unsafe"
+    [[ $(stat -c %s "$routing_file") -le $max_routing_bytes ]] || fail "routing exceeds the size limit"
+    local document
+    document=$(<"$routing_file")
+    valid_routing "$document" ||
+        fail "routing is invalid; remove it as root or replace it with a signed routing change"
+    # Normalize: every writer emits the same explicit, duplicate-free shape.
+    jq '{version: 1, paid_api: (.paid_api // "allowed"), tiers: ((.tiers // {}) | with_entries(select(.value != null)))}' <<<"$document"
+}
+
+# Every routed pair must already be discovered in the model policy. Routing
+# never grants access; this only keeps typos and stale ids out.
+require_routed_models_discovered() {
+    local document=$1
+    [[ -f $policy_file && ! -L $policy_file ]] || fail "no policy; run 'sudo jarvis-models refresh' first"
+    [[ $(protected_file_state "$policy_file") == root:jarvis:640 ]] || fail "policy permissions are unsafe"
+    jq -e --argjson routing "$document" '
+      .version == 1 and (.models | type == "array")
+      and (.models as $known
+           | all($routing.tiers[]?.chain[]?; . as $entry
+                 | any($known[]; .provider == $entry.provider and .model == $entry.model)))' \
+      "$policy_file" >/dev/null || fail "routing names a model that is not discovered; run refresh first"
+}
+
+atomic_write_routing() (
+    local content=$1 tmp
+    tmp=$(mktemp "$policy_dir/.routing.XXXXXX") || fail "cannot stage routing"
+    trap 'rm -f -- "$tmp"' EXIT
+    umask 077
+    printf '%s\n' "$content" > "$tmp" &&
+        chown root:jarvis "$tmp" && chmod 0640 "$tmp" &&
+        valid_routing "$(<"$tmp")" && sync -- "$tmp" &&
+        mv -f -- "$tmp" "$routing_file" || fail "routing replacement failed; previous routing retained"
+)
+
+write_routing() {
+    local document=$1
+    valid_routing "$document" || fail "invalid routing; previous routing retained"
+    require_routed_models_discovered "$document"
+    atomic_write_routing "$document" || exit 1
+    # Core loads routing only at startup or through the signed broker path.
+    activate_model_policy
+}
+
+list_routing() {
+    local document tier
+    document=$(read_routing) || exit 1
+    printf 'paid API: %s\n' "$(jq -r '.paid_api' <<<"$document")"
+    printf '%-8s %-4s %-16s %s\n' TIER RANK PROVIDER MODEL
+    for tier in cheap default hard; do
+        if jq -e --arg tier "$tier" '.tiers | has($tier)' <<<"$document" >/dev/null; then
+            jq -r --arg tier "$tier" '.tiers[$tier].chain | to_entries[] | [(.key + 1 | tostring), .value.provider, .value.model] | @tsv' <<<"$document" |
+                while IFS=$'\t' read -r rank provider model; do
+                    printf '%-8s %-4s %-16s %s\n' "$tier" "$rank" "$provider" "$model"
+                done
+        else
+            printf '%-8s %-4s %s\n' "$tier" - "built-in order"
+        fi
+    done
+}
+
+show_routing_tier() {
+    local tier=$1
+    valid_tier "$tier" || fail "unknown tier; use cheap, default or hard"
+    read_routing | jq --arg tier "$tier" '.tiers[$tier] // "built-in order"' || exit 1
+}
+
+set_routing_tier() {
+    local tier=$1 approved=false chain='[]' updated
+    shift
+    valid_tier "$tier" || fail "unknown tier; use cheap, default or hard"
+    local -a values=()
+    while (($#)); do
+        case $1 in
+            --metered-after-subscription) approved=true ;;
+            *) values+=("$1") ;;
+        esac
+        shift
+    done
+    ((${#values[@]} >= 2 && ${#values[@]} % 2 == 0)) || fail "give one or more <provider> <model> pairs"
+    ((${#values[@]} <= 18)) || fail "a tier chain has at most 9 entries"
+    local index
+    for ((index = 0; index < ${#values[@]}; index += 2)); do
+        valid_provider "${values[index]}" || fail "unknown provider"
+        chain=$(jq -c --arg provider "${values[index]}" --arg model "${values[index + 1]}" \
+            '. + [{provider: $provider, model: $model}]' <<<"$chain")
+    done
+    updated=$(read_routing | jq --arg tier "$tier" --argjson chain "$chain" --argjson approved "$approved" \
+        '.tiers[$tier] = {chain: $chain, metered_after_subscription: $approved}') || exit 1
+    valid_routing "$updated" ||
+        fail "invalid route: check models, duplicates, or a metered entry after a subscription (needs --metered-after-subscription)"
+    write_routing "$updated"
+    echo "jarvis-models: $tier routing updated; models still need to be enabled."
+}
+
+reset_routing_tier() {
+    local tier=$1
+    valid_tier "$tier" || fail "unknown tier; use cheap, default or hard"
+    local updated
+    updated=$(read_routing | jq --arg tier "$tier" 'del(.tiers[$tier])') || exit 1
+    write_routing "$updated"
+    echo "jarvis-models: $tier uses the built-in order again."
+}
+
+set_paid_api() {
+    local state=$1
+    [[ $state =~ ^(allowed|off)$ ]] || fail "paid-api takes allowed or off"
+    local updated
+    updated=$(read_routing | jq --arg state "$state" '.paid_api = $state') || exit 1
+    write_routing "$updated"
+    echo "jarvis-models: paid APIs are now $state."
+}
+
+route_command() {
+    local command=${1:-}
+    shift || true
+    case $command in
+        list) (($# == 0)) || usage; list_routing ;;
+        show) (($# == 1)) || usage; show_routing_tier "$1" ;;
+        set) (($# >= 3)) || usage; set_routing_tier "$@" ;;
+        reset) (($# == 1)) || usage; reset_routing_tier "$1" ;;
+        paid-api) (($# == 1)) || usage; set_paid_api "$1" ;;
+        *) usage ;;
+    esac
+}
+
 main() {
     [[ ${EUID} -eq 0 ]] || fail "must run as root"
     command -v jq >/dev/null 2>&1 || fail "jq is required"
@@ -480,7 +704,7 @@ main() {
     # The root broker locks this same stable directory inode. Locking the JSON
     # file itself is insufficient because every writer replaces it atomically.
     case ${1:-} in
-        refresh|refresh-configured|enable|disable|set-route)
+        refresh|refresh-configured|register|enable|disable|set-route|route)
             local migration_lock
             exec {migration_lock}</etc/jarvis
             flock --exclusive --wait 10 "$migration_lock" || fail "policy migration is in progress"
@@ -494,12 +718,14 @@ main() {
     case ${1:-} in
         refresh-configured) (($# == 1)) || usage; refresh_configured ;;
         refresh) (($# == 1 || $# == 2)) || usage; refresh "${2:-}" ;;
+        register) (($# == 3)) || usage; register_subscription_model "$2" "$3" ;;
         list) (($# == 1 || $# == 2)) || usage; list_models "${2:-}" ;;
         enable) (($# == 3)) || usage; set_state "$2" "$3" true ;;
         disable) (($# == 3)) || usage; set_state "$2" "$3" false ;;
         show) (($# == 3)) || usage; show_model "$2" "$3" ;;
         providers) (($# == 3)) || usage; list_huggingface_providers "$2" "$3" ;;
         set-route) (($# == 4)) || usage; set_huggingface_route "$2" "$3" "$4" ;;
+        route) shift; route_command "$@" ;;
         *) usage ;;
     esac
 }

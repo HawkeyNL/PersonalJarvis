@@ -788,6 +788,14 @@ restore_claude_runtime_state() {
        $service_enabled == $claude_service_was_enabled ]] || return 1
 }
 
+# The optional Codex chat worker is only ever restarted when it already runs,
+# so the new unit and binary apply; it is never enabled or started here. A
+# socket restart may stop a running service; the socket starts it on demand.
+restart_codex_chat_worker() {
+    systemctl try-restart jarvis-codex-chat.socket >/dev/null 2>&1 || true
+    systemctl try-restart jarvis-codex-chat.service >/dev/null 2>&1 || true
+}
+
 wait_for_warm_laya() {
     local response attempt
     [[ $laya_service_was_active == true ]] || return 0
@@ -854,6 +862,7 @@ restart_managed_services() {
     systemctl try-restart jarvis-opensandbox.service >/dev/null 2>&1 || true
     restore_laya_runtime_state || return 1
     restore_claude_runtime_state || return 1
+    restart_codex_chat_worker
     systemctl start jarvis-core.service || return 1
     curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
         --retry 11 --retry-delay 5 --retry-connrefused \
@@ -881,6 +890,7 @@ restore_release_transaction() {
     systemctl try-restart jarvis-opensandbox.service >/dev/null 2>&1 || true
     restore_laya_runtime_state || return 1
     restore_claude_runtime_state || return 1
+    restart_codex_chat_worker
     systemctl start jarvis-core.service >/dev/null 2>&1 || return 1
     curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
         --retry 11 --retry-delay 5 --retry-connrefused \
@@ -934,6 +944,17 @@ activate_managed_release() {
             systemctl is-active --quiet jarvis-claude.socket || \
             unit_enabled jarvis-claude.socket; then
             echo 'jarvis updater: disconnect and stop optional Claude worker before rolling back to a pre-subscription-worker release' >&2
+            return 1
+        fi
+        unit_manager="$previous/manage-systemd-units"
+    fi
+    if jq -e '.tooling.codex_chat_worker == 1' "$previous/release.json" >/dev/null && \
+        ! jq -e '.tooling.codex_chat_worker == 1' "$release/release.json" >/dev/null; then
+        if systemctl is-active --quiet jarvis-codex-chat.service || \
+            unit_enabled jarvis-codex-chat.service || \
+            systemctl is-active --quiet jarvis-codex-chat.socket || \
+            unit_enabled jarvis-codex-chat.socket; then
+            echo 'jarvis updater: run `systemctl disable --now jarvis-codex-chat.socket` and stop jarvis-codex-chat.service before rolling back to a release without the Codex chat worker' >&2
             return 1
         fi
         unit_manager="$previous/manage-systemd-units"

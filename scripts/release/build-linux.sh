@@ -63,6 +63,11 @@ verify_systemd_unit_candidate() {
     echo "release candidate does not declare subscription-worker capability 1" >&2
     exit 1
   }
+  jq -e '.tooling.codex_chat_worker == 1 and (.tooling.codex_chat_worker | type) == "number"' \
+    "$release/release.json" >/dev/null || {
+    echo "release candidate does not declare Codex chat worker capability 1" >&2
+    exit 1
+  }
   jq -e '.tooling.model_policy_directory == 1 and (.tooling.model_policy_directory | type) == "number"' \
     "$release/release.json" >/dev/null || {
     echo "release candidate does not declare model-policy directory capability 1" >&2
@@ -212,6 +217,7 @@ install -m 0755 "$release_target_dir/release/jarvis-model-policy-storage" "$temp
 install -m 0755 "$release_target_dir/release/jarvis-codex-broker" "$temporary_release/jarvis-codex-broker"
 install -m 0755 "$release_target_dir/release/jarvis-codex-runtime" "$temporary_release/jarvis-codex-runtime"
 install -m 0755 "$release_target_dir/release/jarvis-claude-worker" "$temporary_release/jarvis-claude-worker"
+install -m 0755 "$release_target_dir/release/jarvis-codex-chat-worker" "$temporary_release/jarvis-codex-chat-worker"
 install -m 0755 "$release_target_dir/release/jarvis-agent-bundle" "$temporary_release/jarvis-agent-bundle"
 install -m 0755 "$release_target_dir/release/jarvis" "$temporary_release/jarvis"
 install -m 0755 "$release_target_dir/release/jarvis-core-admin" "$temporary_release/jarvis-core-admin"
@@ -254,6 +260,7 @@ for unit in \
   jarvis-model-catalog.service jarvis-model-catalog.timer \
   jarvis-laya.service jarvis-laya.socket \
   jarvis-claude.service jarvis-claude.socket \
+  jarvis-codex-chat.service jarvis-codex-chat.socket \
   jarvis-backup.service jarvis-backup.timer; do
   install -m 0644 "deploy/systemd/$unit" "$temporary_release/systemd-$unit"
 done
@@ -279,12 +286,12 @@ jq -n \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
   --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" --arg schema_eight "$schema_eight_sha256" --arg schema_nine "$schema_nine_sha256" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 10, from_sha256: [$schema_six, $schema_seven, $schema_eight, $schema_nine]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1, codex_runtime: 1, backup_timer: 1}}' \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 10, from_sha256: [$schema_six, $schema_seven, $schema_eight, $schema_nine]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1, codex_chat_worker: 1, codex_runtime: 1, backup_timer: 1}}' \
   > "$temporary_release/release.json"
 
 (
   cd "$temporary_release"
-  sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-codex-runtime jarvis-claude-worker jarvis-agent-bundle \
+  sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-codex-runtime jarvis-claude-worker jarvis-codex-chat-worker jarvis-agent-bundle \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
     jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials jarvis-backup \
     com.hawkeynl.jarvis.devices.policy \

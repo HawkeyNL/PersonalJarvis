@@ -10,6 +10,7 @@ const rows = ref<AiAccountRecord[]>([]);
 const busy = ref(false);
 const error = ref("");
 const result = ref<OperationResult | null>(null);
+const labels: Record<AiAccountProvider, string> = { claude: "Claude Code", codex: "Codex (coding)", "codex-chat": "Codex chat" };
 
 async function load() {
   busy.value = true;
@@ -42,7 +43,7 @@ onMounted(load);
   <ResultPanel v-if="result" :result="result" />
   <section class="credential-grid">
     <article v-for="row in rows" :key="row.provider" class="metric-card credential-card">
-      <span class="card-label">{{ row.provider === "claude" ? "Claude Code" : "Codex" }}</span>
+      <span class="card-label">{{ labels[row.provider] }}</span>
       <StatusBadge :state="row.state" />
       <p>Worker: {{ row.worker }}<br>Billing: {{ row.billing === "overage_unverified" ? "Extra usage setting not verified" : row.billing }}<br>Runtime: {{ row.runtime }}</p>
       <p v-if="row.provider === 'claude' && row.state === 'connected'">Claude login is linked. Verify extra usage is disabled or capped at zero in your provider account before explicitly enabling the worker socket.</p>

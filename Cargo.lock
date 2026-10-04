@@ -2558,6 +2558,7 @@ dependencies = [
  "hex",
  "jarvis-client-core",
  "jarvis-identity",
+ "jarvis-llm",
  "serde",
  "serde_json",
  "sha2",

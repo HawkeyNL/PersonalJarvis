@@ -96,6 +96,10 @@ if jq -e '.tooling.subscription_workers? == 1' "$release_dir/release.json" >/dev
     [[ -x $release_dir/jarvis-claude-worker && ! -L $release_dir/jarvis-claude-worker ]] ||
         fail "Claude subscription worker is invalid"
 fi
+if jq -e '.tooling.codex_chat_worker? == 1' "$release_dir/release.json" >/dev/null 2>&1; then
+    [[ -x $release_dir/jarvis-codex-chat-worker && ! -L $release_dir/jarvis-codex-chat-worker ]] ||
+        fail "Codex chat worker is invalid"
+fi
 [[ -x $release_dir/jarvis-agent-bundle && ! -L $release_dir/jarvis-agent-bundle ]] || fail "agent-bundle validator is invalid"
 [[ -x $release_dir/jarvis && ! -L $release_dir/jarvis ]] || fail "Jarvis admin binary is invalid"
 [[ -x $release_dir/update-core-release && ! -L $release_dir/update-core-release ]] || \

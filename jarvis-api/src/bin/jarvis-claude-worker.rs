@@ -1,16 +1,9 @@
 //! Finite subscription-only Claude brain worker. The official CLI runs as
 //! jarvis-claude, never inside Core and never with Core's provider API keys.
 
-use std::{
-    ffi::{CStr, CString},
-    fs,
-    os::{
-        fd::FromRawFd,
-        unix::fs::{MetadataExt, PermissionsExt},
-    },
-    path::Path,
-    time::Duration,
-};
+mod subscription_worker;
+
+use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use jarvis_llm::claude_worker_protocol::{
@@ -18,9 +11,13 @@ use jarvis_llm::claude_worker_protocol::{
     ClaudeWorkerState, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
 };
 use serde::Deserialize;
+use subscription_worker::{
+    authorized_peer, inherited_listener, named_uid, send, validate_private_dir,
+    validate_root_binary,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
+    net::UnixStream,
     process::Command,
     sync::Semaphore,
 };
@@ -67,7 +64,7 @@ async fn main() -> Result<()> {
     let permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_RUNS));
     loop {
         let (mut stream, _) = listener.accept().await?;
-        if stream.peer_cred().context("inspect local peer")?.uid() != core_uid {
+        if !authorized_peer(&stream, core_uid) {
             continue;
         }
         let Ok(permit) = permits.clone().try_acquire_owned() else {
@@ -88,19 +85,6 @@ async fn main() -> Result<()> {
             let _ = send(&mut stream, reply).await;
         });
     }
-}
-
-fn inherited_listener() -> Result<UnixListener> {
-    let pid = std::env::var("LISTEN_PID").context("socket activation PID missing")?;
-    let count = std::env::var("LISTEN_FDS").context("socket activation fd missing")?;
-    if pid.parse::<u32>()? != std::process::id() || count != "1" {
-        bail!("Claude worker requires exactly one systemd Unix socket");
-    }
-    // systemd passes the first listening fd as 3 for Accept=no socket units.
-    let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
-    std_listener.set_nonblocking(true)?;
-    let listener = UnixListener::from_std(std_listener)?;
-    Ok(listener)
 }
 
 async fn handle(stream: &mut UnixStream) -> Result<ClaudeWorkerReply> {
@@ -156,16 +140,6 @@ async fn supported_runtime() -> bool {
     matches!(result, Ok(Ok(status)) if status.success())
         && bytes.len() <= 1024
         && reviewed_claude_version(&bytes)
-}
-
-async fn send(stream: &mut UnixStream, reply: ClaudeWorkerReply) -> Result<()> {
-    let bytes = serde_json::to_vec(&reply)?;
-    if bytes.len() > MAX_REPLY_BYTES {
-        bail!("Claude worker reply exceeded bound");
-    }
-    stream.write_all(&bytes).await?;
-    stream.shutdown().await?;
-    Ok(())
 }
 
 async fn subscription_auth() -> bool {
@@ -295,56 +269,6 @@ fn clean_command() -> Command {
         .env("LANG", "C.UTF-8")
         .current_dir(HOME);
     command
-}
-
-fn named_uid(name: &str) -> Result<u32> {
-    let name = CString::new(name)?;
-    let record = unsafe { libc::getpwnam(name.as_ptr()) };
-    if record.is_null() {
-        bail!("required service identity missing");
-    }
-    let record = unsafe { &*record };
-    let shell = unsafe { CStr::from_ptr(record.pw_shell) }.to_str()?;
-    if shell != "/usr/sbin/nologin" {
-        bail!("service identity has unsafe shell");
-    }
-    Ok(record.pw_uid)
-}
-
-fn validate_private_dir(path: &str, uid: u32) -> Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.is_dir()
-        || meta.file_type().is_symlink()
-        || meta.uid() != uid
-        || meta.permissions().mode() & 0o777 != 0o700
-    {
-        bail!("unsafe Claude worker private directory");
-    }
-    Ok(())
-}
-
-fn validate_root_binary(path: &str) -> Result<()> {
-    let path = Path::new(path);
-    for parent in path.ancestors().skip(1) {
-        let meta = fs::symlink_metadata(parent)?;
-        if !meta.is_dir()
-            || meta.file_type().is_symlink()
-            || meta.uid() != 0
-            || meta.permissions().mode() & 0o022 != 0
-        {
-            bail!("unsafe Claude runtime parent directory");
-        }
-    }
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.is_file()
-        || meta.file_type().is_symlink()
-        || meta.uid() != 0
-        || meta.permissions().mode() & 0o022 != 0
-        || meta.permissions().mode() & 0o111 == 0
-    {
-        bail!("unsafe Claude runtime executable");
-    }
-    Ok(())
 }
 
 #[cfg(test)]

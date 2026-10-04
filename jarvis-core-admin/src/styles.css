@@ -170,6 +170,18 @@ code { padding: 2px 5px; border-radius: 4px; background: rgba(255,255,255,.06); 
 .card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
 .route-controls { display: flex; align-items: center; gap: 9px; margin: 18px 0 7px; }
 .route-controls select { flex: 1; }
+.routing-card { margin-bottom: 18px; }
+.paid-switch { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; font: 600 13px var(--mono); white-space: nowrap; }
+.paid-switch.allowed strong { color: var(--yellow); }
+.paid-switch.off strong { color: var(--accent); }
+.routing-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.routing-tier { min-width: 0; padding: 14px; border: 1px solid var(--border-soft); border-radius: 11px; background: rgba(13,27,21,.5); }
+.route-chain { display: grid; gap: 8px; margin: 12px 0; padding-left: 20px; }
+.route-chain li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 2px 8px; }
+.route-chain small { grid-column: 1; color: var(--muted); font: 11px var(--mono); }
+.route-chain .action-row { grid-column: 2; grid-row: 1 / span 2; flex-wrap: nowrap; gap: 4px; }
+.route-check { display: flex; align-items: center; gap: 8px; margin: 8px 0; font-size: 13px; }
+.route-warning { margin: 0 0 10px; color: var(--yellow); font-size: 12px; line-height: 1.5; }
 .modal-loading { display: flex; align-items: center; gap: 10px; min-height: 130px; color: var(--muted); font: 12px var(--mono); }
 .restart-backdrop { z-index: 200; }
 .restart-dialog { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }

@@ -43,7 +43,7 @@ pub fn compute_class(backend: &str) -> ComputeClass {
     } else {
         match backend {
             "ollama" | "laya" => ComputeClass::Local,
-            "claude-cli" | "codex" => ComputeClass::Subscription,
+            "claude-cli" | "codex" | "codex-cli" => ComputeClass::Subscription,
             _ => ComputeClass::Unknown,
         }
     }
@@ -678,6 +678,8 @@ mod tests {
     fn compute_class_does_not_confuse_subscription_with_paid_api() {
         assert_eq!(compute_class("claude-cli"), ComputeClass::Subscription);
         assert_eq!(compute_class("codex"), ComputeClass::Subscription);
+        assert_eq!(compute_class("codex-cli"), ComputeClass::Subscription);
+        assert!(!is_metered("codex-cli"));
         assert_eq!(compute_class("laya"), ComputeClass::Local);
         assert_eq!(compute_class("anthropic-api"), ComputeClass::MeteredApi);
         assert_eq!(compute_class("unreviewed"), ComputeClass::Unknown);

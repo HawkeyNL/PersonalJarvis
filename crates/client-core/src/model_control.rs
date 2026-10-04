@@ -56,6 +56,7 @@ impl ModelToggleApproval {
                 | "ollama-cloud"
                 | "huggingface"
                 | "claude-cli"
+                | "codex-cli"
         ) || self.model.is_empty()
             || self.model.len() > 256
             || self.model.chars().any(char::is_control)
@@ -71,6 +72,135 @@ impl ModelToggleApproval {
         approval_message(
             "model.set_enabled",
             &Sha256::digest(payload).into(),
+            self.request_id,
+            &nonce,
+            self.user_id,
+            self.device_id,
+            OffsetDateTime::from_unix_timestamp(self.issued_at).map_err(|_| "invalid time")?,
+            OffsetDateTime::from_unix_timestamp(self.expires_at).map_err(|_| "invalid time")?,
+            &state,
+        )
+    }
+
+    /// Produce only the narrow broker request, never arbitrary signed JSON.
+    pub fn signed_request(&self, signature_hex: &str) -> Result<serde_json::Value, &'static str> {
+        self.message()?;
+        if hex::decode(signature_hex)
+            .map_err(|_| "invalid signature")?
+            .len()
+            != 64
+        {
+            return Err("invalid signature");
+        }
+        let format = &time::format_description::well_known::Rfc3339;
+        Ok(serde_json::json!({
+            "request_id": self.request_id, "nonce_hex": self.nonce_hex,
+            "user_id": self.user_id, "device_id": self.device_id,
+            "issued_at": OffsetDateTime::from_unix_timestamp(self.issued_at).map_err(|_| "invalid time")?.format(format).map_err(|_| "invalid time")?,
+            "expires_at": OffsetDateTime::from_unix_timestamp(self.expires_at).map_err(|_| "invalid time")?.format(format).map_err(|_| "invalid time")?,
+            "operation": self.operation(), "signature_hex": signature_hex,
+        }))
+    }
+}
+
+/// The owner routing document exactly as signed. Field order and the omission
+/// rules are part of the canonical payload: an absent tier is omitted, while
+/// `paid_api` and `metered_after_subscription` are always written.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingDocument {
+    pub version: u32,
+    #[serde(default)]
+    pub paid_api: PaidApi,
+    #[serde(default)]
+    pub tiers: RoutingTiers,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PaidApi {
+    #[default]
+    Allowed,
+    Off,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingTiers {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cheap: Option<TierRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<TierRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard: Option<TierRoute>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TierRoute {
+    pub chain: Vec<RouteEntry>,
+    #[serde(default)]
+    pub metered_after_subscription: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteEntry {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Approval for `model.routing_set`: replace the whole routing document.
+/// Core and the root broker validate the document and require every pair to
+/// be discovered; this type only produces the exact bytes to sign.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRoutingApproval {
+    pub request_id: Uuid,
+    pub nonce_hex: String,
+    pub user_id: Uuid,
+    pub device_id: Uuid,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub routing: RoutingDocument,
+    /// `routing_sha256` from `GET /v1/system/models`.
+    pub expected_routing_sha256: String,
+}
+
+#[derive(Serialize)]
+struct RoutingOperation<'a> {
+    action: &'static str,
+    routing: &'a RoutingDocument,
+    expected_routing_sha256: &'a str,
+}
+
+impl ModelRoutingApproval {
+    fn operation(&self) -> RoutingOperation<'_> {
+        RoutingOperation {
+            action: "model_routing_set",
+            routing: &self.routing,
+            expected_routing_sha256: &self.expected_routing_sha256,
+        }
+    }
+
+    /// Canonical payload: compact serde_json of the operation (no whitespace,
+    /// only `"` and `\\` escaped, `/` and non-ASCII written as UTF-8).
+    pub fn canonical_payload(&self) -> Result<Vec<u8>, &'static str> {
+        serde_json::to_vec(&self.operation()).map_err(|_| "invalid operation")
+    }
+
+    pub fn message(&self) -> Result<Vec<u8>, &'static str> {
+        if self.routing.version != 1 {
+            return Err("invalid routing operation");
+        }
+        let state: [u8; 32] = hex::decode(&self.expected_routing_sha256)
+            .map_err(|_| "invalid routing hash")?
+            .try_into()
+            .map_err(|_| "invalid routing hash")?;
+        let nonce = hex::decode(&self.nonce_hex).map_err(|_| "invalid nonce")?;
+        approval_message(
+            "model.routing_set",
+            &Sha256::digest(self.canonical_payload()?).into(),
             self.request_id,
             &nonce,
             self.user_id,
@@ -171,6 +301,64 @@ mod tests {
             assert!(encode("model.set_enabled", &[0; 32], lifetime).is_err());
         }
         assert!(encode("model.set_enabled", &[0; 32], 300).is_ok());
+    }
+
+    /// Fixed `model.routing_set` vector for the Swift and Kotlin clients.
+    const ROUTING_CANONICAL_PAYLOAD: &str = r#"{"action":"model_routing_set","routing":{"version":1,"paid_api":"off","tiers":{"cheap":{"chain":[{"provider":"huggingface","model":"org/modèl"},{"provider":"claude-cli","model":"claude-haiku-4-5"}],"metered_after_subscription":false},"hard":{"chain":[{"provider":"claude-cli","model":"claude-opus-5"},{"provider":"anthropic-api","model":"claude-opus-5"}],"metered_after_subscription":true}}},"expected_routing_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#;
+    const ROUTING_CANONICAL_PAYLOAD_SHA256: &str =
+        "a9c73476991bb884fbaf43378882c25f4403a8ce3daa44d1012221ce15e30a59";
+
+    #[test]
+    fn fixed_routing_vector_is_compact_ordered_and_omits_absent_tiers() {
+        // Built from loose JSON: key order, whitespace and a `null` tier in
+        // the input must not change the signed bytes.
+        let routing: RoutingDocument = serde_json::from_str(
+            r#"{"tiers":{"hard":{"metered_after_subscription":true,"chain":[
+                 {"model":"claude-opus-5","provider":"claude-cli"},
+                 {"provider":"anthropic-api","model":"claude-opus-5"}]},
+               "default":null,
+               "cheap":{"chain":[{"provider":"huggingface","model":"org/modèl"},
+                                 {"provider":"claude-cli","model":"claude-haiku-4-5"}]}},
+              "paid_api":"off","version":1}"#,
+        )
+        .unwrap();
+        let approval = ModelRoutingApproval {
+            request_id: Uuid::from_bytes([1; 16]),
+            nonce_hex: "02".repeat(32),
+            user_id: Uuid::from_bytes([3; 16]),
+            device_id: Uuid::from_bytes([4; 16]),
+            issued_at: 1,
+            expires_at: 121,
+            routing,
+            expected_routing_sha256:
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+        };
+        let payload = approval.canonical_payload().unwrap();
+        assert_eq!(
+            String::from_utf8(payload.clone()).unwrap(),
+            ROUTING_CANONICAL_PAYLOAD
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&payload)),
+            ROUTING_CANONICAL_PAYLOAD_SHA256
+        );
+        let message = approval.message().unwrap();
+        let action = b"model.routing_set";
+        assert_eq!(&message[30..30 + action.len()], action);
+        assert_eq!(
+            hex::encode(&message[30 + action.len()..30 + action.len() + 32]),
+            ROUTING_CANONICAL_PAYLOAD_SHA256
+        );
+        let mut changed = approval.clone();
+        changed.expected_routing_sha256 = "00".repeat(32);
+        assert_ne!(changed.message().unwrap(), message);
+        changed = approval.clone();
+        changed.routing.paid_api = PaidApi::Allowed;
+        assert_ne!(changed.message().unwrap(), message);
+        changed = approval;
+        changed.routing.version = 2;
+        assert!(changed.message().is_err());
+        assert!(serde_json::from_str::<RoutingDocument>(r#"{"version":1,"extra":1}"#).is_err());
     }
 
     #[test]

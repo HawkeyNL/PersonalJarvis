@@ -3,12 +3,16 @@
 //! Per request it orders the backends by a *sensible* policy — cheapest for
 //! trivial tasks, quality-first for real work, strong-only for the hardest — and
 //! tries them in order, skipping ones the registry marks unavailable (with a
-//! safety net: if the registry says none are up, try them anyway). Falls through
-//! on any error except a genuine refusal.
+//! safety net: if the registry says none are up, try the unmetered ones anyway).
+//! Falls through on any error except a genuine refusal.
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    net::IpAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -17,7 +21,7 @@ use async_trait::async_trait;
 use crate::types::{ChatReply, ChatRequest, LlmError, ProviderFailure, Tier};
 #[cfg(test)]
 use crate::ModelAccessPolicy;
-use crate::{LiveModelPolicy, LlmProvider};
+use crate::{LiveModelPolicy, LiveRouting, LlmProvider};
 
 /// Live availability of a backend, by id — implemented by the api over the
 /// resource registry (`jarvis-registry`), so the router routes on what's up now.
@@ -35,6 +39,46 @@ impl Availability for AlwaysAvailable {
 /// An availability source that considers every backend up (no registry).
 pub fn always_available() -> Arc<dyn Availability> {
     Arc::new(AlwaysAvailable)
+}
+
+/// Whether the configured Ollama endpoint is off this host. Set once when the
+/// Ollama brain is built; a remote Ollama may bill and is treated as metered.
+static OLLAMA_REMOTE: AtomicBool = AtomicBool::new(false);
+
+/// Record the configured Ollama URL. Only a loopback host (127.0.0.0/8, ::1,
+/// `localhost`) keeps `ollama` unmetered; anything else, including an
+/// unparsable URL, fails closed to metered.
+pub(crate) fn record_ollama_url(url: &str) {
+    OLLAMA_REMOTE.store(!is_loopback_url(url), Ordering::Relaxed);
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Static classification by provider id, independent of runtime config, so
+/// the broker, the CLI and Core validate `routing.json` identically.
+pub(crate) fn is_metered_provider_id(backend_id: &str) -> bool {
+    !matches!(backend_id, "ollama" | "claude-cli" | "codex-cli")
+}
+
+/// Whether a backend bills per call. Fails closed: only the known local and
+/// subscription backends are unmetered, and Ollama only on loopback; anything
+/// else is treated as paid.
+pub fn is_metered_backend(backend_id: &str) -> bool {
+    is_metered_provider_id(backend_id)
+        || (backend_id == "ollama" && OLLAMA_REMOTE.load(Ordering::Relaxed))
 }
 
 /// What a model is good for — mirrors `jarvis_registry::ModelClass` so the router
@@ -78,6 +122,8 @@ pub struct RouterProvider {
     /// Root-owned, explicit allowlist.  Provider credentials do not imply
     /// permission to route to a model.
     model_policy: Arc<LiveModelPolicy>,
+    /// Owner-defined per-tier order and `paid_api` switch (`routing.json`).
+    routing: Arc<LiveRouting>,
     health: Mutex<BTreeMap<String, HealthCooldown>>,
     label: String,
 }
@@ -125,9 +171,15 @@ impl RouterProvider {
             availability,
             catalog,
             model_policy,
+            routing: Arc::default(),
             health: Mutex::new(BTreeMap::new()),
             label,
         }
+    }
+
+    pub(crate) fn with_routing(mut self, routing: Arc<LiveRouting>) -> Self {
+        self.routing = routing;
+        self
     }
 
     /// Model classes acceptable for a tier, best-preferred first — "low models
@@ -175,7 +227,8 @@ impl RouterProvider {
         None
     }
 
-    /// Preference order of backend ids for a tier. Cheap → cheapest first (free
+    /// Built-in preference order of backend ids for a tier, used when the
+    /// owner's routing has no chain for it. Cheap → cheapest first (free
     /// local/plan, then the cheapest metered); Default → the plan first for
     /// quality, strong APIs as the vangnet, cheap/local last; Hard → strong
     /// brains only. Ids not built (no key) are simply skipped.
@@ -269,28 +322,88 @@ impl RouterProvider {
             .remove(backend);
     }
 
-    /// The backends to try, in order: policy order ∩ existing candidates,
-    /// preferring registry-available ones. A recent health cooldown is never
+    /// The backends to try, in order, each with the model the owner pinned for
+    /// it (routed chains only): the owner's routed chain for the tier, else the
+    /// built-in order, ∩ existing candidates, without metered backends when
+    /// paid APIs are off, preferring registry-available ones. An explicitly
+    /// requested model (`routed == false`) is more specific than a tier chain
+    /// and uses the built-in order. A recent health cooldown is never
     /// overridden by the old "try everything" safety net: that would turn a
     /// revoked credential or 429 into an unbounded request-by-request retry.
-    fn plan(&self, tier: Tier) -> Vec<&Candidate> {
-        let ordered: Vec<&Candidate> = Self::policy(tier)
-            .iter()
-            .filter_map(|id| self.candidates.iter().find(|c| c.id == *id))
+    /// The safety net never includes metered backends: the monthly cap is
+    /// enforced through availability, so "nothing available" must not become
+    /// a paid call. A pinned provider (`only`) is the whole plan: a pin never
+    /// falls back to another provider.
+    fn plan(
+        &self,
+        tier: Tier,
+        routed: bool,
+        only: Option<&str>,
+    ) -> Vec<(&Candidate, Option<String>)> {
+        let routing = self.routing.snapshot();
+        let find = |id: &str| self.candidates.iter().find(|c| c.id == id);
+        let ordered: Vec<(&Candidate, Option<String>)> =
+            match (only, routing.tier(tier).filter(|_| routed)) {
+                (Some(provider), _) => find(provider).map(|c| (c, None)).into_iter().collect(),
+                (None, Some(route)) => route
+                    .runtime_chain()
+                    .filter_map(|entry| {
+                        find(&entry.provider).map(|c| (c, Some(entry.model.clone())))
+                    })
+                    .collect(),
+                (None, None) => Self::policy(tier)
+                    .iter()
+                    .filter_map(|id| find(id).map(|c| (c, None)))
+                    .collect(),
+            };
+        let ordered: Vec<_> = ordered
+            .into_iter()
+            .filter(|(c, _)| !routing.refuses_provider(&c.id))
             .collect();
-        let available: Vec<&Candidate> = ordered
+        let available: Vec<_> = ordered
             .iter()
-            .copied()
-            .filter(|c| self.availability.is_available(&c.id))
+            .filter(|(c, _)| self.availability.is_available(&c.id))
+            .cloned()
             .collect();
         let base = if available.is_empty() {
             ordered
+                .into_iter()
+                .filter(|(candidate, _)| !is_metered_backend(&candidate.id))
+                .collect()
         } else {
             available
         };
         base.into_iter()
-            .filter(|candidate| self.is_healthy(&candidate.id))
+            .filter(|(candidate, _)| self.is_healthy(&candidate.id))
             .collect()
+    }
+
+    /// The model to send to `backend`, or `None` to skip it. Every choice is
+    /// checked against the live owner allowlist at attempt time.
+    fn choose_model(
+        &self,
+        backend: &str,
+        pinned: Option<&str>,
+        requested: Option<&str>,
+        tier: Tier,
+    ) -> Option<String> {
+        match (requested, pinned) {
+            (Some(model), _) => self
+                .requested_model_is_allowed(backend, model)
+                .then(|| model.to_string()),
+            // A routed entry names its exact model: no catalog class needed.
+            (None, Some(model)) => self
+                .model_policy
+                .allows(backend, model)
+                .then(|| model.to_string()),
+            (None, None) => self.model_for(backend, tier),
+        }
+    }
+
+    /// The plan is a snapshot; the owner may switch paid APIs off while a
+    /// request is in flight. Re-check right before every attempt.
+    fn paid_api_now_refuses(&self, backend: &str) -> bool {
+        self.routing.snapshot().refuses_provider(backend)
     }
 
     fn requested_model_is_allowed(&self, backend: &str, model: &str) -> bool {
@@ -302,10 +415,13 @@ impl RouterProvider {
             && self.model_policy.allows(backend, model)
     }
 
+    /// Backends without static tier models: an owner-enabled exact policy
+    /// entry is their model. `codex-cli` has no configured default at all.
     fn dynamic_cloud_backend(backend: &str) -> bool {
         matches!(
             backend,
-            "openai-api"
+            "codex-cli"
+                | "openai-api"
                 | "anthropic-api"
                 | "deepseek-api"
                 | "xai-api"
@@ -323,9 +439,12 @@ impl LlmProvider for RouterProvider {
     }
 
     fn can_serve_tier(&self, tier: Tier) -> bool {
-        self.plan(tier)
+        self.plan(tier, true, None)
             .iter()
-            .any(|candidate| self.model_for(&candidate.id, tier).is_some())
+            .any(|(candidate, pinned)| {
+                self.choose_model(&candidate.id, pinned.as_deref(), None, tier)
+                    .is_some()
+            })
     }
 
     async fn chat_stream(
@@ -333,14 +452,17 @@ impl LlmProvider for RouterProvider {
         req: &ChatRequest,
         sink: crate::TextDeltaSink,
     ) -> Result<ChatReply, LlmError> {
-        for candidate in self.plan(req.tier) {
-            let chosen = match req.model.as_deref() {
-                Some(model) if self.requested_model_is_allowed(&candidate.id, model) => {
-                    Some(model.to_string())
-                }
-                Some(_) => None,
-                None => self.model_for(&candidate.id, req.tier),
-            };
+        for (candidate, pinned) in self.plan(req.tier, req.model.is_none(), req.provider.as_deref())
+        {
+            if self.paid_api_now_refuses(&candidate.id) {
+                continue;
+            }
+            let chosen = self.choose_model(
+                &candidate.id,
+                pinned.as_deref(),
+                req.model.as_deref(),
+                req.tier,
+            );
             let Some(model) = chosen else { continue };
             let attempt = ChatRequest {
                 model: Some(model),
@@ -362,30 +484,31 @@ impl LlmProvider for RouterProvider {
     }
 
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
-        let plan = self.plan(req.tier);
+        let plan = self.plan(req.tier, req.model.is_none(), req.provider.as_deref());
         if plan.is_empty() {
             return Err(LlmError::NotConfigured(
                 "no capable brain for this tier".into(),
             ));
         }
         let mut last = None;
-        for candidate in plan {
-            // Pick the cheapest sufficient model for this backend + tier; if the
-            // request already names a model, respect it. Fall back to the
-            // provider's own tier model when the catalog has nothing.
-            let chosen = match req.model.as_deref() {
-                Some(model) if self.requested_model_is_allowed(&candidate.id, model) => {
-                    Some(model.to_string())
-                }
-                Some(_) => None,
-                None => self.model_for(&candidate.id, req.tier),
-            };
+        for (candidate, pinned) in plan {
+            // A requested model wins, then the owner's routed model, else the
+            // cheapest sufficient catalog model for this backend + tier.
+            let chosen = self.choose_model(
+                &candidate.id,
+                pinned.as_deref(),
+                req.model.as_deref(),
+                req.tier,
+            );
             // Never fall through to a provider's configured default: that would
             // turn an API key or a mutable provider alias into an implicit
             // model authorization bypass.
             let Some(chosen) = chosen else {
                 continue;
             };
+            if self.paid_api_now_refuses(&candidate.id) {
+                continue;
+            }
             let attempt = ChatRequest {
                 model: Some(chosen),
                 ..req.clone()
@@ -416,6 +539,7 @@ impl LlmProvider for RouterProvider {
 mod tests {
     use super::*;
     use crate::types::ChatMessage;
+    use crate::RoutingSnapshot;
 
     struct Fixed {
         label: String,
@@ -468,8 +592,8 @@ mod tests {
         ]
     }
 
-    fn ids(plan: Vec<&Candidate>) -> Vec<String> {
-        plan.iter().map(|c| c.id.clone()).collect()
+    fn ids(plan: Vec<(&Candidate, Option<String>)>) -> Vec<String> {
+        plan.iter().map(|(c, _)| c.id.clone()).collect()
     }
 
     fn catalog() -> Vec<CatalogModel> {
@@ -547,6 +671,7 @@ mod tests {
             mode: crate::RoutingMode::Auto,
             max_tokens: 16,
             model: Some("fixture".into()),
+            provider: None,
         };
         assert!(router.chat(&request).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -648,6 +773,7 @@ mod tests {
             mode: crate::RoutingMode::Auto,
             max_tokens: 16,
             model: None,
+            provider: None,
         };
         assert_eq!(
             r.chat(&ask(Tier::Default)).await.unwrap().model,
@@ -663,7 +789,7 @@ mod tests {
     fn cheap_prefers_local_then_plan_then_api() {
         let r = RouterProvider::new(all(), always_available(), vec![]);
         assert_eq!(
-            ids(r.plan(Tier::Cheap)),
+            ids(r.plan(Tier::Cheap, true, None)),
             ["ollama", "claude-cli", "anthropic-api"]
         );
     }
@@ -672,7 +798,7 @@ mod tests {
     fn default_prefers_plan_then_api_then_local() {
         let r = RouterProvider::new(all(), always_available(), vec![]);
         assert_eq!(
-            ids(r.plan(Tier::Default)),
+            ids(r.plan(Tier::Default, true, None)),
             ["claude-cli", "anthropic-api", "ollama"]
         );
     }
@@ -680,7 +806,10 @@ mod tests {
     #[test]
     fn hard_is_strong_only() {
         let r = RouterProvider::new(all(), always_available(), vec![]);
-        assert_eq!(ids(r.plan(Tier::Hard)), ["claude-cli", "anthropic-api"]);
+        assert_eq!(
+            ids(r.plan(Tier::Hard, true, None)),
+            ["claude-cli", "anthropic-api"]
+        );
     }
 
     #[test]
@@ -695,7 +824,7 @@ mod tests {
         let r = RouterProvider::new(fleet, always_available(), vec![]);
         // Cheap: free first, then the cheapest metered.
         assert_eq!(
-            ids(r.plan(Tier::Cheap)),
+            ids(r.plan(Tier::Cheap, true, None)),
             [
                 "ollama",
                 "claude-cli",
@@ -706,7 +835,7 @@ mod tests {
         );
         // Default: plan first, strong APIs, then cheap/local last.
         assert_eq!(
-            ids(r.plan(Tier::Default)),
+            ids(r.plan(Tier::Default, true, None)),
             [
                 "claude-cli",
                 "anthropic-api",
@@ -717,7 +846,7 @@ mod tests {
         );
         // Hard: strong brains only (no deepseek/ollama).
         assert_eq!(
-            ids(r.plan(Tier::Hard)),
+            ids(r.plan(Tier::Hard, true, None)),
             ["claude-cli", "anthropic-api", "openai-api"]
         );
     }
@@ -725,20 +854,121 @@ mod tests {
     #[test]
     fn availability_filters_but_keeps_a_safety_net() {
         let r = RouterProvider::new(all(), Arc::new(Only("anthropic-api")), vec![]);
-        assert_eq!(ids(r.plan(Tier::Default)), ["anthropic-api"]);
+        assert_eq!(ids(r.plan(Tier::Default, true, None)), ["anthropic-api"]);
 
-        // If the registry claims nothing is up, still try (ordered) rather than fail.
-        struct None_;
-        impl Availability for None_ {
-            fn is_available(&self, _: &str) -> bool {
-                false
-            }
-        }
-        let r2 = RouterProvider::new(all(), Arc::new(None_), vec![]);
+        // If the registry claims nothing is up, still try the unmetered
+        // backends (ordered) rather than fail, but never a paid one.
+        let r2 = RouterProvider::new(all(), Arc::new(Nothing), vec![]);
         assert_eq!(
-            ids(r2.plan(Tier::Default)),
-            ["claude-cli", "anthropic-api", "ollama"]
+            ids(r2.plan(Tier::Default, true, None)),
+            ["claude-cli", "ollama"]
         );
+    }
+
+    struct Nothing;
+    impl Availability for Nothing {
+        fn is_available(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// Counts calls; always fails so the router would fall through.
+    struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl LlmProvider for Counting {
+        fn label(&self) -> &str {
+            "counting"
+        }
+        async fn chat(&self, _req: &ChatRequest) -> Result<ChatReply, LlmError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(LlmError::Empty)
+        }
+    }
+
+    fn counted(id: &str) -> (Candidate, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Candidate {
+                id: id.into(),
+                provider: Arc::new(Counting(calls.clone())),
+            },
+            calls,
+        )
+    }
+
+    fn ask(tier: Tier, model: Option<&str>) -> ChatRequest {
+        ChatRequest {
+            system: None,
+            messages: vec![ChatMessage::user("fixture")],
+            tier,
+            mode: crate::RoutingMode::Auto,
+            max_tokens: 16,
+            model: model.map(str::to_string),
+            provider: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cap_reached_and_nothing_available_never_attempts_a_metered_backend() {
+        use std::sync::atomic::Ordering;
+        let (paid, paid_calls) = counted("anthropic-api");
+        let (plan, plan_calls) = counted("claude-cli");
+        let c = vec![
+            CatalogModel {
+                backend: "anthropic-api".into(),
+                id: "paid".into(),
+                class: ModelClass::Light,
+            },
+            CatalogModel {
+                backend: "claude-cli".into(),
+                id: "plan".into(),
+                class: ModelClass::Light,
+            },
+        ];
+        let r = RouterProvider::with_policy(
+            vec![paid, plan],
+            Arc::new(Nothing),
+            c.clone(),
+            allow_catalog(&c),
+        );
+        for tier in [Tier::Cheap, Tier::Default, Tier::Hard] {
+            assert!(r.chat(&ask(tier, None)).await.is_err());
+            assert!(r.chat(&ask(tier, Some("paid"))).await.is_err());
+        }
+        assert_eq!(paid_calls.load(Ordering::SeqCst), 0);
+        assert!(plan_calls.load(Ordering::SeqCst) > 0);
+
+        // Only metered backends configured: nothing is attempted at all.
+        let (paid, paid_calls) = counted("openai-api");
+        let c = vec![CatalogModel {
+            backend: "openai-api".into(),
+            id: "gpt".into(),
+            class: ModelClass::Mid,
+        }];
+        let r = RouterProvider::with_policy(
+            vec![paid],
+            Arc::new(Nothing),
+            c.clone(),
+            allow_catalog(&c),
+        );
+        assert!(r.plan(Tier::Default, true, None).is_empty());
+        assert!(r.chat(&ask(Tier::Default, Some("gpt"))).await.is_err());
+        assert_eq!(paid_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unknown_backends_are_treated_as_metered() {
+        assert!(!is_metered_backend("ollama"));
+        assert!(!is_metered_backend("claude-cli"));
+        for id in [
+            "anthropic-api",
+            "openai-api",
+            "zai-api",
+            "huggingface",
+            "new",
+        ] {
+            assert!(is_metered_backend(id));
+        }
     }
 
     #[tokio::test]
@@ -776,13 +1006,17 @@ mod tests {
                 mode: crate::RoutingMode::Auto,
                 max_tokens: 16,
                 model: None,
+                provider: None,
             })
             .await
             .unwrap();
         assert_eq!(reply.text, "anthropic-api");
         // The malformed first response receives a bounded health cooldown, so
         // the next request does not repeatedly hit the same failing backend.
-        assert_eq!(ids(r.plan(Tier::Default)), ["anthropic-api", "ollama"]);
+        assert_eq!(
+            ids(r.plan(Tier::Default, true, None)),
+            ["anthropic-api", "ollama"]
+        );
     }
 
     #[test]
@@ -821,6 +1055,7 @@ mod tests {
             mode: crate::RoutingMode::Auto,
             max_tokens: 16,
             model: None,
+            provider: None,
         };
         assert!(router.chat(&request).await.is_err());
         assert!(!router.requested_model_is_allowed("openai-api", "fixture-discovered"));
@@ -871,8 +1106,468 @@ mod tests {
                 mode: crate::RoutingMode::Auto,
                 max_tokens: 16,
                 model: Some("claude-test".into()),
+                provider: None,
             })
             .await;
         assert!(matches!(result, Err(LlmError::NotConfigured(_))));
+    }
+
+    /// Echoes the backend id and the model it was handed; counts calls.
+    struct EchoAs(&'static str, Arc<std::sync::atomic::AtomicUsize>, bool);
+    #[async_trait]
+    impl LlmProvider for EchoAs {
+        fn label(&self) -> &str {
+            self.0
+        }
+        async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.2 {
+                return Err(LlmError::Empty);
+            }
+            Ok(ChatReply {
+                text: self.0.into(),
+                model: req.model.clone().unwrap_or_default(),
+                backend: Some(self.0.into()),
+                requested_route: None,
+                actual_provider: None,
+                stop_reason: None,
+                usage: None,
+            })
+        }
+    }
+
+    struct Fleet {
+        router: RouterProvider,
+        calls: BTreeMap<&'static str, Arc<std::sync::atomic::AtomicUsize>>,
+    }
+
+    impl Fleet {
+        fn calls(&self, id: &str) -> usize {
+            self.calls[id].load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// ollama, claude-cli, zai-api and anthropic-api; `failing` backends error.
+    fn fleet(
+        routing: RoutingSnapshot,
+        enabled: &[(&str, &str)],
+        availability: Arc<dyn Availability>,
+        failing: &[&str],
+    ) -> Fleet {
+        fleet_of(
+            &["ollama", "claude-cli", "zai-api", "anthropic-api"],
+            routing,
+            enabled,
+            availability,
+            failing,
+        )
+    }
+
+    fn fleet_of(
+        ids: &[&'static str],
+        routing: RoutingSnapshot,
+        enabled: &[(&str, &str)],
+        availability: Arc<dyn Availability>,
+        failing: &[&str],
+    ) -> Fleet {
+        let mut calls = BTreeMap::new();
+        let candidates = ids
+            .iter()
+            .copied()
+            .map(|id| {
+                let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                calls.insert(id, counter.clone());
+                Candidate {
+                    id: id.into(),
+                    provider: Arc::new(EchoAs(id, counter, !failing.contains(&id))),
+                }
+            })
+            .collect();
+        let policy = ModelAccessPolicy {
+            version: 1,
+            models: enabled
+                .iter()
+                .map(|(provider, model)| crate::ModelAccessEntry {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    enabled: true,
+                    source: "test".into(),
+                    route: None,
+                })
+                .collect(),
+        };
+        let c = catalog();
+        let router = RouterProvider::with_policy(candidates, availability, c, policy)
+            .with_routing(Arc::new(LiveRouting::new(routing)));
+        Fleet { router, calls }
+    }
+
+    fn routing(raw: &str) -> RoutingSnapshot {
+        RoutingSnapshot {
+            routing: Some(crate::ModelRouting::parse(raw.as_bytes()).unwrap()),
+            unavailable_reason: None,
+        }
+    }
+
+    const CHEAP_ROUTE: &str = r#"{"version":1,"tiers":{"cheap":{"chain":[
+        {"provider":"zai-api","model":"glm-5.3-flash"},
+        {"provider":"claude-cli","model":"claude-haiku-4-5"}]}}}"#;
+
+    #[tokio::test]
+    async fn routed_chain_overrides_builtin_order_with_pinned_models() {
+        let f = fleet(
+            routing(CHEAP_ROUTE),
+            &[
+                ("zai-api", "glm-5.3-flash"),
+                ("claude-cli", "claude-haiku-4-5"),
+            ],
+            always_available(),
+            &[],
+        );
+        assert_eq!(
+            ids(f.router.plan(Tier::Cheap, true, None)),
+            ["zai-api", "claude-cli"]
+        );
+        // A tier without a chain keeps the built-in order.
+        assert_eq!(
+            ids(f.router.plan(Tier::Default, true, None)),
+            ["claude-cli", "anthropic-api", "zai-api", "ollama"]
+        );
+        // The pinned model is used even though the catalog has no zai entry.
+        let reply = f.router.chat(&ask(Tier::Cheap, None)).await.unwrap();
+        assert_eq!(
+            (reply.text.as_str(), reply.model.as_str()),
+            ("zai-api", "glm-5.3-flash")
+        );
+        assert!(f.router.can_serve_tier(Tier::Cheap));
+    }
+
+    #[tokio::test]
+    async fn routed_entries_still_pass_allowlist_availability_and_health() {
+        // Allowlist: the zai pin is not enabled, so it is never attempted.
+        let f = fleet(
+            routing(CHEAP_ROUTE),
+            &[("claude-cli", "claude-haiku-4-5")],
+            always_available(),
+            &[],
+        );
+        let reply = f.router.chat(&ask(Tier::Cheap, None)).await.unwrap();
+        assert_eq!(reply.model, "claude-haiku-4-5");
+        assert_eq!(f.calls("zai-api"), 0);
+
+        // Availability (the monthly cap): an unavailable metered entry is skipped.
+        let f = fleet(
+            routing(CHEAP_ROUTE),
+            &[
+                ("zai-api", "glm-5.3-flash"),
+                ("claude-cli", "claude-haiku-4-5"),
+            ],
+            Arc::new(Only("claude-cli")),
+            &[],
+        );
+        assert_eq!(ids(f.router.plan(Tier::Cheap, true, None)), ["claude-cli"]);
+        f.router.chat(&ask(Tier::Cheap, None)).await.unwrap();
+        assert_eq!(f.calls("zai-api"), 0);
+
+        // Health: a failing entry falls through, then cools down.
+        let f = fleet(
+            routing(CHEAP_ROUTE),
+            &[
+                ("zai-api", "glm-5.3-flash"),
+                ("claude-cli", "claude-haiku-4-5"),
+            ],
+            always_available(),
+            &["zai-api"],
+        );
+        let reply = f.router.chat(&ask(Tier::Cheap, None)).await.unwrap();
+        assert_eq!(reply.text, "claude-cli");
+        assert_eq!(ids(f.router.plan(Tier::Cheap, true, None)), ["claude-cli"]);
+        assert_eq!(f.calls("zai-api"), 1);
+
+        // Nothing routable: the chain does not silently widen to other backends.
+        let f = fleet(routing(CHEAP_ROUTE), &[], always_available(), &[]);
+        assert!(f.router.chat(&ask(Tier::Cheap, None)).await.is_err());
+        assert!(!f.router.can_serve_tier(Tier::Cheap));
+        assert_eq!(f.calls("ollama") + f.calls("anthropic-api"), 0);
+    }
+
+    #[tokio::test]
+    async fn paid_api_off_removes_metered_from_routed_and_builtin_orders() {
+        let f = fleet(
+            routing(
+                r#"{"version":1,"paid_api":"off","tiers":{"cheap":{"chain":[
+                {"provider":"zai-api","model":"glm-5.3-flash"},
+                {"provider":"claude-cli","model":"claude-haiku-4-5"}]}}}"#,
+            ),
+            &[
+                ("zai-api", "glm-5.3-flash"),
+                ("claude-cli", "claude-haiku-4-5"),
+                ("anthropic-api", "claude-sonnet-5"),
+            ],
+            always_available(),
+            &[],
+        );
+        assert_eq!(ids(f.router.plan(Tier::Cheap, true, None)), ["claude-cli"]);
+        for tier in [Tier::Default, Tier::Hard] {
+            assert!(f
+                .router
+                .plan(tier, true, None)
+                .iter()
+                .all(|(c, _)| !is_metered_backend(&c.id)));
+        }
+        assert_eq!(
+            ids(f.router.plan(Tier::Default, false, None)),
+            ["claude-cli", "ollama"]
+        );
+        // An explicitly requested metered model is not reached either.
+        let result = f
+            .router
+            .chat(&ask(Tier::Default, Some("claude-sonnet-5")))
+            .await;
+        assert!(result.is_err());
+        f.router.chat(&ask(Tier::Cheap, None)).await.unwrap();
+        assert_eq!(f.calls("zai-api") + f.calls("anthropic-api"), 0);
+    }
+
+    #[test]
+    fn unusable_routing_file_falls_back_to_builtin_order_without_metered() {
+        let f = fleet(
+            RoutingSnapshot::unavailable("routing_invalid"),
+            &[],
+            always_available(),
+            &[],
+        );
+        assert_eq!(
+            ids(f.router.plan(Tier::Default, true, None)),
+            ["claude-cli", "ollama"]
+        );
+        assert_eq!(
+            ids(f.router.plan(Tier::Cheap, true, None)),
+            ["ollama", "claude-cli"]
+        );
+        assert_eq!(ids(f.router.plan(Tier::Hard, true, None)), ["claude-cli"]);
+    }
+
+    #[tokio::test]
+    async fn requested_model_uses_builtin_order_and_live_swap_needs_no_rebuild() {
+        let live = Arc::new(LiveRouting::default());
+        let f = fleet(
+            RoutingSnapshot::default(),
+            &[
+                ("claude-cli", "claude-haiku-4-5"),
+                ("anthropic-api", "claude-sonnet-5"),
+            ],
+            always_available(),
+            &[],
+        );
+        let router = f.router.with_routing(live.clone());
+        live.swap(
+            &RoutingSnapshot::default(),
+            routing(
+                r#"{"version":1,"tiers":{"default":{"chain":[
+                {"provider":"claude-cli","model":"claude-haiku-4-5"}]}}}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(ids(router.plan(Tier::Default, true, None)), ["claude-cli"]);
+        // An explicit model is more specific than the tier chain.
+        let reply = router
+            .chat(&ask(Tier::Default, Some("claude-sonnet-5")))
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "anthropic-api");
+    }
+
+    #[tokio::test]
+    async fn pinned_provider_never_falls_back_to_another_provider() {
+        let enabled = [
+            ("claude-cli", "claude-opus-5"),
+            ("anthropic-api", "claude-opus-5"),
+        ];
+        let pin = |provider: &str| ChatRequest {
+            provider: Some(provider.into()),
+            ..ask(Tier::Hard, Some("claude-opus-5"))
+        };
+        let f = fleet(
+            RoutingSnapshot::default(),
+            &enabled,
+            always_available(),
+            &["claude-cli"],
+        );
+        assert!(f.router.chat(&pin("claude-cli")).await.is_err());
+        assert_eq!(f.calls("claude-cli"), 1);
+        assert_eq!(f.calls("anthropic-api"), 0);
+
+        let f = fleet(
+            RoutingSnapshot::default(),
+            &enabled,
+            always_available(),
+            &[],
+        );
+        let reply = f.router.chat(&pin("claude-cli")).await.unwrap();
+        assert_eq!(
+            (reply.text.as_str(), reply.model.as_str()),
+            ("claude-cli", "claude-opus-5")
+        );
+
+        // A metered pin is refused while paid APIs are off, never rerouted.
+        let f = fleet(
+            routing(r#"{"version":1,"paid_api":"off"}"#),
+            &enabled,
+            always_available(),
+            &[],
+        );
+        assert!(f.router.chat(&pin("anthropic-api")).await.is_err());
+        assert_eq!(f.calls("anthropic-api") + f.calls("claude-cli"), 0);
+    }
+
+    #[tokio::test]
+    async fn codex_subscription_never_falls_back_to_the_paid_openai_api() {
+        let backends = ["codex-cli", "openai-api", "claude-cli", "ollama"];
+        let enabled = [
+            ("codex-cli", "gpt-6-luna"),
+            ("openai-api", "gpt-6-luna"),
+            ("claude-cli", "claude-haiku-4-5"),
+        ];
+        let luna = r#"{"version":1,"tiers":{"default":{"chain":[
+            {"provider":"codex-cli","model":"gpt-6-luna"}]}}}"#;
+        // A failing Codex subscription (e.g. Luna not yet rolled out to the
+        // account) ends the routed chain; the paid OpenAI API is never tried.
+        let f = fleet_of(
+            &backends,
+            routing(luna),
+            &enabled,
+            always_available(),
+            &["codex-cli"],
+        );
+        assert!(f.router.chat(&ask(Tier::Default, None)).await.is_err());
+        assert_eq!((f.calls("codex-cli"), f.calls("openai-api")), (1, 0));
+
+        // A pin never falls back either, and never needs a configured default.
+        let pin = ChatRequest {
+            provider: Some("codex-cli".into()),
+            ..ask(Tier::Default, None)
+        };
+        assert!(f.router.chat(&pin).await.is_err());
+        assert_eq!(f.calls("openai-api"), 0);
+
+        // The owner's next subscription entry is used; the reply is unmetered.
+        let f = fleet_of(
+            &backends,
+            routing(
+                r#"{"version":1,"tiers":{"default":{"chain":[
+                {"provider":"codex-cli","model":"gpt-6-luna"},
+                {"provider":"claude-cli","model":"claude-haiku-4-5"}]}}}"#,
+            ),
+            &enabled,
+            always_available(),
+            &["codex-cli"],
+        );
+        let reply = f.router.chat(&ask(Tier::Default, None)).await.unwrap();
+        assert_eq!(reply.text, "claude-cli");
+        assert_eq!(f.calls("openai-api"), 0);
+        assert!(!is_metered_backend("codex-cli"));
+
+        // Built-in order never reaches codex-cli: it is off until routed.
+        assert!(!ids_of_policy().contains(&"codex-cli"));
+    }
+
+    #[tokio::test]
+    async fn paid_api_off_keeps_the_codex_subscription() {
+        let backends = ["codex-cli", "openai-api"];
+        let enabled = [("codex-cli", "gpt-6-luna"), ("openai-api", "gpt-6-luna")];
+        let f = fleet_of(
+            &backends,
+            routing(
+                r#"{"version":1,"paid_api":"off","tiers":{"hard":{"chain":[
+                {"provider":"codex-cli","model":"gpt-6-luna"}]}}}"#,
+            ),
+            &enabled,
+            always_available(),
+            &[],
+        );
+        assert_eq!(ids(f.router.plan(Tier::Hard, true, None)), ["codex-cli"]);
+        let reply = f.router.chat(&ask(Tier::Hard, None)).await.unwrap();
+        assert_eq!(
+            (reply.text.as_str(), reply.model.as_str()),
+            ("codex-cli", "gpt-6-luna")
+        );
+        assert_eq!(f.calls("openai-api"), 0);
+    }
+
+    fn ids_of_policy() -> Vec<&'static str> {
+        [Tier::Cheap, Tier::Default, Tier::Hard]
+            .into_iter()
+            .flat_map(|tier| RouterProvider::policy(tier).iter().copied())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn paid_api_switched_off_mid_request_stops_metered_attempts() {
+        struct SwitchOffThenFail(Arc<LiveRouting>);
+        #[async_trait]
+        impl LlmProvider for SwitchOffThenFail {
+            fn label(&self) -> &str {
+                "claude-cli"
+            }
+            async fn chat(&self, _req: &ChatRequest) -> Result<ChatReply, LlmError> {
+                let current = self.0.snapshot();
+                let mut next = current.clone();
+                next.routing.as_mut().unwrap().paid_api = crate::PaidApi::Off;
+                self.0.swap(&current, next).unwrap();
+                Err(LlmError::Empty)
+            }
+        }
+        let live = Arc::new(LiveRouting::new(routing(
+            r#"{"version":1,"tiers":{"default":{"chain":[
+            {"provider":"claude-cli","model":"claude-haiku-4-5"},
+            {"provider":"zai-api","model":"glm-5.3-flash"}],
+            "metered_after_subscription":true}}}"#,
+        )));
+        let (zai, zai_calls) = counted("zai-api");
+        let candidates = vec![
+            Candidate {
+                id: "claude-cli".into(),
+                provider: Arc::new(SwitchOffThenFail(live.clone())),
+            },
+            zai,
+        ];
+        let c = catalog();
+        let mut policy = allow_catalog(&c);
+        policy.models.push(crate::ModelAccessEntry {
+            provider: "zai-api".into(),
+            model: "glm-5.3-flash".into(),
+            enabled: true,
+            source: "test".into(),
+            route: None,
+        });
+        let router = RouterProvider::with_policy(candidates, always_available(), c, policy)
+            .with_routing(live);
+        assert!(router.chat(&ask(Tier::Default, None)).await.is_err());
+        assert_eq!(zai_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn only_a_loopback_ollama_url_counts_as_local() {
+        for url in [
+            "http://127.0.0.1:11434",
+            "http://127.8.9.10:11434/",
+            "http://localhost:11434",
+            "http://LOCALHOST",
+            "http://[::1]:11434",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in [
+            "http://192.168.1.20:11434",
+            "https://ollama.example.com",
+            "http://localhost.example.com",
+            "http://127.0.0.1.nip.io",
+            "http://[::ffff:c0a8:114]",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "{url}");
+        }
     }
 }

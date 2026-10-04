@@ -61,6 +61,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         model_policy: Arc::new(jarvis_llm::LiveModelPolicy::new(
             jarvis_llm::ModelAccessPolicy::deny_by_default(),
         )),
+        model_routing: Arc::default(),
         pricing_registry: Arc::new(jarvis_usage::PricingRegistry::builtin()),
         usage_snapshot_path: None,
         privileged_broker_socket: None,

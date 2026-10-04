@@ -137,6 +137,190 @@ pub enum ModelMutation {
         model: String,
         route: String,
     },
+    /// Record an exact subscription pair as discovered (disabled).
+    Register {
+        provider: ModelProvider,
+        model: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteTier {
+    Cheap,
+    Default,
+    Hard,
+}
+
+impl RouteTier {
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::Cheap => "cheap",
+            Self::Default => "default",
+            Self::Hard => "hard",
+        }
+    }
+}
+
+/// Providers a routed chain may name (`jarvis_llm::ROUTING_PROVIDERS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteProvider {
+    AnthropicApi,
+    OpenaiApi,
+    DeepseekApi,
+    XaiApi,
+    ZaiApi,
+    Ollama,
+    OllamaCloud,
+    Huggingface,
+    ClaudeCli,
+    CodexCli,
+}
+
+impl RouteProvider {
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::AnthropicApi => "anthropic-api",
+            Self::OpenaiApi => "openai-api",
+            Self::DeepseekApi => "deepseek-api",
+            Self::XaiApi => "xai-api",
+            Self::ZaiApi => "zai-api",
+            Self::Ollama => "ollama",
+            Self::OllamaCloud => "ollama-cloud",
+            Self::Huggingface => "huggingface",
+            Self::ClaudeCli => "claude-cli",
+            Self::CodexCli => "codex-cli",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteEntry {
+    pub provider: RouteProvider,
+    pub model: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaidApi {
+    Allowed,
+    Off,
+}
+
+impl PaidApi {
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TierRoute {
+    pub chain: Vec<RouteEntry>,
+    pub metered_after_subscription: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRouting {
+    pub version: u32,
+    pub paid_api: PaidApi,
+    pub tiers: BTreeMap<RouteTier, TierRoute>,
+}
+
+/// `jarvis --json models route list`: the stored document, or why Core
+/// cannot use it (Core then runs the built-in order without paid APIs).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingReport {
+    pub routing: Option<ModelRouting>,
+    pub routing_unavailable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RouteMutation {
+    Set {
+        tier: RouteTier,
+        chain: Vec<RouteEntry>,
+        metered_after_subscription: bool,
+    },
+    Reset {
+        tier: RouteTier,
+    },
+    PaidApi {
+        state: PaidApi,
+    },
+}
+
+const MAX_ROUTE_CHAIN: usize = 9;
+
+/// Fixed `jarvis models register …` argv. Subscriptions have no model
+/// catalog, so the owner records the exact pair; it stays disabled.
+fn register_arguments(provider: ModelProvider, model: String) -> AdminResult<Vec<String>> {
+    if !matches!(provider, ModelProvider::ClaudeCli | ModelProvider::CodexCli) {
+        return Err("only claude-cli and codex-cli models can be registered".to_owned());
+    }
+    // Same rule as the subscription worker request; never option-like.
+    if model.is_empty()
+        || model.len() > 80
+        || model.starts_with('-')
+        || !model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("model identifier contains unsupported characters".to_owned());
+    }
+    Ok(vec![
+        "models".to_owned(),
+        "register".to_owned(),
+        provider.cli_name().to_owned(),
+        model,
+    ])
+}
+
+/// Fixed `jarvis models route …` argv. The trusted helper validates the full
+/// document again and requires every pair to be discovered.
+fn route_mutation_arguments(request: RouteMutation) -> AdminResult<Vec<String>> {
+    let mut args = vec!["models".to_owned(), "route".to_owned()];
+    match request {
+        RouteMutation::Set {
+            tier,
+            chain,
+            metered_after_subscription,
+        } => {
+            if chain.is_empty() || chain.len() > MAX_ROUTE_CHAIN {
+                return Err("a tier chain has 1 to 9 entries".to_owned());
+            }
+            args.extend(["set".to_owned(), tier.cli_name().to_owned()]);
+            for (index, entry) in chain.iter().enumerate() {
+                validate_model(&entry.model)?;
+                // Never let a model id look like an option to the CLI.
+                if entry.model.starts_with('-') {
+                    return Err("model identifier contains unsupported characters".to_owned());
+                }
+                if chain[..index].contains(entry) {
+                    return Err("a tier chain cannot repeat a model".to_owned());
+                }
+                args.extend([entry.provider.cli_name().to_owned(), entry.model.clone()]);
+            }
+            if metered_after_subscription {
+                args.push("--metered-after-subscription".to_owned());
+            }
+        }
+        RouteMutation::Reset { tier } => {
+            args.extend(["reset".to_owned(), tier.cli_name().to_owned()]);
+        }
+        RouteMutation::PaidApi { state } => {
+            args.extend(["paid-api".to_owned(), state.cli_name().to_owned()]);
+        }
+    }
+    Ok(args)
 }
 
 #[derive(Debug, Serialize)]
@@ -271,7 +455,7 @@ pub struct CredentialRecord {
     pub configured: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AiAccountRecord {
     pub provider: String,
@@ -286,6 +470,8 @@ pub struct AiAccountRecord {
 pub enum AiAccountProvider {
     Claude,
     Codex,
+    #[serde(rename = "codex-chat")]
+    CodexChat,
 }
 
 impl AiAccountProvider {
@@ -293,6 +479,7 @@ impl AiAccountProvider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::CodexChat => "codex-chat",
         }
     }
 }
@@ -636,17 +823,38 @@ pub fn model_mutation(
     )
 }
 
+pub fn model_routes(session: &SessionManager) -> AdminResult<RoutingReport> {
+    parse_json(&session.run(BrokerRequest::ModelRoutes)?.stdout)
+}
+
+pub fn model_route_mutation(
+    session: &SessionManager,
+    request: RouteMutation,
+) -> AdminResult<OperationResult> {
+    operation(
+        session.run(BrokerRequest::ModelRouteMutation { request })?,
+        "Model routing updated",
+    )
+}
+
 pub fn credentials(session: &SessionManager) -> AdminResult<Vec<CredentialRecord>> {
     parse_json(&session.run(BrokerRequest::Credentials)?.stdout)
 }
 
 pub fn ai_accounts(session: &SessionManager) -> AdminResult<Vec<AiAccountRecord>> {
-    let rows: Vec<AiAccountRecord> = parse_json(&session.run(BrokerRequest::Accounts)?.stdout)?;
-    if rows.len() != 2
+    validate_ai_accounts(parse_json(&session.run(BrokerRequest::Accounts)?.stdout)?)
+}
+
+/// Exactly one row per known login, each with its fixed worker identity.
+fn validate_ai_accounts(rows: Vec<AiAccountRecord>) -> AdminResult<Vec<AiAccountRecord>> {
+    let providers: std::collections::BTreeSet<&str> =
+        rows.iter().map(|row| row.provider.as_str()).collect();
+    if rows.len() != 3
+        || providers.len() != rows.len()
         || rows.iter().any(|row| {
             !matches!(
                 (row.provider.as_str(), row.worker.as_str()),
-                ("claude", "jarvis-claude") | ("codex", "jarvis-codex")
+                ("claude", "jarvis-claude") | ("codex", "jarvis-codex") | ("codex-chat", "jarvis-codex-chat")
             )
                 || !matches!(
                     row.state.as_str(),
@@ -658,7 +866,6 @@ pub fn ai_accounts(session: &SessionManager) -> AdminResult<Vec<AiAccountRecord>
                     "inactive" | "socket_ready" | "active" | "unavailable"
                 )
         })
-        || rows[0].provider == rows[1].provider
     {
         return Err("AI account status contained unexpected metadata".to_owned());
     }
@@ -713,6 +920,7 @@ pub fn ai_account_entry(action: &OsStr, provider: &OsStr) -> AdminResult<()> {
     let provider = match provider.to_str() {
         Some("claude") => AiAccountProvider::Claude,
         Some("codex") => AiAccountProvider::Codex,
+        Some("codex-chat") => AiAccountProvider::CodexChat,
         _ => return Err("unsupported AI account provider".to_owned()),
     };
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
@@ -1216,9 +1424,25 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
                         route,
                     ]
                 }
+                ModelMutation::Register { provider, model } => register_arguments(provider, model)?,
             };
             (ADMIN, args, Duration::from_secs(900))
         }
+        BrokerRequest::ModelRoutes => (
+            ADMIN,
+            vec![
+                "--json".to_owned(),
+                "models".to_owned(),
+                "route".to_owned(),
+                "list".to_owned(),
+            ],
+            Duration::from_secs(120),
+        ),
+        BrokerRequest::ModelRouteMutation { request } => (
+            ADMIN,
+            route_mutation_arguments(request)?,
+            Duration::from_secs(900),
+        ),
         BrokerRequest::Credentials => (
             ADMIN,
             vec![
@@ -1571,6 +1795,139 @@ mod tests {
     }
 
     #[test]
+    fn register_is_a_typed_subscription_only_request() {
+        let register = |payload: &str| -> AdminResult<Vec<String>> {
+            match serde_json::from_str(payload).map_err(|e| e.to_string())? {
+                ModelMutation::Register { provider, model } => register_arguments(provider, model),
+                _ => Err("not a register request".to_owned()),
+            }
+        };
+        assert_eq!(
+            register(r#"{"action":"register","provider":"codex-cli","model":"gpt-6-luna"}"#)
+                .unwrap(),
+            ["models", "register", "codex-cli", "gpt-6-luna"]
+        );
+        assert_eq!(
+            register(r#"{"action":"register","provider":"claude-cli","model":"claude-opus-5"}"#)
+                .unwrap(),
+            ["models", "register", "claude-cli", "claude-opus-5"]
+        );
+        let long = "m".repeat(81);
+        for (provider, model) in [
+            ("openai-api", "gpt-6-luna"),
+            ("ollama-local", "llama3.2"),
+            ("codex-cli", "-c"),
+            ("codex-cli", "org/model"),
+            ("codex-cli", "a b"),
+            ("codex-cli", ""),
+            ("codex-cli", long.as_str()),
+        ] {
+            let payload =
+                serde_json::json!({"action": "register", "provider": provider, "model": model});
+            assert!(
+                register(&payload.to_string()).is_err(),
+                "{provider} {model}"
+            );
+        }
+    }
+
+    fn route_arguments(payload: &str) -> AdminResult<Vec<String>> {
+        let request: RouteMutation = serde_json::from_str(payload).map_err(|e| e.to_string())?;
+        route_mutation_arguments(request)
+    }
+
+    #[test]
+    fn route_mutations_map_to_fixed_argv() {
+        assert_eq!(
+            route_arguments(
+                r#"{"action":"set","tier":"cheap","chain":[{"provider":"zai-api","model":"glm-5.3-flash"},{"provider":"claude-cli","model":"claude-haiku-4-5"}],"metered_after_subscription":true}"#
+            )
+            .unwrap(),
+            [
+                "models", "route", "set", "cheap", "zai-api", "glm-5.3-flash", "claude-cli",
+                "claude-haiku-4-5", "--metered-after-subscription",
+            ]
+        );
+        assert_eq!(
+            route_arguments(
+                r#"{"action":"set","tier":"hard","chain":[{"provider":"codex-cli","model":"gpt-6-luna"}],"metered_after_subscription":false}"#
+            )
+            .unwrap(),
+            ["models", "route", "set", "hard", "codex-cli", "gpt-6-luna"]
+        );
+        assert_eq!(
+            route_arguments(r#"{"action":"reset","tier":"hard"}"#).unwrap(),
+            ["models", "route", "reset", "hard"]
+        );
+        assert_eq!(
+            route_arguments(r#"{"action":"paid_api","state":"off"}"#).unwrap(),
+            ["models", "route", "paid-api", "off"]
+        );
+    }
+
+    #[test]
+    fn route_mutations_reject_unsafe_or_unknown_input() {
+        let entry = r#"{"provider":"ollama","model":"llama3.2"}"#;
+        let chain = |count| {
+            (0..count)
+                .map(|index| format!(r#"{{"provider":"ollama","model":"m{index}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let ten = chain(10);
+        for payload in [
+            r#"{"action":"set","tier":"turbo","chain":[{"provider":"ollama","model":"a"}],"metered_after_subscription":false}"#.to_owned(),
+            r#"{"action":"set","tier":"cheap","chain":[{"provider":"jev","model":"a"}],"metered_after_subscription":false}"#.to_owned(),
+            r#"{"action":"set","tier":"cheap","chain":[{"provider":"ollama-local","model":"a"}],"metered_after_subscription":false}"#.to_owned(),
+            r#"{"action":"set","tier":"cheap","chain":[],"metered_after_subscription":false}"#.to_owned(),
+            format!(r#"{{"action":"set","tier":"cheap","chain":[{ten}],"metered_after_subscription":false}}"#),
+            format!(r#"{{"action":"set","tier":"cheap","chain":[{entry},{entry}],"metered_after_subscription":false}}"#),
+            r#"{"action":"set","tier":"cheap","chain":[{"provider":"ollama","model":"a b"}],"metered_after_subscription":false}"#.to_owned(),
+            r#"{"action":"set","tier":"cheap","chain":[{"provider":"ollama","model":"a\nb"}],"metered_after_subscription":false}"#.to_owned(),
+            r#"{"action":"set","tier":"cheap","chain":[{"provider":"ollama","model":"--metered-after-subscription"}],"metered_after_subscription":false}"#.to_owned(),
+            format!(r#"{{"action":"set","tier":"cheap","chain":[{{"provider":"ollama","model":"{}"}}],"metered_after_subscription":false}}"#, "a".repeat(257)),
+            r#"{"action":"set","tier":"cheap","chain":[{"provider":"ollama","model":"a","enabled":true}],"metered_after_subscription":false}"#.to_owned(),
+            r#"{"action":"set","tier":"cheap","chain":[{"provider":"ollama","model":"a"}]}"#.to_owned(),
+            r#"{"action":"paid_api","state":"maybe"}"#.to_owned(),
+            r#"{"action":"reset","tier":"hard","shell":"id"}"#.to_owned(),
+            r#"{"action":"enable","tier":"hard"}"#.to_owned(),
+        ] {
+            assert!(route_arguments(&payload).is_err(), "{payload}");
+        }
+        let nine = chain(9);
+        assert!(route_arguments(&format!(
+            r#"{{"action":"set","tier":"default","chain":[{nine}],"metered_after_subscription":false}}"#
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn routing_report_parses_the_cli_json() {
+        let report: RoutingReport = serde_json::from_str(
+            r#"{"routing":{"version":1,"paid_api":"off","tiers":{"cheap":{"chain":[{"provider":"claude-cli","model":"claude-haiku-4-5"}],"metered_after_subscription":false}}},"routing_unavailable_reason":null}"#,
+        )
+        .unwrap();
+        let routing = report.routing.unwrap();
+        assert!(matches!(routing.paid_api, PaidApi::Off));
+        assert_eq!(
+            routing.tiers[&RouteTier::Cheap].chain[0].provider,
+            RouteProvider::ClaudeCli
+        );
+        let unusable: RoutingReport = serde_json::from_str(
+            r#"{"routing":null,"routing_unavailable_reason":"routing_invalid"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            unusable.routing_unavailable_reason.as_deref(),
+            Some("routing_invalid")
+        );
+        assert!(serde_json::from_str::<RoutingReport>(
+            r#"{"routing":null,"routing_unavailable_reason":null,"raw":"x"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn credential_entry_is_typed_and_contains_no_secret_argument() {
         let provider: CredentialProvider = serde_json::from_str(r#""huggingface""#).unwrap();
         assert!(serde_json::from_str::<CredentialProvider>(r#""arbitrary""#).is_err());
@@ -1612,5 +1969,28 @@ mod tests {
         assert_eq!(row.billing, "overage_unverified");
         let with_token = safe.replace("\"runtime\"", "\"access_token\":\"canary-secret\",\"runtime\"");
         assert!(serde_json::from_str::<AiAccountRecord>(&with_token).is_err());
+    }
+
+    #[test]
+    fn ai_accounts_need_one_row_per_login_with_its_own_worker() {
+        let row = |provider: &str, worker: &str| AiAccountRecord {
+            provider: provider.to_owned(),
+            worker: worker.to_owned(),
+            state: "logged_out".to_owned(),
+            billing: "unverified".to_owned(),
+            runtime: "inactive".to_owned(),
+        };
+        let claude = row("claude", "jarvis-claude");
+        let codex = row("codex", "jarvis-codex");
+        let chat = row("codex-chat", "jarvis-codex-chat");
+        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone(), chat.clone()]).is_ok());
+        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone()]).is_err());
+        assert!(validate_ai_accounts(vec![claude.clone(), codex.clone(), codex.clone()]).is_err());
+        // The chat worker never shares the coding login's identity.
+        assert!(validate_ai_accounts(vec![claude, codex, row("codex-chat", "jarvis-codex")]).is_err());
+        assert_eq!(
+            serde_json::to_string(&AiAccountProvider::CodexChat).unwrap(),
+            "\"codex-chat\""
+        );
     }
 }

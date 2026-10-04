@@ -233,6 +233,12 @@ enum ModelsCommand {
     List {
         provider: Option<Provider>,
     },
+    /// Record one exact subscription pair (claude-cli or codex-cli) as
+    /// discovered and disabled; subscriptions have no model catalog.
+    Register {
+        provider: Provider,
+        model: ModelId,
+    },
     Enable {
         provider: Provider,
         model: ModelId,
@@ -254,6 +260,104 @@ enum ModelsCommand {
         model: ModelId,
         route: HfRoute,
     },
+    /// Per-tier order of discovered models and the paid API switch. Routing
+    /// never enables a model; the allowlist still decides.
+    Route {
+        #[command(subcommand)]
+        command: RouteCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RouteCommand {
+    List,
+    Show {
+        tier: RouteTier,
+    },
+    /// Ordered `<provider> <model>` pairs, first choice first (at most 9).
+    Set {
+        tier: RouteTier,
+        #[arg(required = true, num_args = 2..=18)]
+        entries: Vec<String>,
+        /// Allow a paid API after a subscription in this chain.
+        #[arg(long)]
+        metered_after_subscription: bool,
+    },
+    /// Return the tier to the built-in order.
+    Reset {
+        tier: RouteTier,
+    },
+    /// `off` removes every paid (metered) API from every tier.
+    PaidApi {
+        state: PaidApiState,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RouteTier {
+    Cheap,
+    Default,
+    Hard,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PaidApiState {
+    Allowed,
+    Off,
+}
+
+fn value_name(value: impl ValueEnum) -> String {
+    value
+        .to_possible_value()
+        .expect("route values are never skipped")
+        .get_name()
+        .to_owned()
+}
+
+/// Typed `jarvis models route` arguments for the compatibility helper.
+fn route_arguments(command: RouteCommand) -> Result<Vec<String>> {
+    let mut arguments = vec!["route".to_owned()];
+    match command {
+        RouteCommand::List => arguments.push("list".into()),
+        RouteCommand::Show { tier } => arguments.extend(["show".into(), value_name(tier)]),
+        RouteCommand::Reset { tier } => arguments.extend(["reset".into(), value_name(tier)]),
+        RouteCommand::PaidApi { state } => arguments.extend(["paid-api".into(), value_name(state)]),
+        RouteCommand::Set {
+            tier,
+            entries,
+            metered_after_subscription,
+        } => {
+            if entries.len() % 2 != 0 {
+                bail!("give one or more <provider> <model> pairs");
+            }
+            arguments.extend(["set".into(), value_name(tier)]);
+            for pair in entries.chunks(2) {
+                let provider = Provider::from_str(&pair[0], false)
+                    .map_err(|_| anyhow::anyhow!("unknown provider"))?;
+                let model = pair[1].parse::<ModelId>().map_err(anyhow::Error::msg)?;
+                arguments.extend([provider.as_str().to_owned(), model.0]);
+            }
+            if metered_after_subscription {
+                arguments.push("--metered-after-subscription".into());
+            }
+        }
+    }
+    Ok(arguments)
+}
+
+/// Typed `jarvis models register` arguments; the helper checks them again.
+fn register_arguments(provider: Provider, model: ModelId) -> Result<Vec<String>> {
+    if !matches!(provider, Provider::ClaudeCli | Provider::CodexCli) {
+        bail!("register is only for subscription providers (claude-cli, codex-cli)");
+    }
+    if !jarvis_llm::claude_worker_protocol::valid_worker_model(&model.0) {
+        bail!("invalid model: use 1 to 80 of A-Z a-z 0-9 . _ - and do not start with -");
+    }
+    Ok(vec![
+        "register".to_owned(),
+        provider.as_str().to_owned(),
+        model.0,
+    ])
 }
 
 #[derive(Debug, Args)]
@@ -286,6 +390,8 @@ enum Provider {
     OllamaCloud,
     #[value(name = "claude-cli")]
     ClaudeCli,
+    #[value(name = "codex-cli")]
+    CodexCli,
     Huggingface,
 }
 impl Provider {
@@ -299,6 +405,7 @@ impl Provider {
             Self::Ollama => "ollama",
             Self::OllamaCloud => "ollama-cloud",
             Self::ClaudeCli => "claude-cli",
+            Self::CodexCli => "codex-cli",
             Self::Huggingface => "huggingface",
         }
     }
@@ -1391,6 +1498,65 @@ fn read_model_policy() -> Result<ModelPolicy> {
     Ok(policy)
 }
 
+/// Read `routing.json` like Core does at startup: no links, root-owned, not
+/// group/world-writable, bounded. `Ok(None)` means absent (built-in order).
+/// Errors are Core's stable reason codes.
+fn read_routing_file(path: &Path) -> std::result::Result<Option<Vec<u8>>, &'static str> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Err("routing_unsafe"),
+        Err(_) => return Err("routing_unreadable"),
+    };
+    let metadata = file.metadata().map_err(|_| "routing_unreadable")?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err("routing_unsafe");
+    }
+    let mut raw = Vec::new();
+    file.take(jarvis_llm::ROUTING_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| "routing_unreadable")?;
+    if raw.len() > jarvis_llm::ROUTING_MAX_BYTES {
+        return Err("routing_too_large");
+    }
+    Ok(Some(raw))
+}
+
+/// `{"routing", "routing_unavailable_reason"}` for an unusable or absent file
+/// as well as a valid one. Core fails closed on an unusable file.
+fn routing_report_from(
+    file: std::result::Result<Option<Vec<u8>>, &'static str>,
+) -> serde_json::Value {
+    let routing = file.and_then(|raw| {
+        raw.map(|raw| jarvis_llm::ModelRouting::parse(&raw).map_err(|_| "routing_invalid"))
+            .transpose()
+    });
+    match routing {
+        Ok(routing) => serde_json::json!({"routing": routing, "routing_unavailable_reason": null}),
+        Err(reason) => serde_json::json!({"routing": null, "routing_unavailable_reason": reason}),
+    }
+}
+
+fn routing_report() -> Result<serde_json::Value> {
+    let policy = admin_helpers::resolve_model_policy_path(
+        Path::new("/opt/jarvis/current"),
+        Path::new("/opt/jarvis/releases"),
+        Path::new("/usr/local/sbin"),
+        0,
+        0,
+    )?;
+    if policy.file_name() != Some(OsStr::new("policy.json")) {
+        bail!("the active release has no model routing");
+    }
+    Ok(routing_report_from(read_routing_file(
+        &policy.with_file_name("routing.json"),
+    )))
+}
+
 fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Result<()> {
     if presentation.json
         && !matches!(
@@ -1398,9 +1564,16 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
             ModelsCommand::List { .. }
                 | ModelsCommand::Show { .. }
                 | ModelsCommand::Providers { .. }
+                | ModelsCommand::Route {
+                    command: RouteCommand::List
+                }
         )
     {
         bail!("--json is supported only for read-only models list/show");
+    }
+    if presentation.json && matches!(&args.command, ModelsCommand::Route { .. }) {
+        println!("{}", routing_report()?);
+        return Ok(());
     }
     if let ModelsCommand::List { provider } = &args.command {
         let mut policy = read_model_policy()?;
@@ -1506,6 +1679,7 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
             .into_iter()
             .chain(provider.map(|value| value.as_str().to_owned()))
             .collect(),
+        ModelsCommand::Register { provider, model } => register_arguments(provider, model)?,
         ModelsCommand::Enable { provider, model } => {
             vec!["enable".to_owned(), provider.as_str().to_owned(), model.0]
         }
@@ -1533,6 +1707,7 @@ fn models(args: ModelsArgs, presentation: &Presentation, verbose: bool) -> Resul
                 route.0,
             ]
         }
+        ModelsCommand::Route { command } => route_arguments(command)?,
     };
     compatibility_helper(AdminHelper::Models, arguments, verbose)
 }

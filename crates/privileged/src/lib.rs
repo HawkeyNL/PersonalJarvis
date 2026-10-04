@@ -2,6 +2,7 @@
 //! broker.  It intentionally describes only allowlisted configuration actions;
 //! it has no shell, path, environment or arbitrary-file operation.
 
+use jarvis_llm::ModelRouting;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -10,6 +11,7 @@ use uuid::Uuid;
 pub mod local_devices;
 
 pub const ACTION_MODEL_SET_ENABLED: &str = "model.set_enabled";
+pub const ACTION_MODEL_ROUTING_SET: &str = "model.routing_set";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -23,11 +25,41 @@ pub enum Operation {
         enabled: bool,
         expected_policy_sha256: String,
     },
+    /// Replace the whole owner routing document (`routing.json`). Routing only
+    /// orders already-discovered models; it never enables one.
+    /// `expected_routing_sha256` binds the approval to the exact current file
+    /// bytes, or to empty bytes when the file is absent, so an invalid file
+    /// can still be repaired.
+    ModelRoutingSet {
+        routing: ModelRouting,
+        expected_routing_sha256: String,
+    },
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && hex::decode(value).is_ok()
 }
 
 impl Operation {
     pub fn action(&self) -> &'static str {
-        ACTION_MODEL_SET_ENABLED
+        match self {
+            Self::ModelSetEnabled { .. } => ACTION_MODEL_SET_ENABLED,
+            Self::ModelRoutingSet { .. } => ACTION_MODEL_ROUTING_SET,
+        }
+    }
+
+    /// The protected file version this operation is bound to.
+    pub fn expected_state_sha256(&self) -> &str {
+        match self {
+            Self::ModelSetEnabled {
+                expected_policy_sha256,
+                ..
+            } => expected_policy_sha256,
+            Self::ModelRoutingSet {
+                expected_routing_sha256,
+                ..
+            } => expected_routing_sha256,
+        }
     }
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
@@ -49,12 +81,20 @@ impl Operation {
                         | "ollama-cloud"
                         | "huggingface"
                         | "claude-cli"
+                        | "codex-cli"
                 ) || model.is_empty()
                     || model.len() > 256
                     || model.chars().any(char::is_control)
-                    || expected_policy_sha256.len() != 64
-                    || hex::decode(expected_policy_sha256).is_err()
+                    || !valid_sha256_hex(expected_policy_sha256)
                 {
+                    return Err(ProtocolError::InvalidOperation);
+                }
+            }
+            Self::ModelRoutingSet {
+                routing,
+                expected_routing_sha256,
+            } => {
+                if routing.validate().is_err() || !valid_sha256_hex(expected_routing_sha256) {
                     return Err(ProtocolError::InvalidOperation);
                 }
             }
@@ -62,11 +102,13 @@ impl Operation {
         Ok(())
     }
 
+    /// Compact serde_json bytes of the validated operation, SHA-256-bound in
+    /// the Ed25519 message. Every struct has a fixed field order and only
+    /// typed, validated values; no arbitrary maps or JSON are accepted. For
+    /// `model_routing_set` an absent tier is omitted, while `paid_api` and
+    /// `metered_after_subscription` are always present (see the fixed vector).
     pub fn canonical_payload(&self) -> Result<Vec<u8>, ProtocolError> {
         self.validate()?;
-        // This enum has a fixed field order. serde_json is only used after
-        // validating scalar-only values, then its bytes are SHA-256-bound in
-        // the Ed25519 message; no maps or arbitrary JSON are accepted.
         serde_json::to_vec(self).map_err(|_| ProtocolError::InvalidOperation)
     }
 }
@@ -111,15 +153,10 @@ impl SignedRequest {
             return Err(ProtocolError::InvalidApproval);
         }
         let payload: [u8; 32] = Sha256::digest(self.operation.canonical_payload()?).into();
-        let state = match &self.operation {
-            Operation::ModelSetEnabled {
-                expected_policy_sha256,
-                ..
-            } => hex::decode(expected_policy_sha256)
-                .map_err(|_| ProtocolError::InvalidOperation)?
-                .try_into()
-                .map_err(|_| ProtocolError::InvalidOperation)?,
-        };
+        let state: [u8; 32] = hex::decode(self.operation.expected_state_sha256())
+            .map_err(|_| ProtocolError::InvalidOperation)?
+            .try_into()
+            .map_err(|_| ProtocolError::InvalidOperation)?;
         jarvis_identity::privileged_config_approval_message(
             self.operation.action(),
             &payload,
@@ -201,10 +238,144 @@ mod tests {
         changed.provider = "shell".into();
         assert!(changed.message().is_err());
     }
+
+    fn routing_approval() -> jarvis_client_core::model_control::ModelRoutingApproval {
+        let routing = serde_json::from_value(serde_json::json!({
+            "version": 1, "paid_api": "off", "tiers": {
+                "cheap": {"chain": [{"provider": "huggingface", "model": "org/modèl"},
+                                    {"provider": "claude-cli", "model": "claude-haiku-4-5"}]},
+                "hard": {"chain": [{"provider": "claude-cli", "model": "claude-opus-5"},
+                                   {"provider": "anthropic-api", "model": "claude-opus-5"}],
+                         "metered_after_subscription": true}}}))
+        .unwrap();
+        jarvis_client_core::model_control::ModelRoutingApproval {
+            request_id: Uuid::from_bytes([1; 16]),
+            nonce_hex: "02".repeat(32),
+            user_id: Uuid::from_bytes([3; 16]),
+            device_id: Uuid::from_bytes([4; 16]),
+            issued_at: 1,
+            expires_at: 121,
+            routing,
+            expected_routing_sha256: hex::encode(Sha256::digest(b"")),
+        }
+    }
+
+    fn routing_operation(request: &mut SignedRequest) -> (&mut ModelRouting, &mut String) {
+        let Operation::ModelRoutingSet {
+            routing,
+            expected_routing_sha256,
+        } = &mut request.operation
+        else {
+            unreachable!()
+        };
+        (routing, expected_routing_sha256)
+    }
+
+    #[test]
+    fn native_routing_approval_matches_the_fixed_vector_and_broker_bytes() {
+        let approval = routing_approval();
+        let key = SigningKey::from_bytes(&[6; 32]);
+        let signature = hex::encode(key.sign(&approval.message().unwrap()).to_bytes());
+        let request: SignedRequest =
+            serde_json::from_value(approval.signed_request(&signature).unwrap()).unwrap();
+        assert_eq!(request.operation.action(), "model.routing_set");
+        assert_eq!(
+            hex::encode(Sha256::digest(
+                request.operation.canonical_payload().unwrap()
+            )),
+            "a9c73476991bb884fbaf43378882c25f4403a8ce3daa44d1012221ce15e30a59"
+        );
+        assert_eq!(request.message().unwrap(), approval.message().unwrap());
+        assert!(jarvis_identity::verify_signature(
+            key.verifying_key().as_bytes(),
+            &request.message().unwrap(),
+            &hex::decode(&signature).unwrap()
+        )
+        .is_ok());
+        // A different document cannot reuse the signature.
+        let mut changed = request.clone();
+        routing_operation(&mut changed).0.paid_api = jarvis_llm::PaidApi::Allowed;
+        assert!(jarvis_identity::verify_signature(
+            key.verifying_key().as_bytes(),
+            &changed.message().unwrap(),
+            &hex::decode(&signature).unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn signature_for_one_action_cannot_approve_the_other() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let mut toggle = request();
+        toggle.signature_hex = hex::encode(key.sign(&toggle.message().unwrap()).to_bytes());
+        let routing_request: SignedRequest = serde_json::from_value(
+            routing_approval()
+                .signed_request(&toggle.signature_hex)
+                .unwrap(),
+        )
+        .unwrap();
+        // Same envelope and state hash, only the operation swapped.
+        let mut replay = toggle.clone();
+        replay.operation = Operation::ModelRoutingSet {
+            routing: serde_json::from_value(
+                serde_json::to_value(routing_approval().routing).unwrap(),
+            )
+            .unwrap(),
+            expected_routing_sha256: toggle.operation.expected_state_sha256().into(),
+        };
+        let signature = hex::decode(&toggle.signature_hex).unwrap();
+        for forged in [&replay, &routing_request] {
+            assert!(jarvis_identity::verify_signature(
+                key.verifying_key().as_bytes(),
+                &forged.message().unwrap(),
+                &signature
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn routing_operation_rejects_invalid_documents_and_hashes() {
+        let base: SignedRequest =
+            serde_json::from_value(routing_approval().signed_request(&"00".repeat(64)).unwrap())
+                .unwrap();
+        assert!(base.message().is_ok());
+        let mut oversized = base.clone();
+        let (routing, _) = routing_operation(&mut oversized);
+        routing.tiers.default = Some(jarvis_llm::TierRoute {
+            chain: (0..10)
+                .map(|index| jarvis_llm::RouteEntry {
+                    provider: "ollama".into(),
+                    model: format!("m{index}"),
+                })
+                .collect(),
+            metered_after_subscription: false,
+        });
+        let mut metered = base.clone();
+        routing_operation(&mut metered)
+            .0
+            .tiers
+            .hard
+            .as_mut()
+            .unwrap()
+            .metered_after_subscription = false;
+        let mut not_hex = base.clone();
+        *routing_operation(&mut not_hex).1 = "zz".repeat(32);
+        let mut short = base.clone();
+        *routing_operation(&mut short).1 = "00".repeat(31);
+        let mut version = base;
+        routing_operation(&mut version).0.version = 2;
+        for request in [oversized, metered, not_hex, short, version] {
+            assert_eq!(request.message(), Err(ProtocolError::InvalidOperation));
+        }
+    }
+
     #[test]
     fn signed_message_rejects_arbitrary_path_and_command_shapes() {
         let mut req = request();
-        let Operation::ModelSetEnabled { model, .. } = &mut req.operation;
+        let Operation::ModelSetEnabled { model, .. } = &mut req.operation else {
+            unreachable!()
+        };
         *model = "../../etc/shadow\nsh -c id".into();
         assert_eq!(req.message(), Err(ProtocolError::InvalidOperation));
     }
@@ -213,7 +384,9 @@ mod tests {
         let mut req = request();
         let key = SigningKey::from_bytes(&[9; 32]);
         req.signature_hex = hex::encode(key.sign(&req.message().unwrap()).to_bytes());
-        let Operation::ModelSetEnabled { enabled, .. } = &mut req.operation;
+        let Operation::ModelSetEnabled { enabled, .. } = &mut req.operation else {
+            unreachable!()
+        };
         *enabled = false;
         let sig = hex::decode(&req.signature_hex).unwrap();
         assert!(jarvis_identity::verify_signature(
@@ -250,7 +423,10 @@ mod tests {
         let mut req = request();
         let Operation::ModelSetEnabled {
             provider, model, ..
-        } = &mut req.operation;
+        } = &mut req.operation
+        else {
+            unreachable!()
+        };
         *provider = "huggingface".into();
         *model = "fixture-org/fixture-model".into();
         assert!(req.message().is_ok());
@@ -280,7 +456,9 @@ mod tests {
         assert!(serde_json::from_value::<SignedRequest>(value).is_err());
         for control in ['\t', '\u{001b}', '\u{007f}'] {
             let mut req = request();
-            let Operation::ModelSetEnabled { model, .. } = &mut req.operation;
+            let Operation::ModelSetEnabled { model, .. } = &mut req.operation else {
+                unreachable!()
+            };
             *model = format!("fixture{control}model");
             assert_eq!(req.message(), Err(ProtocolError::InvalidOperation));
         }
