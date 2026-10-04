@@ -460,7 +460,7 @@ pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store:
         .by_agent
         .iter()
         .map(|row| {
-            let mut value = agent_usage_value(row);
+            let mut value = agent_usage_value(&row.totals, row.last_used.as_deref());
             value["agent_id"] = json!(row.agent_id);
             value
         })
@@ -554,18 +554,18 @@ pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store:
 const MAX_USAGE_AGENTS: usize = 100;
 
 /// One agent's monthly usage, shared by `/v1/system/usage` and `/v1/agents`.
-pub(crate) fn agent_usage_value(row: &usage::AgentUsage) -> Value {
+pub(crate) fn agent_usage_value(totals: &usage::UsageTotals, last_used: Option<&str>) -> Value {
     json!({
-        "requests": row.totals.requests,
-        "input_tokens": row.totals.input_tokens,
-        "output_tokens": row.totals.output_tokens,
-        "total_tokens": row.totals.total_tokens,
-        "spent_eur": row.totals.cost_eur,
-        "failures": row.totals.failures,
-        "fallbacks": row.totals.fallbacks,
-        "latency_p50_ms": row.totals.latency_p50_ms,
-        "latency_p95_ms": row.totals.latency_p95_ms,
-        "last_used": row.last_used,
+        "requests": totals.requests,
+        "input_tokens": totals.input_tokens,
+        "output_tokens": totals.output_tokens,
+        "total_tokens": totals.total_tokens,
+        "spent_eur": totals.cost_eur,
+        "failures": totals.failures,
+        "fallbacks": totals.fallbacks,
+        "latency_p50_ms": totals.latency_p50_ms,
+        "latency_p95_ms": totals.latency_p95_ms,
+        "last_used": last_used,
     })
 }
 

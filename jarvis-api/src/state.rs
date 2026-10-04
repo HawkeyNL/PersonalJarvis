@@ -204,6 +204,9 @@ pub struct AppState {
     pub eur_per_usd: f64,
     /// Agentic execution kill switch (ADR-029) — Jarvis has no hands unless true.
     pub agent_enabled: bool,
+    /// Private agent definitions from the owner's immutable bundle. `None`
+    /// only outside production, where a missing bundle is tolerated.
+    pub agent_registry: Option<Arc<jarvis_core::AgentRegistry>>,
     /// The sandbox Jarvis' read-only actions are confined to. `None` ⇒ no
     /// workspace configured (actions refused even when enabled).
     pub agent_sandbox: Option<Arc<agent::Sandbox>>,

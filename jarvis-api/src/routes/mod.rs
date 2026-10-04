@@ -5,6 +5,7 @@
 
 pub(crate) mod account;
 pub(crate) mod agent;
+pub(crate) mod agents;
 pub(crate) mod app_updates;
 pub(crate) mod auth;
 pub(crate) mod broker;

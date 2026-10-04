@@ -202,6 +202,7 @@ pub fn build_router(state: AppState) -> Router {
             post(system_privileged_config),
         )
         .route("/v1/system/self-improve", post(system_self_improve))
+        .route("/v1/agents", get(routes::agents::list))
         .route("/v1/agent/action", post(agent_action))
         .route("/v1/agent/pending", get(agent_pending))
         .route(

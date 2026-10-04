@@ -79,6 +79,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         )),
         eur_per_usd: 0.92,
         agent_enabled: sandbox.is_some(),
+        agent_registry: None,
         agent_sandbox: sandbox.map(Arc::new),
         rate_limiter: Arc::new(RateLimiter::new()),
         auth_limits: AuthLimits::default(),
@@ -256,6 +257,71 @@ async fn every_application_update_route_requires_authentication_before_storage_a
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
     }
+}
+
+/// Owner read models for the app share the `Authed` gate of `/v1/system/*`.
+const OWNER_READ_MODELS: [&str; 1] = ["/v1/agents"];
+
+#[tokio::test]
+async fn owner_read_models_refuse_missing_or_invalid_sessions() {
+    // An unconnected database cannot authenticate any token.
+    let app = build_router(state(jarvis_store::Database::init(), None).await);
+    for path in OWNER_READ_MODELS {
+        for authorization in [None, Some("Bearer not-a-session"), Some("Basic b3duZXI=")] {
+            let mut request = Request::builder().uri(path);
+            if let Some(value) = authorization {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} {authorization:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn owner_read_models_answer_an_owner_session() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db, None).await);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let get = |path: &'static str| {
+        app.clone().oneshot(
+            Request::builder()
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+
+    // No bundle (development): an empty list with a reason, never a 500.
+    let agents = get("/v1/agents").await?;
+    assert_eq!(agents.status(), StatusCode::OK);
+    let agents = json_body(agents).await;
+    assert_eq!(agents["agents"], json!([]));
+    assert_eq!(agents["agent_count"], 0);
+    assert_eq!(agents["unavailable_reason"], "agent_bundle_unavailable");
+    Ok(())
 }
 
 async fn enroll_login(app: &axum::Router, signing: &SigningKey) -> (String, Vec<u8>) {
