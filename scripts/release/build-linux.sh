@@ -17,7 +17,7 @@ verify_admin_helper_candidate() {
     echo "release candidate artifact checksum manifest is missing or unsafe" >&2
     exit 1
   }
-  for helper in jarvis-models jarvis-credentials jarvis-backup; do
+  for helper in jarvis-models jarvis-credentials jarvis-backup jarvis-housekeeping; do
     [[ -f "$release/$helper" && ! -L "$release/$helper" && -x "$release/$helper" ]] || {
       echo "release candidate is missing executable $helper" >&2
       exit 1
@@ -76,6 +76,11 @@ verify_systemd_unit_candidate() {
   jq -e '.tooling.backup_timer == 1 and (.tooling.backup_timer | type) == "number"' \
     "$release/release.json" >/dev/null || {
     echo "release candidate does not declare backup-timer capability 1" >&2
+    exit 1
+  }
+  jq -e '.tooling.housekeeping_timer == 1 and (.tooling.housekeeping_timer | type) == "number"' \
+    "$release/release.json" >/dev/null || {
+    echo "release candidate does not declare housekeeping-timer capability 1" >&2
     exit 1
   }
   jq -e '.tooling.systemd_units == 1 and (.tooling.systemd_units | type) == "number"' \
@@ -239,6 +244,7 @@ install -m 0755 deploy/systemd/update-core-release.sh "$temporary_release/update
 install -m 0755 deploy/systemd/jarvis-models.sh "$temporary_release/jarvis-models"
 install -m 0755 deploy/systemd/jarvis-credentials.sh "$temporary_release/jarvis-credentials"
 install -m 0755 deploy/systemd/jarvis-backup.sh "$temporary_release/jarvis-backup"
+install -m 0755 deploy/systemd/jarvis-housekeeping.sh "$temporary_release/jarvis-housekeeping"
 install -m 0755 deploy/systemd/manage-systemd-units.sh "$temporary_release/manage-systemd-units"
 install -m 0755 deploy/systemd/schema-backup.sh "$temporary_release/schema-backup"
 install -m 0755 deploy/systemd/verify-home-node.sh "$temporary_release/verify-home-node"
@@ -261,7 +267,8 @@ for unit in \
   jarvis-laya.service jarvis-laya.socket \
   jarvis-claude.service jarvis-claude.socket \
   jarvis-codex-chat.service jarvis-codex-chat.socket \
-  jarvis-backup.service jarvis-backup.timer; do
+  jarvis-backup.service jarvis-backup.timer \
+  jarvis-housekeeping.service jarvis-housekeeping.timer; do
   install -m 0644 "deploy/systemd/$unit" "$temporary_release/systemd-$unit"
 done
 install -m 0644 deploy/systemd/pricing-registry.json "$temporary_release/pricing-registry.json"
@@ -286,14 +293,14 @@ jq -n \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
   --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" --arg schema_eight "$schema_eight_sha256" --arg schema_nine "$schema_nine_sha256" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 10, from_sha256: [$schema_six, $schema_seven, $schema_eight, $schema_nine]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1, codex_chat_worker: 1, codex_runtime: 1, backup_timer: 1}}' \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 10, from_sha256: [$schema_six, $schema_seven, $schema_eight, $schema_nine]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1, codex_chat_worker: 1, codex_runtime: 1, backup_timer: 1, housekeeping_timer: 1}}' \
   > "$temporary_release/release.json"
 
 (
   cd "$temporary_release"
   sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-codex-runtime jarvis-claude-worker jarvis-codex-chat-worker jarvis-agent-bundle \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
-    jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials jarvis-backup \
+    jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials jarvis-backup jarvis-housekeeping \
     com.hawkeynl.jarvis.devices.policy \
     manage-systemd-units jarvis-model-policy-storage schema-backup verify-home-node install-home-node-core ui.sh laya-offline.py provision-laya \
     pricing-registry.json \

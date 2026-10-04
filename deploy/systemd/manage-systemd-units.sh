@@ -29,6 +29,8 @@ readonly -a managed_units=(
     jarvis-codex-chat.socket
     jarvis-backup.service
     jarvis-backup.timer
+    jarvis-housekeeping.service
+    jarvis-housekeeping.timer
 )
 
 subscription_capability() {
@@ -86,10 +88,23 @@ backup_capability() {
     echo 1
 }
 
+housekeeping_capability() {
+    local release=$1
+    if ! jq -e '.tooling | has("housekeeping_timer")' "$release/release.json" >/dev/null; then
+        echo legacy
+        return
+    fi
+    jq -e '.tooling.housekeeping_timer == 1 and (.tooling.housekeeping_timer | type) == "number" and .tooling.admin_helpers == 1 and .tooling.systemd_units == 1' "$release/release.json" >/dev/null ||
+        fail "unsupported housekeeping-timer capability"
+    echo 1
+}
+
 unit_required() {
     case $2 in
         jarvis-backup.service|jarvis-backup.timer)
             [[ $(backup_capability "$1") == 1 ]] ;;
+        jarvis-housekeeping.service|jarvis-housekeeping.timer)
+            [[ $(housekeeping_capability "$1") == 1 ]] ;;
         jarvis-model-catalog.service|jarvis-model-catalog.timer)
             [[ $(catalog_capability "$1") == 1 ]] ;;
         jarvis-laya.service|jarvis-laya.socket)
@@ -249,7 +264,7 @@ validate_checksum_manifest() {
 }
 
 validate_artifacts() {
-    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version laya_version subscription_version codex_chat_version backup_version
+    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version laya_version subscription_version codex_chat_version backup_version housekeeping_version
     managed_version=$(capability "$release") || return 1
     device_version=$(device_capability "$release") || return 1
     policy_version=$(policy_capability "$release") || return 1
@@ -257,6 +272,7 @@ validate_artifacts() {
     subscription_version=$(subscription_capability "$release") || return 1
     codex_chat_version=$(codex_chat_capability "$release") || return 1
     backup_version=$(backup_capability "$release") || return 1
+    housekeeping_version=$(housekeeping_capability "$release") || return 1
     if jq -e '.tooling | has("codex_runtime")' "$release/release.json" >/dev/null; then
         jq -e '.tooling.codex_runtime == 1' "$release/release.json" >/dev/null || fail "unsupported Codex runtime capability"
         [[ -f $release/jarvis-codex-runtime && ! -L $release/jarvis-codex-runtime && -x $release/jarvis-codex-runtime ]] ||
@@ -299,6 +315,14 @@ validate_artifacts() {
         (( (8#$mode & 0022) == 0 )) || fail "backup helper permissions are unsafe"
         matches=$(awk '$2 == "jarvis-backup" { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
         [[ $matches == 1 ]] || fail "backup helper is not uniquely checksum-bound"
+    fi
+    if [[ $housekeeping_version == 1 ]]; then
+        [[ -f $release/jarvis-housekeeping && ! -L $release/jarvis-housekeeping && -x $release/jarvis-housekeeping ]] ||
+            fail "housekeeping helper is missing or unsafe"
+        mode=$(stat -c '%a' "$release/jarvis-housekeeping")
+        (( (8#$mode & 0022) == 0 )) || fail "housekeeping helper permissions are unsafe"
+        matches=$(awk '$2 == "jarvis-housekeeping" { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
+        [[ $matches == 1 ]] || fail "housekeeping helper is not uniquely checksum-bound"
     fi
     catalog_capability "$release" >/dev/null || return 1
     if [[ $managed_version != 1 ]]; then
@@ -379,6 +403,9 @@ validate_release() {
     fi
     if [[ $(backup_capability "$release") == 1 ]]; then
         [[ $(stat -c '%u:%g' "$release/jarvis-backup") == 0:0 ]] || fail "backup helper is not root-owned"
+    fi
+    if [[ $(housekeeping_capability "$release") == 1 ]]; then
+        [[ $(stat -c '%u:%g' "$release/jarvis-housekeeping") == 0:0 ]] || fail "housekeeping helper is not root-owned"
     fi
     if jq -e 'has("schema_migration")' "$release/release.json" >/dev/null; then
         [[ $(stat -c '%u:%g' "$release/schema-backup") == 0:0 ]] || fail "schema backup helper is not root-owned"

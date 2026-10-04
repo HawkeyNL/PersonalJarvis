@@ -1,0 +1,62 @@
+[Unit]
+Description=Jarvis disk housekeeping (see docs/HOUSEKEEPING.md)
+# Inert, not failed, after a rollback to a release without the helper.
+ConditionPathExists=/opt/jarvis/current/jarvis-housekeeping
+# A run that finds an update, backup or app sync in progress exits 75 and
+# retries every 10 minutes, at most 3 starts in 2 hours.
+StartLimitIntervalSec=2h
+StartLimitBurst=3
+
+# Static by design: no [Install] section. Only jarvis-housekeeping.timer is an
+# owner opt-in; installers and the updater never enable it.
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/jarvis/current/jarvis-housekeeping apply
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+UMask=0077
+Nice=19
+CPUSchedulingPolicy=idle
+# Lowest best-effort I/O, not idle: deletions run under the updater lock and
+# must not starve behind other I/O.
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=1h
+# Only a busy exit (75) is worth retrying; a rule error (1) stays failed
+# until the owner looks at it.
+Restart=on-failure
+RestartPreventExitStatus=1
+RestartSec=10min
+NoNewPrivileges=true
+# Root owns everything it deletes. Sizing the service-owned legacy mirror
+# below /var/lib/jarvis needs only DAC read/search.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectClock=true
+ProtectHostname=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+# Only the two lock files below /run (created first, outside the sandbox,
+# as the updater and backup would), the two directories rule 1 and rule 2
+# prune, and the state directory are writable.
+ExecStartPre=+/usr/bin/touch /run/jarvis-updater.lock /run/jarvis-housekeeping.lock
+ReadWritePaths=-/run/jarvis-updater.lock -/run/jarvis-housekeeping.lock
+ReadWritePaths=/opt/jarvis/releases -/var/lib/jarvis-app-updates
+StateDirectory=jarvis-housekeeping
+StateDirectoryMode=0755
+# Docker (report-only) and syslog are reached over Unix sockets only.
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=512M
+TasksMax=64

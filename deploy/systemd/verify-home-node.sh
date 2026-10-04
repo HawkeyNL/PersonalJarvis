@@ -215,6 +215,22 @@ else
     ui_detail "Codex chat worker: inactive (optional)"
 fi
 
+# Optional owner-enabled disk housekeeping: its record is root-written and
+# world-readable so the unprivileged Core Admin App can show the last run.
+if [[ -e /var/lib/jarvis-housekeeping || -L /var/lib/jarvis-housekeeping ]]; then
+    check "Housekeeping state directory permissions" bash -c \
+        '[[ -d /var/lib/jarvis-housekeeping && ! -L /var/lib/jarvis-housekeeping && $(stat -c "%U:%G:%a" /var/lib/jarvis-housekeeping) == root:root:755 ]]'
+    if [[ -e /var/lib/jarvis-housekeeping/last-run.json || -L /var/lib/jarvis-housekeeping/last-run.json ]]; then
+        check "Housekeeping last-run record permissions" bash -c \
+            '[[ -f /var/lib/jarvis-housekeeping/last-run.json && ! -L /var/lib/jarvis-housekeeping/last-run.json && $(stat -c "%U:%G:%a" /var/lib/jarvis-housekeeping/last-run.json) == root:root:644 ]]'
+    fi
+fi
+if systemctl is-enabled --quiet jarvis-housekeeping.timer 2>/dev/null; then
+    ui_detail "Disk housekeeping: daily timer enabled (sudo jarvis housekeeping status)"
+else
+    ui_detail "Disk housekeeping: timer disabled (optional; sudo jarvis housekeeping status)"
+fi
+
 if ((failures)); then
     ui_error "Security verification: $passed passed, $failures failed. Do not enable public ingress."
     exit 1
