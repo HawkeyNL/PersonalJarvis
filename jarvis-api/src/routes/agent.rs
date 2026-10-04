@@ -12,6 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -42,6 +43,7 @@ struct PendingListRow {
     #[serde(with = "uuid::serde::hyphenated")]
     id: Uuid,
     action_type: String,
+    action: String,
     preview: String,
     #[serde(with = "serde_bytes")]
     nonce: Vec<u8>,
@@ -60,6 +62,20 @@ struct PendingApprovalRow {
 #[derive(Deserialize)]
 struct Claimed {
     id: String,
+}
+
+/// Bytes the approving device must sign: domain-separated and bound to this
+/// pending action, its nonce, the SHA-256 of the stored action JSON and the
+/// approving device, so a login/unlock nonce signature or one for another
+/// action never verifies here.
+fn approval_message(
+    pending_id: Uuid,
+    nonce: &[u8],
+    action_json: &str,
+    device_id: Uuid,
+) -> Option<Vec<u8>> {
+    let action_sha256 = Sha256::digest(action_json.as_bytes());
+    jarvis_client_core::agent_approval_message(pending_id, nonce, &action_sha256, device_id).ok()
 }
 
 /// Run a single read-only agent action (ADR-029 phase 4a). Gated by the kill
@@ -191,7 +207,7 @@ pub(crate) async fn agent_pending(authed: Authed, State(state): State<AppState>)
     let rows: Vec<PendingListRow> = match state
         .db
         .query(
-            "SELECT record::id(id) AS id, action_type, preview, nonce, created_at \
+            "SELECT record::id(id) AS id, action_type, action, preview, nonce, created_at \
          FROM agent_pending_actions WHERE user_id = $user_id AND status = 'pending' \
          AND expires_at > time::now() ORDER BY created_at DESC",
         )
@@ -208,22 +224,32 @@ pub(crate) async fn agent_pending(authed: Authed, State(state): State<AppState>)
         .into_iter()
         .map(|row| {
             json!({ "pending_id": row.id, "action": row.action_type, "preview": row.preview,
-                "nonce": hex::encode(row.nonce), "created_at": row.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() })
+                "nonce": hex::encode(row.nonce),
+                "action_sha256": hex::encode(Sha256::digest(row.action.as_bytes())),
+                "approval_message": jarvis_client_core::AGENT_APPROVAL_MESSAGE_V1,
+                "created_at": row.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() })
         })
         .collect();
     Json(json!({ "pending": entries }))
 }
 
-/// Approve a pending mutation by signing its nonce with a trusted device, then
-/// execute it once (ADR-029 4b). The signature proves owner presence (the device
-/// key is biometric-gated); the stored action is what runs — the LLM can propose,
-/// only a signed human can commit.
+/// Approve a pending mutation by signing its `agent-approval-v1` message with a
+/// trusted device, then execute it once (ADR-029 4b). Raw-nonce signatures (the
+/// pre-v1 format, and what login/unlock sign) are refused. The signature proves
+/// owner presence (the device key is biometric-gated); the stored action is what
+/// runs — the LLM can propose, only a signed human can commit.
 pub(crate) async fn agent_pending_approve(
     authed: Authed,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(req): Json<ApproveReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.agent_enabled {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "agent disabled", "hint": "zet JARVIS_AGENT_ENABLED=true" })),
+        ));
+    }
     if !validation::is_hex_of_len(&req.signature, validation::ED25519_SIGNATURE_HEX_LEN) {
         return Err(bad_request("invalid signature"));
     }
@@ -254,12 +280,19 @@ pub(crate) async fn agent_pending_approve(
         )
     })?;
 
-    // Verify the owner's device signature over the nonce.
+    // Verify the owner's device signature over the action-bound v1 message.
+    let message =
+        approval_message(id, &nonce, &action_json, authed.device.id).ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "corrupt pending action" })),
+            )
+        })?;
     identity::verify_device_signature(
         &state.db,
         authed.user.id,
         authed.device.id,
-        &nonce,
+        &message,
         &signature,
     )
     .await
@@ -373,4 +406,56 @@ pub(crate) async fn agent_pending_deny(
     )
     .await;
     Ok(Json(json!({ "status": "denied" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn approval_signature_is_domain_separated_and_action_bound() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let public_key = key.verifying_key().to_bytes();
+        let verify = |message: &[u8], signature: &[u8]| {
+            identity::verify_signature(&public_key, message, signature).is_ok()
+        };
+        let (id, device) = (Uuid::now_v7(), Uuid::now_v7());
+        let nonce = [1_u8; 32];
+        let action = r#"{"type":"write_file","path":"note.txt","content":"ok"}"#;
+        let message = approval_message(id, &nonce, action, device).unwrap();
+        let signature = key.sign(&message).to_bytes();
+        assert!(verify(&message, &signature));
+
+        // A login/unlock (raw nonce) signature never approves.
+        assert!(!verify(&message, &key.sign(&nonce).to_bytes()));
+        // A signature for action A never approves action B or a tampered A.
+        for other in [
+            approval_message(Uuid::now_v7(), &nonce, action, device),
+            approval_message(id, &[2; 32], action, device),
+            approval_message(id, &nonce, r#"{"type":"git_commit","message":"x"}"#, device),
+            approval_message(id, &nonce, &action.replace("ok", "no"), device),
+            approval_message(id, &nonce, action, Uuid::now_v7()),
+        ] {
+            assert!(!verify(&other.unwrap(), &signature));
+        }
+        assert!(approval_message(id, &nonce[..31], action, device).is_none());
+    }
+
+    #[test]
+    fn stored_action_json_matches_the_client_core_vector() {
+        let action = agent::Action::WriteFile {
+            path: "note.txt".into(),
+            content: "ok".into(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"write_file","path":"note.txt","content":"ok"}"#
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(json.as_bytes())),
+            "8d2dd02e0f1e485d0be7f748f2fdd0d2160dd245b000ca1bff1ca15cd043dbe5"
+        );
+    }
 }

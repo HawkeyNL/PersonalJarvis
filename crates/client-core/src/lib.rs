@@ -15,6 +15,9 @@ pub mod speech;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const PAIRING_APPROVAL_DOMAIN: &[u8] = b"jarvis-device-pairing-v1\0";
+pub const AGENT_APPROVAL_DOMAIN: &[u8] = b"jarvis/agent-approval/v1\0";
+/// `approval_message` value in `GET /v1/agent/pending` for [`agent_approval_message`].
+pub const AGENT_APPROVAL_MESSAGE_V1: &str = "agent-approval-v1";
 
 pub const MAX_DEVICE_NAME_LEN: usize = 128;
 pub const MAX_PLATFORM_LEN: usize = 32;
@@ -38,6 +41,8 @@ pub fn is_hex_of_len(value: &str, len: usize) -> bool {
 pub enum ProtocolError {
     #[error("invalid pairing approval")]
     InvalidPairingApproval,
+    #[error("invalid agent approval")]
+    InvalidAgentApproval,
 }
 
 /// Canonical, domain-separated v1 bytes signed by a pairing approver.
@@ -60,6 +65,28 @@ pub fn pairing_approval_message(
     message.extend_from_slice(user_id.as_bytes());
     message.extend_from_slice(approver_device_id.as_bytes());
     message.extend_from_slice(&expires_at.unix_timestamp().to_be_bytes());
+    Ok(message)
+}
+
+/// Canonical, domain-separated v1 bytes a trusted device signs to approve one
+/// pending agent action. `action_sha256` is the SHA-256 of the pending action's
+/// stored canonical JSON (compact serde_json, UTF-8), exactly as hex-encoded in
+/// `action_sha256` of `GET /v1/agent/pending`. Every field has a fixed width.
+pub fn agent_approval_message(
+    pending_id: Uuid,
+    nonce: &[u8],
+    action_sha256: &[u8],
+    device_id: Uuid,
+) -> Result<Vec<u8>, ProtocolError> {
+    if nonce.len() != 32 || action_sha256.len() != 32 {
+        return Err(ProtocolError::InvalidAgentApproval);
+    }
+    let mut message = Vec::with_capacity(AGENT_APPROVAL_DOMAIN.len() + 96);
+    message.extend_from_slice(AGENT_APPROVAL_DOMAIN);
+    message.extend_from_slice(pending_id.as_bytes());
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(action_sha256);
+    message.extend_from_slice(device_id.as_bytes());
     Ok(message)
 }
 
@@ -285,6 +312,43 @@ mod tests {
                 "000000006b49d200"
             )
         );
+    }
+
+    /// Fixed agent approval vector for the Swift and Kotlin clients.
+    #[test]
+    fn agent_approval_v1_matches_golden_bytes() {
+        use sha2::{Digest, Sha256};
+        let action = br#"{"type":"write_file","path":"note.txt","content":"ok"}"#;
+        let action_sha256 = Sha256::digest(action);
+        assert_eq!(
+            hex::encode(action_sha256),
+            "8d2dd02e0f1e485d0be7f748f2fdd0d2160dd245b000ca1bff1ca15cd043dbe5"
+        );
+        let pending_id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let device_id = Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap();
+        let nonce: Vec<u8> = (0_u8..32).collect();
+        let message =
+            agent_approval_message(pending_id, &nonce, &action_sha256, device_id).unwrap();
+        assert_eq!(
+            hex::encode(&message),
+            concat!(
+                "6a61727669732f6167656e742d617070726f76616c2f763100",
+                "00112233445566778899aabbccddeeff",
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                "8d2dd02e0f1e485d0be7f748f2fdd0d2160dd245b000ca1bff1ca15cd043dbe5",
+                "ffeeddccbbaa99887766554433221100"
+            )
+        );
+        assert_ne!(message.len(), 32, "never a raw login/unlock nonce");
+        for (nonce, hash) in [
+            (&nonce[..31], &action_sha256[..]),
+            (&nonce[..], &[0_u8; 31][..]),
+        ] {
+            assert_eq!(
+                agent_approval_message(pending_id, nonce, hash, device_id),
+                Err(ProtocolError::InvalidAgentApproval)
+            );
+        }
     }
 
     #[test]
