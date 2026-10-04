@@ -199,6 +199,19 @@ export interface ClaudeRuntimeStatus {
 }
 export type RuntimeChannel = "stable" | "latest";
 export type ClaudeRuntimeMutation = { action: "install"; channel: RuntimeChannel } | { action: "rollback" };
+export interface CodexRuntimeStatus {
+  provider: "codex";
+  installed: boolean;
+  version: string | null;
+  safe_ownership: boolean;
+  latest: string | null;
+  update_available: boolean;
+  rollback_available: boolean;
+  cosign_available: boolean;
+}
+export type CodexRuntimeMutation = { action: "install_latest" } | { action: "install_version"; version: string } | { action: "rollback" };
+/** Strict `MAJOR.MINOR.PATCH`, as the broker and the installer require. */
+export const strictRuntimeVersion = (version: string): boolean => /^\d{1,9}\.\d{1,9}\.\d{1,9}$/.test(version);
 export type LogService =
   | "core"
   | "surrealdb"
@@ -259,6 +272,9 @@ export const api = {
   claudeRuntime: () => invoke<ClaudeRuntimeStatus>("claude_runtime"),
   claudeRuntimeMutation: (request: ClaudeRuntimeMutation) =>
     invoke<OperationResult>("claude_runtime_mutation", { request }),
+  codexRuntime: () => invoke<CodexRuntimeStatus>("codex_runtime"),
+  codexRuntimeMutation: (request: CodexRuntimeMutation) =>
+    invoke<OperationResult>("codex_runtime_mutation", { request }),
   credentialSet: (provider: CredentialProvider) =>
     invoke<OperationResult>("credential_set", { provider }),
   logs: (service: LogService, lines = 500) =>

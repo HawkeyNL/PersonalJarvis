@@ -15,6 +15,7 @@ tui-preview = []
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
 clap.workspace = true
 fs2.workspace = true
 reqwest.workspace = true

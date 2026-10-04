@@ -23,6 +23,8 @@ use super::{
     worker_command, AccountProvider,
 };
 
+mod codex;
+
 const CURL: &str = "/usr/bin/curl";
 const GPG: &str = "/usr/bin/gpg";
 const GPGV: &str = "/usr/bin/gpgv";
@@ -34,14 +36,9 @@ const BINARY_LIMIT: u64 = 400 * 1024 * 1024;
 
 const CLAUDE_RELEASE_KEY: &str = include_str!("../../../../deploy/keys/claude-code-release.asc");
 
-/// Fixed install locations and trust anchors. Only tests construct another
-/// layout; no runtime input can change the production source or destination.
+/// Fixed install destination of a provider runtime. Only tests construct
+/// another layout; no runtime input can change the production destination.
 struct Layout<'a> {
-    base_url: &'a str,
-    /// curl `--proto` value; production accepts HTTPS only.
-    protocol: &'a str,
-    key: &'a str,
-    fingerprint: &'a str,
     target: &'a str,
     previous: &'a str,
     /// Ancestors at or below this directory must be owned and not writable by
@@ -50,11 +47,23 @@ struct Layout<'a> {
     owner: (u32, u32),
 }
 
-const PRODUCTION: Layout<'static> = Layout {
+/// Fixed Claude Code release source and trust anchors.
+struct ClaudeSource<'a> {
+    base_url: &'a str,
+    /// curl `--proto` value; production accepts HTTPS only.
+    protocol: &'a str,
+    key: &'a str,
+    fingerprint: &'a str,
+}
+
+const CLAUDE_SOURCE: ClaudeSource<'static> = ClaudeSource {
     base_url: "https://downloads.claude.ai/claude-code-releases",
     protocol: "=https",
     key: CLAUDE_RELEASE_KEY,
     fingerprint: "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE",
+};
+
+const PRODUCTION: Layout<'static> = Layout {
     target: "/usr/local/bin/claude",
     previous: "/usr/local/lib/jarvis/claude.previous",
     trusted_root: "/",
@@ -64,6 +73,23 @@ const PRODUCTION: Layout<'static> = Layout {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum RuntimeProvider {
     Claude,
+    Codex,
+}
+
+impl RuntimeProvider {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    fn layout(self) -> &'static Layout<'static> {
+        match self {
+            Self::Claude => &PRODUCTION,
+            Self::Codex => &codex::LAYOUT,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -85,7 +111,8 @@ impl Channel {
 pub(crate) enum RuntimeCommand {
     /// Read-only: installed version, version gate, ownership and channel availability.
     Status { provider: RuntimeProvider },
-    /// Download, verify (pinned release key and checksum) and atomically install.
+    /// Download, verify (Claude: pinned release key and checksum; Codex:
+    /// cosign keyless signature and GitHub digests) and atomically install.
     Install {
         provider: RuntimeProvider,
         #[arg(long, value_enum, conflicts_with = "version")]
@@ -136,14 +163,21 @@ pub(in crate::ai_accounts) fn run(command: RuntimeCommand, json: bool) -> Result
             }
             Ok(())
         }
+        RuntimeCommand::Status {
+            provider: RuntimeProvider::Codex,
+        } => codex::print_status(json),
         RuntimeCommand::Install {
-            provider: RuntimeProvider::Claude,
+            provider,
             channel,
             version,
         } => {
             let request = match version {
                 Some(version) => VersionRequest::Exact(version),
-                None => VersionRequest::Channel(channel.unwrap_or(Channel::Stable)),
+                // Codex publishes only GitHub's latest release.
+                None => VersionRequest::Channel(channel.unwrap_or(match provider {
+                    RuntimeProvider::Claude => Channel::Stable,
+                    RuntimeProvider::Codex => Channel::Latest,
+                })),
             };
             // Only a strict version or a fixed channel name enters the audit log.
             let label = match &request {
@@ -153,30 +187,51 @@ pub(in crate::ai_accounts) fn run(command: RuntimeCommand, json: bool) -> Result
                 VersionRequest::Exact(_) => "invalid".to_owned(),
                 VersionRequest::Channel(channel) => channel.name().to_owned(),
             };
-            audited("runtime-install", &label, || {
+            audited(provider, "runtime-install", &label, || {
                 let _lock = crate::mutation_lock(LOCK)?;
-                let version = install(&PRODUCTION, &request, platform()?)?;
+                let version = match provider {
+                    RuntimeProvider::Claude => {
+                        install(&PRODUCTION, &CLAUDE_SOURCE, &request, platform()?)?
+                    }
+                    RuntimeProvider::Codex => {
+                        codex::install(&codex::LAYOUT, &codex::SOURCE, &request, codex::target()?)?
+                    }
+                };
+                let proof = match provider {
+                    RuntimeProvider::Claude => "signed manifest, SHA-256",
+                    RuntimeProvider::Codex => "cosign keyless signature, Rekor entry, SHA-256",
+                };
                 println!(
-                    "claude runtime {version} is installed and verified (signed manifest, SHA-256)"
+                    "{} runtime {version} is installed and verified ({proof})",
+                    provider.name()
                 );
                 Ok(version)
             })
         }
-        RuntimeCommand::Rollback {
-            provider: RuntimeProvider::Claude,
-        } => audited("runtime-rollback", "previous", || {
-            let _lock = crate::mutation_lock(LOCK)?;
-            rollback(&PRODUCTION)?;
-            println!("claude runtime restored from the previous install");
-            Ok("previous".to_owned())
-        }),
+        RuntimeCommand::Rollback { provider } => {
+            audited(provider, "runtime-rollback", "previous", || {
+                let _lock = crate::mutation_lock(LOCK)?;
+                rollback(provider.layout())?;
+                println!(
+                    "{} runtime restored from the previous install",
+                    provider.name()
+                );
+                Ok("previous".to_owned())
+            })
+        }
     }
 }
 
-fn audited(action: &str, label: &str, operation: impl FnOnce() -> Result<String>) -> Result<()> {
+fn audited(
+    provider: RuntimeProvider,
+    action: &str,
+    label: &str,
+    operation: impl FnOnce() -> Result<String>,
+) -> Result<()> {
     let record = |version: &str, outcome: &str| {
         audit_record(&format!(
-            "provider=claude action={action} version={version} outcome={outcome}"
+            "provider={} action={action} version={version} outcome={outcome}",
+            provider.name()
         ))
     };
     record(label, "initiated")?;
@@ -193,16 +248,13 @@ fn status() -> RuntimeStatus {
     let layout = &PRODUCTION;
     let installed = fs::symlink_metadata(layout.target).is_ok();
     let safe_ownership = validate_root_executable(layout.target).is_ok();
-    // Executed only as the dedicated identity in the hardened transient service.
     let version = safe_ownership
-        .then(|| worker_command(AccountProvider::Claude, &["--version"], false).ok())
-        .flatten()
-        .and_then(|mut command| bounded_status_output(&mut command).ok().flatten())
-        .and_then(|output| reported_version(&output));
+        .then(|| installed_version(AccountProvider::Claude))
+        .flatten();
     let gate_ok = version.as_deref().is_some_and(reviewed);
     let latest_stable = tempfile::tempdir().ok().and_then(|dir| {
         let pointer = dir.path().join("stable");
-        fetch(layout, "stable", &pointer, POINTER_LIMIT, 10).ok()?;
+        fetch(&CLAUDE_SOURCE, "stable", &pointer, POINTER_LIMIT, 10).ok()?;
         pointer_version(&fs::read(pointer).ok()?)
     });
     let update_available = latest_stable.as_deref().is_some_and(|latest| {
@@ -225,20 +277,51 @@ fn status() -> RuntimeStatus {
     }
 }
 
-fn install(layout: &Layout, request: &VersionRequest, platform: &str) -> Result<String> {
-    check_destination(layout)?;
-    // Never `$TMPDIR`: the work directory lives in the root-only rollback
-    // directory so no other user can swap verified files by path.
+/// Executed only as the provider's dedicated identity in the hardened
+/// transient service, never as root.
+fn installed_version(provider: AccountProvider) -> Option<String> {
+    worker_command(provider, &["--version"], false)
+        .ok()
+        .and_then(|mut command| bounded_status_output(&mut command).ok().flatten())
+        .and_then(|output| reported_version(&output))
+}
+
+/// Never `$TMPDIR`: the work directory lives in the root-only rollback
+/// directory so no other user can swap verified files by path.
+fn work_directory(layout: &Layout) -> Result<tempfile::TempDir> {
     let work = tempfile::Builder::new()
         .prefix("jarvis-runtime.")
         .tempdir_in(rollback_directory(layout)?)
         .context("create private runtime work directory")?;
     fs::set_permissions(work.path(), fs::Permissions::from_mode(0o700))?;
+    Ok(work)
+}
+
+/// Whether the installed runtime already is exactly this binary.
+fn installed_matches(layout: &Layout, checksum: &str, size: u64) -> Result<bool> {
+    if fs::symlink_metadata(layout.target).is_err() {
+        return Ok(false);
+    }
+    let (digest, length) = copy_hashed(
+        &mut open_no_follow(Path::new(layout.target))?,
+        &mut io::sink(),
+    )?;
+    Ok(length == size && digest.eq_ignore_ascii_case(checksum))
+}
+
+fn install(
+    layout: &Layout,
+    source: &ClaudeSource,
+    request: &VersionRequest,
+    platform: &str,
+) -> Result<String> {
+    check_destination(layout)?;
+    let work = work_directory(layout)?;
     let version = match request {
         VersionRequest::Exact(version) => version.clone(),
         VersionRequest::Channel(channel) => {
             let pointer = work.path().join("pointer");
-            fetch(layout, channel.name(), &pointer, POINTER_LIMIT, 30)?;
+            fetch(source, channel.name(), &pointer, POINTER_LIMIT, 30)?;
             pointer_version(&fs::read(&pointer)?)
                 .context("release channel did not name a strict version")?
         }
@@ -252,34 +335,28 @@ fn install(layout: &Layout, request: &VersionRequest, platform: &str) -> Result<
     let manifest = work.path().join("manifest.json");
     let signature = work.path().join("manifest.json.sig");
     fetch(
-        layout,
+        source,
         &format!("{version}/manifest.json"),
         &manifest,
         MANIFEST_LIMIT,
         60,
     )?;
     fetch(
-        layout,
+        source,
         &format!("{version}/manifest.json.sig"),
         &signature,
         SIGNATURE_LIMIT,
         60,
     )?;
-    verify_signature(layout, work.path(), &manifest, &signature)?;
+    verify_signature(source, work.path(), &manifest, &signature)?;
     let (checksum, size) = manifest_entry(&fs::read(&manifest)?, &version, platform)?;
     // Reinstalling the active version must not replace the rollback copy.
-    if fs::symlink_metadata(layout.target).is_ok() {
-        let (digest, length) = copy_hashed(
-            &mut open_no_follow(Path::new(layout.target))?,
-            &mut io::sink(),
-        )?;
-        if length == size && digest.eq_ignore_ascii_case(&checksum) {
-            return Ok(version);
-        }
+    if installed_matches(layout, &checksum, size)? {
+        return Ok(version);
     }
     let binary = work.path().join("claude");
     fetch(
-        layout,
+        source,
         &format!("{version}/{platform}/claude"),
         &binary,
         size,
@@ -308,13 +385,13 @@ fn replace_target(layout: &Layout, source: &Path, expected: Option<(&str, u64)>)
     let target = Path::new(layout.target);
     let directory = parent(target)?;
     let mut staged = tempfile::Builder::new()
-        .prefix(".claude.")
+        .prefix(&stage_prefix(layout))
         .tempfile_in(directory)
         .context("stage runtime beside its destination")?;
     let (digest, length) = copy_hashed(&mut open_no_follow(source)?, staged.as_file_mut())?;
     if let Some((checksum, size)) = expected {
         if length != size || !digest.eq_ignore_ascii_case(checksum) {
-            bail!("downloaded runtime does not match the signed manifest checksum");
+            bail!("downloaded runtime does not match its verified checksum");
         }
     }
     let file = staged.as_file();
@@ -348,7 +425,18 @@ fn rollback_directory<'a>(layout: &'a Layout) -> Result<&'a Path> {
     Ok(directory)
 }
 
+/// Staged copies are named after the runtime, for example `.codex.XXXX`.
+fn stage_prefix(layout: &Layout) -> String {
+    let name = Path::new(layout.target)
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    format!(".{name}.")
+}
+
+/// Runs under the shared runtime lock, so every work directory is stale.
 fn remove_stale(layout: &Layout) -> Result<()> {
+    let prefix = stage_prefix(layout);
     for directory in [
         parent(Path::new(layout.target))?,
         parent(Path::new(layout.previous))?,
@@ -361,7 +449,7 @@ fn remove_stale(layout: &Layout) -> Result<()> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let kind = entry.file_type()?;
-            if name.starts_with(".claude.") && kind.is_file() {
+            if name.starts_with(&prefix) && kind.is_file() {
                 fs::remove_file(entry.path())?;
             } else if name.starts_with("jarvis-runtime.") && kind.is_dir() {
                 fs::remove_dir_all(entry.path())?;
@@ -376,7 +464,7 @@ fn keep_previous(layout: &Layout) -> Result<()> {
     let directory = parent(previous)?;
     check_tree(layout, previous)?;
     let mut staged = tempfile::Builder::new()
-        .prefix(".claude.")
+        .prefix(&stage_prefix(layout))
         .tempfile_in(directory)?;
     copy_hashed(
         &mut open_no_follow(Path::new(layout.target))?,
@@ -441,16 +529,37 @@ fn owned_regular_file(layout: &Layout, path: &Path) -> Result<()> {
     check_tree(layout, path)
 }
 
-fn fetch(layout: &Layout, path: &str, output: &Path, limit: u64, seconds: u32) -> Result<()> {
+fn fetch(source: &ClaudeSource, path: &str, output: &Path, limit: u64, seconds: u32) -> Result<()> {
+    curl(
+        source.protocol,
+        &format!("{}/{path}", source.base_url),
+        output,
+        limit,
+        seconds,
+    )
+    .with_context(|| format!("runtime download failed: {path}"))
+    .map(|_| ())
+}
+
+/// One bounded GET that never follows a redirect. Returns the HTTP status and
+/// the redirect target curl reports (empty without one).
+fn curl(
+    protocol: &str,
+    url: &str,
+    output: &Path,
+    limit: u64,
+    seconds: u32,
+) -> Result<(String, String)> {
     validate_system_executable(CURL)?;
-    // `-q` (first) ignores any curlrc; redirects are never followed.
-    let status = Command::new(CURL)
+    // `-q` (first) ignores any curlrc; `--globoff` keeps `[]{}` in a URL literal.
+    let result = Command::new(CURL)
         .args([
             "-q",
             "--fail",
             "--silent",
+            "--globoff",
             "--proto",
-            layout.protocol,
+            protocol,
             "--tlsv1.2",
         ])
         .args([
@@ -459,33 +568,42 @@ fn fetch(layout: &Layout, path: &str, output: &Path, limit: u64, seconds: u32) -
             "--max-time",
             &seconds.to_string(),
         ])
-        .args(["--max-filesize", &limit.to_string(), "--output"])
+        .args(["--max-filesize", &limit.to_string()])
+        .args(["--write-out", "%{http_code} %{redirect_url}", "--output"])
         .arg(output)
-        .arg(format!("{}/{path}", layout.base_url))
+        .arg(url)
         .env_clear()
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .output()
         .context("start runtime download")?;
-    if !status.success() {
-        bail!("runtime download failed: {path}");
+    if !result.status.success() {
+        bail!("download did not complete");
     }
     let metadata = fs::symlink_metadata(output).context("inspect runtime download")?;
     if !metadata.is_file() || metadata.len() > limit {
-        bail!("runtime download exceeded its size bound: {path}");
+        bail!("download exceeded its size bound");
     }
-    Ok(())
+    let written = String::from_utf8(result.stdout).context("unexpected download status")?;
+    let (code, location) = written
+        .split_once(' ')
+        .context("unexpected download status")?;
+    Ok((code.to_owned(), location.to_owned()))
 }
 
-fn verify_signature(layout: &Layout, work: &Path, manifest: &Path, signature: &Path) -> Result<()> {
+fn verify_signature(
+    source: &ClaudeSource,
+    work: &Path,
+    manifest: &Path,
+    signature: &Path,
+) -> Result<()> {
     validate_system_executable(GPG)?;
     validate_system_executable(GPGV)?;
     let home = work.join("gnupg");
     DirBuilder::new().mode(0o700).create(&home)?;
     let armored = work.join("release-key.asc");
     let keyring = work.join("release-key.gpg");
-    fs::write(&armored, layout.key)?;
+    fs::write(&armored, source.key)?;
     let dearmored = Command::new(GPG)
         .args(["--batch", "--no-options", "--homedir"])
         .arg(&home)
@@ -521,7 +639,7 @@ fn verify_signature(layout: &Layout, work: &Path, manifest: &Path, signature: &P
     // The last VALIDSIG field is the primary key fingerprint.
     let pinned = status.lines().any(|line| {
         line.starts_with("[GNUPG:] VALIDSIG ")
-            && line.split_whitespace().last() == Some(layout.fingerprint)
+            && line.split_whitespace().last() == Some(source.fingerprint)
     });
     if !output.status.success() || !good || !pinned {
         bail!("release manifest signature is not valid for the pinned Claude Code release key");
@@ -615,7 +733,7 @@ fn reviewed(version: &str) -> bool {
     jarvis_llm::claude_worker_protocol::reviewed_claude_version(version.as_bytes())
 }
 
-fn copy_hashed(source: &mut File, destination: &mut impl Write) -> Result<(String, u64)> {
+fn copy_hashed(source: &mut impl Read, destination: &mut impl Write) -> Result<(String, u64)> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut length = 0u64;
@@ -751,13 +869,18 @@ mod tests {
             }
         }
 
-        fn layout(&self) -> Layout<'_> {
-            let owner = unsafe { (libc::geteuid(), libc::getegid()) };
-            Layout {
+        fn source(&self) -> ClaudeSource<'_> {
+            ClaudeSource {
                 base_url: &self.paths[3],
                 protocol: "=file",
                 key: &self.key,
                 fingerprint: &self.fingerprint,
+            }
+        }
+
+        fn layout(&self) -> Layout<'_> {
+            let owner = unsafe { (libc::geteuid(), libc::getegid()) };
+            Layout {
                 target: &self.paths[1],
                 previous: &self.paths[2],
                 trusted_root: self.root.path().to_str().unwrap(),
@@ -826,7 +949,7 @@ mod tests {
         /// leaves the target, rollback copy and target directory untouched.
         fn assert_refused(&self, request: VersionRequest, expected: &str) {
             let before = (self.target(), self.previous(), self.bin_entries());
-            let error = install(&self.layout(), &request, PLATFORM).unwrap_err();
+            let error = install(&self.layout(), &self.source(), &request, PLATFORM).unwrap_err();
             assert!(format!("{error:#}").contains(expected), "{error:#}");
             assert_eq!((self.target(), self.previous(), self.bin_entries()), before);
         }
@@ -851,7 +974,7 @@ mod tests {
             .lines()
             .filter_map(|line| line.strip_prefix("fpr:::::::::"))
             .collect::<Vec<_>>();
-        assert_eq!(fingerprints, [format!("{}:", PRODUCTION.fingerprint)]);
+        assert_eq!(fingerprints, [format!("{}:", CLAUDE_SOURCE.fingerprint)]);
         assert_eq!(
             listing
                 .lines()
@@ -864,10 +987,10 @@ mod tests {
     #[test]
     fn production_source_and_destination_are_fixed() {
         assert_eq!(
-            PRODUCTION.base_url,
+            CLAUDE_SOURCE.base_url,
             "https://downloads.claude.ai/claude-code-releases"
         );
-        assert_eq!(PRODUCTION.protocol, "=https");
+        assert_eq!(CLAUDE_SOURCE.protocol, "=https");
         assert_eq!(PRODUCTION.target, AccountProvider::Claude.binary());
         assert_eq!(PRODUCTION.owner, (0, 0));
         assert_eq!(PRODUCTION.trusted_root, "/");
@@ -905,8 +1028,12 @@ mod tests {
         fixture.release("2.1.300", b"runtime-300");
         fixture.pointer("stable", "2.1.300\n");
         let layout = fixture.layout();
+        let source = fixture.source();
         let request = VersionRequest::Channel(Channel::Stable);
-        assert_eq!(install(&layout, &request, PLATFORM).unwrap(), "2.1.300");
+        assert_eq!(
+            install(&layout, &source, &request, PLATFORM).unwrap(),
+            "2.1.300"
+        );
         assert_eq!(fixture.target().as_deref(), Some(&b"runtime-300"[..]));
         let mode = fs::metadata(layout.target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);
@@ -921,7 +1048,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            install(&layout, &exact("2.1.301"), PLATFORM).unwrap(),
+            install(&layout, &source, &exact("2.1.301"), PLATFORM).unwrap(),
             "2.1.301"
         );
         assert_eq!(fixture.target().as_deref(), Some(&b"runtime-301"[..]));
@@ -937,7 +1064,7 @@ mod tests {
 
         // Reinstalling the active version keeps the real rollback copy.
         assert_eq!(
-            install(&layout, &exact("2.1.301"), PLATFORM).unwrap(),
+            install(&layout, &source, &exact("2.1.301"), PLATFORM).unwrap(),
             "2.1.301"
         );
         assert_eq!(fixture.previous().as_deref(), Some(&b"runtime-300"[..]));
@@ -953,7 +1080,13 @@ mod tests {
     fn unverifiable_releases_are_refused_without_changes() {
         let fixture = Fixture::new();
         fixture.release("2.1.300", b"runtime-300");
-        install(&fixture.layout(), &exact("2.1.300"), PLATFORM).unwrap();
+        install(
+            &fixture.layout(),
+            &fixture.source(),
+            &exact("2.1.300"),
+            PLATFORM,
+        )
+        .unwrap();
 
         // Manifest altered after signing.
         let manifest = fixture.release("2.1.301", b"runtime-301");

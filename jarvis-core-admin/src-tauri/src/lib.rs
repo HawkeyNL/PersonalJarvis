@@ -236,6 +236,26 @@ async fn claude_runtime_mutation(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+async fn codex_runtime(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+) -> Result<admin::CodexRuntimeStatus, String> {
+    with_session(session, |session| admin::codex_runtime(&session)).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn codex_runtime_mutation(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+    request: admin::CodexRuntimeMutation,
+) -> Result<admin::OperationResult, String> {
+    with_session(session, move |session| {
+        admin::codex_runtime_mutation(&session, request)
+    })
+    .await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 async fn ai_account_action(
     session: tauri::State<'_, Arc<session::SessionManager>>,
     provider: admin::AiAccountProvider,
@@ -329,6 +349,8 @@ pub fn run() {
             ai_account_action,
             claude_runtime,
             claude_runtime_mutation,
+            codex_runtime,
+            codex_runtime_mutation,
             credential_set,
             devices_overview,
             device_action,

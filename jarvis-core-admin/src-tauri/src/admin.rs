@@ -585,6 +585,29 @@ pub enum ClaudeRuntimeMutation {
     Rollback {},
 }
 
+/// Sanitized official Codex CLI runtime state; versions are strict
+/// `MAJOR.MINOR.PATCH` and nothing else from the release service is kept.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexRuntimeStatus {
+    pub provider: String,
+    pub installed: bool,
+    pub version: Option<String>,
+    pub safe_ownership: bool,
+    pub latest: Option<String>,
+    pub update_available: bool,
+    pub rollback_available: bool,
+    pub cosign_available: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CodexRuntimeMutation {
+    InstallLatest {},
+    InstallVersion { version: String },
+    Rollback {},
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CredentialProvider {
@@ -965,16 +988,17 @@ pub fn claude_runtime(session: &SessionManager) -> AdminResult<ClaudeRuntimeStat
     )?)
 }
 
-fn validate_claude_runtime(status: ClaudeRuntimeStatus) -> AdminResult<ClaudeRuntimeStatus> {
-    let strict = |version: &Option<String>| {
-        version.as_deref().is_none_or(|version| {
-            let parts = version.split('.').collect::<Vec<_>>();
-            parts.len() == 3
-                && parts.iter().all(|part| {
-                    (1..=9).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit())
-                })
+/// `MAJOR.MINOR.PATCH`, ASCII digits only.
+fn strict_runtime_version(version: &str) -> bool {
+    let parts = version.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            (1..=9).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit())
         })
-    };
+}
+
+fn validate_claude_runtime(status: ClaudeRuntimeStatus) -> AdminResult<ClaudeRuntimeStatus> {
+    let strict = |version: &Option<String>| version.as_deref().is_none_or(strict_runtime_version);
     if status.provider != "claude" || !strict(&status.version) || !strict(&status.latest_stable) {
         return Err("Claude runtime status contained unexpected metadata".to_owned());
     }
@@ -1019,6 +1043,59 @@ fn claude_runtime_arguments(request: &ClaudeRuntimeMutation) -> (Vec<String>, Du
             Duration::from_secs(300),
         ),
     }
+}
+
+pub fn codex_runtime(session: &SessionManager) -> AdminResult<CodexRuntimeStatus> {
+    validate_codex_runtime(parse_json(
+        &session.run(BrokerRequest::CodexRuntime)?.stdout,
+    )?)
+}
+
+fn validate_codex_runtime(status: CodexRuntimeStatus) -> AdminResult<CodexRuntimeStatus> {
+    let strict = |version: &Option<String>| version.as_deref().is_none_or(strict_runtime_version);
+    if status.provider != "codex" || !strict(&status.version) || !strict(&status.latest) {
+        return Err("Codex runtime status contained unexpected metadata".to_owned());
+    }
+    Ok(status)
+}
+
+pub fn codex_runtime_mutation(
+    session: &SessionManager,
+    request: CodexRuntimeMutation,
+) -> AdminResult<OperationResult> {
+    let summary = match request {
+        CodexRuntimeMutation::InstallLatest {} | CodexRuntimeMutation::InstallVersion { .. } => {
+            "Codex CLI runtime installed and verified"
+        }
+        CodexRuntimeMutation::Rollback {} => "Previous Codex CLI runtime restored",
+    };
+    operation(
+        session.run(BrokerRequest::CodexRuntimeMutation { request })?,
+        summary,
+    )
+}
+
+/// Fixed argv for each typed runtime request; a strict version is the only
+/// input, re-checked here because the request crosses the broker boundary.
+fn codex_runtime_arguments(request: &CodexRuntimeMutation) -> AdminResult<(Vec<String>, Duration)> {
+    let mut args = ["accounts", "runtime"].map(str::to_owned).to_vec();
+    match request {
+        CodexRuntimeMutation::InstallLatest {} => {
+            args.extend(["install", "codex", "--channel", "latest"].map(str::to_owned));
+        }
+        CodexRuntimeMutation::InstallVersion { version } => {
+            if !strict_runtime_version(version) {
+                return Err("Codex version must be MAJOR.MINOR.PATCH".to_owned());
+            }
+            args.extend(["install", "codex", "--version", version].map(str::to_owned));
+        }
+        CodexRuntimeMutation::Rollback {} => {
+            args.extend(["rollback", "codex"].map(str::to_owned));
+            return Ok((args, Duration::from_secs(300)));
+        }
+    }
+    // Downloads (bounded by curl at 15 minutes), cosign (3 minutes) and copy.
+    Ok((args, Duration::from_secs(1_500)))
 }
 
 pub fn ai_account_action(
@@ -1624,6 +1701,17 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
             let (args, timeout) = claude_runtime_arguments(&request);
             (ADMIN, args, timeout)
         }
+        BrokerRequest::CodexRuntime => (
+            ADMIN,
+            ["--json", "accounts", "runtime", "status", "codex"]
+                .map(str::to_owned)
+                .to_vec(),
+            Duration::from_secs(60),
+        ),
+        BrokerRequest::CodexRuntimeMutation { request } => {
+            let (args, timeout) = codex_runtime_arguments(&request)?;
+            (ADMIN, args, timeout)
+        }
         BrokerRequest::Logs { query } => {
             if !(1..=2_000).contains(&query.lines) {
                 return Err("log line count must be between 1 and 2000".to_owned());
@@ -1975,6 +2063,98 @@ mod tests {
                 "{payload}"
             );
         }
+    }
+
+    #[test]
+    fn codex_runtime_requests_map_to_fixed_arguments() {
+        let parse = |payload: &str| serde_json::from_str::<CodexRuntimeMutation>(payload);
+        let args = |payload: &str| codex_runtime_arguments(&parse(payload).unwrap());
+        assert_eq!(
+            args(r#"{"action":"install_latest"}"#).unwrap().0,
+            [
+                "accounts",
+                "runtime",
+                "install",
+                "codex",
+                "--channel",
+                "latest"
+            ]
+        );
+        assert_eq!(
+            args(r#"{"action":"install_version","version":"0.160.0"}"#)
+                .unwrap()
+                .0,
+            [
+                "accounts",
+                "runtime",
+                "install",
+                "codex",
+                "--version",
+                "0.160.0"
+            ]
+        );
+        assert_eq!(
+            args(r#"{"action":"rollback"}"#).unwrap().0,
+            ["accounts", "runtime", "rollback", "codex"]
+        );
+        for version in [
+            "0.160",
+            "v0.160.0",
+            "0.160.0-alpha.1",
+            "0.160.0 --channel",
+            "--channel",
+        ] {
+            let payload = serde_json::json!({ "action": "install_version", "version": version });
+            assert!(args(&payload.to_string()).is_err(), "{version}");
+        }
+        for payload in [
+            r#"{"action":"install"}"#,
+            r#"{"action":"install_version"}"#,
+            r#"{"action":"install_latest","version":"0.160.0"}"#,
+            r#"{"action":"install_latest","channel":"stable"}"#,
+            r#"{"action":"rollback","provider":"claude"}"#,
+            r#"{"action":"remove"}"#,
+        ] {
+            assert!(parse(payload).is_err(), "{payload}");
+        }
+    }
+
+    #[test]
+    fn codex_runtime_status_keeps_only_strict_versions() {
+        let status = |version: Option<&str>, latest: Option<&str>| CodexRuntimeStatus {
+            provider: "codex".to_owned(),
+            installed: version.is_some(),
+            version: version.map(str::to_owned),
+            safe_ownership: true,
+            latest: latest.map(str::to_owned),
+            update_available: false,
+            rollback_available: false,
+            cosign_available: true,
+        };
+        assert!(validate_codex_runtime(status(Some("0.160.0"), Some("0.161.0"))).is_ok());
+        assert!(validate_codex_runtime(status(None, None)).is_ok());
+        for bad in [
+            "0.160",
+            "codex-cli 0.160.0",
+            "rust-v0.160.0",
+            "<b>0.160.0</b>",
+        ] {
+            assert!(
+                validate_codex_runtime(status(Some(bad), None)).is_err(),
+                "{bad}"
+            );
+            assert!(
+                validate_codex_runtime(status(None, Some(bad))).is_err(),
+                "{bad}"
+            );
+        }
+        let mut other = status(None, None);
+        other.provider = "claude".to_owned();
+        assert!(validate_codex_runtime(other).is_err());
+        assert!(serde_json::from_str::<CodexRuntimeStatus>(
+            r#"{"provider":"codex","installed":false,"version":null,"safe_ownership":false,"latest":null,"update_available":false,"rollback_available":false,"cosign_available":false,"url":"/x"}"#
+        )
+        .is_err());
     }
 
     #[test]

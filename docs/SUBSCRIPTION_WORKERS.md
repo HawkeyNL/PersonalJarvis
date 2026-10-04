@@ -13,10 +13,10 @@ dedicated `jarvis-claude` identity. Codex uses `codex login --device-auth`,
 `codex login status` and `codex logout` under `jarvis-codex`. These are distinct
 from Anthropic/OpenAI API keys. The root-owned official CLI executables must be
 installed at `/usr/local/bin/claude` and `/usr/local/bin/codex` before linking.
-Claude Code can be installed by the owner from Core Admin or the admin CLI (see
-[Installing the Claude Code runtime](#installing-the-claude-code-runtime));
-Codex is installed manually for now. No updater or worker ever downloads a
-moving CLI version automatically.
+Both can be installed by the owner from Core Admin or the admin CLI (see
+[Installing the Claude Code runtime](#installing-the-claude-code-runtime) and
+[Installing the Codex CLI runtime](#installing-the-codex-cli-runtime)). No
+updater or worker ever downloads a moving CLI version automatically.
 Neither worker uses the owner's home or browser profile. An administrator must
 verify the installed CLI version and its supported login/runtime flags against
 the [Claude Code authentication documentation](https://code.claude.com/docs/en/authentication),
@@ -209,6 +209,83 @@ signature with `gpgv --keyring <dearmored deploy/keys/claude-code-release.asc>`
 and the checksum with `sha256sum`, then
 `sudo install -o root -g root -m 0755 claude /usr/local/bin/claude`.
 
+## Installing the Codex CLI runtime
+
+Core Admin → AI Accounts shows, on the Codex (coding) card, the installed Codex
+version, whether its ownership is safe, the latest GitHub release, whether a
+rollback copy exists and whether `cosign` is installed. **Install / update
+runtime** (latest release or an exact version) and **Roll back runtime** send a
+fixed typed request through the existing privileged session; the host-local
+equivalents are:
+
+```sh
+sudo jarvis accounts runtime status codex
+sudo jarvis accounts runtime install codex --channel latest   # or --version 0.160.0
+sudo jarvis accounts runtime rollback codex
+```
+
+Owner steps:
+
+1. `sudo apt install cosign` (once). Without it the installer refuses to start.
+2. Install the runtime from Core Admin (or the command above).
+3. Review that exact version for the chat worker and set
+   `JARVIS_CODEX_REVIEWED_VERSION` (see
+   [Codex chat worker](#codex-chat-worker-text-only-off-by-default)); the
+   installer never changes the reviewed version.
+4. `sudo jarvis accounts connect codex` (coding login) and/or
+   `sudo jarvis accounts connect codex-chat` (chat worker login), or Connect in
+   Core Admin.
+
+The installer only uses `https://api.github.com/repos/openai/codex/releases`
+and `https://github.com/openai/codex/releases/download` (HTTPS only, bounded
+size and time) and fails closed at every step, in a private work directory
+inside the root-only `/usr/local/lib/jarvis` (never `$TMPDIR`):
+
+1. Refuse an unsafe destination (as for Claude: `/usr/local/bin/codex` may not
+   be a symlink or foreign-owned, no unsafe ancestor) and a missing or
+   non-root-controlled `/usr/bin/cosign`.
+2. Resolve `--version` (strict `MAJOR.MINOR.PATCH`) or the latest release from
+   the API; the release tag must be exactly `rust-v<version>`. There is no
+   version floor here: the chat worker's owner-set reviewed version is the
+   gate for use.
+3. Download `codex-<arch>-unknown-linux-musl.sigstore` and
+   `codex-<arch>-unknown-linux-musl.tar.gz`. GitHub answers with one redirect;
+   the installer follows exactly that hop by hand and only to
+   `https://objects.githubusercontent.com/` or
+   `https://release-assets.githubusercontent.com/`. Each file must match the
+   size and SHA-256 `digest` that the GitHub API publishes for it.
+4. Decompress with `/usr/bin/gzip` and accept only one ustar/GNU header for the
+   regular file `codex-<arch>-unknown-linux-musl` (at most 400 MiB) followed by
+   zero padding: links, other or `..`/absolute paths, extension headers and
+   extra members are refused.
+5. Check that the bundle's Rekor `hashedrekord` entry records the extracted
+   binary's SHA-256, then run, with a clean environment, a private `HOME` and a
+   3-minute bound:
+
+   ```sh
+   cosign verify-blob --offline=true --bundle codex-<arch>-unknown-linux-musl.sigstore \
+     --certificate-identity https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v<version> \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com codex
+   ```
+
+   The identity is matched exactly (no regular expression). `--offline` only
+   forbids an online Rekor search; the bundle's signed entry timestamp is still
+   checked against the Rekor key in Sigstore's TUF trusted root, which cosign
+   refreshes from its embedded root.
+6. If the installed binary is already identical, stop without changes.
+   Otherwise keep it as `/usr/local/lib/jarvis/codex.previous` and atomically
+   install the verified binary as `root:root 0755`, exactly as for Claude.
+
+The candidate is never executed as root: `runtime status` runs
+`codex --version` only as `jarvis-codex` in the hardened transient service.
+Rollback restores, unverified, whatever binary the last install replaced.
+Each install and rollback writes fixed `provider/action/version/outcome`
+events to `authpriv` syslog.
+
+Not verified on the Home Node yet: a real install with the Ubuntu cosign 2.6.2
+package (the tests use a fake cosign), including how it fetches the TUF
+trusted root.
+
 ## Production activation
 
 Before production activation, the owner must install and review the official
@@ -342,8 +419,8 @@ while the socket or service is enabled or active.
 
 Owner activation:
 
-1. Install the official Codex CLI as a root-owned regular file at
-   `/usr/local/bin/codex` (not a symlink or an npm wrapper).
+1. Install the official Codex CLI at `/usr/local/bin/codex` with the verified
+   installer ([Installing the Codex CLI runtime](#installing-the-codex-cli-runtime)).
 2. Check that this version supports every flag and `-c` key in the invocation
    above (`codex exec --help` and the official non-interactive and config
    documentation), that its `--json` events use the type names the worker
