@@ -3,7 +3,7 @@
 
 mod subscription_worker;
 
-use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+use std::{ffi::OsString, fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use jarvis_llm::claude_worker_protocol::{
@@ -26,6 +26,11 @@ const CLAUDE: &str = "/usr/local/bin/claude";
 const HOME: &str = "/var/lib/jarvis-claude";
 const RUNTIME: &str = "/run/jarvis-claude";
 const MAX_PARALLEL_RUNS: usize = 2;
+const RUN_TIMEOUT: Duration = Duration::from_secs(120);
+/// An owner-enabled research run searches the web first.
+const RESEARCH_RUN_TIMEOUT: Duration = Duration::from_secs(300);
+/// Search, read results, answer: enough turns for a few searches, bounded.
+const RESEARCH_MAX_TURNS: &str = "8";
 
 #[derive(Deserialize)]
 struct CliUsage {
@@ -77,11 +82,15 @@ async fn main() -> Result<()> {
         };
         tokio::spawn(async move {
             let _permit = permit;
-            let reply =
-                match tokio::time::timeout(Duration::from_secs(125), handle(&mut stream)).await {
-                    Ok(Ok(reply)) => reply,
-                    _ => ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure),
-                };
+            let reply = match tokio::time::timeout(
+                RESEARCH_RUN_TIMEOUT + Duration::from_secs(5),
+                handle(&mut stream),
+            )
+            .await
+            {
+                Ok(Ok(reply)) => reply,
+                _ => ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure),
+            };
             let _ = send(&mut stream, reply).await;
         });
     }
@@ -189,19 +198,11 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
         system_file = Some(file);
     }
     let mut command = clean_command();
-    command.args(["-p", "--output-format", "json", "--model", &request.model]);
-    command.args([
-        "--restricted",
-        "--bare",
-        "--no-session-persistence",
-        "--tools",
-        "",
-        "--disallowedTools",
-        "mcp__*",
-    ]);
-    if let Some(file) = system_file.as_ref() {
-        command.arg("--system-prompt-file").arg(file.path());
-    }
+    command.args(cli_args(
+        &request.model,
+        request.research,
+        system_file.as_ref().map(|file| file.path()),
+    ));
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -213,7 +214,12 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
     drop(stdin);
     let stdout = child.stdout.take().context("Claude stdout unavailable")?;
     let mut bytes = Vec::new();
-    let output = tokio::time::timeout(Duration::from_secs(120), async {
+    let limit = if request.research {
+        RESEARCH_RUN_TIMEOUT
+    } else {
+        RUN_TIMEOUT
+    };
+    let output = tokio::time::timeout(limit, async {
         stdout
             .take((MAX_REPLY_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
@@ -227,6 +233,47 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
         ));
     }
     Ok(parse_cli_reply(&bytes))
+}
+
+/// The reviewed `claude -p` invocation: restricted, bare, no session, no MCP
+/// and no built-in tool. Only an owner-enabled research run gets exactly one
+/// tool: `WebSearch`, which runs on Anthropic's side and returns titles and
+/// URLs. `WebFetch` (a host-side fetch) stays unavailable: `--restricted`
+/// removes it unless `--tools` names it, and `--tools` names only WebSearch.
+fn cli_args(model: &str, research: bool, system_prompt: Option<&Path>) -> Vec<OsString> {
+    let tools = if research { "WebSearch" } else { "" };
+    let mut args: Vec<OsString> = [
+        "-p",
+        "--output-format",
+        "json",
+        "--model",
+        model,
+        "--restricted",
+        "--bare",
+        "--no-session-persistence",
+        "--tools",
+        tools,
+        "--disallowedTools",
+        "mcp__*",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    if research {
+        // `-p` cannot ask for permission; allow exactly the one tool.
+        args.extend(
+            [
+                "--allowedTools",
+                "WebSearch",
+                "--max-turns",
+                RESEARCH_MAX_TURNS,
+            ]
+            .map(OsString::from),
+        );
+    }
+    if let Some(path) = system_prompt {
+        args.extend([OsString::from("--system-prompt-file"), path.into()]);
+    }
+    args
 }
 
 fn parse_cli_reply(bytes: &[u8]) -> ClaudeWorkerReply {
@@ -306,6 +353,46 @@ mod tests {
         assert_eq!(environment.get("DISABLE_UPDATES"), Some(&Some("1")));
         assert_eq!(environment.get("DISABLE_AUTOUPDATER"), Some(&Some("1")));
         assert!(!environment.contains_key("ANTHROPIC_API_KEY"));
+    }
+
+    fn argv(research: bool, system_prompt: Option<&Path>) -> String {
+        cli_args("claude-opus-5", research, system_prompt)
+            .iter()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn argv_is_exactly_the_reviewed_invocation() {
+        let prompt = Path::new("/run/jarvis-claude/.tmpX");
+        assert_eq!(
+            argv(false, Some(prompt)),
+            "-p --output-format json --model claude-opus-5 --restricted --bare \
+             --no-session-persistence --tools  --disallowedTools mcp__* \
+             --system-prompt-file /run/jarvis-claude/.tmpX"
+        );
+        assert_eq!(cli_args("m", false, None)[9], OsString::from(""));
+        assert_eq!(
+            argv(true, Some(prompt)),
+            "-p --output-format json --model claude-opus-5 --restricted --bare \
+             --no-session-persistence --tools WebSearch --disallowedTools mcp__* \
+             --allowedTools WebSearch --max-turns 8 \
+             --system-prompt-file /run/jarvis-claude/.tmpX"
+        );
+        // Never the host-side fetch, never an MCP or command tool.
+        for research in [false, true] {
+            let args = argv(research, None);
+            for forbidden in [
+                "WebFetch",
+                "Bash",
+                "default",
+                "--dangerously",
+                "--mcp-config",
+            ] {
+                assert!(!args.contains(forbidden), "{forbidden}");
+            }
+        }
     }
 
     #[test]

@@ -11,11 +11,16 @@ use crate::{
         ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState, MAX_REPLY_BYTES,
         MAX_REQUEST_BYTES, SOCKET,
     },
-    types::{ChatMessage, ChatReply, ChatRequest, LlmError, Role, Tier, Usage},
+    types::{
+        ChatMessage, ChatReply, ChatRequest, LlmError, ResearchRequest, Role, Tier, Usage,
+        RESEARCH_SYSTEM_PROMPT,
+    },
     LlmProvider,
 };
 
 const WORKER_TIMEOUT: Duration = Duration::from_secs(125);
+/// Research runs search the web first; the worker stops them at 300 s.
+const RESEARCH_WORKER_TIMEOUT: Duration = Duration::from_secs(310);
 
 pub struct ClaudeCliProvider {
     model_default: String,
@@ -63,6 +68,11 @@ impl LlmProvider for ClaudeCliProvider {
             .unwrap_or_else(|| self.model_for(req.tier).to_owned());
         CLAUDE_WORKER.chat(model, req).await
     }
+
+    async fn research(&self, req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+        let model = req.model.clone().unwrap_or_else(|| self.model_hard.clone());
+        CLAUDE_WORKER.research(model, req).await
+    }
 }
 
 /// One local subscription worker: a fixed socket speaking the finite worker
@@ -90,7 +100,27 @@ impl SubscriptionWorker {
             model,
             system: req.system.clone(),
             prompt: build_bounded_prompt(&req.messages),
+            research: false,
         };
+        self.send(request, WORKER_TIMEOUT).await
+    }
+
+    /// A research run: the bounded question and the fixed research prompt,
+    /// nothing else.
+    pub(crate) async fn research(
+        &self,
+        model: String,
+        req: &ResearchRequest,
+    ) -> Result<ChatReply, LlmError> {
+        self.send(research_worker_request(model, req), RESEARCH_WORKER_TIMEOUT)
+            .await
+    }
+
+    async fn send(
+        &self,
+        request: ClaudeWorkerRequest,
+        timeout: Duration,
+    ) -> Result<ChatReply, LlmError> {
         if !request.valid() {
             return Err(LlmError::NotConfigured(format!(
                 "{} worker request exceeds the bounded context policy",
@@ -102,7 +132,7 @@ impl SubscriptionWorker {
         if payload.len() + 1 > MAX_REQUEST_BYTES {
             return Err(self.failure());
         }
-        let reply = tokio::time::timeout(WORKER_TIMEOUT, async {
+        let reply = tokio::time::timeout(timeout, async {
             let mut socket = UnixStream::connect(self.socket)
                 .await
                 .map_err(|_| self.failure())?;
@@ -194,6 +224,16 @@ impl SubscriptionWorker {
     }
 }
 
+fn research_worker_request(model: String, req: &ResearchRequest) -> ClaudeWorkerRequest {
+    ClaudeWorkerRequest {
+        protocol: 1,
+        model,
+        system: Some(RESEARCH_SYSTEM_PROMPT.to_owned()),
+        prompt: req.question().to_owned(),
+        research: true,
+    }
+}
+
 /// Include only the most recent eight turns, with an aggregate character cap.
 fn build_bounded_prompt(messages: &[ChatMessage]) -> String {
     let mut selected = Vec::new();
@@ -242,6 +282,29 @@ mod tests {
         assert!(prompt.contains("recent 8"));
         let large = build_bounded_prompt(&[ChatMessage::user("x".repeat(100_000))]);
         assert!(large.len() < 25_000);
+    }
+
+    #[test]
+    fn research_request_carries_only_the_question_and_the_fixed_prompt() {
+        let request = research_worker_request(
+            "claude-opus-5".into(),
+            &ResearchRequest::new("Wat is de laatste Rust-release?").unwrap(),
+        );
+        assert!(request.research);
+        assert!(request.valid());
+        assert_eq!(request.prompt, "Wat is de laatste Rust-release?");
+        assert_eq!(request.system.as_deref(), Some(RESEARCH_SYSTEM_PROMPT));
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "protocol": 1,
+                "model": "claude-opus-5",
+                "system": RESEARCH_SYSTEM_PROMPT,
+                "prompt": "Wat is de laatste Rust-release?",
+                "research": true,
+            })
+        );
     }
 
     #[test]

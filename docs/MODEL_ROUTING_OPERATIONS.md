@@ -135,7 +135,9 @@ health.
    "hard":  {"chain": [{"provider": "claude-cli", "model": "claude-opus-5"}]}}}
 ```
 
-Validation (Core, broker and CLI apply the same rules): only these fields;
+Validation (Core, broker and CLI apply the same rules): only these fields
+(plus the optional `research_web_search`, see
+[Research web search](#research-web-search-off-by-default));
 `version` is 1; at most 64 KiB; tiers are `cheap`, `default` and `hard`; a
 missing tier keeps the built-in order for that tier; a chain has 1 to 9
 entries; providers are the routable provider IDs (`anthropic-api`,
@@ -180,7 +182,8 @@ Failure behaviour:
 
 Core reads routing only at startup and through the signed broker path; there
 is no file watcher. `GET /v1/system/models` reports `routing`,
-`routing_sha256`, `routing_unavailable_reason` and `routing_mutation`
+`routing_sha256`, `routing_unavailable_reason`, `research_web_search`
+(`on` or `off`, the effective state) and `routing_mutation`
 (`device-signed-model-route-v1` when the broker is available and the file is
 readable, otherwise `unavailable`).
 
@@ -194,6 +197,7 @@ sudo jarvis models route set cheap zai-api glm-5.3-flash claude-cli claude-haiku
 sudo jarvis models route set default claude-cli claude-opus-5 anthropic-api claude-opus-5 --metered-after-subscription
 sudo jarvis models route reset cheap
 sudo jarvis models route paid-api off
+sudo jarvis models route research-web-search on   # or off
 ```
 
 Every command takes the policy directory lock. Changes validate the complete
@@ -215,8 +219,12 @@ read safely.
 The canonical payload is compact JSON without whitespace, in this field order:
 `action`, `routing` (`version`, `paid_api`, `tiers` with `cheap`, `default`,
 `hard`; each tier `chain` of `provider`, `model`, then
-`metered_after_subscription`), `expected_routing_sha256`. An absent tier is
-omitted; `paid_api` and `metered_after_subscription` are always written. Only
+`metered_after_subscription`; then `research_web_search`),
+`expected_routing_sha256`. An absent tier is omitted; `paid_api` and
+`metered_after_subscription` are always written; `research_web_search` is
+written only when `"on"`, so the fixed vector below is unchanged. An app that
+does not know the field drops it from a full replacement, which turns research
+off (fail closed). Only
 `"` and `\` are escaped; `/` and non-ASCII characters are written as UTF-8.
 Fixed vector (in `crates/client-core/src/model_control.rs`):
 
@@ -233,6 +241,45 @@ if it is exactly the signed document and the live routing did not change
 meanwhile. A lost reply, a different read-back or a concurrent change turns
 paid APIs off (`routing_activation_unverified`). The signed request must fit
 the broker's 16 KiB frame.
+
+### Research web search (off by default)
+
+`"research_web_search": "on"` is the owner's opt-in for web search. Absent or
+`"off"` is the default; an unusable routing file keeps it off. Turn it on or off
+with `sudo jarvis models route research-web-search on|off`, in the Core Admin
+model routing card or with a signed app change. Like every routing
+change it restarts Core.
+
+When it is on, only a request with the explicit mode `research` searches. A
+classifier that guesses "research" for an Auto request does not: that request
+stays an ordinary hard-tier answer without tools. A research request:
+
+- sends **only the latest user question** (trimmed, at most 2000 characters;
+  a longer question is refused, never cut) with a fixed research instruction
+  that asks for an answer and a `Sources:` list of https URLs. No persona,
+  memory, conversation history, device or location data goes with it. Core
+  builds it through a separate code path (`ResearchRequest`) that has no field
+  for anything else;
+- runs only on a subscription worker that supports research (`claude-cli`,
+  `codex-cli`), taken from the owner's `hard` chain in order (or the built-in
+  hard order, which reaches `claude-cli`), with an owner-enabled model;
+- never uses a paid API: metered providers have no web search here at all,
+  and there is no paid fallback, `paid_api` and `metered_after_subscription`
+  notwithstanding;
+- answers with a fixed notice when research is off, the question is too long,
+  or no capable subscription answered ("Research staat uit" / "Research is nu
+  niet beschikbaar"), never with a silent non-search or paid answer.
+
+**What leaves the Home Node.** The question and the fixed instruction go to
+the subscription provider (Anthropic for `claude-cli`, OpenAI for
+`codex-cli`). The provider runs the search on its own servers and may pass the
+search queries, which can contain words from the question, to its search
+partners. The Home Node itself fetches nothing: no browser, no local fetch.
+The answer, with the source URLs the model reports, is stored in the
+conversation like any other answer; the app shows links through its safe
+Markdown renderer (https only). Web content is untrusted: the model is told to
+ignore instructions in it, and it cannot trigger any other tool (see
+`SUBSCRIPTION_WORKERS.md`, "Research runs").
 
 ## Routing, health and spend
 

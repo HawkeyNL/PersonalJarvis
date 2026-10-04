@@ -421,6 +421,62 @@ enforce it: `jarvis-codex-chat.socket` and `.service` declare
 side stops the other, and `verify-home-node.sh` fails when the chat worker and
 a coding unit are enabled or running together.
 
+## Research runs (owner opt-in)
+
+Both workers accept a `research` flag in the request. Core sets it only for an
+explicit Research request while the owner's `research_web_search` switch in
+`routing.json` is on (see `MODEL_ROUTING_OPERATIONS.md`). The request then
+carries only the latest question (at most 2000 characters; the worker accepts
+at most 8 KiB) and a fixed research instruction. Without the flag, both
+workers run exactly as described above, with every tool off.
+
+**Claude.** A research run changes only the tool flags of the reviewed
+invocation:
+
+```text
+claude -p --output-format json --model <model> --restricted --bare
+  --no-session-persistence --tools WebSearch --disallowedTools mcp__*
+  --allowedTools WebSearch --max-turns 8 [--system-prompt-file <private file>]
+```
+
+`--tools WebSearch` makes `WebSearch` the only built-in tool (the CLI
+reference: `--tools` restricts the built-in tools to the named ones;
+`--allowedTools` lets that tool run without a permission prompt, which `-p`
+cannot show). `WebSearch` runs on Anthropic's web search backend and returns
+titles and URLs; it does not fetch pages (Claude Code tools reference,
+"WebSearch tool behavior"). `WebFetch`, which would fetch URLs from this host,
+stays unavailable: `--restricted` removes it unless `--tools` names it, and
+`--tools` does not. MCP stays denied and `--bare`, `--restricted` and
+`--no-session-persistence` stay. The CLI reference names no newer version
+requirement for these flags, so the 2.1.248 gate is unchanged; a real research
+run has not been accepted on the Home Node yet.
+
+**Codex.** A research run changes only `-c web_search=disabled` into
+`-c web_search=live` (Codex config reference: `web_search` is
+`disabled | cached | indexed | live`). The search is OpenAI's hosted web search
+tool; the CLI fetches nothing itself. The event allowlist then also accepts
+`web_search` items (codex-rs `exec` JSONL `item.started|updated|completed` with
+`item.type == "web_search"`) whose `action.type` is `search`, `open_page` or
+`find_in_page`, or that have no action. Every other tool item (command, MCP,
+collab tool, file change, plan update), a web search with an unknown or
+`other` action, a web search in an ordinary run, and any unknown event still
+stops the whole run with `tool_use_refused`.
+
+**Bounds.** A research run stops after 300 seconds (Core waits 310 seconds);
+ordinary runs keep 120 seconds. The output bounds are unchanged (Claude: 256
+KiB CLI result; Codex: 512 KiB per event, 4 MiB stream, 128 KiB answer). The
+two parallel runs per worker are shared with ordinary chat, so two long
+research runs can make chat wait for a free slot.
+
+**Prompt injection.** Search results can contain instructions. The research
+instruction tells the model to treat web content as data, and the worker
+limits what an injected instruction could do: Claude has no tool except
+`WebSearch` (besides the CLI's own `EndConversation`) and at most 8 turns,
+and Codex runs that use any other tool are killed and discarded. The run's
+context holds only the question, so there is no private data to leak into a
+search query. No unit or network change is needed: the search runs on the
+provider's side and neither worker fetches web pages itself.
+
 ### Retired jarvis-codex-chat identity
 
 Earlier releases ran the chat worker as a separate `jarvis-codex-chat` user

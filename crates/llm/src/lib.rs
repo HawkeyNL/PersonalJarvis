@@ -45,8 +45,9 @@ pub use routing::{
 };
 pub use stream::TextDeltaSink;
 pub use types::{
-    classify_task, ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, Role,
-    RoutingMode, TaskRequirements, Tier, Usage,
+    classify_task, ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, ResearchRequest,
+    Role, RoutingMode, TaskRequirements, Tier, Usage, MAX_RESEARCH_QUESTION_CHARS,
+    RESEARCH_SYSTEM_PROMPT,
 };
 
 /// A swappable brain: given a conversation, produce a reply.
@@ -69,6 +70,14 @@ pub trait LlmProvider: Send + Sync {
         _text: TextDeltaSink,
     ) -> Result<ChatReply, LlmError> {
         self.chat(req).await
+    }
+    /// Answer one question with provider-hosted web search. Only the
+    /// subscription workers and the router implement it; every other backend,
+    /// paid APIs included, refuses.
+    async fn research(&self, _req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+        Err(LlmError::NotConfigured(
+            "research web search is not supported by this backend".into(),
+        ))
     }
 }
 

@@ -377,7 +377,18 @@ pub(super) async fn execute_chat(
         .as_ref()
         .map(|run| run.run_id.to_string())
         .unwrap_or_else(|| Uuid::now_v7().to_string());
-    let reply = if let Some(run) = &realtime_run {
+    // Only an explicit owner Research request may search the web; a
+    // classifier's Research advice stays an ordinary hard-tier answer. The
+    // research path receives the latest question alone: no persona, memory,
+    // history or device data.
+    let reply = if requested_mode == llm::RoutingMode::Research {
+        Ok(research_reply(
+            &state.model_routing.snapshot(),
+            state.llm.as_ref(),
+            &new_msg,
+        )
+        .await)
+    } else if let Some(run) = &realtime_run {
         let hub = state.realtime.clone();
         let run = run.clone();
         let user = authed.user.id;
@@ -514,6 +525,45 @@ pub(super) async fn execute_chat(
                     "conversation_id": conv_id,
                 })),
             ))
+        }
+    }
+}
+
+const RESEARCH_OFF: &str = "Research staat uit. De eigenaar kan zoeken op het web aanzetten met \
+`sudo jarvis models route research-web-search on` of in Core Admin (Model routing).";
+const RESEARCH_UNAVAILABLE: &str = "Research is nu niet beschikbaar: geen ingeschakeld \
+abonnement (claude-cli of codex-cli) kon de vraag uitvoeren. Er is geen betaalde API gebruikt.";
+
+/// The answer to an explicit Research request. Off, too long or unavailable
+/// is a clear, fixed answer, never a silent paid-API or non-search answer.
+async fn research_reply(
+    routing: &llm::RoutingSnapshot,
+    brain: &dyn llm::LlmProvider,
+    latest_question: &str,
+) -> llm::ChatReply {
+    let notice = |text: String| llm::ChatReply {
+        text,
+        model: "research".into(),
+        backend: None,
+        requested_route: None,
+        actual_provider: None,
+        stop_reason: Some("research_unavailable".into()),
+        usage: None,
+    };
+    if !routing.research_web_search_on() {
+        return notice(RESEARCH_OFF.into());
+    }
+    let Some(request) = llm::ResearchRequest::new(latest_question) else {
+        return notice(format!(
+            "Je research-vraag is te lang: maximaal {} tekens. Stel een kortere vraag.",
+            llm::MAX_RESEARCH_QUESTION_CHARS
+        ));
+    };
+    match brain.research(&request).await {
+        Ok(reply) => reply,
+        Err(error) => {
+            tracing::warn!(failure = ?error.failure_category(), "research unavailable");
+            notice(RESEARCH_UNAVAILABLE.into())
         }
     }
 }
@@ -846,5 +896,97 @@ pub(crate) async fn assistant_orchestrate(
                 })),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records what research received; ordinary chat must never be used.
+    #[derive(Default)]
+    struct Recorder {
+        seen: Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl llm::LlmProvider for Recorder {
+        fn label(&self) -> &str {
+            "recorder"
+        }
+        async fn chat(&self, _req: &llm::ChatRequest) -> Result<llm::ChatReply, llm::LlmError> {
+            panic!("research must never fall back to an ordinary chat");
+        }
+        async fn research(
+            &self,
+            req: &llm::ResearchRequest,
+        ) -> Result<llm::ChatReply, llm::LlmError> {
+            self.seen.lock().unwrap().push(req.question().to_owned());
+            if self.fail {
+                return Err(llm::LlmError::NotConfigured("no subscription".into()));
+            }
+            Ok(llm::ChatReply {
+                text: "Answer\nSources:\nhttps://example.org/a".into(),
+                model: "claude-opus-5".into(),
+                backend: Some("claude-cli".into()),
+                requested_route: None,
+                actual_provider: None,
+                stop_reason: Some("end_turn".into()),
+                usage: None,
+            })
+        }
+    }
+
+    fn routing(raw: &str) -> llm::RoutingSnapshot {
+        llm::RoutingSnapshot {
+            routing: Some(llm::ModelRouting::parse(raw.as_bytes()).unwrap()),
+            unavailable_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn research_off_is_a_clear_answer_and_calls_nothing() {
+        let brain = Recorder::default();
+        for snapshot in [
+            llm::RoutingSnapshot::default(),
+            routing(r#"{"version":1,"paid_api":"off"}"#),
+            llm::RoutingSnapshot::unavailable("routing_invalid"),
+        ] {
+            let reply = research_reply(&snapshot, &brain, "nieuws?").await;
+            assert_eq!(reply.text, RESEARCH_OFF);
+            assert!(reply.backend.is_none());
+        }
+        assert!(brain.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn research_sends_only_the_latest_question() {
+        let brain = Recorder::default();
+        let on = routing(r#"{"version":1,"research_web_search":"on"}"#);
+        let reply = research_reply(&on, &brain, "  Wat is de laatste Rust-release?  ").await;
+        assert_eq!(reply.text, "Answer\nSources:\nhttps://example.org/a");
+        assert_eq!(
+            *brain.seen.lock().unwrap(),
+            ["Wat is de laatste Rust-release?"]
+        );
+        // Overlong: refused with a clear answer, never cut or sent.
+        let long = "x".repeat(llm::MAX_RESEARCH_QUESTION_CHARS + 1);
+        let reply = research_reply(&on, &brain, &long).await;
+        assert!(reply.text.contains("te lang"));
+        assert_eq!(brain.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn research_without_a_subscription_says_so() {
+        let brain = Recorder {
+            fail: true,
+            ..Default::default()
+        };
+        let on = routing(r#"{"version":1,"research_web_search":"on"}"#);
+        let reply = research_reply(&on, &brain, "nieuws?").await;
+        assert_eq!(reply.text, RESEARCH_UNAVAILABLE);
+        assert!(reply.backend.is_none());
     }
 }
