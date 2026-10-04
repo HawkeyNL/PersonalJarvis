@@ -124,6 +124,11 @@ enum Commands {
         #[command(subcommand)]
         command: ServicesCommand,
     },
+    /// Deterministic disk housekeeping; see docs/HOUSEKEEPING.md.
+    Housekeeping {
+        #[command(subcommand)]
+        command: HousekeepingCommand,
+    },
     #[cfg(feature = "tui-preview")]
     /// Render fixture-only TUI states without administrative access.
     TuiPreview(TuiPreviewArgs),
@@ -495,6 +500,17 @@ enum AgentsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum HousekeepingCommand {
+    /// Read-only: what would be removed, sizes, disk free and the last run.
+    Status,
+    /// A dry run unless --apply; the daily timer runs the --apply form.
+    Run {
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ServicesCommand {
     Status,
 }
@@ -559,8 +575,26 @@ fn run() -> Result<()> {
         Commands::Services {
             command: ServicesCommand::Status,
         } => services(&presentation),
+        Commands::Housekeeping { command } => {
+            let mut helper = trusted_admin_helper_command(AdminHelper::Housekeeping)?;
+            helper.args(housekeeping_arguments(&command, cli.json));
+            run_command(&mut helper, SubprocessMode::InheritedInteractive)
+        }
         #[cfg(feature = "tui-preview")]
         Commands::TuiPreview(_) => unreachable!("handled before root-only commands"),
+    }
+}
+
+/// Only `run --apply` reaches the deleting mode of the fixed helper.
+fn housekeeping_arguments(command: &HousekeepingCommand, json: bool) -> Vec<&'static str> {
+    let mode = match command {
+        HousekeepingCommand::Run { apply: true } => "apply",
+        HousekeepingCommand::Status | HousekeepingCommand::Run { apply: false } => "status",
+    };
+    if json {
+        vec![mode, "--json"]
+    } else {
+        vec![mode]
     }
 }
 

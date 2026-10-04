@@ -6,6 +6,7 @@ use super::*;
 pub(super) enum AdminHelper {
     Models,
     Credentials,
+    Housekeeping,
 }
 
 impl AdminHelper {
@@ -13,6 +14,7 @@ impl AdminHelper {
         match self {
             Self::Models => "jarvis-models",
             Self::Credentials => "jarvis-credentials",
+            Self::Housekeeping => "jarvis-housekeeping",
         }
     }
 
@@ -21,6 +23,7 @@ impl AdminHelper {
         match name {
             "jarvis-models" => Ok(Self::Models),
             "jarvis-credentials" => Ok(Self::Credentials),
+            "jarvis-housekeeping" => Ok(Self::Housekeeping),
             _ => bail!("unsupported internal helper"),
         }
     }
