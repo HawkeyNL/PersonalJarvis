@@ -165,7 +165,7 @@ onBeforeUnmount(() => {
       <div v-if="!locked && node.views.length > 1" class="node-tabs">
         <JvSegmented v-model="activeView" variant="tabs" :items="node.views" :label="`${node.label} views`" controls="node-view" />
       </div>
-      <main id="node-view" :class="['page', `page-${active}`, { 'with-tabs': !locked && node.views.length > 1, 'logs-active': active === 'logs', 'locked-page': locked }]">
+      <main id="node-view" :role="!locked && node.views.length > 1 ? 'tabpanel' : undefined" :class="['page', { 'with-tabs': !locked && node.views.length > 1, 'logs-active': active === 'logs', 'locked-page': locked }]">
         <component :is="current" v-if="!locked" @restart-required="restartRequired = true" @open="(view: ViewName) => (active = view)" />
         <section v-else class="lock-screen" aria-live="polite">
           <JvOrb :size="190" tone="idle" still :label="false" />
