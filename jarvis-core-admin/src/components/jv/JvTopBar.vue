@@ -62,9 +62,14 @@ defineProps<{ title: string; subtitle?: string }>();
 .title::before { right: calc(100% + 0px); background: linear-gradient(90deg, transparent, rgba(var(--accent-rgb), 0.6)); }
 .title::after { left: calc(100% + 0px); background: linear-gradient(90deg, rgba(var(--accent-rgb), 0.6), transparent); }
 
+/* The session cluster is wider than the desktop app's; drop the title rules
+   before they run into it. */
+@media (max-width: 1399px) {
+  .title::before, .title::after { display: none; }
+}
 @media (max-width: 1099px), (max-height: 759px) {
   .jv-topbar { padding: 16px 16px 0; gap: 12px; grid-template-columns: auto minmax(0, 1fr) auto; }
-  .tag, .title::before, .title::after { display: none; }
+  .tag { display: none; }
   .ring { width: 28px; height: 28px; }
   .name { font-size: 18px; letter-spacing: 0.42em; }
   .title h1 { font-size: 19px; letter-spacing: 0.32em; }

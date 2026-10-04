@@ -2,6 +2,12 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { api, errorText, type ViewName } from "./admin";
 import NavIcon, { type IconName } from "./components/NavIcon.vue";
+import JvBackdrop from "./components/jv/JvBackdrop.vue";
+import JvOrb from "./components/jv/JvOrb.vue";
+import JvPanel from "./components/jv/JvPanel.vue";
+import JvSegmented from "./components/jv/JvSegmented.vue";
+import JvStatusDot from "./components/jv/JvStatusDot.vue";
+import JvTopBar from "./components/jv/JvTopBar.vue";
 import AgentsView from "./views/AgentsView.vue";
 import CredentialsView from "./views/CredentialsView.vue";
 import AiAccountsView from "./views/AiAccountsView.vue";
@@ -15,24 +21,25 @@ import ServicesView from "./views/ServicesView.vue";
 import SystemView from "./views/SystemView.vue";
 import UpdateView from "./views/UpdateView.vue";
 
-const navSections: { label: string; items: { id: ViewName; label: string }[] }[] = [
-  { label: "Home", items: [{ id: "overview", label: "Overview" }] },
-  { label: "Operations", items: [
-    { id: "health", label: "Health" }, { id: "services", label: "Services" }, { id: "logs", label: "Logs" },
+// Four nodes, as in the redesign; each node's views are tabs. A slim rail
+// replaces the hub/satellite stage of the desktop NodePage: that stage takes
+// ~420px of height, which leaves no room for the log viewport and the model
+// tables in this 820px (minimum 620px) window.
+type NodeId = "overview" | "operations" | "intelligence" | "administration";
+const nodes: { id: NodeId; label: string; subtitle: string; icon: IconName; views: { id: ViewName; label: string; icon: IconName }[] }[] = [
+  { id: "overview", label: "Overview", subtitle: "HOME NODE AT A GLANCE", icon: "core", views: [
+    { id: "overview", label: "Overview", icon: "core" },
   ] },
-  { label: "Intelligence", items: [
-    { id: "agents", label: "Agents" }, { id: "models", label: "Models" }, { id: "usage", label: "Usage & Costs" },
+  { id: "operations", label: "Operations", subtitle: "HEALTH · SERVICES · LOGS", icon: "pulse", views: [
+    { id: "health", label: "Health", icon: "pulse" }, { id: "services", label: "Services", icon: "layers" }, { id: "logs", label: "Logs", icon: "lines" },
   ] },
-  { label: "Administration", items: [
-    { id: "devices", label: "Devices" }, { id: "ai-accounts", label: "AI Accounts" }, { id: "credentials", label: "Credentials" }, { id: "update", label: "Update" }, { id: "system", label: "System" },
+  { id: "intelligence", label: "Intelligence", subtitle: "AGENTS · MODELS · USAGE", icon: "bulb", views: [
+    { id: "agents", label: "Agents", icon: "agents" }, { id: "models", label: "Models", icon: "chip" }, { id: "usage", label: "Usage & Costs", icon: "chart" },
+  ] },
+  { id: "administration", label: "Administration", subtitle: "DEVICES · ACCOUNTS · UPDATES", icon: "shield", views: [
+    { id: "devices", label: "Devices", icon: "monitor" }, { id: "ai-accounts", label: "AI Accounts", icon: "link-2" }, { id: "credentials", label: "Credentials", icon: "key" }, { id: "update", label: "Update", icon: "download" }, { id: "system", label: "System", icon: "gear" },
   ] },
 ];
-const icons: Record<ViewName, IconName> = {
-  overview: "core", health: "pulse", services: "layers", logs: "lines",
-  agents: "agents", models: "chip", usage: "chart",
-  devices: "monitor", "ai-accounts": "link-2", credentials: "key", update: "download", system: "gear",
-};
-const items = navSections.flatMap((section) => section.items);
 const views = { overview: OverviewView, health: HealthView, services: ServicesView, update: UpdateView, agents: AgentsView, models: ModelsView, usage: UsageView, credentials: CredentialsView, "ai-accounts": AiAccountsView, devices: DevicesView, logs: LogsView, system: SystemView };
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const TOUCH_INTERVAL_MS = 5 * 1000;
@@ -46,6 +53,8 @@ const restartRequired = ref(false);
 const restartBusy = ref(false);
 const restartError = ref("");
 const current = computed(() => views[active.value]);
+const node = computed(() => nodes.find((item) => item.views.some((view) => view.id === active.value)) ?? nodes[0]);
+const activeView = computed({ get: () => active.value, set: (id: string) => { active.value = id as ViewName; } });
 let clockTimer: number | undefined;
 let idleTimer: number | undefined;
 let runtimeTimer: number | undefined;
@@ -136,23 +145,37 @@ onBeforeUnmount(() => {
 </script>
 <template>
   <div class="app-shell" @pointermove="recordActivity" @pointerdown="recordActivity" @mouseenter="recordActivity" @wheel="recordActivity" @touchstart="recordActivity" @keydown="recordActivity" @focusin="recordActivity">
-    <aside class="sidebar">
-      <div class="brand"><div class="brand-mark"><i /></div><div><strong>JARVIS</strong><span>CORE ADMIN</span></div></div>
-      <nav aria-label="Administration sections"><div v-for="section in navSections" :key="section.label" class="nav-section"><span class="nav-category">{{ section.label }}</span><button v-for="item in section.items" :key="item.id" :disabled="locked" :class="{ active: active === item.id }" @click="active = item.id"><NavIcon :name="icons[item.id]" /><span>{{ item.label }}</span></button></div></nav>
-      <div class="security-boundary"><span :class="['status-light', { locked }]" />{{ locked ? "Administration locked" : "Authenticated session" }}<small>{{ locked ? "Unlock through system authorization" : `Locks after inactivity · ${idleSeconds}s` }}</small></div>
-    </aside>
+    <JvBackdrop glow-y="34%" horizon="64px" />
+    <nav class="rail" aria-label="Administration nodes">
+      <button v-for="item in nodes" :key="item.id" type="button" :disabled="locked" :class="{ on: !locked && node.id === item.id }" :aria-current="!locked && node.id === item.id ? 'page' : undefined" @click="active = item.views[0].id">
+        <span class="rail-icon" aria-hidden="true"><NavIcon :name="item.icon" /></span>
+        <span>{{ item.label }}</span>
+      </button>
+    </nav>
     <div class="main-shell">
-      <header class="topbar"><div><span class="topbar-kicker">JARVIS HOME NODE</span><strong>{{ locked ? "Locked" : items.find((item) => item.id === active)?.label }}</strong></div><div class="topbar-actions"><button v-if="!locked" class="small secondary" @click="lock('Locked by owner.')">Lock</button><time>{{ clock }}</time></div></header>
-      <main :class="['page', { 'logs-active': active === 'logs', 'locked-page': locked }]">
-        <component :is="current" v-if="!locked" @restart-required="restartRequired = true" />
+      <JvTopBar :title="locked ? 'LOCKED' : node.label.toUpperCase()" :subtitle="locked ? 'PRIVILEGED ADMINISTRATION' : node.subtitle">
+        <div class="session-cluster">
+          <JvStatusDot :tone="locked ? 'warn' : 'ok'" :label="locked ? 'Locked' : 'Authenticated'" />
+          <span v-if="!locked" class="session-idle">locks in {{ idleSeconds }}s</span>
+          <span class="sep" aria-hidden="true"></span>
+          <span class="session-clock"><NavIcon name="clock" /><time>{{ clock }}</time></span>
+          <button v-if="!locked" class="small" @click="lock('Locked by owner.')">Lock</button>
+        </div>
+      </JvTopBar>
+      <div v-if="!locked && node.views.length > 1" class="node-tabs">
+        <JvSegmented v-model="activeView" variant="tabs" :items="node.views" :label="`${node.label} views`" controls="node-view" />
+      </div>
+      <main id="node-view" :class="['page', `page-${active}`, { 'with-tabs': !locked && node.views.length > 1, 'logs-active': active === 'logs', 'locked-page': locked }]">
+        <component :is="current" v-if="!locked" @restart-required="restartRequired = true" @open="(view: ViewName) => (active = view)" />
         <section v-else class="lock-screen" aria-live="polite">
-          <div class="lock-mark"><i /></div>
-          <span class="topbar-kicker">PRIVILEGED ADMINISTRATION</span>
-          <h1>Jarvis Core is locked</h1>
-          <p>Authenticate once through the GNOME system dialog. Your password is never handled by this application.</p>
-          <div v-if="authError" class="lock-error">{{ authError }}</div>
-          <button class="primary" :disabled="authBusy" @click="unlock">{{ authBusy ? "Waiting for system authorization…" : "Unlock administration" }}</button>
-          <small>The session locks after five minutes without pointer or keyboard activity.</small>
+          <JvOrb :size="190" tone="idle" still :label="false" />
+          <JvPanel icon="shield" title="Jarvis Core is locked" tone="warn" status="Locked" description="Authenticate once through the GNOME system dialog. Your password is never handled by this application.">
+            <div v-if="authError" class="lock-error">{{ authError }}</div>
+            <div class="lock-actions">
+              <button class="primary" :disabled="authBusy" @click="unlock">{{ authBusy ? "Waiting for system authorization…" : "Unlock administration" }}</button>
+              <small>The session locks after five minutes without pointer or keyboard activity.</small>
+            </div>
+          </JvPanel>
         </section>
       </main>
     </div>
