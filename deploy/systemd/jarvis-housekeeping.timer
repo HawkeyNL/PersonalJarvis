@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Jarvis disk housekeeping (owner opt-in)
+
+# Disabled by default. Release-owned: a drop-in that changes the schedule
+# blocks Core updates. Runs before the 06:00 backup window.
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=1h
+Persistent=true
+Unit=jarvis-housekeeping.service
+
+[Install]
+WantedBy=timers.target

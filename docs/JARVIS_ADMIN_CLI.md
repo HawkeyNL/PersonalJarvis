@@ -347,6 +347,14 @@ is never rendered by the TUI or emitted in JSON.
 
 ## Diagnostics
 
+### Disk housekeeping
+
+`sudo jarvis housekeeping status [--json]` shows which old Core releases and
+app-update generations would be removed, their sizes, disk free and the last
+run. `run` is a dry run; `run --apply` deletes. Exit status 75 means an update,
+backup or app sync holds a lock. Rules, the opt-in daily timer and what is
+never touched are in [HOUSEKEEPING.md](HOUSEKEEPING.md).
+
 ### First-device activation code
 
 `sudo jarvis account activation-code --allow-cidr <private-device-ip>/32`

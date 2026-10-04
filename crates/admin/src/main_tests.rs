@@ -54,6 +54,28 @@ fn bare_update_is_a_center_but_explicit_modes_are_not() {
     );
 }
 #[test]
+fn housekeeping_defaults_to_a_dry_run_and_takes_no_paths() {
+    let arguments = |argv: &[&str]| {
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let Some(Commands::Housekeeping { command }) = cli.command else {
+            panic!("expected housekeeping command");
+        };
+        housekeeping_arguments(&command, cli.json)
+    };
+    assert_eq!(arguments(&["jarvis", "housekeeping", "status"]), ["status"]);
+    assert_eq!(
+        arguments(&["jarvis", "housekeeping", "status", "--json"]),
+        ["status", "--json"]
+    );
+    assert_eq!(arguments(&["jarvis", "housekeeping", "run"]), ["status"]);
+    assert_eq!(
+        arguments(&["jarvis", "--json", "housekeeping", "run", "--apply"]),
+        ["apply", "--json"]
+    );
+    assert!(Cli::try_parse_from(["jarvis", "housekeeping", "run", "/opt"]).is_err());
+    assert!(Cli::try_parse_from(["jarvis", "housekeeping", "prune"]).is_err());
+}
+#[test]
 fn log_target_is_allowlisted() {
     assert!(Cli::try_parse_from(["jarvis", "logs", "arbitrary.service"]).is_err());
 }

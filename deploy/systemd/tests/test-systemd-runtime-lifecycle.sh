@@ -36,6 +36,21 @@ fi
 grep -Eq '^TimeoutStartSec=' "$backup_service"
 grep -Fxq 'Restart=on-failure' "$backup_service"
 grep -Fxq 'StartLimitBurst=3' "$backup_service"
+# Housekeeping follows the same opt-in shape, runs at idle priority and is
+# inert (not failed) after a rollback to a release without its helper.
+housekeeping_service="$repo_dir/deploy/systemd/jarvis-housekeeping.service"
+housekeeping_timer="$repo_dir/deploy/systemd/jarvis-housekeeping.timer"
+grep -Fxq 'WantedBy=timers.target' "$housekeeping_timer"
+grep -Fxq 'Persistent=true' "$housekeeping_timer"
+if grep -Eq '^(\[Install\]|PartOf=|WantedBy=)' "$housekeeping_service"; then
+    echo "jarvis-housekeeping.service must stay static and independent of Core" >&2
+    exit 1
+fi
+for directive in 'ConditionPathExists=/opt/jarvis/current/jarvis-housekeeping' 'IOSchedulingClass=best-effort' \
+    'Nice=19' 'ProtectSystem=strict' 'PrivateNetwork=true' 'RestrictAddressFamilies=AF_UNIX' \
+    'CapabilityBoundingSet=CAP_DAC_READ_SEARCH' 'Restart=on-failure' 'RestartPreventExitStatus=1' 'StartLimitBurst=3'; do
+    grep -Fxq "$directive" "$housekeeping_service" || { echo "jarvis-housekeeping.service lacks $directive" >&2; exit 1; }
+done
 # `is-enabled --quiet` also succeeds for static units; the updater must use
 # unit_enabled, which accepts only enabled|enabled-runtime.
 if grep -Fq 'is-enabled --quiet' "$repo_dir/deploy/systemd/update-core-release.sh"; then

@@ -20,6 +20,7 @@ use crate::session::{BrokerRequest, SessionManager};
 const ADMIN: &str = "/usr/local/sbin/jarvis";
 const CORE_ADMIN_BINARY: &str = "/usr/bin/jarvis-core-admin";
 const CORE_ADMIN_VERSION: &str = "/usr/share/jarvis-core-admin/version";
+const HOUSEKEEPING_STATE: &str = "/var/lib/jarvis-housekeeping/last-run.json";
 const PKEXEC: &str = "/usr/bin/pkexec";
 const PTYXIS: &str = "/usr/bin/ptyxis";
 const GNOME_TERMINAL: &str = "/usr/bin/gnome-terminal";
@@ -1280,7 +1281,7 @@ pub fn system() -> AdminResult<SystemResponse> {
         .find_map(|line| line.strip_prefix("PRETTY_NAME="))
         .map(|value| value.trim_matches('"').to_owned())
         .unwrap_or_else(|| "Ubuntu Linux".to_owned());
-    let values = vec![
+    let mut values = vec![
         ("Active release".to_owned(), json_field(&release, "tag")),
         (
             "Core component".to_owned(),
@@ -1315,6 +1316,9 @@ pub fn system() -> AdminResult<SystemResponse> {
             env!("CARGO_PKG_VERSION").to_owned(),
         ),
     ];
+    values.extend(housekeeping_values(
+        read_fixed(HOUSEKEEPING_STATE, 64 * 1024).ok().as_deref(),
+    ));
     Ok(SystemResponse { values })
 }
 
@@ -1851,9 +1855,80 @@ fn json_nested_field(value: &Option<serde_json::Value>, parent: &str, key: &str)
         .unwrap_or_else(|| "unavailable".to_owned())
 }
 
+/// Rows for the root-written, world-readable record of the last
+/// `jarvis-housekeeping apply` run (see docs/HOUSEKEEPING.md).
+fn housekeeping_values(record: Option<&str>) -> Vec<(String, String)> {
+    let record = record
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .filter(|value| {
+            value
+                .get("format_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+        });
+    let bytes = |key: &str| {
+        record
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_u64)
+            .map_or_else(|| "unavailable".to_owned(), human_bytes)
+    };
+    let last_run = if record.is_some() {
+        format!(
+            "{} ({})",
+            json_field(&record, "finished_at"),
+            json_field(&record, "outcome")
+        )
+    } else {
+        "never".to_owned()
+    };
+    vec![
+        ("Housekeeping last run".to_owned(), last_run),
+        (
+            "Housekeeping reclaimed".to_owned(),
+            bytes("reclaimed_bytes"),
+        ),
+        (
+            "Disk free at last housekeeping".to_owned(),
+            bytes("disk_free_bytes"),
+        ),
+    ]
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn housekeeping_record_is_summarized_or_absent() {
+        let rows = housekeeping_values(Some(
+            r#"{"format_version":1,"finished_at":"2026-10-04T04:41:00Z","outcome":"ok","removed":2,"reclaimed_bytes":1610612736,"disk_free_bytes":536870912000,"disk_total_bytes":1000000000000}"#,
+        ));
+        assert_eq!(rows[0].1, "2026-10-04T04:41:00Z (ok)");
+        assert_eq!(rows[1].1, "1.5 GiB");
+        assert_eq!(rows[2].1, "500.0 GiB");
+        for record in [None, Some("not json"), Some(r#"{"format_version":2}"#)] {
+            let rows = housekeeping_values(record);
+            assert_eq!(rows[0].1, "never");
+            assert_eq!(rows[1].1, "unavailable");
+        }
+        assert_eq!(human_bytes(512), "512 B");
+    }
 
     #[test]
     fn typed_inputs_are_strict() {
