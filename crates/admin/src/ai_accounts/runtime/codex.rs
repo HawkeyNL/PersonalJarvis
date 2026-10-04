@@ -17,7 +17,6 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -193,7 +192,6 @@ pub(super) fn install(
 
     let bundle = work.path().join("codex.sigstore");
     download(source, &version, &bundle_name, &bundle, &bundle_asset, 60)?;
-    let signed = rekor_digest(&fs::read(&bundle)?)?;
     let archive = work.path().join("codex.tar.gz");
     download(
         source,
@@ -205,10 +203,6 @@ pub(super) fn install(
     )?;
     let binary = work.path().join("codex");
     let (digest, size) = extract(&archive, &member, &binary)?;
-    // Defence in depth: cosign checks this too.
-    if digest != signed {
-        bail!("extracted Codex binary does not match the SHA-256 in the signed Rekor entry");
-    }
     verify_blob(&cosign, work.path(), &bundle, &binary, &version)?;
     // Reinstalling the active version must not replace the rollback copy.
     if installed_matches(layout, &digest, size)? {
@@ -297,32 +291,6 @@ fn allowed_redirect<'a>(source: &Source, location: &'a str) -> Result<&'a str> {
         bail!("release download redirected outside GitHub asset storage");
     }
     Ok(location)
-}
-
-/// The SHA-256 that the bundle's Rekor `hashedrekord` entry records for the
-/// signed binary.
-fn rekor_digest(bytes: &[u8]) -> Result<String> {
-    let bundle: Value = serde_json::from_slice(bytes).context("parse Codex Sigstore bundle")?;
-    let body = bundle
-        .pointer("/rekorBundle/Payload/body")
-        .and_then(Value::as_str)
-        .context("Codex Sigstore bundle has no Rekor entry")?;
-    let entry: Value = serde_json::from_slice(&BASE64.decode(body).context("decode Rekor entry")?)
-        .context("parse Rekor entry")?;
-    let hash = entry.pointer("/spec/data/hash");
-    if entry.get("kind").and_then(Value::as_str) != Some("hashedrekord")
-        || hash
-            .and_then(|hash| hash.get("algorithm"))
-            .and_then(Value::as_str)
-            != Some("sha256")
-    {
-        bail!("Rekor entry is not a SHA-256 hashedrekord");
-    }
-    hash.and_then(|hash| hash.get("value"))
-        .and_then(Value::as_str)
-        .filter(|value| sha256_hex(value))
-        .map(str::to_owned)
-        .context("Rekor entry has no valid SHA-256")
 }
 
 fn sha256_hex(text: &str) -> bool {
@@ -542,23 +510,8 @@ mod tests {
         hex::encode(Sha256::digest(bytes))
     }
 
-    fn bundle(binary_digest: &str) -> Vec<u8> {
-        let entry = serde_json::json!({
-            "apiVersion": "0.0.1",
-            "kind": "hashedrekord",
-            "spec": { "data": { "hash": { "algorithm": "sha256", "value": binary_digest } } }
-        });
-        serde_json::json!({
-            "base64Signature": "c2ln",
-            "cert": "Y2VydA==",
-            "rekorBundle": {
-                "SignedEntryTimestamp": "c2V0",
-                "Payload": { "body": BASE64.encode(entry.to_string()), "integratedTime": 1, "logIndex": 1, "logID": "00" }
-            }
-        })
-        .to_string()
-        .into_bytes()
-    }
+    /// cosign alone reads the bundle; the fake one ignores its contents.
+    const BUNDLE: &[u8] = br#"{"fixture":"bundle"}"#;
 
     /// Rootless release tree, served over local HTTP, with a fake cosign that
     /// records its arguments and exits with the code in `cosign-exit`.
@@ -700,7 +653,7 @@ mod tests {
                 &format!("rust-v{version}"),
                 &archive,
                 &digest,
-                &bundle(&sha256(binary)),
+                BUNDLE,
             );
         }
 
@@ -758,19 +711,6 @@ mod tests {
         assert_eq!(LAYOUT.target, AccountProvider::Codex.binary());
         assert_eq!(LAYOUT.owner, (0, 0));
         assert_eq!(LAYOUT.trusted_root, "/");
-    }
-
-    #[test]
-    fn real_release_bundle_names_the_binary_digest() {
-        let real = include_bytes!(
-            "../../../tests/fixtures/codex-0.160.0-x86_64-unknown-linux-musl.sigstore"
-        );
-        assert_eq!(
-            rekor_digest(real).unwrap(),
-            "12eb3e81114588aca3b7998f4f19e8997b056aca08e57a7ca7c8a3ec8c652aad"
-        );
-        assert!(rekor_digest(b"{}").is_err());
-        assert!(rekor_digest(&bundle(&"A".repeat(64))).is_err());
     }
 
     #[test]
@@ -937,34 +877,24 @@ mod tests {
 
         // Archive does not match GitHub's digest.
         let archive = fixture.archive(&[(MEMBER, b"codex-162")]);
-        let signed = bundle(&sha256(b"codex-162"));
         fixture.publish(
             "0.162.0",
             "rust-v0.162.0",
             &archive,
             &"0".repeat(64),
-            &signed,
+            BUNDLE,
         );
         fixture.assert_refused(exact("0.162.0"), "digest");
 
-        // Binary does not match the signed Rekor entry.
         let digest = sha256(&archive);
-        fixture.publish(
-            "0.163.0",
-            "rust-v0.163.0",
-            &archive,
-            &digest,
-            &bundle(&sha256(b"x")),
-        );
-        fixture.assert_refused(exact("0.163.0"), "Rekor");
 
         // A second member in the archive.
         let extra = fixture.archive(&[(MEMBER, b"codex-164"), ("evil", b"evil")]);
-        fixture.publish("0.164.0", "rust-v0.164.0", &extra, &sha256(&extra), &signed);
+        fixture.publish("0.164.0", "rust-v0.164.0", &extra, &sha256(&extra), BUNDLE);
         fixture.assert_refused(exact("0.164.0"), "content beyond");
 
         // Metadata for another release served under the requested tag.
-        fixture.publish("0.165.0", "rust-v0.160.0", &archive, &digest, &signed);
+        fixture.publish("0.165.0", "rust-v0.160.0", &archive, &digest, BUNDLE);
         fixture.assert_refused(exact("0.165.0"), "different Codex release");
 
         // Redirect to a host outside the allowlist.
