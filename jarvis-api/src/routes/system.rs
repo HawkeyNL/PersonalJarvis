@@ -58,9 +58,14 @@ pub(crate) async fn system_brain_set(
     Json(req): Json<BrainPreferenceReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     validate_brain_selection(&state, req.provider.as_deref(), req.model.as_deref())?;
+    // `table:$param` is not valid SurrealQL; bind the record id instead.
+    let user_id = authed.user.id.to_string();
     state.db.query(
-        "UPSERT owner_brain_preferences:$id SET id = $id, user_id = $user_id, provider = $provider, model = $model, updated_at = time::now() RETURN NONE",
-    ).bind(json!({"id": authed.user.id.to_string(), "user_id": authed.user.id.to_string(), "provider": req.provider, "model": req.model})).await
+        "UPSERT $record SET id = $id, user_id = $user_id, provider = $provider, model = $model, updated_at = time::now() RETURN NONE",
+    ).bind(("record", surrealdb::RecordId::from_table_key("owner_brain_preferences", user_id.as_str())))
+        .bind(json!({"id": user_id, "user_id": user_id, "provider": req.provider, "model": req.model})).await
+        .map_err(|_| internal_error())?
+        .check()
         .map_err(|_| internal_error())?;
     record_security_event(
         &state,
