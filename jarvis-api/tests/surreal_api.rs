@@ -260,7 +260,7 @@ async fn every_application_update_route_requires_authentication_before_storage_a
 }
 
 /// Owner read models for the app share the `Authed` gate of `/v1/system/*`.
-const OWNER_READ_MODELS: [&str; 1] = ["/v1/agents"];
+const OWNER_READ_MODELS: [&str; 2] = ["/v1/agents", "/v1/system/services"];
 
 #[tokio::test]
 async fn owner_read_models_refuse_missing_or_invalid_sessions() {
@@ -321,6 +321,15 @@ async fn owner_read_models_answer_an_owner_session() -> Result<(), Box<dyn std::
     assert_eq!(agents["agents"], json!([]));
     assert_eq!(agents["agent_count"], 0);
     assert_eq!(agents["unavailable_reason"], "agent_bundle_unavailable");
+
+    // Fixed labels in a fixed order, whatever the runner's systemd says.
+    let services = get("/v1/system/services").await?;
+    assert_eq!(services.status(), StatusCode::OK);
+    let services = json_body(services).await;
+    assert_eq!(services["services"][0]["label"], "Core");
+    assert_eq!(services["services"].as_array().map(Vec::len), Some(7));
+    assert_eq!(services["disks"][0]["label"], "system");
+    assert_eq!(services["disks"][1]["label"], "data");
     Ok(())
 }
 

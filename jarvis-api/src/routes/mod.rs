@@ -14,5 +14,6 @@ mod chat_context;
 pub(crate) mod coding;
 pub(crate) mod portfolio;
 pub(crate) mod runs;
+pub(crate) mod services;
 pub(crate) mod system;
 pub(crate) mod voice;
