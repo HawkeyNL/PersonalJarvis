@@ -74,7 +74,7 @@ Line numbers come from `76668a7`.
    - The unauthenticated RPC crash (< 3.1.0) needs network reach to port
      8000. That port is published on loopback only.
    - What raises urgency: any local workload that can reach host loopback.
-     See open question Q3.
+     See decision 3 in §8.
    - Recommendation: do the staged plan below, with a full rehearsal on a
      copy before touching the Home Node.
 
@@ -260,7 +260,7 @@ The statements were extracted from all Rust string literals.
 | B2 | `type::thing` removed; `type::record(table, key)` replaces it. 2.6.5 has `type::record`, but with different arguments (`(rid, table?)`). | **Yes** | `account.rs:254` | Dual-compatible: bind a record id from Rust and write `UPSERT $rid SET …`. With SDK 2 use `surrealdb::RecordId::from_table_key`; with SDK 3, `surrealdb::types::RecordId::new`. | [src] |
 | B3 | `FLEXIBLE` must follow `TYPE`. 3.3 errors with "FLEXIBLE must be specified after TYPE". 2.6.5 parses clauses in any order. | **Yes**: fresh installs and every database below v10 | `schema/surreal/0010_coding_reservations.surql:31` | Change to `DEFINE FIELD OVERWRITE checkpoint ON coding_sessions TYPE option<object> FLEXIBLE;`. 2.6.5 also accepts this. **This changes the schema fingerprint**, so it ships in the engine-switch release (§7). | [src] both parsers |
 | B4 | Selecting from a table that does not exist now errors instead of returning `[]`. | **Yes**: fresh installs (empty database) | `crates/store/src/lib.rs:84,104,124,144,164`. The first select runs before `0001` creates `schema_version`. | Dual-compatible: check the table exists before selecting, e.g. `RETURN (INFO FOR DB).tables.schema_version != NONE;`, then select. Also check that `EDITOR` may run `INFO FOR DB` [unverified]. | [docs] |
-| B5 | SCHEMAFULL rejects undefined fields. 2.x silently drops them. | **Yes**: every LLM usage write would fail | `crates/usage/src/surreal.rs:29` writes `requested_route`, `actual_provider`, `cost_estimate_classification`, which no schema file defines. They are silently dropped today. | Either stop writing them (keeps today's stored data exactly; smallest change) or add them in a new migration 0011 (owner choice, Q6). | [docs]; schema checked by script |
+| B5 | SCHEMAFULL rejects undefined fields. 2.x silently drops them. | **Yes**: every LLM usage write would fail | `crates/usage/src/surreal.rs:29` writes `requested_route`, `actual_provider`, `cost_estimate_classification`, which no schema file defines. They are silently dropped today. | Either stop writing them (keeps today's stored data exactly; smallest change) or add them in a new migration 0011 (decision 6 in §8: add migration 0011). | [docs]; schema checked by script |
 | B6 | Record id `table:$param` is rejected. **2.6.5 already rejects it** with the same parse error. | **Existing bug** | `jarvis-api/src/routes/system.rs:62` (`UPSERT owner_brain_preferences:$id`). Setting the owner brain preference cannot work today. The result is also never `.check()`ed, and no test covers it. | Separate bug-fix PR: bind a record id (as in B2), `.check()` the result, add a test. | [src] both parsers |
 | B7 | A JSON `null` binding becomes `NULL` (3.3) instead of `NONE` (2.6.5); `option<T>` rejects `NULL`. | **Probably yes, wide** | Every `json!` binding with an `Option` value, e.g. `usage/src/surreal.rs:36-44`, `audit.rs`, `routes/chat.rs`, `routes/coding.rs`, the codex broker. | In PR2, use typed binding structs: `Option::None` serialises to `NONE` (3.3 `serialize_none` → `Value::None`, [src]). Or check every `json!` site. Covered by the full database test suite on 3.3. | [src] mapping; [docs] NULL rejection |
 | B8 | 3.3: `UPDATE`/`UPSERT` evaluate `WHERE` before applying data. | No breakage expected: our compare-and-swap updates already rely on pre-state `WHERE` | about 25 conditional updates (identity, agent approvals, budget, broker) | Keep the existing replay and compare-and-swap tests; they must pass on 3.3. | [docs] |
@@ -376,7 +376,7 @@ tagged otherwise.
 0. **Preconditions**, checked by the helper:
    - The active release is the last 2.x release.
    - A `jarvis-backup create` from today exists, and the owner confirms
-     an off-host copy (Q4).
+     an off-host copy (decision 4 in §8).
    - The 3.3 image digest named in the candidate's `release.json` is
      already pulled.
    - Free space is at least 3 × `du /var/lib/jarvis/surrealdb` + 1 GiB,
@@ -415,7 +415,7 @@ tagged otherwise.
 10. **Commit:**
     - Mark the transaction committed.
     - Keep `surrealdb.v2-<txn>`, the T0 snapshot and the old env file until
-      the owner removes them explicitly (Q5).
+      the owner removes them explicitly (decision 5 in §8).
     - Tell the owner to run `jarvis-backup create` immediately and copy
       the first 3.x archive off the host.
 
@@ -526,7 +526,7 @@ tagged otherwise.
     `jarvis-backup verify` should print the archive's engine version.
 - **Image availability:** we depend on the 2.6.5 image digest staying
   pullable. Keep a `docker save` tarball of it next to the off-host
-  backups (Q7).
+  backups (decision 7 in §8).
 
 ## 6. Risk register
 
@@ -553,7 +553,7 @@ Likelihood (L) and impact (I) are rated 1–3. The score is L×I.
 All PRs target an integration branch (`feat/surrealdb-3`) except PR1 and
 the bug-fix PR. The reason: once SDK 3 lands, `main` can no longer be
 released to a 2.6.5 Home Node (§1.1). The alternative is to freeze `main`
-releases while PR2–PR4 are open (Q1).
+releases while PR2–PR4 are open; decision 1 in §8 rejects that.
 
 - **PR0, spike (CI only, throwaway; no production change).** One workflow
   job with a 3.3 container runs the full schema chain and a corpus of
@@ -574,8 +574,8 @@ releases while PR2–PR4 are open (Q1).
   - It goes to `main` on its own because it is broken today, independent
     of the upgrade.
 - **PR1 (to `main`, releasable on 2.6.5): dual-compatible SurrealQL.**
-  Covers B1, B2, B4, and B5 (stop writing the three undefined fields,
-  unless Q6 says persist them).
+  Covers B1, B2 and B4; merged as #89. B5 moves to PR2, which adds
+  migration 0011 for the three usage fields (decision 6 in §8).
   - No schema file changes, so the fingerprint is unchanged and this is
     a normal `--version` release.
   - Verification: the existing CI database suite on 2.6.5; the PR0 corpus
@@ -584,7 +584,7 @@ releases while PR2–PR4 are open (Q1).
   - Bump `surrealdb` to `=3.3.x` with `protocol-ws` only. Use
     `SurrealValue` derives and typed bindings that remove `null`s (B7).
   - Use `Bytes`, the time conversion, and `String` auth fields.
-  - Edit B3 in `0010`.
+  - Edit B3 in `0010`, and add migration `0011` for the B5 usage fields.
   - Switch every CI and test image to the pinned 3.3 digest, and add a
     3.3 migration test that runs as a database `EDITOR` from an empty
     database and from v6–v9.
@@ -613,8 +613,8 @@ releases while PR2–PR4 are open (Q1).
 
 1. **CI:** the PR3 fixture passes on every run, including kill-at-each-step
    and the full rollback.
-2. **Throwaway VM** (not the Home Node; owner's workstation or a cloud VM,
-   Q2):
+2. **Throwaway VM, optional** (not the Home Node; owner's workstation or
+   a cloud VM; see decision 2 in §8):
    - Install the last 2.x release with the production compose and digest.
    - The owner decrypts the latest real `jarvis-backup` archive **on that
      VM** (the Home Node cannot decrypt) and restores it with today's
@@ -651,36 +651,39 @@ releases while PR2–PR4 are open (Q1).
       containers and ports, not touched).
 - [ ] Rollback command and runbook printed or at hand.
 - [ ] After commit: new `jarvis-backup` taken and copied off host; the
-      `surrealdb.v2-*` directory kept until the owner decides (Q5).
+      `surrealdb.v2-*` directory kept for 30 days (decision 5 in §8).
 
-## 8. Open questions for the owner
+## 8. Decisions (owner delegated them on 2026-10-05)
 
-1. **Release freeze or integration branch?** Do you accept that `main`
-   cannot ship SDK 3 until the engine migration ships (an integration
-   branch), or should `main` releases pause instead?
-2. **Where may the drill run?** On a VM or workstation where you can
-   decrypt a real backup? The Home Node itself only does a non-swapping
-   rehearsal.
-3. **Can anything reach port 8000 on host loopback** besides Core,
-   `jarvis-backup` and the brokers? For example, the OpenSandbox or Codex
-   workloads, or Laya. If yes, the unauthenticated RPC crash
-   (GHSA-wjjj-24cx-f28g) makes this more urgent.
-4. **Is there an off-host copy** of a recent `jarvis-backup` archive, and
-   how large is `/var/lib/jarvis/surrealdb`? Please report only the
-   output of `sudo du -sh` and `df -h`.
-5. **How long to keep the old data?** How long should
-   `surrealdb.v2-<txn>`, the T0 snapshot and the old env file stay after
-   commit (suggestion: 30 days)?
-6. **Usage fields:** should `requested_route`, `actual_provider` and
-   `cost_estimate_classification` be persisted (new migration 0011), or is
-   it fine to keep not storing them, as today?
-7. **2.6.5 image tarball:** may the drill produce a `docker save` of the
-   2.6.5 image to keep for disaster recovery?
-8. **Production image:** is the production `SURREALDB_IMAGE` digest
-   (`sha256:d653f6c8…`) really 2.6.5? Answer "yes" or "no" only.
-9. **SurrealDB 2.7.0:** do you want an interim step to it? Its release
-   notes could not be verified. It does not carry the 3.3.0-only advisory
-   fixes, and it does not remove any step above, so this plan skips it.
+1. **Integration branch, no release freeze.** `main` keeps shipping on
+   2.6.5. PR2–PR4 land on `feat/surrealdb-3` and reach `main` together as
+   one release.
+2. **Drill location: CI plus the Home Node rehearsal.** No off-host VM is
+   available, so the VM step in §7.1 is optional. The CI fixture covers
+   every failure and rollback path. `surrealdb-engine-migrate --rehearse`
+   covers the real data: it runs in disposable containers on copies, swaps
+   nothing, and also exercises both rollbacks on those copies. The live
+   database is never the drill target.
+3. **Port 8000 exposure: assume other local workloads can reach it.** Fail
+   closed: treat GHSA-wjjj-24cx-f28g as a reason to do this upgrade soon,
+   not as a reason to skip steps.
+4. **There is no off-host backup today.** This is a hard gate. Before the
+   swap, `jarvis-backup` must be configured, a fresh archive must be copied
+   off host (for example to the owner's workstation) and `jarvis-backup
+   verify` must pass there. The database size is measured at go time with
+   `du -sh` and `df -h` only.
+5. **Old data is kept for 30 days** after commit: `surrealdb.v2-<txn>`,
+   the T0 snapshot and the old env file. Deleting them stays a manual owner
+   step.
+6. **Usage fields are persisted.** PR2 adds migration 0011 that defines
+   `requested_route`, `actual_provider` and `cost_estimate_classification`
+   as optional strings, so 3.x SCHEMAFULL accepts the writes and the usage
+   view keeps them.
+7. **Keep a `docker save` of the 2.6.5 image** next to the off-host backup.
+8. **Production image digest** is checked at go time with
+   `docker image inspect` (no secrets involved) instead of asking the owner.
+9. **Skip SurrealDB 2.7.0.** It removes no step and lacks the 3.3.0-only
+   advisory fixes.
 
 ## Appendix: sources
 
