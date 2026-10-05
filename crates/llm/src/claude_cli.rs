@@ -181,6 +181,7 @@ impl SubscriptionWorker {
                     backend: Some(self.backend.into()),
                     requested_route: None,
                     actual_provider: None,
+                    fallback_count: 0,
                     stop_reason: Some("end_turn".into()),
                     usage: Some(Usage {
                         input_tokens: reply.input_tokens.unwrap_or(0),

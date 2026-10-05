@@ -48,7 +48,9 @@ impl LlmProvider for FallbackProvider {
             Err(LlmError::Refused) => Err(LlmError::Refused),
             Err(e) => {
                 tracing::warn!(error = %e, "primary brain failed; falling back to local");
-                self.fallback.chat(req).await
+                let mut reply = self.fallback.chat(req).await?;
+                reply.fallback_count = reply.fallback_count.saturating_add(1);
+                Ok(reply)
             }
         }
     }

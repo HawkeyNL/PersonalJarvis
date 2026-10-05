@@ -114,6 +114,7 @@ impl LlmProvider for OpenAiCompatProvider {
             backend: Some(self.backend.clone()),
             requested_route: None,
             actual_provider: None,
+            fallback_count: 0,
             stop_reason: parser.finish,
             usage: parser.usage,
         })
@@ -193,6 +194,7 @@ impl LlmProvider for OpenAiCompatProvider {
             backend: Some(self.backend.clone()),
             requested_route: None,
             actual_provider: None,
+            fallback_count: 0,
             stop_reason: finish,
             usage,
         })

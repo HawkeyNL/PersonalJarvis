@@ -491,6 +491,7 @@ impl LlmProvider for RouterProvider {
             ));
         }
         let mut last = None;
+        let mut fallback_count = 0u32;
         for (candidate, pinned) in plan {
             // A requested model wins, then the owner's routed model, else the
             // cheapest sufficient catalog model for this backend + tier.
@@ -514,8 +515,9 @@ impl LlmProvider for RouterProvider {
                 ..req.clone()
             };
             match candidate.provider.chat(&attempt).await {
-                Ok(reply) => {
+                Ok(mut reply) => {
                     self.record_success(&candidate.id);
+                    reply.fallback_count = fallback_count;
                     return Ok(reply);
                 }
                 Err(LlmError::Refused) => return Err(LlmError::Refused),
@@ -528,6 +530,7 @@ impl LlmProvider for RouterProvider {
                         "brain failed; routing to next"
                     );
                     last = Some(e);
+                    fallback_count += 1;
                 }
             }
         }
@@ -558,6 +561,7 @@ mod tests {
                     backend: Some(self.label.clone()),
                     requested_route: None,
                     actual_provider: None,
+                    fallback_count: 0,
                     stop_reason: None,
                     usage: None,
                 })
@@ -754,6 +758,7 @@ mod tests {
                     backend: Some("claude-cli".into()),
                     requested_route: None,
                     actual_provider: None,
+                    fallback_count: 0,
                     stop_reason: None,
                     usage: None,
                 })
@@ -1011,11 +1016,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply.text, "anthropic-api");
+        assert_eq!(reply.fallback_count, 1);
         // The malformed first response receives a bounded health cooldown, so
         // the next request does not repeatedly hit the same failing backend.
         assert_eq!(
             ids(r.plan(Tier::Default, true, None)),
             ["anthropic-api", "ollama"]
+        );
+        let reply = r.chat(&ask(Tier::Default, None)).await.unwrap();
+        assert_eq!(
+            (reply.text.as_str(), reply.fallback_count),
+            ("anthropic-api", 0)
         );
     }
 
@@ -1130,6 +1141,7 @@ mod tests {
                 backend: Some(self.0.into()),
                 requested_route: None,
                 actual_provider: None,
+                fallback_count: 0,
                 stop_reason: None,
                 usage: None,
             })

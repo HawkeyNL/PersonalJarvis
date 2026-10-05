@@ -713,42 +713,49 @@ async fn month_statistics_break_down_agents_latency_failures_and_fallbacks(
     .bind(json!({"id": uuid::Uuid::now_v7().to_string()}))
     .await?
     .check()?;
-    let entry = |agent: Option<&str>, latency_ms, failure: Option<&str>, fallback_count| {
-        jarvis_usage::UsageEntry {
-            request_id: uuid::Uuid::now_v7().to_string(),
-            backend: "ollama-cloud".to_owned(),
-            model: "fixture-model".to_owned(),
-            requested_route: None,
-            actual_provider: None,
-            cost_estimate_classification: "known".to_owned(),
-            routing_mode: "test".to_owned(),
-            quality_tier: "test".to_owned(),
-            agent_id: agent.map(str::to_owned),
-            latency_ms,
-            status: if failure.is_some() {
-                "failed"
-            } else {
-                "succeeded"
-            }
-            .to_owned(),
-            failure_category: failure.map(str::to_owned),
-            fallback_count,
-            input_tokens: 10,
-            output_tokens: 5,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            cost_eur: 0.01,
-        }
+    let entry = |agent: Option<&str>, latency_ms, fallback_count| jarvis_usage::UsageEntry {
+        request_id: uuid::Uuid::now_v7().to_string(),
+        backend: "ollama-cloud".to_owned(),
+        model: "fixture-model".to_owned(),
+        requested_route: None,
+        actual_provider: None,
+        cost_estimate_classification: "known".to_owned(),
+        routing_mode: "test".to_owned(),
+        quality_tier: "test".to_owned(),
+        agent_id: agent.map(str::to_owned),
+        latency_ms,
+        status: "succeeded".to_owned(),
+        failure_category: None,
+        fallback_count,
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cost_eur: 0.01,
     };
+    // The same constructor Core's metering uses for a call without a reply.
+    let failed = jarvis_usage::UsageEntry::failed(
+        "ollama-cloud",
+        "fixture-model",
+        "timeout",
+        jarvis_usage::UsageMetadata {
+            agent_id: Some("researcher".to_owned()),
+            latency_ms: 300,
+            ..Default::default()
+        },
+    );
     for row in [
-        entry(Some("researcher"), 100, None, 0),
-        entry(Some("researcher"), 300, Some("timeout"), 2),
+        entry(Some("researcher"), 100, 2),
+        failed,
         // Unmeasured internal call: counted, but excluded from latency.
-        entry(None, 0, None, 0),
+        entry(None, 0, 0),
     ] {
         jarvis_usage::record(&db, &row).await?;
     }
 
+    // A failed call is not billed, so it never consumes the monthly cap.
+    let month_total = jarvis_usage::month_total_eur(&db).await?;
+    assert!((month_total - 0.02).abs() < 1e-9, "{month_total}");
     let stats = jarvis_usage::month_statistics(&db).await?;
     assert_eq!(stats.totals.requests, 4);
     assert_eq!(stats.totals.failures, 1);
@@ -764,7 +771,8 @@ async fn month_statistics_break_down_agents_latency_failures_and_fallbacks(
     assert_eq!(agents.len(), 1);
     let agent = &agents[0];
     assert_eq!(agent.agent_id, "researcher");
-    assert_eq!((agent.totals.requests, agent.totals.total_tokens), (2, 30));
+    assert_eq!((agent.totals.requests, agent.totals.total_tokens), (2, 15));
+    assert!((agent.totals.cost_eur - 0.01).abs() < 1e-9);
     assert_eq!((agent.totals.failures, agent.totals.fallbacks), (1, 2));
     assert!(agent.totals.latency_p50_ms.is_some());
     // RFC 3339 text from `time::format(.., '%+')`, e.g. 2026-10-04T11:07:31.123+00:00.

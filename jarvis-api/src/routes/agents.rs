@@ -164,6 +164,8 @@ mod tests {
                 requests: 3,
                 total_tokens: 900,
                 cost_eur: 0.12,
+                failures: 1,
+                fallbacks: 2,
                 ..Default::default()
             },
         };
@@ -178,9 +180,8 @@ mod tests {
             value["agents"][0]["usage"]["last_used"],
             "2026-10-03T09:00:00Z"
         );
-        // Not measured yet: null, never a zero.
-        assert_eq!(value["agents"][0]["usage"]["failures"], Value::Null);
-        assert_eq!(value["agents"][0]["usage"]["fallbacks"], Value::Null);
+        assert_eq!(value["agents"][0]["usage"]["failures"], 1);
+        assert_eq!(value["agents"][0]["usage"]["fallbacks"], 2);
         assert_eq!(value["agents"][1]["usage"]["requests"], 0);
         assert_eq!(value["agents"][1]["usage"]["last_used"], Value::Null);
         assert_eq!(value["usage_unavailable_reason"], Value::Null);

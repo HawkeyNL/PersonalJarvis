@@ -304,11 +304,19 @@ sudo jarvis --json usage
 ```
 
 It includes request and token totals, daily/provider/model breakdowns,
-estimated spend and latency p50/p95 (over calls with a measured latency). The
-report also has fields for per-agent usage (`by_agent`), failure counts
-(`failures`, `failures_by_category`) and router fallbacks (`fallbacks`); Core
-does not record these yet, so they are `null` ("not measured"), never a
-measured zero, until it does. The same data is available as the persistent
+estimated spend and latency p50/p95 (over calls with a measured latency).
+`fallbacks` counts the failed router attempts that preceded each recorded
+reply. A model call that produced no reply is recorded as one request with no
+tokens and no cost, so it never consumes the monthly budget (a failed Jev
+intent call was sent and keeps its conservative estimate); `failures` and
+`failures_by_category` count those calls by a fixed category (`timeout`,
+`rate_limited`, `plan_limit`, `auth`, `unavailable`, `refused`,
+`tool_use_refused`, `model_unavailable`, `other`), never by provider text.
+Because the routed provider is unknown after a failure, such a row names the
+owner's pinned provider and model, or `router`/`unknown`, and its own failed
+attempts are not counted as fallbacks. Per-agent usage (`by_agent`) stays
+`null` ("not measured"), never a measured zero: no Core path makes a model call
+on behalf of a registered agent yet. The same data is available as the persistent
 Costs view in `sudo jarvis`. Core refreshes the snapshot at startup, after metered requests
 and periodically so a temporary database failure can recover without an extra
 model call. The snapshot is bounded, root-controlled and contains no
