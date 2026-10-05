@@ -221,18 +221,18 @@ impl Store {
         versions.sort();
         let mut candidates = String::new();
         if !versions.is_empty() {
-            candidates.push_str("<section><h2>Losse iOS-testbuilds</h2><p>Dit zijn afzonderlijke candidates, geen complete clientrelease.</p><ul>");
+            candidates.push_str("<section><h2>Standalone iOS test builds</h2><p>These are separate candidates, not a complete client release.</p><ul>");
         }
         for version in versions.iter().rev() {
             // Version parsed as numeric SemVer; no untrusted HTML or URL input.
-            candidates.push_str(&format!("<li><a href=\"/downloads/ios/v{version}/Jarvis_{version}_ios_arm64_unsigned.ipa\">Jarvis {version} — IPA voor zelf ondertekenen</a></li>"));
+            candidates.push_str(&format!("<li><a href=\"/downloads/ios/v{version}/Jarvis_{version}_ios_arm64_unsigned.ipa\">Jarvis {version} — IPA for self-signing</a></li>"));
         }
         if !versions.is_empty() {
             candidates.push_str("</ul></section>");
         }
         let releases = super::release_store::public_links(&self.root, self.owner)?;
         let releases = if releases.is_empty() {
-            "<h2>Clientreleases</h2><p>Er is nog geen complete release geïmporteerd. Probeer het later opnieuw.</p>"
+            "<h2>Client releases</h2><p>No complete release has been imported yet. Please try again later.</p>"
         } else {
             &releases
         };

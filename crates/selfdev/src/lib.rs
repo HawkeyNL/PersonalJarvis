@@ -21,18 +21,18 @@ use jarvis_llm::{ChatMessage, ChatReply, ChatRequest, LlmError, LlmProvider, Rou
 
 const MAX_TOKENS: u32 = 1200;
 
-const SYS: &str = "Je bent Jarvis en je denkt na over hoe je JEZELF kunt verbeteren, \
-op basis van je eigen ecosysteem (hardware, breinen, modellen, budget, capabilities). \
-Je STELT ALLEEN VOOR — je voert niets uit, bewerkt geen bestanden, activeert niets. \
-Regels die je nooit overtreedt: (1) niets betaalds activeren zonder toestemming — \
-markeer zulke voorstellen met requires_approval=true en noem de kosten; (2) blijf binnen \
-het maandbudget; (3) de Core (jarvis-core/**) en je eigen Jarvis.md raak je NOOIT zelf aan — \
-voorstellen daarover markeer je als owner-only (handmatig door de eigenaar). \
-Geef 2 tot 6 concrete voorstellen. Antwoord UITSLUITEND met JSON in de vorm: \
-{\"summary\": \"korte samenvatting\", \"proposals\": [{\"title\": \"...\", \
-\"category\": \"model|key|tool|code|capability|core\", \"rationale\": \"waarom\", \
+const SYS: &str = "You are Jarvis and you reflect on how to improve YOURSELF, \
+based on your own ecosystem (hardware, brains, models, budget, capabilities). \
+You ONLY PROPOSE — you execute nothing, edit no files, activate nothing. \
+Rules you never break: (1) activate nothing paid without permission — \
+mark such proposals with requires_approval=true and state the cost; (2) stay within \
+the monthly budget; (3) you NEVER touch the Core (jarvis-core/**) or your own Jarvis.md yourself — \
+mark proposals about those as owner-only (done manually by the owner). \
+Give 2 to 6 concrete proposals. Answer ONLY with JSON of the form: \
+{\"summary\": \"short summary\", \"proposals\": [{\"title\": \"...\", \
+\"category\": \"model|key|tool|code|capability|core\", \"rationale\": \"why\", \
 \"cost\": \"gratis|metered|abonnement\", \"requires_approval\": true, \
-\"steps\": [\"stap 1\", \"stap 2\"]}]} en niets anders.";
+\"steps\": [\"step 1\", \"step 2\"]}]} and nothing else.";
 
 /// One improvement Jarvis proposes for itself. Advisory — never executed here.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -58,7 +58,7 @@ pub struct SelfDevReport {
 }
 
 /// Ask Jarvis to propose improvements to itself, given a rendered snapshot of its
-/// ecosystem and budget. `focus` narrows the scope (e.g. "goedkopere modellen").
+/// ecosystem and budget. `focus` narrows the scope (e.g. "cheaper models").
 pub async fn propose(
     llm: &Arc<dyn LlmProvider>,
     persona: &str,
@@ -93,15 +93,15 @@ pub async fn propose(
 
 fn build_context(ecosystem: &str, budget_eur: f64, spent_eur: f64, focus: Option<&str>) -> String {
     let remaining = (budget_eur - spent_eur).max(0.0);
-    let mut s = String::from("Je huidige ecosysteem:\n");
+    let mut s = String::from("Your current ecosystem:\n");
     s.push_str(ecosystem);
     s.push_str(&format!(
-        "\n\nBudget: €{spent_eur:.2} van €{budget_eur:.2} gebruikt deze maand (€{remaining:.2} over).\n"
+        "\n\nBudget: €{spent_eur:.2} of €{budget_eur:.2} used this month (€{remaining:.2} left).\n"
     ));
     if let Some(f) = focus.map(str::trim).filter(|f| !f.is_empty()) {
-        s.push_str(&format!("\nFocus van dit verzoek: {f}\n"));
+        s.push_str(&format!("\nFocus of this request: {f}\n"));
     }
-    s.push_str("\nWelke concrete verbeteringen aan jezelf stel je voor?");
+    s.push_str("\nWhich concrete improvements to yourself do you propose?");
     s
 }
 
@@ -126,7 +126,7 @@ fn parse_report(text: &str) -> (String, Vec<Proposal>) {
                 if !summary.is_empty() || !proposals.is_empty() {
                     return (
                         if summary.is_empty() {
-                            "Voorstellen voor zelfverbetering.".to_string()
+                            "Self-improvement proposals.".to_string()
                         } else {
                             summary
                         },
@@ -212,12 +212,12 @@ mod tests {
     #[test]
     fn parses_a_structured_report() {
         let (summary, props) = parse_report(
-            r#"wat tekst {"summary":"kort","proposals":[
-              {"title":"DeepSeek-reasoner alleen voor Hard","category":"model",
-               "rationale":"goedkoper","cost":"metered","requires_approval":true,
-               "steps":["a","b"]}]} nog wat"#,
+            r#"some text {"summary":"short","proposals":[
+              {"title":"DeepSeek-reasoner only for Hard","category":"model",
+               "rationale":"cheaper","cost":"metered","requires_approval":true,
+               "steps":["a","b"]}]} some more"#,
         );
-        assert_eq!(summary, "kort");
+        assert_eq!(summary, "short");
         assert_eq!(props.len(), 1);
         assert_eq!(props[0].category, "model");
         assert!(props[0].requires_approval);
@@ -226,8 +226,8 @@ mod tests {
 
     #[test]
     fn falls_back_to_raw_text_without_json() {
-        let (summary, props) = parse_report("gewoon tekst zonder json");
-        assert_eq!(summary, "gewoon tekst zonder json");
+        let (summary, props) = parse_report("just text without json");
+        assert_eq!(summary, "just text without json");
         assert!(props.is_empty());
     }
 
@@ -245,7 +245,7 @@ mod tests {
             r#"{"summary":"s","proposals":[{"title":"T","category":"tool","requires_approval":false}]}"#
                 .to_string(),
         ));
-        let report = propose(&llm, "persona", "ecosysteem", 50.0, 10.0, Some("modellen"))
+        let report = propose(&llm, "persona", "ecosystem", 50.0, 10.0, Some("models"))
             .await
             .unwrap();
         assert_eq!(report.summary, "s");

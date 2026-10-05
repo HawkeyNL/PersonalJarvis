@@ -53,7 +53,7 @@ impl FromRequestParts<AppState> for Authed {
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(serde_json::json!({
                     "error": "rate limited",
-                    "hint": "te veel pogingen; probeer het straks opnieuw",
+                    "hint": "too many attempts; try again later",
                 })),
             ));
         }

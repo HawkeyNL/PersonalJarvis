@@ -18,17 +18,17 @@ use jarvis_llm::{ChatMessage, ChatReply, ChatRequest, LlmError, LlmProvider, Rou
 const MAX_STEPS: usize = 6;
 const MAX_TOKENS: u32 = 1024;
 
-const PLAN_SYS: &str = "Je bent Jarvis' planner. Verdeel de taak van de gebruiker in 2 tot 6 \
-concrete, uitvoerbare stappen die elk los af te handelen zijn. Denk eerst, plan zuinig. \
-Antwoord UITSLUITEND met JSON in de vorm {\"steps\": [\"stap 1\", \"stap 2\"]} en niets anders.";
+const PLAN_SYS: &str = "You are Jarvis' planner. Split the user's task into 2 to 6 \
+concrete, actionable steps that can each be handled independently. Think first, plan economically. \
+Answer ONLY with JSON of the form {\"steps\": [\"step 1\", \"step 2\"]} and nothing else.";
 
-const EXEC_SYS: &str = "Je voert één stap uit van een groter plan van Jarvis. Gebruik de \
-gegeven context en eerdere resultaten. Doe alleen déze stap, bondig en concreet. \
-Voer geen echte acties uit (geen commando's/bestanden) — lever het denk-/schrijfwerk als tekst.";
+const EXEC_SYS: &str = "You carry out one step of a larger Jarvis plan. Use the \
+given context and earlier results. Do only THIS step, concisely and concretely. \
+Do not perform real actions (no commands/files) — deliver the thinking/writing work as text.";
 
-const SYNTH_SYS: &str = "Je bent Jarvis. Combineer de deelresultaten tot één helder, \
-volledig eindantwoord voor de gebruiker in het Nederlands. Controleer of het plan is \
-gevolgd; noem het eerlijk als er iets ontbreekt of onzeker is.";
+const SYNTH_SYS: &str = "You are Jarvis. Combine the partial results into one clear, \
+complete final answer for the user in Dutch. Check whether the plan was \
+followed; say so honestly if anything is missing or uncertain.";
 
 /// One executed step and the model that did it.
 #[derive(Debug, Clone)]
@@ -129,26 +129,26 @@ async fn chat_once(
 }
 
 fn exec_context(task: &str, plan: &[String], done: &[StepResult], i: usize, step: &str) -> String {
-    let mut s = format!("Oorspronkelijke taak:\n{task}\n\nVolledig plan:\n");
+    let mut s = format!("Original task:\n{task}\n\nFull plan:\n");
     for (n, p) in plan.iter().enumerate() {
         s.push_str(&format!("{}. {p}\n", n + 1));
     }
     if !done.is_empty() {
-        s.push_str("\nResultaten tot nu toe:\n");
+        s.push_str("\nResults so far:\n");
         for prev in done {
             s.push_str(&format!("- {}: {}\n", prev.step, prev.output));
         }
     }
-    s.push_str(&format!("\nVoer nu stap {} uit: {step}", i + 1));
+    s.push_str(&format!("\nNow carry out step {}: {step}", i + 1));
     s
 }
 
 fn synth_context(task: &str, steps: &[StepResult]) -> String {
-    let mut s = format!("Oorspronkelijke taak:\n{task}\n\nUitgevoerde stappen:\n");
+    let mut s = format!("Original task:\n{task}\n\nCompleted steps:\n");
     for (n, st) in steps.iter().enumerate() {
         s.push_str(&format!("{}. {}\n   → {}\n", n + 1, st.step, st.output));
     }
-    s.push_str("\nSchrijf nu het eindantwoord.");
+    s.push_str("\nNow write the final answer.");
     s
 }
 
@@ -198,22 +198,19 @@ mod tests {
 
     #[test]
     fn extract_steps_prefers_json() {
-        let t = "Zeker! ```json\n{\"steps\": [\"onderzoek\", \"schrijf\", \"controleer\"]}\n```";
-        assert_eq!(extract_steps(t), ["onderzoek", "schrijf", "controleer"]);
+        let t = "Sure! ```json\n{\"steps\": [\"research\", \"write\", \"check\"]}\n```";
+        assert_eq!(extract_steps(t), ["research", "write", "check"]);
     }
 
     #[test]
     fn extract_steps_falls_back_to_numbered_lines() {
-        let t = "Plan:\n1. Verzamel data\n2) Analyseer\n- Rapporteer\nklaar";
-        assert_eq!(
-            extract_steps(t),
-            ["Verzamel data", "Analyseer", "Rapporteer"]
-        );
+        let t = "Plan:\n1. Gather data\n2) Analyze\n- Report\ndone";
+        assert_eq!(extract_steps(t), ["Gather data", "Analyze", "Report"]);
     }
 
     #[test]
     fn extract_steps_empty_when_no_structure() {
-        assert!(extract_steps("gewoon wat proza zonder stappen").is_empty());
+        assert!(extract_steps("just some prose without steps").is_empty());
     }
 
     /// A provider that answers by tier: Hard → a plan, Cheap → a step result,
@@ -251,7 +248,7 @@ mod tests {
         let llm: Arc<dyn LlmProvider> = Arc::new(Scripted {
             seen: Mutex::new(Vec::new()),
         });
-        let r = plan_and_execute(&llm, "bouw iets", "Je bent Jarvis.")
+        let r = plan_and_execute(&llm, "build something", "Je bent Jarvis.")
             .await
             .unwrap();
         assert_eq!(r.plan, ["a", "b"]);

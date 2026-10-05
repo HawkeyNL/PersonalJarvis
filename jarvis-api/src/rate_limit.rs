@@ -186,7 +186,7 @@ pub(crate) fn too_many_requests() -> Response {
         [(axum::http::header::RETRY_AFTER, "60")],
         Json(json!({
             "error": "rate limited",
-            "hint": "te veel pogingen; probeer het straks opnieuw",
+            "hint": "too many attempts; try again later",
         })),
     )
         .into_response()

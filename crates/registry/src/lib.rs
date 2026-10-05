@@ -178,20 +178,20 @@ pub async fn collect(input: &CollectInput) -> Registry {
             name: "claude CLI".into(),
             present: claude_ver.is_some(),
             version: claude_ver.clone(),
-            detail: Some("brein via je abonnement".into()),
+            detail: Some("brain via your subscription".into()),
         },
         SoftwareItem {
             name: "ollama".into(),
             present: ollama_ver.is_some(),
             version: ollama_ver,
             detail: (!ollama_models.is_empty())
-                .then(|| format!("{} lokaal model(len)", ollama_models.len())),
+                .then(|| format!("{} local model(s)", ollama_models.len())),
         },
         SoftwareItem {
             name: "cmake".into(),
             present: cmake_ver.is_some(),
             version: cmake_ver,
-            detail: Some("nodig voor whisper-STT".into()),
+            detail: Some("needed for whisper STT".into()),
         },
         SoftwareItem {
             name: "whisper-model".into(),
@@ -398,24 +398,24 @@ fn derive_brains(
     vec![
         Brain {
             id: "claude-cli".into(),
-            label: format!("Claude-abonnement · {}", input.anthropic_model),
+            label: format!("Claude subscription · {}", input.anthropic_model),
             cost: CostTier::Plan,
             available: claude_present,
             note: if claude_present {
                 "headless `claude` CLI (plan)".into()
             } else {
-                format!("`{}` niet gevonden", input.claude_cli_bin)
+                format!("`{}` not found", input.claude_cli_bin)
             },
         },
         Brain {
             id: "codex-cli".into(),
-            label: "ChatGPT-abonnement (Codex)".into(),
+            label: "ChatGPT subscription (Codex)".into(),
             cost: CostTier::Plan,
             available: codex_chat_present,
             note: if codex_chat_present {
-                "lokale Codex-chatworker (abonnement, alleen tekst)".into()
+                "local Codex chat worker (subscription, text only)".into()
             } else {
-                "Codex-chatworker niet ingeschakeld".into()
+                "Codex chat worker not enabled".into()
             },
         },
         Brain {
@@ -426,7 +426,7 @@ fn derive_brains(
             note: if input.has_xai_key {
                 "per-token".into()
             } else {
-                "geen API-key gezet".into()
+                "no API key set".into()
             },
         },
         Brain {
@@ -437,7 +437,7 @@ fn derive_brains(
             note: if input.has_zai_key {
                 "per-token".into()
             } else {
-                "geen API-key gezet".into()
+                "no API key set".into()
             },
         },
         Brain {
@@ -448,7 +448,7 @@ fn derive_brains(
             note: if input.has_ollama_cloud_key {
                 "credentialed remote API".into()
             } else {
-                "geen API-key gezet".into()
+                "no API key set".into()
             },
         },
         Brain {
@@ -459,7 +459,7 @@ fn derive_brains(
             note: if input.has_huggingface_key {
                 "Inference Providers router".into()
             } else {
-                "geen API-key gezet".into()
+                "no API key set".into()
             },
         },
         Brain {
@@ -470,7 +470,7 @@ fn derive_brains(
             note: if input.has_api_key {
                 "per-token (vangnet)".into()
             } else {
-                "geen API-key gezet".into()
+                "no API key set".into()
             },
         },
         Brain {
@@ -481,7 +481,7 @@ fn derive_brains(
             note: if input.has_openai_key {
                 "per-token".into()
             } else {
-                "geen API-key gezet".into()
+                "no API key set".into()
             },
         },
         Brain {
@@ -490,20 +490,20 @@ fn derive_brains(
             cost: CostTier::Metered,
             available: input.has_deepseek_key,
             note: if input.has_deepseek_key {
-                "per-token (goedkoop)".into()
+                "per-token (cheap)".into()
             } else {
-                "geen API-key gezet".into()
+                "no API key set".into()
             },
         },
         Brain {
             id: "ollama".into(),
-            label: format!("Ollama lokaal · {}", input.ollama_model),
+            label: format!("Ollama local · {}", input.ollama_model),
             cost: CostTier::Local,
             available: ollama_available,
             note: if ollama_available {
-                format!("{} lokaal model(len)", ollama_models.len())
+                format!("{} local model(s)", ollama_models.len())
             } else {
-                "ollama niet actief".into()
+                "ollama not running".into()
             },
         },
     ]
@@ -517,7 +517,7 @@ fn host_info() -> HostInfo {
         .first()
         .map(|c| c.brand().trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "onbekend".into());
+        .unwrap_or_else(|| "unknown".into());
     let cores = sys.cpus().len();
     let mem_gb = sys.total_memory() as f32 / 1024.0 / 1024.0 / 1024.0;
     let arch = std::env::consts::ARCH.to_string();
@@ -525,9 +525,9 @@ fn host_info() -> HostInfo {
         .or_else(System::name)
         .unwrap_or_else(|| std::env::consts::OS.to_string());
     let gpu = if std::env::consts::OS == "macos" && arch == "aarch64" {
-        "Apple Silicon (geïntegreerde GPU)".into()
+        "Apple Silicon (integrated GPU)".into()
     } else {
-        "onbekend".into()
+        "unknown".into()
     };
     HostInfo {
         os,
@@ -652,7 +652,7 @@ mod tests {
         let brains = derive_brains(&i, false, false, &[]);
         assert!(!brain(&brains, "claude-cli").available); // no claude binary
         assert!(!brain(&brains, "codex-cli").available); // worker socket off
-        assert!(brain(&brains, "claude-cli").note.contains("niet gevonden"));
+        assert!(brain(&brains, "claude-cli").note.contains("not found"));
         assert!(!brain(&brains, "anthropic-api").available); // no api key
         assert!(!brain(&brains, "openai-api").available); // no openai key
         assert!(!brain(&brains, "deepseek-api").available); // no deepseek key

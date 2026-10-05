@@ -93,13 +93,7 @@ fn complete_signed_release_stages_and_activates_exact_api_layout() {
     let index = super::super::Store::open(&public, owner).unwrap();
     index.render_index().unwrap();
     let html = fs::read_to_string(public.join("index.html")).unwrap();
-    for label in [
-        "Linux",
-        "Windows",
-        "macOS",
-        "Android",
-        "iOS — zelf ondertekenen",
-    ] {
+    for label in ["Linux", "Windows", "macOS", "Android", "iOS — self-signing"] {
         assert!(html.contains(label));
     }
     assert!(!html.contains("fixture-private-token"));

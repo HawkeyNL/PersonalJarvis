@@ -172,7 +172,7 @@ pub(super) async fn execute_chat(
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({
                 "error": "rate limited",
-                "hint": "te veel pogingen; probeer het straks opnieuw",
+                "hint": "too many attempts; try again later",
             })),
         ));
     }
@@ -486,7 +486,7 @@ pub(super) async fn execute_chat(
             })))
         }
         Err(llm::LlmError::Refused) => {
-            let text = "Sorry, daar kan ik niet op antwoorden.";
+            let text = "Sorry, I can't answer that.";
             let message =
                 append_message(&state.db, conv_id, authed.user.id, "assistant", text, None)
                     .await
@@ -517,7 +517,7 @@ pub(super) async fn execute_chat(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
                     "error": "brain unavailable",
-                    "hint": "controleer JARVIS_LLM_API_KEY of start Ollama lokaal",
+                    "hint": "check JARVIS_LLM_API_KEY or start Ollama locally",
                     "conversation_id": conv_id,
                 })),
             ))
@@ -579,7 +579,7 @@ async fn classify_topic(
 fn derive_title(msg: &str) -> String {
     let t = clean_title(msg);
     if t.is_empty() {
-        "Nieuw gesprek".to_string()
+        "New conversation".to_string()
     } else {
         t
     }
@@ -843,7 +843,7 @@ pub(crate) async fn assistant_orchestrate(
             })))
         }
         Err(llm::LlmError::Refused) => Ok(Json(json!({
-            "answer": "Sorry, daar kan ik niet op antwoorden.",
+            "answer": "Sorry, I can't answer that.",
             "plan": Value::Array(vec![]),
             "steps": Value::Array(vec![]),
         }))),
@@ -853,7 +853,7 @@ pub(crate) async fn assistant_orchestrate(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
                     "error": "brain unavailable",
-                    "hint": "controleer je brein-config (router/keys/Ollama)",
+                    "hint": "check your brain config (router/keys/Ollama)",
                 })),
             ))
         }

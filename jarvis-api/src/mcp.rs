@@ -68,7 +68,7 @@ pub(crate) async fn mcp_endpoint(
                     "content": [{ "type": "text", "text": text }],
                     "isError": false,
                 })),
-                Err(ToolErr::Unknown) => Err((-32601, format!("onbekende tool: {name}"))),
+                Err(ToolErr::Unknown) => Err((-32601, format!("unknown tool: {name}"))),
                 Err(ToolErr::Failed(msg)) => Ok(json!({
                     "resultType": "complete",
                     "content": [{ "type": "text", "text": msg }],
@@ -76,7 +76,7 @@ pub(crate) async fn mcp_endpoint(
                 })),
             }
         }
-        other => Err((-32601, format!("methode niet gevonden: {other}"))),
+        other => Err((-32601, format!("method not found: {other}"))),
     };
 
     let payload = match outcome {
@@ -109,7 +109,7 @@ fn mcp_handshake(body: &Value) -> Value {
         "capabilities": { "tools": {} },
         "serverInfo": info,
         "_meta": { "io.modelcontextprotocol/serverInfo": info },
-        "instructions": "Read-only tools van Jarvis: portfolio, status en geheugen.",
+        "instructions": "Read-only Jarvis tools: portfolio, status and memory.",
     })
 }
 
@@ -118,20 +118,20 @@ fn mcp_tools() -> Value {
     json!([
         {
             "name": "portfolio_summary",
-            "description": "Jarvis' portfolio: posities, kostenbasis en allocatie (alleen-lezen).",
+            "description": "Jarvis' portfolio: positions, cost basis and allocation (read-only).",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
             "name": "jarvis_status",
-            "description": "Jarvis' ecosysteem: host, breinen, model-catalogus en maandbudget (alleen-lezen).",
+            "description": "Jarvis' ecosystem: host, brains, model catalog and monthly budget (read-only).",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
             "name": "recent_conversations",
-            "description": "Recente gesprekstitels — Jarvis' geheugen, nieuwste eerst (alleen-lezen).",
+            "description": "Recent conversation titles — Jarvis' memory, newest first (read-only).",
             "inputSchema": {
                 "type": "object",
-                "properties": { "limit": { "type": "integer", "description": "max aantal (1-50)" } },
+                "properties": { "limit": { "type": "integer", "description": "max count (1-50)" } },
                 "additionalProperties": false
             }
         }
@@ -161,14 +161,14 @@ async fn mcp_call(
 async fn mcp_portfolio(state: &AppState, authed: &Authed) -> Result<String, ToolErr> {
     let holdings = portfolio::list_holdings(&state.db, authed.user.id)
         .await
-        .map_err(|e| ToolErr::Failed(format!("portfolio niet leesbaar: {e}")))?;
+        .map_err(|e| ToolErr::Failed(format!("portfolio not readable: {e}")))?;
     if holdings.is_empty() {
-        return Ok("Geen posities in het portfolio.".to_string());
+        return Ok("No positions in the portfolio.".to_string());
     }
     let total: Decimal = holdings.iter().map(|h| h.cost_basis()).sum();
     let hundred = Decimal::from(100);
     let mut s = format!(
-        "Portfolio — {} posities, totale kostenbasis {}:\n",
+        "Portfolio — {} positions, total cost basis {}:\n",
         holdings.len(),
         total.normalize()
     );
@@ -195,12 +195,12 @@ async fn mcp_portfolio(state: &AppState, authed: &Authed) -> Result<String, Tool
 fn mcp_status(state: &AppState) -> String {
     let eco = match state.registry.read() {
         Ok(reg) => render_ecosystem(&reg, state.agent_enabled, state.agent_sandbox.is_some()),
-        Err(_) => "(ecosysteem tijdelijk niet leesbaar)".to_string(),
+        Err(_) => "(ecosystem temporarily unreadable)".to_string(),
     };
     let spent = state.spent_cents.load(Ordering::Relaxed) as f64 / 100.0;
     let budget = state.budget_cents as f64 / 100.0;
     format!(
-        "{eco}\nBudget: €{spent:.2} van €{budget:.2} gebruikt deze maand (€{:.2} over).",
+        "{eco}\nBudget: €{spent:.2} of €{budget:.2} used this month (€{:.2} left).",
         (budget - spent).max(0.0)
     )
 }
@@ -229,14 +229,14 @@ async fn mcp_recent_conversations(
         )
         .bind(json!({"user_id": authed.user.id.to_string(), "limit": limit}))
         .await
-        .map_err(|_| ToolErr::Failed("gesprekken niet leesbaar".to_string()))?;
+        .map_err(|_| ToolErr::Failed("conversations not readable".to_string()))?;
     let rows: Vec<ConversationRow> = response
         .take(0)
-        .map_err(|_| ToolErr::Failed("gesprekken niet leesbaar".to_string()))?;
+        .map_err(|_| ToolErr::Failed("conversations not readable".to_string()))?;
     if rows.is_empty() {
-        return Ok("Nog geen gesprekken.".to_string());
+        return Ok("No conversations yet.".to_string());
     }
-    let mut s = String::from("Recente gesprekken:\n");
+    let mut s = String::from("Recent conversations:\n");
     for row in rows {
         s.push_str(&format!(
             "- {} ({})\n",

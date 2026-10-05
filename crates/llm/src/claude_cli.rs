@@ -219,7 +219,7 @@ fn build_bounded_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for (role, content) in selected {
         prompt.push_str(match role {
-            Role::User => "Gebruiker: ",
+            Role::User => "User: ",
             Role::Assistant => "Jarvis: ",
         });
         prompt.push_str(&content);

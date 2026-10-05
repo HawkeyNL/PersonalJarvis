@@ -359,7 +359,7 @@ pub(super) fn public_links(root: &Path, owner: u32) -> Result<String> {
     html.push_str("}</style>");
     for version in versions.iter().rev() {
         let badge = if version == latest {
-            " <span class=\"latest-badge\">Latest · nieuwste versie</span>"
+            " <span class=\"latest-badge\">Latest · newest version</span>"
         } else {
             ""
         };
@@ -369,7 +369,7 @@ pub(super) fn public_links(root: &Path, owner: u32) -> Result<String> {
             ("windows-x86_64", ".exe", "Windows"),
             ("macos-arm64", ".dmg", "macOS"),
             ("android-universal", ".apk", "Android"),
-            ("ios-arm64", "_unsigned.ipa", "iOS — zelf ondertekenen"),
+            ("ios-arm64", "_unsigned.ipa", "iOS — self-signing"),
         ] {
             let name = format!("Jarvis_{version}_{}{suffix}", target.replace('-', "_"));
             validate_directory(&releases.join(format!("v{version}/{target}")), owner)?;
