@@ -11,6 +11,15 @@ struct BootstrapBindings {
     public_key: Vec<u8>,
 }
 
+/// The record id is bound from Rust: `type::thing` is gone in SurrealDB 3.x
+/// and `type::record` takes different arguments in 2.6.5 and 3.x.
+#[derive(serde::Serialize)]
+struct ApprovalBindings {
+    #[serde(flatten)]
+    fields: serde_json::Value,
+    password_record: surrealdb::RecordId,
+}
+
 /// Called only after the API verifies a locally provisioned activation code
 /// and LAN scope. The one-use global latch and all first-account records are
 /// committed together; revoking all devices never reopens bootstrap.
@@ -30,7 +39,7 @@ pub async fn bootstrap_account(
     let user = existing.as_ref().map_or_else(Uuid::now_v7, |u| u.id);
     let device = Uuid::now_v7();
     execute(db, "BEGIN TRANSACTION; \
-        IF time::now() >= time::from::unix($expires) { THROW 'activation expired'; }; \
+        IF time::unix(time::now()) >= $expires { THROW 'activation expired'; }; \
         LET $active = SELECT id FROM devices WHERE status = 'active'; \
         IF array::len($active) != 0 { THROW 'activation unavailable'; }; \
         CREATE ONLY bootstrap_state:owner SET id = 'owner', claimed_at = time::now(), device_id = $device; \
@@ -251,7 +260,7 @@ pub async fn approve_action(
     let message = account_approval_message(&challenge).map_err(|_| IdentityError::AuthFailed)?;
     verify_device_signature(db, user, device, &message, signature).await?;
     let mutation = match action {
-        AccountAction::PasswordSet => "UPSERT type::thing('account_passwords', $user) SET user_id = $user, \
+        AccountAction::PasswordSet => "UPSERT $password_record SET user_id = $user, \
             verifier = $claim[0].verifier, revision = $id, updated_at = time::now(); \
             UPDATE sessions SET revoked_at = time::now() WHERE user_id = $user AND revoked_at IS NONE; \
             DELETE account_actions WHERE user_id = $user;",
@@ -271,8 +280,14 @@ pub async fn approve_action(
     execute(
         db,
         &query,
-        json!({"id":id.to_string(), "user":user.to_string(), "device":device.to_string(),
-        "action":action.as_str(), "target":challenge.target.to_string()}),
+        ApprovalBindings {
+            fields: json!({"id":id.to_string(), "user":user.to_string(), "device":device.to_string(),
+            "action":action.as_str(), "target":challenge.target.to_string()}),
+            password_record: surrealdb::RecordId::from_table_key(
+                "account_passwords",
+                user.to_string(),
+            ),
+        },
     )
     .await?;
     Ok(challenge)

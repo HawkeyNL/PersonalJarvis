@@ -75,16 +75,36 @@ pub async fn connect(
     Ok(db)
 }
 
+/// The current schema version, or `None` on an empty database. SurrealDB 3.x
+/// errors on a read from a table that does not exist (2.x returns nothing), so
+/// look the table up first; `INFO FOR DB` works on both.
+async fn schema_version(db: &Database) -> Result<Option<SchemaVersion>, StoreError> {
+    #[derive(serde::Deserialize)]
+    struct DbInfo {
+        tables: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
+    }
+    let info: Option<DbInfo> = db
+        .query("INFO FOR DB")
+        .await
+        .map_err(StoreError::schema)?
+        .take(0)
+        .map_err(StoreError::schema)?;
+    if !info.is_some_and(|info| info.tables.contains_key("schema_version")) {
+        return Ok(None);
+    }
+    db.query("SELECT version FROM schema_version:baseline")
+        .await
+        .map_err(StoreError::schema)?
+        .take(0)
+        .map_err(StoreError::schema)
+}
+
 /// Apply the checked-in schema as a single database transaction. A failure
 /// aborts startup; continuing with a partly-defined security schema would be
 /// unsafe. This is an idempotent baseline for the empty, pre-production Home
 /// Node only. Later schema changes must be explicit, versioned migrations.
 pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
-    let mut response = db
-        .query("SELECT version FROM schema_version:baseline")
-        .await
-        .map_err(StoreError::schema)?;
-    let current: Option<SchemaVersion> = response.take(0).map_err(StoreError::schema)?;
+    let current = schema_version(db).await?;
     if current.is_some_and(|v| v.version == 10) {
         return Ok(());
     }
@@ -100,11 +120,7 @@ pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
 }
 
 async fn apply_through_nine(db: &Database) -> Result<(), StoreError> {
-    let mut response = db
-        .query("SELECT version FROM schema_version:baseline")
-        .await
-        .map_err(StoreError::schema)?;
-    let current: Option<SchemaVersion> = response.take(0).map_err(StoreError::schema)?;
+    let current = schema_version(db).await?;
     if current.is_some_and(|v| v.version == 9) {
         return Ok(());
     }
@@ -120,11 +136,7 @@ async fn apply_through_nine(db: &Database) -> Result<(), StoreError> {
 }
 
 async fn apply_through_eight(db: &Database) -> Result<(), StoreError> {
-    let mut response = db
-        .query("SELECT version FROM schema_version:baseline")
-        .await
-        .map_err(StoreError::schema)?;
-    let current: Option<SchemaVersion> = response.take(0).map_err(StoreError::schema)?;
+    let current = schema_version(db).await?;
     if current.is_some_and(|v| v.version == 8) {
         return Ok(());
     }
@@ -140,11 +152,7 @@ async fn apply_through_eight(db: &Database) -> Result<(), StoreError> {
 }
 
 async fn apply_through_seven(db: &Database) -> Result<(), StoreError> {
-    let mut response = db
-        .query("SELECT version FROM schema_version:baseline")
-        .await
-        .map_err(StoreError::schema)?;
-    let current: Option<SchemaVersion> = response.take(0).map_err(StoreError::schema)?;
+    let current = schema_version(db).await?;
     if current.is_some_and(|v| v.version == 7) {
         return Ok(());
     }
@@ -160,11 +168,7 @@ async fn apply_through_seven(db: &Database) -> Result<(), StoreError> {
 }
 
 async fn apply_through_six(db: &Database) -> Result<(), StoreError> {
-    let mut version = db
-        .query("SELECT version FROM schema_version:baseline")
-        .await
-        .map_err(StoreError::schema)?;
-    let current: Option<SchemaVersion> = version.take(0).map_err(StoreError::schema)?;
+    let current = schema_version(db).await?;
     if let Some(current) = current {
         if current.version == 6 {
             return Ok(());

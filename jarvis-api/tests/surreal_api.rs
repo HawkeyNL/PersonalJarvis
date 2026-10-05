@@ -334,6 +334,56 @@ async fn owner_read_models_answer_an_owner_session() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn owner_brain_preference_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db, None).await);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let request = |method: &'static str, body: Option<Value>| {
+        let builder = Request::builder()
+            .method(method)
+            .uri("/v1/system/brain")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json");
+        app.clone().oneshot(
+            builder
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                .unwrap(),
+        )
+    };
+
+    // Local Ollama is allowed without a policy entry. Set twice: the second
+    // write must update the same row, not trip the unique user index.
+    for model in ["llama3", "qwen3"] {
+        let set = request("PUT", Some(json!({"provider": "ollama", "model": model}))).await?;
+        assert_eq!(set.status(), StatusCode::OK);
+        let get = json_body(request("GET", None).await?).await;
+        assert_eq!(
+            get["default"],
+            json!({"mode": "pinned", "provider": "ollama", "model": model})
+        );
+    }
+
+    let auto = request("PUT", Some(json!({"provider": null, "model": null}))).await?;
+    assert_eq!(auto.status(), StatusCode::OK);
+    let get = json_body(request("GET", None).await?).await;
+    assert_eq!(get["default"], json!({"mode": "auto"}));
+    Ok(())
+}
+
 async fn enroll_login(app: &axum::Router, signing: &SigningKey) -> (String, Vec<u8>) {
     let enroll = app.clone().oneshot(Request::builder().method("POST").uri("/v1/auth/enroll")
         .header(header::CONTENT_TYPE, "application/json").body(Body::from(serde_json::to_vec(&json!({"name":"test", "platform":"ios", "public_key": hex::encode(signing.verifying_key().to_bytes())})).unwrap())).unwrap()).await.unwrap();
