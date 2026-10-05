@@ -47,7 +47,7 @@ pub use stream::TextDeltaSink;
 pub use types::{
     classify_task, ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, ResearchRequest,
     Role, RoutingMode, TaskRequirements, Tier, Usage, MAX_RESEARCH_QUESTION_CHARS,
-    RESEARCH_SYSTEM_PROMPT,
+    RESEARCH_SYSTEM_PROMPT, USAGE_FAILURE_CATEGORIES,
 };
 
 /// A swappable brain: given a conversation, produce a reply.
@@ -443,6 +443,7 @@ impl LlmProvider for Echo {
             backend: Some("stub".into()),
             requested_route: None,
             actual_provider: None,
+            fallback_count: 0,
             stop_reason: Some("end_turn".into()),
             usage: None,
         })

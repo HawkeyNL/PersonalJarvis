@@ -414,7 +414,6 @@ pub struct UsageMetadata {
     pub latency_ms: i64,
     pub status: String,
     pub failure_category: Option<String>,
-    pub fallback_count: i32,
 }
 
 impl Default for UsageMetadata {
@@ -427,7 +426,39 @@ impl Default for UsageMetadata {
             latency_ms: 0,
             status: "succeeded".into(),
             failure_category: None,
+        }
+    }
+}
+
+impl UsageEntry {
+    /// A model call that produced no reply. It carries no tokens and no cost,
+    /// so it never consumes the monthly cap: only a reply with usage is
+    /// billed. `category` is a Core-assigned identifier, never provider text.
+    pub fn failed(
+        backend: &str,
+        model: &str,
+        category: &'static str,
+        metadata: UsageMetadata,
+    ) -> Self {
+        Self {
+            request_id: metadata.request_id,
+            backend: backend.to_owned(),
+            model: model.to_owned(),
+            requested_route: None,
+            actual_provider: None,
+            cost_estimate_classification: "not_billed".into(),
+            routing_mode: metadata.routing_mode,
+            quality_tier: metadata.quality_tier,
+            agent_id: metadata.agent_id,
+            latency_ms: metadata.latency_ms,
+            status: "failed".into(),
+            failure_category: Some(category.to_owned()),
             fallback_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_eur: 0.0,
         }
     }
 }
@@ -511,11 +542,15 @@ pub use surreal::{
 /// aggregates still compute them, but reports show a dimension whose flag is
 /// `false` as `null` ("not measured"), never as a measured zero. Flip a flag
 /// in the change that starts recording that dimension.
+///
+/// No Core path runs a model call on behalf of a registered agent yet, so no
+/// row carries an `agent_id`.
 pub const AGENT_USAGE_INSTRUMENTED: bool = false;
-/// Failed calls are not recorded yet (only replies with usage are metered).
-pub const FAILURES_INSTRUMENTED: bool = false;
-/// The router does not report how many candidates it tried yet.
-pub const FALLBACKS_INSTRUMENTED: bool = false;
+/// Failed assistant, orchestration, self-improve and intent calls are recorded
+/// as zero-token, zero-cost rows with a bounded failure category.
+pub const FAILURES_INSTRUMENTED: bool = true;
+/// Each reply records how many failed router attempts preceded it.
+pub const FALLBACKS_INSTRUMENTED: bool = true;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageTotals {
@@ -801,6 +836,33 @@ mod tests {
         let fresh = cost_eur("anthropic-api", "claude-sonnet-5", 1_000_000, 0, 0, 0.92);
         let cached = cost_eur("anthropic-api", "claude-sonnet-5", 0, 0, 1_000_000, 0.92);
         assert!(cached < fresh / 5.0, "cached {cached} vs fresh {fresh}");
+    }
+
+    #[test]
+    fn failed_call_has_a_category_but_no_tokens_or_cost() {
+        let entry = UsageEntry::failed(
+            "router",
+            "unknown",
+            "timeout",
+            UsageMetadata {
+                latency_ms: 42,
+                ..Default::default()
+            },
+        );
+        assert_eq!(entry.status, "failed");
+        assert_eq!(entry.failure_category.as_deref(), Some("timeout"));
+        assert_eq!(entry.latency_ms, 42);
+        assert_eq!(
+            (
+                entry.input_tokens,
+                entry.output_tokens,
+                entry.cache_read_tokens,
+                entry.cache_write_tokens,
+                entry.fallback_count,
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(entry.cost_eur, 0.0);
     }
 
     #[test]

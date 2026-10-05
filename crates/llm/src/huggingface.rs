@@ -252,6 +252,7 @@ mod tests {
                 backend: Some("huggingface".into()),
                 requested_route: None,
                 actual_provider: None,
+                fallback_count: 0,
                 stop_reason: Some("stop".into()),
                 usage: Some(crate::Usage {
                     input_tokens: 3,

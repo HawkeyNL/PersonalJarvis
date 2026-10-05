@@ -290,6 +290,9 @@ pub struct ChatReply {
     pub stop_reason: Option<String>,
     /// Token usage, when the provider reports it.
     pub usage: Option<Usage>,
+    /// Failed attempts the router fell through before this reply (0 when the
+    /// first attempt answered). Set by the routing layer, never by a backend.
+    pub fallback_count: u32,
 }
 
 /// Errors from the brain.
@@ -346,6 +349,46 @@ impl LlmError {
             Self::Api { .. } | Self::Empty => ProviderFailure::MalformedResponse,
             Self::Refused => ProviderFailure::Refused,
             Self::NotConfigured(_) => ProviderFailure::NotConfigured,
+        }
+    }
+}
+
+/// The bounded failure categories recorded in `llm_usage`. Core assigns them;
+/// they never carry provider text, prompts or answers.
+pub const USAGE_FAILURE_CATEGORIES: [&str; 9] = [
+    "timeout",
+    "rate_limited",
+    "plan_limit",
+    "auth",
+    "unavailable",
+    "refused",
+    "tool_use_refused",
+    "model_unavailable",
+    "other",
+];
+
+impl LlmError {
+    /// The usage failure category, one of [`USAGE_FAILURE_CATEGORIES`].
+    /// Subscription-worker bodies are Core-authored, so matching their fixed
+    /// wording is safe; provider bodies only ever fall through to `other`.
+    pub fn usage_failure_category(&self) -> &'static str {
+        match self {
+            Self::Http(error) if error.is_timeout() => "timeout",
+            Self::Api {
+                status: 408 | 504, ..
+            } => "timeout",
+            Self::Api { status: 429, body } if body.ends_with("plan limit reached") => "plan_limit",
+            Self::Api { body, .. } if body.ends_with("attempted tool use and was refused") => {
+                "tool_use_refused"
+            }
+            Self::Refused => "refused",
+            Self::NotConfigured(_) => "model_unavailable",
+            _ => match self.failure_category() {
+                ProviderFailure::RateLimited => "rate_limited",
+                ProviderFailure::Authentication => "auth",
+                ProviderFailure::Transport | ProviderFailure::Unavailable => "unavailable",
+                _ => "other",
+            },
         }
     }
 }
@@ -407,6 +450,40 @@ mod tests {
         let longest = "é".repeat(MAX_RESEARCH_QUESTION_CHARS);
         assert!(ResearchRequest::new(&longest).is_some());
         assert!(ResearchRequest::new(&format!("{longest}x")).is_none());
+    }
+
+    #[test]
+    fn usage_failure_categories_are_bounded_and_never_echo_provider_text() {
+        let api = |status, body: &str| LlmError::Api {
+            status,
+            body: body.into(),
+        };
+        let cases = [
+            (api(504, "Claude worker timed out"), "timeout"),
+            (
+                api(429, "Claude subscription plan limit reached"),
+                "plan_limit",
+            ),
+            (api(429, "slow down"), "rate_limited"),
+            (api(401, "recognizable-test-secret"), "auth"),
+            (api(503, "Claude subscription unavailable"), "unavailable"),
+            (
+                api(502, "Codex run attempted tool use and was refused"),
+                "tool_use_refused",
+            ),
+            (LlmError::Refused, "refused"),
+            (
+                LlmError::NotConfigured("no brain".into()),
+                "model_unavailable",
+            ),
+            (api(400, "recognizable-test-secret"), "other"),
+            (LlmError::Empty, "other"),
+        ];
+        for (error, expected) in cases {
+            let category = error.usage_failure_category();
+            assert_eq!(category, expected);
+            assert!(USAGE_FAILURE_CATEGORIES.contains(&category));
+        }
     }
 
     #[test]

@@ -239,6 +239,7 @@ mod tests {
                 backend: Some("test".into()),
                 requested_route: None,
                 actual_provider: None,
+                fallback_count: 0,
                 stop_reason: None,
                 usage: None,
             })

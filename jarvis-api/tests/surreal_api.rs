@@ -334,6 +334,56 @@ async fn owner_read_models_answer_an_owner_session() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn owner_brain_preference_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db, None).await);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let request = |method: &'static str, body: Option<Value>| {
+        let builder = Request::builder()
+            .method(method)
+            .uri("/v1/system/brain")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json");
+        app.clone().oneshot(
+            builder
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                .unwrap(),
+        )
+    };
+
+    // Local Ollama is allowed without a policy entry. Set twice: the second
+    // write must update the same row, not trip the unique user index.
+    for model in ["llama3", "qwen3"] {
+        let set = request("PUT", Some(json!({"provider": "ollama", "model": model}))).await?;
+        assert_eq!(set.status(), StatusCode::OK);
+        let get = json_body(request("GET", None).await?).await;
+        assert_eq!(
+            get["default"],
+            json!({"mode": "pinned", "provider": "ollama", "model": model})
+        );
+    }
+
+    let auto = request("PUT", Some(json!({"provider": null, "model": null}))).await?;
+    assert_eq!(auto.status(), StatusCode::OK);
+    let get = json_body(request("GET", None).await?).await;
+    assert_eq!(get["default"], json!({"mode": "auto"}));
+    Ok(())
+}
+
 async fn enroll_login(app: &axum::Router, signing: &SigningKey) -> (String, Vec<u8>) {
     let enroll = app.clone().oneshot(Request::builder().method("POST").uri("/v1/auth/enroll")
         .header(header::CONTENT_TYPE, "application/json").body(Body::from(serde_json::to_vec(&json!({"name":"test", "platform":"ios", "public_key": hex::encode(signing.verifying_key().to_bytes())})).unwrap())).unwrap()).await.unwrap();
@@ -663,42 +713,49 @@ async fn month_statistics_break_down_agents_latency_failures_and_fallbacks(
     .bind(json!({"id": uuid::Uuid::now_v7().to_string()}))
     .await?
     .check()?;
-    let entry = |agent: Option<&str>, latency_ms, failure: Option<&str>, fallback_count| {
-        jarvis_usage::UsageEntry {
-            request_id: uuid::Uuid::now_v7().to_string(),
-            backend: "ollama-cloud".to_owned(),
-            model: "fixture-model".to_owned(),
-            requested_route: None,
-            actual_provider: None,
-            cost_estimate_classification: "known".to_owned(),
-            routing_mode: "test".to_owned(),
-            quality_tier: "test".to_owned(),
-            agent_id: agent.map(str::to_owned),
-            latency_ms,
-            status: if failure.is_some() {
-                "failed"
-            } else {
-                "succeeded"
-            }
-            .to_owned(),
-            failure_category: failure.map(str::to_owned),
-            fallback_count,
-            input_tokens: 10,
-            output_tokens: 5,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            cost_eur: 0.01,
-        }
+    let entry = |agent: Option<&str>, latency_ms, fallback_count| jarvis_usage::UsageEntry {
+        request_id: uuid::Uuid::now_v7().to_string(),
+        backend: "ollama-cloud".to_owned(),
+        model: "fixture-model".to_owned(),
+        requested_route: None,
+        actual_provider: None,
+        cost_estimate_classification: "known".to_owned(),
+        routing_mode: "test".to_owned(),
+        quality_tier: "test".to_owned(),
+        agent_id: agent.map(str::to_owned),
+        latency_ms,
+        status: "succeeded".to_owned(),
+        failure_category: None,
+        fallback_count,
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cost_eur: 0.01,
     };
+    // The same constructor Core's metering uses for a call without a reply.
+    let failed = jarvis_usage::UsageEntry::failed(
+        "ollama-cloud",
+        "fixture-model",
+        "timeout",
+        jarvis_usage::UsageMetadata {
+            agent_id: Some("researcher".to_owned()),
+            latency_ms: 300,
+            ..Default::default()
+        },
+    );
     for row in [
-        entry(Some("researcher"), 100, None, 0),
-        entry(Some("researcher"), 300, Some("timeout"), 2),
+        entry(Some("researcher"), 100, 2),
+        failed,
         // Unmeasured internal call: counted, but excluded from latency.
-        entry(None, 0, None, 0),
+        entry(None, 0, 0),
     ] {
         jarvis_usage::record(&db, &row).await?;
     }
 
+    // A failed call is not billed, so it never consumes the monthly cap.
+    let month_total = jarvis_usage::month_total_eur(&db).await?;
+    assert!((month_total - 0.02).abs() < 1e-9, "{month_total}");
     let stats = jarvis_usage::month_statistics(&db).await?;
     assert_eq!(stats.totals.requests, 4);
     assert_eq!(stats.totals.failures, 1);
@@ -714,7 +771,8 @@ async fn month_statistics_break_down_agents_latency_failures_and_fallbacks(
     assert_eq!(agents.len(), 1);
     let agent = &agents[0];
     assert_eq!(agent.agent_id, "researcher");
-    assert_eq!((agent.totals.requests, agent.totals.total_tokens), (2, 30));
+    assert_eq!((agent.totals.requests, agent.totals.total_tokens), (2, 15));
+    assert!((agent.totals.cost_eur - 0.01).abs() < 1e-9);
     assert_eq!((agent.totals.failures, agent.totals.fallbacks), (1, 2));
     assert!(agent.totals.latency_p50_ms.is_some());
     // RFC 3339 text from `time::format(.., '%+')`, e.g. 2026-10-04T11:07:31.123+00:00.

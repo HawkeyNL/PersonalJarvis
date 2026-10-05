@@ -65,14 +65,38 @@ pub(crate) async fn record_usage_with_metadata(
         latency_ms: metadata.latency_ms,
         status: metadata.status,
         failure_category: metadata.failure_category,
-        fallback_count: metadata.fallback_count,
+        fallback_count: i32::try_from(reply.fallback_count).unwrap_or(i32::MAX),
         input_tokens: u.input_tokens as i32,
         output_tokens: u.output_tokens as i32,
         cache_read_tokens: u.cache_read_tokens as i32,
         cache_write_tokens: u.cache_write_tokens as i32,
         cost_eur: cost,
     };
-    if let Err(e) = usage::record(&state.db, &entry).await {
+    persist(state, &entry).await;
+}
+
+/// Record a model call that produced no reply as one zero-token, zero-cost
+/// row with a bounded category, so it never consumes the monthly cap. The
+/// routed backend is unknown after a failure; `backend`/`model` name the
+/// owner's pin when there was one, else `router`/`unknown`.
+pub(crate) async fn record_failure(
+    state: &AppState,
+    pinned: Option<(&str, &str)>,
+    error: &llm::LlmError,
+    metadata: usage::UsageMetadata,
+) {
+    let (backend, model) = pinned.unwrap_or(("router", "unknown"));
+    let category = error.usage_failure_category();
+    tracing::info!(%backend, %model, category, "model call failed");
+    persist(
+        state,
+        &usage::UsageEntry::failed(backend, model, category, metadata),
+    )
+    .await;
+}
+
+async fn persist(state: &AppState, entry: &usage::UsageEntry) {
+    if let Err(e) = usage::record(&state.db, entry).await {
         tracing::warn!(error = %e, "failed to record llm usage");
     }
     // Re-read the month total so the gate stays correct across a month rollover.

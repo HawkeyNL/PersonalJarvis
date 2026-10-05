@@ -626,6 +626,7 @@ async fn decide_jev(
         .ok()?;
 
     let result = jev.classify(latest_user_turn).await;
+    let mut failure_category = None;
     let (model, input_tokens, output_tokens, status, kind) = match result {
         Ok(decision) => {
             let kind = decision.usable_kind_at(threshold);
@@ -650,6 +651,13 @@ async fn decide_jev(
         }
         Err(reason) => {
             tracing::warn!(reason, "Jev unavailable; deterministic routing retained");
+            // The request was sent and may be billed, so it keeps its
+            // conservative usage; the category is a fixed identifier.
+            failure_category = Some(if reason == "Jev request failed" {
+                "unavailable"
+            } else {
+                "other"
+            });
             (
                 "jev-unconfirmed".to_owned(),
                 MAX_BILLABLE_INPUT_TOKENS,
@@ -665,6 +673,7 @@ async fn decide_jev(
         backend: Some("jev".into()),
         requested_route: None,
         actual_provider: None,
+        fallback_count: 0,
         stop_reason: None,
         usage: Some(jarvis_llm::Usage {
             input_tokens,
@@ -690,6 +699,7 @@ async fn decide_jev(
             routing_mode: "intent_classification".into(),
             quality_tier: "advisory".into(),
             status: status.into(),
+            failure_category: failure_category.map(str::to_owned),
             ..Default::default()
         },
     )

@@ -18,7 +18,7 @@ use jarvis_usage as usage;
 
 use crate::audit::record_security_event;
 use crate::error::bad_request;
-use crate::metering::record_usage;
+use crate::metering::{record_failure, record_usage};
 use crate::validation;
 use crate::{AppState, Authed};
 
@@ -58,9 +58,14 @@ pub(crate) async fn system_brain_set(
     Json(req): Json<BrainPreferenceReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     validate_brain_selection(&state, req.provider.as_deref(), req.model.as_deref())?;
+    // `table:$param` is not valid SurrealQL; bind the record id instead.
+    let user_id = authed.user.id.to_string();
     state.db.query(
-        "UPSERT owner_brain_preferences:$id SET id = $id, user_id = $user_id, provider = $provider, model = $model, updated_at = time::now() RETURN NONE",
-    ).bind(json!({"id": authed.user.id.to_string(), "user_id": authed.user.id.to_string(), "provider": req.provider, "model": req.model})).await
+        "UPSERT $record SET id = $id, user_id = $user_id, provider = $provider, model = $model, updated_at = time::now() RETURN NONE",
+    ).bind(("record", surrealdb::RecordId::from_table_key("owner_brain_preferences", user_id.as_str())))
+        .bind(json!({"id": user_id, "user_id": user_id, "provider": req.provider, "model": req.model})).await
+        .map_err(|_| internal_error())?
+        .check()
         .map_err(|_| internal_error())?;
     record_security_event(
         &state,
@@ -559,12 +564,12 @@ pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store:
 
 const MAX_USAGE_AGENTS: usize = 100;
 
-/// `null` ("not measured") until Core records failed calls.
+/// `null` ("not measured") while Core does not record failed calls.
 fn failures(totals: &usage::UsageTotals) -> Option<u64> {
     usage::FAILURES_INSTRUMENTED.then_some(totals.failures)
 }
 
-/// `null` ("not measured") until the router reports its fallbacks.
+/// `null` ("not measured") while the router does not report its fallbacks.
 fn fallbacks(totals: &usage::UsageTotals) -> Option<u64> {
     usage::FALLBACKS_INSTRUMENTED.then_some(totals.fallbacks)
 }
@@ -758,7 +763,7 @@ pub(crate) async fn system_self_improve(
     };
     let spent_eur = state.spent_cents.load(Ordering::Relaxed) as f64 / 100.0;
     let budget_eur = state.budget_cents as f64 / 100.0;
-    match selfdev::propose(
+    let result = selfdev::propose(
         &state.llm,
         &state.jarvis_system,
         &ecosystem,
@@ -766,8 +771,11 @@ pub(crate) async fn system_self_improve(
         spent_eur,
         req.focus.as_deref(),
     )
-    .await
-    {
+    .await;
+    if let Err(error) = &result {
+        record_failure(&state, None, error, Default::default()).await;
+    }
+    match result {
         Ok(report) => {
             for reply in &report.calls {
                 record_usage(&state, reply).await;
