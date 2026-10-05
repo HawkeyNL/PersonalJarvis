@@ -88,16 +88,18 @@ export interface HfProvidersResponse {
 }
 export type RouteTier = "cheap" | "default" | "hard";
 export type PaidApi = "allowed" | "off";
+export type ResearchWebSearch = "on" | "off";
 export interface RouteEntry { provider: string; model: string }
 export interface TierRoute { chain: RouteEntry[]; metered_after_subscription: boolean }
 export interface RoutingReport {
-  routing: { version: number; paid_api: PaidApi; tiers: Partial<Record<RouteTier, TierRoute>> } | null;
+  routing: { version: number; paid_api: PaidApi; tiers: Partial<Record<RouteTier, TierRoute>>; research_web_search?: ResearchWebSearch } | null;
   routing_unavailable_reason: string | null;
 }
 export type RouteMutation =
   | { action: "set"; tier: RouteTier; chain: RouteEntry[]; metered_after_subscription: boolean }
   | { action: "reset"; tier: RouteTier }
-  | { action: "paid_api"; state: PaidApi };
+  | { action: "paid_api"; state: PaidApi }
+  | { action: "research_web_search"; state: ResearchWebSearch };
 export interface UsageRow {
   backend: string;
   model: string | null;

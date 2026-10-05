@@ -2,6 +2,8 @@
 //! policy). It only *orders* candidates and pins models per tier; it never
 //! grants access. The allowlist, the monthly cap and health still decide at
 //! attempt time. `paid_api: "off"` removes every metered backend.
+//! `research_web_search: "on"` is the owner's opt-in for explicit Research
+//! requests to use provider-hosted web search through a subscription worker.
 
 use std::{collections::BTreeSet, sync::RwLock};
 
@@ -42,6 +44,24 @@ pub enum PaidApi {
     Off,
 }
 
+/// The owner's opt-in for provider-hosted web search in explicit Research
+/// requests. Off by default; only subscription workers ever search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchWebSearch {
+    #[default]
+    Off,
+    On,
+}
+
+impl ResearchWebSearch {
+    /// Off is omitted when serialized, so documents and signed payloads that
+    /// predate the switch keep their exact bytes.
+    pub fn is_off(&self) -> bool {
+        *self == Self::Off
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteEntry {
@@ -80,9 +100,11 @@ pub struct ModelRouting {
     pub paid_api: PaidApi,
     #[serde(default)]
     pub tiers: TierRoutes,
+    #[serde(default, skip_serializing_if = "ResearchWebSearch::is_off")]
+    pub research_web_search: ResearchWebSearch,
 }
 
-fn is_subscription_backend(provider: &str) -> bool {
+pub(crate) fn is_subscription_backend(provider: &str) -> bool {
     matches!(provider, "claude-cli" | "codex-cli")
 }
 
@@ -202,6 +224,16 @@ impl RoutingSnapshot {
                 .routing
                 .as_ref()
                 .is_some_and(|routing| routing.paid_api == PaidApi::Off)
+    }
+
+    /// Research web search runs only with a usable routing file that turns
+    /// it on explicitly; an absent or unusable file keeps it off.
+    pub fn research_web_search_on(&self) -> bool {
+        self.unavailable_reason.is_none()
+            && self
+                .routing
+                .as_ref()
+                .is_some_and(|routing| routing.research_web_search == ResearchWebSearch::On)
     }
 
     /// A brain pin or explicit provider choice must be refused, not silently
@@ -402,6 +434,36 @@ mod tests {
         assert!(!routing.all_discovered(&policy));
         let empty = ModelRouting::parse(br#"{"version":1}"#).unwrap();
         assert!(empty.all_discovered(&policy));
+    }
+
+    #[test]
+    fn research_web_search_is_off_unless_explicitly_on() {
+        let parse = |raw: &str| RoutingSnapshot {
+            routing: Some(ModelRouting::parse(raw.as_bytes()).unwrap()),
+            unavailable_reason: None,
+        };
+        assert!(!RoutingSnapshot::default().research_web_search_on());
+        assert!(!parse(r#"{"version":1}"#).research_web_search_on());
+        assert!(!parse(r#"{"version":1,"research_web_search":"off"}"#).research_web_search_on());
+        assert!(parse(r#"{"version":1,"research_web_search":"on"}"#).research_web_search_on());
+        assert!(!RoutingSnapshot::unavailable("routing_invalid").research_web_search_on());
+        for raw in [
+            r#"{"version":1,"research_web_search":"ON"}"#,
+            r#"{"version":1,"research_web_search":true}"#,
+            r#"{"version":1,"research_web_search":"live"}"#,
+        ] {
+            assert!(ModelRouting::parse(raw.as_bytes()).is_err(), "{raw}");
+        }
+        // Off is omitted, so pre-existing documents keep their exact bytes.
+        let off = ModelRouting::parse(br#"{"version":1,"research_web_search":"off"}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&off).unwrap(),
+            r#"{"version":1,"paid_api":"allowed","tiers":{}}"#
+        );
+        let on = ModelRouting::parse(br#"{"version":1,"research_web_search":"on"}"#).unwrap();
+        assert!(serde_json::to_string(&on)
+            .unwrap()
+            .ends_with(r#""research_web_search":"on"}"#));
     }
 
     #[test]
