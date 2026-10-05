@@ -536,10 +536,10 @@ pub(super) async fn execute_chat(
     }
 }
 
-const RESEARCH_OFF: &str = "Research staat uit. De eigenaar kan zoeken op het web aanzetten met \
-`sudo jarvis models route research-web-search on` of in Core Admin (Model routing).";
-const RESEARCH_UNAVAILABLE: &str = "Research is nu niet beschikbaar: geen ingeschakeld \
-abonnement (claude-cli of codex-cli) kon de vraag uitvoeren. Er is geen betaalde API gebruikt.";
+const RESEARCH_OFF: &str = "Research is off. The owner can turn on web search with \
+`sudo jarvis models route research-web-search on` or in Core Admin (Model routing).";
+const RESEARCH_UNAVAILABLE: &str = "Research is unavailable right now: no enabled \
+subscription (claude-cli or codex-cli) could run the question. No paid API was used.";
 
 /// The answer to an explicit Research request. Off, too long or unavailable
 /// is a clear, fixed answer, never a silent paid-API or non-search answer.
@@ -563,7 +563,7 @@ async fn research_reply(
     }
     let Some(request) = llm::ResearchRequest::new(latest_question) else {
         return notice(format!(
-            "Je research-vraag is te lang: maximaal {} tekens. Stel een kortere vraag.",
+            "Your research question is too long: at most {} characters. Ask a shorter question.",
             llm::MAX_RESEARCH_QUESTION_CHARS
         ));
     };
@@ -987,7 +987,7 @@ mod tests {
         // Overlong: refused with a clear answer, never cut or sent.
         let long = "x".repeat(llm::MAX_RESEARCH_QUESTION_CHARS + 1);
         let reply = research_reply(&on, &brain, &long).await;
-        assert!(reply.text.contains("te lang"));
+        assert!(reply.text.contains("too long"));
         assert_eq!(brain.seen.lock().unwrap().len(), 1);
     }
 
