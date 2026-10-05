@@ -292,6 +292,17 @@ mod tests {
             &hex::decode(&signature).unwrap()
         )
         .is_ok());
+        // Research on: the native client and the broker still agree byte for byte.
+        let mut research = approval.clone();
+        research.routing.research_web_search =
+            jarvis_client_core::model_control::ResearchWebSearch::On;
+        let research_request: SignedRequest =
+            serde_json::from_value(research.signed_request(&signature).unwrap()).unwrap();
+        assert_eq!(
+            research_request.message().unwrap(),
+            research.message().unwrap()
+        );
+        assert_ne!(research.message().unwrap(), approval.message().unwrap());
         // A different document cannot reuse the signature.
         let mut changed = request.clone();
         routing_operation(&mut changed).0.paid_api = jarvis_llm::PaidApi::Allowed;

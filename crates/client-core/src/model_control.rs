@@ -106,6 +106,7 @@ impl ModelToggleApproval {
 /// The owner routing document exactly as signed. Field order and the omission
 /// rules are part of the canonical payload: an absent tier is omitted, while
 /// `paid_api` and `metered_after_subscription` are always written.
+/// `research_web_search` is written last and only when `on`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingDocument {
@@ -114,6 +115,23 @@ pub struct RoutingDocument {
     pub paid_api: PaidApi,
     #[serde(default)]
     pub tiers: RoutingTiers,
+    #[serde(default, skip_serializing_if = "ResearchWebSearch::is_off")]
+    pub research_web_search: ResearchWebSearch,
+}
+
+/// Owner opt-in for provider-hosted web search in explicit Research requests.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchWebSearch {
+    #[default]
+    Off,
+    On,
+}
+
+impl ResearchWebSearch {
+    fn is_off(&self) -> bool {
+        *self == Self::Off
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -354,6 +372,12 @@ mod tests {
         assert_ne!(changed.message().unwrap(), message);
         changed = approval.clone();
         changed.routing.paid_api = PaidApi::Allowed;
+        assert_ne!(changed.message().unwrap(), message);
+        changed = approval.clone();
+        changed.routing.research_web_search = ResearchWebSearch::On;
+        assert!(String::from_utf8(changed.canonical_payload().unwrap())
+            .unwrap()
+            .ends_with(r#"}},"research_web_search":"on"},"expected_routing_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#));
         assert_ne!(changed.message().unwrap(), message);
         changed = approval;
         changed.routing.version = 2;

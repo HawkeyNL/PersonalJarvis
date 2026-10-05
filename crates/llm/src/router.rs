@@ -18,7 +18,7 @@ use std::{
 
 use async_trait::async_trait;
 
-use crate::types::{ChatReply, ChatRequest, LlmError, ProviderFailure, Tier};
+use crate::types::{ChatReply, ChatRequest, LlmError, ProviderFailure, ResearchRequest, Tier};
 #[cfg(test)]
 use crate::ModelAccessPolicy;
 use crate::{LiveModelPolicy, LiveRouting, LlmProvider};
@@ -415,6 +415,17 @@ impl RouterProvider {
             && self.model_policy.allows(backend, model)
     }
 
+    /// A failed research run (a timeout, a refused search event) says nothing
+    /// about ordinary chat on the same subscription. Only a revoked login or
+    /// a full plan applies to both; a cooldown for anything else could push
+    /// chat onto a paid API.
+    fn research_failure_affects_chat(failure: ProviderFailure) -> bool {
+        matches!(
+            failure,
+            ProviderFailure::Authentication | ProviderFailure::RateLimited
+        )
+    }
+
     /// Backends without static tier models: an owner-enabled exact policy
     /// entry is their model. `codex-cli` has no configured default at all.
     fn dynamic_cloud_backend(backend: &str) -> bool {
@@ -535,6 +546,52 @@ impl LlmProvider for RouterProvider {
             }
         }
         Err(last.unwrap_or_else(|| LlmError::NotConfigured("no brain answered".into())))
+    }
+
+    /// Research runs only when the owner turned it on, and only on the
+    /// subscription workers of the hard-tier plan. A paid API never searches,
+    /// so there is no metered fallback at all.
+    async fn research(&self, req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+        if !self.routing.snapshot().research_web_search_on() {
+            return Err(LlmError::NotConfigured("research web search is off".into()));
+        }
+        let mut last = None;
+        let mut fallback_count = 0u32;
+        for (candidate, pinned) in self.plan(Tier::Hard, true, None) {
+            if !crate::routing::is_subscription_backend(&candidate.id) {
+                continue;
+            }
+            // The owner may switch research off while a request is in flight.
+            if !self.routing.snapshot().research_web_search_on() {
+                return Err(LlmError::NotConfigured("research web search is off".into()));
+            }
+            let Some(model) = self.choose_model(&candidate.id, pinned.as_deref(), None, Tier::Hard)
+            else {
+                continue;
+            };
+            let mut attempt = req.clone();
+            attempt.model = Some(model);
+            match candidate.provider.research(&attempt).await {
+                Ok(mut reply) => {
+                    self.record_success(&candidate.id);
+                    reply.fallback_count = fallback_count;
+                    return Ok(reply);
+                }
+                Err(LlmError::Refused) => return Err(LlmError::Refused),
+                Err(error) => {
+                    fallback_count += 1;
+                    let failure = error.failure_category();
+                    if Self::research_failure_affects_chat(failure) {
+                        self.record_failure(&candidate.id, failure);
+                    }
+                    tracing::warn!(backend = %candidate.id, failure = ?failure, "research failed; routing to next");
+                    last = Some(error);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            LlmError::NotConfigured("no owner-enabled subscription can research".into())
+        }))
     }
 }
 
@@ -1146,6 +1203,24 @@ mod tests {
                 usage: None,
             })
         }
+
+        /// Echoes the backend, the model and exactly what it was handed.
+        async fn research(&self, req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.2 {
+                return Err(LlmError::Empty);
+            }
+            Ok(ChatReply {
+                text: format!("{}: {}", self.0, req.question()),
+                model: req.model.clone().unwrap_or_default(),
+                backend: Some(self.0.into()),
+                requested_route: None,
+                actual_provider: None,
+                fallback_count: 0,
+                stop_reason: None,
+                usage: None,
+            })
+        }
     }
 
     struct Fleet {
@@ -1505,6 +1580,242 @@ mod tests {
             ("codex-cli", "gpt-6-luna")
         );
         assert_eq!(f.calls("openai-api"), 0);
+    }
+
+    const RESEARCH_FLEET: [&str; 4] = ["claude-cli", "codex-cli", "anthropic-api", "openai-api"];
+    const RESEARCH_MODELS: [(&str, &str); 4] = [
+        ("claude-cli", "claude-opus-5"),
+        ("codex-cli", "gpt-6-luna"),
+        ("anthropic-api", "claude-opus-5"),
+        ("openai-api", "gpt-6-luna"),
+    ];
+
+    fn research_fleet(raw: &str, failing: &[&str]) -> Fleet {
+        fleet_of(
+            &RESEARCH_FLEET,
+            routing(raw),
+            &RESEARCH_MODELS,
+            always_available(),
+            failing,
+        )
+    }
+
+    fn question() -> ResearchRequest {
+        ResearchRequest::new("Wat is de laatste Rust-release?").unwrap()
+    }
+
+    fn research_calls(f: &Fleet) -> Vec<usize> {
+        RESEARCH_FLEET.iter().map(|id| f.calls(id)).collect()
+    }
+
+    #[tokio::test]
+    async fn research_is_off_by_default_and_calls_nobody() {
+        for raw in [
+            r#"{"version":1}"#,
+            r#"{"version":1,"research_web_search":"off"}"#,
+        ] {
+            let f = research_fleet(raw, &[]);
+            let error = f.router.research(&question()).await.unwrap_err();
+            assert!(matches!(error, LlmError::NotConfigured(_)), "{raw}");
+            assert_eq!(research_calls(&f), [0, 0, 0, 0]);
+        }
+        // An unusable routing file keeps research off too.
+        let f = fleet_of(
+            &RESEARCH_FLEET,
+            RoutingSnapshot::unavailable("routing_invalid"),
+            &RESEARCH_MODELS,
+            always_available(),
+            &[],
+        );
+        assert!(f.router.research(&question()).await.is_err());
+        assert_eq!(research_calls(&f), [0, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn research_uses_only_subscriptions_of_the_hard_chain() {
+        // Paid entries first in the owner's chain are skipped, not searched.
+        let f = research_fleet(
+            r#"{"version":1,"research_web_search":"on","tiers":{"hard":{"chain":[
+                {"provider":"anthropic-api","model":"claude-opus-5"},
+                {"provider":"openai-api","model":"gpt-6-luna"},
+                {"provider":"codex-cli","model":"gpt-6-luna"},
+                {"provider":"claude-cli","model":"claude-opus-5"}]}}}"#,
+            &[],
+        );
+        let reply = f.router.research(&question()).await.unwrap();
+        assert_eq!(
+            (reply.text.as_str(), reply.model.as_str()),
+            ("codex-cli: Wat is de laatste Rust-release?", "gpt-6-luna")
+        );
+        assert_eq!(research_calls(&f), [0, 1, 0, 0]);
+        // Without an owner chain the built-in hard order applies: claude-cli.
+        let f = research_fleet(r#"{"version":1,"research_web_search":"on"}"#, &[]);
+        let reply = f.router.research(&question()).await.unwrap();
+        assert_eq!(
+            (reply.backend.as_deref(), reply.model.as_str()),
+            (Some("claude-cli"), "claude-opus-5")
+        );
+        assert_eq!(research_calls(&f), [1, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn research_without_a_capable_subscription_never_reaches_a_paid_api() {
+        // Only paid APIs in the hard chain: nothing is called.
+        let f = research_fleet(
+            r#"{"version":1,"research_web_search":"on","tiers":{"hard":{"chain":[
+                {"provider":"anthropic-api","model":"claude-opus-5"}]}}}"#,
+            &[],
+        );
+        assert!(matches!(
+            f.router.research(&question()).await,
+            Err(LlmError::NotConfigured(_))
+        ));
+        assert_eq!(research_calls(&f), [0, 0, 0, 0]);
+        // Failing subscriptions end the attempt; the paid API after them,
+        // even when explicitly approved for chat, is never searched.
+        let f = research_fleet(
+            r#"{"version":1,"research_web_search":"on","tiers":{"hard":{"chain":[
+                {"provider":"claude-cli","model":"claude-opus-5"},
+                {"provider":"codex-cli","model":"gpt-6-luna"},
+                {"provider":"anthropic-api","model":"claude-opus-5"}],
+                "metered_after_subscription":true}}}"#,
+            &["claude-cli", "codex-cli"],
+        );
+        assert!(f.router.research(&question()).await.is_err());
+        assert_eq!(research_calls(&f), [1, 1, 0, 0]);
+        // A subscription that is not owner-enabled is skipped as well.
+        let f = fleet_of(
+            &RESEARCH_FLEET,
+            routing(r#"{"version":1,"research_web_search":"on"}"#),
+            &[("anthropic-api", "claude-opus-5")],
+            always_available(),
+            &[],
+        );
+        assert!(f.router.research(&question()).await.is_err());
+        assert_eq!(research_calls(&f), [0, 0, 0, 0]);
+    }
+
+    struct ResearchFails(u16);
+    #[async_trait]
+    impl LlmProvider for ResearchFails {
+        fn label(&self) -> &str {
+            "claude-cli"
+        }
+        async fn chat(&self, _req: &ChatRequest) -> Result<ChatReply, LlmError> {
+            Err(LlmError::Empty)
+        }
+        async fn research(&self, _req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+            Err(LlmError::Api {
+                status: self.0,
+                body: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn research_failures_cool_down_chat_only_for_auth_or_plan_limit() {
+        for (status, cooled) in [
+            (504, false),
+            (503, false),
+            (502, false),
+            (429, true),
+            (401, true),
+        ] {
+            let c = catalog();
+            let router = RouterProvider::with_policy(
+                vec![Candidate {
+                    id: "claude-cli".into(),
+                    provider: Arc::new(ResearchFails(status)),
+                }],
+                always_available(),
+                c.clone(),
+                allow_catalog(&c),
+            )
+            .with_routing(Arc::new(LiveRouting::new(routing(
+                r#"{"version":1,"research_web_search":"on"}"#,
+            ))));
+            assert!(router.research(&question()).await.is_err());
+            assert_eq!(router.is_healthy("claude-cli"), !cooled, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn research_switched_off_mid_request_stops_further_attempts() {
+        struct SwitchOffThenFail(Arc<LiveRouting>);
+        #[async_trait]
+        impl LlmProvider for SwitchOffThenFail {
+            fn label(&self) -> &str {
+                "claude-cli"
+            }
+            async fn chat(&self, _req: &ChatRequest) -> Result<ChatReply, LlmError> {
+                Err(LlmError::Empty)
+            }
+            async fn research(&self, _req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+                let current = self.0.snapshot();
+                let mut next = current.clone();
+                next.routing.as_mut().unwrap().research_web_search = crate::ResearchWebSearch::Off;
+                self.0.swap(&current, next).unwrap();
+                Err(LlmError::Empty)
+            }
+        }
+        let live = Arc::new(LiveRouting::new(routing(
+            r#"{"version":1,"research_web_search":"on","tiers":{"hard":{"chain":[
+            {"provider":"claude-cli","model":"claude-opus-5"},
+            {"provider":"codex-cli","model":"gpt-6-luna"}]}}}"#,
+        )));
+        let codex_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let codex = Candidate {
+            id: "codex-cli".into(),
+            provider: Arc::new(EchoAs("codex-cli", codex_calls.clone(), true)),
+        };
+        let c = catalog();
+        let mut policy = allow_catalog(&c);
+        policy.models.push(crate::ModelAccessEntry {
+            provider: "codex-cli".into(),
+            model: "gpt-6-luna".into(),
+            enabled: true,
+            source: "test".into(),
+            route: None,
+        });
+        let router = RouterProvider::with_policy(
+            vec![
+                Candidate {
+                    id: "claude-cli".into(),
+                    provider: Arc::new(SwitchOffThenFail(live.clone())),
+                },
+                codex,
+            ],
+            always_available(),
+            c,
+            policy,
+        )
+        .with_routing(live);
+        assert!(router.research(&question()).await.is_err());
+        assert_eq!(codex_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn research_with_paid_api_off_still_uses_the_subscription() {
+        let f = research_fleet(
+            r#"{"version":1,"paid_api":"off","research_web_search":"on"}"#,
+            &[],
+        );
+        let reply = f.router.research(&question()).await.unwrap();
+        assert_eq!(reply.backend.as_deref(), Some("claude-cli"));
+        assert_eq!(research_calls(&f), [1, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn paid_api_backends_refuse_research_themselves() {
+        // Defense in depth: even if a paid provider were reached, its trait
+        // default refuses instead of searching.
+        let reply = Fixed {
+            label: "anthropic-api".into(),
+            ok: true,
+        }
+        .research(&question())
+        .await;
+        assert!(matches!(reply, Err(LlmError::NotConfigured(_))));
     }
 
     fn ids_of_policy() -> Vec<&'static str> {

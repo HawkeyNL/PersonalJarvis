@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use crate::{
     claude_cli::SubscriptionWorker,
     codex_chat_protocol::SOCKET,
-    types::{ChatReply, ChatRequest, LlmError},
+    types::{ChatReply, ChatRequest, LlmError, ResearchRequest},
     LlmProvider,
 };
 
@@ -35,5 +35,13 @@ impl LlmProvider for CodexCliProvider {
             .clone()
             .ok_or_else(|| LlmError::NotConfigured("codex-cli needs an exact model".into()))?;
         CODEX_WORKER.chat(model, req).await
+    }
+
+    async fn research(&self, req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+        let model = req
+            .model
+            .clone()
+            .ok_or_else(|| LlmError::NotConfigured("codex-cli needs an exact model".into()))?;
+        CODEX_WORKER.research(model, req).await
     }
 }

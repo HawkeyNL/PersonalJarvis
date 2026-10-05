@@ -10,21 +10,19 @@ use std::{path::Path, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use jarvis_llm::{
-    claude_worker_protocol::{
-        ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState, MAX_REQUEST_BYTES,
-    },
+    claude_worker_protocol::{ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState},
     codex_chat_protocol::{
         classify_codex_failure, codex_subscription_status, parse_codex_event,
         reviewed_codex_version, CodexEvent, REVIEWED_VERSION_ENV,
     },
 };
 use subscription_worker::{
-    authorized_peer, inherited_listener, named_uid, send, validate_private_dir,
-    validate_root_binary,
+    authorized_peer, inherited_listener, named_uid, read_request, reply_deadline, research_slot,
+    run_timeout, send, validate_private_dir, validate_root_binary, MAX_PARALLEL_RESEARCH_RUNS,
+    MAX_PARALLEL_RUNS, REQUEST_READ_TIMEOUT,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
     process::{Child, Command},
     sync::Semaphore,
 };
@@ -36,8 +34,6 @@ const CODEX: &str = "/usr/local/bin/codex";
 const IDENTITY: &str = "jarvis-codex";
 const HOME: &str = "/var/lib/jarvis-codex";
 const RUNTIME: &str = "/run/jarvis-codex-chat";
-const MAX_PARALLEL_RUNS: usize = 2;
-const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ANSWER_BYTES: usize = 128 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 /// Bound on everything one status probe prints.
@@ -73,6 +69,7 @@ async fn main() -> Result<()> {
     validate_private_dir(RUNTIME, worker_uid)?;
     let listener = inherited_listener()?;
     let permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_RUNS));
+    let research_permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_RESEARCH_RUNS));
     // Under PrivatePIDs this process is PID 1 of its namespace, which ignores
     // SIGTERM without a handler; stop promptly when systemd asks.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -92,39 +89,35 @@ async fn main() -> Result<()> {
             .await;
             continue;
         };
+        let research_permits = research_permits.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let reply = match tokio::time::timeout(
-                RUN_TIMEOUT + Duration::from_secs(5),
-                handle(&mut stream, reviewed),
-            )
-            .await
-            {
-                Ok(Ok(reply)) => reply,
-                _ => ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure),
-            };
+            let failure = || ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure);
+            let reply =
+                match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request(&mut stream)).await {
+                    Ok(Ok(request)) => match research_slot(request.research, &research_permits) {
+                        Some(_research_permit) => {
+                            let deadline = reply_deadline(request.research);
+                            match tokio::time::timeout(deadline, handle(request, reviewed)).await {
+                                Ok(Ok(reply)) => reply,
+                                _ => failure(),
+                            }
+                        }
+                        // The one research slot is busy: refuse, never queue.
+                        None => failure(),
+                    },
+                    _ => failure(),
+                };
             let _ = send(&mut stream, reply).await;
         });
     }
 }
 
-async fn handle(stream: &mut UnixStream, reviewed: &str) -> Result<ClaudeWorkerReply> {
-    // The run gets what is left of RUN_TIMEOUT after the request and the
-    // probes, so its own deadline (which stops the whole process group)
-    // always fires before the outer reply deadline.
+async fn handle(request: ClaudeWorkerRequest, reviewed: &str) -> Result<ClaudeWorkerReply> {
+    // The run gets what is left of its run timeout after the probes, so its
+    // own deadline (which stops the whole process group) always fires before
+    // the outer reply deadline.
     let started = std::time::Instant::now();
-    let mut bytes = Vec::new();
-    stream
-        .take((MAX_REQUEST_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await?;
-    if bytes.len() > MAX_REQUEST_BYTES || !bytes.ends_with(b"\n") {
-        bail!("invalid bounded Codex chat request");
-    }
-    let request: ClaudeWorkerRequest = serde_json::from_slice(&bytes)?;
-    if !request.valid() {
-        bail!("invalid Codex chat request shape");
-    }
     let version = bounded_probe(&["--version"], Duration::from_secs(3), false).await;
     if !version.is_some_and(|output| reviewed_codex_version(&output, reviewed)) {
         return Ok(ClaudeWorkerReply::failure(
@@ -138,7 +131,8 @@ async fn handle(stream: &mut UnixStream, reviewed: &str) -> Result<ClaudeWorkerR
             ClaudeWorkerState::SubscriptionUnavailable,
         ));
     }
-    run_official_client(request, RUN_TIMEOUT.saturating_sub(started.elapsed())).await
+    let limit = run_timeout(request.research).saturating_sub(started.elapsed());
+    run_official_client(request, limit).await
 }
 
 /// Non-generative status probe of the official CLI.
@@ -201,8 +195,10 @@ async fn bounded_output(
 /// ChatGPT login only, read-only sandbox and every tool, app, memory, hook,
 /// history and analytics feature off. `--json` streams every event, so the
 /// worker can refuse a run that uses a tool even if a `-c` key stopped
-/// working. The prompt arrives on stdin (`-`), never as an argument.
-fn exec_args(model: &str, instructions: Option<&Path>) -> Vec<String> {
+/// working. The prompt arrives on stdin (`-`), never as an argument. Only an
+/// owner-enabled research run turns on the provider-hosted web search
+/// (`web_search=live`); everything else stays off.
+fn exec_args(model: &str, instructions: Option<&Path>, research: bool) -> Vec<String> {
     let mut args: Vec<String> = [
         "exec",
         "--json",
@@ -220,7 +216,11 @@ fn exec_args(model: &str, instructions: Option<&Path>) -> Vec<String> {
     for setting in [
         "features.shell_tool=false",
         "features.unified_exec=false",
-        "web_search=disabled",
+        if research {
+            "web_search=live"
+        } else {
+            "web_search=disabled"
+        },
         "tools.view_image=false",
         "features.apps=false",
         "features.multi_agent=false",
@@ -277,8 +277,12 @@ async fn run_official_client(
         instructions = Some(path);
     }
     let mut command = clean_command(CODEX, &workdir);
-    command.args(exec_args(&request.model, instructions.as_deref()));
-    let outcome = run_cli(command, &request.prompt, limit).await?;
+    command.args(exec_args(
+        &request.model,
+        instructions.as_deref(),
+        request.research,
+    ));
+    let outcome = run_cli(command, &request.prompt, limit, request.research).await?;
     Ok(finish(outcome))
 }
 
@@ -303,7 +307,12 @@ enum Outcome {
     TimedOut,
 }
 
-async fn run_cli(mut command: Command, prompt: &str, limit: Duration) -> Result<Outcome> {
+async fn run_cli(
+    mut command: Command,
+    prompt: &str,
+    limit: Duration,
+    research: bool,
+) -> Result<Outcome> {
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -332,7 +341,7 @@ async fn run_cli(mut command: Command, prompt: &str, limit: Duration) -> Result<
     });
     let diagnostics = tokio::spawn(read_tail(stderr, MAX_DIAGNOSTIC_BYTES));
     let run = async {
-        let Some(events) = read_events(stdout).await? else {
+        let Some(events) = read_events(stdout, research).await? else {
             return Ok(Outcome::Refused);
         };
         let status = child.wait().await?;
@@ -355,8 +364,12 @@ async fn run_cli(mut command: Command, prompt: &str, limit: Duration) -> Result<
 }
 
 /// Read the `--json` event stream until it ends. `Ok(None)` as soon as one
-/// event is not plainly text; the caller then stops the whole run.
-async fn read_events(stdout: impl AsyncRead + Unpin) -> std::io::Result<Option<Events>> {
+/// event is not plainly text (or, in a research run, a provider-hosted web
+/// search); the caller then stops the whole run.
+async fn read_events(
+    stdout: impl AsyncRead + Unpin,
+    research: bool,
+) -> std::io::Result<Option<Events>> {
     let mut reader = tokio::io::BufReader::new(stdout);
     let mut events = Events::default();
     let mut total = 0;
@@ -379,7 +392,7 @@ async fn read_events(stdout: impl AsyncRead + Unpin) -> std::io::Result<Option<E
         if line.ends_with(b"\n") {
             line.pop();
         }
-        match parse_codex_event(&line) {
+        match parse_codex_event(&line, research) {
             CodexEvent::Benign => {}
             CodexEvent::AgentMessage(text) => events.answer = Some(text),
             CodexEvent::TurnCompleted => events.completed = true,
@@ -487,6 +500,10 @@ mod tests {
 
     /// A fake CLI that prints these JSONL events, then runs `tail`.
     async fn fake_run(events: &[&str], tail: &str) -> Outcome {
+        fake_run_as(events, tail, false).await
+    }
+
+    async fn fake_run_as(events: &[&str], tail: &str, research: bool) -> Outcome {
         let lines = events
             .iter()
             .map(|line| format!("echo '{line}'"))
@@ -496,6 +513,7 @@ mod tests {
             shell(&format!("{lines}; {tail}")),
             "hi",
             Duration::from_secs(10),
+            research,
         )
         .await
         .unwrap()
@@ -506,6 +524,7 @@ mod tests {
         let argv = exec_args(
             "gpt-6-luna",
             Some(Path::new("/run/jarvis-codex-chat/run-x/instructions.md")),
+            false,
         );
         assert_eq!(
             argv.join(" "),
@@ -518,9 +537,67 @@ mod tests {
              -c shell_environment_policy.inherit=none -c forced_login_method=\"chatgpt\" \
              -c model_instructions_file=\"/run/jarvis-codex-chat/run-x/instructions.md\" -"
         );
-        let plain = exec_args("gpt-6-luna", None);
+        let plain = exec_args("gpt-6-luna", None, false);
         assert_eq!(plain.last().map(String::as_str), Some("-"));
         assert!(!plain.iter().any(|arg| arg.contains("instructions")));
+    }
+
+    #[test]
+    fn research_argv_differs_only_in_the_hosted_web_search() {
+        let path = Path::new("/run/jarvis-codex-chat/run-x/instructions.md");
+        let argv = exec_args("gpt-6-luna", Some(path), true);
+        assert_eq!(
+            argv.join(" "),
+            "exec --json --ephemeral --skip-git-repo-check --ignore-user-config --ignore-rules \
+             --sandbox read-only -m gpt-6-luna \
+             -c features.shell_tool=false -c features.unified_exec=false \
+             -c web_search=live -c tools.view_image=false -c features.apps=false \
+             -c features.multi_agent=false -c features.memories=false -c features.hooks=false \
+             -c history.persistence=none -c analytics.enabled=false -c approval_policy=never \
+             -c shell_environment_policy.inherit=none -c forced_login_method=\"chatgpt\" \
+             -c model_instructions_file=\"/run/jarvis-codex-chat/run-x/instructions.md\" -"
+        );
+        let plain = exec_args("gpt-6-luna", Some(path), false);
+        let changed: Vec<_> = argv
+            .iter()
+            .zip(&plain)
+            .filter(|(research, plain)| research != plain)
+            .collect();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(argv.len(), plain.len());
+    }
+
+    const SEARCH: &str = r#"{"type":"item.completed","item":{"id":"i0","type":"web_search","query":"q","action":{"type":"search","query":"q"}}}"#;
+
+    #[tokio::test]
+    async fn web_search_events_are_accepted_only_in_research_runs() {
+        let reply = finish(fake_run_as(&[SEARCH, ANSWER, DONE], "true", true).await);
+        assert!(matches!(reply.state, ClaudeWorkerState::Completed));
+        assert_eq!(reply.text.as_deref(), Some("Hello"));
+        // An ordinary run that searches is stopped and its answer discarded.
+        let reply = finish(fake_run_as(&[SEARCH, ANSWER, DONE], "true", false).await);
+        assert!(matches!(reply.state, ClaudeWorkerState::ToolUseRefused));
+        assert!(reply.text.is_none());
+    }
+
+    #[tokio::test]
+    async fn research_runs_still_refuse_every_other_tool_and_unknown_events() {
+        for event in [
+            r#"{"type":"item.started","item":{"id":"i2","type":"command_execution","command":"id","status":"in_progress"}}"#,
+            r#"{"type":"item.started","item":{"id":"i4","type":"mcp_tool_call","server":"s","tool":"t"}}"#,
+            r#"{"type":"item.completed","item":{"id":"i5","type":"file_change","changes":[]}}"#,
+            r#"{"type":"item.completed","item":{"id":"i6","type":"collab_tool_call"}}"#,
+            r#"{"type":"item.completed","item":{"id":"i7","type":"web_search","action":{"type":"other"}}}"#,
+            r#"{"type":"something_new"}"#,
+            "not json",
+        ] {
+            let reply = finish(fake_run_as(&[SEARCH, event, ANSWER, DONE], "true", true).await);
+            assert!(
+                matches!(reply.state, ClaudeWorkerState::ToolUseRefused),
+                "{event}"
+            );
+            assert!(reply.text.is_none(), "{event}");
+        }
     }
 
     #[tokio::test]
@@ -544,7 +621,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("worker.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let _client = UnixStream::connect(&path).await.unwrap();
+        let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
         let me = unsafe { libc::geteuid() };
         assert!(authorized_peer(&stream, me));
@@ -575,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn a_hanging_cli_is_stopped_at_the_deadline() {
         let started = std::time::Instant::now();
-        let outcome = run_cli(shell("sleep 30"), "hi", Duration::from_millis(200))
+        let outcome = run_cli(shell("sleep 30"), "hi", Duration::from_millis(200), false)
             .await
             .unwrap();
         assert!(matches!(outcome, Outcome::TimedOut));
@@ -590,6 +667,7 @@ mod tests {
             shell("p=$(cat); [ \"$p\" = 'private prompt' ] && head -c 100000 /dev/zero >&2"),
             "private prompt",
             Duration::from_secs(10),
+            false,
         )
         .await
         .unwrap();
@@ -638,6 +716,7 @@ mod tests {
             )),
             "hi",
             Duration::from_secs(10),
+            false,
         )
         .await;
         assert!(outcome.is_err());
@@ -656,6 +735,7 @@ mod tests {
             )),
             "hi",
             Duration::from_secs(10),
+            false,
         )
         .await
         .unwrap();
@@ -727,6 +807,7 @@ mod tests {
             ),
             "hi",
             Duration::from_secs(10),
+            false,
         )
         .await
         .unwrap();

@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub const SOCKET: &str = "/run/jarvis-claude.sock";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_REPLY_BYTES: usize = 256 * 1024;
+/// Longest research prompt a worker accepts (the bounded question in UTF-8).
+pub const MAX_RESEARCH_PROMPT_BYTES: usize = 4 * crate::types::MAX_RESEARCH_QUESTION_CHARS;
 
 /// The reviewed CLI contract is Claude Code 2.1.248+ within its 2.1 line.
 /// `--restricted` first appeared in 2.1.248. A later minor/major line needs
@@ -51,13 +53,27 @@ pub struct ClaudeWorkerRequest {
     pub model: String,
     pub system: Option<String>,
     pub prompt: String,
+    /// Owner-enabled research run: the worker allows only the provider-hosted
+    /// web search tool. It carries only the bounded question and the fixed
+    /// research prompt. Omitted when false, so ordinary requests keep their
+    /// exact shape.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub research: bool,
 }
 
 impl ClaudeWorkerRequest {
     pub fn valid(&self) -> bool {
+        let prompt_limit = if self.research {
+            MAX_RESEARCH_PROMPT_BYTES
+        } else {
+            48 * 1024
+        };
         self.protocol == 1
             && !self.prompt.trim().is_empty()
-            && self.prompt.len() <= 48 * 1024
+            && self.prompt.len() <= prompt_limit
+            // Nothing but the fixed research prompt rides along with a search.
+            && (!self.research
+                || self.system.as_deref() == Some(crate::types::RESEARCH_SYSTEM_PROMPT))
             && self
                 .system
                 .as_deref()
@@ -135,8 +151,40 @@ mod tests {
             model: "claude-sonnet-5".into(),
             system: None,
             prompt: "hello".into(),
+            research: false,
         };
         assert!(request.valid());
+        assert!(!serde_json::to_string(&request)
+            .unwrap()
+            .contains("research"));
+        let research = ClaudeWorkerRequest {
+            protocol: 1,
+            model: "claude-sonnet-5".into(),
+            system: Some(crate::types::RESEARCH_SYSTEM_PROMPT.into()),
+            prompt: "x".repeat(MAX_RESEARCH_PROMPT_BYTES),
+            research: true,
+        };
+        assert!(research.valid());
+        assert!(!ClaudeWorkerRequest {
+            prompt: "x".repeat(MAX_RESEARCH_PROMPT_BYTES + 1),
+            system: Some(crate::types::RESEARCH_SYSTEM_PROMPT.into()),
+            ..research
+        }
+        .valid());
+        // A research run carries no persona or other system text.
+        for system in [
+            None,
+            Some("You are Jarvis. The owner lives in ...".to_owned()),
+        ] {
+            assert!(!ClaudeWorkerRequest {
+                protocol: 1,
+                model: "claude-sonnet-5".into(),
+                system,
+                prompt: "hello".into(),
+                research: true,
+            }
+            .valid());
+        }
         assert!(!ClaudeWorkerRequest {
             model: "x;sh".into(),
             ..request
@@ -147,6 +195,7 @@ mod tests {
             model: "-c".into(),
             system: None,
             prompt: "hello".into(),
+            research: false,
         }
         .valid());
     }

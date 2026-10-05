@@ -40,13 +40,14 @@ pub use router::{
     always_available, is_metered_backend, Availability, CatalogModel, ModelClass, RouterProvider,
 };
 pub use routing::{
-    LiveRouting, ModelRouting, PaidApi, RouteEntry, RoutingSnapshot, TierRoute, TierRoutes,
-    ROUTING_MAX_BYTES, ROUTING_PROVIDERS,
+    LiveRouting, ModelRouting, PaidApi, ResearchWebSearch, RouteEntry, RoutingSnapshot, TierRoute,
+    TierRoutes, ROUTING_MAX_BYTES, ROUTING_PROVIDERS,
 };
 pub use stream::TextDeltaSink;
 pub use types::{
-    classify_task, ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, Role,
-    RoutingMode, TaskRequirements, Tier, Usage, USAGE_FAILURE_CATEGORIES,
+    classify_task, ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, ResearchRequest,
+    Role, RoutingMode, TaskRequirements, Tier, Usage, MAX_RESEARCH_QUESTION_CHARS,
+    RESEARCH_SYSTEM_PROMPT, USAGE_FAILURE_CATEGORIES,
 };
 
 /// A swappable brain: given a conversation, produce a reply.
@@ -69,6 +70,14 @@ pub trait LlmProvider: Send + Sync {
         _text: TextDeltaSink,
     ) -> Result<ChatReply, LlmError> {
         self.chat(req).await
+    }
+    /// Answer one question with provider-hosted web search. Only the
+    /// subscription workers and the router implement it; every other backend,
+    /// paid APIs included, refuses.
+    async fn research(&self, _req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+        Err(LlmError::NotConfigured(
+            "research web search is not supported by this backend".into(),
+        ))
     }
 }
 

@@ -67,7 +67,8 @@ pub fn codex_subscription_status(output: &[u8]) -> &'static str {
 /// `error`). It must be re-checked against the reviewed CLI version.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodexEvent {
-    /// Session or turn lifecycle, reasoning, or a partial agent message.
+    /// Session or turn lifecycle, reasoning, a partial agent message, or a
+    /// provider-hosted web search in a research run.
     Benign,
     /// A completed agent message: the latest one is the answer.
     AgentMessage(String),
@@ -75,14 +76,18 @@ pub enum CodexEvent {
     TurnCompleted,
     /// A structured error message, used only to classify a failure.
     Error(String),
-    /// Anything else: a command, web search, MCP or tool call, file change,
-    /// plan update, an unknown event or item type, or an unparseable line.
+    /// Anything else: a command, a web search outside a research run, MCP or
+    /// tool call, file change, plan update, an unknown event or item type, or
+    /// an unparseable line.
     /// The worker stops the run and discards its answer.
     Refused,
 }
 
-/// Fail closed: only the event and item types listed here are allowed.
-pub fn parse_codex_event(line: &[u8]) -> CodexEvent {
+/// Fail closed: only the event and item types listed here are allowed. A
+/// `web_search` item (the provider-hosted search; codex-rs `WebSearchItem`)
+/// is allowed only in an owner-enabled research run, and only with a known
+/// search action; every other tool item still stops the run.
+pub fn parse_codex_event(line: &[u8], research: bool) -> CodexEvent {
     use serde_json::Value;
     let Ok(event) = serde_json::from_slice::<Value>(line) else {
         return CodexEvent::Refused;
@@ -104,10 +109,26 @@ pub fn parse_codex_event(line: &[u8]) -> CodexEvent {
                     })
                 }
                 Some("error") => message(&item["message"]),
+                Some("web_search") if research && known_web_search_action(item) => {
+                    CodexEvent::Benign
+                }
                 _ => CodexEvent::Refused,
             }
         }
         _ => CodexEvent::Refused,
+    }
+}
+
+/// codex-rs `WebSearchAction`: `search`, `open_page` and `find_in_page` run
+/// on the provider's side. A missing action (older CLIs) is the search
+/// itself; `other` or anything unknown is refused.
+fn known_web_search_action(item: &serde_json::Value) -> bool {
+    match item.get("action") {
+        None => true,
+        Some(action) => matches!(
+            action.get("type").and_then(serde_json::Value::as_str),
+            Some("search" | "open_page" | "find_in_page")
+        ),
     }
 }
 
@@ -276,7 +297,7 @@ mod tests {
 
     #[test]
     fn only_text_events_are_allowed() {
-        let event = |line: &str| parse_codex_event(line.as_bytes());
+        let event = |line: &str| parse_codex_event(line.as_bytes(), false);
         for benign in [
             r#"{"type":"thread.started","thread_id":"t"}"#,
             r#"{"type":"turn.started"}"#,
@@ -312,7 +333,6 @@ mod tests {
     fn tool_unknown_and_malformed_events_are_refused() {
         for line in [
             r#"{"type":"item.started","item":{"id":"i2","type":"command_execution","command":"id","status":"in_progress"}}"#,
-            r#"{"type":"item.completed","item":{"id":"i3","type":"web_search","query":"x"}}"#,
             r#"{"type":"item.started","item":{"id":"i4","type":"mcp_tool_call","server":"s","tool":"t"}}"#,
             r#"{"type":"item.completed","item":{"id":"i5","type":"file_change","changes":[]}}"#,
             r#"{"type":"item.completed","item":{"id":"i6","type":"todo_list","items":[]}}"#,
@@ -325,11 +345,56 @@ mod tests {
             "plain text output",
             "",
         ] {
+            for research in [false, true] {
+                assert_eq!(
+                    parse_codex_event(line.as_bytes(), research),
+                    CodexEvent::Refused,
+                    "{line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn web_search_is_accepted_only_in_research_runs() {
+        let searches = [
+            r#"{"type":"item.started","item":{"id":"i1","type":"web_search","query":"","action":{"type":"search","query":"rust release"}}}"#,
+            r#"{"type":"item.updated","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"open_page","url":"https://example.org"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"find_in_page","url":"https://example.org","pattern":"x"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i3","type":"web_search","query":"x"}}"#,
+        ];
+        for line in searches {
             assert_eq!(
-                parse_codex_event(line.as_bytes()),
+                parse_codex_event(line.as_bytes(), true),
+                CodexEvent::Benign,
+                "{line}"
+            );
+            assert_eq!(
+                parse_codex_event(line.as_bytes(), false),
                 CodexEvent::Refused,
                 "{line}"
             );
         }
+        // An unknown or catch-all search action is refused even in research.
+        for line in [
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"other"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"download"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":"search"}}"#,
+        ] {
+            assert_eq!(
+                parse_codex_event(line.as_bytes(), true),
+                CodexEvent::Refused,
+                "{line}"
+            );
+        }
+        // Text events still work in research runs.
+        assert_eq!(
+            parse_codex_event(
+                br#"{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"Answer"}}"#,
+                true
+            ),
+            CodexEvent::AgentMessage("Answer".into())
+        );
     }
 }

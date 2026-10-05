@@ -219,6 +219,24 @@ impl PaidApi {
     }
 }
 
+/// Owner opt-in for provider-hosted web search in explicit Research requests.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchWebSearch {
+    #[default]
+    Off,
+    On,
+}
+
+impl ResearchWebSearch {
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TierRoute {
@@ -232,6 +250,9 @@ pub struct ModelRouting {
     pub version: u32,
     pub paid_api: PaidApi,
     pub tiers: BTreeMap<RouteTier, TierRoute>,
+    /// Omitted by the CLI when off.
+    #[serde(default)]
+    pub research_web_search: ResearchWebSearch,
 }
 
 /// `jarvis --json models route list`: the stored document, or why Core
@@ -256,6 +277,9 @@ pub enum RouteMutation {
     },
     PaidApi {
         state: PaidApi,
+    },
+    ResearchWebSearch {
+        state: ResearchWebSearch,
     },
 }
 
@@ -319,6 +343,12 @@ fn route_mutation_arguments(request: RouteMutation) -> AdminResult<Vec<String>> 
         }
         RouteMutation::PaidApi { state } => {
             args.extend(["paid-api".to_owned(), state.cli_name().to_owned()]);
+        }
+        RouteMutation::ResearchWebSearch { state } => {
+            args.extend([
+                "research-web-search".to_owned(),
+                state.cli_name().to_owned(),
+            ]);
         }
     }
     Ok(args)
@@ -2548,6 +2578,14 @@ mod tests {
             route_arguments(r#"{"action":"paid_api","state":"off"}"#).unwrap(),
             ["models", "route", "paid-api", "off"]
         );
+        assert_eq!(
+            route_arguments(r#"{"action":"research_web_search","state":"on"}"#).unwrap(),
+            ["models", "route", "research-web-search", "on"]
+        );
+        assert_eq!(
+            route_arguments(r#"{"action":"research_web_search","state":"off"}"#).unwrap(),
+            ["models", "route", "research-web-search", "off"]
+        );
     }
 
     #[test]
@@ -2574,6 +2612,8 @@ mod tests {
             r#"{"action":"set","tier":"cheap","chain":[{"provider":"ollama","model":"a","enabled":true}],"metered_after_subscription":false}"#.to_owned(),
             r#"{"action":"set","tier":"cheap","chain":[{"provider":"ollama","model":"a"}]}"#.to_owned(),
             r#"{"action":"paid_api","state":"maybe"}"#.to_owned(),
+            r#"{"action":"research_web_search","state":"live"}"#.to_owned(),
+            r#"{"action":"research_web_search"}"#.to_owned(),
             r#"{"action":"reset","tier":"hard","shell":"id"}"#.to_owned(),
             r#"{"action":"enable","tier":"hard"}"#.to_owned(),
         ] {
@@ -2594,6 +2634,15 @@ mod tests {
         .unwrap();
         let routing = report.routing.unwrap();
         assert!(matches!(routing.paid_api, PaidApi::Off));
+        assert_eq!(routing.research_web_search, ResearchWebSearch::Off);
+        let research: RoutingReport = serde_json::from_str(
+            r#"{"routing":{"version":1,"paid_api":"allowed","tiers":{},"research_web_search":"on"},"routing_unavailable_reason":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            research.routing.unwrap().research_web_search,
+            ResearchWebSearch::On
+        );
         assert_eq!(
             routing.tiers[&RouteTier::Cheap].chain[0].provider,
             RouteProvider::ClaudeCli
