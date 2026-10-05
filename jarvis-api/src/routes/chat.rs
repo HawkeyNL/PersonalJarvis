@@ -172,7 +172,7 @@ pub(super) async fn execute_chat(
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({
                 "error": "rate limited",
-                "hint": "te veel pogingen; probeer het straks opnieuw",
+                "hint": "too many attempts; try again later",
             })),
         ));
     }
@@ -497,7 +497,7 @@ pub(super) async fn execute_chat(
             })))
         }
         Err(llm::LlmError::Refused) => {
-            let text = "Sorry, daar kan ik niet op antwoorden.";
+            let text = "Sorry, I can't answer that.";
             let message =
                 append_message(&state.db, conv_id, authed.user.id, "assistant", text, None)
                     .await
@@ -528,7 +528,7 @@ pub(super) async fn execute_chat(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
                     "error": "brain unavailable",
-                    "hint": "controleer JARVIS_LLM_API_KEY of start Ollama lokaal",
+                    "hint": "check JARVIS_LLM_API_KEY or start Ollama locally",
                     "conversation_id": conv_id,
                 })),
             ))
@@ -536,10 +536,10 @@ pub(super) async fn execute_chat(
     }
 }
 
-const RESEARCH_OFF: &str = "Research staat uit. De eigenaar kan zoeken op het web aanzetten met \
-`sudo jarvis models route research-web-search on` of in Core Admin (Model routing).";
-const RESEARCH_UNAVAILABLE: &str = "Research is nu niet beschikbaar: geen ingeschakeld \
-abonnement (claude-cli of codex-cli) kon de vraag uitvoeren. Er is geen betaalde API gebruikt.";
+const RESEARCH_OFF: &str = "Research is off. The owner can turn on web search with \
+`sudo jarvis models route research-web-search on` or in Core Admin (Model routing).";
+const RESEARCH_UNAVAILABLE: &str = "Research is unavailable right now: no enabled \
+subscription (claude-cli or codex-cli) could run the question. No paid API was used.";
 
 /// The answer to an explicit Research request. Off, too long or unavailable
 /// is a clear, fixed answer, never a silent paid-API or non-search answer.
@@ -563,7 +563,7 @@ async fn research_reply(
     }
     let Some(request) = llm::ResearchRequest::new(latest_question) else {
         return notice(format!(
-            "Je research-vraag is te lang: maximaal {} tekens. Stel een kortere vraag.",
+            "Your research question is too long: at most {} characters. Ask a shorter question.",
             llm::MAX_RESEARCH_QUESTION_CHARS
         ));
     };
@@ -630,7 +630,7 @@ async fn classify_topic(
 fn derive_title(msg: &str) -> String {
     let t = clean_title(msg);
     if t.is_empty() {
-        "Nieuw gesprek".to_string()
+        "New conversation".to_string()
     } else {
         t
     }
@@ -894,7 +894,7 @@ pub(crate) async fn assistant_orchestrate(
             })))
         }
         Err(llm::LlmError::Refused) => Ok(Json(json!({
-            "answer": "Sorry, daar kan ik niet op antwoorden.",
+            "answer": "Sorry, I can't answer that.",
             "plan": Value::Array(vec![]),
             "steps": Value::Array(vec![]),
         }))),
@@ -904,7 +904,7 @@ pub(crate) async fn assistant_orchestrate(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
                     "error": "brain unavailable",
-                    "hint": "controleer je brein-config (router/keys/Ollama)",
+                    "hint": "check your brain config (router/keys/Ollama)",
                 })),
             ))
         }
@@ -987,7 +987,7 @@ mod tests {
         // Overlong: refused with a clear answer, never cut or sent.
         let long = "x".repeat(llm::MAX_RESEARCH_QUESTION_CHARS + 1);
         let reply = research_reply(&on, &brain, &long).await;
-        assert!(reply.text.contains("te lang"));
+        assert!(reply.text.contains("too long"));
         assert_eq!(brain.seen.lock().unwrap().len(), 1);
     }
 

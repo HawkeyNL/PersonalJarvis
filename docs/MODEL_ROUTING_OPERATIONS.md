@@ -267,8 +267,8 @@ stays an ordinary hard-tier answer without tools. A research request:
   and there is no paid fallback, `paid_api` and `metered_after_subscription`
   notwithstanding;
 - answers with a fixed notice when research is off, the question is too long,
-  or no capable subscription answered ("Research staat uit" / "Research is nu
-  niet beschikbaar"), never with a silent non-search or paid answer.
+  or no capable subscription answered ("Research is off" / "Research is
+  unavailable right now"), never with a silent non-search or paid answer.
 
 **What leaves the Home Node.** The question and the fixed instruction go to
 the subscription provider (Anthropic for `claude-cli`, OpenAI for

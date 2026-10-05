@@ -449,7 +449,7 @@ async fn main() -> anyhow::Result<()> {
     };
     if config.agent_enabled && agent_sandbox.is_some() {
         tracing::warn!(
-            "AGENTIC EXECUTION IS ENABLED (mutaties achter getekende goedkeuring, ADR-029 4a/4b)"
+            "AGENTIC EXECUTION IS ENABLED (mutations behind signed approval, ADR-029 4a/4b)"
         );
     }
 

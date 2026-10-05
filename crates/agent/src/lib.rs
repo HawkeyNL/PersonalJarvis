@@ -296,20 +296,20 @@ pub async fn preview(sandbox: &Sandbox, action: &Action) -> Result<String, Agent
         Action::WriteFile { path, content } => {
             let target = sandbox.resolve_write(path)?; // enforces Core/secret denial
             let verb = if target.exists() {
-                "OVERSCHRIJFT"
+                "OVERWRITES"
             } else {
-                "nieuw bestand"
+                "new file"
             };
             let head: String = content.chars().take(2000).collect();
             Ok(format!(
-                "WriteFile {path} ({verb}, {} bytes)\n--- inhoud ---\n{head}",
+                "WriteFile {path} ({verb}, {} bytes)\n--- content ---\n{head}",
                 content.len()
             ))
         }
         Action::GitCommit { message } => {
             let status = git(sandbox, GitRead::Status).await?;
             Ok(format!(
-                "GitCommit \"{message}\"\n--- staat (git status) ---\n{}",
+                "GitCommit \"{message}\"\n--- state (git status) ---\n{}",
                 if status.trim().is_empty() {
                     "(niets te committen)".into()
                 } else {
@@ -319,14 +319,14 @@ pub async fn preview(sandbox: &Sandbox, action: &Action) -> Result<String, Agent
         }
         Action::ClaudeCode { .. } => Err(AgentError::Denied(CLAUDE_CODE_DISABLED.into())),
         // Read-only actions don't need a preview; describe them plainly.
-        other => Ok(format!("{} (alleen-lezen)", action_type(other))),
+        other => Ok(format!("{} (read-only)", action_type(other))),
     }
 }
 
 fn write_file(sandbox: &Sandbox, path: &str, content: &str) -> Result<String, AgentError> {
     let target = sandbox.resolve_write(path)?;
     std::fs::write(&target, content).map_err(|e| AgentError::Exec(e.to_string()))?;
-    Ok(format!("geschreven: {path} ({} bytes)", content.len()))
+    Ok(format!("written: {path} ({} bytes)", content.len()))
 }
 
 async fn git_commit(sandbox: &Sandbox, message: &str) -> Result<String, AgentError> {
@@ -336,7 +336,7 @@ async fn git_commit(sandbox: &Sandbox, message: &str) -> Result<String, AgentErr
 }
 
 const CLAUDE_CODE_DISABLED: &str =
-    "directe Claude Code-uitvoering is uitgeschakeld — gebruik de OpenSandbox-provider";
+    "direct Claude Code execution is disabled — use the OpenSandbox provider";
 
 /// Deny-rules for the Claude Code executor. These are enforced in *every*
 /// permission mode (even `bypassPermissions`), so they — not the tool flags —
@@ -369,13 +369,13 @@ async fn claude_code(_: &Sandbox, _: &str) -> Result<String, AgentError> {
 #[cfg(test)]
 fn parse_claude_code_output(stdout: &str) -> Result<String, AgentError> {
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .map_err(|e| AgentError::Exec(format!("onparseerbare claude-output: {e}")))?;
+        .map_err(|e| AgentError::Exec(format!("unparseable claude output: {e}")))?;
     if v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false) {
         let msg = v
             .get("result")
             .and_then(|r| r.as_str())
             .or_else(|| v.get("subtype").and_then(|s| s.as_str()))
-            .unwrap_or("claude meldde een fout");
+            .unwrap_or("claude reported an error");
         return Err(AgentError::Exec(format!("claude: {msg}")));
     }
     let result = match v.get("result") {
@@ -384,7 +384,7 @@ fn parse_claude_code_output(stdout: &str) -> Result<String, AgentError> {
         None => String::new(),
     };
     Ok(if result.is_empty() {
-        "(claude gaf geen tekst terug)".to_string()
+        "(claude returned no text)".to_string()
     } else {
         result
     })
@@ -707,12 +707,12 @@ mod tests {
             &sb,
             &Action::WriteFile {
                 path: "x.txt".into(),
-                content: "inhoud".into(),
+                content: "content".into(),
             },
         )
         .await
         .unwrap();
-        assert!(p.contains("inhoud"));
+        assert!(p.contains("content"));
         let denied = preview(
             &sb,
             &Action::WriteFile {
@@ -794,15 +794,15 @@ mod tests {
     #[test]
     fn parses_claude_code_success_and_error() {
         let ok = parse_claude_code_output(
-            r#"{"type":"result","subtype":"success","is_error":false,"result":"klaar: 2 bestanden bewerkt"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done: edited 2 files"}"#,
         )
         .unwrap();
-        assert_eq!(ok, "klaar: 2 bestanden bewerkt");
+        assert_eq!(ok, "done: edited 2 files");
 
         let err = parse_claude_code_output(
-            r#"{"is_error":true,"subtype":"error_max_turns","result":"limiet bereikt"}"#,
+            r#"{"is_error":true,"subtype":"error_max_turns","result":"limit reached"}"#,
         );
-        assert!(matches!(err, Err(AgentError::Exec(m)) if m.contains("limiet bereikt")));
+        assert!(matches!(err, Err(AgentError::Exec(m)) if m.contains("limit reached")));
     }
 
     #[test]

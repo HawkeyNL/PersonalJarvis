@@ -759,7 +759,7 @@ pub(crate) async fn system_self_improve(
     }
     let ecosystem = match state.registry.read() {
         Ok(reg) => render_ecosystem(&reg, state.agent_enabled, state.agent_sandbox.is_some()),
-        Err(_) => "(ecosysteem tijdelijk niet leesbaar)".to_string(),
+        Err(_) => "(ecosystem temporarily unreadable)".to_string(),
     };
     let spent_eur = state.spent_cents.load(Ordering::Relaxed) as f64 / 100.0;
     let budget_eur = state.budget_cents as f64 / 100.0;
@@ -797,8 +797,8 @@ pub(crate) async fn system_self_improve(
             Ok(Json(json!({
                 "summary": report.summary,
                 "proposals": proposals,
-                "note": "Jarvis stelt alleen voor — uitvoeren gaat via jouw goedkeuring (4b/4c); \
-                         de Core en Jarvis.md blijven handmatig, alleen door jou.",
+                "note": "Jarvis only proposes — execution goes through your approval (4b/4c); \
+                         the Core and Jarvis.md stay manual, by you only.",
             })))
         }
         Err(e) => {
@@ -807,7 +807,7 @@ pub(crate) async fn system_self_improve(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
                     "error": "brain unavailable",
-                    "hint": "controleer je brein-config (router/keys/Ollama)",
+                    "hint": "check your brain config (router/keys/Ollama)",
                 })),
             ))
         }
@@ -823,23 +823,23 @@ pub(crate) fn render_ecosystem(
 ) -> String {
     let h = &reg.host;
     let mut s = format!(
-        "Host: {} {}, {} ({} cores), {:.1} GB RAM, GPU: {}\nActief brein: {}\n",
+        "Host: {} {}, {} ({} cores), {:.1} GB RAM, GPU: {}\nActive brain: {}\n",
         h.os, h.arch, h.cpu, h.cpu_cores, h.mem_total_gb, h.gpu, reg.active_brain
     );
-    s.push_str("\nBreinen:\n");
+    s.push_str("\nBrains:\n");
     for b in &reg.brains {
         s.push_str(&format!(
-            "- {} [{}] beschikbaar: {} — {}\n",
+            "- {} [{}] available: {} — {}\n",
             b.label,
             enum_str(&b.cost),
             yesno(b.available),
             b.note
         ));
     }
-    s.push_str("\nModel-catalogus:\n");
+    s.push_str("\nModel catalog:\n");
     for m in &reg.models {
         s.push_str(&format!(
-            "- {} ({}, {}, {}) beschikbaar: {}\n",
+            "- {} ({}, {}, {}) available: {}\n",
             m.id,
             m.backend,
             enum_str(&m.class),
@@ -847,7 +847,7 @@ pub(crate) fn render_ecosystem(
             yesno(m.available)
         ));
     }
-    s.push_str("\nTools op de host:\n");
+    s.push_str("\nTools on the host:\n");
     for t in &reg.software {
         let v = t
             .version
@@ -857,18 +857,14 @@ pub(crate) fn render_ecosystem(
         s.push_str(&format!(
             "- {}: {}{}\n",
             t.name,
-            if t.present { "aanwezig" } else { "afwezig" },
+            if t.present { "present" } else { "absent" },
             v
         ));
     }
     s.push_str(&format!(
-        "\nAgent-capabilities: agent {}, werkmap {}\n",
-        if agent_enabled { "AAN" } else { "uit" },
-        if has_workspace {
-            "geconfigureerd"
-        } else {
-            "geen"
-        }
+        "\nAgent-capabilities: agent {}, workspace {}\n",
+        if agent_enabled { "ON" } else { "off" },
+        if has_workspace { "configured" } else { "none" }
     ));
     s
 }
@@ -884,9 +880,9 @@ fn enum_str<T: serde::Serialize>(t: &T) -> String {
 
 fn yesno(b: bool) -> &'static str {
     if b {
-        "ja"
+        "yes"
     } else {
-        "nee"
+        "no"
     }
 }
 
