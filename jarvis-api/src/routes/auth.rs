@@ -173,11 +173,14 @@ pub(crate) async fn auth_bootstrap(
     let stored = identity::password::PasswordService::shared()
         .hash(password)
         .await
-        .map_err(|_| {
-            (
+        .map_err(|error| match error {
+            identity::password::PasswordError::Common => {
+                bad_request("password is too common; choose another")
+            }
+            _ => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error":"activation unavailable"})),
-            )
+            ),
         })?;
     let (user, device) = identity::surreal::account::bootstrap_account(
         &state.db, &req.name, platform, &key, stored, expires_at,
@@ -627,9 +630,20 @@ pub(crate) async fn unlock_approve(
     }
     let signature =
         hex::decode(&req.signature).map_err(|_| bad_request("invalid signature encoding"))?;
-    identity::approve_unlock_request(&state.db, id, authed.user.id, authed.device.id, &signature)
+    if identity::approve_unlock_request(&state.db, id, authed.user.id, authed.device.id, &signature)
         .await
-        .map_err(|_| unauthorized())?;
+        .is_err()
+    {
+        record_security_event(
+            &state,
+            Some(authed.device.id),
+            "unlock.approve",
+            "fail",
+            None,
+        )
+        .await;
+        return Err(unauthorized());
+    }
     record_security_event(&state, Some(authed.device.id), "unlock.approve", "ok", None).await;
     Ok(Json(json!({ "status": "approved" })))
 }
