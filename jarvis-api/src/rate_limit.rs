@@ -68,8 +68,8 @@ const MAX_TRACKED_KEYS: usize = 4096;
 /// Count one event for `key` and return the running count in its window.
 /// A full table first drops expired windows, then the oldest one: refusing
 /// new keys instead would let anyone with enough source addresses lock every
-/// other caller out. Evicting cannot raise an attacker's budget, because each
-/// fresh source key already starts with a full budget.
+/// other caller out. Keys are per route class and source, so evicting only
+/// hands an attacker what a fresh source address would already give them.
 fn count(map: &Mutex<Windows>, key: &str, window: Duration) -> u32 {
     let now = Instant::now();
     // A poisoned lock is not a security event; recover the guard and carry on.
@@ -134,9 +134,6 @@ impl RateLimiter {
         map.remove(key);
     }
 }
-
-/// Pre-auth password checks on `/v1/auth/pairing/requests`, for all sources.
-const PAIRING_PASSWORD_CHECKS_PER_MIN: u32 = 20;
 
 // ---- HTTP middleware --------------------------------------------------------
 
@@ -261,42 +258,33 @@ pub(crate) async fn rate_limit_mw(
     ));
 
     // Flat per-endpoint rate limit.
+    // Keyed by route class, never by the raw path: prefix routes carry a
+    // caller-chosen tail, and one key per tail would let a single source mint
+    // keys until eviction resets its own counters.
     let flat = match path.as_str() {
-        "/v1/auth/enroll" => Some(limits.enroll_per_min),
-        "/v1/auth/bootstrap" => Some(limits.enroll_per_min.min(3)),
-        "/v1/auth/pairing/requests" => Some(limits.enroll_per_min.min(5)),
-        "/v1/auth/challenge" => Some(limits.challenge_per_min),
-        "/v1/auth/login" => Some(limits.login_per_min),
-        _ if path.starts_with("/v1/auth/account/") => Some(5),
-        _ if path.starts_with("/v1/devices/") && path.ends_with("/revoke-request") => Some(5),
+        "/v1/auth/enroll" => Some(("enroll", limits.enroll_per_min)),
+        "/v1/auth/bootstrap" => Some(("bootstrap", limits.enroll_per_min.min(3))),
+        "/v1/auth/pairing/requests" => Some(("pairing", limits.enroll_per_min.min(5))),
+        "/v1/auth/challenge" => Some(("challenge", limits.challenge_per_min)),
+        "/v1/auth/login" => Some(("login", limits.login_per_min)),
+        _ if path.starts_with("/v1/auth/account/") => Some(("account", 5)),
+        _ if path.starts_with("/v1/devices/") && path.ends_with("/revoke-request") => {
+            Some(("revoke", 5))
+        }
         _ if path.starts_with("/v1/auth/pairing/requests/") && path.ends_with("/status") => {
-            Some(limits.challenge_per_min)
+            Some(("pairing-status", limits.challenge_per_min))
         }
         _ => None,
     };
-    if let Some(max) = flat {
+    if let Some((class, max)) = flat {
         if !state
             .rate_limiter
-            .check(&format!("{path}:{ip}"), max, window)
+            .check(&format!("{class}:{ip}"), max, window)
         {
             tracing::warn!(%ip, %path, "auth rate limit hit");
             return too_many_requests();
         }
     }
-    // Each pairing request runs a full Argon2 check before the caller holds
-    // any device authority: cap them across all sources, so address rotation
-    // buys neither online guessing nor memory pressure.
-    if path == "/v1/auth/pairing/requests"
-        && !state.rate_limiter.check_reserved(
-            "pairing:global",
-            PAIRING_PASSWORD_CHECKS_PER_MIN,
-            window,
-        )
-    {
-        tracing::warn!("global pairing budget exhausted");
-        return too_many_requests();
-    }
-
     // Login-specific failure lockout — repeated bad signatures lock the IP.
     let is_login = path == "/v1/auth/login";
     let fail_key = format!("loginfail:{ip}");

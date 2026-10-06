@@ -25,6 +25,9 @@ pub enum IdentityError {
     /// Deliberately opaque so callers can't distinguish failure reasons.
     #[error("authentication failed")]
     AuthFailed,
+    /// No password-check capacity right now: retryable, never a failed guess.
+    #[error("authentication busy")]
+    Busy,
 }
 
 /// A device platform. Persisted as text.
