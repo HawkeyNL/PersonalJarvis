@@ -219,6 +219,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         // Per-IP rate limiting on auth-sensitive endpoints (enroll/challenge/login).
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit_mw))
+        .layer(middleware::map_response(no_store_by_default))
         .with_state(state)
         .layer(TraceLayer::new_for_http().make_span_with(
             |request: &axum::http::Request<axum::body::Body>| {
@@ -227,6 +228,16 @@ pub fn build_router(state: AppState) -> Router {
                 tracing::info_span!("http", method = %request.method(), path = request.uri().path())
             },
         ))
+}
+
+/// API responses carry session tokens and personal data, so nothing may
+/// cache them unless a handler chose its own policy (ASVS 14.3.2).
+async fn no_store_by_default(mut response: axum::response::Response) -> axum::response::Response {
+    response
+        .headers_mut()
+        .entry(axum::http::header::CACHE_CONTROL)
+        .or_insert(axum::http::HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn root() -> Json<Value> {

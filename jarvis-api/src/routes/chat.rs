@@ -862,10 +862,26 @@ pub(crate) struct OrchestrateReq {
 /// the steps, a synthesis composes + checks. Pure reasoning — no tools/actions.
 /// Every underlying call is billed against the budget (ADR-027).
 pub(crate) async fn assistant_orchestrate(
-    _authed: Authed,
+    authed: Authed,
     State(state): State<AppState>,
     Json(req): Json<OrchestrateReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // One orchestration fans out into several model calls: it shares the
+    // device's LLM budget with chat instead of bypassing it.
+    if !allow_authenticated_device(
+        &state,
+        authed.device.id,
+        "llm",
+        state.auth_limits.llm_per_min,
+    ) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "rate limited",
+                "hint": "too many attempts; try again later",
+            })),
+        ));
+    }
     let task = req.task.trim();
     if task.is_empty() {
         return Err(bad_request("task is required"));

@@ -262,6 +262,23 @@ async fn every_application_update_route_requires_authentication_before_storage_a
 }
 
 #[tokio::test]
+async fn api_responses_are_never_cached_by_default() {
+    let app = build_router(state(jarvis_store::Database::init(), None).await);
+    for path in ["/livez", "/v1/auth/me"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn dev_enrollment_is_refused_unless_enabled_outside_production() {
     let body = json!({"name": "attacker", "platform": "ios", "public_key": hex::encode([7u8; 32])});
     for (environment, dev_enrollment) in [("test", false), ("production", true)] {

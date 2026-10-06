@@ -706,6 +706,16 @@ pub async fn login_with_password(
     })
 }
 
+/// A session also ends after this long without use (ASVS 7.3.1). Every
+/// authenticated request updates `last_used_at`; an open realtime connection
+/// stays bounded by the absolute expiry and revocation.
+const SESSION_IDLE: time::Duration = time::Duration::hours(72);
+
+fn session_is_live(session: &Session, now: OffsetDateTime) -> bool {
+    let last_activity = session.last_used_at.unwrap_or(session.created_at);
+    session.revoked_at.is_none() && session.expires_at >= now && now - last_activity < SESSION_IDLE
+}
+
 pub async fn authenticate(db: &Database, token: &str) -> Result<Authenticated, IdentityError> {
     let raw = hex::decode(token).map_err(|_| IdentityError::AuthFailed)?;
     let token_hash = sha2::Sha256::digest(&raw).to_vec();
@@ -716,7 +726,7 @@ pub async fn authenticate(db: &Database, token: &str) -> Result<Authenticated, I
     )
     .await?
     .ok_or(IdentityError::AuthFailed)?;
-    if session.revoked_at.is_some() || session.expires_at < OffsetDateTime::now_utc() {
+    if !session_is_live(&session, OffsetDateTime::now_utc()) {
         return Err(IdentityError::AuthFailed);
     }
     let _updated: Option<serde_json::Value> = one(
@@ -1000,6 +1010,34 @@ mod tests {
     use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
 
     use super::*;
+
+    #[test]
+    fn sessions_end_on_revocation_expiry_or_idleness() {
+        let now = OffsetDateTime::now_utc();
+        let session = |last_used_at: Option<OffsetDateTime>| Session {
+            id: Uuid::now_v7(),
+            user_id: Uuid::now_v7(),
+            device_id: Uuid::now_v7(),
+            token_hash: Vec::new(),
+            created_at: now - time::Duration::days(5),
+            expires_at: now + time::Duration::days(2),
+            last_used_at,
+            revoked_at: None,
+        };
+        assert!(session_is_live(
+            &session(Some(now - time::Duration::hours(1))),
+            now
+        ));
+        assert!(!session_is_live(&session(Some(now - SESSION_IDLE)), now));
+        // Never used since login: idleness counts from creation.
+        assert!(!session_is_live(&session(None), now));
+        let mut revoked = session(Some(now));
+        revoked.revoked_at = Some(now);
+        assert!(!session_is_live(&revoked, now));
+        let mut expired = session(Some(now));
+        expired.expires_at = now - time::Duration::seconds(1);
+        assert!(!session_is_live(&expired, now));
+    }
 
     /// Exercises the real SurrealDB wire protocol and the critical one-use
     /// challenge boundary. It is deliberately opt-in: CI will run it after the

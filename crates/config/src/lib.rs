@@ -692,6 +692,14 @@ impl AppConfig {
     /// opens a socket. Public TLS terminates at Caddy; production Core is never
     /// allowed to become a directly reachable HTTP listener.
     pub fn validate_runtime_security(&self) -> Result<(), String> {
+        // An unknown name (a typo such as "prod") would silently disable
+        // every production-only check, so only known names start.
+        if !matches!(
+            self.environment.as_str(),
+            "development" | "test" | "production"
+        ) {
+            return Err("JARVIS_ENVIRONMENT must be development, test, or production".to_string());
+        }
         if !matches!(self.laya_mode.as_str(), "off" | "shadow" | "primary") {
             return Err("JARVIS_LAYA_MODE must be off, shadow, or primary".to_string());
         }
@@ -1192,6 +1200,15 @@ mod tests {
 
             jail.set_env("JARVIS_ENVIRONMENT", "development");
             assert!(AppConfig::load()?.dev_enrollment);
+
+            jail.set_env("JARVIS_DEV_ENROLLMENT", "false");
+            for unknown in ["prod", "staging"] {
+                jail.set_env("JARVIS_ENVIRONMENT", unknown);
+                assert!(
+                    AppConfig::load()?.validate_runtime_security().is_err(),
+                    "{unknown}"
+                );
+            }
             Ok(())
         });
     }
