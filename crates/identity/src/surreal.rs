@@ -632,7 +632,12 @@ pub async fn login_with_password(
     .await?
     .ok_or(IdentityError::AuthFailed)?;
     let _key_created_at = key.created_at;
-    verify_signature(&key.public_key, &challenge.nonce, signature)?;
+    let message = jarvis_client_core::login_message(challenge_id, device_id, &challenge.nonce)
+        .map_err(|_| IdentityError::AuthFailed)?;
+    verify_signature(&key.public_key, &message, signature)
+        // Transition: clients before the v1 login message sign the raw nonce.
+        // Remove once every client signs `login_message` (apps 0.1.19+).
+        .or_else(|_| verify_signature(&key.public_key, &challenge.nonce, signature))?;
     let owner: DeviceOwner = one(
         db,
         "SELECT user_id FROM devices WHERE record::id(id) = $id AND status = 'active' LIMIT 1",
@@ -954,7 +959,17 @@ pub async fn approve_unlock_request(
     if pending.requesting_device_id == approver_device_id {
         return Err(IdentityError::AuthFailed);
     }
-    verify_device_signature(db, user_id, approver_device_id, &pending.nonce, signature).await?;
+    let message =
+        jarvis_client_core::unlock_approval_message(id, approver_device_id, &pending.nonce)
+            .map_err(|_| IdentityError::AuthFailed)?;
+    if verify_device_signature(db, user_id, approver_device_id, &message, signature)
+        .await
+        .is_err()
+    {
+        // Transition: clients before the v1 unlock message sign the raw
+        // nonce. Remove once every client signs `unlock_approval_message`.
+        verify_device_signature(db, user_id, approver_device_id, &pending.nonce, signature).await?;
+    }
 
     // Claiming repeats every decision-relevant predicate. A second concurrent
     // approval cannot overwrite the first device or resolve an expired request.
@@ -1070,7 +1085,13 @@ mod tests {
         )
         .await?;
         let challenge = create_challenge(&db, device.id).await?;
-        let signature = signing.sign(&challenge.nonce).to_bytes();
+        let signature = signing
+            .sign(&jarvis_client_core::login_message(
+                challenge.id,
+                device.id,
+                &challenge.nonce,
+            )?)
+            .to_bytes();
         let first_db = db.clone();
         let second_db = db.clone();
         let first_signature = signature;
@@ -1107,13 +1128,31 @@ mod tests {
                 .len(),
             1
         );
-        let self_signature = signing.sign(&unlock_nonce).to_bytes();
+        let unlock_message = |device_id| {
+            jarvis_client_core::unlock_approval_message(unlock_id, device_id, &unlock_nonce)
+        };
+        let self_signature = signing.sign(&unlock_message(device.id)?).to_bytes();
         assert!(
             approve_unlock_request(&db, unlock_id, owner.id, device.id, &self_signature)
                 .await
                 .is_err()
         );
-        let approval_signature = approver_signing.sign(&unlock_nonce).to_bytes();
+        // A login proof over the same id, device and nonce is not an approval.
+        let login_proof = approver_signing
+            .sign(&jarvis_client_core::login_message(
+                unlock_id,
+                approver.id,
+                &unlock_nonce,
+            )?)
+            .to_bytes();
+        assert!(
+            approve_unlock_request(&db, unlock_id, owner.id, approver.id, &login_proof)
+                .await
+                .is_err()
+        );
+        let approval_signature = approver_signing
+            .sign(&unlock_message(approver.id)?)
+            .to_bytes();
         approve_unlock_request(&db, unlock_id, owner.id, approver.id, &approval_signature).await?;
         assert_eq!(
             unlock_request_status(&db, unlock_id, owner.id)

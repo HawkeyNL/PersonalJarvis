@@ -16,6 +16,8 @@ pub mod speech;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const PAIRING_APPROVAL_DOMAIN: &[u8] = b"jarvis-device-pairing-v1\0";
 pub const AGENT_APPROVAL_DOMAIN: &[u8] = b"jarvis/agent-approval/v1\0";
+pub const LOGIN_DOMAIN: &[u8] = b"jarvis-login-v1\0";
+pub const UNLOCK_APPROVAL_DOMAIN: &[u8] = b"jarvis-unlock-approval-v1\0";
 /// `approval_message` value in `GET /v1/agent/pending` for [`agent_approval_message`].
 pub const AGENT_APPROVAL_MESSAGE_V1: &str = "agent-approval-v1";
 
@@ -43,6 +45,50 @@ pub enum ProtocolError {
     InvalidPairingApproval,
     #[error("invalid agent approval")]
     InvalidAgentApproval,
+    #[error("invalid challenge nonce")]
+    InvalidChallenge,
+}
+
+/// Canonical v1 bytes a device signs to log in with one challenge. The domain
+/// and the bound challenge and device ids keep a login proof from doubling as
+/// an unlock approval or any other signature.
+pub fn login_message(
+    challenge_id: Uuid,
+    device_id: Uuid,
+    nonce: &[u8],
+) -> Result<Vec<u8>, ProtocolError> {
+    challenge_message(LOGIN_DOMAIN, challenge_id, device_id, nonce)
+}
+
+/// Canonical v1 bytes the approving device signs for one unlock request.
+pub fn unlock_approval_message(
+    request_id: Uuid,
+    approver_device_id: Uuid,
+    nonce: &[u8],
+) -> Result<Vec<u8>, ProtocolError> {
+    challenge_message(
+        UNLOCK_APPROVAL_DOMAIN,
+        request_id,
+        approver_device_id,
+        nonce,
+    )
+}
+
+fn challenge_message(
+    domain: &[u8],
+    id: Uuid,
+    device_id: Uuid,
+    nonce: &[u8],
+) -> Result<Vec<u8>, ProtocolError> {
+    if nonce.len() != 32 {
+        return Err(ProtocolError::InvalidChallenge);
+    }
+    let mut message = Vec::with_capacity(domain.len() + 64);
+    message.extend_from_slice(domain);
+    message.extend_from_slice(id.as_bytes());
+    message.extend_from_slice(device_id.as_bytes());
+    message.extend_from_slice(nonce);
+    Ok(message)
 }
 
 /// Canonical, domain-separated v1 bytes signed by a pairing approver.
@@ -279,6 +325,35 @@ pub struct ConversationResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fixed login and unlock vectors for the Swift and Kotlin clients.
+    #[test]
+    fn login_and_unlock_v1_match_golden_bytes() {
+        let id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let device = Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap();
+        let nonce: Vec<u8> = (0_u8..32).collect();
+        let tail = concat!(
+            "00112233445566778899aabbccddeeff",
+            "ffeeddccbbaa99887766554433221100",
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        );
+        assert_eq!(
+            hex::encode(login_message(id, device, &nonce).unwrap()),
+            format!("6a61727669732d6c6f67696e2d763100{tail}")
+        );
+        assert_eq!(
+            hex::encode(unlock_approval_message(id, device, &nonce).unwrap()),
+            format!("6a61727669732d756e6c6f636b2d617070726f76616c2d763100{tail}")
+        );
+        assert_ne!(
+            login_message(id, device, &nonce).unwrap(),
+            unlock_approval_message(id, device, &nonce).unwrap()
+        );
+        assert_eq!(
+            login_message(id, device, &nonce[..31]),
+            Err(ProtocolError::InvalidChallenge)
+        );
+    }
 
     #[test]
     fn pairing_approval_v1_matches_golden_bytes() {
