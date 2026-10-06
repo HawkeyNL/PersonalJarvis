@@ -240,7 +240,7 @@ async fn password_change_after_bootstrap_replaces_the_bootstrap_verifier(
     approve_action(&db, request.request_id, owner.id, device.id, &signature).await?;
 
     let rows: Option<i64> = db
-        .query("SELECT VALUE count() FROM account_passwords WHERE user_id = $user GROUP ALL")
+        .query("RETURN array::len(SELECT id FROM account_passwords WHERE user_id = $user)")
         .bind(("user", owner.id.to_string()))
         .await?
         .take(0)?;
