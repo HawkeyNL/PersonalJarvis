@@ -493,6 +493,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         environment: config.environment.clone(),
         require_https: config.environment.eq_ignore_ascii_case("production"),
+        dev_enrollment: config.dev_enrollment,
         ibkr_gateway_url: config.ibkr_gateway_url.clone(),
         llm,
         fast_intent_router: {

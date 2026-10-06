@@ -37,6 +37,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         db,
         environment: "test".to_string(),
         require_https: false,
+        dev_enrollment: true,
         ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
         llm: jarvis_llm::stub(),
         fast_intent_router: None,
@@ -257,6 +258,32 @@ async fn every_application_update_route_requires_authentication_before_storage_a
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn dev_enrollment_is_refused_unless_enabled_outside_production() {
+    let body = json!({"name": "attacker", "platform": "ios", "public_key": hex::encode([7u8; 32])});
+    for (environment, dev_enrollment) in [("test", false), ("production", true)] {
+        let mut fixture = state(jarvis_store::Database::init(), None).await;
+        fixture.environment = environment.to_string();
+        fixture.dev_enrollment = dev_enrollment;
+        let response = build_router(fixture)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/enroll")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{environment} {dev_enrollment}"
+        );
     }
 }
 
