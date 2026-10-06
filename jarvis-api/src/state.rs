@@ -156,6 +156,8 @@ pub struct AppState {
     /// Production requests carrying bearer credentials must have arrived over
     /// HTTPS through an explicitly trusted local reverse proxy.
     pub require_https: bool,
+    /// Dev-only `/v1/auth/enroll`; config refuses it in production.
+    pub dev_enrollment: bool,
     pub ibkr_gateway_url: String,
     /// The brain (DEC-001) — provider-abstracted, swappable at runtime.
     pub llm: Arc<dyn llm::LlmProvider>,

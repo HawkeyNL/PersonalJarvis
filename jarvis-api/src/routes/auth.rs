@@ -27,15 +27,16 @@ use crate::validation;
 use crate::{AppState, Authed};
 
 /// Dev-only device enrollment: create the single user if needed and register
-/// the calling device with its public key. Disabled in production.
+/// the calling device with its public key. Off unless `JARVIS_DEV_ENROLLMENT`
+/// is set, and never in production.
 pub(crate) async fn auth_enroll(
     State(state): State<AppState>,
     Json(req): Json<EnrollReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if state.environment == "production" {
+    if !state.dev_enrollment || state.environment == "production" {
         return Err((
             StatusCode::FORBIDDEN,
-            Json(json!({ "error": "enrollment is disabled in production" })),
+            Json(json!({ "error": "enrollment is disabled" })),
         ));
     }
     // Bound the free-text fields and pin the key to an exact-length hex string

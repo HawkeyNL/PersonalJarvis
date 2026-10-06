@@ -81,9 +81,15 @@ pub struct AppConfig {
     #[serde(default)]
     pub log_json: bool,
 
-    /// Deployment environment name (e.g. `development`, `production`).
+    /// Deployment environment name (e.g. `development`, `production`),
+    /// lowercased by [`AppConfig::load`] so every comparison is exact.
     #[serde(default = "default_environment")]
     pub environment: String,
+
+    /// Dev-only `/v1/auth/enroll`. Off unless explicitly enabled, and refused
+    /// in production: it registers any caller's key on the owner account.
+    #[serde(default)]
+    pub dev_enrollment: bool,
 
     /// Public DNS name served by the local HTTPS reverse proxy. This is
     /// deployment metadata for Caddy and must never contain a URL, path, or
@@ -616,10 +622,12 @@ impl AppConfig {
     ///
     /// Environment variables take precedence over the file.
     pub fn load() -> Result<Self, figment::Error> {
-        Figment::new()
+        let mut config: Self = Figment::new()
             .merge(Toml::file("jarvis.toml"))
             .merge(Env::prefixed("JARVIS_"))
-            .extract()
+            .extract()?;
+        config.environment.make_ascii_lowercase();
+        Ok(config)
     }
 
     /// Parse the direct proxy peers allowed to supply forwarding headers.
@@ -708,6 +716,9 @@ impl AppConfig {
             return Err("invalid TypeSafe Jev model alias".to_string());
         }
         if self.environment.eq_ignore_ascii_case("production") {
+            if self.dev_enrollment {
+                return Err("JARVIS_DEV_ENROLLMENT must not be enabled in production".to_string());
+            }
             let bind_addr: SocketAddr = self
                 .bind_addr
                 .parse()
@@ -767,6 +778,7 @@ impl fmt::Debug for AppConfig {
             .field("surreal_password", &redact(&self.surreal_password))
             .field("log_json", &self.log_json)
             .field("environment", &self.environment)
+            .field("dev_enrollment", &self.dev_enrollment)
             .field("public_hostname", &self.public_hostname)
             .field("ibkr_gateway_url", &self.ibkr_gateway_url)
             .field("llm_provider", &self.llm_provider)
@@ -894,6 +906,7 @@ mod tests {
             surreal_password: "supersecret".to_string(),
             log_json: false,
             environment: "test".to_string(),
+            dev_enrollment: false,
             public_hostname: String::new(),
             ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
             llm_provider: "anthropic".to_string(),
@@ -1032,6 +1045,7 @@ mod tests {
             surreal_password: "x".to_string(),
             log_json: false,
             environment: "production".to_string(),
+            dev_enrollment: false,
             public_hostname: String::new(),
             ibkr_gateway_url: String::new(),
             llm_provider: String::new(),
@@ -1156,6 +1170,28 @@ mod tests {
             jail.set_env("JARVIS_TRUSTED_PROXY_HOPS", "2");
             jail.set_env("JARVIS_TRUSTED_PROXY_IPS", "127.0.0.1");
             assert!(AppConfig::load()?.validate_runtime_security().is_err());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn environment_is_case_insensitive_and_dev_enrollment_never_runs_in_production() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("JARVIS_SURREAL_ENDPOINT", "127.0.0.1:8000");
+            jail.set_env("JARVIS_SURREAL_USERNAME", "core");
+            jail.set_env("JARVIS_SURREAL_PASSWORD", "test-password");
+            jail.set_env("JARVIS_BIND_ADDR", "127.0.0.1:8080");
+            jail.set_env("JARVIS_ENVIRONMENT", "Production");
+            let cfg = AppConfig::load()?;
+            assert_eq!(cfg.environment, "production");
+            assert!(!cfg.dev_enrollment);
+            assert!(cfg.validate_runtime_security().is_ok());
+
+            jail.set_env("JARVIS_DEV_ENROLLMENT", "true");
+            assert!(AppConfig::load()?.validate_runtime_security().is_err());
+
+            jail.set_env("JARVIS_ENVIRONMENT", "development");
+            assert!(AppConfig::load()?.dev_enrollment);
             Ok(())
         });
     }
