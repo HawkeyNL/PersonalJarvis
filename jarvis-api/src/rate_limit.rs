@@ -55,9 +55,9 @@ type Windows = HashMap<String, (Instant, u32)>;
 #[derive(Default)]
 pub struct RateLimiter {
     hits: Mutex<Windows>,
-    /// Authenticated devices, kept apart so anonymous traffic can never evict
-    /// or crowd out an owner device's budget.
-    devices: Mutex<Windows>,
+    /// Keys anonymous traffic must never evict or crowd out: authenticated
+    /// devices and global budgets. Bounded by the number of such keys.
+    reserved: Mutex<Windows>,
     /// Consecutive *failed* attempts per key, for failure-based lockout — kept
     /// separate from `hits` so a successful call can clear a caller's penalty.
     failures: Mutex<Windows>,
@@ -106,9 +106,9 @@ impl RateLimiter {
         count(&self.hits, key, window) <= max
     }
 
-    /// [`Self::check`] for an authenticated device's own table.
-    pub fn check_device(&self, key: &str, max: u32, window: Duration) -> bool {
-        count(&self.devices, key, window) <= max
+    /// [`Self::check`] for keys that anonymous floods must not evict.
+    pub fn check_reserved(&self, key: &str, max: u32, window: Duration) -> bool {
+        count(&self.reserved, key, window) <= max
     }
 
     /// Record one failed attempt for `key` within `window`; return the running
@@ -234,7 +234,7 @@ pub(crate) fn allow_authenticated_device(
     profile: &str,
     per_min: u32,
 ) -> bool {
-    state.rate_limiter.check_device(
+    state.rate_limiter.check_reserved(
         &format!("{profile}:device:{device_id}"),
         per_min,
         Duration::from_secs(60),
@@ -287,9 +287,11 @@ pub(crate) async fn rate_limit_mw(
     // any device authority: cap them across all sources, so address rotation
     // buys neither online guessing nor memory pressure.
     if path == "/v1/auth/pairing/requests"
-        && !state
-            .rate_limiter
-            .check("pairing:global", PAIRING_PASSWORD_CHECKS_PER_MIN, window)
+        && !state.rate_limiter.check_reserved(
+            "pairing:global",
+            PAIRING_PASSWORD_CHECKS_PER_MIN,
+            window,
+        )
     {
         tracing::warn!("global pairing budget exhausted");
         return too_many_requests();
@@ -425,7 +427,7 @@ mod tests {
     fn a_full_table_admits_new_callers_and_never_touches_devices() {
         let rl = RateLimiter::new();
         let w = Duration::from_secs(60);
-        assert!(rl.check_device("authenticated:device:owner", 1, w));
+        assert!(rl.check_reserved("authenticated:device:owner", 1, w));
         for n in 0..MAX_TRACKED_KEYS {
             assert!(rl.check(&format!("flood:{n}"), 1, w));
         }
@@ -434,7 +436,7 @@ mod tests {
         assert!(!rl.check("owner-login", 1, w));
         assert!(rl.hits.lock().unwrap().len() <= MAX_TRACKED_KEYS);
         // Anonymous churn neither evicts nor resets an owner device's window.
-        assert!(!rl.check_device("authenticated:device:owner", 1, w));
+        assert!(!rl.check_reserved("authenticated:device:owner", 1, w));
     }
 
     #[test]
