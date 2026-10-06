@@ -260,8 +260,16 @@ pub async fn approve_action(
     let message = account_approval_message(&challenge).map_err(|_| IdentityError::AuthFailed)?;
     verify_device_signature(db, user, device, &message, signature).await?;
     let mutation = match action {
-        AccountAction::PasswordSet => "UPSERT $password_record SET user_id = $user, \
-            verifier = $claim[0].verifier, revision = $id, updated_at = time::now(); \
+        // Bootstrap stores the first verifier under a generated record id:
+        // replace the owner's row wherever it lives (the owner index is UNIQUE).
+        AccountAction::PasswordSet => "LET $current = SELECT id FROM account_passwords WHERE user_id = $user; \
+            IF array::len($current) = 0 { \
+                CREATE $password_record SET user_id = $user, verifier = $claim[0].verifier, \
+                revision = $id, updated_at = time::now(); \
+            } ELSE { \
+                UPDATE account_passwords SET verifier = $claim[0].verifier, revision = $id, \
+                updated_at = time::now() WHERE user_id = $user; \
+            }; \
             UPDATE sessions SET revoked_at = time::now() WHERE user_id = $user AND revoked_at IS NONE; \
             DELETE account_actions WHERE user_id = $user;",
         AccountAction::DeviceRevoke => "UPDATE devices SET status = 'revoked', updated_at = time::now() \

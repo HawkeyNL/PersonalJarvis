@@ -191,3 +191,79 @@ async fn signed_account_changes_enforce_password_and_revoke_sessions(
     assert_eq!(get_device(&db, device.id).await?.unwrap().status, "revoked");
     Ok(())
 }
+
+/// Bootstrap stores the first verifier under a generated record id, so a later
+/// signed password change must replace that row instead of adding a second one
+/// for the same owner (the owner index is UNIQUE).
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn password_change_after_bootstrap_replaces_the_bootstrap_verifier(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(std::env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &std::env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &std::env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!(
+        "password_change_fixture_{}",
+        Uuid::now_v7().simple()
+    ))
+    .use_db("fixture")
+    .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let key = SigningKey::from_bytes(&rand::random());
+    let hash = |password: &str| {
+        PasswordService::shared().hash(AccountPassword::new(password.to_owned()).unwrap())
+    };
+    let deadline = OffsetDateTime::now_utc().unix_timestamp() + 600;
+    let (owner, device) = bootstrap_account(
+        &db,
+        "fixture",
+        Platform::Linux,
+        &key.verifying_key().to_bytes(),
+        hash(PASSWORD).await?,
+        deadline,
+    )
+    .await?;
+    let changed = "changed fixture account password never used in production";
+    let request = request_action(
+        &db,
+        owner.id,
+        device.id,
+        AccountAction::PasswordSet,
+        owner.id,
+        Some(hash(changed).await?),
+    )
+    .await?;
+    let signature = key.sign(&account_approval_message(&request)?).to_bytes();
+    approve_action(&db, request.request_id, owner.id, device.id, &signature).await?;
+
+    let rows: Option<i64> = db
+        .query("RETURN array::len(SELECT id FROM account_passwords WHERE user_id = $user)")
+        .bind(("user", owner.id.to_string()))
+        .await?
+        .take(0)?;
+    assert_eq!(rows, Some(1));
+    let login_as = |password: &str| {
+        let db = &db;
+        let key = &key;
+        let password = password.to_owned();
+        async move {
+            let challenge = create_challenge(db, device.id).await?;
+            let signed = key.sign(&challenge.nonce).to_bytes();
+            login_with_password(
+                db,
+                device.id,
+                challenge.id,
+                &signed,
+                Some(AccountPassword::new(password)?),
+            )
+            .await
+            .map_err(Box::<dyn std::error::Error>::from)
+        }
+    };
+    assert!(login_as(PASSWORD).await.is_err());
+    login_as(changed).await?;
+    Ok(())
+}
