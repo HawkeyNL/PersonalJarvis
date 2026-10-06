@@ -553,7 +553,10 @@ pub async fn create_challenge(db: &Database, device_id: Uuid) -> Result<Challeng
     let id = Uuid::now_v7();
     execute(
         db,
-        "CREATE auth_challenges SET id = $id, device_id = $device_id, nonce = <bytes>$nonce, \
+        // Anyone may request a challenge, so expired ones are dropped here
+        // instead of accumulating; nothing reads a challenge after expiry.
+        "DELETE auth_challenges WHERE expires_at < time::now(); \
+         CREATE auth_challenges SET id = $id, device_id = $device_id, nonce = <bytes>$nonce, \
          created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE RETURN AFTER",
         ChallengeBindings {
             id: id.to_string(),
@@ -638,16 +641,10 @@ pub async fn login_with_password(
     .await?
     .ok_or(IdentityError::AuthFailed)?;
 
-    let account_revision = account::verify_password(
-        db,
-        crate::password::PasswordService::shared(),
-        owner.user_id,
-        password,
-    )
-    .await?;
-
     // This conditional claim is the replay boundary: only one concurrent caller
-    // can observe a returned record and proceed to mint a session.
+    // can observe a returned record and proceed to mint a session. It runs
+    // before the password check, so a wrong password burns the challenge and
+    // every guess needs a fresh signature from the device key.
     let claimed: Option<ClaimedRecord> = one(
         db,
         "UPDATE auth_challenges SET consumed_at = time::now() WHERE record::id(id) = $id AND device_id = $device_id \
@@ -661,6 +658,14 @@ pub async fn login_with_password(
     if claimed.id != challenge_id.to_string() {
         return Err(IdentityError::DatabaseSurreal);
     }
+
+    let account_revision = account::verify_password(
+        db,
+        crate::password::PasswordService::shared(),
+        owner.user_id,
+        password,
+    )
+    .await?;
 
     let mut token = vec![0_u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);

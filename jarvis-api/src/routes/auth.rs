@@ -246,7 +246,7 @@ pub(crate) async fn pairing_create(
     // signing device remains. Legacy/unactivated owners cannot use this path.
     identity::surreal::account::verify_password(
         &state.db,
-        identity::password::PasswordService::shared(),
+        identity::password::PasswordService::pre_auth(),
         user.id,
         password,
     )
