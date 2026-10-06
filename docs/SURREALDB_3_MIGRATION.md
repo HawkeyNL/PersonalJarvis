@@ -36,9 +36,10 @@ Line numbers come from `76668a7`.
      (PR1).
 2. **The on-disk RocksDB format is not compatible.** [docs]
    - A 3.x binary cannot open the 2.x data directory.
-   - The only supported path is `surreal v2 export --v3` (a 3.0.3+ CLI against
-     a 2.6.0+ source) followed by `surreal import` into an empty 3.x
-     datastore.
+   - The supported path is a `--v3` export from the 2.x side followed by
+     `surreal import` into an empty 3.x datastore. PR0 used the pinned
+     2.6.5 image's own `export --v3`; the 3.3 `surreal v2` wrapper is not
+     usable (§9).
    - Existing `jarvis-backup` archives hold plain 2.x exports. They cannot
      be imported into 3.x directly.
 3. **SurrealQL in Jarvis has five confirmed breaking hits and one existing
@@ -266,12 +267,12 @@ The statements were extracted from all Rust string literals.
 | B8 | 3.3: `UPDATE`/`UPSERT` evaluate `WHERE` before applying data. | No breakage expected: our compare-and-swap updates already rely on pre-state `WHERE` | about 25 conditional updates (identity, agent approvals, budget, broker) | Keep the existing replay and compare-and-swap tests; they must pass on 3.3. | [docs] |
 | B9 | In `SET`, every expression reads the record's state from before the statement. | No hit: no `SET` right-hand side reads another field (checked by script) | none | none | inventory |
 | B10 | The `id` field is validated against its declared kind when the record id is generated. | No hit expected: ids stay strings | 19 `DEFINE FIELD id … TYPE string` | Keep binding ids as **strings**. A `uuid::Uuid` bound through SDK 3 becomes a SurrealDB `uuid` value and would break the `string` id kind and every `record::id(id) = $id` lookup. | [src] 3.3 `doc/field.rs` |
-| B11 | `UPSERT <table>` with no id and no `WHERE`. Semantics in 3.x are not documented for this shape. | Unknown | `jarvis-api/src/routes/voice.rs:100` | Test it in PR0. If it differs, bind `voice_profiles` by a deterministic record id (this needs a data fix, because existing rows have random ids). | [unverified] |
-| B12 | `RETURN <param> AS alias` on `DELETE`. | Unknown | `routes/chat.rs:778` | Test it in PR0. | [unverified] |
+| B11 | `UPSERT <table>` with no id and no `WHERE`. Semantics in 3.x are not documented for this shape. | Unknown | `jarvis-api/src/routes/voice.rs:100` | Test it in PR0. If it differs, bind `voice_profiles` by a deterministic record id (this needs a data fix, because existing rows have random ids). | PR0: see §9 |
+| B12 | `RETURN <param> AS alias` on `DELETE`. | Unknown | `routes/chat.rs:778` | Test it in PR0. | PR0: see §9 |
 | B13 | `math::min`/`max` on empty arrays, the `.id` idiom, optional chaining, `GROUP`+`SPLIT`, `LIKE` operators, `MTREE`/`SEARCH`, futures, `rand::guid`, compulsory `LET`, numeric id ordering, `<set>`. | No hit | none (all variables already use `LET`) | none | inventory |
 | B14 | Field evaluation follows dependency order (3.3). | No hit: no `VALUE`/`DEFAULT`, and `ASSERT`s only read `$value` | none | none | [docs] |
-| B15 | `DEFINE` statements inside `BEGIN … COMMIT`, and implicit creation of namespace and database on first use. | Unknown | every schema file; tests that use random namespaces | Covered by the 3.3 migration test (fresh path) in PR2. | [unverified] |
-| B16 | `math::percentile` and `time::max` on empty or all-`NONE` groups. | Unknown | `usage/src/surreal.rs:161,188` | Covered by the existing usage statistics tests on 3.3. | [unverified] |
+| B15 | `DEFINE` statements inside `BEGIN … COMMIT`, and implicit creation of namespace and database on first use. | Unknown | every schema file; tests that use random namespaces | Covered by the 3.3 migration test (fresh path) in PR2. | PR0: see §9 |
+| B16 | `math::percentile` and `time::max` on empty or all-`NONE` groups. | Unknown | `usage/src/surreal.rs:161,188` | Covered by the existing usage statistics tests on 3.3. | PR0: see §9 |
 
 ### 3.2 Tooling and infrastructure
 
@@ -387,12 +388,13 @@ tagged otherwise.
 2. **Source engine:** reflink-copy T0 to a scratch directory S. Start
    `<2.6.5 digest> start --unauthenticated rocksdb:/data/jarvis.db` on S
    with `--network none`, `--cap-drop ALL` and a memory limit.
-3. **Export:** run `<3.3 digest> v2 export --v3 --endpoint http://127.0.0.1:8000 --namespace <ns> --database <db> /run/…/export-v3.surql`
+3. **Export:** run `<2.6.5 digest> export --v3 --endpoint http://127.0.0.1:8000 --namespace <ns> --database <db> /run/…/export-v3.surql`
    in a container **sharing S's network namespace**
    (`--network container:<S>`).
    - This needs no host network and no new port.
-   - [unverified] The exact flags of `v2 export`, and whether it accepts an
-     unauthenticated source.
+   - PR0 verified these flags against an unauthenticated 2.6.5 source (§9).
+   - Do not use the 3.3 `surreal v2 export`: it downloads a 2.7.0 binary
+     from the internet after an interactive prompt.
 4. **Target engine:** create `/var/lib/jarvis/surrealdb.v3` (root, 0700).
    Start `<3.3 digest> start --unauthenticated rocksdb:/data/jarvis.db` on
    it, networkless.
@@ -520,7 +522,7 @@ tagged otherwise.
 - **2.x archives** created before the upgrade:
   1. Restore `/etc/jarvis` from the archive (old digest).
   2. Import into a disposable 2.6.5 datastore.
-  3. `v2 export --v3`.
+  3. Export with the 2.6.5 image's `export --v3`.
   4. Import into 3.3.
   - PR3 documents this two-step path in `BACKUP_AND_RESTORE.md`, and
     `jarvis-backup verify` should print the archive's engine version.
@@ -684,6 +686,31 @@ releases while PR2–PR4 are open; decision 1 in §8 rejects that.
    `docker image inspect` (no secrets involved) instead of asking the owner.
 9. **Skip SurrealDB 2.7.0.** It removes no step and lacks the 3.3.0-only
    advisory fixes.
+
+## 9. PR0 spike findings (2026-10-06)
+
+CI-only spike (draft PR #93, never merged) against
+`surrealdb/surrealdb@sha256:681c6c22c287421b5c7d99e0fde79b6e0d32c36c1ddeaab2762a1661cb04cd20`
+(3.3.0) and the production 2.6.5 digest `sha256:d653f6c8…`, which the spike
+confirmed is v2.6.5. The databases were in-memory; RocksDB on-disk
+behaviour, sizes and memory use stay for the drill.
+
+| Item | Result on 3.3 | Action |
+|---|---|---|
+| B3 | Confirmed: unmodified `0010` fails with "FLEXIBLE must be specified after TYPE". With `TYPE option<object> FLEXIBLE` the whole chain applies. | As planned (PR2). |
+| B4 | Confirmed: a `SELECT` on a missing table errors on 3.3 and returns `[]` on 2.6.5. | Handled by #89 (`INFO FOR DB` check); the PR2 test suite on 3.3 covers the rest. |
+| B7 | `NULL` into `option<string>` is rejected by **both** 2.6.5 and 3.3; `NONE` works on both. The risk is only the SDK mapping of JSON `null`. | As planned: typed bindings in PR2. |
+| B11 | `UPSERT voice_profiles SET …` without id behaves the same on both versions. | None. |
+| B12 | `DELETE … RETURN $id AS id` inside a transaction works on 3.3. | None. |
+| B15 | **New breaking hit:** 3.3 no longer creates a namespace or database on first use ("The database 'core' does not exist"). Nothing in the repo runs `DEFINE NAMESPACE` or `DEFINE DATABASE`; production and the tests rely on implicit creation. `DEFINE` inside `BEGIN … COMMIT` works. | PR2: provisioning and every test fixture run `DEFINE NAMESPACE IF NOT EXISTS` / `DEFINE DATABASE IF NOT EXISTS` first. The migration helper defines both before `import`. |
+| B16 | **New difference:** `math::percentile` with `GROUP ALL` on no matching rows returns one row with `p50: []` on 3.3 instead of no row. `latency_p50_ms: Option<f64>` would fail to deserialize, so the monthly statistics break in a month without measured latency. `time::max` with `GROUP BY` returns no rows on both. | PR2: treat an empty array as `NONE` in the query or the row type, with a test. |
+| Re-apply | Re-running `0010` on a migrated database errors ("The field 'id' already exists"). The runner checks `schema_version` first, so this only matters for manual runs. | None. |
+| T3 | `INFO FOR DB` returns an object whose `tables` is a map (plus `accesses`, `analyzers`, `apis`, `buckets`, `configs`, `functions`, `models`, `modules`, `params`, `sequences`, `users`). `surreal sql --json` prints `[[{"version":10}]]`. `export --auth-level root` works. | PR3: run `test-jarvis-backup-surreal.sh` on 3.3 for the exact parsing. |
+| T7 | A database `EDITOR` can apply the whole chain and run `INFO FOR DB`. | None. |
+| T8 | Root is created from `SURREAL_USER`/`SURREAL_PASS`; `--unauthenticated memory`, `isready` and `/health` (HTTP 200) work. | None. |
+| Export | The 2.6.5 image's `export --v3` works against an unauthenticated source; the 3.3 `surreal v2` subcommand wants to download a 2.7.0 binary and fails non-interactively. | §5.2 now uses the 2.6.5 image. |
+| Import | `surreal import` into 3.3 succeeds after the database is defined. Bytes, datetime, duration, nested `NONE`, `NULL`, a record link, float and non-ASCII text round-trip exactly. | None. |
+| Passhash | The `EDITOR` user's passhash survives; sign-in works with the right password and is refused with a wrong one. | None. |
 
 ## Appendix: sources
 
