@@ -1,0 +1,23 @@
+# Throwaway PR0 spike for docs/SURREALDB_3_MIGRATION.md. Never merged.
+name: SurrealDB 3 spike
+
+on:
+  pull_request:
+    paths:
+      - scripts/ci/surrealdb3-spike.sh
+      - .github/workflows/surrealdb3-spike.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  spike:
+    name: SurrealDB 3.3 probes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: bash scripts/ci/surrealdb3-spike.sh
