@@ -262,7 +262,8 @@ pub async fn approve_action(
     let mutation = match action {
         // Bootstrap stores the first verifier under a generated record id:
         // replace the owner's row wherever it lives (the owner index is UNIQUE).
-        AccountAction::PasswordSet => "IF array::len(SELECT id FROM account_passwords WHERE user_id = $user) = 0 { \
+        AccountAction::PasswordSet => "LET $current = SELECT id FROM account_passwords WHERE user_id = $user; \
+            IF array::len($current) = 0 { \
                 CREATE $password_record SET user_id = $user, verifier = $claim[0].verifier, \
                 revision = $id, updated_at = time::now(); \
             } ELSE { \
