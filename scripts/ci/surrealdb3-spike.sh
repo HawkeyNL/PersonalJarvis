@@ -11,22 +11,24 @@ V2=surrealdb/surrealdb:v2.6.5
 V3=surrealdb/surrealdb:v3.3.0
 work=$(mktemp -d)
 out=${GITHUB_STEP_SUMMARY:-/dev/stdout}
-cleanup() { docker rm -f s2 s3 s3u >/dev/null 2>&1; rm -rf -- "$work"; }
+cleanup() { docker rm -f s2 s2u s3 s3u >/dev/null 2>&1; rm -rf -- "$work"; }
 trap cleanup EXIT
 
 note() { printf '%s\n' "$*" | tee -a "$out"; }
-block() { { printf '\n<details><summary>%s</summary>\n\n```\n' "$1"; head -c 6000; printf '\n```\n</details>\n\n'; } | tee -a "$out" >/dev/null; }
+block() { { printf '\n<details><summary>%s</summary>\n\n```\n' "$1"; head -c 6000; printf '\n```\n</details>\n\n'; } | tee -a "$out"; }
 
 # POST SurrealQL to /sql. Args: port ns db [user pass]. Body on stdin.
 sql() {
-    local port=$1 ns=$2 db=$3 user=${4:-root} pass=${5:-root}
-    curl -sS -u "$user:$pass" -H 'Accept: application/json' \
+    local port=$1 ns=$2 db=$3 user=${4:-root} pass=${5:-root} auth=()
+    [[ $user != none ]] && auth=(-u "$user:$pass")
+    curl -sS "${auth[@]}" -H 'Accept: application/json' \
         -H "surreal-ns: $ns" -H "surreal-db: $db" \
         -H "surreal-auth-ns: $ns" -H "surreal-auth-db: $db" \
         --data-binary @- "http://127.0.0.1:$port/sql"
 }
 sql_root() { curl -sS -u root:root -H 'Accept: application/json' -H "surreal-ns: $2" -H "surreal-db: $3" --data-binary @- "http://127.0.0.1:$1/sql"; }
-statuses() { jq -c '[.[]? | .status]' 2>/dev/null || echo 'unparseable'; }
+statuses() { local r; r=$(cat); jq -c '[.[]? | .status]' <<<"$r" 2>/dev/null || printf 'not JSON: %s' "${r:0:300}"; }
+define_db() { printf 'DEFINE NAMESPACE IF NOT EXISTS %s; USE NS %s; DEFINE DATABASE IF NOT EXISTS %s;' "$2" "$2" "$3" | sql "$1" "$2" "$3" "${4:-root}" | statuses; }
 
 wait_ready() {
     for _ in $(seq 1 30); do
@@ -63,7 +65,9 @@ apply_chain() { # port ns db user pass patched
         note "  - $(basename "$f"): $(printf '%s' "$body" | sql "$1" "$2" "$3" "$4" "$5" | statuses)"
     done
 }
-note ""; note "## Schema chain on 3.3 as root, unmodified (implicit namespace/database)"
+note ""; note "- B15 implicit namespace/database on 3.3: $(sql 8003 implicit core <"$repo/schema/surreal/0001_baseline.surql" | statuses)"
+note "- define chain_raw: $(define_db 8003 chain_raw core)"; note "- define chain: $(define_db 8003 chain core)"
+note ""; note "## Schema chain on 3.3 as root, unmodified"
 apply_chain 8003 chain_raw core root root raw
 note ""; note "## Schema chain on 3.3 as root, B3 fix applied"
 apply_chain 8003 chain core root root patched
@@ -78,15 +82,21 @@ apply_chain 8003 ed core core core-pw patched
 note "- T7 INFO FOR DB as EDITOR: $(echo 'INFO FOR DB;' | sql 8003 ed core core core-pw | statuses)"
 
 ## T3: INFO FOR DB shape, `sql --json`, export --auth-level root
-echo 'INFO FOR DB;' | sql_root 8003 chain core | jq '.[0].result | with_entries(.value |= (if type == "object" then (keys | .[0:4]) else . end))' | block 'T3 INFO FOR DB (top-level keys, sample)'
+echo 'INFO FOR DB;' | sql_root 8003 chain core | jq '.[0].result | if type == "object" then with_entries(.value |= (if type == "object" then (keys | .[0:4]) else . end)) else . end' | block 'T3 INFO FOR DB (top-level keys, sample)'
 echo 'SELECT version FROM schema_version;' | docker exec -i s3 /surreal sql --hide-welcome --json \
     --endpoint ws://127.0.0.1:8000 --auth-level root --user root --pass root --namespace chain --database core 2>&1 | block 'T3 surreal sql --json'
 docker exec s3 /surreal export --endpoint http://127.0.0.1:8000 --auth-level root --user root --pass root \
     --namespace chain --database core - 2>&1 | head -c 1500 | block 'T3 export --auth-level root (head)'
 
+docker run -d --name s2 -p 127.0.0.1:8002:8000 -e SURREAL_USER=root -e SURREAL_PASS=root \
+    "$V2" start --bind 0.0.0.0:8000 memory >/dev/null
+wait_ready s2 || note "- 2.6.5 NOT READY"
+note "- 2.6.5 define chain: $(define_db 8002 chain core)"
+note "- 2.6.5 chain: $(for f in "$repo"/schema/surreal/*.surql; do sql 8002 chain core <"$f" | statuses; done | tr '\n' ' ' | head -c 400)"
 ## Runtime statement shapes on the migrated 3.3 database
-probe() { note "- $1: \`$(sql_root 8003 chain core | jq -c '[.[]? | {status, result: (.result | tostring | .[0:160])}]')\`"; }
-note ""; note "## Runtime statement shapes (3.3)"
+probe() { local r; r=$(sql_root "$port" chain core); note "- $1: \`$(jq -c '[.[]? | {status, result: (.result | tostring | .[0:200])}]' <<<"$r" 2>/dev/null || echo "${r:0:300}")\`"; }
+for port in 8002 8003; do
+note ""; note "## Runtime statement shapes (port $port: 8002 = 2.6.5, 8003 = 3.3)"
 echo 'SELECT * FROM table_that_does_not_exist;' | probe 'B4 select unknown table'
 cat <<'SQL' | probe 'B11 UPSERT table without id (twice, then count)'
 LET $user_id = 'u1'; LET $embedding = 'AAEC'; LET $dims = 3; LET $engine = 'stub';
@@ -106,25 +116,29 @@ SQL
 cat <<'SQL' | probe 'B7 NULL vs NONE into option<string> (account_actions.verifier)'
 CREATE account_actions:n1 SET id = 'n1', user_id = 'u', device_id = 'd', action = 'device-revoke', target = 't', nonce = <bytes>'AA==', verifier = NULL, created_at = time::now(), expires_at = time::now();
 CREATE account_actions:n2 SET id = 'n2', user_id = 'u', device_id = 'd', action = 'device-revoke', target = 't', nonce = <bytes>'AA==', verifier = NONE, created_at = time::now(), expires_at = time::now();
+SELECT record::id(id) AS id, verifier, type::is::none(verifier) AS is_none, type::is::null(verifier) AS is_null FROM account_actions ORDER BY id;
 SQL
+done
 
 ## 2.6.5 -> 3.3 export/import (unauthenticated source, passhash, typed values)
 note ""; note "## Export 2.6.5 with the 3.3 CLI, import into 3.3"
-docker run -d --name s2 -p 127.0.0.1:8002:8000 "$V2" start --unauthenticated --bind 0.0.0.0:8000 memory >/dev/null
-wait_ready s2 || note "- 2.6.5 NOT READY"
-for f in "$repo"/schema/surreal/*.surql; do sql 8002 data core <"$f" >/dev/null; done
-cat <<'SQL' | sql 8002 data core | statuses | sed 's/^/- seed 2.6.5: /' | tee -a "$out"
+docker run -d --name s2u -p 127.0.0.1:8005:8000 "$V2" start --unauthenticated --bind 0.0.0.0:8000 memory >/dev/null
+wait_ready s2u || note "- 2.6.5 unauthenticated NOT READY"
+note "- define data on 2.6.5: $(define_db 8005 data core none)"
+for f in "$repo"/schema/surreal/*.surql; do sql 8005 data core none <"$f" >/dev/null; done
+cat <<'SQL' | sql 8005 data core none | statuses | sed 's/^/- seed 2.6.5: /' | tee -a "$out"
 DEFINE USER core ON DATABASE PASSWORD 'core-pw' ROLES EDITOR;
 DEFINE TABLE samples SCHEMALESS;
 CREATE samples:typed SET b = <bytes>'AAECAw==', dt = d'2026-10-05T12:34:56.789Z', dur = 90s, obj = { nested: { list: [1, 'two', NONE] } }, n = NULL, f = 1.5, i = 42, s = 'tekst é';
 CREATE samples:link SET other = samples:typed;
 SQL
-before=$(echo 'SELECT * FROM samples ORDER BY id; SELECT count() FROM schema_version GROUP ALL;' | sql 8002 data core | jq -c '[.[].result]')
-docker run --rm --network container:s2 -v "$work:/out" "$V3" v2 export --v3 \
+before=$(echo 'SELECT * FROM samples ORDER BY id; SELECT count() FROM schema_version GROUP ALL;' | sql 8005 data core none | jq -c '[.[].result]')
+docker run --rm --network container:s2u -v "$work:/out" "$V3" v2 export --v3 \
     --endpoint http://127.0.0.1:8000 --namespace data --database core /out/export.surql >"$work/export.log" 2>&1
 note "- v2 export --v3 (unauthenticated source) exit: $?"
 block 'export log' <"$work/export.log"
 [[ -s $work/export.surql ]] && grep -n 'DEFINE USER\|samples:typed\|FLEXIBLE' "$work/export.surql" | head -20 | block 'export excerpt'
+note "- define data on 3.3: $(define_db 8003 data core)"
 docker cp "$work/export.surql" s3:/tmp/export.surql 2>/dev/null
 docker exec s3 /surreal import --endpoint http://127.0.0.1:8000 --user root --pass root \
     --namespace data --database core /tmp/export.surql >"$work/import.log" 2>&1
