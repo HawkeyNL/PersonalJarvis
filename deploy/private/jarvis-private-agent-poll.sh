@@ -11,6 +11,8 @@ readonly current_link=$agent_root/current
 readonly loaded_marker=$agent_root/core-loaded-bundle
 readonly update_lock=/run/jarvis-private-agent-update.lock
 readonly private_update=/usr/local/sbin/jarvis-private-update
+# OpenSSH allowed_signers file; see "Signed agent updates" in the docs.
+readonly allowed_signers=/etc/jarvis/private-agent-allowed-signers
 
 fail() {
     echo "jarvis private agents: $*" >&2
@@ -33,6 +35,7 @@ esac
 [[ $(stat -c '%U:%G:%a' "$config") == root:root:600 ]] || fail "trusted updater configuration is unsafe"
 source_root=
 repository=
+require_signed=
 while IFS= read -r config_line || [[ -n $config_line ]]; do
     case $config_line in
         JARVIS_PRIVATE_AGENT_SOURCE=*)
@@ -42,6 +45,12 @@ while IFS= read -r config_line || [[ -n $config_line ]]; do
         JARVIS_PRIVATE_AGENT_REPOSITORY=*)
             [[ -z $repository ]] || fail "trusted updater configuration contains duplicate repository"
             repository=${config_line#*=}
+            ;;
+        JARVIS_PRIVATE_AGENT_REQUIRE_SIGNED=*)
+            [[ -z $require_signed ]] || fail "trusted updater configuration contains duplicate signing policy"
+            require_signed=${config_line#*=}
+            [[ $require_signed == true || $require_signed == false ]] || \
+                fail "trusted updater signing policy must be true or false"
             ;;
         '') ;;
         *) fail "trusted updater configuration contains an unsupported entry" ;;
@@ -72,11 +81,29 @@ remote=$(git -C "$source_root" rev-parse FETCH_HEAD)
 current=$(git -C "$source_root" rev-parse HEAD)
 [[ $remote =~ ^[0-9a-f]{40}$ && $current =~ ^[0-9a-f]{40}$ ]] || fail "private agent revision is invalid"
 
+# With signing required, only a main tip signed by an allowlisted SSH key is
+# deployed. The signer vouches for the history it fast-forwards over; an
+# unsigned or foreign tip leaves the current bundle in place.
+signature=not-required
+if [[ $require_signed == true ]]; then
+    [[ -f $allowed_signers && ! -L $allowed_signers && -s $allowed_signers ]] && \
+        [[ $(stat -c '%U:%G:%a' "$allowed_signers") =~ ^root:root:6[04][04]$ ]] || \
+        fail "allowed agent signers file is missing or unsafe"
+    if git -C "$source_root" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$allowed_signers" \
+        verify-commit "$remote" >/dev/null 2>&1; then
+        signature=verified
+    else
+        signature=untrusted
+    fi
+fi
+
 if [[ $mode == check ]]; then
-    printf 'Current: %.12s\nLatest:  %.12s\nUpdate:  %s\n' \
-        "$current" "$remote" "$( [[ $current == "$remote" ]] && printf up-to-date || printf available )"
+    printf 'Current: %.12s\nLatest:  %.12s\nUpdate:  %s\nSigned:  %s\n' \
+        "$current" "$remote" "$( [[ $current == "$remote" ]] && printf up-to-date || printf available )" \
+        "$signature"
     exit 0
 fi
+[[ $signature != untrusted ]] || fail "private agent revision ${remote:0:12} is not signed by an allowed signer"
 
 if [[ $remote != "$current" ]]; then
     git -C "$source_root" merge --ff-only "$remote" || fail "private agent checkout cannot fast-forward"

@@ -349,6 +349,32 @@ agent updater. The Core, agent bundle, Codex and OpenSandbox do not receive it.
 Agent rollback may only select a validated immutable bundle already under
 `/var/lib/jarvis/agents/releases`.
 
+### Signed agent updates
+
+By default the updater deploys the tip of `PersonalJarvisAgents` `main`, so
+anyone who can push to `main` can change the agents on the Home Node. Require
+an SSH signature from an allowlisted key instead:
+
+1. Sign the commits that become the tip of `main` with your SSH key
+   (`git config commit.gpgsign true`, `gpg.format ssh`, `user.signingkey`).
+   Merges made in the GitHub web UI are signed by GitHub, not by you, so merge
+   locally with `git merge -S` (or sign a final commit) and push.
+2. On the Home Node, as root, create the OpenSSH `allowed_signers` file
+   (one line per key: `<email> <key-type> <public-key>`):
+
+   ```bash
+   sudo install -o root -g root -m 0644 allowed_signers /etc/jarvis/private-agent-allowed-signers
+   ```
+
+3. Add `JARVIS_PRIVATE_AGENT_REQUIRE_SIGNED=true` to
+   `/etc/jarvis/private-agent-updater.env`.
+
+`sudo jarvis agents check` then prints `Signed: verified` or
+`Signed: untrusted`. An untrusted tip is never fast-forwarded or bundled, and
+the current bundle stays active. The signature of the tip vouches for the
+history it fast-forwards over. Remove the setting to return to unsigned
+tracking of `main`.
+
 Destructive operations prompt only on a controlling TTY. In automation they
 fail closed unless their explicit `--yes` option is supplied. Credential input
 is never rendered by the TUI or emitted in JSON.

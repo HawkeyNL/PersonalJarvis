@@ -17,7 +17,7 @@ mkdir -p "$fake_bin" "$source_root/.git"
 cleanup() {
     rm -rf -- "$fixture" /var/lib/jarvis/agents /var/lib/jarvis/agents-source
     rm -f -- /etc/jarvis/private-agent-updater.env /usr/local/sbin/jarvis-private-update \
-        /run/jarvis-private-agent-update.lock
+        /run/jarvis-private-agent-update.lock /etc/jarvis/private-agent-allowed-signers
 }
 trap cleanup EXIT
 
@@ -43,6 +43,9 @@ case "$*" in
     'fetch --quiet origin refs/heads/main') printf 'fetch\n' >> "$fixture/git-events" ;;
     'rev-parse FETCH_HEAD') cat "$fixture/remote-revision" ;;
     'rev-parse HEAD') cat "$fixture/current-revision" ;;
+    "-c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/etc/jarvis/private-agent-allowed-signers verify-commit $(cat "$fixture/remote-revision")")
+        [[ -f $fixture/signed ]]
+        ;;
     merge\ --ff-only\ *)
         cp "$fixture/remote-revision" "$fixture/current-revision"
         printf 'merge\n' >> "$fixture/git-events"
@@ -153,5 +156,33 @@ fi
 [[ $(cat /var/lib/jarvis/agents/core-loaded-bundle) == bundle-stable ]]
 [[ $(grep -c '^restart$' "$fixture/core-events") == 2 ]]
 [[ $(grep -c '^ready$' "$fixture/ready-events") == 2 ]]
+
+# Required signing: an unsigned tip is refused before any merge or bundle
+# change, a missing signers file fails closed, and a signed tip deploys.
+cat >> /etc/jarvis/private-agent-updater.env <<'EOF'
+JARVIS_PRIVATE_AGENT_REQUIRE_SIGNED=true
+EOF
+seed_bundle bundle-stable
+printf '%040d\n' 1 > "$fixture/current-revision"
+if run_poll; then
+    echo "update without an allowed signers file unexpectedly succeeded" >&2
+    exit 1
+fi
+printf 'owner@jarvis ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureFixtureFixtureFixtureFixtureFixtureFi\n' \
+    > /etc/jarvis/private-agent-allowed-signers
+chown root:root /etc/jarvis/private-agent-allowed-signers
+chmod 0644 /etc/jarvis/private-agent-allowed-signers
+grep -Fq 'Signed:  untrusted' <<< "$(run_poll --check)"
+if run_poll; then
+    echo "unsigned agent revision unexpectedly deployed" >&2
+    exit 1
+fi
+[[ ! -s $fixture/update-events ]] && ! grep -qx merge "$fixture/git-events"
+[[ $(readlink /var/lib/jarvis/agents/current) == releases/bundle-stable ]]
+: > "$fixture/signed"
+grep -Fq 'Signed:  verified' <<< "$(run_poll --check)"
+JARVIS_PRIVATE_AGENT_NEXT_BUNDLE=bundle-signed run_poll
+grep -qx merge "$fixture/git-events"
+[[ $(cat /var/lib/jarvis/agents/core-loaded-bundle) == bundle-signed ]]
 
 echo "Private agent poll transaction fixture tests passed"
