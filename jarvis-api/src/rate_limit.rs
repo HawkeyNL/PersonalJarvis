@@ -49,16 +49,51 @@ impl Default for AuthLimits {
     }
 }
 
+type Windows = HashMap<String, (Instant, u32)>;
+
 /// Fixed-window request counter keyed by an arbitrary string (e.g. `"path:ip"`).
 #[derive(Default)]
 pub struct RateLimiter {
-    hits: Mutex<HashMap<String, (Instant, u32)>>,
+    hits: Mutex<Windows>,
+    /// Keys anonymous traffic must never evict or crowd out: authenticated
+    /// devices and global budgets. Bounded by the number of such keys.
+    reserved: Mutex<Windows>,
     /// Consecutive *failed* attempts per key, for failure-based lockout — kept
     /// separate from `hits` so a successful call can clear a caller's penalty.
-    failures: Mutex<HashMap<String, (Instant, u32)>>,
+    failures: Mutex<Windows>,
 }
 
 const MAX_TRACKED_KEYS: usize = 4096;
+
+/// Count one event for `key` and return the running count in its window.
+/// A full table first drops expired windows, then the oldest one: refusing
+/// new keys instead would let anyone with enough source addresses lock every
+/// other caller out. Keys are per route class and source, so evicting only
+/// hands an attacker what a fresh source address would already give them.
+fn count(map: &Mutex<Windows>, key: &str, window: Duration) -> u32 {
+    let now = Instant::now();
+    // A poisoned lock is not a security event; recover the guard and carry on.
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= MAX_TRACKED_KEYS && !map.contains_key(key) {
+        map.retain(|_, (start, _)| now.duration_since(*start) < window);
+        // ponytail: O(n) scan only while the table is full; a real LRU if this shows up in profiles.
+        if map.len() >= MAX_TRACKED_KEYS {
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, (start, _))| *start)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+    }
+    let entry = map.entry(key.to_string()).or_insert((now, 0));
+    if now.duration_since(entry.0) >= window {
+        *entry = (now, 0); // window elapsed → start a fresh count
+    }
+    entry.1 = entry.1.saturating_add(1);
+    entry.1
+}
 
 impl RateLimiter {
     pub fn new() -> Self {
@@ -68,44 +103,18 @@ impl RateLimiter {
     /// Record one hit for `key`; return `true` while it stays within `max` hits
     /// per `window`, `false` once the caller has exceeded the limit.
     pub fn check(&self, key: &str, max: u32, window: Duration) -> bool {
-        let now = Instant::now();
-        // A poisoned lock is not a security event; recover the guard and carry on.
-        let mut map = self.hits.lock().unwrap_or_else(|e| e.into_inner());
-        // Opportunistic prune so the map cannot grow without bound over long
-        // uptimes (otherwise bounded only by the number of distinct clients).
-        if map.len() >= MAX_TRACKED_KEYS {
-            map.retain(|_, (start, _)| now.duration_since(*start) < window);
-            if map.len() >= MAX_TRACKED_KEYS && !map.contains_key(key) {
-                // Fail closed instead of allowing an attacker to grow the
-                // in-process limiter without bound via unique source keys.
-                return false;
-            }
-        }
-        let entry = map.entry(key.to_string()).or_insert((now, 0));
-        if now.duration_since(entry.0) >= window {
-            *entry = (now, 0); // window elapsed → start a fresh count
-        }
-        entry.1 += 1;
-        entry.1 <= max
+        count(&self.hits, key, window) <= max
+    }
+
+    /// [`Self::check`] for keys that anonymous floods must not evict.
+    pub fn check_reserved(&self, key: &str, max: u32, window: Duration) -> bool {
+        count(&self.reserved, key, window) <= max
     }
 
     /// Record one failed attempt for `key` within `window`; return the running
     /// failure count. Used for failure-based lockout (e.g. bad login signatures).
     pub fn note_failure(&self, key: &str, window: Duration) -> u32 {
-        let now = Instant::now();
-        let mut map = self.failures.lock().unwrap_or_else(|e| e.into_inner());
-        if map.len() >= MAX_TRACKED_KEYS {
-            map.retain(|_, (start, _)| now.duration_since(*start) < window);
-            if map.len() >= MAX_TRACKED_KEYS && !map.contains_key(key) {
-                return 0;
-            }
-        }
-        let entry = map.entry(key.to_string()).or_insert((now, 0));
-        if now.duration_since(entry.0) >= window {
-            *entry = (now, 0);
-        }
-        entry.1 += 1;
-        entry.1
+        count(&self.failures, key, window)
     }
 
     /// How many failures `key` has accrued in the current `window` (0 if none or
@@ -174,7 +183,28 @@ pub(crate) fn resolved_client_ip(
     peer
 }
 
-pub(crate) fn client_ip(req: &Request, trusted_hops: u32, trusted_peers: &[IpAddr]) -> String {
+/// The throttling key for a client address. One IPv6 subscriber usually
+/// holds at least a /64, so keying single IPv6 addresses would hand an
+/// attacker 2^64 fresh budgets.
+pub(crate) fn limit_key(ip: Option<IpAddr>) -> String {
+    match ip {
+        Some(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!(
+                    "{}/64",
+                    std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)
+                )
+            }
+        },
+        Some(ip) => ip.to_string(),
+        None => "local".to_string(),
+    }
+}
+
+#[cfg(test)]
+fn client_ip(req: &Request, trusted_hops: u32, trusted_peers: &[IpAddr]) -> String {
     resolved_client_ip(req, trusted_hops, trusted_peers)
         .map_or_else(|| "local".to_string(), |ip| ip.to_string())
 }
@@ -201,7 +231,7 @@ pub(crate) fn allow_authenticated_device(
     profile: &str,
     per_min: u32,
 ) -> bool {
-    state.rate_limiter.check(
+    state.rate_limiter.check_reserved(
         &format!("{profile}:device:{device_id}"),
         per_min,
         Duration::from_secs(60),
@@ -221,36 +251,40 @@ pub(crate) async fn rate_limit_mw(
     let window = std::time::Duration::from_secs(60);
     let lock_window = std::time::Duration::from_secs(limits.login_lock_secs);
     let path = req.uri().path().to_string();
-    let ip = client_ip(
+    let ip = limit_key(resolved_client_ip(
         &req,
         state.trusted_proxy_hops,
         state.trusted_proxy_ips.as_slice(),
-    );
+    ));
 
     // Flat per-endpoint rate limit.
+    // Keyed by route class, never by the raw path: prefix routes carry a
+    // caller-chosen tail, and one key per tail would let a single source mint
+    // keys until eviction resets its own counters.
     let flat = match path.as_str() {
-        "/v1/auth/enroll" => Some(limits.enroll_per_min),
-        "/v1/auth/bootstrap" => Some(limits.enroll_per_min.min(3)),
-        "/v1/auth/pairing/requests" => Some(limits.enroll_per_min.min(5)),
-        "/v1/auth/challenge" => Some(limits.challenge_per_min),
-        "/v1/auth/login" => Some(limits.login_per_min),
-        _ if path.starts_with("/v1/auth/account/") => Some(5),
-        _ if path.starts_with("/v1/devices/") && path.ends_with("/revoke-request") => Some(5),
+        "/v1/auth/enroll" => Some(("enroll", limits.enroll_per_min)),
+        "/v1/auth/bootstrap" => Some(("bootstrap", limits.enroll_per_min.min(3))),
+        "/v1/auth/pairing/requests" => Some(("pairing", limits.enroll_per_min.min(5))),
+        "/v1/auth/challenge" => Some(("challenge", limits.challenge_per_min)),
+        "/v1/auth/login" => Some(("login", limits.login_per_min)),
+        _ if path.starts_with("/v1/auth/account/") => Some(("account", 5)),
+        _ if path.starts_with("/v1/devices/") && path.ends_with("/revoke-request") => {
+            Some(("revoke", 5))
+        }
         _ if path.starts_with("/v1/auth/pairing/requests/") && path.ends_with("/status") => {
-            Some(limits.challenge_per_min)
+            Some(("pairing-status", limits.challenge_per_min))
         }
         _ => None,
     };
-    if let Some(max) = flat {
+    if let Some((class, max)) = flat {
         if !state
             .rate_limiter
-            .check(&format!("{path}:{ip}"), max, window)
+            .check(&format!("{class}:{ip}"), max, window)
         {
             tracing::warn!(%ip, %path, "auth rate limit hit");
             return too_many_requests();
         }
     }
-
     // Login-specific failure lockout — repeated bad signatures lock the IP.
     let is_login = path == "/v1/auth/login";
     let fail_key = format!("loginfail:{ip}");
@@ -375,5 +409,32 @@ mod tests {
         assert_eq!(rl.failures_in_window("ip", w), 2);
         rl.clear_failures("ip"); // a success wipes the penalty
         assert_eq!(rl.failures_in_window("ip", w), 0);
+    }
+
+    #[test]
+    fn a_full_table_admits_new_callers_and_never_touches_devices() {
+        let rl = RateLimiter::new();
+        let w = Duration::from_secs(60);
+        assert!(rl.check_reserved("authenticated:device:owner", 1, w));
+        for n in 0..MAX_TRACKED_KEYS {
+            assert!(rl.check(&format!("flood:{n}"), 1, w));
+        }
+        // A fresh caller still gets its own budget, and the table stays bounded.
+        assert!(rl.check("owner-login", 1, w));
+        assert!(!rl.check("owner-login", 1, w));
+        assert!(rl.hits.lock().unwrap().len() <= MAX_TRACKED_KEYS);
+        // Anonymous churn neither evicts nor resets an owner device's window.
+        assert!(!rl.check_reserved("authenticated:device:owner", 1, w));
+    }
+
+    #[test]
+    fn ipv6_callers_share_their_slash_64() {
+        let key = |ip: &str| limit_key(Some(ip.parse().unwrap()));
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::/64");
+        assert_eq!(key("2001:db8:1:2:ffff:1:2:3"), key("2001:db8:1:2::9"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("::ffff:203.0.113.7"), "203.0.113.7");
+        assert_eq!(key("203.0.113.7"), "203.0.113.7");
+        assert_eq!(limit_key(None), "local");
     }
 }

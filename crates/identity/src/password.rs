@@ -140,6 +140,15 @@ impl PasswordService {
         SERVICE.get_or_init(Self::default)
     }
 
+    /// Pairing checks a password before the caller holds any device key. Its
+    /// own single slot keeps a pairing flood from starving owner logins.
+    pub fn pre_auth() -> &'static Self {
+        static SERVICE: std::sync::OnceLock<PasswordService> = std::sync::OnceLock::new();
+        SERVICE.get_or_init(|| Self {
+            slots: Arc::new(Semaphore::new(1)),
+        })
+    }
+
     async fn work<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> Result<T, PasswordError> + Send + 'static,

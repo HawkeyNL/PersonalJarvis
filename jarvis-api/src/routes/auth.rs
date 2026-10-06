@@ -26,6 +26,19 @@ use crate::error::{bad_request, internal, unauthorized};
 use crate::validation;
 use crate::{AppState, Authed};
 
+/// Pre-auth password checks on `/v1/auth/pairing/requests`, for all sources.
+/// A correct guess only yields a pending request that a device or the local
+/// root operator must still approve; the budget bounds guessing and CPU.
+const PAIRING_PASSWORD_CHECKS_PER_MIN: u32 = 60;
+
+/// Retryable: no password-check capacity. Never counted as a failed login.
+fn busy() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({ "error": "busy", "hint": "try again shortly" })),
+    )
+}
+
 /// Dev-only device enrollment: create the single user if needed and register
 /// the calling device with its public key. Off unless `JARVIS_DEV_ENROLLMENT`
 /// is set, and never in production.
@@ -245,14 +258,28 @@ pub(crate) async fn pairing_create(
     // password-authenticated pending request. This grants no device authority:
     // explicit root-peer local approval is still required when no active
     // signing device remains. Legacy/unactivated owners cannot use this path.
+    // Each check is a full Argon2 run before the caller holds any device key:
+    // cap them across all sources right here, so address rotation buys
+    // neither online guesses nor memory pressure. Validation failures above
+    // do not spend this budget.
+    if !state.rate_limiter.check_reserved(
+        "pairing:global",
+        PAIRING_PASSWORD_CHECKS_PER_MIN,
+        std::time::Duration::from_secs(60),
+    ) {
+        return Err(busy());
+    }
     identity::surreal::account::verify_password(
         &state.db,
-        identity::password::PasswordService::shared(),
+        identity::password::PasswordService::pre_auth(),
         user.id,
         password,
     )
     .await
-    .map_err(|_| unauthorized())?;
+    .map_err(|error| match error {
+        identity::IdentityError::Busy => busy(),
+        _ => unauthorized(),
+    })?;
     let platform =
         identity::Platform::parse(&req.platform).map_err(|_| bad_request("unknown platform"))?;
     let key =
@@ -437,6 +464,7 @@ pub(crate) async fn auth_login(
     .await
     {
         Ok(r) => r,
+        Err(identity::IdentityError::Busy) => return Err(busy()),
         Err(_) => {
             record_security_event(&state, Some(req.device_id), "auth.login", "fail", None).await;
             return Err(unauthorized());

@@ -125,7 +125,10 @@ pub async fn verify_password(
     service
         .verify(password.ok_or(IdentityError::AuthFailed)?, stored)
         .await
-        .map_err(|_| IdentityError::AuthFailed)?;
+        .map_err(|error| match error {
+            crate::password::PasswordError::Busy => IdentityError::Busy,
+            _ => IdentityError::AuthFailed,
+        })?;
     Ok(Some(row.revision))
 }
 

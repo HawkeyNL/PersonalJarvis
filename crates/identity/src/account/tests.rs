@@ -59,6 +59,17 @@ async fn first_account_is_atomic_expiring_and_cannot_be_reopened(
     )
     .await
     .is_err());
+    // A failed attempt with a valid signature burns the challenge.
+    assert!(login_with_password(
+        &db,
+        device.id,
+        challenge.id,
+        &key.sign(&challenge.nonce).to_bytes(),
+        Some(AccountPassword::new(PASSWORD.to_owned())?),
+    )
+    .await
+    .is_err());
+    let challenge = create_challenge(&db, device.id).await?;
     login_with_password(
         &db,
         device.id,
@@ -150,6 +161,8 @@ async fn signed_account_changes_enforce_password_and_revoke_sessions(
     let challenge = create_challenge(&db, device.id).await?;
     let signed = key.sign(&challenge.nonce).to_bytes();
     assert!(login(&db, device.id, challenge.id, &signed).await.is_err());
+    let challenge = create_challenge(&db, device.id).await?;
+    let signed = key.sign(&challenge.nonce).to_bytes();
     assert!(login_with_password(
         &db,
         device.id,
@@ -161,6 +174,18 @@ async fn signed_account_changes_enforce_password_and_revoke_sessions(
     )
     .await
     .is_err());
+    // One guess per signed challenge: the right password cannot reuse it.
+    assert!(login_with_password(
+        &db,
+        device.id,
+        challenge.id,
+        &signed,
+        Some(AccountPassword::new(PASSWORD.to_owned())?),
+    )
+    .await
+    .is_err());
+    let challenge = create_challenge(&db, device.id).await?;
+    let signed = key.sign(&challenge.nonce).to_bytes();
     let session = login_with_password(
         &db,
         device.id,
