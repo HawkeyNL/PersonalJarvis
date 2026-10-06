@@ -17,8 +17,10 @@ pub(crate) fn unauthorized() -> (StatusCode, Json<Value>) {
     )
 }
 
-pub(crate) fn internal(_e: identity::IdentityError) -> (StatusCode, Json<Value>) {
-    // Errors are deliberately opaque to clients; details go to logs/traces.
+pub(crate) fn internal(e: identity::IdentityError) -> (StatusCode, Json<Value>) {
+    // Errors are deliberately opaque to clients; the cause goes to the log.
+    // IdentityError carries no secrets or user data (ASVS 16.3.4).
+    tracing::warn!(error = %e, "internal identity error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": "internal error" })),

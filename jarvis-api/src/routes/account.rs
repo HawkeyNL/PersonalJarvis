@@ -2,7 +2,7 @@
 //! authorize management operations on their own.
 use crate::{
     audit::record_security_event,
-    error::{internal, unauthorized},
+    error::{bad_request, internal, unauthorized},
     AppState, Authed,
 };
 use axum::{
@@ -12,7 +12,7 @@ use axum::{
 };
 use jarvis_client_core::account::AccountAction;
 use jarvis_identity::{
-    password::{AccountPassword, PasswordService},
+    password::{AccountPassword, PasswordError, PasswordService},
     surreal::account,
 };
 use serde::Deserialize;
@@ -61,15 +61,17 @@ pub(crate) async fn password_request(
     )
     .await
     .map_err(|_| unauthorized())?;
-    let stored = PasswordService::shared()
-        .hash(req.password)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error":"password service unavailable"})),
-            )
-        })?;
+    let stored =
+        PasswordService::shared()
+            .hash(req.password)
+            .await
+            .map_err(|error| match error {
+                PasswordError::Common => bad_request("password is too common; choose another"),
+                _ => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error":"password service unavailable"})),
+                ),
+            })?;
     let request = account::request_action(
         &state.db,
         auth.user.id,
@@ -111,9 +113,19 @@ pub(crate) async fn approve(
         return Err(unauthorized());
     }
     let signature = hex::decode(req.signature).map_err(|_| unauthorized())?;
-    let approved = account::approve_action(&state.db, id, auth.user.id, auth.device.id, &signature)
-        .await
-        .map_err(|_| unauthorized())?;
+    let Ok(approved) =
+        account::approve_action(&state.db, id, auth.user.id, auth.device.id, &signature).await
+    else {
+        record_security_event(
+            &state,
+            Some(auth.device.id),
+            "account.approve",
+            "fail",
+            None,
+        )
+        .await;
+        return Err(unauthorized());
+    };
     state.realtime.disconnect_owner(
         auth.user.id,
         match approved.action {

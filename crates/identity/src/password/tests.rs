@@ -110,3 +110,21 @@ async fn cancelled_waiter_does_not_release_running_work_slot() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn common_passwords_cannot_be_set() {
+    let service = PasswordService::default();
+    for common in [
+        "1q2w3e4r5t6y7u8i9o0p",
+        "123456789987654321",
+        "1Q2W3E4R5T6Y7U8I9O0P",
+    ] {
+        assert_eq!(
+            service.hash(password(common)).await.unwrap_err(),
+            PasswordError::Common,
+            "{common}"
+        );
+    }
+    let stored = service.hash(password(FIXTURE)).await.unwrap();
+    service.verify(password(FIXTURE), stored).await.unwrap();
+}

@@ -51,6 +51,13 @@ impl AccountPassword {
         }
         Ok(Self(value))
     }
+
+    fn is_common(&self) -> bool {
+        include_str!("common-passwords.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .any(|common| common.eq_ignore_ascii_case(&self.0))
+    }
 }
 
 /// PHC verifier, private to backend storage. Not serializable to client DTOs.
@@ -108,6 +115,8 @@ pub enum PasswordError {
     InvalidVerifier,
     #[error("authentication failed")]
     AuthenticationFailed,
+    #[error("password is too common; choose another")]
+    Common,
     #[error("password service busy; retry later")]
     Busy,
     #[error("password service unavailable")]
@@ -169,7 +178,13 @@ impl PasswordService {
         .map_err(|_| PasswordError::Unavailable)?
     }
 
+    /// Hashes a *new* password, so this is where common ones are refused
+    /// (ASVS 6.2.4). Verification never applies the list: an existing
+    /// password must keep working until the owner changes it.
     pub async fn hash(&self, password: AccountPassword) -> Result<StoredPassword, PasswordError> {
+        if password.is_common() {
+            return Err(PasswordError::Common);
+        }
         self.work(move || {
             let mut salt_bytes = [0_u8; SALT_BYTES];
             rand::RngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut salt_bytes)
