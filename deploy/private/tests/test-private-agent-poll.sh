@@ -38,6 +38,9 @@ set -euo pipefail
 fixture=$JARVIS_PRIVATE_AGENT_TEST_FIXTURE
 [[ ${1:-} == -C && ${2:-} == /var/lib/jarvis/agents-source ]] || exit 1
 shift 2
+# Every call must neutralise repository-controlled programs.
+[[ "$*" == "-c core.hooksPath=/dev/null -c core.fsmonitor=false -c gpg.ssh.program=/usr/bin/ssh-keygen "* ]] || exit 1
+shift 6
 case "$*" in
     'remote get-url origin') printf '%s\n' 'https://github.com/HawkeyNL/PersonalJarvisAgents.git' ;;
     'fetch --quiet origin refs/heads/main') printf 'fetch\n' >> "$fixture/git-events" ;;
@@ -46,6 +49,7 @@ case "$*" in
     "-c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/etc/jarvis/private-agent-allowed-signers verify-commit $(cat "$fixture/remote-revision")")
         [[ -f $fixture/signed ]]
         ;;
+    'status --porcelain --untracked-files=all') [[ ! -f $fixture/dirty ]] || printf '?? stray.md\n' ;;
     merge\ --ff-only\ *)
         cp "$fixture/remote-revision" "$fixture/current-revision"
         printf 'merge\n' >> "$fixture/git-events"
@@ -181,6 +185,15 @@ fi
 [[ $(readlink /var/lib/jarvis/agents/current) == releases/bundle-stable ]]
 : > "$fixture/signed"
 grep -Fq 'Signed:  verified' <<< "$(run_poll --check)"
+# A modified or untracked file in the checkout is never bundled.
+: > "$fixture/dirty"
+if run_poll; then
+    echo "dirty agent checkout unexpectedly deployed" >&2
+    exit 1
+fi
+rm -f -- "$fixture/dirty"
+seed_bundle bundle-stable
+printf '%040d\n' 1 > "$fixture/current-revision"
 JARVIS_PRIVATE_AGENT_NEXT_BUNDLE=bundle-signed run_poll
 grep -qx merge "$fixture/git-events"
 [[ $(cat /var/lib/jarvis/agents/core-loaded-bundle) == bundle-signed ]]

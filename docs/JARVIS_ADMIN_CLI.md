@@ -366,14 +366,19 @@ an SSH signature from an allowlisted key instead:
    sudo install -o root -g root -m 0644 allowed_signers /etc/jarvis/private-agent-allowed-signers
    ```
 
-3. Add `JARVIS_PRIVATE_AGENT_REQUIRE_SIGNED=true` to
+3. Keep the checkout in a root-owned path that no other user can write,
+   for example `/var/lib/jarvis-agents-source` (root, 0700). With signing
+   required the updater refuses a checkout below a directory such as
+   `/var/lib/jarvis`, which Core owns.
+4. Add `JARVIS_PRIVATE_AGENT_REQUIRE_SIGNED=true` to
    `/etc/jarvis/private-agent-updater.env`.
 
 `sudo jarvis agents check` then prints `Signed: verified` or
 `Signed: untrusted`. An untrusted tip is never fast-forwarded or bundled, and
 the current bundle stays active. The signature of the tip vouches for the
 history it fast-forwards over. Remove the setting to return to unsigned
-tracking of `main`.
+tracking of `main`. To retire a key, delete its line: a `valid-before`
+option is checked against the commit date, which the committer chooses.
 
 Destructive operations prompt only on a controlling TTY. In automation they
 fail closed unless their explicit `--yes` option is supplied. Credential input
