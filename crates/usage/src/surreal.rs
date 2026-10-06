@@ -112,10 +112,26 @@ struct AggregateRow {
     failures: Option<i64>,
     #[serde(default)]
     fallbacks: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "percentile")]
     latency_p50_ms: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "percentile")]
     latency_p95_ms: Option<f64>,
+}
+
+/// A percentile over no rows: SurrealDB 2 returns no row, SurrealDB 3 returns
+/// a row whose percentile is `[]`. Both mean "not measured".
+fn percentile<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Number(Option<f64>),
+        Empty(Vec<serde::de::IgnoredAny>),
+    }
+    match <Raw as serde::Deserialize>::deserialize(deserializer)? {
+        Raw::Number(value) => Ok(value),
+        Raw::Empty(values) if values.is_empty() => Ok(None),
+        Raw::Empty(_) => Err(serde::de::Error::custom("percentile is a non-empty array")),
+    }
 }
 
 fn totals(row: &AggregateRow) -> UsageTotals {
@@ -329,6 +345,21 @@ pub async fn release_task(db: &Database, task_id: &str) -> Result<(), jarvis_sto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percentile_over_no_rows_is_not_measured_on_both_engines() {
+        let row = |json: &str| serde_json::from_str::<AggregateRow>(json).unwrap();
+        assert_eq!(
+            row(r#"{"latency_p50_ms": 12.5}"#).latency_p50_ms,
+            Some(12.5)
+        );
+        assert_eq!(row(r#"{"latency_p50_ms": null}"#).latency_p50_ms, None);
+        assert_eq!(row("{}").latency_p95_ms, None);
+        // SurrealDB 3 shape for an empty GROUP ALL.
+        let empty = row(r#"{"latency_p50_ms": [], "latency_p95_ms": []}"#);
+        assert_eq!((empty.latency_p50_ms, empty.latency_p95_ms), (None, None));
+        assert!(serde_json::from_str::<AggregateRow>(r#"{"latency_p50_ms": [1.0]}"#).is_err());
+    }
 
     #[test]
     fn aggregate_query_selects_only_bounded_non_secret_dimensions() {

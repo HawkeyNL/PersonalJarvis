@@ -65,11 +65,13 @@ compose_file=${JARVIS_SURREALDB_COMPOSE_FILE:-/opt/jarvis/surrealdb/docker-compo
 # generated base64 password contains no quote characters, so it is safe in this
 # fixed SQL literal. Feed the statement through stdin directly to the official,
 # shell-less image's `/surreal sql` binary. This creates exactly the
-# database-scoped EDITOR account required by current Core.
-printf "DEFINE USER %s ON DATABASE PASSWORD '%s' ROLES EDITOR;\\n" "$username" "$core_password" \
+# database-scoped EDITOR account required by current Core. The namespace and
+# database are defined explicitly: SurrealDB 3 no longer creates them on first
+# use, and the validated names are safe in these fixed SQL literals.
+printf "DEFINE NAMESPACE IF NOT EXISTS %s; USE NS %s; DEFINE DATABASE IF NOT EXISTS %s; USE DB %s; DEFINE USER %s ON DATABASE PASSWORD '%s' ROLES EDITOR;\\n" \
+        "$namespace" "$namespace" "$database" "$database" "$username" "$core_password" \
     | docker compose --env-file "$env_file" -f "$compose_file" exec -T surrealdb \
-        /surreal sql --hide-welcome --endpoint ws://127.0.0.1:8000 \
-            --auth-level root --namespace "$namespace" --database "$database" >/dev/null
+        /surreal sql --hide-welcome --endpoint ws://127.0.0.1:8000 --auth-level root >/dev/null
 
 umask 077
 printf '%s' "$core_password" > "$password_file"

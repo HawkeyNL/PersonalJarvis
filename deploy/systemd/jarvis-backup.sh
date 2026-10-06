@@ -248,6 +248,10 @@ restore_test() {
         (( attempt < 30 )) || fail 'disposable restore container did not become ready'
         sleep 1
     done
+    # SurrealDB 3 no longer creates the target on first use.
+    printf 'DEFINE NAMESPACE IF NOT EXISTS restoretest; USE NS restoretest; DEFINE DATABASE IF NOT EXISTS restoretest;\n' \
+        | docker exec -i "$verify_container" /surreal sql --hide-welcome --endpoint ws://127.0.0.1:8000 >/dev/null \
+        || fail 'cannot define the disposable restore database'
     # Import errors quote exported statements (password hashes, user data).
     # Report only the error class and position, never the quoted text.
     if ! docker exec "$verify_container" /surreal import --log error --endpoint http://127.0.0.1:8000 \
