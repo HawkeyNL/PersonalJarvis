@@ -11,10 +11,19 @@ readonly current_link=$agent_root/current
 readonly loaded_marker=$agent_root/core-loaded-bundle
 readonly update_lock=/run/jarvis-private-agent-update.lock
 readonly private_update=/usr/local/sbin/jarvis-private-update
+# OpenSSH allowed_signers file; see "Signed agent updates" in the docs.
+readonly allowed_signers=/etc/jarvis/private-agent-allowed-signers
 
 fail() {
     echo "jarvis private agents: $*" >&2
     exit 1
+}
+
+# Root runs git in a checkout it does not fully control: never let the
+# repository's own config pick hooks, fsmonitor or the signature program.
+source_git() {
+    git -C "$source_root" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+        -c gpg.ssh.program=/usr/bin/ssh-keygen "$@"
 }
 
 usage() {
@@ -33,6 +42,7 @@ esac
 [[ $(stat -c '%U:%G:%a' "$config") == root:root:600 ]] || fail "trusted updater configuration is unsafe"
 source_root=
 repository=
+require_signed=
 while IFS= read -r config_line || [[ -n $config_line ]]; do
     case $config_line in
         JARVIS_PRIVATE_AGENT_SOURCE=*)
@@ -43,6 +53,12 @@ while IFS= read -r config_line || [[ -n $config_line ]]; do
             [[ -z $repository ]] || fail "trusted updater configuration contains duplicate repository"
             repository=${config_line#*=}
             ;;
+        JARVIS_PRIVATE_AGENT_REQUIRE_SIGNED=*)
+            [[ -z $require_signed ]] || fail "trusted updater configuration contains duplicate signing policy"
+            require_signed=${config_line#*=}
+            [[ $require_signed == true || $require_signed == false ]] || \
+                fail "trusted updater signing policy must be true or false"
+            ;;
         '') ;;
         *) fail "trusted updater configuration contains an unsupported entry" ;;
     esac
@@ -51,7 +67,7 @@ done < "$config"
     $repository == HawkeyNL/PersonalJarvisAgents ]] || fail "trusted updater configuration is invalid"
 source_root=$(realpath -e -- "$source_root") || fail "private agent checkout is unavailable"
 [[ -d $source_root/.git && ! -L $source_root/.git ]] || fail "private agent checkout is unavailable"
-origin=$(git -C "$source_root" remote get-url origin)
+origin=$(source_git remote get-url origin)
 case $origin in
     https://github.com/HawkeyNL/PersonalJarvisAgents|\
     https://github.com/HawkeyNL/PersonalJarvisAgents.git|\
@@ -67,19 +83,53 @@ fi
 
 exec 9>"$update_lock"
 flock -n 9 || fail "another private agent operation is running"
-git -C "$source_root" fetch --quiet origin refs/heads/main || fail "could not fetch private agent origin/main"
-remote=$(git -C "$source_root" rev-parse FETCH_HEAD)
-current=$(git -C "$source_root" rev-parse HEAD)
+source_git fetch --quiet origin refs/heads/main || fail "could not fetch private agent origin/main"
+remote=$(source_git rev-parse FETCH_HEAD)
+current=$(source_git rev-parse HEAD)
 [[ $remote =~ ^[0-9a-f]{40}$ && $current =~ ^[0-9a-f]{40}$ ]] || fail "private agent revision is invalid"
 
-if [[ $mode == check ]]; then
-    printf 'Current: %.12s\nLatest:  %.12s\nUpdate:  %s\n' \
-        "$current" "$remote" "$( [[ $current == "$remote" ]] && printf up-to-date || printf available )"
-    exit 0
+# With signing required, only a main tip signed by an allowlisted SSH key is
+# deployed. The signer vouches for the history it fast-forwards over; an
+# unsigned or foreign tip leaves the current bundle in place.
+signature=not-required
+if [[ $require_signed == true ]]; then
+    # A checkout below a directory another user can write could be swapped
+    # after verification, so every path component must be root-controlled.
+    path=$source_root
+    while :; do
+        [[ -n $(find "$path" -maxdepth 0 -user root ! -perm /022 2>/dev/null) ]] || \
+            fail "private agent checkout path is not root-controlled: $path"
+        [[ $path == / ]] && break
+        path=$(dirname -- "$path")
+    done
+    [[ -f $allowed_signers && ! -L $allowed_signers && -s $allowed_signers ]] && \
+        [[ $(stat -c '%U:%G:%a' "$allowed_signers") =~ ^root:root:6[04][04]$ ]] || \
+        fail "allowed agent signers file is missing or unsafe"
+    if source_git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$allowed_signers" \
+        verify-commit "$remote" >/dev/null 2>&1; then
+        signature=verified
+    else
+        signature=untrusted
+    fi
 fi
 
+if [[ $mode == check ]]; then
+    printf 'Current: %.12s\nLatest:  %.12s\nUpdate:  %s\nSigned:  %s\n' \
+        "$current" "$remote" "$( [[ $current == "$remote" ]] && printf up-to-date || printf available )" \
+        "$signature"
+    exit 0
+fi
+[[ $signature != untrusted ]] || fail "private agent revision ${remote:0:12} is not signed by an allowed signer"
+
 if [[ $remote != "$current" ]]; then
-    git -C "$source_root" merge --ff-only "$remote" || fail "private agent checkout cannot fast-forward"
+    source_git merge --ff-only "$remote" || fail "private agent checkout cannot fast-forward"
+fi
+# The bundler reads the working tree: with signing required it must be the
+# verified commit exactly, with no modified or untracked files.
+if [[ $require_signed == true ]]; then
+    [[ $(source_git rev-parse HEAD) == "$remote" && \
+        -z $(source_git status --porcelain --untracked-files=all) ]] || \
+        fail "private agent checkout does not match the verified revision"
 fi
 
 active_bundle() {
