@@ -714,7 +714,7 @@ pub async fn login_with_password(
 /// A session also ends after this long without use (ASVS 7.3.1). Every
 /// authenticated request updates `last_used_at`; an open realtime connection
 /// stays bounded by the absolute expiry and revocation.
-const SESSION_IDLE: time::Duration = time::Duration::hours(72);
+const SESSION_IDLE: time::Duration = time::Duration::hours(24);
 
 fn session_is_live(session: &Session, now: OffsetDateTime) -> bool {
     let last_activity = session.last_used_at.unwrap_or(session.created_at);
