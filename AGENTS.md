@@ -20,6 +20,16 @@ configuration. Keep changes narrow and avoid speculative infrastructure.
   does not authorize agents, and does not relax signed approval for remote
   clients or other privileged actions. Core Admin remains unprivileged and
   must never receive the OS password; its five-minute inactivity lock remains.
+- Owner-approved exception: autonomous on-chain trading defined in a private
+  ADR may execute financial mutations without per-action approval, but only
+  inside an unexpired trading mandate signed on a pinned owner device. The
+  mandate is the only source of limits; no code, config, database write,
+  learning step or agent may raise them. A dedicated signer holds the keys
+  outside Core, agents and sandboxes, verifies the mandate and every
+  transaction itself, and moves funds only through verified swaps or to the
+  mandate's fixed sweep address. Execution stays disabled by default. LLM
+  output never builds, approves or encourages a transaction. This exception
+  covers no other agent, venue, asset or action.
 - Normal source-control and release-engineering operations in this repository
   (including editing, committing, pushing, tagging and dispatching CI/release
   workflows) are outside the Jarvis device-signing protocol. They still require
