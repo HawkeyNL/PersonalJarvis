@@ -25,41 +25,34 @@ fn kept(entries: Vec<Entry>) -> Vec<String> {
 
 #[test]
 fn owner_examples_follow_the_evolving_catalog() {
-    let mut inventory = line(1, 0, 8);
+    let mut inventory: Vec<Entry> = (1..=4).flat_map(|major| line(major, 0, 2)).collect();
+    inventory.extend(line(5, 0, 0));
+    assert_eq!(kept(inventory.clone()), ["3.0.2", "4.0.2", "5.0.0"]);
+    inventory.extend((1..=4).map(|p| entry(Target::LinuxX86_64, format!("5.0.{p}"))));
+    inventory.extend(line(5, 1, 5));
     assert_eq!(
         kept(inventory.clone()),
-        ["1.0.0", "1.0.6", "1.0.7", "1.0.8"]
+        ["3.0.2", "4.0.2", "5.0.4", "5.1.3", "5.1.4", "5.1.5"]
     );
-    inventory.extend(line(2, 0, 0));
-    assert_eq!(
-        kept(inventory.clone()),
-        ["1.0.0", "1.0.7", "1.0.8", "2.0.0"]
-    );
-    inventory.extend((1..=5).map(|p| entry(Target::LinuxX86_64, format!("2.0.{p}"))));
-    assert_eq!(
-        kept(inventory.clone()),
-        ["1.0.0", "2.0.0", "2.0.3", "2.0.4", "2.0.5"]
-    );
-    inventory.extend(line(2, 1, 5));
-    assert_eq!(
-        kept(inventory.clone()),
-        ["1.0.0", "2.0.0", "2.0.5", "2.1.3", "2.1.4", "2.1.5"]
-    );
-    inventory.extend(line(3, 0, 5));
-    inventory.extend(line(4, 0, 0));
+    inventory.extend((2..=6).flat_map(|minor| line(5, minor, 6)));
     assert_eq!(
         kept(inventory),
-        ["2.0.0", "3.0.0", "3.0.4", "3.0.5", "4.0.0"]
+        ["3.0.2", "4.0.2", "5.4.6", "5.5.6", "5.6.4", "5.6.5", "5.6.6"]
     );
+}
+
+#[test]
+fn current_client_line_keeps_its_latest_three_patches() {
+    assert_eq!(kept(line(0, 1, 20)), ["0.1.18", "0.1.19", "0.1.20"]);
+    let mut entries = line(0, 0, 53);
+    entries.extend(line(0, 1, 0));
+    assert_eq!(kept(entries), ["0.0.53", "0.1.0"]);
 }
 
 #[test]
 fn only_latest_three_minor_lines_in_current_major_survive() {
     let entries = (0..=4).flat_map(|minor| line(2, minor, 5)).collect();
-    assert_eq!(
-        kept(entries),
-        ["2.0.0", "2.2.5", "2.3.5", "2.4.3", "2.4.4", "2.4.5"]
-    );
+    assert_eq!(kept(entries), ["2.2.5", "2.3.5", "2.4.3", "2.4.4", "2.4.5"]);
 }
 
 #[test]

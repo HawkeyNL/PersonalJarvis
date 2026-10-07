@@ -7,28 +7,19 @@ See [private importer setup](../../deploy/app-updates/PRIVATE_DOWNLOADS.md).
 
 ## Exact policy, independently for every downloadable target
 
-1. Keep the latest three stable releases in semantic version order.
-2. Additionally keep the actual `MAJOR.0.0` baselines of the latest three distinct
-   major lines present for that target. Do not fabricate a missing baseline.
-3. Within the newest major only, keep the latest patch of each of its newest
-   three distinct minor lines, including the current minor.
-4. Remove remaining versions from the public archive's retention set. Once
-   major 4 exists after majors 1, 2 and 3, no major-1 version is retained.
+1. Keep the latest three patches of the current minor line.
+2. Keep the latest patch of the two previous minor lines in the current major.
+3. Keep the latest release of the two previous major lines.
+4. Remove every other version from the public archive.
 
-All rules form one union, not three independent duplicate copies. Thus there
-can be more than three retained versions per target. A minor baseline such as
-`2.1.0` has no special lifetime; it is not retained merely for ending in `.0`.
-An old major retains its `X.0.0`, not its final patch indefinitely. At a major
-transition the previous major's final patches naturally age out of the rolling
-latest-three window.
+Missing lines are not invented: with only one major, only rules 1 and 2 apply.
 
 | Newest release | Retained versions in the example sequence |
 | --- | --- |
-| 1.0.8 | 1.0.0, 1.0.6, 1.0.7, 1.0.8 |
-| 2.0.0 | 1.0.0, 1.0.7, 1.0.8, 2.0.0 |
-| 2.0.5 | 1.0.0, 2.0.0, 2.0.3, 2.0.4, 2.0.5 |
-| 2.1.5 | 1.0.0, 2.0.0, 2.0.5, 2.1.3, 2.1.4, 2.1.5 |
-| 4.0.0 after 3.0.5 | 2.0.0, 3.0.0, 3.0.4, 3.0.5, 4.0.0 |
+| 5.0.0 after 1.0.2 … 4.0.2 | 3.0.2, 4.0.2, 5.0.0 |
+| 5.1.5 after 5.0.4 | 3.0.2, 4.0.2, 5.0.4, 5.1.3, 5.1.4, 5.1.5 |
+| 5.6.6 after 5.2 … 5.5 | 3.0.2, 4.0.2, 5.4.6, 5.5.6, 5.6.4, 5.6.5, 5.6.6 |
+| 0.1.20 | 0.1.18, 0.1.19, 0.1.20 |
 
 ## Read-only planner
 
@@ -55,21 +46,18 @@ prerelease versions fail closed. Input strings are not echoed into errors.
 The `plan` command performs no network/file mutations. The separate `sync-ios`
 command requires trusted root-controlled configuration at fixed paths. It streams
 GHCR files to disk, verifies the pinned digest and exact layer checksums and
-updates a public index atomically. No subprocess execution or deletion of
-historical versions is exposed by either command.
+updates a public index atomically. Neither command executes a subprocess or
+deletes historical versions.
 
-## Integration status and requirements
+## Automatic retirement
 
-**Automatic cleanup is not connected yet.** The initial IPA importer preserves
-all previously approved versions. Its index and Caddy route serve only the
-separate root-controlled public archive. A later retention integration must
-atomically activate an index before retiring obsolete public files. Never delete
-from the authenticated mirror or expose its filesystem as a public Caddy root.
-Never apply a client-supplied inventory as filesystem authority. Group all
-installer/signature files for a target/version under the same retention decision.
-
-Tests cover the owner's sequence, per-target independence, numeric sorting,
-missing baselines, minor expiry, bounded invalid input and incremental cleanup
-equivalence over 180 releases. Full integration still needs transactional
-publication, verified-import and symlink/path-safety tests before automatic
-deletion can be enabled.
+`sync-release` applies the policy to the public `releases/` directory after it
+activates the authenticated update. Every entry must be a canonical `vX.Y.Z`
+directory owned by the expected user, or nothing is retired. Retired releases
+are first renamed out of `releases/`, then the index is rebuilt, and only then
+are their files deleted, so the fresh index never links a removed installer.
+If a step fails, the moved releases are put back. A browser may still show a
+cached page for up to five minutes. A release
+directory holds every target of a version and is retired as one unit. The
+authenticated update mirror and the separate `ios/` candidates are never
+pruned by this step.

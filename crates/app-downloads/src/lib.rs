@@ -12,7 +12,7 @@ pub mod mirror;
 
 pub const MAX_CATALOG_ENTRIES: usize = 10_000;
 pub const MAX_VERSION_BYTES: usize = 64;
-const RECENT_RELEASES: usize = 3;
+const RECENT_PATCHES: usize = 3;
 const RECENT_MAJORS: usize = 3;
 const RECENT_MINORS: usize = 3;
 
@@ -40,9 +40,9 @@ pub struct Entry {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KeepReason {
-    RecentRelease,
-    MajorBaseline,
+    RecentPatch,
     MinorLatest,
+    MajorLatest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -99,54 +99,45 @@ pub fn plan(entries: impl IntoIterator<Item = Entry>) -> Result<Vec<TargetPlan>,
         .collect())
 }
 
-fn target_plan(target: Target, versions: &BTreeSet<Version>) -> TargetPlan {
-    let majors: BTreeSet<u64> = versions.iter().map(|v| v.major).collect();
-    let recent_majors: BTreeSet<u64> = majors.iter().rev().take(RECENT_MAJORS).copied().collect();
-    let newest_major = majors.last().copied();
-    let mut retained: BTreeMap<Version, BTreeSet<KeepReason>> = BTreeMap::new();
+/// The owner's rule: the latest three patches of the current minor, the latest
+/// patch of the two previous minors in the current major and the latest
+/// release of the two previous majors. Older versions are not retained.
+pub fn retain(versions: &BTreeSet<Version>) -> BTreeMap<Version, KeepReason> {
+    let mut retained = BTreeMap::new();
+    let Some(newest) = versions.last() else {
+        return retained;
+    };
+    let mut majors = vec![newest.major];
+    let mut minors = vec![newest.minor];
+    let mut patches = 0;
+    // Newest first, so the first version seen of an older line is its latest.
+    for version in versions.iter().rev() {
+        let reason = if version.major != newest.major {
+            if majors.len() == RECENT_MAJORS || majors.contains(&version.major) {
+                continue;
+            }
+            majors.push(version.major);
+            KeepReason::MajorLatest
+        } else if version.minor != newest.minor {
+            if minors.len() == RECENT_MINORS || minors.contains(&version.minor) {
+                continue;
+            }
+            minors.push(version.minor);
+            KeepReason::MinorLatest
+        } else {
+            if patches == RECENT_PATCHES {
+                continue;
+            }
+            patches += 1;
+            KeepReason::RecentPatch
+        };
+        retained.insert(version.clone(), reason);
+    }
+    retained
+}
 
-    for version in versions
-        .iter()
-        .rev()
-        .filter(|v| recent_majors.contains(&v.major))
-        .take(RECENT_RELEASES)
-    {
-        retained
-            .entry(version.clone())
-            .or_default()
-            .insert(KeepReason::RecentRelease);
-    }
-    // Retain the actual X.0.0 artifact, never invent an absent baseline or
-    // substitute a different patch. Drop an entire major after three newer
-    // distinct major lines have appeared for this target.
-    for major in recent_majors {
-        let baseline = Version::new(major, 0, 0);
-        if versions.contains(&baseline) {
-            retained
-                .entry(baseline)
-                .or_default()
-                .insert(KeepReason::MajorBaseline);
-        }
-    }
-    // Preserve the latest patch of the newest three minor lines in the CURRENT
-    // major. Older majors keep their baseline, not every old minor endpoint.
-    // Otherwise 1.0.8 would remain at 2.0.5, contrary to the owner's examples.
-    let mut minors = BTreeSet::new();
-    for version in versions
-        .iter()
-        .rev()
-        .filter(|v| Some(v.major) == newest_major)
-    {
-        if minors.len() == RECENT_MINORS && !minors.contains(&version.minor) {
-            break;
-        }
-        if minors.insert(version.minor) {
-            retained
-                .entry(version.clone())
-                .or_default()
-                .insert(KeepReason::MinorLatest);
-        }
-    }
+fn target_plan(target: Target, versions: &BTreeSet<Version>) -> TargetPlan {
+    let retained = retain(versions);
     TargetPlan {
         target,
         remove: versions
@@ -156,9 +147,9 @@ fn target_plan(target: Target, versions: &BTreeSet<Version>) -> TargetPlan {
             .collect(),
         keep: retained
             .into_iter()
-            .map(|(version, reasons)| Retained {
+            .map(|(version, reason)| Retained {
                 version: version.to_string(),
-                reasons: reasons.into_iter().collect(),
+                reasons: vec![reason],
             })
             .collect(),
     }

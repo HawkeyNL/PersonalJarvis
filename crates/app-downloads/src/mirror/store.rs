@@ -156,6 +156,68 @@ impl Store {
         self.render_index()
     }
 
+    /// Retire public releases outside the retention rule. They leave
+    /// `releases/` and the index is rebuilt before any file is deleted, so the
+    /// fresh index never links a removed installer. On failure every moved
+    /// release is put back. Returns the number retired.
+    pub fn retire_releases(&self) -> Result<usize> {
+        self.sweep_retired()?;
+        let versions = super::release_store::public_versions(&self.root, self.owner)?;
+        let keep = crate::retain(&versions.iter().cloned().collect());
+        let retired: Vec<_> = versions.iter().filter(|v| !keep.contains_key(v)).collect();
+        if retired.is_empty() {
+            return Ok(0);
+        }
+        // Same filesystem as releases/, so each move is an atomic rename.
+        let trash = tempfile::Builder::new()
+            .prefix(".retired-")
+            .tempdir_in(&self.root)
+            .map_err(|_| "cannot stage retired releases")?;
+        let releases = self.root.join("releases");
+        let mut moved = Vec::new();
+        let result = retired
+            .iter()
+            .try_for_each(|version| {
+                let name = format!("v{version}");
+                fs::rename(releases.join(&name), trash.path().join(&name))
+                    .map_err(|_| "cannot retire public release")?;
+                moved.push(name);
+                Ok(())
+            })
+            .and_then(|()| sync_directory(&releases))
+            .and_then(|()| self.render_index());
+        if let Err(error) = result {
+            // Best effort: the index rendered before this call still links them.
+            for name in &moved {
+                let _ = fs::rename(trash.path().join(name), releases.join(name));
+            }
+            let _ = sync_directory(&releases);
+            return Err(error);
+        }
+        trash
+            .close()
+            .map_err(|_| "cannot delete retired public releases")?;
+        Ok(retired.len())
+    }
+
+    /// Delete `.retired-*` directories a crash left behind. Caddy never serves
+    /// them, but they hold whole installer sets.
+    fn sweep_retired(&self) -> Result<()> {
+        for item in fs::read_dir(&self.root).map_err(|_| "cannot inspect public root")? {
+            let item = item.map_err(|_| "cannot inspect public root")?;
+            if item.file_name().to_string_lossy().starts_with(".retired-") {
+                let meta = fs::symlink_metadata(item.path())
+                    .map_err(|_| "cannot inspect retired releases")?;
+                if !meta.is_dir() || meta.uid() != self.owner {
+                    return Err("unsafe retired release directory");
+                }
+                fs::remove_dir_all(item.path())
+                    .map_err(|_| "cannot delete retired public releases")?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn render_index(&self) -> Result<()> {
         let mut versions = Vec::new();
         for item in

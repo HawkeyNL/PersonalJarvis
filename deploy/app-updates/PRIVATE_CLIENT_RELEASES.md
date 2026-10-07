@@ -146,7 +146,8 @@ protected mirror, metadata, token, or arbitrary directory listings.
 8. Bad signature/hash, interrupted transfer and unavailable GHCR leave the prior
    active generation intact. Same-version substitution is refused.
 
-The version-retention planner remains separate from destructive cleanup in this
-initial full-release importer; no existing history is deleted automatically.
+After activation, `sync-release` retires public releases outside the
+retention policy in `crates/app-downloads/README.md`. The authenticated update
+mirror keeps its own history and is not pruned by that step.
 Real platform signing, device installation and production Caddy tests must be
 reported separately from rootless cryptographic/OCI fixture tests.
