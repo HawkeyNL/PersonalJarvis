@@ -315,10 +315,12 @@ fn publish_public(
     sync_directory(&releases)
 }
 
-pub(super) fn public_links(root: &Path, owner: u32) -> Result<String> {
+/// Every public release directory, validated; any unexpected entry fails the
+/// whole inventory so neither the index nor retention acts on a partial view.
+pub(super) fn public_versions(root: &Path, owner: u32) -> Result<Vec<semver::Version>> {
     let releases = root.join("releases");
     if fs::symlink_metadata(&releases).is_err() {
-        return Ok(String::new());
+        return Ok(Vec::new());
     }
     validate_directory(&releases, owner)?;
     let mut versions = Vec::new();
@@ -338,9 +340,15 @@ pub(super) fn public_links(root: &Path, owner: u32) -> Result<String> {
         }
     }
     versions.sort();
+    Ok(versions)
+}
+
+pub(super) fn public_links(root: &Path, owner: u32) -> Result<String> {
+    let versions = public_versions(root, owner)?;
     if versions.is_empty() {
         return Ok(String::new());
     }
+    let releases = root.join("releases");
     let latest = versions.last().expect("nonempty versions");
     let mut html = String::from("<div class=\"release-browser\"><h2>Jarvis clients</h2><label class=\"version-picker\" for=\"release-version\">Versie</label><select id=\"release-version\" class=\"version-picker\">");
     for version in versions.iter().rev() {
