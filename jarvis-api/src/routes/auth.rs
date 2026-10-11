@@ -24,8 +24,8 @@ use jarvis_identity as identity;
 use crate::audit::{record_security_event, record_unauthenticated_event};
 use crate::error::{bad_request, internal, unauthorized};
 use crate::rate_limit::{
-    device_password_key, note_password_failure, password_backoff, ACCOUNT_FREE_PASSWORD_FAILURES,
-    ACCOUNT_PASSWORD_KEY, DEVICE_FREE_PASSWORD_FAILURES,
+    device_password_key, note_password_failure, note_password_verified, password_backoff,
+    ACCOUNT_PASSWORD_BACKOFF, ACCOUNT_PASSWORD_KEY, DEVICE_PASSWORD_BACKOFF,
 };
 use crate::validation;
 use crate::{AppState, Authed};
@@ -266,7 +266,7 @@ pub(crate) async fn pairing_create(
     // does a request refused by the account-wide password backoff.
     if state
         .rate_limiter
-        .password_backoff(ACCOUNT_PASSWORD_KEY, ACCOUNT_FREE_PASSWORD_FAILURES)
+        .password_backoff(ACCOUNT_PASSWORD_KEY, ACCOUNT_PASSWORD_BACKOFF)
         .is_some()
     {
         return Err(password_backoff());
@@ -286,7 +286,11 @@ pub(crate) async fn pairing_create(
     )
     .await
     {
-        Ok(revision) => revision.is_some(),
+        Ok(Some(_)) => {
+            note_password_verified(&state, None);
+            true
+        }
+        Ok(None) => false,
         Err(identity::IdentityError::Busy) => return Err(busy()),
         Err(identity::IdentityError::PasswordRejected) => {
             note_password_failure(&state, None);
@@ -321,14 +325,28 @@ pub(crate) async fn pairing_create(
             .notifier
             .notify(crate::notify::NotifyEvent::PairingRequested);
     }
-    record_unauthenticated_event(
-        &state,
-        None,
-        "device.pairing_request",
-        "created",
-        Some(&pairing.candidate_fingerprint[..16]),
-    )
-    .await;
+    // A password-verified request is rare and always worth a row; one without
+    // a password check (legacy owner) is budgeted like other anonymous events.
+    let fingerprint = Some(&pairing.candidate_fingerprint[..16]);
+    if password_verified {
+        record_security_event(
+            &state,
+            None,
+            "device.pairing_request",
+            "created",
+            fingerprint,
+        )
+        .await;
+    } else {
+        record_unauthenticated_event(
+            &state,
+            None,
+            "device.pairing_request",
+            "created",
+            fingerprint,
+        )
+        .await;
+    }
     Ok(Json(
         json!({ "request_id": pairing.id, "nonce": hex::encode(pairing.nonce), "expires_at": pairing.expires_at.unix_timestamp() }),
     ))
@@ -484,10 +502,9 @@ pub(crate) async fn auth_login(
         )
     })?;
     // Only a caller holding this device's key can put it into backoff.
-    let device_key = device_password_key(req.device_id);
     if state
         .rate_limiter
-        .password_backoff(&device_key, DEVICE_FREE_PASSWORD_FAILURES)
+        .password_backoff(&device_password_key(req.device_id), DEVICE_PASSWORD_BACKOFF)
         .is_some()
     {
         return Err(password_backoff());
@@ -523,7 +540,7 @@ pub(crate) async fn auth_login(
             return Err(unauthorized());
         }
     };
-    state.rate_limiter.clear_password_failures(&device_key);
+    note_password_verified(&state, Some(req.device_id));
     record_security_event(&state, Some(req.device_id), "auth.login", "ok", None).await;
     Ok(Json(json!({
         "token": result.token,

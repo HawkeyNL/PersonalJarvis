@@ -4,7 +4,8 @@ use crate::{
     audit::record_security_event,
     error::{bad_request, internal, unauthorized},
     rate_limit::{
-        device_password_key, note_password_failure, password_backoff, DEVICE_FREE_PASSWORD_FAILURES,
+        device_password_key, note_password_failure, note_password_verified, password_backoff,
+        DEVICE_PASSWORD_BACKOFF,
     },
     AppState, Authed,
 };
@@ -56,10 +57,12 @@ pub(crate) async fn password_request(
     State(state): State<AppState>,
     Json(req): Json<PasswordChange>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let device_key = device_password_key(auth.device.id);
     if state
         .rate_limiter
-        .password_backoff(&device_key, DEVICE_FREE_PASSWORD_FAILURES)
+        .password_backoff(
+            &device_password_key(auth.device.id),
+            DEVICE_PASSWORD_BACKOFF,
+        )
         .is_some()
     {
         return Err(password_backoff());
@@ -72,7 +75,7 @@ pub(crate) async fn password_request(
     )
     .await
     {
-        Ok(_) => state.rate_limiter.clear_password_failures(&device_key),
+        Ok(_) => note_password_verified(&state, Some(auth.device.id)),
         Err(jarvis_identity::IdentityError::PasswordRejected) => {
             note_password_failure(&state, Some(auth.device.id));
             record_security_event(

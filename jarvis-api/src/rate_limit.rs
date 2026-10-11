@@ -71,19 +71,24 @@ pub struct RateLimiter {
 }
 
 /// Exponential password backoff: after `free` failures each further failure
-/// doubles the wait from `PASSWORD_BACKOFF_BASE`, capped at
-/// `PASSWORD_BACKOFF_MAX` so nobody is ever locked out for longer.
+/// doubles the wait from `PASSWORD_BACKOFF_BASE`, capped at `max` so nobody
+/// is ever locked out for longer.
+#[derive(Clone, Copy, Debug)]
+pub struct PasswordBackoff {
+    pub free: u32,
+    pub max: Duration,
+}
+
 const PASSWORD_BACKOFF_BASE: Duration = Duration::from_secs(2);
-const PASSWORD_BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
 /// A key's failures are forgotten after this long without a new one.
 const PASSWORD_FAILURE_MEMORY: Duration = Duration::from_secs(24 * 60 * 60);
 
-fn password_delay(failures: u32, free: u32) -> Duration {
-    match failures.checked_sub(free) {
+fn password_delay(failures: u32, policy: PasswordBackoff) -> Duration {
+    match failures.checked_sub(policy.free) {
         None | Some(0) => Duration::ZERO,
         Some(over) => PASSWORD_BACKOFF_BASE
             .saturating_mul(1 << (over - 1).min(16))
-            .min(PASSWORD_BACKOFF_MAX),
+            .min(policy.max),
     }
 }
 
@@ -160,7 +165,7 @@ impl RateLimiter {
 
     /// Time `key` must still wait before its next password check, if any.
     /// In memory only: a restart forgets all backoff.
-    pub fn password_backoff(&self, key: &str, free: u32) -> Option<Duration> {
+    pub fn password_backoff(&self, key: &str, policy: PasswordBackoff) -> Option<Duration> {
         let mut map = self
             .password_failures
             .lock()
@@ -171,7 +176,7 @@ impl RateLimiter {
             map.remove(key);
             return None;
         }
-        Some(password_delay(failures, free).saturating_sub(since)).filter(|d| !d.is_zero())
+        Some(password_delay(failures, policy).saturating_sub(since)).filter(|d| !d.is_zero())
     }
 
     /// Record one wrong password for `key`; returns its running count.
@@ -273,14 +278,21 @@ pub(crate) fn allow_authenticated_device(
 //   password change) and gates only the anonymous pairing check. Gating login
 //   with it would let anyone lock the owner out through the pairing endpoint;
 //   the cost is that a holder of several device keys gets each device's
-//   budget.
-// Backoff is bounded by `PASSWORD_BACKOFF_MAX` and forgotten after a day
-// without failures or on a restart.
+//   budget. Its cap is short because `pairing:global` already bounds the
+//   Argon2 work, and any verified password clears it.
+// Backoff is bounded and forgotten after a day without failures or on a
+// restart.
 
-/// Wrong passwords per device before backoff starts (room for typos).
-pub(crate) const DEVICE_FREE_PASSWORD_FAILURES: u32 = 3;
-/// Wrong passwords across the account before pairing backs off.
-pub(crate) const ACCOUNT_FREE_PASSWORD_FAILURES: u32 = 10;
+/// Per device: 3 free failures (typos), then up to 15 minutes.
+pub(crate) const DEVICE_PASSWORD_BACKOFF: PasswordBackoff = PasswordBackoff {
+    free: 3,
+    max: Duration::from_secs(15 * 60),
+};
+/// Account-wide, gating pairing only: 10 free failures, then up to 60 s.
+pub(crate) const ACCOUNT_PASSWORD_BACKOFF: PasswordBackoff = PasswordBackoff {
+    free: 10,
+    max: Duration::from_secs(60),
+};
 /// Jarvis has one owner account.
 pub(crate) const ACCOUNT_PASSWORD_KEY: &str = "password:account";
 
@@ -301,6 +313,19 @@ pub(crate) fn note_password_failure(state: &AppState, device: Option<uuid::Uuid>
         .rate_limiter
         .note_password_failure(ACCOUNT_PASSWORD_KEY);
     tracing::warn!(failures = n, "wrong account password (account)");
+}
+
+/// A verified password clears the account counter and, when given, the
+/// device's counter.
+pub(crate) fn note_password_verified(state: &AppState, device: Option<uuid::Uuid>) {
+    if let Some(id) = device {
+        state
+            .rate_limiter
+            .clear_password_failures(&device_password_key(id));
+    }
+    state
+        .rate_limiter
+        .clear_password_failures(ACCOUNT_PASSWORD_KEY);
 }
 
 /// The response while a password check is in backoff.
@@ -428,25 +453,31 @@ mod tests {
 
     #[test]
     fn password_backoff_is_free_then_exponential_then_bounded() {
-        assert_eq!(password_delay(3, 3), Duration::ZERO);
-        assert_eq!(password_delay(4, 3), Duration::from_secs(2));
-        assert_eq!(password_delay(5, 3), Duration::from_secs(4));
-        assert_eq!(password_delay(12, 3), Duration::from_secs(512));
-        assert_eq!(password_delay(13, 3), PASSWORD_BACKOFF_MAX);
-        assert_eq!(password_delay(u32::MAX, 3), PASSWORD_BACKOFF_MAX);
+        let device = DEVICE_PASSWORD_BACKOFF;
+        assert_eq!(password_delay(3, device), Duration::ZERO);
+        assert_eq!(password_delay(4, device), Duration::from_secs(2));
+        assert_eq!(password_delay(5, device), Duration::from_secs(4));
+        assert_eq!(password_delay(12, device), Duration::from_secs(512));
+        assert_eq!(password_delay(13, device), device.max);
+        assert_eq!(password_delay(u32::MAX, device), device.max);
+        // The account backoff starts later and stays short.
+        let account = ACCOUNT_PASSWORD_BACKOFF;
+        assert_eq!(password_delay(10, account), Duration::ZERO);
+        assert_eq!(password_delay(11, account), Duration::from_secs(2));
+        assert_eq!(password_delay(u32::MAX, account), Duration::from_secs(60));
 
         let rl = RateLimiter::new();
         for n in 1..=3 {
             assert_eq!(rl.note_password_failure("device:a"), n);
-            assert_eq!(rl.password_backoff("device:a", 3), None);
+            assert_eq!(rl.password_backoff("device:a", device), None);
         }
         rl.note_password_failure("device:a");
-        let wait = rl.password_backoff("device:a", 3).unwrap();
+        let wait = rl.password_backoff("device:a", device).unwrap();
         assert!(wait > Duration::from_secs(1) && wait <= Duration::from_secs(2));
         // Keys are independent of each other and of the caller's address.
-        assert_eq!(rl.password_backoff("device:b", 3), None);
+        assert_eq!(rl.password_backoff("device:b", device), None);
         rl.clear_password_failures("device:a");
-        assert_eq!(rl.password_backoff("device:a", 3), None);
+        assert_eq!(rl.password_backoff("device:a", device), None);
     }
 
     #[test]

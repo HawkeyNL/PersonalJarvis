@@ -248,15 +248,26 @@ impl Sandbox {
 }
 
 /// Secret paths are off-limits even to read, even inside the sandbox (ADR-029).
+/// Matching is ASCII case-insensitive on the lossy name, so neither case
+/// variants nor non-UTF-8 names slip through.
 fn is_secret(path: &Path) -> bool {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    name == ".env"
-        || name.starts_with(".env.")
-        || name.ends_with(".pem")
-        || name.ends_with(".key")
-        || name.starts_with("id_rsa")
-        || name.starts_with("id_ed25519")
-        || path.components().any(|c| c.as_os_str() == ".ssh")
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    name.starts_with(".env.")
+        || [".env", ".pem", ".key", ".p12", ".pfx"]
+            .iter()
+            .any(|ext| name.ends_with(ext))
+        || ["id_rsa", "id_ed25519", "id_ecdsa"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        || name == ".netrc"
+        || name == ".git-credentials"
+        || path.components().any(|c| {
+            let c = c.as_os_str().to_string_lossy();
+            c.eq_ignore_ascii_case(".ssh") || c.eq_ignore_ascii_case(".git")
+        })
 }
 
 /// The result of a successful action.
@@ -443,8 +454,8 @@ fn list_dir(sandbox: &Sandbox, path: &str) -> Result<String, AgentError> {
 fn read_file(sandbox: &Sandbox, path: &str) -> Result<String, AgentError> {
     let file = sandbox.resolve(path)?;
     let meta = std::fs::metadata(&file).map_err(|_| AgentError::NotFound)?;
-    if meta.is_dir() {
-        return Err(AgentError::Exec("path is a directory".into()));
+    if !meta.is_file() {
+        return Err(AgentError::Exec("not a regular file".into()));
     }
     if meta.len() > MAX_FILE_BYTES {
         return Err(AgentError::Denied(format!(
@@ -456,34 +467,51 @@ fn read_file(sandbox: &Sandbox, path: &str) -> Result<String, AgentError> {
 }
 
 /// `grep` exclusions mirroring [`is_secret`], so a recursive search never opens
-/// a file that `read_file` would refuse.
+/// a file that `read_file` would refuse. grep globs are case-sensitive, so
+/// only the lower- and upper-case spellings are excluded here; mixed-case
+/// names are still removed from the output by the `is_secret` re-check.
 const GREP_SECRET_EXCLUDES: &[&str] = &[
     "--exclude=.env",
     "--exclude=.env.*",
+    "--exclude=.ENV.*",
+    "--exclude=*.env",
+    "--exclude=*.ENV",
     "--exclude=*.pem",
+    "--exclude=*.PEM",
     "--exclude=*.key",
+    "--exclude=*.KEY",
+    "--exclude=*.p12",
+    "--exclude=*.P12",
+    "--exclude=*.pfx",
+    "--exclude=*.PFX",
     "--exclude=id_rsa*",
     "--exclude=id_ed25519*",
+    "--exclude=id_ecdsa*",
+    "--exclude=.netrc",
+    "--exclude=.git-credentials",
     "--exclude-dir=.ssh",
+    "--exclude-dir=.git",
 ];
 
 async fn grep(sandbox: &Sandbox, pattern: &str, path: &str) -> Result<String, AgentError> {
     let target = sandbox.resolve(path)?;
-    let target = target.to_string_lossy();
+    let target_arg = target.to_string_lossy();
     // `-e` guards a pattern starting with `-`; `--` ends option parsing. Args are
     // passed directly (no shell), so the pattern can't inject commands. `-r`
-    // does not follow symlinks below the (canonical) target.
-    let mut args = vec!["-rnIHZ"];
+    // does not follow symlinks below the (canonical) target; `-D skip` never
+    // reads devices, FIFOs or sockets.
+    let mut args = vec!["-rnIHZ", "-D", "skip"];
     args.extend_from_slice(GREP_SECRET_EXCLUDES);
-    args.extend_from_slice(&["-e", pattern, "--", &target]);
+    args.extend_from_slice(&["-e", pattern, "--", &target_arg]);
     let out = run_cmd(sandbox.root(), "grep", &args).await?;
-    // `-HZ` prints every file name, ending it with NUL. Re-check each name with
-    // `is_secret` so the read filter stays the single source of truth; a line
-    // without a name is dropped (fail closed).
+    // `-HZ` prints every file name, ending it with NUL. Keep only names under
+    // the target and re-check each with `is_secret`, so the read filter stays
+    // the single source of truth; a line without a name is dropped (fail
+    // closed).
     Ok(out
         .lines()
         .filter_map(|line| line.split_once('\0'))
-        .filter(|(file, _)| !is_secret(Path::new(file)))
+        .filter(|(file, _)| Path::new(file).starts_with(&target) && !is_secret(Path::new(file)))
         .map(|(file, rest)| format!("{file}:{rest}\n"))
         .collect())
 }
@@ -560,6 +588,30 @@ mod tests {
         assert!(is_secret(Path::new("/x/id_rsa")));
         assert!(is_secret(Path::new("/home/.ssh/known_hosts")));
         assert!(!is_secret(Path::new("/x/main.rs")));
+        for secret in [
+            "/x/.ENV",
+            "/x/.Env.Local",
+            "/x/prod.env",
+            "/x/Cert.PEM",
+            "/x/tls.Key",
+            "/x/store.p12",
+            "/x/store.PFX",
+            "/x/ID_ECDSA",
+            "/x/.netrc",
+            "/x/.git-credentials",
+            "/r/.git/config",
+            "/r/.GIT/HEAD",
+            "/r/.SSH/config",
+        ] {
+            assert!(is_secret(Path::new(secret)), "{secret}");
+        }
+        for public in ["/x/.gitignore", "/x/.github/ci.yml", "/x/keyboard.rs"] {
+            assert!(!is_secret(Path::new(public)), "{public}");
+        }
+        // A non-UTF-8 name cannot bypass the filter.
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"/x/\xffcert.PEM");
+        assert!(is_secret(Path::new(raw)));
     }
 
     #[tokio::test]
@@ -765,16 +817,24 @@ mod tests {
 
     #[tokio::test]
     async fn grep_never_returns_secret_files() {
-        let (sb, dir) = temp_sandbox("grep_secret");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let sb = Sandbox::new(dir).unwrap();
         std::fs::create_dir_all(dir.join("sub/.ssh")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
         for secret in [
             ".env",
             ".env.local",
+            "prod.env",
             "sub/cert.pem",
-            "sub/tls.key",
+            "sub/Mixed.Key",
+            "sub/store.p12",
             "id_rsa",
             "sub/id_ed25519.pub",
             "sub/.ssh/config",
+            ".netrc",
+            ".git-credentials",
+            ".git/config",
         ] {
             std::fs::write(dir.join(secret), "TOKEN=leak\n").unwrap();
         }

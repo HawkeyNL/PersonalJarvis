@@ -635,24 +635,14 @@ async fn main() -> anyhow::Result<()> {
             budget_gate.sweep().await;
         }
     });
-    // Hourly security audit retention; bounded so a slow database cannot pile
-    // up sweeps.
-    let audit_db = state.db.clone();
+    // Hourly audit housekeeping (dropped-event summary, retention); one run
+    // at a time, each bounded by a timeout.
+    let audit_state = state.clone();
     tokio::spawn(async move {
-        let period = std::time::Duration::from_secs(60 * 60);
-        let mut interval = tokio::time::interval(period);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
         loop {
             interval.tick().await;
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                jarvis_api::prune_security_audit(&audit_db),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "security audit retention failed"),
-                Err(_) => tracing::warn!("security audit retention timed out"),
-            }
+            jarvis_api::run_audit_maintenance(&audit_state).await;
         }
     });
     let _local_device_admin = if state.environment == "production" {
