@@ -263,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
     let budget_cents = (config.llm_monthly_budget_eur * 100.0).round().max(0.0) as u64;
     let spent_eur = jarvis_usage::month_total_eur(&db).await.unwrap_or(0.0);
     let spent_cents = Arc::new(AtomicU64::new((spent_eur * 100.0).round().max(0.0) as u64));
-    let budget_book = Arc::new(jarvis_usage::BudgetBook::new(
+    let budget_book = jarvis_usage::BudgetBook::new(
         jarvis_usage::BudgetLimits {
             monthly_soft_cents: (config.llm_monthly_soft_budget_eur * 100.0)
                 .round()
@@ -273,7 +273,13 @@ async fn main() -> anyhow::Result<()> {
                 as u64,
         },
         spent_cents.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let budget_gate = Arc::new(jarvis_api::budget_gate::BudgetGate::new(
+        budget_book,
+        Arc::new(db.clone()),
     ));
+    // Re-adopt holds that survived a restart before any new reservation.
+    budget_gate.reconcile().await?;
     tracing::info!(
         budget_eur = config.llm_monthly_budget_eur,
         spent_eur,
@@ -556,7 +562,7 @@ async fn main() -> anyhow::Result<()> {
             .then(|| Arc::<str>::from(config.codex_broker_socket.trim())),
         budget_cents,
         spent_cents,
-        budget_book,
+        budget_gate: budget_gate.clone(),
         eur_per_usd: config.llm_eur_per_usd,
         agent_enabled: config.agent_enabled,
         agent_registry,
@@ -588,6 +594,15 @@ async fn main() -> anyhow::Result<()> {
         loop {
             interval.tick().await;
             jarvis_api::refresh_usage_snapshot(&usage_snapshot_state).await;
+        }
+    });
+    // One sweep at a time; each database call inside is bounded by a timeout.
+    tokio::spawn(async move {
+        let period = jarvis_api::budget_gate::SWEEP_INTERVAL;
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        loop {
+            interval.tick().await;
+            budget_gate.sweep().await;
         }
     });
     let _local_device_admin = if state.environment == "production" {

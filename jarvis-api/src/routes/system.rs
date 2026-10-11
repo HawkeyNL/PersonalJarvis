@@ -456,7 +456,7 @@ async fn forward_to_broker(
 pub(crate) async fn usage_value(state: &AppState) -> Result<Value, jarvis_store::StoreError> {
     let spent_eur = state.spent_cents.load(Ordering::Relaxed) as f64 / 100.0;
     let budget_eur = state.budget_cents as f64 / 100.0;
-    let reservation = state.budget_book.snapshot();
+    let reservation = state.budget_gate.snapshot();
     let mut statistics = usage::month_statistics(&state.db).await?;
     statistics.by_model.truncate(250);
     statistics.failures_by_category.truncate(32);
@@ -716,7 +716,7 @@ pub(crate) async fn system_budget_preflight(
         req.calls,
         state.eur_per_usd,
     );
-    let budget = state.budget_book.snapshot();
+    let budget = state.budget_gate.snapshot();
     let high_cents = (estimate.high_eur * 100.0).ceil().max(0.0) as u64;
     let recommendation = if high_cents > budget.remaining_hard_cents {
         "do_not_start"

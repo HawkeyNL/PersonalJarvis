@@ -34,7 +34,7 @@ async fn json_body(response: axum::response::Response) -> Value {
 async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState {
     AppState {
         realtime: Default::default(),
-        db,
+        db: db.clone(),
         environment: "test".to_string(),
         require_https: false,
         dev_enrollment: true,
@@ -71,13 +71,16 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         codex_broker_socket: None,
         budget_cents: 5000,
         spent_cents: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        budget_book: Arc::new(jarvis_usage::BudgetBook::new(
-            jarvis_usage::BudgetLimits {
-                monthly_soft_cents: 4_000,
-                monthly_hard_cents: 5_000,
-                per_request_hard_cents: 500,
-            },
-            0,
+        budget_gate: Arc::new(jarvis_api::budget_gate::BudgetGate::new(
+            jarvis_usage::BudgetBook::new(
+                jarvis_usage::BudgetLimits {
+                    monthly_soft_cents: 4_000,
+                    monthly_hard_cents: 5_000,
+                    per_request_hard_cents: 500,
+                },
+                0,
+            ),
+            Arc::new(db),
         )),
         eur_per_usd: 0.92,
         agent_enabled: sandbox.is_some(),
@@ -228,6 +231,62 @@ async fn coding_subscription_reservation_is_server_issued_single_lease_and_zero_
     )
     .await?
     .is_none());
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn durable_budget_reservations_survive_restart_and_expire(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jarvis_api::budget_gate::BudgetGate;
+    use std::time::Duration;
+
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("budget_fixture_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("test")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let gate = || {
+        BudgetGate::new(
+            jarvis_usage::BudgetBook::new(
+                jarvis_usage::BudgetLimits {
+                    monthly_soft_cents: 100,
+                    monthly_hard_cents: 100,
+                    per_request_hard_cents: 100,
+                },
+                0,
+            ),
+            Arc::new(db.clone()),
+        )
+    };
+    let before = gate();
+    let held = before.reserve("held", 60, Duration::from_secs(600)).await;
+    let lapsing = before.reserve("lapsing", 40, Duration::from_secs(1)).await;
+    assert_eq!((held, lapsing), (Ok(()), Ok(())));
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+
+    // A fresh gate stands in for a restarted Core.
+    let after = gate();
+    after.reconcile().await?;
+    assert_eq!(after.snapshot().reserved_cents, 60);
+    assert!(after.cancel("held").await);
+    after.reconcile().await?;
+    assert_eq!(after.snapshot().reserved_cents, 0);
+    let mut rows = db
+        .query("SELECT task_id, status FROM llm_budget_reservations ORDER BY task_id")
+        .await?
+        .check()?;
+    let rows: Vec<Value> = rows.take(0)?;
+    let statuses: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["status"].as_str())
+        .collect();
+    assert_eq!(statuses, ["released", "expired"]);
     Ok(())
 }
 

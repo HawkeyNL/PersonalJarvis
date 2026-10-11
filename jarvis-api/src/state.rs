@@ -198,10 +198,10 @@ pub struct AppState {
     /// Metered spend so far this month, in EUR-cents. Mirrors the DB (refreshed
     /// after each call) so the router's sync budget gate can read it cheaply.
     pub spent_cents: Arc<AtomicU64>,
-    /// Atomic request/task reservations.  Reservations are separate from
-    /// durable usage rows so concurrent work cannot oversubscribe the monthly
-    /// hard cap before post-call metering catches up.
-    pub budget_book: Arc<jarvis_usage::BudgetBook>,
+    /// Atomic, crash-safe request/task reservations.  Reservations are
+    /// separate from durable usage rows so concurrent work cannot
+    /// oversubscribe the monthly hard cap before post-call metering catches up.
+    pub budget_gate: Arc<crate::budget_gate::BudgetGate>,
     /// EUR per 1 USD, to price provider (USD) usage into the EUR budget.
     pub eur_per_usd: f64,
     /// Agentic execution kill switch (ADR-029) — Jarvis has no hands unless true.

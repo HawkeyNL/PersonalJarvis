@@ -10,7 +10,12 @@ Group=jarvis
 EnvironmentFile=/etc/jarvis/core.env
 RuntimeDirectory=jarvis-config-broker
 RuntimeDirectoryMode=0750
-StateDirectory=jarvis/config-broker
+# Replay markers live outside Core's writable /var/lib/jarvis tree, so Core
+# cannot rename or reset them. Markers from an older release below
+# /var/lib/jarvis/config-broker are not read. Approvals expire within five
+# minutes, so only an approval used in the five minutes before this upgrade
+# (or a rollback) could be replayed once; Core could already reset that path.
+StateDirectory=jarvis-config-broker
 StateDirectoryMode=0700
 ExecStart=/opt/jarvis/current/jarvis-config-broker
 Restart=on-failure

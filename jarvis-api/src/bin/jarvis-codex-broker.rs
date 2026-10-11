@@ -29,6 +29,7 @@ use tokio::{
     sync::{watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
 };
 
+use jarvis_api::broker_replay::{ReplayError, ReplayMarkers};
 use jarvis_codex::{
     relay::{CodexSubscriptionAdapter, UnavailableSubscriptionAdapter},
     snapshot::TrustedRepositoryRegistry,
@@ -43,6 +44,9 @@ use jarvis_usage::coding_reservations;
 
 const DEFAULT_SOCKET: &str = "/run/jarvis-codex-broker/broker.sock";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// systemd `StateDirectory=jarvis-codex-broker`: owned by the broker's
+/// service user with mode 0700, so Core cannot write it.
+const STATE_DIR: &str = "/var/lib/jarvis-codex-broker";
 const ARTIFACTS_ROOT: &str = "/var/lib/jarvis-codex-broker/artifacts";
 const MAX_STORED_RUNS: usize = 1_000;
 const MAX_STORED_BYTES: u64 = 512 * 1024 * 1024;
@@ -62,6 +66,8 @@ struct BrokerState {
     sandbox: Option<Arc<dyn SandboxProvider>>,
     adapter: Arc<dyn CodexSubscriptionAdapter>,
     artifacts_root: PathBuf,
+    /// Holds the single-use markers for signed request IDs.
+    state_dir: PathBuf,
     authority: Arc<RunCapabilityAuthority>,
     active: Arc<Mutex<HashMap<uuid::Uuid, watch::Sender<bool>>>>,
     run_slots: Arc<Semaphore>,
@@ -148,6 +154,16 @@ impl SandboxOwnershipRecorder for DurableSandboxOwnership<'_> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The Codex App Server and chat worker run as the same jarvis-codex uid.
+    // A non-dumpable process blocks their same-uid ptrace and
+    // /proc/<pid>/root access, which would otherwise reach this broker's
+    // replay markers through its mount namespace.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        bail!(
+            "mark Codex broker non-dumpable: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     // Root is intentionally not required: this dedicated account owns neither
     // protected persona/configuration nor Docker. systemd supplies its socket
     // directory and a narrowly readable database principal.
@@ -177,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
         sandbox: configured_sandbox(|name| std::env::var(name).ok())?,
         adapter: Arc::new(UnavailableSubscriptionAdapter),
         artifacts_root: PathBuf::from(ARTIFACTS_ROOT),
+        state_dir: PathBuf::from(STATE_DIR),
         authority: Arc::new(RunCapabilityAuthority::default()),
         active: Arc::new(Mutex::new(HashMap::new())),
         run_slots: Arc::new(Semaphore::new(2)),
@@ -184,6 +201,10 @@ async fn main() -> anyhow::Result<()> {
         cleanup_epoch: Arc::new(AtomicU64::new(0)),
         reconcile_lock: Arc::new(AsyncMutex::new(())),
     });
+    state
+        .replay_markers()
+        .prepare()
+        .context("validate Codex broker replay marker directory")?;
     reconcile_owned_sandboxes(&state).await?;
     state.cleanup_healthy.store(true, Ordering::SeqCst);
     let maintenance = state.clone();
@@ -223,6 +244,15 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(%error, "Codex broker request denied");
             }
         });
+    }
+}
+
+impl BrokerState {
+    fn replay_markers(&self) -> ReplayMarkers<'_> {
+        ReplayMarkers {
+            state_dir: &self.state_dir,
+            owner_uid: unsafe { libc::geteuid() },
+        }
     }
 }
 
@@ -480,15 +510,16 @@ async fn handle(stream: UnixStream, state: &Arc<BrokerState>) -> anyhow::Result<
     let signed = request
         .signed_request()
         .context("signed operation required")?;
-    let outcome = validate_signature(&state.db, state.pinned_keys, signed).await;
+    let outcome =
+        validate_signature(&state.db, state.pinned_keys, state.replay_markers(), signed).await;
     if let Err(error) = outcome {
-        let detail = match error.downcast_ref::<TrustError>() {
-            Some(TrustError::NotTrusted) => "device not trusted",
-            Some(TrustError::KeyChanged) => "device key mismatch",
-            Some(TrustError::Invalid(_)) => "trusted keys invalid",
-            Some(TrustError::Signature) | None => "signature or expiry",
-        };
-        audit(&state.db, Some(signed.device_id), "denied", detail).await;
+        audit(
+            &state.db,
+            Some(signed.device_id),
+            "denied",
+            denial_detail(&error),
+        )
+        .await;
         return Err(error);
     }
     // Resolve the signed logical repository and exact commit through the
@@ -1200,23 +1231,36 @@ async fn prepare_signed_run(
 async fn validate_signature(
     db: &jarvis_store::Database,
     pinned_keys: Option<PinnedKeys<'_>>,
+    replays: ReplayMarkers<'_>,
     request: &jarvis_codex::SignedCodingRequest,
 ) -> anyhow::Result<()> {
     request
         .reject_if_expired(time::OffsetDateTime::now_utc())
         .map_err(|_| anyhow::anyhow!("expired Codex approval"))?;
+    let public_key = identity::active_device_public_key(db, request.user_id, request.device_id)
+        .await
+        .map_err(|_| anyhow::anyhow!("untrusted Codex owner device"))?;
+    authorize(request, &public_key, pinned_keys, replays)
+}
+
+/// Everything after the database key lookup: the signature, the pinned key,
+/// the policy and, only when all pass, the replay marker. The `coding_runs`
+/// request ID uniqueness stays as a second, database-side check.
+fn authorize(
+    request: &jarvis_codex::SignedCodingRequest,
+    public_key: &[u8],
+    pinned_keys: Option<PinnedKeys<'_>>,
+    replays: ReplayMarkers<'_>,
+) -> anyhow::Result<()> {
     let message = request
         .message()
         .map_err(|_| anyhow::anyhow!("invalid Codex approval"))?;
     let signature = hex::decode(&request.signature_hex)
         .map_err(|_| anyhow::anyhow!("invalid Codex signature"))?;
-    let public_key = identity::active_device_public_key(db, request.user_id, request.device_id)
-        .await
-        .map_err(|_| anyhow::anyhow!("untrusted Codex owner device"))?;
     trusted_keys::verify_approval(
         pinned_keys,
         request.device_id,
-        &public_key,
+        public_key,
         &message,
         &signature,
     )
@@ -1227,7 +1271,22 @@ async fn validate_signature(
     if jarvis_codex::request_policy(true) != jarvis_policy::PolicyDecision::RequireApproval {
         bail!("Codex policy denied");
     }
-    Ok(())
+    Ok(replays.consume(request.request_id)?)
+}
+
+fn denial_detail(error: &anyhow::Error) -> &'static str {
+    match error.downcast_ref::<ReplayError>() {
+        Some(ReplayError::Replay) => return "replay rejected",
+        Some(ReplayError::UnsafeStore) => return "replay marker store unsafe",
+        Some(ReplayError::Io(_)) => return "replay marker store unavailable",
+        None => {}
+    }
+    match error.downcast_ref::<TrustError>() {
+        Some(TrustError::NotTrusted) => "device not trusted",
+        Some(TrustError::KeyChanged) => "device key mismatch",
+        Some(TrustError::Invalid(_)) => "trusted keys invalid",
+        Some(TrustError::Signature) | None => "signature or expiry",
+    }
 }
 
 async fn audit(
@@ -1340,6 +1399,7 @@ mod tests {
             sandbox,
             adapter,
             artifacts_root,
+            state_dir: PathBuf::from("/nonexistent/jarvis-test-broker-state"),
             authority: Arc::new(RunCapabilityAuthority::default()),
             active: Arc::new(Mutex::new(HashMap::new())),
             run_slots: Arc::new(Semaphore::new(2)),
@@ -2794,6 +2854,7 @@ mod tests {
             sandbox: Some(manager),
             adapter: Arc::new(UnavailableSubscriptionAdapter),
             artifacts_root: PathBuf::from("/nonexistent/jarvis-test-artifacts"),
+            state_dir: PathBuf::from("/nonexistent/jarvis-test-broker-state"),
             authority: Arc::new(RunCapabilityAuthority::default()),
             active: Arc::new(Mutex::new(HashMap::new())),
             run_slots: Arc::new(Semaphore::new(2)),
@@ -2896,5 +2957,86 @@ mod tests {
             ]
         )
         .is_err());
+    }
+
+    #[test]
+    fn authorize_consumes_the_replay_marker_only_after_every_check_passes() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use std::os::unix::fs::MetadataExt;
+        let fixture = tempfile::tempdir().unwrap();
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = fs::metadata(fixture.path()).unwrap();
+        let replays = ReplayMarkers {
+            state_dir: fixture.path(),
+            owner_uid: owner.uid(),
+        };
+        let device = SigningKey::from_bytes(&[9; 32]);
+        let public_key = device.verifying_key().to_bytes();
+        let signed = |device_id: uuid::Uuid| {
+            let mut request = signed_start(
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+            );
+            request.device_id = device_id;
+            request.signature_hex =
+                hex::encode(device.sign(&request.message().unwrap()).to_bytes());
+            request
+        };
+        let pins = fixture.path().join("trusted-device-keys");
+        let pinned_id = uuid::Uuid::now_v7();
+        let substituted_id = uuid::Uuid::now_v7();
+        trusted_keys::update(&pins, owner.uid(), owner.gid(), |keys| {
+            keys.insert(pinned_id, &public_key)?;
+            keys.insert(substituted_id, &[3; 32])
+        })
+        .unwrap();
+        let pinned = Some(PinnedKeys {
+            path: &pins,
+            owner_uid: owner.uid(),
+        });
+        let check = |request: &SignedCodingRequest, pinned| {
+            let result = authorize(request, &public_key, pinned, replays);
+            let consumed = fixture
+                .path()
+                .join("replays")
+                .join(request.request_id.to_string())
+                .exists();
+            (result.map_err(|error| denial_detail(&error)), consumed)
+        };
+        // Failed authentication never consumes the one-time request ID.
+        assert_eq!(
+            check(&signed(substituted_id), pinned),
+            (Err("device key mismatch"), false)
+        );
+        assert_eq!(
+            check(&signed(uuid::Uuid::now_v7()), pinned),
+            (Err("device not trusted"), false)
+        );
+        let mut forged = signed(pinned_id);
+        forged.signature_hex = hex::encode([0_u8; 64]);
+        assert_eq!(check(&forged, pinned), (Err("signature or expiry"), false));
+        // A valid approval is accepted once; the same request is a replay.
+        let request = signed(pinned_id);
+        assert_eq!(check(&request, pinned), (Ok(()), true));
+        assert_eq!(check(&request, pinned), (Err("replay rejected"), true));
+        // An unsafe marker directory fails closed and is not a replay.
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o770)).unwrap();
+        let request = signed(pinned_id);
+        assert_eq!(
+            check(&request, None),
+            (Err("replay marker store unsafe"), false)
+        );
+        // A missing state directory is unavailable, not unsafe or a replay.
+        let missing = fixture.path().join("missing");
+        let unavailable = ReplayMarkers {
+            state_dir: &missing,
+            owner_uid: owner.uid(),
+        };
+        let result = authorize(&signed(pinned_id), &public_key, None, unavailable);
+        assert_eq!(
+            result.map_err(|error| denial_detail(&error)),
+            Err("replay marker store unavailable")
+        );
     }
 }
