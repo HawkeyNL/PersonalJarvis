@@ -342,6 +342,46 @@ pub async fn release_task(db: &Database, task_id: &str) -> Result<(), jarvis_sto
     Ok(())
 }
 
+/// Marks every lapsed active reservation as expired, so a crashed caller's
+/// hold stops counting against the budget once its TTL passes.
+pub async fn expire_tasks(db: &Database) -> Result<(), jarvis_store::StoreError> {
+    db.query(
+        "UPDATE llm_budget_reservations SET status = 'expired' \
+         WHERE status = 'active' AND expires_at <= time::now() RETURN NONE",
+    )
+    .await
+    .map_err(jarvis_store::StoreError::schema)?
+    .check()
+    .map_err(jarvis_store::StoreError::schema)?;
+    Ok(())
+}
+
+/// A still-active durable reservation and its whole seconds until expiry.
+#[derive(Debug, serde::Deserialize)]
+pub struct ActiveReservation {
+    pub task_id: String,
+    pub projected_cents: i64,
+    pub remaining_secs: i64,
+}
+
+/// Bounded read of unexpired active reservations for startup reconciliation.
+pub async fn active_tasks(
+    db: &Database,
+    limit: usize,
+) -> Result<Vec<ActiveReservation>, jarvis_store::StoreError> {
+    db.query(
+        "SELECT task_id, projected_cents, \
+         time::unix(expires_at) - time::unix(time::now()) AS remaining_secs \
+         FROM llm_budget_reservations WHERE status = 'active' AND expires_at > time::now() \
+         LIMIT $limit",
+    )
+    .bind(json!({ "limit": limit }))
+    .await
+    .map_err(jarvis_store::StoreError::schema)?
+    .take(0)
+    .map_err(jarvis_store::StoreError::schema)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

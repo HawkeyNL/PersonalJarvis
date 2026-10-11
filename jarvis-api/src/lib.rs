@@ -27,6 +27,7 @@ use std::sync::RwLock;
 mod audit;
 #[cfg(unix)]
 pub mod broker_replay;
+pub mod budget_gate;
 mod error;
 mod extract;
 pub mod intent;

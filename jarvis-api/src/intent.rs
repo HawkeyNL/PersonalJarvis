@@ -21,6 +21,8 @@ const LOCAL_ENDPOINT: &str = "http://jarvis-laya.local/v1/systemone";
 const LOCAL_SOCKET: &str = "/run/jarvis-laya.sock";
 const MAX_SHADOW_TASKS: usize = 4;
 const SHADOW_TASK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Far above Jev's 3 s request timeout, so only a lost caller ever expires.
+const JEV_RESERVATION_TTL: Duration = Duration::from_secs(120);
 pub(crate) const MAX_BILLABLE_INPUT_TOKENS: u32 = 4_096;
 pub(crate) const MAX_BILLABLE_OUTPUT_TOKENS: u32 = 512;
 
@@ -621,8 +623,9 @@ async fn decide_jev(
     let projected_cents = (projected_eur * 100.0).ceil().max(1.0) as u64;
     let reservation = format!("jev:{}", uuid::Uuid::now_v7());
     state
-        .budget_book
-        .reserve(&reservation, projected_cents)
+        .budget_gate
+        .reserve(&reservation, projected_cents, JEV_RESERVATION_TTL)
+        .await
         .ok()?;
 
     let result = jev.classify(latest_user_turn).await;
@@ -646,7 +649,7 @@ async fn decide_jev(
             // Cooldown can begin between preflight and classify under
             // concurrency. No HTTP request was sent, so release the reserved
             // budget without creating a synthetic paid usage record.
-            state.budget_book.cancel(&reservation);
+            state.budget_gate.cancel(&reservation).await;
             return None;
         }
         Err(reason) => {
@@ -684,13 +687,13 @@ async fn decide_jev(
     };
     // If usage persistence fails, the reservation is still settled locally;
     // a later successful DB reconciliation can replace the estimate.
-    if state
-        .budget_book
+    let settled = state
+        .budget_gate
         .settle(&reservation, projected_cents)
-        .is_err()
-    {
-        return None;
-    }
+        .await;
+    // The request was sent and may be billed, so its usage is recorded even
+    // when settling hits the cap; otherwise the cost would vanish once the
+    // retained hold expires.
     record_usage_with_metadata(
         state,
         &reply,
@@ -704,7 +707,7 @@ async fn decide_jev(
         },
     )
     .await;
-    kind
+    settled.ok().and(kind)
 }
 
 #[cfg(test)]
