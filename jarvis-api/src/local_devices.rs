@@ -98,10 +98,21 @@ async fn execute(
     let owner = jarvis_identity::first_user(&state.db).await?;
     let result = match request {
         DeviceRequest::List {} => {
-            let devices = match owner {
-                Some(owner) => jarvis_identity::list_active_devices(&state.db, owner.id).await?,
-                None => vec![],
-            };
+            let mut devices = Vec::new();
+            if let Some(owner) = owner {
+                for device in jarvis_identity::list_active_devices(&state.db, owner.id).await? {
+                    // Public, not secret: the root CLI pins it after the owner
+                    // checks its fingerprint (`jarvis devices trust`).
+                    let public_key =
+                        jarvis_identity::active_device_public_key(&state.db, owner.id, device.id)
+                            .await
+                            .ok()
+                            .map(hex::encode);
+                    let mut device = serde_json::to_value(device)?;
+                    device["public_key"] = json!(public_key);
+                    devices.push(device);
+                }
+            }
             return Ok(json!({"devices":devices}));
         }
         DeviceRequest::Pending {} => {
@@ -121,7 +132,12 @@ async fn execute(
             fingerprint,
         } => local_devices::approve(&state.db, peer, request_id, &fingerprint)
             .await
-            .map(|d| ("local.device.approve", json!({"device_id":d.id}))),
+            .map(|(d, key)| {
+                (
+                    "local.device.approve",
+                    json!({"device_id":d.id,"public_key":hex::encode(key)}),
+                )
+            }),
         DeviceRequest::Deny { request_id } => local_devices::deny(&state.db, peer, request_id)
             .await
             .map(|()| ("local.device.deny", json!({"status":"denied"}))),

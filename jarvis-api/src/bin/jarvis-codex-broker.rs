@@ -37,6 +37,7 @@ use jarvis_codex::{
 };
 use jarvis_config::AppConfig;
 use jarvis_identity as identity;
+use jarvis_privileged::trusted_keys::{self, PinnedKeys, TrustError};
 use jarvis_sandbox::{OpenSandboxProvider, SandboxAvailability, SandboxHandle, SandboxProvider};
 use jarvis_usage::coding_reservations;
 
@@ -56,6 +57,8 @@ struct Reply {
 struct BrokerState {
     db: jarvis_store::Database,
     core_uid: u32,
+    /// `None` only when `JARVIS_BROKER_REQUIRE_TRUSTED_KEYS=false`.
+    pinned_keys: Option<PinnedKeys<'static>>,
     sandbox: Option<Arc<dyn SandboxProvider>>,
     adapter: Arc<dyn CodexSubscriptionAdapter>,
     artifacts_root: PathBuf,
@@ -168,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(BrokerState {
         db,
         core_uid: lookup_core_uid()?,
+        pinned_keys: config
+            .broker_require_trusted_keys
+            .then(PinnedKeys::production),
         sandbox: configured_sandbox(|name| std::env::var(name).ok())?,
         adapter: Arc::new(UnavailableSubscriptionAdapter),
         artifacts_root: PathBuf::from(ARTIFACTS_ROOT),
@@ -474,15 +480,15 @@ async fn handle(stream: UnixStream, state: &Arc<BrokerState>) -> anyhow::Result<
     let signed = request
         .signed_request()
         .context("signed operation required")?;
-    let outcome = validate_signature(&state.db, signed).await;
+    let outcome = validate_signature(&state.db, state.pinned_keys, signed).await;
     if let Err(error) = outcome {
-        audit(
-            &state.db,
-            Some(signed.device_id),
-            "denied",
-            "signature or expiry",
-        )
-        .await;
+        let detail = match error.downcast_ref::<TrustError>() {
+            Some(TrustError::NotTrusted) => "device not trusted",
+            Some(TrustError::KeyChanged) => "device key mismatch",
+            Some(TrustError::Invalid(_)) => "trusted keys invalid",
+            Some(TrustError::Signature) | None => "signature or expiry",
+        };
+        audit(&state.db, Some(signed.device_id), "denied", detail).await;
         return Err(error);
     }
     // Resolve the signed logical repository and exact commit through the
@@ -1193,6 +1199,7 @@ async fn prepare_signed_run(
 
 async fn validate_signature(
     db: &jarvis_store::Database,
+    pinned_keys: Option<PinnedKeys<'_>>,
     request: &jarvis_codex::SignedCodingRequest,
 ) -> anyhow::Result<()> {
     request
@@ -1203,9 +1210,20 @@ async fn validate_signature(
         .map_err(|_| anyhow::anyhow!("invalid Codex approval"))?;
     let signature = hex::decode(&request.signature_hex)
         .map_err(|_| anyhow::anyhow!("invalid Codex signature"))?;
-    identity::verify_device_signature(db, request.user_id, request.device_id, &message, &signature)
+    let public_key = identity::active_device_public_key(db, request.user_id, request.device_id)
         .await
         .map_err(|_| anyhow::anyhow!("untrusted Codex owner device"))?;
+    trusted_keys::verify_approval(
+        pinned_keys,
+        request.device_id,
+        &public_key,
+        &message,
+        &signature,
+    )
+    .map_err(|error| match error {
+        TrustError::Signature => anyhow::anyhow!("untrusted Codex owner device"),
+        other => anyhow::Error::new(other),
+    })?;
     if jarvis_codex::request_policy(true) != jarvis_policy::PolicyDecision::RequireApproval {
         bail!("Codex policy denied");
     }
@@ -1318,6 +1336,7 @@ mod tests {
         Arc::new(BrokerState {
             db,
             core_uid: 0,
+            pinned_keys: None,
             sandbox,
             adapter,
             artifacts_root,
@@ -2771,6 +2790,7 @@ mod tests {
         let state = BrokerState {
             db: db.clone(),
             core_uid: 0,
+            pinned_keys: None,
             sandbox: Some(manager),
             adapter: Arc::new(UnavailableSubscriptionAdapter),
             artifacts_root: PathBuf::from("/nonexistent/jarvis-test-artifacts"),

@@ -590,6 +590,48 @@ fn trusted_updater_config_is_strict_and_never_shell_parsed() {
 }
 
 #[test]
+fn device_trust_needs_one_target_and_never_auto_confirms_bulk_or_replacement() {
+    use local_devices::DeviceCommand;
+    let id = "0192abcd-0000-7000-8000-0000000000ef";
+    let trust = |args: &[&str]| {
+        Cli::try_parse_from(["jarvis", "devices", "trust"].iter().chain(args)).map(|cli| match cli
+            .command
+        {
+            Some(Commands::Devices {
+                command:
+                    DeviceCommand::Trust {
+                        device_id,
+                        all_active,
+                        replace,
+                        yes,
+                    },
+            }) => (device_id.map(|id| id.to_string()), all_active, replace, yes),
+            _ => panic!("expected devices trust"),
+        })
+    };
+    let one = Some(id.to_string());
+    assert_eq!(trust(&[id]).unwrap(), (one.clone(), false, false, false));
+    assert_eq!(
+        trust(&[id, "--yes"]).unwrap(),
+        (one.clone(), false, false, true)
+    );
+    assert_eq!(
+        trust(&[id, "--replace"]).unwrap(),
+        (one, false, true, false)
+    );
+    assert_eq!(
+        trust(&["--all-active"]).unwrap(),
+        (None, true, false, false)
+    );
+    assert!(trust(&[]).is_err());
+    assert!(trust(&[id, "--all-active"]).is_err());
+    assert!(trust(&["--all-active", "--yes"]).is_err());
+    assert!(trust(&["--all-active", "--replace"]).is_err());
+    assert!(trust(&[id, "--replace", "--yes"]).is_err());
+    assert!(trust(&["not-a-uuid"]).is_err());
+}
+
+#[test]
 fn confirmation_is_explicit_and_non_secret() {
     assert!(confirmation_answer("yes\n"));
     assert!(confirmation_answer("Y"));

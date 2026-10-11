@@ -411,6 +411,9 @@ activation is one-time; generating another code does not reset enrollment.
 Never send codes through command arguments, redirects, logs or support messages.
 The account password is separate and must be at least 15 characters. Older
 hexadecimal activation codes remain supported by the verifier and clients.
+After activation, pin the new device for privileged changes with
+`sudo jarvis devices trust <device-uuid>` (see
+[Trusted device keys](#trusted-device-keys-for-privileged-changes)).
 
 ### Schema-changing releases
 
@@ -497,6 +500,8 @@ sudo jarvis --json devices pending
 sudo jarvis devices approve <request-uuid> --fingerprint <displayed-fingerprint>
 sudo jarvis devices deny <request-uuid>
 sudo jarvis devices revoke <device-uuid>
+sudo jarvis devices trust <device-uuid>
+sudo jarvis devices trust --all-active
 ```
 
 Check the pending fingerprint against the requesting device before approving.
@@ -531,6 +536,98 @@ Log targets are allowlisted; the command is not a generic `journalctl` or
 The previous `jarvis-models`, `jarvis-credentials`, and private updater helpers
 remain compatibility/internal fallbacks, but normal owner operations should use
 `sudo jarvis ...`.
+
+#### Trusted device keys for privileged changes
+
+As defense in depth, the root configuration broker (model policy and routing
+changes) and the Codex broker do not rely on Core's database alone for the
+approving device's key. They accept an owner approval only when the device
+signature verifies against the device's current database key **and** that key
+is pinned for the device in `/etc/jarvis/trusted-device-keys`.
+
+The file is `root:jarvis 0640` (the non-root Codex broker reads it through its
+`jarvis` group; Core can read it but not change it). Each line is
+`<device-id> <public-key>`: the lowercase hyphenated device UUID and the
+lowercase hex Ed25519 key as Core stores it. Blank lines and `#` comments are
+allowed. The brokers refuse a symlink, a non-root owner, group/other write
+access (on the file or on `/etc/jarvis`), a file over 64 KiB, a duplicate
+device or any malformed line, and then reject every approval. Manage the file
+only through the CLI; it rewrites the whole file atomically and does not keep
+manual comments.
+
+```bash
+sudo jarvis devices trust <device-uuid>
+sudo jarvis devices trust <device-uuid> --replace
+sudo jarvis devices trust --all-active
+```
+
+Both forms show each device's ID, name, platform and key fingerprint (the
+SHA-256 of the key in hex, the same format as the pairing fingerprint) and ask
+for confirmation. The device list and keys come from Core, so pinning is trust
+on first use: check each fingerprint against the device itself, or against the
+fingerprint you checked when you approved its pairing, before confirming.
+`--yes` skips the question only for a single new device.
+
+`--all-active` trusts Core's current list of active devices. Run it right after
+the update that introduces this check, check that the number of devices and
+their names are exactly the devices you own, and confirm interactively;
+`--all-active --yes` is refused. It only adds devices that are not pinned yet.
+
+A pinned key is never replaced silently. When Core offers a different key for a
+pinned device, the CLI prints `KEY CHANGED: pinned <old> -> offered <new>` and
+refuses. `--all-active` skips such a device. Use `--replace` (always with an
+interactive confirmation) only for a device you re-paired yourself.
+
+`sudo jarvis devices approve` also pins the approved key, after checking that
+it matches the fingerprint you supplied; it validates the pin file before Core
+activates the device. `sudo jarvis devices revoke` removes the device's entry,
+even when Core refuses or cannot be reached. Core Admin's approve and revoke
+actions run these same commands; it has no trust action, so trusting an
+existing device is CLI-only. A device revoked through a remote client keeps its
+entry, because Core cannot change the file. For a lost or replaced device,
+always also run `sudo jarvis devices revoke <device-uuid>` on the Home Node so
+its key is no longer trusted by the brokers.
+
+A device paired through the app (approved from another signed-in device) or
+activated with a first-device activation code is not pinned automatically.
+Pin it once with `sudo jarvis devices trust <device-uuid>` before using it for
+model, routing or Codex approvals.
+
+When a device is refused, the broker logs one of:
+
+```text
+device not trusted for privileged changes; run `sudo jarvis devices trust <device-id>`
+pinned key differs from database key; possible compromise; do not re-trust unless this device was re-paired
+trusted device key file rejected: <reason>
+```
+
+See `sudo jarvis logs config-broker` or `sudo jarvis logs codex-broker`. The
+app only shows that the change was refused. The configuration broker records
+the security audit outcome `device_not_trusted`, `device_key_mismatch` or
+`trusted_keys_invalid`; the Codex broker records the matching detail. Treat a
+key mismatch as a possible compromise of Core's database.
+
+The pin does not cover replay: the configuration broker's one-time request
+markers live below Core's state directory, so a compromised Core could replay
+an owner-signed approval it relayed while that approval is still unexpired.
+
+Rollback: set `JARVIS_BROKER_REQUIRE_TRUSTED_KEYS=false` in
+`/etc/jarvis/core.env` (configuration broker) and
+`/etc/jarvis/codex-broker.env` (Codex broker), then restart the broker. Both
+files must stay root-owned and not writable by the Core service identity.
+Signatures are still verified against the database key. Remove the line, or
+set it to `true`, to restore the default.
+
+**Upgrade note.** From the release that adds this check, privileged broker
+changes are refused until the owner's devices are pinned. Right after updating,
+run once, interactively:
+
+```bash
+sudo jarvis devices trust --all-active
+```
+
+and confirm only after checking the device count, names and every listed
+fingerprint.
 
 ## Home Node development without replacing production
 

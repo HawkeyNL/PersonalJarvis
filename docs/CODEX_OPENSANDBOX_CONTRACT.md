@@ -14,8 +14,10 @@ domain-separated Ed25519 signature to the operation, request ID, nonce, owner
 and device IDs, issue/expiry times, repository identity, exact base commit,
 objective, factual checkpoint, reservation and resource limits. The local
 broker must revalidate the active device and consume the request ID once before
-performing a mutation. A Bearer session is only a transport gate and is never
-enough to start a run.
+performing a mutation. The device key must also be pinned in the root-owned
+`/etc/jarvis/trusted-device-keys` (see
+[Trusted device keys](JARVIS_ADMIN_CLI.md#trusted-device-keys-for-privileged-changes)).
+A Bearer session is only a transport gate and is never enough to start a run.
 
 There are no protocol fields for host paths, Git URLs, shell commands,
 environment variables, image references or arbitrary network destinations. A

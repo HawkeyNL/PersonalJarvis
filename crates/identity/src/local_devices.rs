@@ -28,7 +28,7 @@ pub async fn approve(
     _peer: &LocalRootPeer<'_>,
     request_id: Uuid,
     fingerprint: &str,
-) -> Result<Device, IdentityError> {
+) -> Result<(Device, Vec<u8>), IdentityError> {
     let owner = first_user(db).await?.ok_or(IdentityError::AuthFailed)?;
     let request = pairing_request(db, request_id, owner.id)
         .await?
@@ -39,7 +39,11 @@ pub async fn approve(
     {
         return Err(IdentityError::AuthFailed);
     }
-    activate_pairing_request(db, request, None).await
+    // The root CLI pins exactly this key after checking it against the
+    // owner-supplied fingerprint.
+    let public_key = request.candidate_public_key.clone();
+    let device = activate_pairing_request(db, request, None).await?;
+    Ok((device, public_key))
 }
 
 pub async fn revoke(
