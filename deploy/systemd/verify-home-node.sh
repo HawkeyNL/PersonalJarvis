@@ -87,6 +87,9 @@ config_broker_runtime_valid() {
 config_broker_state_valid() {
     expect_mode /var/lib/jarvis-config-broker root:jarvis:700
 }
+codex_broker_state_valid() {
+    expect_mode /var/lib/jarvis-codex-broker jarvis-codex:jarvis:700
+}
 config_broker_socket_valid() {
     local socket=/run/jarvis-config-broker/broker.sock
     [[ -S $socket && ! -L $socket ]] || return 1
@@ -225,6 +228,9 @@ fi
 # The chat worker and the coding path share the one Codex login; until the
 # shared-token design is re-reviewed they must never be enabled together.
 check "Codex chat worker and Codex coding units are not enabled together" codex_chat_and_coding_apart
+if unit_in_use jarvis-codex-broker.service; then
+    check "Codex broker persistent state directory is protected" codex_broker_state_valid
+fi
 # Optional owner-enabled Codex chat worker: when its socket is on, the local
 # IPC and identity boundary is mandatory.
 if systemctl is-active --quiet jarvis-codex-chat.socket; then

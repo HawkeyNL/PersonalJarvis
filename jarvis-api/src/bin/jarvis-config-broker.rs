@@ -19,7 +19,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 
-use jarvis_api::broker_replay::ReplayMarkers;
+use jarvis_api::broker_replay::{ReplayError, ReplayMarkers};
 use jarvis_config::AppConfig;
 use jarvis_identity as identity;
 use jarvis_llm::{ModelAccessPolicy, ModelRouting, ROUTING_MAX_BYTES};
@@ -179,12 +179,7 @@ fn authorize(
             TrustError::Signature => anyhow::anyhow!("untrusted owner device signature"),
             other => anyhow::Error::new(other),
         })?;
-    replays
-        .consume(request.request_id)
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::AlreadyExists => anyhow::anyhow!("approval replay rejected"),
-            _ => anyhow::anyhow!("unsafe broker state directory"),
-        })
+    Ok(replays.consume(request.request_id)?)
 }
 
 fn outcome(result: &anyhow::Result<()>) -> &'static str {
@@ -197,11 +192,15 @@ fn outcome(result: &anyhow::Result<()>) -> &'static str {
         Some(TrustError::Invalid(_)) => return "trusted_keys_invalid",
         Some(TrustError::Signature) | None => {}
     }
+    match error.downcast_ref::<ReplayError>() {
+        Some(ReplayError::Replay) => return "replay_rejected",
+        Some(ReplayError::UnsafeStore) => return "replay_store_unsafe",
+        Some(ReplayError::Io(_)) => return "replay_store_unavailable",
+        None => {}
+    }
     let message = error.to_string();
     if message.contains("expired") {
         "expired"
-    } else if message.contains("replay") {
-        "replay_rejected"
     } else if message.contains("signature") || message.contains("device") {
         "signature_denied"
     } else {
@@ -847,7 +846,7 @@ mod request_tests {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
         let request = signed(pinned_id, uuid::Uuid::now_v7());
         let result = authorize(&request, &public_key, None, state);
-        assert_eq!(outcome(&result), "denied");
+        assert_eq!(outcome(&result), "replay_store_unsafe");
         assert!(!replays.join(request.request_id.to_string()).exists());
         fs::remove_dir_all(root).unwrap();
     }

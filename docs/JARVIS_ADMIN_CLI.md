@@ -617,7 +617,15 @@ signature and the pinned key check pass; a request refused by those checks
 leaves no marker. The brokers refuse to start, and refuse every request, when
 the directory is a symlink, has another owner or is group- or world-writable.
 The Codex broker also keeps its database check that a request ID starts at
-most one run.
+most one run. The request ID is used up once the checks pass, even when the
+Codex run then fails to start: the owner signs a new request to try again.
+
+Limitation: the Codex broker shares the `jarvis-codex` user with the Codex App
+Server (`jarvis-codex.service`) and the Codex chat worker. Those two units
+cannot reach the broker's state directory or see its process
+(`InaccessiblePaths=`, `PrivatePIDs=`, `ProtectProc=invisible`), but file
+permissions alone do not separate them. A dedicated user for the Codex broker
+is the full fix and is planned as a follow-up.
 
 Rollback: set `JARVIS_BROKER_REQUIRE_TRUSTED_KEYS=false` in
 `/etc/jarvis/core.env` (configuration broker) and
@@ -640,9 +648,11 @@ fingerprint.
 **Upgrade note (replay markers).** systemd creates
 `/var/lib/jarvis-config-broker` when the update restarts the configuration
 broker; there is nothing for the owner to do. Markers from earlier releases
-below `/var/lib/jarvis/config-broker` are no longer read: approvals expire
-within five minutes, so they no longer matter, and the old directory can be
-left in place.
+below `/var/lib/jarvis/config-broker` are no longer read, and the old directory
+can be left in place. Approvals expire within five minutes, so only an
+approval used in the five minutes before the upgrade (or before a rollback to
+an earlier release) could be replayed once. That is not a regression: Core
+could already reset the old directory.
 
 ## Home Node development without replacing production
 

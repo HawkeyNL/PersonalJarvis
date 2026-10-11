@@ -29,6 +29,11 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/var/lib/jarvis-codex /var/lib/jarvis-engineering
+# The Codex broker runs as the same jarvis-codex uid. Keep its state (single-use
+# approval markers) out of reach, also through /proc/<broker-pid>/root.
+ProtectProc=invisible
+PrivatePIDs=true
+InaccessiblePaths=-/var/lib/jarvis-codex-broker
 
 [Install]
 WantedBy=multi-user.target

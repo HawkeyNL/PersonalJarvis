@@ -29,7 +29,7 @@ use tokio::{
     sync::{watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
 };
 
-use jarvis_api::broker_replay::ReplayMarkers;
+use jarvis_api::broker_replay::{ReplayError, ReplayMarkers};
 use jarvis_codex::{
     relay::{CodexSubscriptionAdapter, UnavailableSubscriptionAdapter},
     snapshot::TrustedRepositoryRegistry,
@@ -1261,30 +1261,21 @@ fn authorize(
     if jarvis_codex::request_policy(true) != jarvis_policy::PolicyDecision::RequireApproval {
         bail!("Codex policy denied");
     }
-    replays
-        .consume(request.request_id)
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::AlreadyExists => anyhow::anyhow!("Codex approval replay rejected"),
-            _ => anyhow::anyhow!("unsafe Codex broker state directory"),
-        })
+    Ok(replays.consume(request.request_id)?)
 }
 
 fn denial_detail(error: &anyhow::Error) -> &'static str {
+    match error.downcast_ref::<ReplayError>() {
+        Some(ReplayError::Replay) => return "replay rejected",
+        Some(ReplayError::UnsafeStore) => return "replay marker store unsafe",
+        Some(ReplayError::Io(_)) => return "replay marker store unavailable",
+        None => {}
+    }
     match error.downcast_ref::<TrustError>() {
         Some(TrustError::NotTrusted) => "device not trusted",
         Some(TrustError::KeyChanged) => "device key mismatch",
         Some(TrustError::Invalid(_)) => "trusted keys invalid",
-        Some(TrustError::Signature) => "signature or expiry",
-        None => {
-            let message = error.to_string();
-            if message.contains("replay") {
-                "replay rejected"
-            } else if message.contains("state directory") {
-                "replay marker store unsafe"
-            } else {
-                "signature or expiry"
-            }
-        }
+        Some(TrustError::Signature) | None => "signature or expiry",
     }
 }
 
@@ -3025,6 +3016,17 @@ mod tests {
         assert_eq!(
             check(&request, None),
             (Err("replay marker store unsafe"), false)
+        );
+        // A missing state directory is unavailable, not unsafe or a replay.
+        let missing = fixture.path().join("missing");
+        let unavailable = ReplayMarkers {
+            state_dir: &missing,
+            owner_uid: owner.uid(),
+        };
+        let result = authorize(&signed(pinned_id), &public_key, None, unavailable);
+        assert_eq!(
+            result.map_err(|error| denial_detail(&error)),
+            Err("replay marker store unavailable")
         );
     }
 }

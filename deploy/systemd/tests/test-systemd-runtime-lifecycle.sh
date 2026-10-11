@@ -24,6 +24,16 @@ core="$repo_dir/deploy/systemd/jarvis-core.service"
 grep -Fxq 'User=jarvis-codex' "$codex_broker"
 grep -Fxq 'StateDirectory=jarvis-codex-broker' "$codex_broker"
 grep -Fxq 'StateDirectoryMode=0700' "$codex_broker"
+# The App Server shares the broker's uid: it must not reach the broker state
+# directly or through /proc/<broker-pid>/root.
+app_server="$repo_dir/deploy/systemd/jarvis-codex.service"
+grep -Fxq 'User=jarvis-codex' "$app_server"
+grep -Fxq 'ProtectProc=invisible' "$app_server"
+grep -Fxq 'PrivatePIDs=true' "$app_server"
+grep -Eq '^InaccessiblePaths=.*-/var/lib/jarvis-codex-broker( |$)' "$app_server"
+grep -Eq '^InaccessiblePaths=.*-/var/lib/jarvis-codex-broker( |$)' \
+    "$repo_dir/deploy/systemd/jarvis-codex-chat.service"
+grep -Fxq 'PrivatePIDs=true' "$repo_dir/deploy/systemd/jarvis-codex-chat.service"
 grep -Fxq 'ReadWritePaths=/var/lib/jarvis' "$core"
 if grep -Eq '^(ReadWritePaths|StateDirectory)=.*(jarvis-config-broker|jarvis-codex-broker)' "$core"; then
     echo "Core must not be able to write broker replay markers" >&2
