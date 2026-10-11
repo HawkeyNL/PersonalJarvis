@@ -9,7 +9,7 @@ until `JARVIS_NOTIFY_NTFY_URL` is set.
 | Event | Message | Priority | Tap opens |
 |---|---|---|---|
 | Monthly LLM spend reaches 90% of the hard budget (`JARVIS_LLM_MONTHLY_BUDGET_EUR`), once per calendar month (UTC) | Budget reached 90% this month | default | `jarvis://health/usage` |
-| A new device pairing request was created | New device wants to pair — open Jarvis to review | high | `jarvis://approvals/pairing` |
+| A new device pairing request was created with a verified account password | New device wants to pair — open Jarvis to review | high | `jarvis://approvals/pairing` |
 
 Every push has the title `Jarvis` and nothing else: no amounts, IP addresses,
 device names or key fingerprints. The app shows the details after the owner
@@ -25,16 +25,30 @@ Behaviour in Core:
 - The budget marker is kept in memory. At startup a month that is already at
   or above 90% counts as notified, so restarts do not repeat the push.
 - Logs name the event kind and HTTP status only, never the token or topic.
-- An invalid URL or an unusable token file is logged at startup and leaves
-  notifications off; Core keeps running.
+- A pairing request accepted without a password check (an owner with no
+  stored account password) sends no push, so an unauthenticated caller cannot
+  trigger one.
+- An invalid URL or a missing or malformed token is logged at startup and
+  leaves notifications off; Core keeps running.
+
+What leaves the Home Node: without `upstream-base-url`, nothing beyond the
+phones' own connections. With it set (needed for the iOS ntfy app), every
+published message is announced to ntfy.sh as a poll request carrying the
+message id and a hash of the topic URL, whether or not an iPhone is
+subscribed; ntfy.sh then sees the Home Node's IP
+address and the timing, and Apple sees the timing of the APNs push. The
+message text stays on the Home Node. Leave `upstream-base-url` out of
+`server.yml` if no iPhone uses the ntfy app.
 
 ## 1. Install ntfy (owner)
 
 Install the ntfy server from its official package source
 (<https://docs.ntfy.sh/install/>). Do not confuse it with the unrelated
-Debian/Ubuntu `ntfy` Python package. Then:
+Debian/Ubuntu `ntfy` Python package. The package's default configuration
+listens on port 80 without authentication, so stop it before anything else:
 
 ```bash
+sudo systemctl disable --now ntfy
 sudo install -o root -g ntfy -m 0640 deploy/ntfy/server.yml /etc/ntfy/server.yml
 sudoedit /etc/ntfy/server.yml          # set base-url to https://ntfy.<domain>
 sudo install -D -o root -g root -m 0644 deploy/ntfy/ntfy.service.d-jarvis.conf \
@@ -54,20 +68,25 @@ the auth database keeps its owner:
 sudo -u ntfy ntfy user add jarvis-publisher      # prompts for a password
 sudo -u ntfy ntfy access jarvis-publisher <topic> write-only
 sudo -u ntfy ntfy token add jarvis-publisher     # prints tk_...
-sudo -u ntfy ntfy user add owner                 # the phone login
+sudo -u ntfy ntfy user add owner                 # the phone login, see below
 sudo -u ntfy ntfy access owner <topic> read-only
 ```
 
-Store the publisher token where only root and the `jarvis` group can read it:
+The `owner` password is reachable from the internet through Caddy: generate a
+strong random one (for example `openssl rand -base64 24`) and keep it only in
+a password manager and the phone apps.
+
+The publisher token is a Core secret like the provider credentials: one line
+in `/etc/jarvis/secrets/ntfy.env` with the same `root:jarvis 0640`
+boundary (checked by `verify-home-node.sh`). The shipped `jarvis-core.service`
+loads it through `EnvironmentFile=-/etc/jarvis/secrets/ntfy.env`.
 
 ```bash
-sudo install -o root -g jarvis -m 0640 /dev/null /etc/jarvis/notify-ntfy.token
-sudoedit /etc/jarvis/notify-ntfy.token           # paste the tk_... token, one line
+sudo install -o root -g jarvis -m 0640 /dev/null /etc/jarvis/secrets/ntfy.env
+sudoedit /etc/jarvis/secrets/ntfy.env     # one line: JARVIS_NOTIFY_NTFY_TOKEN=tk_...
 ```
 
-Core refuses the file unless it is a regular, root-owned, single-link file
-without group-write or world access, in a root-owned directory nobody else can
-write.
+Core accepts the token only as one printable word of at most 256 bytes.
 
 ## 3. Public hostname (owner)
 
@@ -92,7 +111,10 @@ Both apps use the `owner` login, which can only read the topic.
   `https://ntfy.<domain>` with the `owner` login, then subscribe to the topic
   on that server. iOS delivery depends on `upstream-base-url` in `server.yml`:
   ntfy.sh only forwards a poll request with the message id through APNs, and
-  the app then fetches the message from the Home Node.
+  the app then fetches the message from the Home Node (see "What leaves the
+  Home Node" above).
+- `enable-login` stays `false` in `server.yml`: it only concerns the ntfy web
+  app, which is disabled. Turn it on only if a phone app turns out to need it.
 
 ## 5. Enable in Core (owner)
 
@@ -120,4 +142,4 @@ Remove `JARVIS_NOTIFY_NTFY_URL` from `/etc/jarvis/core.env` and
 `sudo systemctl restart jarvis-core`. To remove ntfy as well:
 `sudo systemctl disable --now ntfy`, comment the ntfy block in the installed
 Caddyfile again and `sudo systemctl reload caddy`, then delete
-`/etc/jarvis/notify-ntfy.token`.
+`/etc/jarvis/secrets/ntfy.env` and restart Core again.

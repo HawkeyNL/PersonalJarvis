@@ -26,9 +26,10 @@ use crate::error::{bad_request, internal, unauthorized};
 use crate::validation;
 use crate::{AppState, Authed};
 
-/// Pre-auth password checks on `/v1/auth/pairing/requests`, for all sources.
-/// A correct guess only yields a pending request that a device or the local
-/// root operator must still approve; the budget bounds guessing and CPU.
+/// Pre-auth attempts on `/v1/auth/pairing/requests` (each a password check
+/// when the owner has a stored password), for all sources. A correct guess
+/// only yields a pending request that a device or the local root operator
+/// must still approve; the budget bounds guessing and CPU.
 const PAIRING_PASSWORD_CHECKS_PER_MIN: u32 = 60;
 
 /// Retryable: no password-check capacity. Never counted as a failed login.
@@ -247,14 +248,16 @@ pub(crate) async fn pairing_create(
             Json(json!({ "error": "first device bootstrap required" })),
         ));
     }
-    // After one-time activation, revoking the last device must still allow a
-    // password-authenticated pending request. This grants no device authority:
-    // explicit root-peer local approval is still required when no active
-    // signing device remains. Legacy/unactivated owners cannot use this path.
-    // Each check is a full Argon2 run before the caller holds any device key:
-    // cap them across all sources right here, so address rotation buys
-    // neither online guesses nor memory pressure. Validation failures above
-    // do not spend this budget.
+    // With no active device, only an activated owner (bootstrap consumed and
+    // a password stored) reaches this point, so the request needs the
+    // password and explicit root-peer local approval. With an active device,
+    // an owner who has a stored password must supply it; an owner without
+    // one (legacy setup) gets a pending request with no password check at
+    // all. A request never grants device authority: an existing
+    // device or the local root operator must still approve it.
+    // Every attempt spends this global budget, which caps the Argon2 runs
+    // across all sources so address rotation buys neither online guesses nor
+    // memory pressure. Validation failures above do not spend it.
     if !state.rate_limiter.check_reserved(
         "pairing:global",
         PAIRING_PASSWORD_CHECKS_PER_MIN,
@@ -262,7 +265,7 @@ pub(crate) async fn pairing_create(
     ) {
         return Err(busy());
     }
-    identity::surreal::account::verify_password(
+    let password_verified = identity::surreal::account::verify_password(
         &state.db,
         identity::password::PasswordService::pre_auth(),
         user.id,
@@ -272,7 +275,8 @@ pub(crate) async fn pairing_create(
     .map_err(|error| match error {
         identity::IdentityError::Busy => busy(),
         _ => unauthorized(),
-    })?;
+    })?
+    .is_some();
     let platform =
         identity::Platform::parse(&req.platform).map_err(|_| bad_request("unknown platform"))?;
     let key =
@@ -285,9 +289,13 @@ pub(crate) async fn pairing_create(
                 Json(json!({ "error": "pairing request unavailable" })),
             )
         })?;
-    state
-        .notifier
-        .notify(crate::notify::NotifyEvent::PairingRequested);
+    // Only a password-verified request may reach the owner's phone; an
+    // unauthenticated caller must not be able to trigger pushes.
+    if password_verified {
+        state
+            .notifier
+            .notify(crate::notify::NotifyEvent::PairingRequested);
+    }
     record_security_event(
         &state,
         None,

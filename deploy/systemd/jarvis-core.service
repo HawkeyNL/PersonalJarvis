@@ -20,6 +20,8 @@ EnvironmentFile=-/etc/jarvis/secrets/zai.env
 EnvironmentFile=-/etc/jarvis/secrets/ollama-cloud.env
 EnvironmentFile=-/etc/jarvis/secrets/huggingface.env
 EnvironmentFile=-/etc/jarvis/secrets/jev.env
+# Optional owner-notification publisher token (docs/NOTIFICATIONS.md).
+EnvironmentFile=-/etc/jarvis/secrets/ntfy.env
 ExecStart=/opt/jarvis/current/jarvis-api
 # `systemctl reload` re-reads the staged private agent bundle only. A failed
 # reload keeps the previous bundle and reports the registry degraded.

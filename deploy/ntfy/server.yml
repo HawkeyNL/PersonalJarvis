@@ -15,10 +15,15 @@ cache-duration: "12h"
 auth-file: "/var/lib/ntfy/user.db"
 auth-default-access: "deny-all"
 enable-signup: false
-enable-login: true
+# Web-app login only; the phone apps authenticate without it. Enable only if
+# a client turns out to need it.
+enable-login: false
 
-# iOS only: ntfy.sh relays a poll request carrying the message id through
-# APNs; the message itself stays on this server.
+# iOS only: with this set, every published message is announced to ntfy.sh
+# as a poll request (message id and a hash of the topic URL), which relays it
+# through APNs; the message text stays on this server. ntfy.sh still sees the
+# Home Node's IP address and the timing, and Apple sees the timing. Remove
+# this line when no iPhone uses the ntfy app.
 upstream-base-url: "https://ntfy.sh"
 
 # No attachments (attachment-cache-dir stays unset) and no web app; the

@@ -6,10 +6,7 @@
 //! timeout and retry, and a full queue drops the event and counts it.
 
 use std::{
-    fs,
-    io::Read,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::Path,
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -23,8 +20,9 @@ use url::{Host, Url};
 
 /// Environment variable naming the full publish URL including the topic.
 pub const URL_ENV: &str = "JARVIS_NOTIFY_NTFY_URL";
-/// Root-owned (root:jarvis 0640) publisher access token.
-pub const TOKEN_FILE: &str = "/etc/jarvis/notify-ntfy.token";
+/// Publisher access token, delivered like the other Core secrets through a
+/// root-managed systemd `EnvironmentFile`.
+pub const TOKEN_ENV: &str = "JARVIS_NOTIFY_NTFY_TOKEN";
 
 const QUEUE_CAPACITY: usize = 16;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,7 +33,7 @@ const MIN_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_TOKEN_BYTES: usize = 256;
 const MAX_TOPIC_LEN: usize = 64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NotifyEvent {
     /// Monthly LLM spend reached 90% of the hard budget.
     BudgetNinetyPercent,
@@ -89,7 +87,7 @@ pub struct Notifier {
 
 struct Inner {
     queue: mpsc::Sender<NotifyEvent>,
-    last_sent: Mutex<[Option<Instant>; 2]>,
+    last_sent: Mutex<HashMap<NotifyEvent, Instant>>,
     /// (year, month) in UTC of the last budget notification, matching the
     /// calendar month `jarvis_usage::month_total_eur` sums over.
     budget_month: Mutex<Option<(i32, u8)>>,
@@ -97,13 +95,8 @@ struct Inner {
 }
 
 impl Notifier {
-    /// Read the protected token and start the worker. `Err` is a stable,
-    /// non-sensitive reason; the caller keeps notifications disabled.
-    pub fn from_config(raw_url: &str, token_file: &Path) -> Result<Self, &'static str> {
-        Self::start(raw_url, &read_token(token_file)?)
-    }
-
-    /// Validate the URL and token and spawn the publish worker.
+    /// Validate the URL and token and spawn the publish worker. `Err` is a
+    /// stable, non-sensitive reason; the caller keeps notifications disabled.
     pub fn start(raw_url: &str, token: &str) -> Result<Self, &'static str> {
         start_with(
             parse_url(raw_url)?,
@@ -117,7 +110,7 @@ impl Notifier {
         Self {
             inner: Some(Arc::new(Inner {
                 queue,
-                last_sent: Mutex::new([None; 2]),
+                last_sent: Mutex::new(HashMap::new()),
                 budget_month: Mutex::new(None),
                 dropped: AtomicU64::new(0),
             })),
@@ -136,11 +129,13 @@ impl Notifier {
                 .last_sent
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            let slot = &mut last[event as usize];
-            if slot.is_some_and(|at| now.duration_since(at) < MIN_INTERVAL) {
+            if last
+                .get(&event)
+                .is_some_and(|at| now.duration_since(*at) < MIN_INTERVAL)
+            {
                 return;
             }
-            *slot = Some(now);
+            last.insert(event, now);
         }
         if inner.queue.try_send(event).is_err() {
             let dropped = inner.dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -153,6 +148,9 @@ impl Notifier {
     }
 
     /// Call after every refresh of this month's spend.
+    // ponytail: the month is read here, not with the spend total; a refresh
+    // racing the UTC month boundary can attribute last month's total to the
+    // new month. Pass the month in from the usage query if that matters.
     pub fn budget_spend(&self, spent_cents: u64, budget_cents: u64) {
         if self.budget_crossed(spent_cents, budget_cents, current_month()) {
             self.notify(NotifyEvent::BudgetNinetyPercent);
@@ -326,39 +324,6 @@ fn parse_token(raw: &[u8]) -> Result<HeaderValue, &'static str> {
         .map_err(|_| "notification token is invalid")?;
     value.set_sensitive(true);
     Ok(value)
-}
-
-/// Same protection rules as other root-provisioned inputs: no symlink, a
-/// root-owned directory nobody else can write, a root-owned single-link file
-/// without group-write or world access.
-fn read_token(path: &Path) -> Result<String, &'static str> {
-    let parent = path.parent().ok_or("notification token path is invalid")?;
-    let dir = fs::symlink_metadata(parent).map_err(|_| "notification token unavailable")?;
-    if !dir.is_dir() || dir.uid() != 0 || dir.mode() & 0o022 != 0 {
-        return Err("notification token directory is unsafe");
-    }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|_| "notification token unavailable")?;
-    let info = file
-        .metadata()
-        .map_err(|_| "notification token unavailable")?;
-    if !info.is_file()
-        || info.uid() != 0
-        || info.mode() & 0o027 != 0
-        || info.nlink() != 1
-        || info.len() > MAX_TOKEN_BYTES as u64
-    {
-        return Err("notification token file is unsafe");
-    }
-    let mut raw = Vec::new();
-    file.take(MAX_TOKEN_BYTES as u64 + 1)
-        .read_to_end(&mut raw)
-        .map_err(|_| "notification token unavailable")?;
-    parse_token(&raw)?;
-    String::from_utf8(raw).map_err(|_| "notification token is invalid")
 }
 
 #[cfg(test)]
@@ -582,15 +547,5 @@ mod tests {
             assert!(parse_token(bad).is_err());
         }
         assert!(parse_token(b"tk_abc").unwrap().is_sensitive());
-    }
-
-    #[test]
-    fn a_token_file_not_owned_by_root_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("notify-ntfy.token");
-        fs::write(&path, "tk_fixture\n").unwrap();
-        // Rootless fixture: the directory and file belong to the test user.
-        assert!(read_token(&path).is_err());
-        assert!(Notifier::from_config("http://127.0.0.1:2586/t", &path).is_err());
     }
 }

@@ -510,9 +510,9 @@ async fn main() -> anyhow::Result<()> {
         .filter(|value| !value.trim().is_empty())
     {
         None => jarvis_api::notify::Notifier::default(),
-        Some(url) => match jarvis_api::notify::Notifier::from_config(
+        Some(url) => match jarvis_api::notify::Notifier::start(
             &url,
-            Path::new(jarvis_api::notify::TOKEN_FILE),
+            &std::env::var(jarvis_api::notify::TOKEN_ENV).unwrap_or_default(),
         ) {
             Ok(notifier) => {
                 tracing::info!("owner notifications enabled");
