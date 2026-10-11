@@ -1,5 +1,7 @@
 # Goal: Intelligent Model Router v1 + Secure Credential Manager
 
+> **Status (2026-10-11):** Implemented — Tiered routing, provider health and fallback, pricing registry, provider adapters, research mode and the root-operated credential manager exist in `crates/llm`, `jarvis-api` and `deploy/systemd`. Remaining gaps are tracked in `docs/MODEL_ACCESS_AND_BUDGET_CONTROL_GOAL.md`.
+
 Implement an intelligent, cost-aware multi-provider model router for PersonalJarvis and a root-operated credential manager for the Ubuntu Home Node.
 
 Work against the current architecture. Preserve all existing Home Node, private AgentRegistry, immutable release, SurrealDB, approval, sandbox and security boundaries.

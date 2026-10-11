@@ -1,5 +1,7 @@
 # Goal: Owner-selectable brain, persistent Codex coding sessions, and automatic private-agent deployment
 
+> **Status (2026-10-11):** Implemented — The owner brain preference API, persistent Codex coding sessions and runs (`/v1/coding/*`) and the private agent bundle updater (`deploy/private`, `jarvis-private-agent-updater`) exist. Coding budget integration is partial; see the budget goal.
+
 Implement three related operational capabilities for PersonalJarvis:
 
 1. the owner can choose/control Jarvis's brain/model policy from the Jarvis app/API;

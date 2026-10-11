@@ -1,5 +1,7 @@
 # Goal: private agent runtime boundary and immutable Jarvis persona
 
+> **Status (2026-10-11):** Partly implemented — The `AgentRegistry`, bundle validation and installer tooling are in place and Core loads the registry at start and hot-reloads it on SIGHUP. `AgentRun` is not wired into execution and the `AgentChangeProposal` pipeline is missing.
+
 Implement a production-safe agent registry/runtime boundary in the public `PersonalJarvis` repository while keeping all real personal agent definitions private in `HawkeyNL/PersonalJarvisAgents`.
 
 ## Context

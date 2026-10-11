@@ -1,5 +1,7 @@
 # Goal: improve Home Node setup and verification output UX
 
+> **Status (2026-10-11):** Implemented — Setup and verification scripts use the shared presentation helper `deploy/lib/ui.sh`, covered by `test-output-presentation.sh` and `test-ui-tty.sh`.
+
 Implement a human-friendly terminal presentation for the production Home Node setup and verification scripts without changing their security semantics, exit behavior, idempotency, or machine-readable logs.
 
 ## Current problem

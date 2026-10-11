@@ -1,5 +1,7 @@
 # Goal addendum: Rust-first Jarvis administration and deployment orchestration
 
+> **Status (2026-10-11):** Partly implemented — The Rust `jarvis` binary owns the owner-facing commands and update orchestration. Home Node setup, verification and several system helpers (`deploy/systemd/*.sh`) remain Bash.
+
 This addendum is mandatory scope for PR #29.
 
 The v0.0.10 production regressions exposed a broader maintainability problem: security-sensitive Home Node orchestration is spread across Bash scripts that mix TTY handling, secrets, state transitions, subprocess execution, retries, rollback, parsing and presentation.

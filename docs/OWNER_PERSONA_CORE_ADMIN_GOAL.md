@@ -1,5 +1,7 @@
 # Goal: owner-only Jarvis persona management in Core Admin
 
+> **Status (2026-10-11):** Not started — `deploy/private/install-private-config.sh` installs the protected persona, but Core Admin has no persona editing, validation or rollback workflow.
+
 Add a safe owner workflow for updating the protected private `Jarvis.md` from the Jarvis Core Admin experience without creating a Jarvis self-modification capability.
 
 Work against CURRENT `main` and preserve:
