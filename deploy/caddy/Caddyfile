@@ -1,12 +1,20 @@
 # Public Jarvis HTTPS ingress for the Ubuntu Home Node.
 #
-# Install this as /etc/caddy/Caddyfile and set JARVIS_PUBLIC_HOSTNAME through
-# the accompanying systemd drop-in. It intentionally uses TLS-ALPN-01 only, so
-# the router and firewall need to expose TCP 443 — never port 8080 or port 80.
+# Install this as /etc/caddy/Caddyfile together with the two systemd drop-ins
+# in this directory (see README.md); one sets JARVIS_PUBLIC_HOSTNAME. It
+# intentionally uses TLS-ALPN-01 only, so the router and firewall need to
+# expose TCP 443 — never port 8080 or port 80.
 {
 	# Do not create an HTTP listener solely to redirect traffic. HTTP is not a
 	# supported public Jarvis transport.
 	auto_https disable_redirects
+
+	# Admin API on a Unix socket that only the caddy user (and root) can use,
+	# not on TCP 127.0.0.1:2019 where any local process could reconfigure the
+	# ingress. `caddy reload --config` reads this address from the config, so
+	# `systemctl reload caddy` keeps working. /run/caddy comes from
+	# caddy.service.d-jarvis-admin.conf.
+	admin unix//run/caddy/admin.sock
 }
 
 {$JARVIS_PUBLIC_HOSTNAME} {

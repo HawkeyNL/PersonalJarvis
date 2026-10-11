@@ -3,6 +3,91 @@
 `Caddyfile` is the public HTTPS ingress template. TLS ends at Caddy, which
 forwards API traffic to Core on the same host.
 
+## Admin API on a Unix socket
+
+The template's global options set `admin unix//run/caddy/admin.sock`, so
+Caddy's admin API is not on TCP `127.0.0.1:2019`, where every local user and
+service could replace the running configuration. The drop-in
+`caddy.service.d-jarvis-admin.conf` makes systemd create `/run/caddy` as
+`caddy:caddy` with mode `0700` at each start. Caddy creates the socket with the
+service umask (`0755` with the default `0022`); connecting needs write access,
+so only `caddy` and root can use it. The Ubuntu package (Caddy 2.6) has no
+socket file mode option, so the directory is what restricts access.
+
+`systemctl reload caddy` keeps working: the packaged unit runs
+`caddy reload --config /etc/caddy/Caddyfile --force`, which reads the admin
+address from the file it loads. Other `caddy` commands that talk to a running
+instance need root and `--config /etc/caddy/Caddyfile` or
+`--address unix//run/caddy/admin.sock`.
+
+### Shared Caddy instance
+
+The admin endpoint belongs to the whole Caddy process, not to one site. A
+Caddyfile has a single global options block, at the top. If the installed
+`/etc/caddy/Caddyfile` also serves other sites or products, this change applies
+to them too: anything that uses `http://localhost:2019` stops working. That
+includes scripts or services that post configuration, `caddy-api.service` or
+`caddy run --resume` setups, and Prometheus scraping of the admin `/metrics`
+endpoint. Check this before the rollout. Add the `admin` line to the existing
+global options block; never add a second block.
+
+### Rollout
+
+Run these as the owner; they restart Caddy, which drops connections to every
+site it serves for about a second. Certificates are reused from storage.
+
+1. Check what uses the admin API and whether other sites share the instance:
+   - `sudo ss -ltnp 'sport = :2019'` should list only `caddy`;
+   - `systemctl cat caddy` shows the unit and any existing drop-ins (look for
+     `--resume`, another `RuntimeDirectory=` or `caddy-api.service`);
+   - `sudo grep -n -E '2019|admin|^[^#[:space:]].*\{' /etc/caddy/Caddyfile`
+     lists global options and all site blocks;
+   - search the other products' configs, scripts and monitoring for `2019`;
+   - `ls -ld /run/caddy` should fail with "No such file or directory". If it
+     exists, find out who uses it before continuing: systemd takes it over and
+     deletes it whenever Caddy stops.
+2. Back up: `sudo cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak-admin-tcp`.
+3. Install the drop-in and load it (this alone changes nothing at runtime):
+
+   ```sh
+   sudo install -d -o root -g root -m 0755 /etc/systemd/system/caddy.service.d
+   sudo install -o root -g root -m 0644 deploy/caddy/caddy.service.d-jarvis-admin.conf \
+     /etc/systemd/system/caddy.service.d/jarvis-admin.conf
+   sudo systemctl daemon-reload
+   ```
+
+4. With `sudoedit /etc/caddy/Caddyfile`, add `admin unix//run/caddy/admin.sock`
+   to the global options block.
+5. Validate with the hostname environment that Caddy's service loads:
+   `sudo sh -c 'set -a; . /etc/jarvis/public.env; caddy validate --config /etc/caddy/Caddyfile'`.
+6. Restart, do not reload: `sudo systemctl restart caddy`. The running instance
+   still listens on TCP 2019, while `systemctl reload` would send the new
+   configuration to the socket address in the new file, which does not exist
+   yet. That reload fails and leaves the old configuration running. A restart
+   also lets systemd create `/run/caddy`.
+7. Verify:
+   - `ss -ltn | grep ':2019'` prints nothing;
+   - `sudo stat -c '%U:%G %a' /run/caddy` prints `caddy:caddy 700` and
+     `sudo ls -l /run/caddy/admin.sock` shows a socket owned by `caddy`;
+   - `sudo journalctl -u caddy -n 50` shows `admin endpoint started` with
+     `unix//run/caddy/admin.sock`;
+   - `sudo systemctl reload caddy` succeeds (this uses the socket);
+   - the Jarvis hostname and every other site on the instance still work.
+
+### Roll back
+
+Restore the backup and restart (a reload cannot work here: it would look for
+the admin API on TCP 2019, which is no longer listening):
+
+```sh
+sudo cp -a /etc/caddy/Caddyfile.bak-admin-tcp /etc/caddy/Caddyfile
+sudo systemctl restart caddy
+```
+
+The drop-in is harmless without the `admin` line. To remove it as well:
+`sudo rm /etc/systemd/system/caddy.service.d/jarvis-admin.conf`, then
+`sudo systemctl daemon-reload` and `sudo systemctl restart caddy`.
+
 ## Optional: Core API over a Unix socket
 
 As defense in depth, Core can additionally serve its API on a Unix socket that

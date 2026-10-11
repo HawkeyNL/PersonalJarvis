@@ -68,6 +68,8 @@ class PublicDownloadTests(unittest.TestCase):
                 raw = result.stdout.decode().replace("/var/lib/jarvis-public-downloads", str(archive))
                 raw = raw.replace("127.0.0.1:8080", f"127.0.0.1:{api.server_port}")
                 config = json.loads(raw)
+                # The shipped admin API is Unix-socket only; the isolated run disables it.
+                self.assertEqual(config["admin"], {"listen": "unix//run/caddy/admin.sock"})
                 config["admin"] = {"disabled": True, "config": {"persist": False}}
                 config["apps"].pop("tls", None)
                 server = next(iter(config["apps"]["http"]["servers"].values()))
