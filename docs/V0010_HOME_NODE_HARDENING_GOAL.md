@@ -1,5 +1,7 @@
 # Goal: v0.0.10 Home Node hardening + polished `sudo jarvis` UX
 
+> **Status (2026-10-11):** Implemented — The TTY, runtime-directory, release-activation and `sudo jarvis` UX fixes have code and shell-test coverage (for example `test-ui-tty.sh`, `test-systemd-runtime-lifecycle.sh`). The real-node reboot and acceptance sequences are not verifiable from the repository.
+
 Perform a focused production hardening pass after the real Ubuntu Home Node upgrade exposed two v0.0.10 deployment regressions. Also polish the newly merged unified `sudo jarvis` owner CLI so it is pleasant and safe to use interactively.
 
 Do not weaken any security boundary to improve UX. Work against current main and inspect adjacent Home Node systemd/deployment scripts for the same classes of bug rather than fixing only the two observed lines.

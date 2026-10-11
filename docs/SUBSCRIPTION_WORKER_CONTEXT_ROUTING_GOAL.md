@@ -1,5 +1,7 @@
 # Goal: subscription workers, bounded context routing and owner-only provider authentication
 
+> **Status (2026-10-11):** Implemented — Claude and Codex subscription workers, bounded context compilation and owner-only AI account management (Core Admin `AiAccountsView`, `jarvis` CLI) exist. Agent integration depends on the AgentRun wiring noted in `docs/PRIVATE_AGENT_RUNTIME_GOAL.md`.
+
 Implement the next routing/authentication layer for PersonalJarvis on CURRENT `main`.
 
 This goal extends, and must not weaken:

@@ -1,12 +1,14 @@
 # Goal: private agent runtime boundary and immutable Jarvis persona
 
+> **Status (2026-10-11):** Partly implemented — The `AgentRegistry`, bundle validation and installer tooling are in place and Core loads the registry at start. `AgentRun` is not wired into execution and the `AgentChangeProposal` pipeline is missing.
+
 Implement a production-safe agent registry/runtime boundary in the public `PersonalJarvis` repository while keeping all real personal agent definitions private in `HawkeyNL/PersonalJarvisAgents`.
 
 ## Context
 
 `PersonalJarvis` is public and contains runtime/API/app/deployment code. `PersonalJarvisAgents` is private and contains the real personal agent Markdown definitions. Public GitHub CI MUST NOT require access to the private repository or any private agent content.
 
-The current `jarvis-core` only owns persona loading (`load_persona`) and explicitly says future orchestration has not yet been implemented. There is currently no production Agent Registry/loader/runtime boundary in `jarvis-core`.
+`jarvis-core` owns persona loading (`load_persona`) and the `AgentRegistry` loader; the runtime execution boundary (`AgentRun`) is not yet wired into execution.
 
 The private agent repository explicitly defines its profiles as documentation/contracts: profiles may request capabilities but MUST NOT grant themselves runtime capability, policy exceptions, secret access, or execution rights. The public runtime remains authoritative.
 

@@ -1,5 +1,7 @@
 # Goal: Unified `jarvis` Home Node administration CLI
 
+> **Status (2026-10-11):** Implemented — The Rust `jarvis` binary (`crates/admin`) provides the update, credentials, models, agents, status, health and logs commands with CLI tests. Some setup and verification flows still delegate to shell helpers.
+
 Implement a single first-class root-operated administration command for the PersonalJarvis Home Node.
 
 The owner should no longer need to remember separate script paths or manually enter `/etc/jarvis` for routine administration.

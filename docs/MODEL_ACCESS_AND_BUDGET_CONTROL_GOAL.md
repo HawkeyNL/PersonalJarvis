@@ -1,5 +1,7 @@
 # Goal extension: Model access control, provider discovery, and budget-aware long-task planning
 
+> **Status (2026-10-11):** Partly implemented — Model allowlist, enable/disable toggles, global budgets, spend accounting, preflight estimates and durable budget reservations are done. Provider/model caps, checkpoints, approval thresholds and billing reconciliation are missing.
+
 This document is REQUIRED scope for PR #26 together with `docs/INTELLIGENT_MODEL_ROUTER_GOAL.md`.
 
 The owner must be able to decide exactly which provider models Jarvis is allowed to use after provider credentials are configured. Jarvis must also reason about projected cost before committing to long-running or high-volume API work.
