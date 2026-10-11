@@ -25,11 +25,15 @@ grep -Fxq 'User=jarvis-codex' "$codex_broker"
 grep -Fxq 'StateDirectory=jarvis-codex-broker' "$codex_broker"
 grep -Fxq 'StateDirectoryMode=0700' "$codex_broker"
 # The App Server shares the broker's uid: it must not reach the broker state
-# directly or through /proc/<broker-pid>/root.
+# directly. The non-dumpable broker covers /proc/<broker-pid>/root.
 app_server="$repo_dir/deploy/systemd/jarvis-codex.service"
 grep -Fxq 'User=jarvis-codex' "$app_server"
 grep -Fxq 'ProtectProc=invisible' "$app_server"
-grep -Fxq 'PrivatePIDs=true' "$app_server"
+if grep -Eq '^PrivatePIDs=' "$app_server"; then
+    echo "codex app-server must not become PID 1 of a private PID namespace" >&2
+    exit 1
+fi
+grep -Fq 'libc::PR_SET_DUMPABLE, 0' "$repo_dir/jarvis-api/src/bin/jarvis-codex-broker.rs"
 grep -Eq '^InaccessiblePaths=.*-/var/lib/jarvis-codex-broker( |$)' "$app_server"
 grep -Eq '^InaccessiblePaths=.*-/var/lib/jarvis-codex-broker( |$)' \
     "$repo_dir/deploy/systemd/jarvis-codex-chat.service"

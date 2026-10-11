@@ -154,6 +154,16 @@ impl SandboxOwnershipRecorder for DurableSandboxOwnership<'_> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The Codex App Server and chat worker run as the same jarvis-codex uid.
+    // A non-dumpable process blocks their same-uid ptrace and
+    // /proc/<pid>/root access, which would otherwise reach this broker's
+    // replay markers through its mount namespace.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        bail!(
+            "mark Codex broker non-dumpable: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     // Root is intentionally not required: this dedicated account owns neither
     // protected persona/configuration nor Docker. systemd supplies its socket
     // directory and a narrowly readable database principal.

@@ -7,10 +7,12 @@
 //! within its TTL. Markers are never removed.
 //!
 //! Limitation: the Codex broker shares the `jarvis-codex` uid with the Codex
-//! App Server and the Codex chat worker. Their units keep the broker's state
-//! directory and processes out of reach (`InaccessiblePaths=`,
-//! `PrivatePIDs=`, `ProtectProc=`), but file permissions alone do not. A
-//! dedicated broker uid is the full fix and remains a follow-up.
+//! App Server and the Codex chat worker, so file permissions alone do not
+//! separate them. The broker marks itself non-dumpable (blocking same-uid
+//! ptrace and `/proc/<pid>/root`), and their units hide the broker's state
+//! directory (`InaccessiblePaths=`) and run with `ProtectProc=invisible`
+//! (the chat worker also with `PrivatePIDs=`). A dedicated broker uid is the
+//! full fix and remains a follow-up.
 use std::{
     fmt, fs, io,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},

@@ -621,11 +621,12 @@ most one run. The request ID is used up once the checks pass, even when the
 Codex run then fails to start: the owner signs a new request to try again.
 
 Limitation: the Codex broker shares the `jarvis-codex` user with the Codex App
-Server (`jarvis-codex.service`) and the Codex chat worker. Those two units
-cannot reach the broker's state directory or see its process
-(`InaccessiblePaths=`, `PrivatePIDs=`, `ProtectProc=invisible`), but file
-permissions alone do not separate them. A dedicated user for the Codex broker
-is the full fix and is planned as a follow-up.
+Server (`jarvis-codex.service`) and the Codex chat worker, so file permissions
+alone do not separate them. The broker marks itself non-dumpable, which blocks
+their access to it through ptrace and `/proc/<pid>/root`, and both units hide
+the broker's state directory (`InaccessiblePaths=`) and run with
+`ProtectProc=invisible`. A dedicated user for the Codex broker is the full fix
+and is planned as a follow-up.
 
 Rollback: set `JARVIS_BROKER_REQUIRE_TRUSTED_KEYS=false` in
 `/etc/jarvis/core.env` (configuration broker) and
