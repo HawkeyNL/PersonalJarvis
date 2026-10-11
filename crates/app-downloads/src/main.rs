@@ -1,4 +1,5 @@
-//! Read-only retention planner and fixed-path trusted release importers.
+//! Read-only retention planner and fixed-path trusted release importers;
+//! `sync-release` also retires public releases outside the retention policy.
 use std::io::{self, Read};
 
 use jarvis_app_downloads::{plan, Entry};
@@ -114,6 +115,11 @@ async fn sync_release() -> Result<(), &'static str> {
     public_store.render_index()?;
     store.activate(&destination)?;
     println!("Verified desktop and Android updates activated; iOS IPA published for local owner signing only.");
+    // After activation, so a retention failure never blocks an update.
+    let retired = public_store.retire_releases()?;
+    if retired > 0 {
+        println!("Retired {retired} public release(s) outside the retention rule.");
+    }
     Ok(())
 }
 

@@ -98,10 +98,9 @@ the authenticated mirror adapter and separate reviewed activation policy.
 
 ## Retention and limitations
 
-The Rust planner supports iOS and the previously agreed version-line rules.
-Automatic deletion is deliberately not connected to this initial importer:
-all approved candidates remain until the transactional retention integration is
-reviewed/tested. No existing protected mirror/history is deleted. The importer
+The Rust planner supports iOS and the version-line rules. Full client releases
+are retired by `sync-release`; standalone iOS candidates under `ios/` are not
+deleted automatically and stay until the owner removes them. No existing protected mirror/history is deleted. The importer
 checks inventory integrity before rebuilding the index, streams downloads to
 disk, bounds metadata to 1 MiB and an IPA to 2 GiB, and serializes writers.
 The service has a 192 MiB memory ceiling. No Docker socket is needed or granted.

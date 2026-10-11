@@ -39,10 +39,9 @@ symlink inside a deleted release is removed as a link, not followed.
 
 These are reported by `status` only:
 
-- **Public downloads** (`/var/lib/jarvis-public-downloads`). The public page
-  lists every version on purpose and follows the owner retention policy of
-  `jarvis-app-downloads plan`; deleting here would also leave dead links on
-  the page until the next sync.
+- **Public downloads** (`/var/lib/jarvis-public-downloads`). `jarvis-app-downloads
+  sync-release` retires old releases itself under the owner retention policy
+  (see `crates/app-downloads/README.md`); housekeeping never deletes there.
 - **The legacy app mirror** (`/var/lib/jarvis/app-updates`). The owner decides
   whether to remove it.
 - **Docker.** Dangling images are counted. They cannot be attributed to Jarvis

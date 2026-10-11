@@ -52,6 +52,100 @@ fn download_version_picker_defaults_to_semver_latest_without_scripts() {
 }
 
 #[test]
+fn retirement_removes_old_public_releases_after_the_index_drops_them() {
+    let (_temp, root, public) = dirs();
+    let owner = unsafe { libc::geteuid() };
+    let store = ReleaseStore::open(&root, owner).unwrap();
+    for patch in 1..=5 {
+        prepare(
+            &store,
+            &Fixture::new(&format!("0.1.{patch}"), patch),
+            &public,
+        )
+        .unwrap();
+    }
+    let index = super::super::Store::open(&public, owner).unwrap();
+    index.render_index().unwrap();
+    assert_eq!(index.retire_releases().unwrap(), 2);
+    let html = fs::read_to_string(public.join("index.html")).unwrap();
+    for patch in 1..=5 {
+        let version = format!("0.1.{patch}");
+        let present = patch >= 3;
+        assert_eq!(
+            public.join(format!("releases/v{version}")).exists(),
+            present
+        );
+        assert_eq!(
+            html.contains(&format!("data-version=\"{version}\"")),
+            present
+        );
+        // The authenticated update mirror is never pruned by public retention.
+        assert!(root.join(format!("releases/v{version}")).exists());
+    }
+    assert!(fs::read_dir(&public).unwrap().all(|e| !e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".retired-")));
+    assert_eq!(index.retire_releases().unwrap(), 0);
+}
+
+#[test]
+fn failed_retirement_restores_releases_and_sweeps_crash_leftovers() {
+    let (_temp, root, public) = dirs();
+    let owner = unsafe { libc::geteuid() };
+    let store = ReleaseStore::open(&root, owner).unwrap();
+    for patch in 1..=4 {
+        prepare(
+            &store,
+            &Fixture::new(&format!("0.1.{patch}"), patch),
+            &public,
+        )
+        .unwrap();
+    }
+    let index = super::super::Store::open(&public, owner).unwrap();
+    // An invalid iOS candidate makes the index rebuild fail after the moves.
+    fs::create_dir(public.join("ios/junk")).unwrap();
+    assert!(index.retire_releases().is_err());
+    for patch in 1..=4 {
+        assert!(public.join(format!("releases/v0.1.{patch}")).exists());
+    }
+    fs::remove_dir(public.join("ios/junk")).unwrap();
+    fs::create_dir_all(public.join(".retired-crash/v0.0.1")).unwrap();
+    fs::write(public.join(".retired-crash/v0.0.1/installer"), b"x").unwrap();
+    assert_eq!(index.retire_releases().unwrap(), 1);
+    assert!(!public.join(".retired-crash").exists());
+    assert!(!public.join("releases/v0.1.1").exists());
+    assert!(public.join("ios").exists());
+}
+
+#[test]
+fn retirement_fails_closed_on_an_unexpected_public_entry() {
+    let (_temp, root, public) = dirs();
+    let owner = unsafe { libc::geteuid() };
+    let store = ReleaseStore::open(&root, owner).unwrap();
+    for patch in 1..=4 {
+        prepare(
+            &store,
+            &Fixture::new(&format!("0.1.{patch}"), patch),
+            &public,
+        )
+        .unwrap();
+    }
+    let index = super::super::Store::open(&public, owner).unwrap();
+    for name in ["notes", "v0.1.9-rc.1"] {
+        fs::create_dir(public.join("releases").join(name)).unwrap();
+        assert!(index.retire_releases().is_err());
+        assert!(public.join("releases/v0.1.1").exists());
+        fs::remove_dir(public.join("releases").join(name)).unwrap();
+    }
+    symlink(&root, public.join("releases/v0.1.9")).unwrap();
+    assert!(index.retire_releases().is_err());
+    assert!(public.join("releases/v0.1.1").exists());
+    assert!(root.join("releases/v0.1.1").exists());
+}
+
+#[test]
 fn complete_signed_release_stages_and_activates_exact_api_layout() {
     let (_temp, root, public) = dirs();
     let owner = unsafe { libc::geteuid() };
