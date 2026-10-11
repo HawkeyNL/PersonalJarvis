@@ -31,7 +31,8 @@ RuntimeDirectoryMode=0700
 # Home of the opt-in API socket for Caddy (JARVIS_API_UNIX_SOCKET). The
 # directory becomes jarvis:caddy 2750: Caddy may traverse it, and the setgid
 # bit gives the socket Core creates (mode 0660) the caddy group without adding
-# Core to that group. Without a caddy group it stays private to jarvis.
+# Core to that group. If the chgrp fails the directory stays jarvis:jarvis and
+# Core refuses to open the socket (and to start) while it is configured.
 ExecStartPre=-+/usr/bin/chgrp caddy /run/jarvis-core
 ExecStartPre=+/usr/bin/chmod 2750 /run/jarvis-core
 

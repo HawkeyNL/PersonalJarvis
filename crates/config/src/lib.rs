@@ -384,9 +384,9 @@ pub struct AppConfig {
     #[serde(default)]
     pub trusted_proxy_ips: String,
 
-    /// Optional absolute path of a Unix socket on which Core additionally
-    /// serves the API for the local reverse proxy. Empty (the default) keeps
-    /// TCP-only behaviour. When set, forwarding headers are trusted only from
+    /// Optional Unix socket, directly inside [`API_SOCKET_DIR`], on which Core
+    /// additionally serves the API for the local reverse proxy. Empty (the
+    /// default) keeps TCP-only behaviour. When set, forwarding headers are trusted only from
     /// the proxy's kernel-reported uid on this socket, never over TCP.
     #[serde(default)]
     pub api_unix_socket: String,
@@ -402,6 +402,9 @@ pub struct AppConfig {
     #[serde(default)]
     pub bootstrap_allowed_cidrs: String,
 }
+
+/// The systemd `RuntimeDirectory` that holds Core's optional API socket.
+pub const API_SOCKET_DIR: &str = "/run/jarvis-core";
 
 fn default_bind_addr() -> String {
     "127.0.0.1:8080".to_string()
@@ -763,8 +766,12 @@ impl AppConfig {
             }
         }
 
-        if !self.api_unix_socket.is_empty() && !Path::new(&self.api_unix_socket).is_absolute() {
-            return Err("JARVIS_API_UNIX_SOCKET must be an absolute path".to_string());
+        if !self.api_unix_socket.is_empty()
+            && Path::new(&self.api_unix_socket).parent() != Some(Path::new(API_SOCKET_DIR))
+        {
+            return Err(format!(
+                "JARVIS_API_UNIX_SOCKET must name a socket directly inside {API_SOCKET_DIR}"
+            ));
         }
 
         if !self.public_hostname.is_empty()
@@ -1226,8 +1233,16 @@ mod tests {
             assert!(AppConfig::load()?.validate_runtime_security().is_err());
 
             jail.set_env("JARVIS_TRUSTED_PROXY_HOPS", "1");
-            jail.set_env("JARVIS_API_UNIX_SOCKET", "run/jarvis-core/api.sock");
-            assert!(AppConfig::load()?.validate_runtime_security().is_err());
+            for outside in [
+                "run/jarvis-core/api.sock",
+                "/tmp/api.sock",
+                "/run/jarvis-core/../api.sock",
+                "/run/jarvis-core/sub/api.sock",
+                "/run/jarvis-core",
+            ] {
+                jail.set_env("JARVIS_API_UNIX_SOCKET", outside);
+                assert!(AppConfig::load()?.validate_runtime_security().is_err());
+            }
             jail.set_env("JARVIS_API_UNIX_SOCKET", "/run/jarvis-core/api.sock");
             assert!(AppConfig::load()?.validate_runtime_security().is_ok());
             Ok(())

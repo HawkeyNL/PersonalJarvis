@@ -77,17 +77,20 @@ fn forwarded_client(peer: Option<Peer>, headers: &HeaderMap, hops: u32) -> Optio
     if hops == 0 {
         return direct;
     }
-    let ips = headers
+    let entries: Vec<&str> = headers
         .get("x-forwarded-for")?
         .to_str()
         .ok()?
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::parse)
-        .collect::<Result<Vec<IpAddr>, _>>()
-        .ok()?;
-    ips.len().checked_sub(hops as usize).map(|index| ips[index])
+        .collect();
+    // Only the entry the trusted proxy appended matters; anything before it
+    // is client-supplied and may be garbage without affecting the result.
+    entries
+        .get(entries.len().checked_sub(hops as usize)?)?
+        .parse()
+        .ok()
 }
 
 fn peer_hops(extensions: &Extensions, state: &AppState) -> (Option<Peer>, u32) {
@@ -126,27 +129,58 @@ pub(crate) fn arrived_via_https_proxy(
             .is_some_and(|value| value.eq_ignore_ascii_case("https"))
 }
 
-/// Resolve the reverse proxy's uid once at startup.
-pub fn proxy_uid() -> anyhow::Result<u32> {
-    // SAFETY: getpwnam is given a valid NUL-terminated name and its result is
-    // read immediately, before any other passwd lookup on this thread.
-    let entry = unsafe { libc::getpwnam(PROXY_USER.as_ptr()) };
-    if entry.is_null() {
-        bail!("reverse proxy account {PROXY_USER:?} is missing");
+/// The reverse proxy's identity, resolved once at startup.
+#[derive(Clone, Copy, Debug)]
+pub struct ProxyIdentity {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// `(uid, primary gid)` of a local account, or `None` if it does not exist.
+fn lookup_user(name: &CStr) -> Option<(u32, u32)> {
+    // SAFETY: zeroed passwd is a valid out-parameter; getpwnam_r only writes
+    // into it and `buf`, both of which outlive the call.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut result = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwnam_r(
+            name.as_ptr(),
+            &mut entry,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    (status == 0 && !result.is_null()).then_some((entry.pw_uid, entry.pw_gid))
+}
+
+/// Resolve the Caddy account. It must be a distinct identity from Core, or
+/// any Core-owned connection would count as the proxy.
+pub fn proxy_identity() -> anyhow::Result<ProxyIdentity> {
+    let (uid, gid) = lookup_user(PROXY_USER)
+        .with_context(|| format!("reverse proxy account {PROXY_USER:?} is missing"))?;
+    // SAFETY: geteuid has no preconditions.
+    if uid == unsafe { libc::geteuid() } {
+        bail!("reverse proxy account must not be Core's own user");
     }
-    Ok(unsafe { (*entry).pw_uid })
+    Ok(ProxyIdentity { uid, gid })
 }
 
 /// Bind the API socket inside its systemd-managed runtime directory. The
-/// directory's group (setgid) decides who may connect; the socket itself is
-/// group read/write only. Trust still comes from the peer uid, not the mode.
-pub fn bind_api_socket(path: &Path) -> anyhow::Result<UnixListener> {
+/// directory must carry the proxy's group (setgid, so the socket inherits it)
+/// and grant nothing to anyone else; the socket itself is group read/write
+/// only. Trust still comes from the peer uid, not the mode.
+pub fn bind_api_socket(path: &Path, proxy_gid: u32) -> anyhow::Result<UnixListener> {
     let parent = path.parent().context("API socket path has no parent")?;
     let dir = fs::symlink_metadata(parent).context("API socket directory unavailable")?;
     // SAFETY: geteuid has no preconditions.
     let euid = unsafe { libc::geteuid() };
-    if !dir.is_dir() || dir.uid() != euid || dir.mode() & 0o007 != 0 {
-        bail!("unsafe API socket directory");
+    if !dir.is_dir() || dir.uid() != euid || dir.mode() & 0o027 != 0 {
+        bail!("unsafe API socket directory: must be owned by Core with no group write or other access");
+    }
+    if dir.gid() != proxy_gid {
+        bail!("API socket directory group is not the reverse proxy's group; check the jarvis-core unit's chgrp step");
     }
     match fs::symlink_metadata(path) {
         Ok(info) if info.file_type().is_socket() && info.uid() == euid => fs::remove_file(path)?,
@@ -241,16 +275,40 @@ mod tests {
         for headers in [HeaderMap::new(), xff("not-an-ip"), xff("9.9.9.9")] {
             assert_eq!(forwarded_client(tcp(LOOPBACK), &headers, 2), None);
         }
+        // The selected entry itself must parse.
+        let headers = xff("203.0.113.7, not-an-ip");
+        assert_eq!(forwarded_client(unix(PROXY), &headers, 1), None);
+    }
+
+    #[test]
+    fn client_supplied_garbage_before_the_proxy_entry_is_ignored() {
+        let headers = xff("not-an-ip, , 203.0.113.7");
+        assert_eq!(
+            forwarded_client(unix(PROXY), &headers, 1),
+            Some("203.0.113.7".parse().unwrap())
+        );
+    }
+
+    fn private_dir() -> (tempfile::TempDir, u32) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o750)).unwrap();
+        let gid = fs::metadata(dir.path()).unwrap().gid();
+        (dir, gid)
+    }
+
+    #[test]
+    fn missing_accounts_are_reported_as_absent() {
+        assert_eq!(lookup_user(c"root"), Some((0, 0)));
+        assert_eq!(lookup_user(c"jarvis-no-such-account"), None);
     }
 
     #[tokio::test]
     async fn bound_socket_reports_the_connecting_uid() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o750)).unwrap();
+        let (dir, gid) = private_dir();
         let path = dir.path().join("api.sock");
         // A stale socket from a crashed process is replaced.
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
-        let listener = bind_api_socket(&path).unwrap();
+        let listener = bind_api_socket(&path, gid).unwrap();
         let mode = fs::metadata(&path).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o660);
 
@@ -264,15 +322,21 @@ mod tests {
         drop(listener);
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"").unwrap();
-        assert!(bind_api_socket(&path).is_err());
+        assert!(bind_api_socket(&path, gid).is_err());
         assert!(path.exists());
     }
 
     #[test]
-    fn world_accessible_socket_directory_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(bind_api_socket(&dir.path().join("api.sock")).is_err());
+    fn unsafe_socket_directories_are_refused() {
+        let (dir, gid) = private_dir();
+        let path = dir.path().join("api.sock");
+        // Without the proxy's group (a failed chgrp) Core must not listen.
+        assert!(bind_api_socket(&path, gid.wrapping_add(1)).is_err());
+        for mode in [0o755, 0o770] {
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+            assert!(bind_api_socket(&path, gid).is_err());
+        }
+        assert!(!path.exists());
     }
 
     /// End to end over a real socket: axum captures the peer uid and only the
@@ -289,7 +353,8 @@ mod tests {
         }
         async fn request(dir: &Path, proxy: u32) -> String {
             let path = dir.join(format!("{proxy}.sock"));
-            let listener = bind_api_socket(&path).unwrap();
+            let gid = fs::metadata(dir).unwrap().gid();
+            let listener = bind_api_socket(&path, gid).unwrap();
             let app = Router::new().route("/", get(seen)).with_state(proxy);
             tokio::spawn(async move {
                 axum::serve(listener, app.into_make_service_with_connect_info::<Peer>())
@@ -308,8 +373,7 @@ mod tests {
             response
         }
 
-        let dir = tempfile::tempdir().unwrap();
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o750)).unwrap();
+        let (dir, _) = private_dir();
         let euid = unsafe { libc::geteuid() };
         assert!(request(dir.path(), euid)
             .await

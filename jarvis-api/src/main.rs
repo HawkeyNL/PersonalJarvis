@@ -455,10 +455,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let trusted_proxy_ips = config.trusted_proxy_ips().map_err(anyhow::Error::msg)?;
-    let unix_proxy_uid = if config.api_unix_socket.is_empty() {
+    let unix_proxy = if config.api_unix_socket.is_empty() {
         None
     } else {
-        Some(jarvis_api::proxy_uid()?)
+        Some(jarvis_api::proxy_identity()?)
     };
     let bootstrap_enrollment = config.bootstrap_enrollment().map_err(anyhow::Error::msg)?;
     let update_mirror_root = std::env::var("JARVIS_APP_UPDATE_MIRROR_ROOT")
@@ -573,7 +573,7 @@ async fn main() -> anyhow::Result<()> {
         },
         trusted_proxy_hops: config.trusted_proxy_hops,
         trusted_proxy_ips: Arc::new(trusted_proxy_ips),
-        unix_proxy_uid,
+        unix_proxy_uid: unix_proxy.map(|proxy| proxy.uid),
         bootstrap_enrollment,
         app_update_mirror,
     };
@@ -606,9 +606,9 @@ async fn main() -> anyhow::Result<()> {
             .clone()
             .into_make_service_with_connect_info::<jarvis_api::Peer>(),
     );
-    if unix_proxy_uid.is_some() {
+    if let Some(proxy) = unix_proxy {
         let socket = Path::new(&config.api_unix_socket);
-        let unix = jarvis_api::bind_api_socket(socket)?;
+        let unix = jarvis_api::bind_api_socket(socket, proxy.gid)?;
         tracing::info!(path = %socket.display(), "jarvis-api listening on Unix socket");
         let unix = axum::serve(
             unix,
