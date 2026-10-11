@@ -455,16 +455,37 @@ fn read_file(sandbox: &Sandbox, path: &str) -> Result<String, AgentError> {
     std::fs::read_to_string(&file).map_err(|e| AgentError::Exec(e.to_string()))
 }
 
+/// `grep` exclusions mirroring [`is_secret`], so a recursive search never opens
+/// a file that `read_file` would refuse.
+const GREP_SECRET_EXCLUDES: &[&str] = &[
+    "--exclude=.env",
+    "--exclude=.env.*",
+    "--exclude=*.pem",
+    "--exclude=*.key",
+    "--exclude=id_rsa*",
+    "--exclude=id_ed25519*",
+    "--exclude-dir=.ssh",
+];
+
 async fn grep(sandbox: &Sandbox, pattern: &str, path: &str) -> Result<String, AgentError> {
     let target = sandbox.resolve(path)?;
+    let target = target.to_string_lossy();
     // `-e` guards a pattern starting with `-`; `--` ends option parsing. Args are
-    // passed directly (no shell), so the pattern can't inject commands.
-    run_cmd(
-        sandbox.root(),
-        "grep",
-        &["-rnI", "-e", pattern, "--", &target.to_string_lossy()],
-    )
-    .await
+    // passed directly (no shell), so the pattern can't inject commands. `-r`
+    // does not follow symlinks below the (canonical) target.
+    let mut args = vec!["-rnIHZ"];
+    args.extend_from_slice(GREP_SECRET_EXCLUDES);
+    args.extend_from_slice(&["-e", pattern, "--", &target]);
+    let out = run_cmd(sandbox.root(), "grep", &args).await?;
+    // `-HZ` prints every file name, ending it with NUL. Re-check each name with
+    // `is_secret` so the read filter stays the single source of truth; a line
+    // without a name is dropped (fail closed).
+    Ok(out
+        .lines()
+        .filter_map(|line| line.split_once('\0'))
+        .filter(|(file, _)| !is_secret(Path::new(file)))
+        .map(|(file, rest)| format!("{file}:{rest}\n"))
+        .collect())
 }
 
 async fn git(sandbox: &Sandbox, sub: GitRead) -> Result<String, AgentError> {
@@ -501,11 +522,12 @@ fn cap(mut s: String) -> (String, bool) {
     if s.len() <= MAX_OUTPUT {
         return (s, false);
     }
-    s.truncate(MAX_OUTPUT);
-    // Trim to a char boundary.
-    while !s.is_char_boundary(s.len()) {
-        s.pop();
+    // `truncate` panics inside a multi-byte character: cut at a boundary.
+    let mut end = MAX_OUTPUT;
+    while !s.is_char_boundary(end) {
+        end -= 1;
     }
+    s.truncate(end);
     (s, true)
 }
 
@@ -729,6 +751,59 @@ mod tests {
         let (s, truncated) = cap("x".repeat(MAX_OUTPUT + 100));
         assert!(truncated);
         assert_eq!(s.len(), MAX_OUTPUT);
+    }
+
+    #[test]
+    fn cap_cuts_on_a_char_boundary() {
+        // A 3-byte character straddles the cap.
+        let s = format!("{}€tail", "x".repeat(MAX_OUTPUT - 1));
+        let (s, truncated) = cap(s);
+        assert!(truncated);
+        assert_eq!(s.len(), MAX_OUTPUT - 1);
+        assert!(s.bytes().all(|b| b == b'x'));
+    }
+
+    #[tokio::test]
+    async fn grep_never_returns_secret_files() {
+        let (sb, dir) = temp_sandbox("grep_secret");
+        std::fs::create_dir_all(dir.join("sub/.ssh")).unwrap();
+        for secret in [
+            ".env",
+            ".env.local",
+            "sub/cert.pem",
+            "sub/tls.key",
+            "id_rsa",
+            "sub/id_ed25519.pub",
+            "sub/.ssh/config",
+        ] {
+            std::fs::write(dir.join(secret), "TOKEN=leak\n").unwrap();
+        }
+        std::fs::write(dir.join("sub/notes.txt"), "TOKEN=public\n").unwrap();
+        let out = execute(
+            &sb,
+            &Action::Grep {
+                pattern: "TOKEN".into(),
+                path: ".".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .output;
+        assert!(!out.contains("leak"), "secret content leaked: {out}");
+        assert!(out.contains("notes.txt:1:TOKEN=public"), "{out}");
+
+        // A single-file target still reports its matches.
+        let one = execute(
+            &sb,
+            &Action::Grep {
+                pattern: "TOKEN".into(),
+                path: "sub/notes.txt".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .output;
+        assert!(one.contains("notes.txt:1:TOKEN=public"), "{one}");
     }
 
     // ---- 4c: Claude Code executor -----------------------------------------

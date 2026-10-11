@@ -1,6 +1,7 @@
 //! Append-only security and agent audit trails. Audit payloads deliberately omit
 //! secrets, prompts and action content. A write failure is logged but never
-//! changes the authorization or execution outcome.
+//! changes the authorization or execution outcome. Security rows older than
+//! [`SECURITY_AUDIT_RETENTION_DAYS`] are pruned by an hourly sweep.
 
 use axum::{extract::State, Json};
 use serde::Deserialize;
@@ -67,6 +68,59 @@ pub(crate) async fn record_security_event(
     {
         tracing::warn!(%error, event, "failed to write security audit");
     }
+}
+
+/// Rows an unauthenticated caller can cause, across all sources, per minute.
+const UNAUTHENTICATED_AUDIT_PER_MIN: u32 = 10;
+
+/// [`record_security_event`] for events any anonymous caller can trigger. They
+/// share one global budget so a flood cannot grow the table without bound or
+/// bury the owner's rows; the excess is dropped and later reported as one
+/// `audit.unauthenticated dropped <n>` row.
+pub(crate) async fn record_unauthenticated_event(
+    state: &AppState,
+    device_id: Option<Uuid>,
+    event: &str,
+    outcome: &str,
+    detail: Option<&str>,
+) {
+    if !state.rate_limiter.check_reserved(
+        "audit:unauthenticated",
+        UNAUTHENTICATED_AUDIT_PER_MIN,
+        std::time::Duration::from_secs(60),
+    ) {
+        if state.rate_limiter.note_dropped_audit() == 0 {
+            tracing::warn!("unauthenticated audit budget exhausted; dropping events");
+        }
+        return;
+    }
+    let dropped = state.rate_limiter.take_dropped_audit();
+    if dropped > 0 {
+        let dropped = dropped.to_string();
+        record_security_event(
+            state,
+            None,
+            "audit.unauthenticated",
+            "dropped",
+            Some(&dropped),
+        )
+        .await;
+    }
+    record_security_event(state, device_id, event, outcome, detail).await;
+}
+
+/// Security audit rows are kept this long. Deliberately generous: it only
+/// bounds growth and keeps months of history for investigations.
+pub const SECURITY_AUDIT_RETENTION_DAYS: u32 = 180;
+
+/// Delete security audit rows older than [`SECURITY_AUDIT_RETENTION_DAYS`].
+pub async fn prune_security_audit(db: &jarvis_store::Database) -> Result<(), surrealdb::Error> {
+    db.query(format!(
+        "DELETE security_audit WHERE ts < time::now() - {SECURITY_AUDIT_RETENTION_DAYS}d RETURN NONE"
+    ))
+    .await?
+    .check()?;
+    Ok(())
 }
 
 #[derive(Deserialize)]

@@ -635,6 +635,26 @@ async fn main() -> anyhow::Result<()> {
             budget_gate.sweep().await;
         }
     });
+    // Hourly security audit retention; bounded so a slow database cannot pile
+    // up sweeps.
+    let audit_db = state.db.clone();
+    tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(60 * 60);
+        let mut interval = tokio::time::interval(period);
+        loop {
+            interval.tick().await;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                jarvis_api::prune_security_audit(&audit_db),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "security audit retention failed"),
+                Err(_) => tracing::warn!("security audit retention timed out"),
+            }
+        }
+    });
     let _local_device_admin = if state.environment == "production" {
         Some(jarvis_api::local_devices::start(state.clone())?)
     } else {

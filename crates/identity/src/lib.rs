@@ -25,6 +25,10 @@ pub enum IdentityError {
     /// Deliberately opaque so callers can't distinguish failure reasons.
     #[error("authentication failed")]
     AuthFailed,
+    /// The account password was checked and did not match. Same opaque text as
+    /// `AuthFailed`; lets the API count password guesses separately.
+    #[error("authentication failed")]
+    PasswordRejected,
     /// No password-check capacity right now: retryable, never a failed guess.
     #[error("authentication busy")]
     Busy,
