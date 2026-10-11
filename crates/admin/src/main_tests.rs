@@ -590,7 +590,7 @@ fn trusted_updater_config_is_strict_and_never_shell_parsed() {
 }
 
 #[test]
-fn device_trust_needs_exactly_one_target() {
+fn device_trust_needs_one_target_and_never_auto_confirms_bulk_or_replacement() {
     use local_devices::DeviceCommand;
     let id = "0192abcd-0000-7000-8000-0000000000ef";
     let trust = |args: &[&str]| {
@@ -602,20 +602,32 @@ fn device_trust_needs_exactly_one_target() {
                     DeviceCommand::Trust {
                         device_id,
                         all_active,
+                        replace,
                         yes,
                     },
-            }) => (device_id.map(|id| id.to_string()), all_active, yes),
+            }) => (device_id.map(|id| id.to_string()), all_active, replace, yes),
             _ => panic!("expected devices trust"),
         })
     };
-    assert_eq!(trust(&[id]).unwrap(), (Some(id.into()), false, false));
+    let one = Some(id.to_string());
+    assert_eq!(trust(&[id]).unwrap(), (one.clone(), false, false, false));
     assert_eq!(
         trust(&[id, "--yes"]).unwrap(),
-        (Some(id.into()), false, true)
+        (one.clone(), false, false, true)
     );
-    assert_eq!(trust(&["--all-active"]).unwrap(), (None, true, false));
+    assert_eq!(
+        trust(&[id, "--replace"]).unwrap(),
+        (one, false, true, false)
+    );
+    assert_eq!(
+        trust(&["--all-active"]).unwrap(),
+        (None, true, false, false)
+    );
     assert!(trust(&[]).is_err());
     assert!(trust(&[id, "--all-active"]).is_err());
+    assert!(trust(&["--all-active", "--yes"]).is_err());
+    assert!(trust(&["--all-active", "--replace"]).is_err());
+    assert!(trust(&[id, "--replace", "--yes"]).is_err());
     assert!(trust(&["not-a-uuid"]).is_err());
 }
 

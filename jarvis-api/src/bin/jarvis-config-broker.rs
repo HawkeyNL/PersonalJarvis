@@ -23,7 +23,7 @@ use jarvis_config::AppConfig;
 use jarvis_identity as identity;
 use jarvis_llm::{ModelAccessPolicy, ModelRouting, ROUTING_MAX_BYTES};
 use jarvis_privileged::{
-    trusted_keys::{self, TrustError},
+    trusted_keys::{self, PinnedKeys, TrustError},
     Operation, SignedRequest,
 };
 
@@ -76,12 +76,12 @@ async fn main() -> anyhow::Result<()> {
         let db = db.clone();
         let policy = PathBuf::from(&config.llm_model_policy_path);
         let routing = PathBuf::from(&config.llm_model_routing_path);
-        let trusted_device_keys = config
+        let pinned = config
             .broker_require_trusted_keys
-            .then_some(Path::new(trusted_keys::TRUSTED_DEVICE_KEYS_PATH));
+            .then(PinnedKeys::production);
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle(stream, &db, &policy, &routing, trusted_device_keys).await {
+            if let Err(error) = handle(stream, &db, &policy, &routing, pinned).await {
                 tracing::warn!(%error, "privileged broker request denied");
             }
         });
@@ -123,7 +123,7 @@ async fn handle(
     db: &jarvis_store::Database,
     policy_path: &Path,
     routing_path: &Path,
-    trusted_device_keys: Option<&Path>,
+    pinned: Option<PinnedKeys<'_>>,
 ) -> anyhow::Result<()> {
     let (read, mut write) = stream.into_split();
     let line = read_request_frame(read, std::time::Duration::from_secs(5)).await?;
@@ -134,42 +134,14 @@ async fn handle(
         request
             .reject_if_expired(time::OffsetDateTime::now_utc())
             .map_err(|_| anyhow::anyhow!("expired approval"))?;
-        let message = request
-            .message()
-            .map_err(|_| anyhow::anyhow!("invalid approval payload"))?;
-        let signature = hex::decode(&request.signature_hex)
-            .map_err(|_| anyhow::anyhow!("invalid signature"))?;
         let public_key = identity::active_device_public_key(db, request.user_id, request.device_id)
             .await
             .map_err(|_| anyhow::anyhow!("untrusted owner device signature"))?;
-        trusted_keys::verify_approval(
-            trusted_device_keys,
-            request.device_id,
-            &public_key,
-            &message,
-            &signature,
-        )
-        .map_err(|error| match error {
-            TrustError::Signature => anyhow::anyhow!("untrusted owner device signature"),
-            other => anyhow::Error::new(other),
-        })?;
-        consume_once(request.request_id)?;
+        authorize(&request, &public_key, pinned, Path::new(REPLAY_DIR))?;
         apply(&request.operation, policy_path, routing_path)
     }
     .await;
-    let outcome = match result.as_ref() {
-        Ok(()) => "applied",
-        Err(error) if error.to_string().contains("expired") => "expired",
-        Err(error) if error.to_string().contains("replay") => "replay_rejected",
-        Err(error) if error.downcast_ref::<TrustError>().is_some() => "device_not_trusted",
-        Err(error)
-            if error.to_string().contains("signature") || error.to_string().contains("device") =>
-        {
-            "signature_denied"
-        }
-        Err(_) => "denied",
-    };
-    audit(db, &request, outcome).await;
+    audit(db, &request, outcome(&result)).await;
     result?;
     write
         .write_all(serde_json::to_string(&Reply { status: "applied" })?.as_bytes())
@@ -178,8 +150,51 @@ async fn handle(
     Ok(())
 }
 
-fn consume_once(request_id: uuid::Uuid) -> anyhow::Result<()> {
-    let path = Path::new(REPLAY_DIR).join(request_id.to_string());
+/// Everything after the database key lookup and before the mutation: the
+/// signature, the pinned key and, only when both pass, the replay marker.
+fn authorize(
+    request: &SignedRequest,
+    public_key: &[u8],
+    pinned: Option<PinnedKeys<'_>>,
+    replay_dir: &Path,
+) -> anyhow::Result<()> {
+    let message = request
+        .message()
+        .map_err(|_| anyhow::anyhow!("invalid approval payload"))?;
+    let signature =
+        hex::decode(&request.signature_hex).map_err(|_| anyhow::anyhow!("invalid signature"))?;
+    trusted_keys::verify_approval(pinned, request.device_id, public_key, &message, &signature)
+        .map_err(|error| match error {
+            TrustError::Signature => anyhow::anyhow!("untrusted owner device signature"),
+            other => anyhow::Error::new(other),
+        })?;
+    consume_once(replay_dir, request.request_id)
+}
+
+fn outcome(result: &anyhow::Result<()>) -> &'static str {
+    let Err(error) = result else {
+        return "applied";
+    };
+    match error.downcast_ref::<TrustError>() {
+        Some(TrustError::NotTrusted) => return "device_not_trusted",
+        Some(TrustError::KeyChanged) => return "device_key_mismatch",
+        Some(TrustError::Invalid(_)) => return "trusted_keys_invalid",
+        Some(TrustError::Signature) | None => {}
+    }
+    let message = error.to_string();
+    if message.contains("expired") {
+        "expired"
+    } else if message.contains("replay") {
+        "replay_rejected"
+    } else if message.contains("signature") || message.contains("device") {
+        "signature_denied"
+    } else {
+        "denied"
+    }
+}
+
+fn consume_once(replay_dir: &Path, request_id: uuid::Uuid) -> anyhow::Result<()> {
+    let path = replay_dir.join(request_id.to_string());
     let result = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -731,5 +746,95 @@ mod request_tests {
         assert!(serde_json::from_value::<RequestEnvelope>(envelope.clone()).is_ok());
         envelope["approved"] = json!(true);
         assert!(serde_json::from_value::<RequestEnvelope>(envelope).is_err());
+    }
+
+    #[test]
+    fn authorize_requires_the_pinned_key_before_consuming_the_replay_marker() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let root = std::env::temp_dir().join(format!("jarvis-authorize-{}", uuid::Uuid::new_v4()));
+        let replays = root.join("replays");
+        fs::create_dir_all(&replays).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).unwrap();
+        let owner = fs::metadata(&root).unwrap();
+        let pins = root.join("trusted-device-keys");
+        let device = SigningKey::from_bytes(&[5; 32]);
+        let public_key = device.verifying_key().to_bytes();
+        let signed = |device_id: uuid::Uuid, request_id: uuid::Uuid| {
+            let mut request = SignedRequest {
+                request_id,
+                nonce_hex: "00".repeat(32),
+                user_id: uuid::Uuid::nil(),
+                device_id,
+                issued_at: time::OffsetDateTime::UNIX_EPOCH,
+                expires_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(1),
+                operation: Operation::ModelSetEnabled {
+                    provider: "ollama-cloud".into(),
+                    model: "fixture-model".into(),
+                    enabled: true,
+                    expected_policy_sha256: "00".repeat(32),
+                },
+                // `message()` requires a well-formed placeholder.
+                signature_hex: "00".repeat(64),
+            };
+            request.signature_hex =
+                hex::encode(device.sign(&request.message().unwrap()).to_bytes());
+            request
+        };
+        let pinned_id = uuid::Uuid::now_v7();
+        let substituted_id = uuid::Uuid::now_v7();
+        trusted_keys::update(&pins, owner.uid(), owner.gid(), |keys| {
+            keys.insert(pinned_id, &public_key)?;
+            keys.insert(substituted_id, &[3; 32])
+        })
+        .unwrap();
+        let pinned = Some(PinnedKeys {
+            path: &pins,
+            owner_uid: owner.uid(),
+        });
+        let missing_path = root.join("missing");
+        let missing = Some(PinnedKeys {
+            path: &missing_path,
+            owner_uid: owner.uid(),
+        });
+        let check = |request: &SignedRequest, pinned| {
+            let result = authorize(request, &public_key, pinned, &replays);
+            let consumed = replays.join(request.request_id.to_string()).exists();
+            (outcome(&result), consumed)
+        };
+        // A substituted database key, an unlisted device and a missing file
+        // are refused without consuming the one-time request ID.
+        assert_eq!(
+            check(&signed(substituted_id, uuid::Uuid::now_v7()), pinned),
+            ("device_key_mismatch", false)
+        );
+        assert_eq!(
+            check(&signed(uuid::Uuid::now_v7(), uuid::Uuid::now_v7()), pinned),
+            ("device_not_trusted", false)
+        );
+        assert_eq!(
+            check(&signed(pinned_id, uuid::Uuid::now_v7()), missing),
+            ("device_not_trusted", false)
+        );
+        fs::write(root.join("broken"), b"garbage\n").unwrap();
+        let broken_path = root.join("broken");
+        let broken = Some(PinnedKeys {
+            path: &broken_path,
+            owner_uid: owner.uid(),
+        });
+        assert_eq!(
+            check(&signed(pinned_id, uuid::Uuid::now_v7()), broken),
+            ("trusted_keys_invalid", false)
+        );
+        // The pinned key is accepted once; the same request is a replay.
+        let request = signed(pinned_id, uuid::Uuid::now_v7());
+        assert_eq!(check(&request, pinned), ("applied", true));
+        assert_eq!(check(&request, pinned), ("replay_rejected", true));
+        // The rollback setting skips only the pin, never the signature.
+        let mut unpinned = signed(uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        assert_eq!(check(&unpinned, None), ("applied", true));
+        unpinned.request_id = uuid::Uuid::now_v7();
+        unpinned.signature_hex = "00".repeat(64);
+        assert_eq!(check(&unpinned, None), ("signature_denied", false));
+        fs::remove_dir_all(root).unwrap();
     }
 }

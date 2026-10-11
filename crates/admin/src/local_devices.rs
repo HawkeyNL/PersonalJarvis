@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use jarvis_privileged::{
     local_devices::{DeviceRequest, RESPONSE_LIMIT, SOCKET_PATH},
-    trusted_keys::{self, TRUSTED_DEVICE_KEYS_PATH},
+    trusted_keys::{self, TrustError, TrustedDeviceKeys, TRUSTED_DEVICE_KEYS_PATH},
 };
 use serde::Deserialize;
 use std::{
@@ -24,6 +24,7 @@ use uuid::Uuid;
 pub enum DeviceCommand {
     List,
     Pending,
+    /// Also pins the approved key for privileged changes.
     Approve {
         request_id: Uuid,
         #[arg(long)]
@@ -40,10 +41,15 @@ pub enum DeviceCommand {
     Trust {
         #[arg(required_unless_present = "all_active", conflicts_with = "all_active")]
         device_id: Option<Uuid>,
+        /// Pin every active, not yet pinned device. Never replaces a key.
         #[arg(long)]
         all_active: bool,
-        /// Skip the confirmation after reviewing the fingerprints.
-        #[arg(long)]
+        /// Replace a pinned key that differs from Core's key. Only for a
+        /// re-paired device; always asks for confirmation.
+        #[arg(long, conflicts_with = "all_active")]
+        replace: bool,
+        /// Skip the confirmation for one new device after reviewing it.
+        #[arg(long, conflicts_with_all = ["all_active", "replace"])]
         yes: bool,
     },
 }
@@ -61,15 +67,7 @@ pub fn run(command: DeviceCommand, json: bool) -> Result<()> {
         DeviceCommand::Approve {
             request_id,
             fingerprint,
-        } => {
-            let data = exchange(&DeviceRequest::Approve {
-                request_id,
-                fingerprint: fingerprint.clone(),
-            })?;
-            print(&data)?;
-            trust_approved(&data, &fingerprint)
-                .context("device approved but not trusted for privileged changes; run `sudo jarvis devices trust <device-id>`")
-        }
+        } => approve(request_id, fingerprint),
         DeviceCommand::Deny { request_id } => {
             print(&exchange(&DeviceRequest::Deny { request_id })?)
         }
@@ -88,14 +86,16 @@ pub fn run(command: DeviceCommand, json: bool) -> Result<()> {
         DeviceCommand::Trust {
             device_id,
             all_active: _,
+            replace,
             yes,
-        } => trust(device_id, yes),
+        } => trust(device_id, replace, yes),
     }
 }
 
 fn print(data: &serde_json::Value) -> Result<()> {
-    // JSON escaping also makes control characters in remote device names safe
-    // in ordinary terminal output. Never initialize a transient TUI here.
+    // JSON escaping neutralizes ASCII control characters in remote device
+    // names, not Unicode bidi/format characters; `trust` shows names next to
+    // fingerprints with `shown`. Never initialize a transient TUI here.
     println!("{}", serde_json::to_string_pretty(data)?);
     Ok(())
 }
@@ -126,9 +126,27 @@ fn decode_key(public_key: &str) -> Result<Vec<u8>> {
     }
 }
 
-fn trust_approved(data: &serde_json::Value, fingerprint: &str) -> Result<()> {
-    let (device_id, key) = approved_key(data, fingerprint)?;
-    update_trusted(|keys| keys.insert(device_id, &key))
+fn approve(request_id: Uuid, fingerprint: String) -> Result<()> {
+    // Validate the pin file and hold the lock before Core activates the
+    // device, so a bad file or a concurrent change cannot strand it unpinned.
+    let _lock = crate::mutation_lock(crate::CONFIG_LOCK)?;
+    let path = Path::new(TRUSTED_DEVICE_KEYS_PATH);
+    trusted_keys::load(path)?;
+    let gid = jarvis_gid()?;
+    let data = exchange(&DeviceRequest::Approve {
+        request_id,
+        fingerprint: fingerprint.clone(),
+    })?;
+    print(&data)?;
+    let pinned = approved_key(&data, &fingerprint).and_then(|(device_id, key)| {
+        trusted_keys::update(path, 0, gid, |keys| match keys.get(device_id) {
+            Some(old) if old.as_slice() != key => Err(TrustError::KeyChanged),
+            _ => keys.insert(device_id, &key),
+        })
+        .map_err(anyhow::Error::from)
+    });
+    pinned.context("device approved but not trusted for privileged changes; run `sudo jarvis devices trust <device-id>`")?;
+    Ok(())
 }
 
 /// Core only matched the owner-supplied fingerprint; pin exactly that key.
@@ -142,11 +160,26 @@ fn approved_key(data: &serde_json::Value, fingerprint: &str) -> Result<(Uuid, Ve
     Ok((approved.device_id, key))
 }
 
-fn trust(device_id: Option<Uuid>, yes: bool) -> Result<()> {
-    let listed = ListedDevices::deserialize(exchange(&DeviceRequest::List {})?)
-        .context("invalid local device response")?;
+struct Candidate {
+    id: Uuid,
+    name: String,
+    platform: String,
+    key: Vec<u8>,
+    pinned: Option<[u8; 32]>,
+}
+
+/// Active devices from Core, optionally one, with their current pin.
+fn candidates(
+    listed: ListedDevices,
+    pins: &TrustedDeviceKeys,
+    device_id: Option<Uuid>,
+) -> Result<Vec<Candidate>> {
+    let mut seen = std::collections::HashSet::new();
     let mut selected = Vec::new();
     for device in listed.devices {
+        if !seen.insert(device.id) {
+            bail!("Core listed device {} twice; refusing to trust", device.id);
+        }
         if device_id.is_some_and(|id| id != device.id) {
             continue;
         }
@@ -154,34 +187,89 @@ fn trust(device_id: Option<Uuid>, yes: bool) -> Result<()> {
             eprintln!("Skipping {}: no active signing key.", device.id);
             continue;
         };
-        let key = decode_key(key)?;
-        // Fingerprint first and names debug-escaped (control and bidi
-        // characters): a remote device name cannot disguise the fingerprint.
-        println!(
-            "{}  fingerprint {}  {:?} ({:?})",
-            device.id,
-            trusted_keys::fingerprint(&key),
-            device.name,
-            device.platform
-        );
-        selected.push((device.id, key));
+        selected.push(Candidate {
+            id: device.id,
+            key: decode_key(key)?,
+            pinned: pins.get(device.id).copied(),
+            name: device.name,
+            platform: device.platform,
+        });
     }
     if selected.is_empty() {
         bail!("no matching active device with a signing key");
     }
-    if !yes {
+    Ok(selected)
+}
+
+/// Remote device names are capped and debug-escaped (control and bidi
+/// characters) so they cannot disguise a fingerprint.
+fn shown(value: &str) -> String {
+    let capped: String = value.chars().take(64).collect();
+    format!("{capped:?}")
+}
+
+fn trust(device_id: Option<Uuid>, replace: bool, yes: bool) -> Result<()> {
+    let _lock = crate::mutation_lock(crate::CONFIG_LOCK)?;
+    let path = Path::new(TRUSTED_DEVICE_KEYS_PATH);
+    let pins = trusted_keys::load(path)?.unwrap_or_default();
+    let gid = jarvis_gid()?;
+    let listed = ListedDevices::deserialize(exchange(&DeviceRequest::List {})?)
+        .context("invalid local device response")?;
+    let mut changes = Vec::new();
+    let mut replacing = false;
+    for device in candidates(listed, &pins, device_id)? {
+        let offered = trusted_keys::fingerprint(&device.key);
+        println!(
+            "{}  {} ({})\n    fingerprint {offered}",
+            device.id,
+            shown(&device.name),
+            shown(&device.platform)
+        );
+        match device.pinned {
+            Some(old) if old.as_slice() == device.key => {
+                println!("    already trusted");
+                continue;
+            }
+            Some(old) => {
+                println!(
+                    "    KEY CHANGED: pinned {} -> offered {offered}",
+                    trusted_keys::fingerprint(&old)
+                );
+                if !replace {
+                    if device_id.is_some() {
+                        bail!(
+                            "{}; pass --replace only if this device was re-paired",
+                            TrustError::KeyChanged
+                        );
+                    }
+                    println!("    skipped: --all-active never replaces a pinned key");
+                    continue;
+                }
+                replacing = true;
+            }
+            None => {}
+        }
+        changes.push((device.id, device.key));
+    }
+    if changes.is_empty() {
+        println!("Nothing to change.");
+        return Ok(());
+    }
+    if replacing {
+        crate::confirm("Replace the pinned key? Only do this for a re-paired device.")?;
+    } else if !yes {
         crate::confirm(
             "Check each fingerprint against the device. Trust these keys for privileged changes?",
         )?;
     }
-    update_trusted(|keys| {
-        selected
+    trusted_keys::update(path, 0, gid, |keys| {
+        changes
             .iter()
             .try_for_each(|(id, key)| keys.insert(*id, key))
     })?;
     println!(
         "Trusted {} device key(s) in {TRUSTED_DEVICE_KEYS_PATH}.",
-        selected.len()
+        changes.len()
     );
     Ok(())
 }
@@ -195,19 +283,6 @@ fn untrust(device_id: Uuid) -> Result<()> {
             Ok(())
         })?;
     }
-    Ok(())
-}
-
-fn update_trusted(
-    change: impl FnOnce(&mut trusted_keys::TrustedDeviceKeys) -> Result<(), trusted_keys::TrustError>,
-) -> Result<()> {
-    let _lock = crate::mutation_lock(crate::CONFIG_LOCK)?;
-    trusted_keys::update(
-        Path::new(TRUSTED_DEVICE_KEYS_PATH),
-        0,
-        jarvis_gid()?,
-        change,
-    )?;
     Ok(())
 }
 
@@ -297,5 +372,58 @@ mod tests {
         assert!(
             approved_key(&serde_json::json!({"device_id": Uuid::nil()}), &fingerprint).is_err()
         );
+    }
+
+    fn listed(devices: &[(Uuid, Option<[u8; 32]>)]) -> ListedDevices {
+        ListedDevices {
+            devices: devices
+                .iter()
+                .map(|(id, key)| ListedDevice {
+                    id: *id,
+                    name: "phone".into(),
+                    platform: "ios".into(),
+                    public_key: key.map(hex::encode),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn candidates_refuse_duplicates_and_report_current_pins() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let mut pins = TrustedDeviceKeys::default();
+        pins.insert(a, &[1; 32]).unwrap();
+        assert!(candidates(
+            listed(&[(a, Some([1; 32])), (a, Some([2; 32]))]),
+            &pins,
+            None
+        )
+        .is_err());
+        let all = candidates(
+            listed(&[(a, Some([9; 32])), (b, Some([2; 32]))]),
+            &pins,
+            None,
+        )
+        .unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].pinned, Some([1; 32]));
+        assert_eq!(all[1].pinned, None);
+        let one = candidates(
+            listed(&[(a, Some([1; 32])), (b, Some([2; 32]))]),
+            &pins,
+            Some(b),
+        )
+        .unwrap();
+        assert_eq!(one.iter().map(|c| c.id).collect::<Vec<_>>(), [b]);
+        assert!(candidates(listed(&[(a, None)]), &pins, Some(a)).is_err());
+        assert!(candidates(listed(&[(a, Some([1; 32]))]), &pins, Some(b)).is_err());
+    }
+
+    #[test]
+    fn shown_names_are_capped_and_escape_bidi_controls() {
+        assert_eq!(shown("phone"), "\"phone\"");
+        assert!(shown("a\u{202e}b").contains("\\u{202e}"));
+        assert!(shown("x\u{1b}[2J").contains("\\u{1b}"));
+        assert_eq!(shown(&"n".repeat(100)).len(), 66);
     }
 }

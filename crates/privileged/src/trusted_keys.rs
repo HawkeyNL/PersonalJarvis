@@ -29,6 +29,10 @@ pub enum TrustError {
         "device not trusted for privileged changes; run `sudo jarvis devices trust <device-id>`"
     )]
     NotTrusted,
+    #[error(
+        "pinned key differs from database key; possible compromise; do not re-trust unless this device was re-paired"
+    )]
+    KeyChanged,
     #[error("trusted device key file rejected: {0}")]
     Invalid(String),
 }
@@ -91,10 +95,15 @@ impl TrustedDeviceKeys {
         self.0.remove(&device_id).is_some()
     }
 
+    pub fn get(&self, device_id: Uuid) -> Option<&[u8; KEY_BYTES]> {
+        self.0.get(&device_id)
+    }
+
     pub fn check(&self, device_id: Uuid, public_key: &[u8]) -> Result<(), TrustError> {
         match self.0.get(&device_id) {
             Some(key) if key.as_slice() == public_key => Ok(()),
-            _ => Err(TrustError::NotTrusted),
+            Some(_) => Err(TrustError::KeyChanged),
+            None => Err(TrustError::NotTrusted),
         }
     }
 }
@@ -119,12 +128,29 @@ pub fn fingerprint(public_key: &[u8]) -> String {
     hex::encode(Sha256::digest(public_key))
 }
 
+/// Where a broker reads the pinned keys and which owner the file and its
+/// directory must have. Production is always [`PinnedKeys::production`].
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedKeys<'a> {
+    pub path: &'a Path,
+    pub owner_uid: u32,
+}
+
+impl PinnedKeys<'static> {
+    pub fn production() -> Self {
+        Self {
+            path: Path::new(TRUSTED_DEVICE_KEYS_PATH),
+            owner_uid: 0,
+        }
+    }
+}
+
 /// Verify an owner approval for a privileged broker. `public_key` must be the
 /// device's current database key (`jarvis_identity::active_device_public_key`).
-/// With `trusted_keys` set, that key must also be pinned for the device in
-/// the root-owned file; `None` is the documented rollback setting.
+/// With `pinned` set, that key must also be pinned for the device in the
+/// protected file; `None` is the documented rollback setting.
 pub fn verify_approval(
-    trusted_keys: Option<&Path>,
+    pinned: Option<PinnedKeys<'_>>,
     device_id: Uuid,
     public_key: &[u8],
     message: &[u8],
@@ -132,10 +158,10 @@ pub fn verify_approval(
 ) -> Result<(), TrustError> {
     jarvis_identity::verify_signature(public_key, message, signature)
         .map_err(|_| TrustError::Signature)?;
-    let Some(path) = trusted_keys else {
+    let Some(pinned) = pinned else {
         return Ok(());
     };
-    load(path)?
+    read(pinned.path, pinned.owner_uid)?
         .ok_or(TrustError::NotTrusted)?
         .check(device_id, public_key)
 }
@@ -319,7 +345,7 @@ mod tests {
         // Listed with the matching key.
         assert!(keys.check(DEVICE, &public_key).is_ok());
         // Listed with a different key (database key replaced).
-        assert_eq!(keys.check(OTHER, &public_key), Err(TrustError::NotTrusted));
+        assert_eq!(keys.check(OTHER, &public_key), Err(TrustError::KeyChanged));
         // Not listed.
         assert_eq!(
             keys.check(Uuid::nil(), &public_key),
@@ -327,10 +353,40 @@ mod tests {
         );
         // Missing file (its parent, `/`, is root-owned).
         let missing = Path::new("/").join(format!("jarvis-missing-{}", Uuid::new_v4()));
+        let missing = Some(PinnedKeys {
+            path: &missing,
+            owner_uid: 0,
+        });
         assert_eq!(
-            verify_approval(Some(&missing), DEVICE, &public_key, message, &signature),
+            verify_approval(missing, DEVICE, &public_key, message, &signature),
             Err(TrustError::NotTrusted)
         );
+        // A pinned file: match, changed key, unlisted.
+        let dir = temp_dir();
+        let path = dir.join("trusted-device-keys");
+        let owner = fs::metadata(&dir).unwrap();
+        update(&path, owner.uid(), owner.gid(), |pins| {
+            pins.insert(DEVICE, &public_key)?;
+            pins.insert(OTHER, &[3; 32])
+        })
+        .unwrap();
+        let file = Some(PinnedKeys {
+            path: &path,
+            owner_uid: owner.uid(),
+        });
+        assert!(verify_approval(file, DEVICE, &public_key, message, &signature).is_ok());
+        let other = SigningKey::from_bytes(&[9; 32]);
+        let other_key = other.verifying_key().to_bytes();
+        let other_signature = other.sign(message).to_bytes();
+        assert_eq!(
+            verify_approval(file, OTHER, &other_key, message, &other_signature),
+            Err(TrustError::KeyChanged)
+        );
+        assert_eq!(
+            verify_approval(file, Uuid::nil(), &other_key, message, &other_signature),
+            Err(TrustError::NotTrusted)
+        );
+        fs::remove_dir_all(dir).unwrap();
         // Disabled check: the signature alone decides.
         assert!(verify_approval(None, DEVICE, &public_key, message, &signature).is_ok());
         assert_eq!(
@@ -338,7 +394,7 @@ mod tests {
             Err(TrustError::Signature)
         );
         assert_eq!(
-            verify_approval(Some(&missing), DEVICE, &public_key, b"other", &signature),
+            verify_approval(missing, DEVICE, &public_key, b"other", &signature),
             Err(TrustError::Signature)
         );
     }

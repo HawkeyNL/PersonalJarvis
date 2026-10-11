@@ -172,6 +172,10 @@ if [[ -e /etc/jarvis/huggingface-catalog.json ]]; then
     check "Hugging Face catalog readable by Core" jarvis_reads /etc/jarvis/huggingface-catalog.json
     check "Hugging Face catalog read-only to Core" jarvis_cannot_write /etc/jarvis/huggingface-catalog.json
 fi
+if [[ -e /etc/jarvis/trusted-device-keys || -L /etc/jarvis/trusted-device-keys ]]; then
+    check "Trusted device keys permissions" expect_mode /etc/jarvis/trusted-device-keys root:jarvis:640
+    check "Trusted device keys read-only to Core" jarvis_cannot_write /etc/jarvis/trusted-device-keys
+fi
 check "Pricing registry permissions" expect_mode /etc/jarvis/pricing-registry.json root:jarvis:640
 check "Pricing registry readable by Core" jarvis_reads /etc/jarvis/pricing-registry.json
 check "Pricing registry read-only to Core" jarvis_cannot_write /etc/jarvis/pricing-registry.json
