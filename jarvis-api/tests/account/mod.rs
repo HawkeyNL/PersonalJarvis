@@ -2,10 +2,20 @@ use super::*;
 use jarvis_client_core::account::{account_approval_message, AccountApproval};
 use sha2::{Digest, Sha256};
 
+/// The Argon2 admission pools (`PasswordService::shared` and `pre_auth`) are
+/// process-wide by design and refuse work instead of queueing it. Tests in
+/// this binary run in parallel, so every test that hashes or verifies a
+/// password holds this lock; otherwise they starve each other into 429/503.
+async fn argon2_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(Default::default).lock().await
+}
+
 #[tokio::test]
 #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
 async fn first_activation_requires_local_network_code_and_password_atomically(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _argon2 = argon2_guard().await;
     let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
     db.signin(Root {
         username: &env::var("JARVIS_SURREAL_TEST_USER")?,
@@ -249,6 +259,7 @@ async fn pairing_is_refused_while_the_owner_has_no_password(
 async fn pairing_records_validated_candidate_details_for_the_approver(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use jarvis_identity::password::{AccountPassword, PasswordService};
+    let _argon2 = argon2_guard().await;
     let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
     db.signin(Root {
         username: &env::var("JARVIS_SURREAL_TEST_USER")?,
@@ -460,6 +471,7 @@ async fn request(
 #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
 async fn password_activation_requires_signed_approval_and_invalidates_live_sessions(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _argon2 = argon2_guard().await;
     let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
     db.signin(Root {
         username: &env::var("JARVIS_SURREAL_TEST_USER")?,
