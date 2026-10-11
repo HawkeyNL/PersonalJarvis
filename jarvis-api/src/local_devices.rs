@@ -124,7 +124,8 @@ async fn execute(
             };
             // Never return candidate nonce/key bytes or account credentials.
             return Ok(
-                json!({"requests": pending.into_iter().map(|r| json!({"id":r.id,"name":r.candidate_name,"platform":r.candidate_platform,"fingerprint":r.candidate_fingerprint,"expires_at":r.expires_at.unix_timestamp()})).collect::<Vec<_>>()}),
+                json!({"requests": pending.into_iter().map(|r| json!({"id":r.id,"name":r.candidate_name,"platform":r.candidate_platform,"fingerprint":r.candidate_fingerprint,"expires_at":r.expires_at.unix_timestamp(),
+                    "ip":r.details.ip,"user_agent":r.details.user_agent,"app_version":r.details.app_version,"model":r.details.model})).collect::<Vec<_>>()}),
             );
         }
         DeviceRequest::Approve {

@@ -23,7 +23,7 @@ pub mod local_devices;
 
 use super::{
     verify_signature, Authenticated, Challenge, Device, DeviceKey, IdentityError, LoginResult,
-    PairingRequest, Platform, Session, UnlockRequest, User,
+    PairingDetails, PairingRequest, Platform, Session, UnlockRequest, User,
 };
 
 const USER_FIELDS: &str = "record::id(id) AS id, display_name, status, created_at, updated_at";
@@ -217,6 +217,10 @@ struct PairingCreateBindings {
     fingerprint: String,
     #[serde(with = "serde_bytes")]
     nonce: Vec<u8>,
+    ip: Option<String>,
+    user_agent: Option<String>,
+    app_version: Option<String>,
+    model: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -237,6 +241,15 @@ struct PairingRow {
     created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     expires_at: OffsetDateTime,
+    // Absent (NONE) on rows written before schema v11 or without a value.
+    #[serde(default)]
+    candidate_ip: Option<String>,
+    #[serde(default)]
+    candidate_user_agent: Option<String>,
+    #[serde(default)]
+    candidate_app_version: Option<String>,
+    #[serde(default)]
+    candidate_model: Option<String>,
 }
 
 fn pairing_from_row(row: PairingRow) -> PairingRequest {
@@ -251,6 +264,12 @@ fn pairing_from_row(row: PairingRow) -> PairingRequest {
         status: row.status,
         created_at: row.created_at,
         expires_at: row.expires_at,
+        details: PairingDetails {
+            ip: row.candidate_ip,
+            user_agent: row.candidate_user_agent,
+            app_version: row.candidate_app_version,
+            model: row.candidate_model,
+        },
     }
 }
 
@@ -262,11 +281,12 @@ pub async fn create_pairing_request(
     name: &str,
     platform: Platform,
     public_key: &[u8],
+    details: &PairingDetails,
 ) -> Result<PairingRequest, IdentityError> {
     let fingerprint = hex::encode(sha2::Sha256::digest(public_key));
     let duplicate: Option<PairingRow> = one(
         db,
-        "SELECT record::id(id) AS id, user_id, candidate_name, candidate_platform, candidate_public_key, candidate_fingerprint, nonce, status, created_at, expires_at FROM device_pairing_requests WHERE candidate_fingerprint = $fingerprint AND status = 'pending' AND expires_at > time::now() LIMIT 1",
+        "SELECT record::id(id) AS id, user_id, candidate_name, candidate_platform, candidate_public_key, candidate_fingerprint, nonce, status, created_at, expires_at, candidate_ip, candidate_user_agent, candidate_app_version, candidate_model FROM device_pairing_requests WHERE candidate_fingerprint = $fingerprint AND status = 'pending' AND expires_at > time::now() LIMIT 1",
         json!({ "fingerprint": fingerprint }),
     ).await?;
     if duplicate.is_some() {
@@ -276,8 +296,8 @@ pub async fn create_pairing_request(
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
     let id = Uuid::now_v7();
     execute(db,
-        "CREATE device_pairing_requests SET id = $id, user_id = $user_id, candidate_name = $name, candidate_platform = $platform, candidate_public_key = <bytes>$public_key, candidate_fingerprint = $fingerprint, nonce = <bytes>$nonce, status = 'pending', created_at = time::now(), expires_at = time::now() + 5m, resolved_at = NONE, approved_by_device_id = NONE, activated_device_id = NONE RETURN NONE",
-        PairingCreateBindings { id: id.to_string(), user_id: user_id.to_string(), name: name.to_string(), platform: platform.as_str().to_string(), public_key: public_key.to_vec(), fingerprint, nonce },
+        "CREATE device_pairing_requests SET id = $id, user_id = $user_id, candidate_name = $name, candidate_platform = $platform, candidate_public_key = <bytes>$public_key, candidate_fingerprint = $fingerprint, nonce = <bytes>$nonce, status = 'pending', created_at = time::now(), expires_at = time::now() + 5m, resolved_at = NONE, approved_by_device_id = NONE, activated_device_id = NONE, candidate_ip = $ip, candidate_user_agent = $user_agent, candidate_app_version = $app_version, candidate_model = $model RETURN NONE",
+        PairingCreateBindings { id: id.to_string(), user_id: user_id.to_string(), name: name.to_string(), platform: platform.as_str().to_string(), public_key: public_key.to_vec(), fingerprint, nonce, ip: details.ip.clone(), user_agent: details.user_agent.clone(), app_version: details.app_version.clone(), model: details.model.clone() },
     ).await?;
     pairing_request(db, id, user_id)
         .await?
@@ -290,7 +310,7 @@ async fn pairing_request(
     user_id: Uuid,
 ) -> Result<Option<PairingRequest>, IdentityError> {
     let row: Option<PairingRow> = one(db,
-        "SELECT record::id(id) AS id, user_id, candidate_name, candidate_platform, candidate_public_key, candidate_fingerprint, nonce, status, created_at, expires_at FROM device_pairing_requests WHERE record::id(id) = $id AND user_id = $user_id LIMIT 1",
+        "SELECT record::id(id) AS id, user_id, candidate_name, candidate_platform, candidate_public_key, candidate_fingerprint, nonce, status, created_at, expires_at, candidate_ip, candidate_user_agent, candidate_app_version, candidate_model FROM device_pairing_requests WHERE record::id(id) = $id AND user_id = $user_id LIMIT 1",
         json!({ "id": id.to_string(), "user_id": user_id.to_string() }),
     ).await?;
     Ok(row.map(pairing_from_row))
@@ -358,10 +378,22 @@ pub async fn pending_pairing_requests(
     user_id: Uuid,
 ) -> Result<Vec<PairingRequest>, IdentityError> {
     let rows: Vec<PairingRow> = many(db,
-        "SELECT record::id(id) AS id, user_id, candidate_name, candidate_platform, candidate_public_key, candidate_fingerprint, nonce, status, created_at, expires_at FROM device_pairing_requests WHERE user_id = $user_id AND status = 'pending' AND expires_at > time::now() ORDER BY created_at DESC LIMIT 20",
+        "SELECT record::id(id) AS id, user_id, candidate_name, candidate_platform, candidate_public_key, candidate_fingerprint, nonce, status, created_at, expires_at, candidate_ip, candidate_user_agent, candidate_app_version, candidate_model FROM device_pairing_requests WHERE user_id = $user_id AND status = 'pending' AND expires_at > time::now() ORDER BY created_at DESC LIMIT 20",
         json!({ "user_id": user_id.to_string() }),
     ).await?;
     Ok(rows.into_iter().map(pairing_from_row).collect())
+}
+
+/// Pairing rows hold the candidate's IP address and User-Agent, so they are
+/// deleted a day after expiry. The grace lets an approved candidate still
+/// fetch its device ID with the request nonce.
+pub async fn purge_expired_pairing_requests(db: &Database) -> Result<(), IdentityError> {
+    execute(
+        db,
+        "DELETE device_pairing_requests WHERE expires_at < time::now() - 1d RETURN NONE",
+        json!({}),
+    )
+    .await
 }
 
 /// Verify a request-bound approval, then conditionally consume and activate it
@@ -1188,8 +1220,10 @@ mod tests {
             "New Mac",
             Platform::Macos,
             &candidate.verifying_key().to_bytes(),
+            &PairingDetails::default(),
         )
         .await?;
+        assert_eq!(pairing.details, PairingDetails::default());
         let pairing_message = super::super::pairing_approval_message(
             pairing.id,
             &pairing.nonce,
@@ -1249,14 +1283,38 @@ mod tests {
             &SigningKey::from_bytes(&rand::random())
                 .verifying_key()
                 .to_bytes(),
+            &PairingDetails {
+                ip: Some("2001:db8::1".into()),
+                user_agent: Some("Jarvis/0.1.14".into()),
+                app_version: Some("0.1.14".into()),
+                model: Some("iPhone 16".into()),
+            },
         )
         .await?;
+        // Candidate details round-trip unchanged for the approving owner.
+        let listed = pending_pairing_requests(&db, owner.id).await?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].details, local_request.details);
+        assert_eq!(local_request.details.model.as_deref(), Some("iPhone 16"));
         let local_id = local_request.id;
         let local_device = activate_pairing_request(&db, local_request, None).await?;
         assert_eq!(local_device.user_id, owner.id);
         let consumed = pairing_request(&db, local_id, owner.id).await?.unwrap();
         assert_eq!(consumed.status, "approved");
         assert!(activate_pairing_request(&db, consumed, None).await.is_err());
+
+        // Rows a day past expiry, with their candidate details, are purged;
+        // recent rows of any status stay.
+        let stale = Uuid::now_v7();
+        db.query("CREATE device_pairing_requests SET id = $id, user_id = $user, candidate_name = 'old', candidate_platform = 'ios', candidate_public_key = <bytes>'k', candidate_fingerprint = 'f', nonce = <bytes>'n', status = 'expired', created_at = time::now() - 2d, expires_at = time::now() - 2d, candidate_ip = '192.0.2.9'")
+            .bind(("id", stale.to_string()))
+            .bind(("user", owner.id.to_string()))
+            .await?
+            .check()?;
+        assert!(pairing_request(&db, stale, owner.id).await?.is_some());
+        purge_expired_pairing_requests(&db).await?;
+        assert!(pairing_request(&db, stale, owner.id).await?.is_none());
+        assert!(pairing_request(&db, local_id, owner.id).await?.is_some());
 
         // Revoking a device invalidates every existing bearer session at once;
         // a stolen token must not remain useful until its normal expiry.

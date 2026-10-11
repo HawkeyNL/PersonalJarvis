@@ -511,6 +511,16 @@ sudo jarvis devices trust --all-active
 ```
 
 Check the pending fingerprint against the requesting device before approving.
+
+Every pairing request (`POST /v1/auth/pairing/requests`) needs the owner's
+stored account password. An owner without one, such as a development-enrolled
+setup, gets `403` with `"code": "pairing_password_not_set"` and must first set
+a password from an active device. Each pending request also records the
+candidate's IP address, `User-Agent`, and the optional `app_version` and
+`model` it sent; `devices pending` lists them with control and bidi
+characters escaped. These are unauthenticated hints for the approver, not proof
+of identity; the full key fingerprint is what binds the approval. Core deletes
+pairing requests, with these details, one day after they expire.
 Revocation invalidates the device's sessions and realtime connections. Revoking
 every device does **not** reopen first-device activation or reset the account
 password. These commands are not a lost-password recovery mechanism.

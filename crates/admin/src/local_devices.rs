@@ -63,7 +63,7 @@ pub fn run(command: DeviceCommand, json: bool) -> Result<()> {
     }
     match command {
         DeviceCommand::List => print(&exchange(&DeviceRequest::List {})?),
-        DeviceCommand::Pending => print(&exchange(&DeviceRequest::Pending {})?),
+        DeviceCommand::Pending => print(&escaped_pending(exchange(&DeviceRequest::Pending {})?)),
         DeviceCommand::Approve {
             request_id,
             fingerprint,
@@ -199,6 +199,40 @@ fn candidates(
         bail!("no matching active device with a signing key");
     }
     Ok(selected)
+}
+
+/// Candidate-supplied text in pending requests is capped and has control
+/// and bidi/format characters escaped, like `shown`, so it cannot disguise
+/// the fingerprint printed next to it. Quotes stay as-is for JSON output.
+fn escaped_pending(mut data: serde_json::Value) -> serde_json::Value {
+    let Some(requests) = data["requests"].as_array_mut() else {
+        return data;
+    };
+    for request in requests {
+        for (field, max_chars) in [
+            ("name", 64),
+            ("ip", 64),
+            ("user_agent", 256),
+            ("app_version", 64),
+            ("model", 64),
+        ] {
+            if let Some(text) = request[field].as_str() {
+                request[field] = escaped(text, max_chars).into();
+            }
+        }
+    }
+    data
+}
+
+fn escaped(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .take(max_chars)
+        .map(|c| match c {
+            '"' | '\\' | '\'' => c.to_string(),
+            _ => c.escape_debug().to_string(),
+        })
+        .collect()
 }
 
 /// Remote device names are capped and debug-escaped (control and bidi
@@ -417,6 +451,21 @@ mod tests {
         assert_eq!(one.iter().map(|c| c.id).collect::<Vec<_>>(), [b]);
         assert!(candidates(listed(&[(a, None)]), &pins, Some(a)).is_err());
         assert!(candidates(listed(&[(a, Some([1; 32]))]), &pins, Some(b)).is_err());
+    }
+
+    #[test]
+    fn pending_details_are_capped_and_escape_bidi_controls() {
+        let data = escaped_pending(serde_json::json!({"requests":[{
+            "name":"a\u{202e}b \"q\"", "ip":"192.0.2.1", "user_agent":"u".repeat(300),
+            "app_version":null, "model":"x\u{1b}[2J\u{200b}", "fingerprint":"f\u{202e}"}]}));
+        let request = &data["requests"][0];
+        assert_eq!(request["name"], "a\\u{202e}b \"q\"");
+        assert_eq!(request["ip"], "192.0.2.1");
+        assert_eq!(request["user_agent"].as_str().unwrap().len(), 256);
+        assert!(request["app_version"].is_null());
+        assert_eq!(request["model"], "x\\u{1b}[2J\\u{200b}");
+        // Core-computed fields are left alone.
+        assert_eq!(request["fingerprint"], "f\u{202e}");
     }
 
     #[test]

@@ -635,6 +635,20 @@ async fn main() -> anyhow::Result<()> {
             budget_gate.sweep().await;
         }
     });
+    // Expired pairing requests hold the candidate's IP address and User-Agent.
+    let pairing_db = state.db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            let purge = jarvis_identity::purge_expired_pairing_requests(&pairing_db);
+            match tokio::time::timeout(std::time::Duration::from_secs(5), purge).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "pairing request purge failed"),
+                Err(_) => tracing::warn!("pairing request purge timed out"),
+            }
+        }
+    });
     let _local_device_admin = if state.environment == "production" {
         Some(jarvis_api::local_devices::start(state.clone())?)
     } else {

@@ -198,11 +198,24 @@ pub struct PairingRequestItem {
     pub id: Uuid,
     pub device_name: String,
     pub platform: String,
+    /// Legacy 16-hex prefix of `fingerprint_full`.
     pub fingerprint: String,
     pub nonce: String,
     pub candidate_public_key: String,
     pub created_at: i64,
     pub expires_at: i64,
+    /// Lowercase hex SHA-256 of the candidate key; absent from older Cores.
+    #[serde(default)]
+    pub fingerprint_full: Option<String>,
+    // Unauthenticated hints from the candidate; null when unknown.
+    #[serde(default)]
+    pub ip: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub app_version: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

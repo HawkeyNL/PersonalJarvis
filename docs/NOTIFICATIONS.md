@@ -9,7 +9,7 @@ until `JARVIS_NOTIFY_NTFY_URL` is set.
 | Event | Message | Priority | Tap opens |
 |---|---|---|---|
 | Monthly LLM spend reaches 90% of the hard budget (`JARVIS_LLM_MONTHLY_BUDGET_EUR`), once per calendar month (UTC) | Budget reached 90% this month | default | `jarvis://health/usage` |
-| A new device pairing request was created with a verified account password | New device wants to pair — open Jarvis to review | high | `jarvis://approvals/pairing` |
+| A new device pairing request was created (always with a verified account password) | New device wants to pair — open Jarvis to review | high | `jarvis://approvals/pairing` |
 
 Every push has the title `Jarvis` and nothing else: no amounts, IP addresses,
 device names or key fingerprints. The app shows the details after the owner
@@ -25,9 +25,9 @@ Behaviour in Core:
 - The budget marker is kept in memory. At startup a month that is already at
   or above 90% counts as notified, so restarts do not repeat the push.
 - Logs name the event kind and HTTP status only, never the token or topic.
-- A pairing request accepted without a password check (an owner with no
-  stored account password) sends no push, so an unauthenticated caller cannot
-  trigger one.
+- Core only creates a pairing request after verifying the owner's account
+  password; an owner without one gets `403` (`pairing_password_not_set`) and
+  no push, so an unauthenticated caller cannot trigger one.
 - An invalid URL or a missing or malformed token is logged at startup and
   leaves notifications off; Core keeps running.
 
