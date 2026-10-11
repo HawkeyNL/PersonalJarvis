@@ -44,6 +44,7 @@ mod routes;
 mod state;
 mod validation;
 
+pub use audit::{prune_security_audit, run_audit_maintenance};
 pub use extract::Authed;
 pub use metering::refresh_usage_snapshot;
 pub use peer::{bind_api_socket, proxy_identity, Peer, ProxyIdentity};

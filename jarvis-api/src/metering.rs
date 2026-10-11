@@ -132,7 +132,8 @@ pub async fn refresh_usage_snapshot(state: &AppState) {
     let Ok(bytes) = serde_json::to_vec(&value) else {
         return;
     };
-    if bytes.len() > 512 * 1024 {
+    // The reader caps the file (with its trailing newline) at 512 KiB.
+    if bytes.len() >= 512 * 1024 {
         tracing::warn!("usage summary exceeded its safe size bound");
         return;
     }

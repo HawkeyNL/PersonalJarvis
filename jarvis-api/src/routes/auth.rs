@@ -21,8 +21,12 @@ use jarvis_client_core::{
 };
 use jarvis_identity as identity;
 
-use crate::audit::record_security_event;
+use crate::audit::{record_security_event, record_unauthenticated_event};
 use crate::error::{bad_request, internal, unauthorized};
+use crate::rate_limit::{
+    device_password_key, note_password_failure, note_password_verified, password_backoff,
+    ACCOUNT_PASSWORD_BACKOFF, ACCOUNT_PASSWORD_KEY, DEVICE_PASSWORD_BACKOFF,
+};
 use crate::validation;
 use crate::{AppState, Authed};
 
@@ -139,7 +143,8 @@ pub(crate) async fn auth_bootstrap(
     // a direct caller can never make one count.
     let client_ip = crate::peer::client_ip(&extensions, &headers, &state);
     if !client_ip.is_some_and(|ip| policy.allows(ip)) {
-        record_security_event(&state, None, "auth.bootstrap", "rejected_network", None).await;
+        record_unauthenticated_event(&state, None, "auth.bootstrap", "rejected_network", None)
+            .await;
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({ "error": "bootstrap unavailable" })),
@@ -150,7 +155,7 @@ pub(crate) async fn auth_bootstrap(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !policy.verifies(secret) {
-        record_security_event(&state, None, "auth.bootstrap", "invalid_secret", None).await;
+        record_unauthenticated_event(&state, None, "auth.bootstrap", "invalid_secret", None).await;
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({ "error": "bootstrap unavailable" })),
@@ -257,7 +262,15 @@ pub(crate) async fn pairing_create(
     // device or the local root operator must still approve it.
     // Every attempt spends this global budget, which caps the Argon2 runs
     // across all sources so address rotation buys neither online guesses nor
-    // memory pressure. Validation failures above do not spend it.
+    // memory pressure. Validation failures above do not spend it, and neither
+    // does a request refused by the account-wide password backoff.
+    if state
+        .rate_limiter
+        .password_backoff(ACCOUNT_PASSWORD_KEY, ACCOUNT_PASSWORD_BACKOFF)
+        .is_some()
+    {
+        return Err(password_backoff());
+    }
     if !state.rate_limiter.check_reserved(
         "pairing:global",
         PAIRING_PASSWORD_CHECKS_PER_MIN,
@@ -265,18 +278,34 @@ pub(crate) async fn pairing_create(
     ) {
         return Err(busy());
     }
-    let password_verified = identity::surreal::account::verify_password(
+    let password_verified = match identity::surreal::account::verify_password(
         &state.db,
         identity::password::PasswordService::pre_auth(),
         user.id,
         password,
     )
     .await
-    .map_err(|error| match error {
-        identity::IdentityError::Busy => busy(),
-        _ => unauthorized(),
-    })?
-    .is_some();
+    {
+        Ok(Some(_)) => {
+            note_password_verified(&state, None);
+            true
+        }
+        Ok(None) => false,
+        Err(identity::IdentityError::Busy) => return Err(busy()),
+        Err(identity::IdentityError::PasswordRejected) => {
+            note_password_failure(&state, None);
+            record_unauthenticated_event(
+                &state,
+                None,
+                "device.pairing_request",
+                "password_failed",
+                None,
+            )
+            .await;
+            return Err(unauthorized());
+        }
+        Err(_) => return Err(unauthorized()),
+    };
     let platform =
         identity::Platform::parse(&req.platform).map_err(|_| bad_request("unknown platform"))?;
     let key =
@@ -296,14 +325,28 @@ pub(crate) async fn pairing_create(
             .notifier
             .notify(crate::notify::NotifyEvent::PairingRequested);
     }
-    record_security_event(
-        &state,
-        None,
-        "device.pairing_request",
-        "created",
-        Some(&pairing.candidate_fingerprint[..16]),
-    )
-    .await;
+    // A password-verified request is rare and always worth a row; one without
+    // a password check (legacy owner) is budgeted like other anonymous events.
+    let fingerprint = Some(&pairing.candidate_fingerprint[..16]);
+    if password_verified {
+        record_security_event(
+            &state,
+            None,
+            "device.pairing_request",
+            "created",
+            fingerprint,
+        )
+        .await;
+    } else {
+        record_unauthenticated_event(
+            &state,
+            None,
+            "device.pairing_request",
+            "created",
+            fingerprint,
+        )
+        .await;
+    }
     Ok(Json(
         json!({ "request_id": pairing.id, "nonce": hex::encode(pairing.nonce), "expires_at": pairing.expires_at.unix_timestamp() }),
     ))
@@ -346,7 +389,7 @@ pub(crate) async fn pairing_status(
         return Err(unauthorized());
     };
     if just_expired {
-        record_security_event(
+        record_unauthenticated_event(
             &state,
             None,
             "device.pairing_request",
@@ -458,6 +501,14 @@ pub(crate) async fn auth_login(
             Json(json!({ "error": "invalid signature encoding" })),
         )
     })?;
+    // Only a caller holding this device's key can put it into backoff.
+    if state
+        .rate_limiter
+        .password_backoff(&device_password_key(req.device_id), DEVICE_PASSWORD_BACKOFF)
+        .is_some()
+    {
+        return Err(password_backoff());
+    }
     let result = match identity::surreal::login_with_password(
         &state.db,
         req.device_id,
@@ -469,11 +520,27 @@ pub(crate) async fn auth_login(
     {
         Ok(r) => r,
         Err(identity::IdentityError::Busy) => return Err(busy()),
+        // Valid device signature, wrong password: bounded by the device
+        // backoff, so it is always recorded.
+        Err(identity::IdentityError::PasswordRejected) => {
+            note_password_failure(&state, Some(req.device_id));
+            record_security_event(
+                &state,
+                Some(req.device_id),
+                "auth.login",
+                "password_failed",
+                None,
+            )
+            .await;
+            return Err(unauthorized());
+        }
         Err(_) => {
-            record_security_event(&state, Some(req.device_id), "auth.login", "fail", None).await;
+            record_unauthenticated_event(&state, Some(req.device_id), "auth.login", "fail", None)
+                .await;
             return Err(unauthorized());
         }
     };
+    note_password_verified(&state, Some(req.device_id));
     record_security_event(&state, Some(req.device_id), "auth.login", "ok", None).await;
     Ok(Json(json!({
         "token": result.token,

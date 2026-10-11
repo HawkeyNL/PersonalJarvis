@@ -490,6 +490,91 @@ async fn owner_brain_preference_round_trips() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn security_audit_retention_and_dropped_summary() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("audit_fixture_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("test")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let mut fixture = state(db.clone(), None).await;
+    // Let every failed login reach the handler; only the audit budget applies.
+    fixture.auth_limits.login_per_min = 100;
+    fixture.auth_limits.login_max_failures = 100;
+    let app = build_router(fixture.clone());
+
+    // Eleven unauthenticated failures: ten fill the per-kind budget, one is
+    // dropped and counted.
+    for _ in 0..11 {
+        let body = json!({
+            "device_id": uuid::Uuid::now_v7(),
+            "challenge_id": uuid::Uuid::now_v7(),
+            "signature": "00".repeat(64),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    for (age, event) in [
+        ("181d", "fixture.old"),
+        ("200d", "fixture.old"),
+        ("1000d", "fixture.old"),
+        ("1d", "fixture.recent"),
+        ("179d", "fixture.recent"),
+    ] {
+        db.query(format!(
+            "CREATE security_audit SET id = $id, ts = time::now() - {age}, \
+             device_id = NONE, event = $event, outcome = 'ok', detail = NONE RETURN NONE"
+        ))
+        .bind(json!({"id": uuid::Uuid::now_v7().to_string(), "event": event}))
+        .await?
+        .check()?;
+    }
+
+    assert_eq!(jarvis_api::prune_security_audit(&db).await?, 3);
+    jarvis_api::run_audit_maintenance(&fixture).await;
+
+    let count = |event: &'static str| {
+        let db = db.clone();
+        async move {
+            let mut response = db
+                .query("SELECT count() AS n FROM security_audit WHERE event = $event GROUP ALL")
+                .bind(json!({"event": event}))
+                .await?
+                .check()?;
+            let rows: Vec<Value> = response.take(0)?;
+            Ok::<_, surrealdb::Error>(rows.first().and_then(|r| r["n"].as_u64()).unwrap_or(0))
+        }
+    };
+    assert_eq!(count("fixture.old").await?, 0);
+    assert_eq!(count("fixture.recent").await?, 2);
+    assert_eq!(count("auth.login").await?, 10);
+    let mut summary = db
+        .query("SELECT outcome, detail FROM security_audit WHERE event = 'audit.unauthenticated'")
+        .await?
+        .check()?;
+    let summary: Vec<Value> = summary.take(0)?;
+    assert_eq!(summary, vec![json!({"outcome": "dropped", "detail": "1"})]);
+    // Nothing left to prune or report.
+    assert_eq!(jarvis_api::prune_security_audit(&db).await?, 0);
+    Ok(())
+}
+
 async fn enroll_login(app: &axum::Router, signing: &SigningKey) -> (String, Vec<u8>) {
     let enroll = app.clone().oneshot(Request::builder().method("POST").uri("/v1/auth/enroll")
         .header(header::CONTENT_TYPE, "application/json").body(Body::from(serde_json::to_vec(&json!({"name":"test", "platform":"ios", "public_key": hex::encode(signing.verifying_key().to_bytes())})).unwrap())).unwrap()).await.unwrap();

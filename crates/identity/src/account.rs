@@ -127,6 +127,7 @@ pub async fn verify_password(
         .await
         .map_err(|error| match error {
             crate::password::PasswordError::Busy => IdentityError::Busy,
+            crate::password::PasswordError::AuthenticationFailed => IdentityError::PasswordRejected,
             _ => IdentityError::AuthFailed,
         })?;
     Ok(Some(row.revision))

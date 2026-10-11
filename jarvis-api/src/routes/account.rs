@@ -3,6 +3,10 @@
 use crate::{
     audit::record_security_event,
     error::{bad_request, internal, unauthorized},
+    rate_limit::{
+        device_password_key, note_password_failure, note_password_verified, password_backoff,
+        DEVICE_PASSWORD_BACKOFF,
+    },
     AppState, Authed,
 };
 use axum::{
@@ -53,14 +57,39 @@ pub(crate) async fn password_request(
     State(state): State<AppState>,
     Json(req): Json<PasswordChange>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    account::verify_password(
+    if state
+        .rate_limiter
+        .password_backoff(
+            &device_password_key(auth.device.id),
+            DEVICE_PASSWORD_BACKOFF,
+        )
+        .is_some()
+    {
+        return Err(password_backoff());
+    }
+    match account::verify_password(
         &state.db,
         PasswordService::shared(),
         auth.user.id,
         req.current_password,
     )
     .await
-    .map_err(|_| unauthorized())?;
+    {
+        Ok(_) => note_password_verified(&state, Some(auth.device.id)),
+        Err(jarvis_identity::IdentityError::PasswordRejected) => {
+            note_password_failure(&state, Some(auth.device.id));
+            record_security_event(
+                &state,
+                Some(auth.device.id),
+                "account.password_change",
+                "password_failed",
+                None,
+            )
+            .await;
+            return Err(unauthorized());
+        }
+        Err(_) => return Err(unauthorized()),
+    }
     let stored =
         PasswordService::shared()
             .hash(req.password)

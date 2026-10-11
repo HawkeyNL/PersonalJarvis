@@ -635,6 +635,16 @@ async fn main() -> anyhow::Result<()> {
             budget_gate.sweep().await;
         }
     });
+    // Hourly audit housekeeping (dropped-event summary, retention); one run
+    // at a time, each bounded by a timeout.
+    let audit_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        loop {
+            interval.tick().await;
+            jarvis_api::run_audit_maintenance(&audit_state).await;
+        }
+    });
     let _local_device_admin = if state.environment == "production" {
         Some(jarvis_api::local_devices::start(state.clone())?)
     } else {
