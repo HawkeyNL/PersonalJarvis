@@ -1,6 +1,6 @@
 # Goal: private agent runtime boundary and immutable Jarvis persona
 
-> **Status (2026-10-11):** Partly implemented — The `AgentRegistry`, bundle validation and installer tooling are in place and Core loads the registry at start. `AgentRun` is not wired into execution and the `AgentChangeProposal` pipeline is missing.
+> **Status (2026-10-11):** Partly implemented — The `AgentRegistry`, bundle validation and installer tooling are in place and Core loads the registry at start and hot-reloads it on SIGHUP. `AgentRun` is not wired into execution and the `AgentChangeProposal` pipeline is missing.
 
 Implement a production-safe agent registry/runtime boundary in the public `PersonalJarvis` repository while keeping all real personal agent definitions private in `HawkeyNL/PersonalJarvisAgents`.
 
@@ -8,7 +8,7 @@ Implement a production-safe agent registry/runtime boundary in the public `Perso
 
 `PersonalJarvis` is public and contains runtime/API/app/deployment code. `PersonalJarvisAgents` is private and contains the real personal agent Markdown definitions. Public GitHub CI MUST NOT require access to the private repository or any private agent content.
 
-`jarvis-core` owns persona loading (`load_persona`) and the `AgentRegistry` loader; the runtime execution boundary (`AgentRun`) is not yet wired into execution.
+`jarvis-core` now has the Agent Registry boundary: `AgentRegistry::load` (manifest hashes, no symlinks or traversal), `AgentLoader` with immutable generation-numbered snapshots, and `AgentRun` pinned to a snapshot. Core reloads the staged bundle on SIGHUP (`systemctl reload jarvis-core.service`); a failed reload keeps the previous snapshot and reports the registry degraded on the owner-authenticated `GET /v1/system/services`. The private agent updater still restarts Core after activating a bundle, because only a restart gives it a readiness check against the new bundle. `AgentRun` is not yet wired to execution.
 
 The private agent repository explicitly defines its profiles as documentation/contracts: profiles may request capabilities but MUST NOT grant themselves runtime capability, policy exceptions, secret access, or execution rights. The public runtime remains authoritative.
 

@@ -9,7 +9,10 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
 
@@ -154,6 +157,8 @@ pub struct AgentRegistrySnapshot {
 pub struct AgentLoader {
     bundle_path: PathBuf,
     current: RwLock<Arc<AgentRegistrySnapshot>>,
+    /// Set when the last reload failed and an older snapshot is still served.
+    degraded: AtomicBool,
 }
 
 /// A model-generated change can be shown to an owner, but represents no write
@@ -353,6 +358,7 @@ impl AgentLoader {
                 generation: 1,
                 registry,
             })),
+            degraded: AtomicBool::new(false),
         })
     }
 
@@ -365,15 +371,27 @@ impl AgentLoader {
 
     /// Loads and validates a whole replacement first. If it fails, the active
     /// snapshot is unchanged; no partial registry can become visible.
+    /// A failure marks the loader degraded until a later reload succeeds.
     pub fn reload(&self) -> Result<Arc<AgentRegistrySnapshot>, AgentRegistryError> {
-        let registry = Arc::new(AgentRegistry::load(&self.bundle_path)?);
+        let registry = match AgentRegistry::load(&self.bundle_path) {
+            Ok(registry) => Arc::new(registry),
+            Err(error) => {
+                self.degraded.store(true, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
         let mut current = self.current.write().expect("agent registry lock poisoned");
         let next = Arc::new(AgentRegistrySnapshot {
             generation: current.generation.saturating_add(1),
             registry,
         });
         *current = next.clone();
+        self.degraded.store(false, Ordering::Relaxed);
         Ok(next)
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
     }
 }
 
@@ -815,8 +833,104 @@ mod tests {
             Err(AgentRegistryError::HashMismatch)
         ));
         assert_eq!(loader.snapshot().generation, 1);
+        assert!(loader.is_degraded());
         assert_eq!(run.bundle_id, first.registry.bundle_id());
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Two synthetic bundles behind a `current` symlink, like the installer.
+    fn fixture_bundle_pair() -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("jarvis-agent-reload-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        for bundle in ["bundle-a", "bundle-b"] {
+            let (directory, _) = fixture_registry();
+            let manifest = directory.join("manifest.json");
+            let mut parsed: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+            parsed["bundle_id"] = serde_json::Value::String(bundle.into());
+            std::fs::write(&manifest, serde_json::to_vec(&parsed).unwrap()).unwrap();
+            std::fs::rename(&directory, root.join(bundle)).unwrap();
+        }
+        let current = root.join("current");
+        std::os::unix::fs::symlink("bundle-a", &current).unwrap();
+        (root, current)
+    }
+
+    fn point_current(root: &Path, bundle: &str) {
+        let next = root.join("current.new");
+        let _ = std::fs::remove_file(&next);
+        std::os::unix::fs::symlink(bundle, &next).unwrap();
+        std::fs::rename(next, root.join("current")).unwrap();
+    }
+
+    #[test]
+    fn reload_swaps_the_snapshot_and_clears_degraded() {
+        let (root, current) = fixture_bundle_pair();
+        let loader = AgentLoader::load(&current).unwrap();
+        let first = loader.snapshot();
+        assert_eq!(first.registry.bundle_id(), "bundle-a");
+
+        point_current(&root, "missing");
+        assert!(matches!(
+            loader.reload(),
+            Err(AgentRegistryError::MissingBundle)
+        ));
+        assert!(loader.is_degraded());
+        assert_eq!(loader.snapshot().registry.bundle_id(), "bundle-a");
+
+        point_current(&root, "bundle-b");
+        let next = loader.reload().unwrap();
+        assert_eq!(next.generation, 2);
+        assert_eq!(loader.snapshot().registry.bundle_id(), "bundle-b");
+        assert!(!loader.is_degraded());
+        // A snapshot taken before the reload is untouched.
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.registry.bundle_id(), "bundle-a");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readers_during_reload_see_whole_snapshots() {
+        let (root, current) = fixture_bundle_pair();
+        let loader = Arc::new(AgentLoader::load(&current).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (loader, stop) = (loader.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut last = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        let snapshot = loader.snapshot();
+                        // Odd generations load bundle-a, even ones bundle-b.
+                        let expected = if snapshot.generation % 2 == 1 {
+                            "bundle-a"
+                        } else {
+                            "bundle-b"
+                        };
+                        assert_eq!(snapshot.registry.bundle_id(), expected);
+                        assert_eq!(snapshot.registry.agents().len(), 1);
+                        assert!(snapshot.generation >= last);
+                        last = snapshot.generation;
+                    }
+                })
+            })
+            .collect();
+        for generation in 2..=40u64 {
+            point_current(
+                &root,
+                if generation % 2 == 1 {
+                    "bundle-a"
+                } else {
+                    "bundle-b"
+                },
+            );
+            assert_eq!(loader.reload().unwrap().generation, generation);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

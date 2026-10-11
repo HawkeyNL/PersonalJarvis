@@ -21,6 +21,9 @@ EnvironmentFile=-/etc/jarvis/secrets/ollama-cloud.env
 EnvironmentFile=-/etc/jarvis/secrets/huggingface.env
 EnvironmentFile=-/etc/jarvis/secrets/jev.env
 ExecStart=/opt/jarvis/current/jarvis-api
+# `systemctl reload` re-reads the staged private agent bundle only. A failed
+# reload keeps the previous bundle and reports the registry degraded.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s

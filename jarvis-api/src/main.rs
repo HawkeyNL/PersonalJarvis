@@ -397,14 +397,17 @@ async fn main() -> anyhow::Result<()> {
     // private checkout and uses the generic Core only.
     let agent_bundle_path = std::env::var("JARVIS_AGENT_BUNDLE_PATH")
         .unwrap_or_else(|_| "/var/lib/jarvis/agents/current".to_string());
-    let agent_registry = match jarvis_core::AgentRegistry::load(&agent_bundle_path) {
-        Ok(agent_registry) => {
+    let agent_registry = match jarvis_core::AgentLoader::load(&agent_bundle_path) {
+        Ok(loader) => {
+            let snapshot = loader.snapshot();
             tracing::info!(
-                bundle = %agent_registry.bundle_id(),
-                agent_count = agent_registry.agents().len(),
+                bundle = %snapshot.registry.bundle_id(),
+                agent_count = snapshot.registry.agents().len(),
                 "private AgentRegistry loaded"
             );
-            Some(Arc::new(agent_registry))
+            let loader = Arc::new(loader);
+            reload_agents_on_sighup(loader.clone())?;
+            Some(loader)
         }
         Err(error) if config.environment.eq_ignore_ascii_case("production") => {
             anyhow::bail!("protected AgentRegistry is unavailable: {error}");
@@ -634,5 +637,31 @@ async fn main() -> anyhow::Result<()> {
         tcp.await?;
     }
 
+    Ok(())
+}
+
+/// `systemctl reload jarvis-core` sends SIGHUP: re-read the staged agent
+/// bundle. A failed reload keeps the previous snapshot and marks the loader
+/// degraded until a later reload succeeds.
+fn reload_agents_on_sighup(loader: Arc<jarvis_core::AgentLoader>) -> anyhow::Result<()> {
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    tokio::spawn(async move {
+        while hangup.recv().await.is_some() {
+            let loader = loader.clone();
+            match tokio::task::spawn_blocking(move || loader.reload()).await {
+                Ok(Ok(snapshot)) => tracing::info!(
+                    bundle = %snapshot.registry.bundle_id(),
+                    generation = snapshot.generation,
+                    agent_count = snapshot.registry.agents().len(),
+                    "private AgentRegistry reloaded"
+                ),
+                Ok(Err(error)) => tracing::error!(
+                    %error,
+                    "private AgentRegistry reload failed; keeping the previous bundle"
+                ),
+                Err(error) => tracing::error!(%error, "private AgentRegistry reload task failed"),
+            }
+        }
+    });
     Ok(())
 }

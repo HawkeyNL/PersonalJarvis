@@ -16,7 +16,7 @@ const MAX_TOOLS: usize = 64;
 const MAX_TOOL_NAME_LEN: usize = 128;
 
 pub(crate) async fn list(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
-    let Some(registry) = state.agent_registry.as_deref() else {
+    let Some(loader) = state.agent_registry.as_deref() else {
         return Json(json!({
             "bundle_id": null,
             "agent_count": 0,
@@ -37,9 +37,11 @@ pub(crate) async fn list(_authed: Authed, State(state): State<AppState>) -> Json
                 "usage_query_failed"
             })
     };
+    // One snapshot per response: a concurrent reload never mixes bundles.
+    let snapshot = loader.snapshot();
     Json(agents_value(
-        registry.bundle_id(),
-        registry.agents(),
+        snapshot.registry.bundle_id(),
+        snapshot.registry.agents(),
         usage.as_deref().map_err(|reason| *reason),
     ))
 }
