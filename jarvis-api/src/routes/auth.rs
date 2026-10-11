@@ -241,9 +241,14 @@ pub(crate) async fn pairing_create(
     if req
         .model
         .as_deref()
-        .is_some_and(|model| !validation::display_text(model, validation::MAX_DEVICE_MODEL_LEN))
+        .is_some_and(|model| !validation::printable_ascii(model, validation::MAX_DEVICE_MODEL_LEN))
     {
         return Err(bad_request("invalid model"));
+    }
+    // The approver sees the name next to the fingerprint. Bootstrap keeps its
+    // existing rules: its device is the owner's own, not a remote candidate.
+    if !validation::no_hidden_chars(&req.name) {
+        return Err(bad_request("invalid device name"));
     }
     // Shown to the owner as hints only: a client fully controls its
     // User-Agent, so anything but bounded printable ASCII is dropped.

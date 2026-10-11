@@ -28,22 +28,24 @@ pub fn app_version(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'))
 }
 
-/// Non-blank text of at most `max_chars` characters without control,
-/// zero-width or bidi formatting characters, so a value shown next to a
-/// fingerprint cannot disguise or reorder what the owner reads.
-pub fn display_text(value: &str, max_chars: usize) -> bool {
+/// Non-blank, at most `max_len` bytes, printable ASCII (space to `~`) only.
+pub fn printable_ascii(value: &str, max_len: usize) -> bool {
     !value.trim().is_empty()
-        && value.chars().count() <= max_chars
-        && !value.chars().any(|c| {
-            c.is_control()
-                || matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-                    | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
-        })
+        && value.len() <= max_len
+        && value.bytes().all(|b| (b' '..=b'~').contains(&b))
 }
 
-/// Non-empty, at most `max_len` bytes, printable ASCII (space to `~`) only.
-pub fn printable_ascii(value: &str, max_len: usize) -> bool {
-    !value.is_empty() && value.len() <= max_len && value.bytes().all(|b| (b' '..=b'~').contains(&b))
+/// No control, zero-width or bidi formatting characters, so a device name
+/// shown next to a fingerprint cannot hide or reorder what the owner reads.
+/// Other Unicode stays allowed: default names such as "Gus’s iPhone" use it.
+/// ponytail: explicit denylist of the invisible/bidi code points, not the
+/// whole Unicode `Cf` category; switch to a category table if one is needed.
+pub fn no_hidden_chars(value: &str) -> bool {
+    !value.chars().any(|c| {
+        c.is_control()
+            || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+    })
 }
 
 pub fn bounded_text(value: &str, max_len: usize) -> bool {
@@ -93,21 +95,22 @@ mod tests {
         ] {
             assert!(!app_version(bad), "{bad}");
         }
-        assert!(display_text("Pixel 9 Pro (Ünïcode)", MAX_DEVICE_MODEL_LEN));
-        assert!(display_text(&"é".repeat(64), MAX_DEVICE_MODEL_LEN)); // chars, not bytes
+        assert!(no_hidden_chars("Gus\u{2019}s iPhone (Ünïcode)"));
         for bad in [
-            "",
-            "  ",
             "a\u{7}b",
             "a\nb",
             "abc\u{202E}fed",
             "a\u{200B}b",
             "a\u{2066}b",
             "\u{FEFF}a",
-            &"x".repeat(65),
+            "a\u{AD}b",
         ] {
-            assert!(!display_text(bad, MAX_DEVICE_MODEL_LEN), "{bad:?}");
+            assert!(!no_hidden_chars(bad), "{bad:?}");
         }
+        assert!(printable_ascii("Pixel 9 Pro", MAX_DEVICE_MODEL_LEN));
+        assert!(!printable_ascii("  ", MAX_DEVICE_MODEL_LEN));
+        assert!(!printable_ascii("Pixel\u{202E}9", MAX_DEVICE_MODEL_LEN));
+        assert!(!printable_ascii(&"x".repeat(65), MAX_DEVICE_MODEL_LEN));
         assert!(printable_ascii("Mozilla/5.0 (X11) ~", MAX_USER_AGENT_LEN));
         assert!(!printable_ascii("", MAX_USER_AGENT_LEN));
         assert!(!printable_ascii("a\tb", MAX_USER_AGENT_LEN));

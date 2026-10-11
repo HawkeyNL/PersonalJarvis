@@ -203,7 +203,9 @@ fn candidates(
 
 /// Candidate-supplied text in pending requests is capped and has control
 /// and bidi/format characters escaped, like `shown`, so it cannot disguise
-/// the fingerprint printed next to it. Quotes stay as-is for JSON output.
+/// the fingerprint printed next to it. A backslash is escaped too, so an
+/// escape sequence in the input cannot pass for one added here; quotes stay
+/// as-is for JSON output. Truncation is marked with "…".
 fn escaped_pending(mut data: serde_json::Value) -> serde_json::Value {
     let Some(requests) = data["requests"].as_array_mut() else {
         return data;
@@ -225,14 +227,18 @@ fn escaped_pending(mut data: serde_json::Value) -> serde_json::Value {
 }
 
 fn escaped(value: &str, max_chars: usize) -> String {
-    value
+    let mut shown: String = value
         .chars()
         .take(max_chars)
         .map(|c| match c {
-            '"' | '\\' | '\'' => c.to_string(),
+            '"' | '\'' => c.to_string(),
             _ => c.escape_debug().to_string(),
         })
-        .collect()
+        .collect();
+    if value.chars().nth(max_chars).is_some() {
+        shown.push('…');
+    }
+    shown
 }
 
 /// Remote device names are capped and debug-escaped (control and bidi
@@ -461,7 +467,11 @@ mod tests {
         let request = &data["requests"][0];
         assert_eq!(request["name"], "a\\u{202e}b \"q\"");
         assert_eq!(request["ip"], "192.0.2.1");
-        assert_eq!(request["user_agent"].as_str().unwrap().len(), 256);
+        let user_agent = request["user_agent"].as_str().unwrap();
+        assert_eq!(user_agent.chars().count(), 257);
+        assert!(user_agent.ends_with("u…"));
+        assert_eq!(escaped("a\\u{202e}", 64), "a\\\\u{202e}");
+        assert_eq!(escaped(&"n".repeat(64), 64), "n".repeat(64));
         assert!(request["app_version"].is_null());
         assert_eq!(request["model"], "x\\u{1b}[2J\\u{200b}");
         // Core-computed fields are left alone.

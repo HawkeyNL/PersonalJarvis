@@ -349,6 +349,8 @@ async fn pairing_records_validated_candidate_details_for_the_approver(
         ("model", json!("Pixel\u{202E}9"), StatusCode::BAD_REQUEST),
         ("model", json!("x".repeat(65)), StatusCode::BAD_REQUEST),
         ("model", json!(" "), StatusCode::BAD_REQUEST),
+        ("model", json!("Pixel 9 Pr\u{f6}"), StatusCode::BAD_REQUEST),
+        ("name", json!("Gus\u{202E}enohp"), StatusCode::BAD_REQUEST),
         ("ip", json!("203.0.113.9"), StatusCode::UNPROCESSABLE_ENTITY),
     ];
     for (index, (field, value, expected)) in invalid.into_iter().enumerate() {
@@ -387,6 +389,8 @@ async fn pairing_records_validated_candidate_details_for_the_approver(
     let other = SigningKey::from_bytes(&rand::random());
     let mut plain = base.clone();
     plain["public_key"] = json!(hex::encode(other.verifying_key().to_bytes()));
+    // Visible Unicode, as in a default iOS device name, stays allowed.
+    plain["name"] = json!("Gus\u{2019}s iPhone");
     let created = app
         .clone()
         .oneshot(pairing(
@@ -425,6 +429,7 @@ async fn pairing_records_validated_candidate_details_for_the_approver(
         .find(|item| item["fingerprint_full"] != full.as_str())
         .ok_or("plain request missing")?;
     assert_eq!(plain["ip"], "2001:db8::7");
+    assert_eq!(plain["device_name"], "Gus\u{2019}s iPhone");
     for field in ["user_agent", "app_version", "model"] {
         assert!(plain[field].is_null(), "{field}");
     }
