@@ -207,10 +207,10 @@ pub struct AppState {
     /// Agentic execution kill switch (ADR-029) — Jarvis has no hands unless true.
     pub agent_enabled: bool,
     /// Private agent definitions from the owner's immutable bundle. `None`
-    /// only outside production, where a missing bundle is tolerated. Loaded
-    /// once at startup: the private agent updater restarts Core after it
-    /// swaps the bundle (`deploy/private/jarvis-private-agent-poll.sh`).
-    pub agent_registry: Option<Arc<jarvis_core::AgentRegistry>>,
+    /// only outside production, where a missing bundle is tolerated. SIGHUP
+    /// (`systemctl reload jarvis-core`) reloads it; readers take one
+    /// `snapshot()` per request so a reload never mixes two bundles.
+    pub agent_registry: Option<Arc<jarvis_core::AgentLoader>>,
     /// The sandbox Jarvis' read-only actions are confined to. `None` ⇒ no
     /// workspace configured (actions refused even when enabled).
     pub agent_sandbox: Option<Arc<agent::Sandbox>>,

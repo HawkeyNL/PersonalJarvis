@@ -1,4 +1,5 @@
-//! Owner-visible Home Node service and disk status for the Health page.
+//! Owner-visible Home Node service, disk and agent-registry status for the
+//! Health page.
 //!
 //! Only a compile-time allowlist of Jarvis units is queried, through a fixed
 //! `systemctl show` argv (no shell, cleared environment, bounded time). Only
@@ -12,10 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::Json;
+use axum::{extract::State, Json};
 use serde_json::{json, Value};
 
-use crate::Authed;
+use crate::{AppState, Authed};
 
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -47,10 +48,30 @@ const DISKS: [(&str, &str); 2] = [("system", "/"), ("data", "/var/lib/jarvis")];
 
 static CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
 
-pub(crate) async fn status(_authed: Authed) -> Json<Value> {
+pub(crate) async fn status(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
+    let mut value = cached_status().await;
+    value["agent_registry"] = agent_registry_value(state.agent_registry.as_deref());
+    Json(value)
+}
+
+/// Bundle id, generation and reload health only: never agent definitions.
+/// No loader (a development node without a bundle) is reported degraded.
+fn agent_registry_value(loader: Option<&jarvis_core::AgentLoader>) -> Value {
+    let Some(loader) = loader else {
+        return json!({"bundle_id": null, "generation": null, "degraded": true});
+    };
+    let snapshot = loader.snapshot();
+    json!({
+        "bundle_id": snapshot.registry.bundle_id(),
+        "generation": snapshot.generation,
+        "degraded": loader.is_degraded(),
+    })
+}
+
+async fn cached_status() -> Value {
     if let Some((at, value)) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         if at.elapsed() < CACHE_TTL {
-            return Json(value.clone());
+            return value.clone();
         }
     }
     let disks = tokio::time::timeout(
@@ -69,7 +90,7 @@ pub(crate) async fn status(_authed: Authed) -> Json<Value> {
         "disks": disks,
     });
     *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), value.clone()));
-    Json(value)
+    value
 }
 
 /// Every unit is `unknown` when the call fails, times out or misbehaves.
@@ -269,5 +290,64 @@ mod tests {
 
         let missing = disk_value("data", &dir.path().join("missing"));
         assert_eq!(missing, json!({"label": "data", "state": "unknown"}));
+    }
+
+    #[test]
+    fn agent_registry_reports_bundle_generation_and_degraded_only() {
+        use sha2::{Digest, Sha256};
+
+        assert_eq!(
+            agent_registry_value(None),
+            json!({"bundle_id": null, "generation": null, "degraded": true})
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("agents")).unwrap();
+        let agent = serde_json::to_vec(&json!({
+            "id": "research",
+            "name": "Research",
+            "description": "Synthetic fixture.",
+            "model_policy": "default",
+            "instructions": "SECRET-INSTRUCTIONS",
+            "requested_capabilities": ["read_data"],
+            "allowed_tools": [],
+            "denied_actions": [],
+            "limits": {"max_runtime_seconds": 30, "max_context_chars": 1000, "max_output_chars": 500, "max_parallel_runs": 1}
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join("agents/research.json"), &agent).unwrap();
+        let manifest = |bundle_id: &str| {
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "bundle_id": bundle_id,
+                "agents": [{
+                    "id": "research",
+                    "path": "agents/research.json",
+                    "sha256": hex::encode(Sha256::digest(&agent)),
+                }]
+            }))
+            .unwrap()
+        };
+        std::fs::write(dir.path().join("manifest.json"), manifest("bundle-a")).unwrap();
+        let loader = jarvis_core::AgentLoader::load(dir.path()).unwrap();
+        let healthy = agent_registry_value(Some(&loader));
+        assert_eq!(
+            healthy,
+            json!({"bundle_id": "bundle-a", "generation": 1, "degraded": false})
+        );
+
+        std::fs::write(dir.path().join("manifest.json"), b"{").unwrap();
+        assert!(loader.reload().is_err());
+        assert_eq!(
+            agent_registry_value(Some(&loader)),
+            json!({"bundle_id": "bundle-a", "generation": 1, "degraded": true})
+        );
+
+        std::fs::write(dir.path().join("manifest.json"), manifest("bundle-b")).unwrap();
+        loader.reload().unwrap();
+        assert_eq!(
+            agent_registry_value(Some(&loader)),
+            json!({"bundle_id": "bundle-b", "generation": 2, "degraded": false})
+        );
     }
 }

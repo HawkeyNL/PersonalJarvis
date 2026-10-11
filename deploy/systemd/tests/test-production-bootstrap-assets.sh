@@ -61,6 +61,7 @@ grep -Fq 'release was not staged by the verified-release helper' "$repo_dir/depl
 grep -Fq 'must not contain symlinks' "$repo_dir/deploy/systemd/install-home-node-core.sh"
 grep -Fq 'User=jarvis' "$core_unit"
 grep -Fq 'ReadOnlyPaths=/var/lib/jarvis/agents' "$core_unit"
+grep -Fxq 'ExecReload=/bin/kill -HUP $MAINPID' "$core_unit"
 ! grep -Fq 'SupplementaryGroups=jarvis-codex' "$core_unit"
 grep -Fq 'After=network-online.target jarvis-surrealdb.service' "$core_unit"
 grep -Fq 'User=root' "$db_unit"

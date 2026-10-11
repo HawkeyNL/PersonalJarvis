@@ -349,6 +349,12 @@ agent updater. The Core, agent bundle, Codex and OpenSandbox do not receive it.
 Agent rollback may only select a validated immutable bundle already under
 `/var/lib/jarvis/agents/releases`.
 
+`update` restarts Core after activating a bundle and rolls back when Core does
+not become ready. `sudo systemctl reload jarvis-core.service` instead re-reads
+the active bundle without a restart: a bundle that fails to load leaves the
+previous one in use, and the Health page (`GET /v1/system/services`,
+`agent_registry`) shows its `bundle_id`, `generation` and `degraded` flag.
+
 ### Signed agent updates
 
 By default the updater deploys the tip of `PersonalJarvisAgents` `main`, so
