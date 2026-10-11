@@ -8,5 +8,6 @@
   },
   "track_stable": false,
   "tauri_signing_public_key": "REPLACE_WITH_PUBLIC_TAURI_KEY_NOT_PRIVATE_KEY",
-  "android_signing_certificate_sha256": "REPLACE_WITH_PUBLIC_ANDROID_CERTIFICATE_SHA256"
+  "android_signing_certificate_sha256": "REPLACE_WITH_PUBLIC_ANDROID_CERTIFICATE_SHA256",
+  "public_hostname": "REPLACE_WITH_BARE_PUBLIC_HOSTNAME_OR_REMOVE_LINE"
 }

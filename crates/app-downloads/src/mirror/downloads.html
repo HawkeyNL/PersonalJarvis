@@ -34,8 +34,9 @@ select:focus-visible { outline: 3px solid #7ee7ec; outline-offset: 3px; }
 <h1>Your Jarvis, on every device.</h1>
 <p>Choose an available installer below. On first launch, enter the HTTPS address of your own Home Node and complete the device pairing.</p>
 <section aria-label="Available client releases">{{CLIENT_RELEASES}}</section>
-<aside><h2>iPhone: sign locally first</h2>
-<p>Downloading an IPA does not install the app. Save the file in Files and import it into your local signing tool, such as AltStore Classic. The IPA is not signed by Apple and is not installed automatically.</p></aside>
+<aside><h2>iPhone: AltStore or SideStore</h2>
+<p>On your iPhone, add the Jarvis source to AltStore or SideStore once; new versions then appear there as updates. That tool signs the app on your device. The IPA is not signed by Apple and is never installed automatically. You can also download an IPA above and import it into your signing tool by hand.</p>
+{{ALTSTORE_LINKS}}</aside>
 {{IOS_CANDIDATES}}
 <footer>This page offers public first-install files. Desktop and Android updates use the secure connection to the configured Home Node after sign-in. Never enter a password, token or Apple account details here.</footer>
 </main></body></html>

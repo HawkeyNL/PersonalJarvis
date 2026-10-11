@@ -52,7 +52,8 @@ async fn sync_release() -> Result<(), &'static str> {
     .map_err(|_| "invalid signed release configuration")?;
     config.validate()?;
     let public = Path::new("/var/lib/jarvis-public-downloads");
-    let public_store = Store::open(public, 0)?;
+    let public_store =
+        Store::open(public, 0)?.with_public_hostname(config.public_hostname.as_deref())?;
     let store = ReleaseStore::open(Path::new("/var/lib/jarvis-app-updates"), 0)?;
     let secret = Zeroizing::new(mirror::read_protected(
         Path::new("/etc/jarvis/app-downloads/ghcr.token"),
@@ -120,6 +121,14 @@ async fn sync_release() -> Result<(), &'static str> {
     if retired > 0 {
         println!("Retired {retired} public release(s) outside the retention rule.");
     }
+    // Also after activation: a failure removes the source and fails the run
+    // visibly, but never undoes or blocks the activated update.
+    let source = public_store.publish_altstore(&config.identity.version);
+    public_store.render_index()?;
+    if let Err(error) = source {
+        eprintln!("jarvis-app-downloads: AltStore source: {error}");
+        return Err("AltStore source removed; the activated update is unaffected");
+    }
     Ok(())
 }
 
@@ -149,7 +158,31 @@ async fn sync_ios() -> Result<(), &'static str> {
     )?)
     .map_err(|_| "invalid mirror configuration")?;
     config.validate()?;
-    let store = Store::open(Path::new("/var/lib/jarvis-public-downloads"), 0)?;
+    // Only sync-release writes the AltStore source. This importer reads just
+    // the hostname so its page rebuild keeps the source links; a missing
+    // release config means no links, any other error fails closed.
+    let release_path = Path::new("/etc/jarvis/app-downloads/release.json");
+    let public_hostname = match std::fs::symlink_metadata(release_path) {
+        Ok(_) => {
+            #[derive(serde::Deserialize)]
+            struct Hostname {
+                #[serde(default)]
+                public_hostname: Option<String>,
+            }
+            serde_json::from_slice::<Hostname>(&mirror::read_protected(
+                release_path,
+                0,
+                true,
+                65536,
+            )?)
+            .map_err(|_| "invalid signed release configuration")?
+            .public_hostname
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err("cannot inspect release configuration"),
+    };
+    let store = Store::open(Path::new("/var/lib/jarvis-public-downloads"), 0)?
+        .with_public_hostname(public_hostname.as_deref())?;
     let bytes = Zeroizing::new(mirror::read_protected(
         Path::new("/etc/jarvis/app-downloads/ghcr.token"),
         0,

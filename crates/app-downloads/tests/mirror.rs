@@ -89,7 +89,10 @@ fn full_verified_import_is_idempotent_and_no_token_enters_public_index() {
     assert!(!index.contains("fixture-owner"));
     assert!(index.contains("width=device-width, initial-scale=1"));
     assert!(index.contains("No complete release has been imported yet"));
-    assert!(index.contains("AltStore Classic"));
+    assert!(index.contains("AltStore or SideStore"));
+    // No hostname configured: no source file and no source links.
+    assert!(!index.contains("altstore://") && !index.contains("{{ALTSTORE_LINKS}}"));
+    assert!(!root.path().join("altstore.json").exists());
     assert!(!index.contains("{{CLIENT_RELEASES}}"));
     assert!(!index.contains("<script"));
     assert_eq!(
