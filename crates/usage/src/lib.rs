@@ -8,7 +8,7 @@
 //! Prices are best-effort estimates in USD per 1M tokens (providers bill in USD);
 //! they can drift, so treat the budget as a safety cap, not an exact invoice.
 
-use std::{collections::BTreeMap, fs, path::Path, sync::Mutex};
+use std::{collections::BTreeMap, fs, path::Path, sync::Mutex, time::Instant};
 
 use serde::{Deserialize, Serialize};
 pub mod coding_reservations;
@@ -534,8 +534,8 @@ pub fn estimate_task_cost_with_registry(
 /// SurrealDB persistence functions. Failures remain best-effort at the caller,
 /// so metering cannot break an assistant reply.
 pub use surreal::{
-    month_agent_statistics, month_breakdown, month_statistics, month_total_eur, record,
-    release_task, reserve_task,
+    active_tasks, expire_tasks, month_agent_statistics, month_breakdown, month_statistics,
+    month_total_eur, record, release_task, reserve_task, ActiveReservation,
 };
 
 /// Which optional `llm_usage` dimensions Core's writers populate today. The
@@ -640,15 +640,28 @@ pub struct BudgetSnapshot {
     pub above_soft_limit: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Hold {
+    cents: u64,
+    expires_at: Instant,
+}
+
 #[derive(Debug, Default)]
 struct BudgetState {
     actual_cents: u64,
-    reservations: BTreeMap<String, u64>,
+    reservations: BTreeMap<String, Hold>,
+}
+
+impl BudgetState {
+    fn reserved_cents(&self) -> u64 {
+        self.reservations.values().map(|hold| hold.cents).sum()
+    }
 }
 
 /// Process-local accounting gate.  It is deliberately atomic under one mutex
-/// so concurrent requests cannot reserve the same remaining budget.  Durable
-/// usage records remain the source for recovery/reconciliation on restart.
+/// so concurrent requests cannot reserve the same remaining budget.  Every
+/// hold carries an expiry so a lost caller can never pin budget forever;
+/// durable reservation rows restore holds after a restart.
 #[derive(Debug)]
 pub struct BudgetBook {
     limits: BudgetLimits,
@@ -666,7 +679,12 @@ impl BudgetBook {
         }
     }
 
-    pub fn reserve(&self, id: impl Into<String>, projected_cents: u64) -> Result<(), BudgetError> {
+    pub fn reserve(
+        &self,
+        id: impl Into<String>,
+        projected_cents: u64,
+        expires_at: Instant,
+    ) -> Result<(), BudgetError> {
         let id = id.into();
         if projected_cents > self.limits.per_request_hard_cents {
             return Err(BudgetError::RequestCap);
@@ -675,38 +693,59 @@ impl BudgetBook {
         if state.reservations.contains_key(&id) {
             return Err(BudgetError::DuplicateReservation);
         }
-        let reserved: u64 = state.reservations.values().sum();
         if state
             .actual_cents
-            .saturating_add(reserved)
+            .saturating_add(state.reserved_cents())
             .saturating_add(projected_cents)
             > self.limits.monthly_hard_cents
         {
             return Err(BudgetError::MonthlyHardCap);
         }
-        state.reservations.insert(id, projected_cents);
+        state.reservations.insert(
+            id,
+            Hold {
+                cents: projected_cents,
+                expires_at,
+            },
+        );
         Ok(())
+    }
+
+    /// Re-adopt a durable hold after a restart.  It was admitted before the
+    /// crash, so it is counted even when it no longer fits a (lowered) cap;
+    /// the remaining budget then reads as zero, which fails closed.
+    pub fn restore(&self, id: impl Into<String>, projected_cents: u64, expires_at: Instant) {
+        let mut state = self.state.lock().expect("budget mutex poisoned");
+        let hold = state.reservations.entry(id.into()).or_insert(Hold {
+            cents: 0,
+            expires_at,
+        });
+        hold.cents = hold.cents.max(projected_cents);
+        hold.expires_at = hold.expires_at.max(expires_at);
     }
 
     /// Commit actual cost and release the corresponding projection.  Actual
     /// spend can never be reduced by a failed/retried request.
     pub fn settle(&self, id: &str, actual_cents: u64) -> Result<(), BudgetError> {
         let mut state = self.state.lock().expect("budget mutex poisoned");
-        let Some(projected) = state.reservations.remove(id) else {
+        let Some(hold) = state.reservations.remove(id) else {
             return Err(BudgetError::DuplicateReservation);
         };
-        let others: u64 = state.reservations.values().sum();
         if state
             .actual_cents
-            .saturating_add(others)
+            .saturating_add(state.reserved_cents())
             .saturating_add(actual_cents)
             > self.limits.monthly_hard_cents
         {
             // Preserve a reservation at the larger amount so a caller cannot
             // bypass the cap by settling an unexpectedly costly task.
-            state
-                .reservations
-                .insert(id.to_string(), projected.max(actual_cents));
+            state.reservations.insert(
+                id.to_string(),
+                Hold {
+                    cents: hold.cents.max(actual_cents),
+                    expires_at: hold.expires_at,
+                },
+            );
             return Err(BudgetError::MonthlyHardCap);
         }
         state.actual_cents = state.actual_cents.saturating_add(actual_cents);
@@ -722,6 +761,14 @@ impl BudgetBook {
             .is_some()
     }
 
+    /// Drop every hold whose expiry is at or before `now`; returns how many.
+    pub fn expire(&self, now: Instant) -> usize {
+        let mut state = self.state.lock().expect("budget mutex poisoned");
+        let before = state.reservations.len();
+        state.reservations.retain(|_, hold| hold.expires_at > now);
+        before - state.reservations.len()
+    }
+
     pub fn reconcile_actual(&self, actual_cents: u64) {
         self.state
             .lock()
@@ -731,7 +778,7 @@ impl BudgetBook {
 
     pub fn snapshot(&self) -> BudgetSnapshot {
         let state = self.state.lock().expect("budget mutex poisoned");
-        let reserved_cents: u64 = state.reservations.values().sum();
+        let reserved_cents = state.reserved_cents();
         BudgetSnapshot {
             actual_cents: state.actual_cents,
             reserved_cents,
@@ -875,10 +922,14 @@ mod tests {
             },
             200,
         );
-        book.reserve("a", 600).unwrap();
-        assert_eq!(book.reserve("b", 300), Err(BudgetError::MonthlyHardCap));
+        let later = Instant::now() + std::time::Duration::from_secs(60);
+        book.reserve("a", 600, later).unwrap();
+        assert_eq!(
+            book.reserve("b", 300, later),
+            Err(BudgetError::MonthlyHardCap)
+        );
         assert!(book.cancel("a"));
-        book.reserve("b", 300).unwrap();
+        book.reserve("b", 300, later).unwrap();
         assert_eq!(book.snapshot().remaining_hard_cents, 500);
     }
 
@@ -892,7 +943,10 @@ mod tests {
             },
             0,
         );
-        assert_eq!(book.reserve("too-large", 101), Err(BudgetError::RequestCap));
+        assert_eq!(
+            book.reserve("too-large", 101, Instant::now()),
+            Err(BudgetError::RequestCap)
+        );
         assert_eq!(price_status("xai-api", "future-grok"), PriceStatus::Unknown);
         assert!(cost_eur("xai-api", "future-grok", 1_000, 1_000, 0, 0.92) > 0.0);
     }

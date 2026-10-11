@@ -209,6 +209,13 @@ Lifecycle conceptually:
 
 A process crash must not leave permanent stale reservations. Add expiry/reconciliation.
 
+Status:
+
+- Done: `BudgetGate` (`jarvis-api/src/budget_gate.rs`) admits atomically in the in-memory book and mirrors each hold in `llm_budget_reservations`; a failed durable write refuses the reservation (fail closed).
+- Done: every hold has a TTL; a 60 s sweeper expires lapsed holds in memory and durably.
+- Done: on Core start, lapsed `active` rows become `expired` and unexpired ones are re-adopted before any new reservation; `reserved_eur` in `GET /v1/system/usage` includes them.
+- Wired: Jev intent classification. Open: agent runs, and checkpoint adjustment (step 4).
+
 ## Checkpoints for long tasks
 
 Long-running paid jobs should work in stages rather than committing the entire budget blindly.
