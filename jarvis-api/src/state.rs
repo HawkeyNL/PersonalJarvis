@@ -233,4 +233,6 @@ pub struct AppState {
     /// Disabled unless the root-operated mirror and its private HTTPS origin
     /// are explicitly configured together.
     pub app_update_mirror: Option<AppUpdateMirror>,
+    /// Generic owner pushes via self-hosted ntfy; disabled unless configured.
+    pub notifier: crate::notify::Notifier,
 }

@@ -31,6 +31,8 @@ async fn first_activation_requires_local_network_code_and_password_atomically(
         }
         .validate(now)?,
     );
+    let (notifier, mut publishes) = ntfy_mock().await?;
+    fixture.notifier = notifier;
     let app = build_router(fixture);
     let key = SigningKey::from_bytes(&rand::random());
     let body = json!({"name":"fixture", "platform":"ios", "public_key":hex::encode(key.verifying_key().to_bytes()),
@@ -125,9 +127,118 @@ async fn first_activation_requires_local_network_code_and_password_atomically(
     );
     let pending = jarvis_identity::pending_pairing_requests(&db, owner.id).await?;
     assert_eq!(pending.len(), 1);
+    // Only the persisted request is announced, once, without its details.
+    let push = tokio::time::timeout(std::time::Duration::from_secs(5), publishes.recv())
+        .await?
+        .ok_or("no notification")?;
+    assert!(push.contains("click: jarvis://approvals/pairing\r\n"));
+    assert!(
+        !push.contains("replacement") && !push.contains(&pending[0].candidate_fingerprint[..16])
+    );
+    assert_no_push(&mut publishes).await;
     assert_eq!(pending[0].status, "pending");
     assert_eq!(jarvis_identity::active_device_count(&db).await?, 0);
     assert!(!jarvis_identity::surreal::account::bootstrap_available(&db).await?);
+    Ok(())
+}
+
+/// Loopback ntfy stand-in: a notifier publishing to it, and every request
+/// it receives (read up to its content-length).
+async fn ntfy_mock() -> Result<
+    (
+        jarvis_api::notify::Notifier,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let ntfy = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let notifier = jarvis_api::notify::Notifier::start(
+        &format!("http://{}/jarvis-test", ntfy.local_addr()?),
+        "tk_fixture",
+    )?;
+    let (published, publishes) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = ntfy.accept().await {
+            let mut raw = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = socket.read(&mut chunk).await.unwrap_or(0);
+                raw.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&raw);
+                let complete = text.split_once("\r\n\r\n").is_some_and(|(head, body)| {
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    body.len() >= length
+                });
+                if complete || read == 0 {
+                    break;
+                }
+            }
+            let _ = published.send(String::from_utf8_lossy(&raw).to_string());
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    Ok((notifier, publishes))
+}
+
+async fn assert_no_push(publishes: &mut tokio::sync::mpsc::UnboundedReceiver<String>) {
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), publishes.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn pairing_without_a_verified_password_sends_no_push(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("pairing_push_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("fixture")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let mut fixture = state(db.clone(), None).await;
+    let (notifier, mut publishes) = ntfy_mock().await?;
+    fixture.notifier = notifier;
+    let app = build_router(fixture);
+    // A dev-enrolled owner has an active device and no stored password, so a
+    // pairing request is accepted without any password check.
+    enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let owner = jarvis_identity::first_user(&db).await?.ok_or("no owner")?;
+    assert!(!jarvis_identity::surreal::account::password_required(&db, owner.id).await?);
+    let candidate = SigningKey::from_bytes(&rand::random());
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/pairing/requests")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({"name":"candidate",
+                    "platform":"android",
+                    "public_key":hex::encode(candidate.verifying_key().to_bytes())}))?))?,
+        )
+        .await?;
+    assert_eq!(created.status(), StatusCode::OK);
+    assert_eq!(
+        jarvis_identity::pending_pairing_requests(&db, owner.id)
+            .await?
+            .len(),
+        1
+    );
+    assert_no_push(&mut publishes).await;
     Ok(())
 }
 

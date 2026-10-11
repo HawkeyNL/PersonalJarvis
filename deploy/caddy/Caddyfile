@@ -80,3 +80,21 @@
 		# reverse_proxy unix//run/jarvis-core/api.sock
 	}
 }
+
+# Optional owner notifications (docs/NOTIFICATIONS.md). Uncomment after
+# installing ntfy and setting JARVIS_NTFY_HOSTNAME in the same environment
+# file as JARVIS_PUBLIC_HOSTNAME. A dedicated hostname: ntfy needs a root URL.
+# {$JARVIS_NTFY_HOSTNAME} {
+# 	tls {
+# 		issuer acme {
+# 			disable_http_challenge
+# 		}
+# 	}
+# 	header {
+# 		Strict-Transport-Security "max-age=31536000"
+# 		X-Content-Type-Options "nosniff"
+# 		Referrer-Policy "no-referrer"
+# 		-Server
+# 	}
+# 	reverse_proxy 127.0.0.1:2586
+# }

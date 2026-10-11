@@ -36,6 +36,7 @@ pub mod local_devices;
 mod mcp;
 mod metering;
 pub mod model_control;
+pub mod notify;
 mod peer;
 mod rate_limit;
 pub mod realtime;

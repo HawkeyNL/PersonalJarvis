@@ -503,6 +503,32 @@ async fn main() -> anyhow::Result<()> {
         None => app_update_mirror,
     };
 
+    // Owner notifications are optional; an unusable configuration is logged
+    // and leaves them off rather than stopping Core.
+    let notifier = match std::env::var(jarvis_api::notify::URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        None => jarvis_api::notify::Notifier::default(),
+        Some(url) => match jarvis_api::notify::Notifier::start(
+            &url,
+            &std::env::var(jarvis_api::notify::TOKEN_ENV).unwrap_or_default(),
+        ) {
+            Ok(notifier) => {
+                tracing::info!("owner notifications enabled");
+                notifier
+            }
+            Err(reason) => {
+                tracing::error!(reason, "owner notifications disabled");
+                jarvis_api::notify::Notifier::default()
+            }
+        },
+    };
+    notifier.seed_budget(
+        spent_cents.load(std::sync::atomic::Ordering::Relaxed),
+        budget_cents,
+    );
+
     let state = AppState {
         realtime: Default::default(),
         db,
@@ -585,6 +611,7 @@ async fn main() -> anyhow::Result<()> {
         unix_proxy_uid: unix_proxy.map(|proxy| proxy.uid),
         bootstrap_enrollment,
         app_update_mirror,
+        notifier,
     };
 
     jarvis_api::refresh_usage_snapshot(&state).await;
