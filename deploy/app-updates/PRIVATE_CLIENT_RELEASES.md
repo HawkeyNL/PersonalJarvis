@@ -35,12 +35,15 @@ the IPA on the device with the owner's Apple account. No App Store or TestFlight
 * Set `public_hostname` in the release configuration to the bare public DNS name
   Caddy serves (the same value as `JARVIS_PUBLIC_HOSTNAME`: no `https://`, port
   or path). Leave it out to publish no source.
-* Every index rebuild then writes `/downloads/altstore.json`: one app
-  (`com.hawkeynl.jarvis`) whose versions are the IPAs of the retained public
-  releases, newest first. Retired releases drop out on the same run.
-* `/downloads/` shows "Add to AltStore" (`altstore://source?url=...`) and "Add
-  to SideStore" (`sidestore://source?url=...`) links. Open the page in Safari on
-  the iPhone and tap one once; afterwards the tool offers new versions as updates.
+* After each activation, `sync-release` writes `/downloads/altstore.json`: one
+  app (`com.hawkeynl.jarvis`) whose versions are the hash-checked IPAs of the
+  retained public releases up to the active version, newest first. Retired
+  releases drop out on the same run. If the source cannot be built it is
+  removed and the run fails, but the activated update stays.
+* While the source exists, `/downloads/` shows "Add to AltStore"
+  (`altstore://source?url=...`) and "Add to SideStore" (`sidestore://source?url=...`)
+  links. Open the page in Safari on the iPhone and tap one once; afterwards the
+  tool offers new versions as updates.
 * The app learns about a newer version from the authenticated
   `GET /v1/app-updates/ios/{current_version}` notice (no install payload), which
   links to the same source and page. It uses Core's

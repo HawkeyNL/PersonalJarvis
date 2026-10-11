@@ -405,17 +405,29 @@ pub(super) fn altstore_url(host: &str) -> String {
     format!("https://{host}/downloads/{ALTSTORE_FILE}")
 }
 
-/// AltStore/SideStore source listing every retained public release, newest
-/// first. Only directories that passed `publish_public` verification exist
-/// under `releases/`; each IPA must still match its signed size and path. No
-/// remote label or free text enters the document: versions are numeric
-/// SemVer, dates are re-formatted and everything else is a constant.
-pub(super) fn altstore_source(root: &Path, owner: u32, host: &str) -> Result<Vec<u8>> {
+/// AltStore/SideStore source listing every retained public release up to the
+/// active updater version, newest first. Only directories that passed
+/// `publish_public` verification exist under `releases/`; each IPA is hashed
+/// again against its signed manifest entry. No remote label or free text
+/// enters the document: versions are numeric SemVer, dates are re-formatted,
+/// digests are checked hex and everything else is a constant.
+pub(super) fn altstore_source(
+    root: &Path,
+    owner: u32,
+    host: &str,
+    active: &str,
+) -> Result<Vec<u8>> {
     if !super::release::valid_hostname(host) {
         return Err("invalid public hostname");
     }
+    let active = super::super::stable_version(active).map_err(|_| "invalid active version")?;
     let mut versions = Vec::new();
     for version in public_versions(root, owner)?.iter().rev() {
+        // Published before activation; never advertise a version that did not
+        // become the active update.
+        if *version > active {
+            continue;
+        }
         let release = root.join("releases").join(format!("v{version}"));
         let manifest = read_protected(&release.join("manifest.json"), owner, false, MAX_METADATA)?;
         let doc: Document =
@@ -427,18 +439,23 @@ pub(super) fn altstore_source(root: &Path, owner: u32, host: &str) -> Result<Vec
             .iter()
             .find(|i| i.platform == "ios" && i.architecture == "arm64")
             .ok_or("public release lacks an iOS installer")?;
-        let size = open_regular(&release.join("ios-arm64").join(&name), owner, false)?
-            .metadata()
-            .map_err(|_| "cannot inspect public iOS installer")?
-            .len();
+        let size = ipa.artifact.size;
+        // Size and SHA-256 must still match the signed manifest entry.
+        verify_file(
+            &release.join("ios-arm64").join(&name),
+            owner,
+            &Layer {
+                digest: format!("sha256:{}", ipa.artifact.sha256),
+                size,
+                media_type: String::new(),
+                annotations: BTreeMap::new(),
+            },
+        )?;
         let date = chrono::DateTime::parse_from_rfc3339(&doc.release.released_at)
             .map_err(|_| "invalid public release date")?
             .with_timezone(&chrono::Utc)
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        if doc.release.version != version.to_string()
-            || ipa.artifact.path != path
-            || ipa.artifact.size != size
-        {
+        if doc.release.version != version.to_string() || ipa.artifact.path != path {
             return Err("public iOS installer does not match its release metadata");
         }
         versions.push(serde_json::json!({
@@ -446,6 +463,9 @@ pub(super) fn altstore_source(root: &Path, owner: u32, host: &str) -> Result<Vec
             "date": date,
             "downloadURL": format!("https://{host}/downloads/{path}"),
             "size": size,
+            // Not part of the AltStore spec (clients ignore it); lets an owner
+            // compare the download with the signed release manifest.
+            "sha256": ipa.artifact.sha256,
             "minOSVersion": IOS_MIN_OS,
         }));
     }

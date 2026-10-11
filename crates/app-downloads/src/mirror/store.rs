@@ -1,3 +1,4 @@
+use super::release_store::ALTSTORE_FILE;
 use super::{digest_hex, Config, Layer, Result, MAX_METADATA};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -305,28 +306,19 @@ impl Store {
             candidates.push_str("</ul></section>");
         }
         let releases = super::release_store::public_links(&self.root, self.owner)?;
-        // The source lists only verified public releases, so it is rebuilt from
-        // the same inventory as the page and written first: a failure leaves
-        // the previous page in place.
-        let source = super::release_store::ALTSTORE_FILE;
+        // Links only while a published source exists, so a failed source
+        // build never leaves the page pointing at a 404.
+        let source_published =
+            fs::symlink_metadata(self.root.join(ALTSTORE_FILE)).is_ok_and(|meta| meta.is_file());
         let altstore_links = match self.public_hostname.as_deref() {
-            Some(host) if !releases.is_empty() => {
-                let bytes = super::release_store::altstore_source(&self.root, self.owner, host)?;
-                self.write_public(source, &bytes)?;
+            Some(host) if source_published && !releases.is_empty() => {
                 // LDH hostname: only ':' and '/' need percent-encoding.
                 let url = super::release_store::altstore_url(host)
                     .replace(':', "%3A")
                     .replace('/', "%2F");
                 format!("<ul><li><a href=\"altstore://source?url={url}\">Add to AltStore</a></li><li><a href=\"sidestore://source?url={url}\">Add to SideStore</a></li></ul>")
             }
-            _ => {
-                if fs::symlink_metadata(self.root.join(source)).is_ok() {
-                    fs::remove_file(self.root.join(source))
-                        .map_err(|_| "cannot remove stale AltStore source")?;
-                    sync_directory(&self.root)?;
-                }
-                String::new()
-            }
+            _ => String::new(),
         };
         let releases = if releases.is_empty() {
             "<h2>Client releases</h2><p>No complete release has been imported yet. Please try again later.</p>"
@@ -341,6 +333,33 @@ impl Store {
             .replace("{{IOS_CANDIDATES}}", &candidates)
             .replace("{{ALTSTORE_LINKS}}", &altstore_links);
         self.write_public("index.html", html.as_bytes())
+    }
+
+    /// Rebuild the AltStore/SideStore source from verified public releases no
+    /// newer than the `active` updater version. Called only after activation,
+    /// so it can never block or precede an update. Any failure, or no
+    /// configured hostname, removes the source: no stale list is ever served.
+    pub fn publish_altstore(&self, active: &str) -> Result<()> {
+        let written = match self.public_hostname.as_deref() {
+            Some(host) => {
+                super::release_store::altstore_source(&self.root, self.owner, host, active)
+                    .and_then(|bytes| self.write_public(ALTSTORE_FILE, &bytes))
+                    .map(|()| true)
+            }
+            None => Ok(false),
+        };
+        if !matches!(written, Ok(true)) {
+            match fs::symlink_metadata(self.root.join(ALTSTORE_FILE)) {
+                Ok(_) => {
+                    fs::remove_file(self.root.join(ALTSTORE_FILE))
+                        .map_err(|_| "cannot remove stale AltStore source")?;
+                    sync_directory(&self.root)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("cannot inspect AltStore source"),
+            }
+        }
+        written.map(drop)
     }
 
     /// Atomically replace one generated public file; never follows a planted

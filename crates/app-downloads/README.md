@@ -64,14 +64,16 @@ pruned by this step.
 
 ## AltStore/SideStore source
 
-When the release configuration sets `public_hostname`, every index rebuild also
-writes `altstore.json` atomically next to `index.html`. It lists the iOS IPA of
-each retained public release, newest first, with absolute
-`https://<public_hostname>/downloads/...` URLs. Only directories that passed
-publication verification are read, and each IPA must still match the size and
-path in its signed release metadata, or the rebuild fails and the previous files
-stay. Retired versions disappear on the same rebuild. Without `public_hostname`
-(or without any complete release) the file is removed and the page shows no
-source links. The iOS bundle identifier and minimum iOS version are pinned
+When the release configuration sets `public_hostname`, `sync-release` writes
+`altstore.json` atomically next to `index.html` after it has activated the
+update and retired old releases, then rebuilds the page. The source lists the
+iOS IPA of each retained public release up to the active version, newest first,
+with absolute `https://<public_hostname>/downloads/...` URLs. Each IPA is hashed
+again against the size and SHA-256 in its signed release metadata (the digest is
+also included as an extra `sha256` key). Without `public_hostname` the source
+is removed. A build failure removes it too and fails the run after activation,
+so the activated update is never blocked and no stale list is served. The page shows the source links
+only while the file exists; `sync-ios` reads just the hostname and never writes
+the source. The iOS bundle identifier and minimum iOS version are pinned
 constants that must follow the App project's `ios/project.yml`.
 
