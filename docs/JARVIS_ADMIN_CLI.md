@@ -607,9 +607,17 @@ the security audit outcome `device_not_trusted`, `device_key_mismatch` or
 `trusted_keys_invalid`; the Codex broker records the matching detail. Treat a
 key mismatch as a possible compromise of Core's database.
 
-The pin does not cover replay: the configuration broker's one-time request
-markers live below Core's state directory, so a compromised Core could replay
-an owner-signed approval it relayed while that approval is still unexpired.
+Each signed request is accepted once. Both brokers record its request ID in
+their own state directory before acting on it: the configuration broker in
+`/var/lib/jarvis-config-broker` (root, mode 0700) and the Codex broker in
+`/var/lib/jarvis-codex-broker` (its `jarvis-codex` service user, mode 0700).
+Core cannot write either directory, so even a compromised Core cannot replay
+an owner-signed approval it relayed. A request ID is recorded only after the
+signature and the pinned key check pass; a request refused by those checks
+leaves no marker. The brokers refuse to start, and refuse every request, when
+the directory is a symlink, has another owner or is group- or world-writable.
+The Codex broker also keeps its database check that a request ID starts at
+most one run.
 
 Rollback: set `JARVIS_BROKER_REQUIRE_TRUSTED_KEYS=false` in
 `/etc/jarvis/core.env` (configuration broker) and
@@ -628,6 +636,13 @@ sudo jarvis devices trust --all-active
 
 and confirm only after checking the device count, names and every listed
 fingerprint.
+
+**Upgrade note (replay markers).** systemd creates
+`/var/lib/jarvis-config-broker` when the update restarts the configuration
+broker; there is nothing for the owner to do. Markers from earlier releases
+below `/var/lib/jarvis/config-broker` are no longer read: approvals expire
+within five minutes, so they no longer matter, and the old directory can be
+left in place.
 
 ## Home Node development without replacing production
 

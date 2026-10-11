@@ -10,11 +10,23 @@ prepare="$repo_dir/deploy/systemd/prepare-home-node.sh"
 
 grep -Fq 'RuntimeDirectory=jarvis-config-broker' "$broker"
 grep -Fq 'RuntimeDirectoryMode=0750' "$broker"
-grep -Fq 'StateDirectory=jarvis/config-broker' "$broker"
-grep -Fq 'StateDirectoryMode=0700' "$broker"
+grep -Fxq 'StateDirectory=jarvis-config-broker' "$broker"
+grep -Fxq 'StateDirectoryMode=0700' "$broker"
 grep -Fxq 'ReadWritePaths=/etc/jarvis/model-policy' "$broker"
-if grep -Eq '^ReadWritePaths=.*(/run/jarvis-config-broker|/var/lib/jarvis/config-broker)' "$broker"; then
+if grep -Eq '^ReadWritePaths=.*(/run/jarvis-config-broker|/var/lib/jarvis)' "$broker"; then
     echo "config broker runtime and state directories must not be ReadWritePaths" >&2
+    exit 1
+fi
+# Broker replay markers must stay outside Core's writable state: Core may
+# write only /var/lib/jarvis, never a broker StateDirectory.
+codex_broker="$repo_dir/deploy/systemd/jarvis-codex-broker.service"
+core="$repo_dir/deploy/systemd/jarvis-core.service"
+grep -Fxq 'User=jarvis-codex' "$codex_broker"
+grep -Fxq 'StateDirectory=jarvis-codex-broker' "$codex_broker"
+grep -Fxq 'StateDirectoryMode=0700' "$codex_broker"
+grep -Fxq 'ReadWritePaths=/var/lib/jarvis' "$core"
+if grep -Eq '^(ReadWritePaths|StateDirectory)=.*(jarvis-config-broker|jarvis-codex-broker)' "$core"; then
+    echo "Core must not be able to write broker replay markers" >&2
     exit 1
 fi
 if grep -Fq 'mkdir /run/jarvis-config-broker' "$prepare"; then

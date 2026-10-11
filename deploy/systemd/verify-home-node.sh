@@ -85,7 +85,7 @@ config_broker_runtime_valid() {
     expect_mode /run/jarvis-config-broker root:jarvis:750
 }
 config_broker_state_valid() {
-    expect_mode /var/lib/jarvis/config-broker root:jarvis:700
+    expect_mode /var/lib/jarvis-config-broker root:jarvis:700
 }
 config_broker_socket_valid() {
     local socket=/run/jarvis-config-broker/broker.sock
