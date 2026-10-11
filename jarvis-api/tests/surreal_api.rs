@@ -90,6 +90,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         auth_limits: AuthLimits::default(),
         trusted_proxy_hops: 0,
         trusted_proxy_ips: Arc::new(Vec::new()),
+        unix_proxy_uid: None,
         bootstrap_enrollment: None,
         app_update_mirror: None,
     }

@@ -17,10 +17,20 @@ if grep -Eq '^ReadWritePaths=.*(/run/jarvis-config-broker|/var/lib/jarvis)' "$br
     echo "config broker runtime and state directories must not be ReadWritePaths" >&2
     exit 1
 fi
+# Core's API socket directory is systemd-managed, Caddy-traversable only, and
+# never makes Core a caddy group member.
+core="$repo_dir/deploy/systemd/jarvis-core.service"
+grep -Fxq 'RuntimeDirectory=jarvis-core-admin jarvis-core' "$core"
+grep -Fxq 'RuntimeDirectoryMode=0700' "$core"
+grep -Fxq 'ExecStartPre=-+/usr/bin/chgrp caddy /run/jarvis-core' "$core"
+grep -Fxq 'ExecStartPre=+/usr/bin/chmod 2750 /run/jarvis-core' "$core"
+if grep -Eq '^(SupplementaryGroups|Group)=.*caddy' "$core"; then
+    echo "Core must not join the caddy group" >&2
+    exit 1
+fi
 # Broker replay markers must stay outside Core's writable state: Core may
 # write only /var/lib/jarvis, never a broker StateDirectory.
 codex_broker="$repo_dir/deploy/systemd/jarvis-codex-broker.service"
-core="$repo_dir/deploy/systemd/jarvis-core.service"
 grep -Fxq 'User=jarvis-codex' "$codex_broker"
 grep -Fxq 'StateDirectory=jarvis-codex-broker' "$codex_broker"
 grep -Fxq 'StateDirectoryMode=0700' "$codex_broker"

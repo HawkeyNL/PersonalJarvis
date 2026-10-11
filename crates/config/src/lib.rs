@@ -14,6 +14,7 @@ pub mod activation;
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
+    path::Path,
 };
 
 use figment::{
@@ -383,6 +384,13 @@ pub struct AppConfig {
     #[serde(default)]
     pub trusted_proxy_ips: String,
 
+    /// Optional Unix socket, directly inside [`API_SOCKET_DIR`], on which Core
+    /// additionally serves the API for the local reverse proxy. Empty (the
+    /// default) keeps TCP-only behaviour. When set, forwarding headers are trusted only from
+    /// the proxy's kernel-reported uid on this socket, never over TCP.
+    #[serde(default)]
+    pub api_unix_socket: String,
+
     /// SHA-256 verifier for the one-time first-owner bootstrap secret. Empty
     /// disables production bootstrap; the raw secret belongs only to the local
     /// root-operated provisioning/recovery procedure.
@@ -394,6 +402,9 @@ pub struct AppConfig {
     #[serde(default)]
     pub bootstrap_allowed_cidrs: String,
 }
+
+/// The systemd `RuntimeDirectory` that holds Core's optional API socket.
+pub const API_SOCKET_DIR: &str = "/run/jarvis-core";
 
 fn default_bind_addr() -> String {
     "127.0.0.1:8080".to_string()
@@ -755,6 +766,14 @@ impl AppConfig {
             }
         }
 
+        if !self.api_unix_socket.is_empty()
+            && Path::new(&self.api_unix_socket).parent() != Some(Path::new(API_SOCKET_DIR))
+        {
+            return Err(format!(
+                "JARVIS_API_UNIX_SOCKET must name a socket directly inside {API_SOCKET_DIR}"
+            ));
+        }
+
         if !self.public_hostname.is_empty()
             && (!self.public_hostname.is_ascii()
                 || self.public_hostname.contains(['/', ':', '@', ' ']))
@@ -885,6 +904,7 @@ impl fmt::Debug for AppConfig {
             .field("llm_rate_per_min", &self.llm_rate_per_min)
             .field("trusted_proxy_hops", &self.trusted_proxy_hops)
             .field("trusted_proxy_ips", &self.trusted_proxy_ips)
+            .field("api_unix_socket", &self.api_unix_socket)
             .field(
                 "bootstrap_secret_sha256",
                 &redact(&self.bootstrap_secret_sha256),
@@ -1011,6 +1031,7 @@ mod tests {
             llm_rate_per_min: 20,
             trusted_proxy_hops: 0,
             trusted_proxy_ips: String::new(),
+            api_unix_socket: String::new(),
             bootstrap_secret_sha256: String::new(),
             bootstrap_allowed_cidrs: String::new(),
         };
@@ -1151,6 +1172,7 @@ mod tests {
             llm_rate_per_min: 1,
             trusted_proxy_hops: 0,
             trusted_proxy_ips: String::new(),
+            api_unix_socket: String::new(),
             bootstrap_secret_sha256: "00".repeat(32),
             bootstrap_allowed_cidrs: String::new(),
         };
@@ -1209,6 +1231,20 @@ mod tests {
             jail.set_env("JARVIS_TRUSTED_PROXY_HOPS", "2");
             jail.set_env("JARVIS_TRUSTED_PROXY_IPS", "127.0.0.1");
             assert!(AppConfig::load()?.validate_runtime_security().is_err());
+
+            jail.set_env("JARVIS_TRUSTED_PROXY_HOPS", "1");
+            for outside in [
+                "run/jarvis-core/api.sock",
+                "/tmp/api.sock",
+                "/run/jarvis-core/../api.sock",
+                "/run/jarvis-core/sub/api.sock",
+                "/run/jarvis-core",
+            ] {
+                jail.set_env("JARVIS_API_UNIX_SOCKET", outside);
+                assert!(AppConfig::load()?.validate_runtime_security().is_err());
+            }
+            jail.set_env("JARVIS_API_UNIX_SOCKET", "/run/jarvis-core/api.sock");
+            assert!(AppConfig::load()?.validate_runtime_security().is_ok());
             Ok(())
         });
     }

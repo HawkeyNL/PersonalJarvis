@@ -9,6 +9,9 @@ template="$repo_dir/deploy/caddy/Caddyfile"
 grep -Fqx $'\tauto_https disable_redirects' "$template"
 grep -Fqx $'\t\t\tdisable_http_challenge' "$template"
 grep -Fqx $'\t\treverse_proxy 127.0.0.1:8080' "$template"
+# The Unix-socket upstream is an owner opt-in: shipped only as a comment.
+grep -Fqx $'\t\t# reverse_proxy unix//run/jarvis-core/api.sock' "$template"
+[[ $(grep -Ec '^\s*reverse_proxy ' "$template") == 1 ]]
 grep -Fqx $'\t@downloads path /downloads /downloads/' "$template"
 grep -Fqx $'\t\trewrite * /index.html' "$template"
 ! grep -Eq '^\s*(root|file_server).*app-updates|file_server browse' "$template"

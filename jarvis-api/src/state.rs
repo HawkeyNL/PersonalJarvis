@@ -223,6 +223,10 @@ pub struct AppState {
     pub trusted_proxy_hops: u32,
     /// Direct peer IPs of the proxies allowed to supply forwarding headers.
     pub trusted_proxy_ips: Arc<Vec<IpAddr>>,
+    /// Reverse proxy uid when Core also serves `JARVIS_API_UNIX_SOCKET`.
+    /// `Some` makes that socket peer the only source of trusted forwarding
+    /// headers; `None` keeps the legacy TCP allowlist above.
+    pub unix_proxy_uid: Option<u32>,
     /// LAN-only, one-time first-owner bootstrap verifier. `None` means no
     /// bootstrap route is usable; it is intentionally not a general secret bag.
     pub bootstrap_enrollment: Option<jarvis_config::BootstrapEnrollment>,
