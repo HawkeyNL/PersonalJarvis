@@ -6,7 +6,7 @@ Implement a production-safe agent registry/runtime boundary in the public `Perso
 
 `PersonalJarvis` is public and contains runtime/API/app/deployment code. `PersonalJarvisAgents` is private and contains the real personal agent Markdown definitions. Public GitHub CI MUST NOT require access to the private repository or any private agent content.
 
-The current `jarvis-core` only owns persona loading (`load_persona`) and explicitly says future orchestration has not yet been implemented. There is currently no production Agent Registry/loader/runtime boundary in `jarvis-core`.
+`jarvis-core` now has the Agent Registry boundary: `AgentRegistry::load` (manifest hashes, no symlinks or traversal), `AgentLoader` with immutable generation-numbered snapshots, and `AgentRun` pinned to a snapshot. Core reloads the staged bundle on SIGHUP (`systemctl reload jarvis-core.service`); a failed reload keeps the previous snapshot and reports the registry degraded on the owner-authenticated `GET /v1/system/services`. The private agent updater still restarts Core after activating a bundle, because only a restart gives it a readiness check against the new bundle. `AgentRun` is not yet wired to execution.
 
 The private agent repository explicitly defines its profiles as documentation/contracts: profiles may request capabilities but MUST NOT grant themselves runtime capability, policy exceptions, secret access, or execution rights. The public runtime remains authoritative.
 
