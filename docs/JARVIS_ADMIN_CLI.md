@@ -511,6 +511,30 @@ sudo jarvis devices trust --all-active
 ```
 
 Check the pending fingerprint against the requesting device before approving.
+
+Every pairing request (`POST /v1/auth/pairing/requests`) needs the owner's
+stored account password. An owner without one, such as a development-enrolled
+setup, gets `403` with `"code": "pairing_password_not_set"` and must first set
+a password from an active device. Each pending request also records the
+candidate's IP address, `User-Agent`, and the optional `app_version` and
+`model` it sent; `devices pending` lists them with control and bidi
+characters escaped. These are unauthenticated hints for the approver, not proof
+of identity; the full key fingerprint is what binds the approval, and apps
+show the fingerprint they compute from the candidate key themselves.
+
+- The IP address is the client address the reverse proxy reports (the last
+  `X-Forwarded-For` entry). Behind the Unix-socket proxy that is Caddy's own
+  view of the client. In the legacy TCP mode (`JARVIS_TRUSTED_PROXY_*`) it is
+  only as trustworthy as the allowlisted proxies, and anything that can reach
+  Core through them can make it up.
+- Clients may send `app_version` and `model` only to a Core that accepts
+  them (this release or newer). An older Core rejects the unknown fields with
+  `422`, so the apps check the Core version first.
+- Core deletes pairing requests, with these details, one day after they
+  expire. Deleted rows can remain in database backups and pre-migration
+  snapshots until those are removed, and in SurrealDB's on-disk (RocksDB)
+  files until it compacts them.
+
 Revocation invalidates the device's sessions and realtime connections. Revoking
 every device does **not** reopen first-device activation or reset the account
 password. These commands are not a lost-password recovery mechanism.

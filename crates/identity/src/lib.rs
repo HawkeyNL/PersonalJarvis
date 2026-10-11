@@ -169,6 +169,18 @@ pub struct PairingRequest {
     pub status: String,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
+    pub details: PairingDetails,
+}
+
+/// What the candidate's connection and client reported when it asked to pair.
+/// Unauthenticated hints for the approving owner; never part of the signed
+/// approval. The API validates and bounds each value before it is stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PairingDetails {
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub app_version: Option<String>,
+    pub model: Option<String>,
 }
 
 /// Canonical, domain-separated bytes that an approving device signs. This is
@@ -281,8 +293,8 @@ pub use surreal::{
     create_unlock_request, create_user, deny_pairing_request, deny_unlock_request, first_user,
     first_user_or_create, get_device, get_user, list_active_devices, login, pairing_request_status,
     pairing_status_for_candidate, pending_pairing_requests, pending_unlock_requests,
-    register_device, revoke_device, revoke_session, session_is_active, unlock_request_status,
-    verify_device_signature,
+    purge_expired_pairing_requests, register_device, revoke_device, revoke_session,
+    session_is_active, unlock_request_status, verify_device_signature,
 };
 
 #[cfg(test)]

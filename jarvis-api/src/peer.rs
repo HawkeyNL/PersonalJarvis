@@ -77,11 +77,13 @@ fn forwarded_client(peer: Option<Peer>, headers: &HeaderMap, hops: u32) -> Optio
     if hops == 0 {
         return direct;
     }
+    // Repeated header lines form one list in order (RFC 9110 §5.3), so a
+    // client line sent ahead of the proxy's cannot displace its entry. An
+    // unreadable line still counts as one (unparsable) entry.
     let entries: Vec<&str> = headers
-        .get("x-forwarded-for")?
-        .to_str()
-        .ok()?
-        .split(',')
+        .get_all("x-forwarded-for")
+        .iter()
+        .flat_map(|line| line.to_str().unwrap_or("unparsable").split(','))
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
@@ -286,6 +288,28 @@ mod tests {
         assert_eq!(
             forwarded_client(unix(PROXY), &headers, 1),
             Some("203.0.113.7".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn the_last_entry_across_repeated_header_lines_is_the_proxys() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "6.6.6.6, 9.9.9.9".parse().unwrap());
+        headers.append(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+        );
+        headers.append("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        // The Unix-socket proxy (one hop) is the last entry of the last line.
+        assert_eq!(
+            forwarded_client(unix(PROXY), &headers, 1),
+            Some("203.0.113.7".parse().unwrap())
+        );
+        // A trusted entry that is the unreadable line yields no client.
+        assert_eq!(forwarded_client(tcp(LOOPBACK), &headers, 2), None);
+        assert_eq!(
+            forwarded_client(tcp(LOOPBACK), &headers, 3),
+            Some("9.9.9.9".parse().unwrap())
         );
     }
 
