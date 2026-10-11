@@ -153,7 +153,7 @@ fn prune_query() -> String {
 
 /// Delete security audit rows older than [`SECURITY_AUDIT_RETENTION_DAYS`],
 /// in bounded batches. Returns the number of rows deleted.
-async fn prune_security_audit(db: &jarvis_store::Database) -> Result<usize, surrealdb::Error> {
+pub async fn prune_security_audit(db: &jarvis_store::Database) -> Result<usize, surrealdb::Error> {
     let query = prune_query();
     let mut total = 0;
     for _ in 0..RETENTION_MAX_BATCHES {
