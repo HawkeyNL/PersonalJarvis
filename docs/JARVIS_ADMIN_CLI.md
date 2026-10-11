@@ -607,9 +607,26 @@ the security audit outcome `device_not_trusted`, `device_key_mismatch` or
 `trusted_keys_invalid`; the Codex broker records the matching detail. Treat a
 key mismatch as a possible compromise of Core's database.
 
-The pin does not cover replay: the configuration broker's one-time request
-markers live below Core's state directory, so a compromised Core could replay
-an owner-signed approval it relayed while that approval is still unexpired.
+Each signed request is accepted once. Both brokers record its request ID in
+their own state directory before acting on it: the configuration broker in
+`/var/lib/jarvis-config-broker` (root, mode 0700) and the Codex broker in
+`/var/lib/jarvis-codex-broker` (its `jarvis-codex` service user, mode 0700).
+Core cannot write either directory, so even a compromised Core cannot replay
+an owner-signed approval it relayed. A request ID is recorded only after the
+signature and the pinned key check pass; a request refused by those checks
+leaves no marker. The brokers refuse to start, and refuse every request, when
+the directory is a symlink, has another owner or is group- or world-writable.
+The Codex broker also keeps its database check that a request ID starts at
+most one run. The request ID is used up once the checks pass, even when the
+Codex run then fails to start: the owner signs a new request to try again.
+
+Limitation: the Codex broker shares the `jarvis-codex` user with the Codex App
+Server (`jarvis-codex.service`) and the Codex chat worker, so file permissions
+alone do not separate them. The broker marks itself non-dumpable, which blocks
+their access to it through ptrace and `/proc/<pid>/root`, and both units hide
+the broker's state directory (`InaccessiblePaths=`) and run with
+`ProtectProc=invisible`. A dedicated user for the Codex broker is the full fix
+and is planned as a follow-up.
 
 Rollback: set `JARVIS_BROKER_REQUIRE_TRUSTED_KEYS=false` in
 `/etc/jarvis/core.env` (configuration broker) and
@@ -628,6 +645,15 @@ sudo jarvis devices trust --all-active
 
 and confirm only after checking the device count, names and every listed
 fingerprint.
+
+**Upgrade note (replay markers).** systemd creates
+`/var/lib/jarvis-config-broker` when the update restarts the configuration
+broker; there is nothing for the owner to do. Markers from earlier releases
+below `/var/lib/jarvis/config-broker` are no longer read, and the old directory
+can be left in place. Approvals expire within five minutes, so only an
+approval used in the five minutes before the upgrade (or before a rollback to
+an earlier release) could be replayed once. That is not a regression: Core
+could already reset the old directory.
 
 ## Home Node development without replacing production
 

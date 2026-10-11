@@ -19,6 +19,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 
+use jarvis_api::broker_replay::{ReplayError, ReplayMarkers};
 use jarvis_config::AppConfig;
 use jarvis_identity as identity;
 use jarvis_llm::{ModelAccessPolicy, ModelRouting, ROUTING_MAX_BYTES};
@@ -28,8 +29,17 @@ use jarvis_privileged::{
 };
 
 const SOCKET: &str = "/run/jarvis-config-broker/broker.sock";
-const REPLAY_DIR: &str = "/var/lib/jarvis/config-broker/replays";
+/// systemd `StateDirectory=jarvis-config-broker`: root-owned 0700, outside
+/// Core's writable `/var/lib/jarvis` tree.
+const STATE_DIR: &str = "/var/lib/jarvis-config-broker";
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
+
+fn replay_markers() -> ReplayMarkers<'static> {
+    ReplayMarkers {
+        state_dir: Path::new(STATE_DIR),
+        owner_uid: 0,
+    }
+}
 
 #[derive(Serialize)]
 struct Reply {
@@ -60,8 +70,9 @@ async fn main() -> anyhow::Result<()> {
     // The broker never applies schema changes: it must fail closed when Core
     // has not established the trusted schema first.
     prepare_socket(&socket)?;
-    fs::create_dir_all(REPLAY_DIR)?;
-    fs::set_permissions(REPLAY_DIR, fs::Permissions::from_mode(0o700))?;
+    replay_markers()
+        .prepare()
+        .context("validate root-only replay marker directory")?;
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
     tracing::info!(socket = %socket, "root configuration broker ready");
@@ -137,7 +148,7 @@ async fn handle(
         let public_key = identity::active_device_public_key(db, request.user_id, request.device_id)
             .await
             .map_err(|_| anyhow::anyhow!("untrusted owner device signature"))?;
-        authorize(&request, &public_key, pinned, Path::new(REPLAY_DIR))?;
+        authorize(&request, &public_key, pinned, replay_markers())?;
         apply(&request.operation, policy_path, routing_path)
     }
     .await;
@@ -156,7 +167,7 @@ fn authorize(
     request: &SignedRequest,
     public_key: &[u8],
     pinned: Option<PinnedKeys<'_>>,
-    replay_dir: &Path,
+    replays: ReplayMarkers<'_>,
 ) -> anyhow::Result<()> {
     let message = request
         .message()
@@ -168,7 +179,7 @@ fn authorize(
             TrustError::Signature => anyhow::anyhow!("untrusted owner device signature"),
             other => anyhow::Error::new(other),
         })?;
-    consume_once(replay_dir, request.request_id)
+    Ok(replays.consume(request.request_id)?)
 }
 
 fn outcome(result: &anyhow::Result<()>) -> &'static str {
@@ -181,28 +192,20 @@ fn outcome(result: &anyhow::Result<()>) -> &'static str {
         Some(TrustError::Invalid(_)) => return "trusted_keys_invalid",
         Some(TrustError::Signature) | None => {}
     }
+    match error.downcast_ref::<ReplayError>() {
+        Some(ReplayError::Replay) => return "replay_rejected",
+        Some(ReplayError::UnsafeStore) => return "replay_store_unsafe",
+        Some(ReplayError::Io(_)) => return "replay_store_unavailable",
+        None => {}
+    }
     let message = error.to_string();
     if message.contains("expired") {
         "expired"
-    } else if message.contains("replay") {
-        "replay_rejected"
     } else if message.contains("signature") || message.contains("device") {
         "signature_denied"
     } else {
         "denied"
     }
-}
-
-fn consume_once(replay_dir: &Path, request_id: uuid::Uuid) -> anyhow::Result<()> {
-    let path = replay_dir.join(request_id.to_string());
-    let result = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path);
-    result
-        .map(|_| ())
-        .map_err(|_| anyhow::anyhow!("approval replay rejected"))
 }
 
 fn apply(operation: &Operation, policy_path: &Path, routing_path: &Path) -> anyhow::Result<()> {
@@ -752,10 +755,14 @@ mod request_tests {
     fn authorize_requires_the_pinned_key_before_consuming_the_replay_marker() {
         use ed25519_dalek::{Signer, SigningKey};
         let root = std::env::temp_dir().join(format!("jarvis-authorize-{}", uuid::Uuid::new_v4()));
-        let replays = root.join("replays");
-        fs::create_dir_all(&replays).unwrap();
+        fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).unwrap();
         let owner = fs::metadata(&root).unwrap();
+        let state = ReplayMarkers {
+            state_dir: &root,
+            owner_uid: owner.uid(),
+        };
+        let replays = root.join("replays");
         let pins = root.join("trusted-device-keys");
         let device = SigningKey::from_bytes(&[5; 32]);
         let public_key = device.verifying_key().to_bytes();
@@ -797,7 +804,7 @@ mod request_tests {
             owner_uid: owner.uid(),
         });
         let check = |request: &SignedRequest, pinned| {
-            let result = authorize(request, &public_key, pinned, &replays);
+            let result = authorize(request, &public_key, pinned, state);
             let consumed = replays.join(request.request_id.to_string()).exists();
             (outcome(&result), consumed)
         };
@@ -835,6 +842,12 @@ mod request_tests {
         unpinned.request_id = uuid::Uuid::now_v7();
         unpinned.signature_hex = "00".repeat(64);
         assert_eq!(check(&unpinned, None), ("signature_denied", false));
+        // An unsafe marker directory fails closed and is not a replay.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+        let request = signed(pinned_id, uuid::Uuid::now_v7());
+        let result = authorize(&request, &public_key, None, state);
+        assert_eq!(outcome(&result), "replay_store_unsafe");
+        assert!(!replays.join(request.request_id.to_string()).exists());
         fs::remove_dir_all(root).unwrap();
     }
 }
