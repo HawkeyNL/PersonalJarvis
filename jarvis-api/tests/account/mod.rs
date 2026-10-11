@@ -43,9 +43,9 @@ async fn first_activation_requires_local_network_code_and_password_atomically(
             .header("x-jarvis-bootstrap-secret", supplied)
             // A forged proxy header must not make a public peer local.
             .header("x-forwarded-for", "10.23.45.10")
-            .extension(axum::extract::ConnectInfo(
+            .extension(axum::extract::ConnectInfo(jarvis_api::Peer::Tcp(
                 peer.parse::<std::net::SocketAddr>().unwrap(),
-            ))
+            )))
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
     };

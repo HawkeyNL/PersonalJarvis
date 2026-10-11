@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Path, Query, State},
+    http::{Extensions, HeaderMap, StatusCode},
     Json,
 };
 use serde_json::{json, Value};
@@ -96,7 +96,7 @@ pub(crate) async fn auth_enroll(
 pub(crate) async fn auth_bootstrap(
     State(state): State<AppState>,
     headers: HeaderMap,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    extensions: Extensions,
     Json(req): Json<PasswordEnrollmentReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Production activation is provisioned locally at a fixed protected path;
@@ -134,19 +134,9 @@ pub(crate) async fn auth_bootstrap(
         platform: req.platform,
         public_key: req.public_key,
     };
-    // Reconstruct the trusted-peer decision from the real socket. A direct
-    // caller cannot make an XFF header trusted; Caddy is the only configured
-    // loopback peer allowed to supply one.
-    let client_ip = if state.trusted_proxy_hops > 0 && state.trusted_proxy_ips.contains(&peer.ip())
-    {
-        headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|raw| raw.split(',').next_back())
-            .and_then(|ip| ip.trim().parse().ok())
-    } else {
-        Some(peer.ip())
-    };
+    // The shared peer policy decides whether a forwarding header is trusted;
+    // a direct caller can never make one count.
+    let client_ip = crate::peer::client_ip(&extensions, &headers, &state);
     if !client_ip.is_some_and(|ip| policy.allows(ip)) {
         record_security_event(&state, None, "auth.bootstrap", "rejected_network", None).await;
         return Err((

@@ -33,6 +33,7 @@ pub mod local_devices;
 mod mcp;
 mod metering;
 pub mod model_control;
+mod peer;
 mod rate_limit;
 pub mod realtime;
 mod routes;
@@ -41,6 +42,7 @@ mod validation;
 
 pub use extract::Authed;
 pub use metering::refresh_usage_snapshot;
+pub use peer::{bind_api_socket, proxy_uid, Peer};
 pub use state::{AppState, AppUpdateMirror};
 // Compatibility re-export: persona ownership is in `jarvis-core`, while the
 // transport crate keeps this public helper available to existing callers.
