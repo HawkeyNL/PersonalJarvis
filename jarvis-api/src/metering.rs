@@ -105,6 +105,7 @@ async fn persist(state: &AppState, entry: &usage::UsageEntry) {
             let cents = (total * 100.0).round() as u64;
             state.spent_cents.store(cents, Ordering::Relaxed);
             state.budget_gate.reconcile_actual(cents);
+            state.notifier.budget_spend(cents, state.budget_cents);
         }
         Err(e) => tracing::warn!(error = %e, "failed to refresh monthly spend"),
     }

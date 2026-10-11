@@ -93,6 +93,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         unix_proxy_uid: None,
         bootstrap_enrollment: None,
         app_update_mirror: None,
+        notifier: Default::default(),
     }
 }
 

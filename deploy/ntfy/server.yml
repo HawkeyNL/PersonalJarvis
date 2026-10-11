@@ -1,0 +1,27 @@
+# ntfy server for Jarvis owner notifications (docs/NOTIFICATIONS.md).
+# Install as /etc/ntfy/server.yml (root:ntfy 0640) and replace the base-url
+# placeholder with the public ntfy hostname that Caddy serves.
+base-url: "https://ntfy.example.com"
+# Loopback only: Caddy terminates TLS on 443 and Core publishes locally.
+listen-http: "127.0.0.1:2586"
+behind-proxy: true
+
+# Short message cache so an offline phone, and the iOS app (which fetches the
+# message after the upstream poll request), can still collect it.
+cache-file: "/var/cache/ntfy/cache.db"
+cache-duration: "12h"
+
+# Nothing is readable or writable without an account and an explicit grant.
+auth-file: "/var/lib/ntfy/user.db"
+auth-default-access: "deny-all"
+enable-signup: false
+enable-login: true
+
+# iOS only: ntfy.sh relays a poll request carrying the message id through
+# APNs; the message itself stays on this server.
+upstream-base-url: "https://ntfy.sh"
+
+# No attachments (attachment-cache-dir stays unset) and no web app; the
+# phone apps use the API directly.
+web-root: "disable"
+log-level: "info"

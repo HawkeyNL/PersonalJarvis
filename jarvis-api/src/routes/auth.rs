@@ -285,6 +285,9 @@ pub(crate) async fn pairing_create(
                 Json(json!({ "error": "pairing request unavailable" })),
             )
         })?;
+    state
+        .notifier
+        .notify(crate::notify::NotifyEvent::PairingRequested);
     record_security_event(
         &state,
         None,

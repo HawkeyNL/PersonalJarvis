@@ -31,6 +31,24 @@ async fn first_activation_requires_local_network_code_and_password_atomically(
         }
         .validate(now)?,
     );
+    // Loopback ntfy stand-in: records each publish request it receives.
+    let ntfy = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    fixture.notifier = jarvis_api::notify::Notifier::start(
+        &format!("http://{}/jarvis-test", ntfy.local_addr()?),
+        "tk_fixture",
+    )?;
+    let (published, mut publishes) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut socket, _)) = ntfy.accept().await {
+            let mut raw = vec![0_u8; 4096];
+            let read = socket.read(&mut raw).await.unwrap_or(0);
+            let _ = published.send(String::from_utf8_lossy(&raw[..read]).to_string());
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        }
+    });
     let app = build_router(fixture);
     let key = SigningKey::from_bytes(&rand::random());
     let body = json!({"name":"fixture", "platform":"ios", "public_key":hex::encode(key.verifying_key().to_bytes()),
@@ -125,6 +143,19 @@ async fn first_activation_requires_local_network_code_and_password_atomically(
     );
     let pending = jarvis_identity::pending_pairing_requests(&db, owner.id).await?;
     assert_eq!(pending.len(), 1);
+    // Only the persisted request is announced, once, without its details.
+    let push = tokio::time::timeout(std::time::Duration::from_secs(5), publishes.recv())
+        .await?
+        .ok_or("no notification")?;
+    assert!(push.contains("click: jarvis://approvals/pairing\r\n"));
+    assert!(
+        !push.contains("replacement") && !push.contains(&pending[0].candidate_fingerprint[..16])
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), publishes.recv())
+            .await
+            .is_err()
+    );
     assert_eq!(pending[0].status, "pending");
     assert_eq!(jarvis_identity::active_device_count(&db).await?, 0);
     assert!(!jarvis_identity::surreal::account::bootstrap_available(&db).await?);
