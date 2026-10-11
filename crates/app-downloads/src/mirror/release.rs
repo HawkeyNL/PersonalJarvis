@@ -20,11 +20,39 @@ pub struct ReleaseConfig {
     pub track_stable: bool,
     pub tauri_signing_public_key: String,
     pub android_signing_certificate_sha256: String,
+    /// Bare DNS name of the public HTTPS origin (Caddy's
+    /// `JARVIS_PUBLIC_HOSTNAME`). Only used for absolute AltStore/SideStore
+    /// source URLs; without it no source is published.
+    #[serde(default)]
+    pub public_hostname: Option<String>,
+}
+
+/// Lowercase LDH hostname only: no scheme, port, path, credentials or IP literal
+/// syntax beyond plain labels, so it can be embedded in URLs without escaping.
+pub fn valid_hostname(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 impl ReleaseConfig {
     pub fn validate(&self) -> Result<()> {
         self.identity.validate()?;
+        if self
+            .public_hostname
+            .as_deref()
+            .is_some_and(|host| !valid_hostname(host))
+        {
+            return Err("invalid public hostname");
+        }
         public_key(&self.tauri_signing_public_key)?;
         digest_hex(&format!(
             "sha256:{}",
@@ -196,7 +224,7 @@ pub struct Identity {
     source_revision: String,
     product: String,
     channel: String,
-    released_at: String,
+    pub released_at: String,
     client_protocol: u32,
     minimum_client_protocol: u32,
     #[serde(default)]

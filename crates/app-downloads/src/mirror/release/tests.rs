@@ -96,6 +96,7 @@ impl Fixture {
                 track_stable: false,
                 tauri_signing_public_key: key(),
                 android_signing_certificate_sha256: "a".repeat(64),
+                public_hostname: None,
             },
             files,
             oci: Vec::new(),
@@ -211,6 +212,17 @@ fn release_configuration_is_nested_strict_and_never_accepts_token_or_source_url(
         .unwrap()
         .validate()
         .unwrap();
+    value["public_hostname"] = json!("jarvis.example.com");
+    serde_json::from_value::<ReleaseConfig>(value.clone())
+        .unwrap()
+        .validate()
+        .unwrap();
+    value["public_hostname"] = json!("https://jarvis.example.com/");
+    assert!(serde_json::from_value::<ReleaseConfig>(value.clone())
+        .unwrap()
+        .validate()
+        .is_err());
+    value.as_object_mut().unwrap().remove("public_hostname");
     for field in ["token", "source_url", "destination", "helper"] {
         value[field] = json!("fixture-not-a-secret");
         assert!(serde_json::from_value::<ReleaseConfig>(value.clone()).is_err());

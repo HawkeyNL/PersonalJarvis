@@ -27,6 +27,31 @@ The existing `ios-candidate.yml` and `sync-ios` remain available for standalone
 candidates; they cannot substitute for a complete signed release. No iOS App
 Store credentials or Apple distribution uploads are introduced.
 
+## iPhone install and updates: AltStore/SideStore
+
+iPhones install and update Jarvis only through AltStore or SideStore, which sign
+the IPA on the device with the owner's Apple account. No App Store or TestFlight.
+
+* Set `public_hostname` in the release configuration to the bare public DNS name
+  Caddy serves (the same value as `JARVIS_PUBLIC_HOSTNAME`: no `https://`, port
+  or path). Leave it out to publish no source.
+* Every index rebuild then writes `/downloads/altstore.json`: one app
+  (`com.hawkeynl.jarvis`) whose versions are the IPAs of the retained public
+  releases, newest first. Retired releases drop out on the same run.
+* `/downloads/` shows "Add to AltStore" (`altstore://source?url=...`) and "Add
+  to SideStore" (`sidestore://source?url=...`) links. Open the page in Safari on
+  the iPhone and tap one once; afterwards the tool offers new versions as updates.
+* The app learns about a newer version from the authenticated
+  `GET /v1/app-updates/ios/{current_version}` notice (no install payload), which
+  links to the same source and page. It uses Core's
+  `JARVIS_APP_UPDATE_PUBLIC_BASE_URL`, so that origin and `public_hostname` must
+  name the same host.
+
+The source format has no hash field and AltStore/SideStore verify nothing
+themselves: trust is HTTPS to the owner's host plus the import-time verification
+above. Whether AltStore/SideStore keep the bundle ID and Keychain data across
+updates with the owner's account must be checked on a real device.
+
 ## Server paths
 
 * `/etc/jarvis/app-downloads/ghcr.token`: shared private read:packages credential.
@@ -36,9 +61,11 @@ Store credentials or Apple distribution uploads are introduced.
 * `/var/lib/jarvis-app-updates/releases/vX.Y.Z`: protected immutable generation.
 * `/var/lib/jarvis-app-updates/current`: atomic active-generation symlink.
 * `/var/lib/jarvis-public-downloads/releases/vX.Y.Z`: separate public copies.
+* `/var/lib/jarvis-public-downloads/altstore.json`: generated AltStore/SideStore
+  source (only with `public_hostname`).
 
 Caddy only exposes canonical AppImage, EXE, DMG, APK and existing IPA installation
-paths plus the generated index. No directory listing, metadata, secrets or
+paths plus the generated index and AltStore source. No directory listing, metadata, secrets or
 protected-mirror alias. `/v1/app-updates/**` still requires enrolled-device auth.
 All clients use the runtime-enrolled Home Node origin; no DNS value in builds.
 The native Rust service is not a Docker container and needs no Docker socket.
@@ -93,8 +120,8 @@ runtime HTTPS origin through the trusted configuration flow. Do not overwrite
 other Core configuration. Restart Core only through approved administration.
 If those settings already match, no client DNS change is needed.
 
-Merge the reviewed `@clientDownload` Caddy block alongside the existing index and
-iOS blocks; preserve the site's TLS/environment and Core proxy. Validate and
+Merge the reviewed `@clientDownload` and `@altstoreSource` Caddy blocks alongside
+the existing index and iOS blocks; preserve the site's TLS/environment and Core proxy. Validate and
 reload through the trusted administration flow. Do not replace working site
 configuration blindly. No new port; existing HTTPS/443 only.
 
@@ -125,7 +152,7 @@ Both `/downloads` and `/downloads/` must return `200` and `text/html`, without
 installer: inspect the installed Caddy routing and generated public index.
 Installers alone use attachment responses. The Rust importer renders a mobile
 HTML page from validated local inventory; no frontend service or embedded Home
-Node hostname is needed. An iOS IPA still requires local owner signing.
+Node hostname is needed. An iOS IPA is signed on the device by AltStore/SideStore.
 
 Desktop and Android updaters do not follow these public links or a custom deep
 link: native clients derive `/v1/app-updates/**` from the enrolled runtime HTTPS
@@ -142,7 +169,10 @@ protected mirror, metadata, token, or arbitrary directory listings.
 5. An enrolled desktop checks through native auth and verifies Tauri signatures.
 6. Android validates APK package identity, versionCode and certificate before the
    OS package installer. AAB is not a public installation link.
-7. iOS IPA still requires local signing; no automatic update claim.
+7. With `public_hostname` set, `/downloads/altstore.json` returns `200`
+   `application/json` listing only retained releases, and the page's AltStore and
+   SideStore links add that source on a real iPhone. The IPA is never installed
+   automatically; updates are confirmed in AltStore/SideStore.
 8. Bad signature/hash, interrupted transfer and unavailable GHCR leave the prior
    active generation intact. Same-version substitution is refused.
 

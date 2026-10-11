@@ -52,7 +52,8 @@ async fn sync_release() -> Result<(), &'static str> {
     .map_err(|_| "invalid signed release configuration")?;
     config.validate()?;
     let public = Path::new("/var/lib/jarvis-public-downloads");
-    let public_store = Store::open(public, 0)?;
+    let public_store =
+        Store::open(public, 0)?.with_public_hostname(config.public_hostname.as_deref())?;
     let store = ReleaseStore::open(Path::new("/var/lib/jarvis-app-updates"), 0)?;
     let secret = Zeroizing::new(mirror::read_protected(
         Path::new("/etc/jarvis/app-downloads/ghcr.token"),
@@ -124,7 +125,7 @@ async fn sync_release() -> Result<(), &'static str> {
 }
 
 async fn sync_ios() -> Result<(), &'static str> {
-    use jarvis_app_downloads::mirror::{self, Config, Registry, Store};
+    use jarvis_app_downloads::mirror::{self, release::ReleaseConfig, Config, Registry, Store};
     use std::path::Path;
     use zeroize::Zeroizing;
     // The service has fixed protected paths; no caller-selected executable,
@@ -149,7 +150,21 @@ async fn sync_ios() -> Result<(), &'static str> {
     )?)
     .map_err(|_| "invalid mirror configuration")?;
     config.validate()?;
-    let store = Store::open(Path::new("/var/lib/jarvis-public-downloads"), 0)?;
+    // The AltStore source hostname belongs to the complete-release
+    // configuration. Reading it keeps this importer's page rebuild from
+    // dropping the source that sync-release published.
+    let release_path = Path::new("/etc/jarvis/app-downloads/release.json");
+    let public_hostname = if std::fs::symlink_metadata(release_path).is_ok() {
+        let release: ReleaseConfig =
+            serde_json::from_slice(&mirror::read_protected(release_path, 0, true, 65536)?)
+                .map_err(|_| "invalid signed release configuration")?;
+        release.validate()?;
+        release.public_hostname
+    } else {
+        None
+    };
+    let store = Store::open(Path::new("/var/lib/jarvis-public-downloads"), 0)?
+        .with_public_hostname(public_hostname.as_deref())?;
     let bytes = Zeroizing::new(mirror::read_protected(
         Path::new("/etc/jarvis/app-downloads/ghcr.token"),
         0,

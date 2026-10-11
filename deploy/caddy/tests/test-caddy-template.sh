@@ -14,6 +14,9 @@ grep -Fqx $'\t\t# reverse_proxy unix//run/jarvis-core/api.sock' "$template"
 [[ $(grep -Ec '^\s*reverse_proxy ' "$template") == 1 ]]
 grep -Fqx $'\t@downloads path /downloads /downloads/' "$template"
 grep -Fqx $'\t\trewrite * /index.html' "$template"
+grep -Fqx $'\t@altstoreSource path /downloads/altstore.json' "$template"
+grep -Fqx $'\t\trewrite * /altstore.json' "$template"
+[[ $(grep -Ec '^\s*rewrite ' "$template") == 2 ]]
 ! grep -Eq '^\s*(root|file_server).*app-updates|file_server browse' "$template"
 grep -Fqx '{$JARVIS_PUBLIC_HOSTNAME} {' "$template"
 ! grep -Eq 'Access-Control-Allow-Origin|0\.0\.0\.0:8080' "$template"

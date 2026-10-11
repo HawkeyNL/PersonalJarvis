@@ -241,3 +241,111 @@ fn symlinks_escaping_current_and_concurrent_writers_rejected() {
     symlink(temp.path(), root.join("releases/v0.1.0")).unwrap();
     assert!(prepare(&store, &Fixture::new("0.1.0", 1), &public).is_err());
 }
+
+#[test]
+fn altstore_source_lists_only_retained_verified_releases_newest_first() {
+    let (_temp, root, public) = dirs();
+    let owner = unsafe { libc::geteuid() };
+    let store = ReleaseStore::open(&root, owner).unwrap();
+    for patch in 1..=4 {
+        prepare(
+            &store,
+            &Fixture::new(&format!("0.1.{patch}"), patch),
+            &public,
+        )
+        .unwrap();
+    }
+    let index = super::super::Store::open(&public, owner)
+        .unwrap()
+        .with_public_hostname(Some("jarvis.example.com"))
+        .unwrap();
+    let versions = |public: &Path| -> Vec<String> {
+        let source: serde_json::Value =
+            serde_json::from_slice(&fs::read(public.join("altstore.json")).unwrap()).unwrap();
+        assert_eq!(source["apps"][0]["bundleIdentifier"], "com.hawkeynl.jarvis");
+        assert_eq!(
+            source["sourceURL"],
+            "https://jarvis.example.com/downloads/altstore.json"
+        );
+        source["apps"][0]["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["version"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    index.render_index().unwrap();
+    assert_eq!(versions(&public), ["0.1.4", "0.1.3", "0.1.2", "0.1.1"]);
+    let source: serde_json::Value =
+        serde_json::from_slice(&fs::read(public.join("altstore.json")).unwrap()).unwrap();
+    let newest = &source["apps"][0]["versions"][0];
+    let ipa = "Jarvis_0.1.4_ios_arm64_unsigned.ipa";
+    assert_eq!(
+        newest["downloadURL"],
+        format!("https://jarvis.example.com/downloads/releases/v0.1.4/ios-arm64/{ipa}")
+    );
+    assert_eq!(newest["size"], Fixture::new("0.1.4", 4).files[ipa].len());
+    assert_eq!(newest["date"], "2026-01-01T00:00:00Z");
+    assert_eq!(newest["minOSVersion"], "17.0");
+    assert_eq!(
+        fs::metadata(public.join("altstore.json")).unwrap().mode() & 0o777,
+        0o644
+    );
+    // Retirement rebuilds the source, so retired versions disappear.
+    assert_eq!(index.retire_releases().unwrap(), 1);
+    assert_eq!(versions(&public), ["0.1.4", "0.1.3", "0.1.2"]);
+    let html = fs::read_to_string(public.join("index.html")).unwrap();
+    let url = "https%3A%2F%2Fjarvis.example.com%2Fdownloads%2Faltstore.json";
+    assert!(html.contains(&format!(
+        "href=\"altstore://source?url={url}\">Add to AltStore"
+    )));
+    assert!(html.contains(&format!(
+        "href=\"sidestore://source?url={url}\">Add to SideStore"
+    )));
+    assert!(!html.contains("<script"));
+
+    // A tampered public IPA fails closed and keeps the previous source.
+    let previous = fs::read(public.join("altstore.json")).unwrap();
+    fs::write(
+        public.join("releases/v0.1.4/ios-arm64").join(ipa),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(index.render_index().is_err());
+    assert_eq!(fs::read(public.join("altstore.json")).unwrap(), previous);
+
+    // Without a configured hostname the source and its links are removed.
+    drop(index);
+    fs::remove_dir_all(public.join("releases/v0.1.4")).unwrap();
+    super::super::Store::open(&public, owner)
+        .unwrap()
+        .render_index()
+        .unwrap();
+    assert!(!public.join("altstore.json").exists());
+    let html = fs::read_to_string(public.join("index.html")).unwrap();
+    assert!(!html.contains("altstore://") && !html.contains("{{ALTSTORE_LINKS}}"));
+}
+
+#[test]
+fn altstore_hostname_rejects_anything_but_a_bare_lowercase_hostname() {
+    let (_temp, _root, public) = dirs();
+    let owner = unsafe { libc::geteuid() };
+    for host in [
+        "",
+        "https://jarvis.example.com",
+        "jarvis.example.com:443",
+        "jarvis.example.com/x",
+        "Jarvis.example.com",
+        "jarvis.example.com\"><script>",
+        "user@jarvis.example.com",
+        "-jarvis.example.com",
+        "jarvis..example.com",
+    ] {
+        let store = super::super::Store::open(&public, owner).unwrap();
+        assert!(store.with_public_hostname(Some(host)).is_err(), "{host}");
+    }
+    assert!(super::super::Store::open(&public, owner)
+        .unwrap()
+        .with_public_hostname(Some("jarvis-1.example.com"))
+        .is_ok());
+}

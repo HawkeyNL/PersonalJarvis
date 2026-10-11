@@ -4,7 +4,10 @@ For Linux, Windows, macOS and Android see [complete private client releases](PRI
 Keep this iOS configuration separate; it cannot authorize automatic updates.
 
 This first importer serves **manually approved unsigned iOS candidates**, not a
-complete signed application release. It does not replace the authenticated
+complete signed application release. iPhone updates for complete releases go
+through the AltStore/SideStore source described in
+[complete private client releases](PRIVATE_CLIENT_RELEASES.md); standalone
+candidates are never listed in that source. It does not replace the authenticated
 app-update mirror. Existing clients do not automatically discover/install this
 IPA. The IPA needs owner-side signing. No Apple key or GitHub token goes to a
 browser. Do not claim a production URL works until the owner deploys and tests it.

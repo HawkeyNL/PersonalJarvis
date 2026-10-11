@@ -311,6 +311,7 @@ async fn every_application_update_route_requires_authentication_before_storage_a
         "/v1/app-updates/artifacts/0.1.0/linux/x86_64/Jarvis_0.1.0_linux_x86_64.AppImage",
         "/v1/app-updates/android/1?client_protocol=1",
         "/v1/app-updates/android/download",
+        "/v1/app-updates/ios/0.1.0",
     ] {
         let response = app
             .clone()

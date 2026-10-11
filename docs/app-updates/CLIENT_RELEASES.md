@@ -36,11 +36,19 @@ The unified manifest contains:
 - supplemental notarized macOS DMG and Android store AAB metadata.
 
 The Home Node mirrors downloadable desktop assets, the APK, DMG, AAB, and the
-manifest. iOS source is simulator-tested in client CI and installed locally
-from Xcode using the owner's Personal Team or registered-device development
-signing. It has no IPA, manifest target, or Home Node update artifact. Only the
-three desktop updater targets and Android APK can be selected by the
+manifest. The unsigned iOS IPA is a manual-signing installer, never an updater
+target. iPhones install and update it through AltStore or SideStore, which sign
+it on the device, from the public source `/downloads/altstore.json` (see
+[complete private client releases](../../deploy/app-updates/PRIVATE_CLIENT_RELEASES.md)).
+Only the three desktop updater targets and Android APK can be selected by the
 authenticated client API.
+
+`GET /v1/app-updates/ios/{current_version}` (authenticated) is informational
+only. It returns `204` when the active release is not newer, otherwise
+`schema_version`, `platform: "ios"`, `version`, `released_at`, `notes`,
+`downloads_page_url`, `altstore_source_url`, `altstore_add_source_url` and
+`sidestore_add_source_url`. It never returns an IPA, install URL or install
+command; the app shows a banner and the owner updates in AltStore/SideStore.
 
 ```text
 /var/lib/jarvis/app-updates/
@@ -130,7 +138,7 @@ Production clients receive the Home Node origin at runtime and require HTTPS.
 Origin changes clear server-specific session/device binding before use. Desktop
 auth/update requests remain in native Rust, Android validates its package and
 certificate before invoking the system installer, and iOS device installation
-remains a local Xcode operation. The Home Node can fetch public GitHub Releases without a token; if an
+goes through AltStore/SideStore on the device. The Home Node can fetch public GitHub Releases without a token; if an
 optional token is configured later, redirects strip Authorization on origin
 change and logs/URLs never contain it.
 

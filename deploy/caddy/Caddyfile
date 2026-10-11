@@ -39,6 +39,16 @@
 		header Cache-Control "public, max-age=300"
 		file_server
 	}
+	# AltStore/SideStore source, generated from verified public releases only.
+	@altstoreSource path /downloads/altstore.json
+	handle @altstoreSource {
+		root * /var/lib/jarvis-public-downloads
+		rewrite * /altstore.json
+		header Content-Type "application/json"
+		header -Content-Disposition
+		header Cache-Control "public, max-age=300"
+		file_server
+	}
 	# Only canonical IPA filenames can be downloaded. No directory browsing,
 	# approval metadata, staging directories or arbitrary file extensions.
 	@iosDownload path_regexp ios ^/downloads/ios/v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)/Jarvis_(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)_ios_arm64_unsigned[.]ipa$

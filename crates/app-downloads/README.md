@@ -61,3 +61,17 @@ cached page for up to five minutes. A release
 directory holds every target of a version and is retired as one unit. The
 authenticated update mirror and the separate `ios/` candidates are never
 pruned by this step.
+
+## AltStore/SideStore source
+
+When the release configuration sets `public_hostname`, every index rebuild also
+writes `altstore.json` atomically next to `index.html`. It lists the iOS IPA of
+each retained public release, newest first, with absolute
+`https://<public_hostname>/downloads/...` URLs. Only directories that passed
+publication verification are read, and each IPA must still match the size and
+path in its signed release metadata, or the rebuild fails and the previous files
+stay. Retired versions disappear on the same rebuild. Without `public_hostname`
+(or without any complete release) the file is removed and the page shows no
+source links. The iOS bundle identifier and minimum iOS version are pinned
+constants that must follow the App project's `ios/project.yml`.
+

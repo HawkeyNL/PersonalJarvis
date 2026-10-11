@@ -58,7 +58,7 @@ pub use rate_limit::{AuthLimits, RateLimiter};
 use routes::agent::{agent_action, agent_pending, agent_pending_approve, agent_pending_deny};
 use routes::app_updates::{
     android_update_check, android_update_download, app_update_artifact, app_update_capability,
-    app_update_check,
+    app_update_check, ios_update_check,
 };
 use routes::auth::{
     auth_bootstrap, auth_challenge, auth_enroll, auth_login, auth_logout, auth_me, delete_device,
@@ -150,6 +150,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/app-updates/android/download",
             get(android_update_download),
+        )
+        .route(
+            "/v1/app-updates/ios/{current_version}",
+            get(ios_update_check),
         )
         .route(
             "/v1/app-updates/{channel}/{target}/{arch}/{current_version}",

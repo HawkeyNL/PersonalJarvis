@@ -50,6 +50,9 @@ class PublicDownloadTests(unittest.TestCase):
                 path.write_bytes(b'fixture-installer-not-installable')
                 client_paths.append('/downloads/' + relative)
             (archive / 'releases/v0.1.0/manifest.json').write_text('{"fixture":"not public"}')
+            source = b'{"name":"fixture-source","apps":[]}'
+            (archive / 'altstore.json').write_bytes(source)
+            (archive / '.index-staged').write_text('fixture not public')
             api = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ProtectedAPI)
             worker = threading.Thread(target=api.serve_forever, daemon=True)
             worker.start()
@@ -107,6 +110,12 @@ class PublicDownloadTests(unittest.TestCase):
                             self.assertEqual(response.headers.get_content_type(), "text/html")
                             self.assertNotIn("Content-Disposition", response.headers)
                             self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
+                    with get('/downloads/altstore.json') as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(response.read(), source)
+                        self.assertEqual(response.headers.get_content_type(), 'application/json')
+                        self.assertEqual(response.headers['Cache-Control'], 'public, max-age=300')
+                        self.assertNotIn('Content-Disposition', response.headers)
                     with get('/downloads/ios/v0.1.0/Jarvis_0.1.0_ios_arm64_unsigned.ipa') as response:
                         self.assertEqual(response.status, 200)
                         self.assertEqual(response.read(), b'fixture-ipa-not-installable')
@@ -126,7 +135,9 @@ class PublicDownloadTests(unittest.TestCase):
                                  '/downloads/releases/v0.1.0/macos-arm64/Jarvis_0.1.0_macos_arm64.app.tar.gz',
                                  '/downloads/releases/v0.1.0/android-universal/Jarvis_0.1.0_android_universal.aab',
                                  '/downloads/ios/.staging-x/Jarvis_0.1.0_ios_arm64_unsigned.ipa',
-                                 '/downloads/ios/v0.1.0/%2e%2e/approved.json'):
+                                 '/downloads/ios/v0.1.0/%2e%2e/approved.json',
+                                 '/altstore.json', '/downloads/altstore.json/', '/downloads/altstore.json.tmp',
+                                 '/downloads/.index-staged', '/downloads/releases/altstore.json'):
                         with get(path) as response:
                             self.assertEqual(response.status, 401, path)
                             self.assertEqual(response.headers.get("X-Fixture-API"), "protected", path)

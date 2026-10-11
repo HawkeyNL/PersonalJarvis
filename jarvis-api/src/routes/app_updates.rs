@@ -32,8 +32,9 @@ struct Manifest {
     artifacts: Vec<ArtifactEntry>,
     // Supplemental installers are checksum-bound by the signed upstream
     // manifest, validated/mirrored by sync, and never exposed as updater targets.
-    #[serde(default, rename = "installers")]
-    _installers: Vec<serde_json::Value>,
+    // Only the iOS notice reads them, to confirm the release includes iOS.
+    #[serde(default)]
+    installers: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,14 +190,11 @@ fn canonical_filename(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-async fn active_release(
+/// The active, validated generation shared by every platform's offer.
+async fn active_manifest(
     mirror: &AppUpdateMirror,
     channel: &str,
-    target: &str,
-    arch: &str,
-) -> Result<SelectedRelease, Response> {
-    let (platform, architecture) = platform(target, arch)
-        .ok_or_else(|| opaque(StatusCode::NOT_FOUND, "unsupported update target"))?;
+) -> Result<(PathBuf, Manifest, Version), Response> {
     let releases = tokio::fs::canonicalize(mirror.root().join("releases"))
         .await
         .map_err(|_| opaque(StatusCode::SERVICE_UNAVAILABLE, "update mirror unavailable"))?;
@@ -236,6 +234,18 @@ async fn active_release(
     }
     let version = Version::parse(&manifest.release.version)
         .map_err(|_| opaque(StatusCode::SERVICE_UNAVAILABLE, "update mirror invalid"))?;
+    Ok((current, manifest, version))
+}
+
+async fn active_release(
+    mirror: &AppUpdateMirror,
+    channel: &str,
+    target: &str,
+    arch: &str,
+) -> Result<SelectedRelease, Response> {
+    let (platform, architecture) = platform(target, arch)
+        .ok_or_else(|| opaque(StatusCode::NOT_FOUND, "unsupported update target"))?;
+    let (current, manifest, version) = active_manifest(mirror, channel).await?;
     let entry = manifest
         .artifacts
         .into_iter()
@@ -316,45 +326,7 @@ async fn active_android_release(
     mirror: &AppUpdateMirror,
     channel: &str,
 ) -> Result<SelectedAndroidRelease, Response> {
-    let releases = tokio::fs::canonicalize(mirror.root().join("releases"))
-        .await
-        .map_err(|_| opaque(StatusCode::SERVICE_UNAVAILABLE, "update mirror unavailable"))?;
-    let current = tokio::fs::canonicalize(mirror.root().join("current"))
-        .await
-        .map_err(|_| opaque(StatusCode::SERVICE_UNAVAILABLE, "update mirror unavailable"))?;
-    if !current.starts_with(&releases) || current.parent() != Some(releases.as_path()) {
-        return Err(opaque(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "update mirror unavailable",
-        ));
-    }
-    let manifest_path = current.join("manifest.json");
-    let manifest_metadata = tokio::fs::metadata(&manifest_path)
-        .await
-        .map_err(|_| opaque(StatusCode::SERVICE_UNAVAILABLE, "update mirror unavailable"))?;
-    if !manifest_metadata.is_file() || manifest_metadata.len() > MAX_MANIFEST_BYTES {
-        return Err(opaque(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "update mirror unavailable",
-        ));
-    }
-    let encoded = tokio::fs::read(&manifest_path)
-        .await
-        .map_err(|_| opaque(StatusCode::SERVICE_UNAVAILABLE, "update mirror unavailable"))?;
-    let manifest: Manifest = serde_json::from_slice(&encoded)
-        .map_err(|_| opaque(StatusCode::SERVICE_UNAVAILABLE, "update mirror invalid"))?;
-    if manifest.schema_version != 1
-        || manifest.release.channel != channel
-        || manifest.release.minimum_client_protocol == 0
-        || !manifest.release.identity_valid()
-    {
-        return Err(opaque(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "update mirror invalid",
-        ));
-    }
-    let version = Version::parse(&manifest.release.version)
-        .map_err(|_| opaque(StatusCode::SERVICE_UNAVAILABLE, "update mirror invalid"))?;
+    let (current, manifest, version) = active_manifest(mirror, channel).await?;
     let entry = manifest
         .artifacts
         .into_iter()
@@ -547,6 +519,59 @@ pub(crate) async fn android_update_download(
             .insert(header::CONTENT_LENGTH, length);
     }
     response
+}
+
+/// Informational iOS notice for an "update available" banner. iOS updates
+/// are installed by AltStore/SideStore from the public source, which re-signs
+/// on the device; this route never returns an IPA, install URL or command.
+pub(crate) async fn ios_update_check(
+    _authed: Authed,
+    State(state): State<AppState>,
+    Path(current_version): Path<String>,
+) -> Response {
+    let current = match Version::parse(current_version.trim_start_matches('v')) {
+        Ok(version) => version,
+        Err(_) => return opaque(StatusCode::BAD_REQUEST, "invalid client version"),
+    };
+    let Some(mirror) = state.app_update_mirror else {
+        return opaque(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application updates unavailable",
+        );
+    };
+    ios_notice(&mirror.for_mobile(), &current).await
+}
+
+async fn ios_notice(mirror: &AppUpdateMirror, current: &Version) -> Response {
+    let (_, manifest, version) = match active_manifest(mirror, "stable").await {
+        Ok(active) => active,
+        Err(response) => return response,
+    };
+    if !manifest.installers.iter().any(|installer| {
+        installer["platform"] == "ios"
+            && installer["architecture"] == "arm64"
+            && installer["distribution"] == "manual-owner-signing"
+    }) {
+        return opaque(StatusCode::NOT_FOUND, "iOS release unavailable");
+    }
+    if version <= *current {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let base = mirror.public_base_url();
+    let source = format!("{base}/downloads/altstore.json");
+    let encoded: String = url::form_urlencoded::byte_serialize(source.as_bytes()).collect();
+    Json(json!({
+        "schema_version": 1,
+        "platform": "ios",
+        "version": version.to_string(),
+        "released_at": manifest.release.released_at,
+        "notes": manifest.release.notes.unwrap_or_default(),
+        "downloads_page_url": format!("{base}/downloads/"),
+        "altstore_source_url": source,
+        "altstore_add_source_url": format!("altstore://source?url={encoded}"),
+        "sidestore_add_source_url": format!("sidestore://source?url={encoded}"),
+    }))
+    .into_response()
 }
 
 pub(crate) async fn app_update_capability(
@@ -761,6 +786,66 @@ mod tests {
         assert!(!protocol_is_compatible(1, 2));
         assert!(!protocol_is_compatible(0, 1));
         assert!(!protocol_is_compatible(1, 0));
+    }
+
+    fn ios_fixture(installers: serde_json::Value) -> (tempfile::TempDir, AppUpdateMirror) {
+        let temp = tempfile::tempdir().unwrap();
+        let release = temp.path().join("releases/v0.2.0");
+        std::fs::create_dir_all(&release).unwrap();
+        let manifest = json!({
+            "schema_version": 1,
+            "release": {"version": "0.2.0", "channel": "stable",
+                "released_at": "2026-10-01T12:00:00Z", "minimum_client_protocol": 1},
+            "artifacts": [],
+            "installers": installers,
+        });
+        std::fs::write(release.join("manifest.json"), manifest.to_string()).unwrap();
+        std::os::unix::fs::symlink("releases/v0.2.0", temp.path().join("current")).unwrap();
+        let mirror = AppUpdateMirror::new(temp.path(), "https://jarvis.example.com").unwrap();
+        (temp, mirror)
+    }
+
+    #[tokio::test]
+    async fn ios_notice_is_informational_and_only_for_newer_releases() {
+        let ios = json!([{"platform": "ios", "architecture": "arm64",
+            "distribution": "manual-owner-signing", "artifact": {"path": "x", "sha256": "y", "size": 1}}]);
+        let (_temp, mirror) = ios_fixture(ios);
+        let response = ios_notice(&mirror, &Version::new(0, 1, 9)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let source = "https%3A%2F%2Fjarvis.example.com%2Fdownloads%2Faltstore.json";
+        assert_eq!(
+            body,
+            json!({
+                "schema_version": 1,
+                "platform": "ios",
+                "version": "0.2.0",
+                "released_at": "2026-10-01T12:00:00Z",
+                "notes": "",
+                "downloads_page_url": "https://jarvis.example.com/downloads/",
+                "altstore_source_url": "https://jarvis.example.com/downloads/altstore.json",
+                "altstore_add_source_url": format!("altstore://source?url={source}"),
+                "sidestore_add_source_url": format!("sidestore://source?url={source}"),
+            })
+        );
+        for current in [Version::new(0, 2, 0), Version::new(0, 3, 0)] {
+            assert_eq!(
+                ios_notice(&mirror, &current).await.status(),
+                StatusCode::NO_CONTENT
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ios_notice_requires_an_ios_installer_in_the_active_release() {
+        let (_temp, mirror) = ios_fixture(json!([]));
+        assert_eq!(
+            ios_notice(&mirror, &Version::new(0, 1, 0)).await.status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]

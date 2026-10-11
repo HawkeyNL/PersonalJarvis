@@ -393,3 +393,83 @@ pub(super) fn public_links(root: &Path, owner: u32) -> Result<String> {
     html.push_str("</div>");
     Ok(html)
 }
+
+pub(super) const ALTSTORE_FILE: &str = "altstore.json";
+/// `PRODUCT_BUNDLE_IDENTIFIER` and iOS `deploymentTarget` in the App repository's
+/// `ios/project.yml`. The signed release metadata carries neither, so they are
+/// pinned here; change them together with the App project.
+const IOS_BUNDLE_ID: &str = "com.hawkeynl.jarvis";
+const IOS_MIN_OS: &str = "17.0";
+
+pub(super) fn altstore_url(host: &str) -> String {
+    format!("https://{host}/downloads/{ALTSTORE_FILE}")
+}
+
+/// AltStore/SideStore source listing every retained public release, newest
+/// first. Only directories that passed `publish_public` verification exist
+/// under `releases/`; each IPA must still match its signed size and path. No
+/// remote label or free text enters the document: versions are numeric
+/// SemVer, dates are re-formatted and everything else is a constant.
+pub(super) fn altstore_source(root: &Path, owner: u32, host: &str) -> Result<Vec<u8>> {
+    if !super::release::valid_hostname(host) {
+        return Err("invalid public hostname");
+    }
+    let mut versions = Vec::new();
+    for version in public_versions(root, owner)?.iter().rev() {
+        let release = root.join("releases").join(format!("v{version}"));
+        let manifest = read_protected(&release.join("manifest.json"), owner, false, MAX_METADATA)?;
+        let doc: Document =
+            serde_json::from_slice(&manifest).map_err(|_| "invalid public release metadata")?;
+        let name = format!("Jarvis_{version}_ios_arm64_unsigned.ipa");
+        let path = format!("releases/v{version}/ios-arm64/{name}");
+        let ipa = doc
+            .installers
+            .iter()
+            .find(|i| i.platform == "ios" && i.architecture == "arm64")
+            .ok_or("public release lacks an iOS installer")?;
+        let size = open_regular(&release.join("ios-arm64").join(&name), owner, false)?
+            .metadata()
+            .map_err(|_| "cannot inspect public iOS installer")?
+            .len();
+        let date = chrono::DateTime::parse_from_rfc3339(&doc.release.released_at)
+            .map_err(|_| "invalid public release date")?
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        if doc.release.version != version.to_string()
+            || ipa.artifact.path != path
+            || ipa.artifact.size != size
+        {
+            return Err("public iOS installer does not match its release metadata");
+        }
+        versions.push(serde_json::json!({
+            "version": version.to_string(),
+            "date": date,
+            "downloadURL": format!("https://{host}/downloads/{path}"),
+            "size": size,
+            "minOSVersion": IOS_MIN_OS,
+        }));
+    }
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "name": "Jarvis",
+        "identifier": format!("{IOS_BUNDLE_ID}.source"),
+        "sourceURL": altstore_url(host),
+        "apps": [{
+            "name": "Jarvis",
+            "bundleIdentifier": IOS_BUNDLE_ID,
+            "developerName": "HawkeyNL",
+            "localizedDescription": "Jarvis client for your own Home Node. Signed on this device by AltStore or SideStore.",
+            // AltStore 2 compares these with the IPA: no extra entitlements,
+            // and the usage descriptions from the App's Info.plist.
+            "appPermissions": {
+                "entitlements": [],
+                "privacy": {
+                    "NSFaceIDUsageDescription": "Jarvis uses Face ID to unlock your authenticated conversations.",
+                    "NSLocalNetworkUsageDescription": "Jarvis connects to your Home Node on the local network.",
+                },
+            },
+            "versions": versions,
+        }],
+        "news": [],
+    }))
+    .map_err(|_| "cannot serialize AltStore source")
+}

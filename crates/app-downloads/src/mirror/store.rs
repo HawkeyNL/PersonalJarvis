@@ -46,6 +46,7 @@ pub fn read_protected(path: &Path, owner: u32, private: bool, max: usize) -> Res
 pub struct Store {
     root: PathBuf,
     owner: u32,
+    public_hostname: Option<String>,
     _lock: File,
 }
 
@@ -76,8 +77,19 @@ impl Store {
         Ok(Self {
             root: root.to_owned(),
             owner,
+            public_hostname: None,
             _lock: lock,
         })
+    }
+
+    /// Public HTTPS hostname for the AltStore/SideStore source. Without it the
+    /// source file is removed and the page shows no source links.
+    pub fn with_public_hostname(mut self, host: Option<&str>) -> Result<Self> {
+        if host.is_some_and(|host| !super::release::valid_hostname(host)) {
+            return Err("invalid public hostname");
+        }
+        self.public_hostname = host.map(str::to_owned);
+        Ok(self)
     }
 
     pub fn stage(&self, config: &Config) -> Result<Stage> {
@@ -293,23 +305,54 @@ impl Store {
             candidates.push_str("</ul></section>");
         }
         let releases = super::release_store::public_links(&self.root, self.owner)?;
+        // The source lists only verified public releases, so it is rebuilt from
+        // the same inventory as the page and written first: a failure leaves
+        // the previous page in place.
+        let source = super::release_store::ALTSTORE_FILE;
+        let altstore_links = match self.public_hostname.as_deref() {
+            Some(host) if !releases.is_empty() => {
+                let bytes = super::release_store::altstore_source(&self.root, self.owner, host)?;
+                self.write_public(source, &bytes)?;
+                // LDH hostname: only ':' and '/' need percent-encoding.
+                let url = super::release_store::altstore_url(host)
+                    .replace(':', "%3A")
+                    .replace('/', "%2F");
+                format!("<ul><li><a href=\"altstore://source?url={url}\">Add to AltStore</a></li><li><a href=\"sidestore://source?url={url}\">Add to SideStore</a></li></ul>")
+            }
+            _ => {
+                if fs::symlink_metadata(self.root.join(source)).is_ok() {
+                    fs::remove_file(self.root.join(source))
+                        .map_err(|_| "cannot remove stale AltStore source")?;
+                    sync_directory(&self.root)?;
+                }
+                String::new()
+            }
+        };
         let releases = if releases.is_empty() {
             "<h2>Client releases</h2><p>No complete release has been imported yet. Please try again later.</p>"
         } else {
             &releases
         };
-        // Only validated numeric versions and fixed platform names enter these
-        // fragments; no remote labels, credentials or absolute origins.
+        // Only validated numeric versions, fixed platform names and the
+        // validated LDH public hostname enter these fragments; no remote
+        // labels or credentials.
         let html = include_str!("downloads.html")
             .replace("{{CLIENT_RELEASES}}", releases)
-            .replace("{{IOS_CANDIDATES}}", &candidates);
+            .replace("{{IOS_CANDIDATES}}", &candidates)
+            .replace("{{ALTSTORE_LINKS}}", &altstore_links);
+        self.write_public("index.html", html.as_bytes())
+    }
+
+    /// Atomically replace one generated public file; never follows a planted
+    /// symlink or replaces a file with unexpected ownership.
+    fn write_public(&self, name: &str, bytes: &[u8]) -> Result<()> {
         let temporary = tempfile::Builder::new()
             .prefix(".index-")
             .tempfile_in(&self.root)
             .map_err(|_| "cannot stage index")?;
         temporary
             .as_file()
-            .write_all(html.as_bytes())
+            .write_all(bytes)
             .map_err(|_| "cannot write index")?;
         temporary
             .as_file()
@@ -319,12 +362,12 @@ impl Store {
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o644))
             .map_err(|_| "cannot set index mode")?;
-        let index = self.root.join("index.html");
-        if fs::symlink_metadata(&index).is_ok() {
-            open_regular(&index, self.owner, false)?;
+        let path = self.root.join(name);
+        if fs::symlink_metadata(&path).is_ok() {
+            open_regular(&path, self.owner, false)?;
         }
         temporary
-            .persist(index)
+            .persist(path)
             .map_err(|_| "cannot activate index")?;
         sync_directory(&self.root)
     }
