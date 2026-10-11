@@ -22,7 +22,10 @@ use tokio::{
 use jarvis_config::AppConfig;
 use jarvis_identity as identity;
 use jarvis_llm::{ModelAccessPolicy, ModelRouting, ROUTING_MAX_BYTES};
-use jarvis_privileged::{Operation, SignedRequest};
+use jarvis_privileged::{
+    trusted_keys::{self, TrustError},
+    Operation, SignedRequest,
+};
 
 const SOCKET: &str = "/run/jarvis-config-broker/broker.sock";
 const REPLAY_DIR: &str = "/var/lib/jarvis/config-broker/replays";
@@ -73,9 +76,12 @@ async fn main() -> anyhow::Result<()> {
         let db = db.clone();
         let policy = PathBuf::from(&config.llm_model_policy_path);
         let routing = PathBuf::from(&config.llm_model_routing_path);
+        let trusted_device_keys = config
+            .broker_require_trusted_keys
+            .then_some(Path::new(trusted_keys::TRUSTED_DEVICE_KEYS_PATH));
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle(stream, &db, &policy, &routing).await {
+            if let Err(error) = handle(stream, &db, &policy, &routing, trusted_device_keys).await {
                 tracing::warn!(%error, "privileged broker request denied");
             }
         });
@@ -117,6 +123,7 @@ async fn handle(
     db: &jarvis_store::Database,
     policy_path: &Path,
     routing_path: &Path,
+    trusted_device_keys: Option<&Path>,
 ) -> anyhow::Result<()> {
     let (read, mut write) = stream.into_split();
     let line = read_request_frame(read, std::time::Duration::from_secs(5)).await?;
@@ -132,15 +139,20 @@ async fn handle(
             .map_err(|_| anyhow::anyhow!("invalid approval payload"))?;
         let signature = hex::decode(&request.signature_hex)
             .map_err(|_| anyhow::anyhow!("invalid signature"))?;
-        identity::verify_device_signature(
-            db,
-            request.user_id,
+        let public_key = identity::active_device_public_key(db, request.user_id, request.device_id)
+            .await
+            .map_err(|_| anyhow::anyhow!("untrusted owner device signature"))?;
+        trusted_keys::verify_approval(
+            trusted_device_keys,
             request.device_id,
+            &public_key,
             &message,
             &signature,
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("untrusted owner device signature"))?;
+        .map_err(|error| match error {
+            TrustError::Signature => anyhow::anyhow!("untrusted owner device signature"),
+            other => anyhow::Error::new(other),
+        })?;
         consume_once(request.request_id)?;
         apply(&request.operation, policy_path, routing_path)
     }
@@ -149,6 +161,7 @@ async fn handle(
         Ok(()) => "applied",
         Err(error) if error.to_string().contains("expired") => "expired",
         Err(error) if error.to_string().contains("replay") => "replay_rejected",
+        Err(error) if error.downcast_ref::<TrustError>().is_some() => "device_not_trusted",
         Err(error)
             if error.to_string().contains("signature") || error.to_string().contains("device") =>
         {

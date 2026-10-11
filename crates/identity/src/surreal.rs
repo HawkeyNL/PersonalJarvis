@@ -815,6 +815,17 @@ pub async fn verify_device_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), IdentityError> {
+    let public_key = active_device_public_key(db, user_id, device_id).await?;
+    verify_signature(&public_key, message, signature)
+}
+
+/// The current signing key of an active device owned by `user_id`: the key
+/// [`verify_device_signature`] checks signatures against.
+pub async fn active_device_public_key(
+    db: &Database,
+    user_id: Uuid,
+    device_id: Uuid,
+) -> Result<Vec<u8>, IdentityError> {
     let device = get_device(db, device_id)
         .await?
         .ok_or(IdentityError::AuthFailed)?;
@@ -830,7 +841,7 @@ pub async fn verify_device_signature(
     .await?
     .ok_or(IdentityError::AuthFailed)?;
     let _key_created_at = key.created_at;
-    verify_signature(&key.public_key, message, signature)
+    Ok(key.public_key)
 }
 
 /// Create a short-lived cross-device unlock request.

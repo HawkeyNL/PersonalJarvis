@@ -276,8 +276,8 @@ pub fn verify_signature(
 }
 
 pub use surreal::{
-    active_device_count, approve_pairing_request, approve_unlock_request, authenticate,
-    bootstrap_register_first_device, create_challenge, create_pairing_request,
+    active_device_count, active_device_public_key, approve_pairing_request, approve_unlock_request,
+    authenticate, bootstrap_register_first_device, create_challenge, create_pairing_request,
     create_unlock_request, create_user, deny_pairing_request, deny_unlock_request, first_user,
     first_user_or_create, get_device, get_user, list_active_devices, login, pairing_request_status,
     pairing_status_for_candidate, pending_pairing_requests, pending_unlock_requests,

@@ -111,6 +111,9 @@ payload containing action, payload hash, request ID, nonce, owner/device IDs,
 issue/expiry times and the current policy SHA-256. The broker independently
 checks the active device key, signature, TTL and one-time replay marker before
 atomically replacing the policy; a changed policy requires a fresh signature.
+The device key must also be pinned in the root-owned
+`/etc/jarvis/trusted-device-keys`; see
+[Trusted device keys](JARVIS_ADMIN_CLI.md#trusted-device-keys-for-privileged-changes).
 
 Credentials remain root-TTY-only through `jarvis credentials`. They are not
 sent through the app or broker until a separately reviewed sealed secret-transfer

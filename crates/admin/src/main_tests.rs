@@ -590,6 +590,36 @@ fn trusted_updater_config_is_strict_and_never_shell_parsed() {
 }
 
 #[test]
+fn device_trust_needs_exactly_one_target() {
+    use local_devices::DeviceCommand;
+    let id = "0192abcd-0000-7000-8000-0000000000ef";
+    let trust = |args: &[&str]| {
+        Cli::try_parse_from(["jarvis", "devices", "trust"].iter().chain(args)).map(|cli| match cli
+            .command
+        {
+            Some(Commands::Devices {
+                command:
+                    DeviceCommand::Trust {
+                        device_id,
+                        all_active,
+                        yes,
+                    },
+            }) => (device_id.map(|id| id.to_string()), all_active, yes),
+            _ => panic!("expected devices trust"),
+        })
+    };
+    assert_eq!(trust(&[id]).unwrap(), (Some(id.into()), false, false));
+    assert_eq!(
+        trust(&[id, "--yes"]).unwrap(),
+        (Some(id.into()), false, true)
+    );
+    assert_eq!(trust(&["--all-active"]).unwrap(), (None, true, false));
+    assert!(trust(&[]).is_err());
+    assert!(trust(&[id, "--all-active"]).is_err());
+    assert!(trust(&["not-a-uuid"]).is_err());
+}
+
+#[test]
 fn confirmation_is_explicit_and_non_secret() {
     assert!(confirmation_answer("yes\n"));
     assert!(confirmation_answer("Y"));

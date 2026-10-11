@@ -185,6 +185,12 @@ pub struct AppConfig {
     #[serde(default)]
     pub codex_broker_socket: String,
 
+    /// Privileged brokers also require the approving device's key to be
+    /// pinned in the root-owned trusted device key file. `false` is only a
+    /// rollback switch; it never relaxes the device signature check.
+    #[serde(default = "default_broker_require_trusted_keys")]
+    pub broker_require_trusted_keys: bool,
+
     /// Path/name of the `claude` CLI, used when `llm_provider = "claude-cli"`
     /// (runs the brain on your Claude subscription; see decisions/ADR-027).
     #[serde(default = "default_claude_cli_bin")]
@@ -605,6 +611,10 @@ fn redact(secret: &str) -> &'static str {
     }
 }
 
+fn default_broker_require_trusted_keys() -> bool {
+    true
+}
+
 fn default_speech_provider() -> String {
     "stub".to_string()
 }
@@ -817,6 +827,10 @@ impl fmt::Debug for AppConfig {
             .field("llm_pricing_registry_path", &self.llm_pricing_registry_path)
             .field("privileged_broker_socket", &self.privileged_broker_socket)
             .field("codex_broker_socket", &self.codex_broker_socket)
+            .field(
+                "broker_require_trusted_keys",
+                &self.broker_require_trusted_keys,
+            )
             .field("llm_claude_cli_bin", &self.llm_claude_cli_bin)
             .field("llm_persona_path", &self.llm_persona_path)
             .field("llm_openai_api_key", &redact(&self.llm_openai_api_key))
@@ -938,6 +952,7 @@ mod tests {
             llm_pricing_registry_path: "/etc/jarvis/pricing-registry.json".to_string(),
             privileged_broker_socket: String::new(),
             codex_broker_socket: String::new(),
+            broker_require_trusted_keys: true,
             llm_claude_cli_bin: "claude".to_string(),
             llm_persona_path: "/etc/jarvis/Jarvis.md".to_string(),
             llm_openai_api_key: "sk-openai-supersecret".to_string(),
@@ -1077,6 +1092,7 @@ mod tests {
             llm_pricing_registry_path: String::new(),
             privileged_broker_socket: String::new(),
             codex_broker_socket: String::new(),
+            broker_require_trusted_keys: true,
             llm_claude_cli_bin: String::new(),
             llm_persona_path: String::new(),
             llm_openai_api_key: String::new(),
@@ -1158,6 +1174,21 @@ mod tests {
             jail.set_env("JARVIS_TRUSTED_PROXY_IPS", "127.0.0.1,::1");
             let cfg = AppConfig::load()?;
             assert_eq!(cfg.trusted_proxy_ips()?.len(), 2);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn brokers_require_trusted_keys_unless_explicitly_disabled() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("JARVIS_SURREAL_ENDPOINT", "127.0.0.1:8000");
+            jail.set_env("JARVIS_SURREAL_USERNAME", "core");
+            jail.set_env("JARVIS_SURREAL_PASSWORD", "test-password");
+            assert!(AppConfig::load()?.broker_require_trusted_keys);
+            jail.set_env("JARVIS_BROKER_REQUIRE_TRUSTED_KEYS", "false");
+            assert!(!AppConfig::load()?.broker_require_trusted_keys);
+            jail.set_env("JARVIS_BROKER_REQUIRE_TRUSTED_KEYS", "maybe");
+            assert!(AppConfig::load().is_err());
             Ok(())
         });
     }
