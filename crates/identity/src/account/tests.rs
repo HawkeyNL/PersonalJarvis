@@ -118,7 +118,7 @@ async fn signed_account_changes_enforce_password_and_revoke_sessions(
         &db,
         owner.id,
         "fixture device",
-        Platform::Linux,
+        Platform::Android,
         "ed25519",
         &key.verifying_key().to_bytes(),
     )
@@ -245,7 +245,7 @@ async fn password_change_after_bootstrap_replaces_the_bootstrap_verifier(
     let (owner, device) = bootstrap_account(
         &db,
         "fixture",
-        Platform::Linux,
+        Platform::Android,
         &key.verifying_key().to_bytes(),
         hash(PASSWORD).await?,
         deadline,
