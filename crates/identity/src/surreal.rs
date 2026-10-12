@@ -634,10 +634,7 @@ pub async fn login_with_password(
     let _key_created_at = key.created_at;
     let message = jarvis_client_core::login_message(challenge_id, device_id, &challenge.nonce)
         .map_err(|_| IdentityError::AuthFailed)?;
-    verify_signature(&key.public_key, &message, signature)
-        // Transition: clients before the v1 login message sign the raw nonce.
-        // Remove once every client signs `login_message` (apps 0.1.19+).
-        .or_else(|_| verify_signature(&key.public_key, &challenge.nonce, signature))?;
+    verify_signature(&key.public_key, &message, signature)?;
     let owner: DeviceOwner = one(
         db,
         "SELECT user_id FROM devices WHERE record::id(id) = $id AND status = 'active' LIMIT 1",
@@ -988,14 +985,7 @@ pub async fn approve_unlock_request(
     let message =
         jarvis_client_core::unlock_approval_message(id, approver_device_id, &pending.nonce)
             .map_err(|_| IdentityError::AuthFailed)?;
-    if verify_device_signature(db, user_id, approver_device_id, &message, signature)
-        .await
-        .is_err()
-    {
-        // Transition: clients before the v1 unlock message sign the raw
-        // nonce. Remove once every client signs `unlock_approval_message`.
-        verify_device_signature(db, user_id, approver_device_id, &pending.nonce, signature).await?;
-    }
+    verify_device_signature(db, user_id, approver_device_id, &message, signature).await?;
 
     // Claiming repeats every decision-relevant predicate. A second concurrent
     // approval cannot overwrite the first device or resolve an expired request.
@@ -1111,6 +1101,12 @@ mod tests {
         )
         .await?;
         let challenge = create_challenge(&db, device.id).await?;
+        // A signature over the bare nonce is not a login proof.
+        let raw_nonce = signing.sign(&challenge.nonce).to_bytes();
+        assert!(matches!(
+            login(&db, device.id, challenge.id, &raw_nonce).await,
+            Err(IdentityError::AuthFailed)
+        ));
         let signature = signing
             .sign(&jarvis_client_core::login_message(
                 challenge.id,
@@ -1163,6 +1159,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        // A signature over the bare nonce is not an approval.
+        let raw_nonce = approver_signing.sign(&unlock_nonce).to_bytes();
+        assert!(matches!(
+            approve_unlock_request(&db, unlock_id, owner.id, approver.id, &raw_nonce).await,
+            Err(IdentityError::AuthFailed)
+        ));
         // A login proof over the same id, device and nonce is not an approval.
         let login_proof = approver_signing
             .sign(&jarvis_client_core::login_message(

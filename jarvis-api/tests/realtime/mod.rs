@@ -123,7 +123,10 @@ async fn device_token(db: &jarvis_store::Database, owner: Uuid) -> (Uuid, String
         db,
         device.id,
         challenge.id,
-        &key.sign(&challenge.nonce).to_bytes(),
+        &key.sign(
+            &jarvis_client_core::login_message(challenge.id, device.id, &challenge.nonce).unwrap(),
+        )
+        .to_bytes(),
     )
     .await
     .unwrap();
