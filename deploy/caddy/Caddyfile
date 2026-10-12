@@ -80,12 +80,11 @@
 
 	# All API routes, including /v1/app-updates/** and /v1/events, keep their
 	# existing Core authentication. No public mirror alias or directory listing.
-	# Caddy overwrites incoming X-Forwarded-*. Core trusts them only from its
-	# configured loopback proxy peer or, with the optional Unix-socket upstream
-	# below (see deploy/caddy/README.md), only from the caddy uid on that socket.
+	# Caddy overwrites incoming X-Forwarded-*. Core serves its API only on this
+	# Unix socket and trusts the headers only from the caddy uid on it; its TCP
+	# listener answers health probes only (see deploy/caddy/README.md).
 	handle {
-		reverse_proxy 127.0.0.1:8080
-		# reverse_proxy unix//run/jarvis-core/api.sock
+		reverse_proxy unix//run/jarvis-core/api.sock
 	}
 }
 
