@@ -44,6 +44,8 @@ if grep -Fq 'TRUSTED_PROXY' "$config" "$repo_dir/deploy/systemd/install-home-nod
 fi
 grep -Fq 'production requires JARVIS_API_UNIX_SOCKET=/run/jarvis-core/api.sock' "$repo_dir/deploy/systemd/install-home-node-core.sh"
 grep -Fq 'caddy_not_on_core_tcp' "$verify"
+grep -Fq 'core_tcp_serves_only_health' "$verify"
+grep -Fq 'core_socket_ready || return 1' "$repo_dir/deploy/systemd/update-core-release.sh"
 grep -Fq 'getent passwd caddy' "$repo_dir/deploy/systemd/setup-home-node.sh"
 grep -Fq 'JARVIS_BOOTSTRAP_SECRET_SHA256=' "$config"
 grep -Fq 'sha256sum' "$config"

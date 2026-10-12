@@ -850,6 +850,15 @@ restore_laya_runtime_state() {
     wait_for_warm_laya
 }
 
+# With the socket configured, Caddy reaches the API only there; TCP readiness
+# alone would keep a release that Caddy cannot reach.
+core_socket_ready() {
+    [[ $(sed -n 's/^JARVIS_API_UNIX_SOCKET=//p' /etc/jarvis/core.env 2>/dev/null | tail -n 1) == \
+        /run/jarvis-core/api.sock ]] || return 0
+    curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+        --unix-socket /run/jarvis-core/api.sock http://core/readyz >/dev/null
+}
+
 restart_managed_services() {
     systemctl daemon-reload || return 1
     # Quiesce Core before manipulating the private socket, so no chat request
@@ -867,6 +876,7 @@ restart_managed_services() {
     curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
         --retry 11 --retry-delay 5 --retry-connrefused \
         http://127.0.0.1:8080/readyz >/dev/null || return 1
+    core_socket_ready || return 1
     systemctl try-restart jarvis-updater.timer >/dev/null 2>&1 || true
     systemctl try-restart jarvis-private-agent-updater.timer >/dev/null 2>&1 || true
     systemctl try-restart jarvis-backup.timer >/dev/null 2>&1 || true

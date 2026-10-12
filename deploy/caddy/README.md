@@ -90,6 +90,14 @@ The drop-in is harmless without the `admin` line. To remove it as well:
 
 ## Core API over a Unix socket
 
+> **Before this release is published:** switch the host to the socket
+> ([below](#switch-an-existing-host-before-updating)) or pause automatic
+> updates with `sudo systemctl stop jarvis-updater.timer`. On a host that has
+> not switched, the installed updater tries each such release, which cannot
+> start: Core is down for a minute or two every time until the previous
+> release is restored. That release then stays staged and later runs stop
+> with "release directory already exists"; every newer release repeats this.
+
 Core serves its API to Caddy only on the Unix socket
 `/run/jarvis-core/api.sock`. Core honours `X-Forwarded-For` and
 `X-Forwarded-Proto` only for connections on that socket whose kernel-reported
@@ -121,8 +129,9 @@ Core creates (mode `0660`) the `caddy` group, so Caddy can connect without Core
 joining the `caddy` group or Caddy joining the `jarvis` group. Production
 requires exactly `/run/jarvis-core/api.sock`, the path the Caddyfile uses.
 Core opens it only if that
-directory is owned by Core, has the `caddy` user's group and grants nothing to
-other users, and only if `caddy` is a different account from Core. Trust is
+directory is owned by Core, has the `caddy` user's group and the setgid bit,
+and grants nothing to other users, only if the new socket ends up in the
+`caddy` group, and only if `caddy` is a different account from Core. Trust is
 decided by the peer uid, not by the file mode.
 
 Core owns the directory, so a compromised Core process could replace the

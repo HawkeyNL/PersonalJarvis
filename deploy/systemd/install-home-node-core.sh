@@ -264,7 +264,8 @@ done
     exit 1
 }
 
-grep -qx 'JARVIS_ENVIRONMENT=production' /etc/jarvis/core.env || {
+environment=$(sed -n 's/^JARVIS_ENVIRONMENT=//p' /etc/jarvis/core.env | tail -n 1)
+[[ $environment == production ]] || {
     echo "JARVIS_ENVIRONMENT must be production" >&2
     exit 1
 }

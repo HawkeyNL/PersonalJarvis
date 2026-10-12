@@ -165,6 +165,9 @@ pub fn bind_api_socket(path: &Path, proxy_gid: u32) -> anyhow::Result<UnixListen
     if dir.gid() != proxy_gid {
         bail!("API socket directory group is not the reverse proxy's group; check the jarvis-core unit's chgrp step");
     }
+    if dir.mode() & 0o2000 == 0 {
+        bail!("API socket directory must be setgid so the socket gets the reverse proxy's group; check the jarvis-core unit's chmod step");
+    }
     match fs::symlink_metadata(path) {
         Ok(info) if info.file_type().is_socket() && info.uid() == euid => fs::remove_file(path)?,
         Ok(_) => bail!("unsafe existing API socket path"),
@@ -173,6 +176,11 @@ pub fn bind_api_socket(path: &Path, proxy_gid: u32) -> anyhow::Result<UnixListen
     }
     let listener = UnixListener::bind(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o660))?;
+    // Without the proxy's group Caddy could not connect while Core still
+    // looked ready on TCP; refuse to start instead.
+    if fs::symlink_metadata(path)?.gid() != proxy_gid {
+        bail!("API socket did not inherit the reverse proxy's group");
+    }
     Ok(listener)
 }
 
@@ -274,7 +282,7 @@ mod tests {
 
     fn private_dir() -> (tempfile::TempDir, u32) {
         let dir = tempfile::tempdir().unwrap();
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o2750)).unwrap();
         let gid = fs::metadata(dir.path()).unwrap().gid();
         (dir, gid)
     }
@@ -315,7 +323,8 @@ mod tests {
         let path = dir.path().join("api.sock");
         // Without the proxy's group (a failed chgrp) Core must not listen.
         assert!(bind_api_socket(&path, gid.wrapping_add(1)).is_err());
-        for mode in [0o755, 0o770] {
+        // No setgid bit (the socket would get Core's group), or too open.
+        for mode in [0o750, 0o2755, 0o2770] {
             fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
             assert!(bind_api_socket(&path, gid).is_err());
         }

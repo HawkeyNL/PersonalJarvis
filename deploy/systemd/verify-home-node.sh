@@ -129,8 +129,21 @@ jarvis_cannot_create_in() {
     runuser -u jarvis -- bash -c '! touch -- "$1/.jarvis-permission-probe" 2>/dev/null' _ "$1"
 }
 # Core's TCP listener serves only health probes, so a TCP upstream is broken.
+# The adapted config also covers imported files; the hostnames only need to be
+# non-empty for adapt. Without caddy (or if adapt fails) fall back to the file.
 caddy_not_on_core_tcp() {
-    ! grep -Eqs '^\s*(reverse_proxy|to)\s.*(127\.0\.0\.1|localhost|\[::1\]):8080(\s|$)' /etc/caddy/Caddyfile
+    local caddyfile=/etc/caddy/Caddyfile adapted
+    [[ -f $caddyfile ]] || return 1
+    if command -v caddy >/dev/null 2>&1 &&
+        adapted=$(env JARVIS_PUBLIC_HOSTNAME=verify.invalid JARVIS_NTFY_HOSTNAME=ntfy.invalid \
+            caddy adapt --config "$caddyfile" --adapter caddyfile 2>/dev/null); then
+        ! grep -Eq '"dial":"(127\.0\.0\.1|localhost|\[::1\])?:8080"' <<<"$adapted"
+    else
+        ! grep -Eq '^\s*(reverse_proxy|to)\s.*(127\.0\.0\.1|localhost|\[::1\]):8080(\s|$)' "$caddyfile"
+    fi
+}
+core_tcp_serves_only_health() {
+    [[ $(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 5 http://127.0.0.1:8080/) == 404 ]]
 }
 caddy_uses_core_socket() {
     grep -Eqs '^\s*reverse_proxy\s+unix//run/jarvis-core/api\.sock(\s|$)' /etc/caddy/Caddyfile
@@ -171,6 +184,7 @@ fi
 ui_step "Health and protected inputs"
 check "/livez responds" curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/livez
 check "/readyz responds" curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/readyz
+check "Core TCP listener serves no API" core_tcp_serves_only_health
 check "Persona readable by Core" jarvis_reads /etc/jarvis/Jarvis.md
 check "Persona is read-only to Core" jarvis_cannot_write /etc/jarvis/Jarvis.md
 if [[ -e /etc/jarvis/model-policy/policy.json ]]; then
