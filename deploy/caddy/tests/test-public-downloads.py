@@ -66,7 +66,9 @@ class PublicDownloadTests(unittest.TestCase):
                 # Test the actual adapted route graph, changing only host/listen,
                 # fixture storage and the upstream. No production state accessed.
                 raw = result.stdout.decode().replace("/var/lib/jarvis-public-downloads", str(archive))
-                raw = raw.replace("127.0.0.1:8080", f"127.0.0.1:{api.server_port}")
+                # The shipped Core upstream is its Unix socket; dial the fixture instead.
+                self.assertIn('"dial":"unix//run/jarvis-core/api.sock"', raw)
+                raw = raw.replace("unix//run/jarvis-core/api.sock", f"127.0.0.1:{api.server_port}")
                 config = json.loads(raw)
                 # The shipped admin API is Unix-socket only; the isolated run disables it.
                 self.assertEqual(config["admin"], {"listen": "unix//run/caddy/admin.sock"})
