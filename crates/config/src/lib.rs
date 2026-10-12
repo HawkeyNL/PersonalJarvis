@@ -372,22 +372,10 @@ pub struct AppConfig {
     #[serde(default = "default_llm_rate")]
     pub llm_rate_per_min: u32,
 
-    /// Trusted proxy hops in front of the API. 0 (default) ⇒ never trust
-    /// `X-Forwarded-For`; use the socket peer address for rate-limit/audit keys.
-    /// Set to N only together with `trusted_proxy_ips` when the API is reachable
-    /// *only* through N trusted proxies.
-    #[serde(default)]
-    pub trusted_proxy_hops: u32,
-
-    /// Comma-separated direct peer IP addresses for the proxies allowed to set
-    /// forwarding headers. Empty (the default) means no proxy is trusted.
-    #[serde(default)]
-    pub trusted_proxy_ips: String,
-
-    /// Optional Unix socket, directly inside [`API_SOCKET_DIR`], on which Core
-    /// additionally serves the API for the local reverse proxy. Empty (the
-    /// default) keeps TCP-only behaviour. When set, forwarding headers are trusted only from
-    /// the proxy's kernel-reported uid on this socket, never over TCP.
+    /// Unix socket, directly inside [`API_SOCKET_DIR`], on which Core serves
+    /// the API for the local reverse proxy. Required in production, where the
+    /// TCP listener answers only health probes. Forwarding headers are trusted
+    /// only from the proxy's kernel-reported uid on this socket, never over TCP.
     #[serde(default)]
     pub api_unix_socket: String,
 
@@ -403,8 +391,10 @@ pub struct AppConfig {
     pub bootstrap_allowed_cidrs: String,
 }
 
-/// The systemd `RuntimeDirectory` that holds Core's optional API socket.
+/// The systemd `RuntimeDirectory` that holds Core's API socket.
 pub const API_SOCKET_DIR: &str = "/run/jarvis-core";
+/// The production API socket: the deploy assets point Caddy at this path.
+pub const API_SOCKET_PATH: &str = "/run/jarvis-core/api.sock";
 
 fn default_bind_addr() -> String {
     "127.0.0.1:8080".to_string()
@@ -651,27 +641,6 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Parse the direct proxy peers allowed to supply forwarding headers.
-    /// Configuration is deliberately strict: enabling proxy hops without an
-    /// explicit peer allowlist fails startup rather than trusting arbitrary
-    /// network clients.
-    pub fn trusted_proxy_ips(&self) -> Result<Vec<IpAddr>, String> {
-        let peers = self
-            .trusted_proxy_ips
-            .split(',')
-            .map(str::trim)
-            .filter(|peer| !peer.is_empty())
-            .map(|peer| {
-                peer.parse()
-                    .map_err(|_| format!("invalid trusted proxy IP: {peer}"))
-            })
-            .collect::<Result<Vec<IpAddr>, _>>()?;
-        if self.trusted_proxy_hops > 0 && peers.is_empty() {
-            return Err("JARVIS_TRUSTED_PROXY_HOPS requires JARVIS_TRUSTED_PROXY_IPS".to_string());
-        }
-        Ok(peers)
-    }
-
     /// Parse the opt-in LAN-only bootstrap policy. Supplying only one half is
     /// a configuration error; an absent policy intentionally means that no
     /// first-device bootstrap endpoint is available.
@@ -758,11 +727,11 @@ impl AppConfig {
                         .to_string(),
                 );
             }
-            if self.trusted_proxy_hops > 1 {
-                return Err(
-                    "production supports only the single directly connected Caddy proxy"
-                        .to_string(),
-                );
+            // Any other name would pass readiness while Caddy gets no API.
+            if self.api_unix_socket != API_SOCKET_PATH {
+                return Err(format!(
+                    "production requires JARVIS_API_UNIX_SOCKET={API_SOCKET_PATH}; Caddy reaches the API only through it"
+                ));
             }
         }
 
@@ -902,8 +871,6 @@ impl fmt::Debug for AppConfig {
                 &self.authenticated_rate_per_min,
             )
             .field("llm_rate_per_min", &self.llm_rate_per_min)
-            .field("trusted_proxy_hops", &self.trusted_proxy_hops)
-            .field("trusted_proxy_ips", &self.trusted_proxy_ips)
             .field("api_unix_socket", &self.api_unix_socket)
             .field(
                 "bootstrap_secret_sha256",
@@ -1029,8 +996,6 @@ mod tests {
             auth_login_lock_secs: 300,
             authenticated_rate_per_min: 300,
             llm_rate_per_min: 20,
-            trusted_proxy_hops: 0,
-            trusted_proxy_ips: String::new(),
             api_unix_socket: String::new(),
             bootstrap_secret_sha256: String::new(),
             bootstrap_allowed_cidrs: String::new(),
@@ -1170,8 +1135,6 @@ mod tests {
             auth_login_lock_secs: 1,
             authenticated_rate_per_min: 1,
             llm_rate_per_min: 1,
-            trusted_proxy_hops: 0,
-            trusted_proxy_ips: String::new(),
             api_unix_socket: String::new(),
             bootstrap_secret_sha256: "00".repeat(32),
             bootstrap_allowed_cidrs: String::new(),
@@ -1181,23 +1144,6 @@ mod tests {
         let policy = cfg.bootstrap_enrollment().unwrap().unwrap();
         assert!(policy.allows("192.168.10.8".parse().unwrap()));
         assert!(!policy.allows("8.8.8.8".parse().unwrap()));
-    }
-
-    #[test]
-    fn proxy_hops_require_an_explicit_peer_allowlist() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("JARVIS_SURREAL_ENDPOINT", "127.0.0.1:8000");
-            jail.set_env("JARVIS_SURREAL_USERNAME", "core");
-            jail.set_env("JARVIS_SURREAL_PASSWORD", "test-password");
-            jail.set_env("JARVIS_TRUSTED_PROXY_HOPS", "1");
-            let cfg = AppConfig::load()?;
-            assert!(cfg.trusted_proxy_ips().is_err());
-
-            jail.set_env("JARVIS_TRUSTED_PROXY_IPS", "127.0.0.1,::1");
-            let cfg = AppConfig::load()?;
-            assert_eq!(cfg.trusted_proxy_ips()?.len(), 2);
-            Ok(())
-        });
     }
 
     #[test]
@@ -1226,14 +1172,13 @@ mod tests {
             assert!(AppConfig::load()?.validate_runtime_security().is_err());
 
             jail.set_env("JARVIS_BIND_ADDR", "127.0.0.1:8080");
-            assert!(AppConfig::load()?.validate_runtime_security().is_ok());
-
-            jail.set_env("JARVIS_TRUSTED_PROXY_HOPS", "2");
-            jail.set_env("JARVIS_TRUSTED_PROXY_IPS", "127.0.0.1");
+            // Without the API socket Caddy has no way in, so Core refuses.
+            assert!(AppConfig::load()?.validate_runtime_security().is_err());
+            jail.set_env("JARVIS_API_UNIX_SOCKET", "");
             assert!(AppConfig::load()?.validate_runtime_security().is_err());
 
-            jail.set_env("JARVIS_TRUSTED_PROXY_HOPS", "1");
             for outside in [
+                "/run/jarvis-core/other.sock",
                 "run/jarvis-core/api.sock",
                 "/tmp/api.sock",
                 "/run/jarvis-core/../api.sock",
@@ -1244,6 +1189,11 @@ mod tests {
                 assert!(AppConfig::load()?.validate_runtime_security().is_err());
             }
             jail.set_env("JARVIS_API_UNIX_SOCKET", "/run/jarvis-core/api.sock");
+            assert!(AppConfig::load()?.validate_runtime_security().is_ok());
+
+            // Leftover lines for the removed proxy-trust settings are ignored.
+            jail.set_env("JARVIS_TRUSTED_PROXY_HOPS", "1");
+            jail.set_env("JARVIS_TRUSTED_PROXY_IPS", "127.0.0.1");
             assert!(AppConfig::load()?.validate_runtime_security().is_ok());
             Ok(())
         });
@@ -1256,6 +1206,7 @@ mod tests {
             jail.set_env("JARVIS_SURREAL_USERNAME", "core");
             jail.set_env("JARVIS_SURREAL_PASSWORD", "test-password");
             jail.set_env("JARVIS_BIND_ADDR", "127.0.0.1:8080");
+            jail.set_env("JARVIS_API_UNIX_SOCKET", "/run/jarvis-core/api.sock");
             jail.set_env("JARVIS_ENVIRONMENT", "Production");
             let cfg = AppConfig::load()?;
             assert_eq!(cfg.environment, "production");

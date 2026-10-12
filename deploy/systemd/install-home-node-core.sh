@@ -286,16 +286,16 @@ for required in JARVIS_SURREAL_ENDPOINT JARVIS_SURREAL_NAMESPACE JARVIS_SURREAL_
     [[ -n ${value:-} ]] || { echo "$required must be set" >&2; exit 1; }
 done
 
-hops=$(sed -n 's/^JARVIS_TRUSTED_PROXY_HOPS=//p' /etc/jarvis/core.env | tail -n 1)
-ips=$(sed -n 's/^JARVIS_TRUSTED_PROXY_IPS=//p' /etc/jarvis/core.env | tail -n 1)
-if [[ ${hops:-0} != 0 && -z ${ips:-} ]]; then
-    echo "trusted proxy hops require JARVIS_TRUSTED_PROXY_IPS" >&2
+# Production Core serves its API only on this socket, for the local Caddy.
+api_socket=$(sed -n 's/^JARVIS_API_UNIX_SOCKET=//p' /etc/jarvis/core.env | tail -n 1)
+[[ $api_socket == /run/jarvis-core/api.sock ]] || {
+    echo "production requires JARVIS_API_UNIX_SOCKET=/run/jarvis-core/api.sock (see deploy/caddy/README.md)" >&2
     exit 1
-fi
-if [[ ${hops:-0} != 0 && ${hops:-0} != 1 ]]; then
-    echo "the single local Caddy ingress requires JARVIS_TRUSTED_PROXY_HOPS=1" >&2
+}
+getent passwd caddy >/dev/null || {
+    echo "the caddy account is missing; install Caddy before Core (see deploy/caddy/README.md)" >&2
     exit 1
-fi
+}
 
 unit_backup=
 unit_transaction_started=false

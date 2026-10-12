@@ -32,6 +32,7 @@ done
 [[ -n $private_agents && -n $bootstrap_cidr ]] || usage
 for command in docker systemctl curl jq openssl; do command -v "$command" >/dev/null 2>&1 || fail "missing prerequisite: $command"; done
 systemctl is-active --quiet docker.service || fail "Docker is not active"
+getent passwd caddy >/dev/null || fail "install Caddy first: Core serves its API only on a socket for the caddy account (deploy/caddy/README.md)"
 
 ui_heading "Jarvis Home Node Setup — $release_tag"
 ui_step "[1/7] Preparing host"
@@ -90,4 +91,4 @@ ui_run "Home Node security verification passed" bash /usr/local/libexec/jarvis/v
 agents=$(jq -r '.agents | length' "$(readlink -f /var/lib/jarvis/agents/current)/manifest.json")
 ui_step "[7/7] Complete"
 ui_success "Jarvis Home Node ready"
-printf 'Release: %s\nCore: active\nSurrealDB: healthy\nAgents: %s\nAPI: http://127.0.0.1:8080\nPublic ingress: not configured\nUpdater timer: enabled\n' "$release_tag" "$agents"
+printf 'Release: %s\nCore: active\nSurrealDB: healthy\nAgents: %s\nAPI: unix//run/jarvis-core/api.sock (health: http://127.0.0.1:8080)\nPublic ingress: deploy/caddy/README.md\nUpdater timer: enabled\n' "$release_tag" "$agents"

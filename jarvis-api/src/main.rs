@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
-use jarvis_api::{build_router, AppState, BrainAvailability};
+use jarvis_api::{build_router, build_tcp_router, AppState, BrainAvailability};
 use jarvis_config::AppConfig;
 
 /// `Some(trimmed)` for a non-empty secret, `None` otherwise — so an unset key
@@ -463,7 +463,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let trusted_proxy_ips = config.trusted_proxy_ips().map_err(anyhow::Error::msg)?;
     let unix_proxy = if config.api_unix_socket.is_empty() {
         None
     } else {
@@ -606,8 +605,6 @@ async fn main() -> anyhow::Result<()> {
             authenticated_per_min: config.authenticated_rate_per_min,
             llm_per_min: config.llm_rate_per_min,
         },
-        trusted_proxy_hops: config.trusted_proxy_hops,
-        trusted_proxy_ips: Arc::new(trusted_proxy_ips),
         unix_proxy_uid: unix_proxy.map(|proxy| proxy.uid),
         bootstrap_enrollment,
         app_update_mirror,
@@ -654,12 +651,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(addr = %config.bind_addr, "jarvis-api listening");
     // Connect info carries the transport peer (TCP address or Unix peer uid)
     // that decides the client IP and whether forwarding headers are trusted.
-    let router = build_router(state);
+    // Production TCP serves only the health probes; the API is socket-only.
     let tcp = axum::serve(
         listener,
-        router
-            .clone()
-            .into_make_service_with_connect_info::<jarvis_api::Peer>(),
+        build_tcp_router(state.clone()).into_make_service_with_connect_info::<jarvis_api::Peer>(),
     );
     if let Some(proxy) = unix_proxy {
         let socket = Path::new(&config.api_unix_socket);
@@ -667,7 +662,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(path = %socket.display(), "jarvis-api listening on Unix socket");
         let unix = axum::serve(
             unix,
-            router.into_make_service_with_connect_info::<jarvis_api::Peer>(),
+            build_router(state).into_make_service_with_connect_info::<jarvis_api::Peer>(),
         );
         tokio::try_join!(tcp.into_future(), unix.into_future())?;
     } else {

@@ -128,6 +128,13 @@ jarvis_cannot_create_in() {
     # shellcheck disable=SC2016 # $1 is expanded by the child shell.
     runuser -u jarvis -- bash -c '! touch -- "$1/.jarvis-permission-probe" 2>/dev/null' _ "$1"
 }
+# Core's TCP listener serves only health probes, so a TCP upstream is broken.
+caddy_not_on_core_tcp() {
+    ! grep -Eqs '^\s*(reverse_proxy|to)\s.*(127\.0\.0\.1|localhost|\[::1\]):8080(\s|$)' /etc/caddy/Caddyfile
+}
+caddy_uses_core_socket() {
+    grep -Eqs '^\s*reverse_proxy\s+unix//run/jarvis-core/api\.sock(\s|$)' /etc/caddy/Caddyfile
+}
 jarvis_cannot_replace_current() {
     # shellcheck disable=SC2016 # $1 is expanded by the child shell.
     runuser -u jarvis -- bash -c '! ln -s releases/not-a-bundle "$1/.current-permission-probe" 2>/dev/null' _ /var/lib/jarvis/agents
@@ -154,6 +161,13 @@ check "Jarvis Core active" systemctl is-active --quiet jarvis-core.service
 check "Updater timer enabled" systemctl is-enabled --quiet jarvis-updater.timer
 check "SurrealDB is loopback-only" loopback_only 8000
 check "Jarvis API is loopback-only" loopback_only 8080
+check "Core API socket is protected" expect_mode /run/jarvis-core/api.sock jarvis:caddy:660
+check "Caddy does not proxy to Core over TCP" caddy_not_on_core_tcp
+if caddy_uses_core_socket; then
+    check "Caddy reaches Core through its API socket" true
+else
+    ui_warning "Public ingress not configured: Caddy does not proxy to /run/jarvis-core/api.sock (deploy/caddy/README.md)"
+fi
 ui_step "Health and protected inputs"
 check "/livez responds" curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/livez
 check "/readyz responds" curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/readyz

@@ -4,7 +4,6 @@
 //! auth rate limiter. It is cheaply cloneable (everything shared is behind `Arc`)
 //! so Axum can hand a clone to each request.
 
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
@@ -218,14 +217,9 @@ pub struct AppState {
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
     /// Tunable thresholds for the auth rate limiter (from `JARVIS_AUTH_*`).
     pub auth_limits: rate_limit::AuthLimits,
-    /// Number of trusted proxy hops in front of the API. Forwarding headers are
-    /// only considered when the direct peer is in `trusted_proxy_ips`.
-    pub trusted_proxy_hops: u32,
-    /// Direct peer IPs of the proxies allowed to supply forwarding headers.
-    pub trusted_proxy_ips: Arc<Vec<IpAddr>>,
-    /// Reverse proxy uid when Core also serves `JARVIS_API_UNIX_SOCKET`.
-    /// `Some` makes that socket peer the only source of trusted forwarding
-    /// headers; `None` keeps the legacy TCP allowlist above.
+    /// Reverse proxy uid when Core serves `JARVIS_API_UNIX_SOCKET` (always in
+    /// production). That socket peer is the only source of trusted forwarding
+    /// headers; `None` trusts no peer at all.
     pub unix_proxy_uid: Option<u32>,
     /// LAN-only, one-time first-owner bootstrap verifier. `None` means no
     /// bootstrap route is usable; it is intentionally not a general secret bag.

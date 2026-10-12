@@ -88,27 +88,39 @@ The drop-in is harmless without the `admin` line. To remove it as well:
 `sudo rm /etc/systemd/system/caddy.service.d/jarvis-admin.conf`, then
 `sudo systemctl daemon-reload` and `sudo systemctl restart caddy`.
 
-## Optional: Core API over a Unix socket
+## Core API over a Unix socket
 
-As defense in depth, Core can additionally serve its API on a Unix socket that
-only Caddy can reach. With the socket enabled, Core honours `X-Forwarded-For`
-and `X-Forwarded-Proto` only for connections on that socket whose
-kernel-reported peer uid is the `caddy` user. Requests on the TCP listener are
-then always treated as direct local requests, so client attribution (rate
-limits, login lockout, bootstrap network policy) and the HTTPS check depend on
-the kernel identity of the proxy instead of a loopback address.
+Core serves its API to Caddy only on the Unix socket
+`/run/jarvis-core/api.sock`. Core honours `X-Forwarded-For` and
+`X-Forwarded-Proto` only for connections on that socket whose kernel-reported
+peer uid is the `caddy` user, so client attribution (rate limits, login
+lockout, bootstrap network policy) and the HTTPS check depend on the kernel
+identity of the proxy instead of a loopback address. Forwarding headers on TCP
+are never trusted.
 
-The socket is off by default. Without `JARVIS_API_UNIX_SOCKET`, Core keeps the
-`JARVIS_TRUSTED_PROXY_HOPS` / `JARVIS_TRUSTED_PROXY_IPS` behaviour. With it,
-those two settings are ignored for trust but still validated at startup.
+In production:
+
+- Core refuses to start unless `JARVIS_API_UNIX_SOCKET=/run/jarvis-core/api.sock`
+  is set in `/etc/jarvis/core.env`, and the installer refuses to activate a
+  release without that line or without a `caddy` account;
+- the loopback TCP listener on `127.0.0.1:8080` answers only `/livez` and
+  `/readyz` (for systemd, the updater and the admin tools); every other path
+  returns 404;
+- the former `JARVIS_TRUSTED_PROXY_HOPS` / `JARVIS_TRUSTED_PROXY_IPS` settings
+  no longer exist. Leftover lines are ignored; keep them while a rollback to a
+  release from before the optional socket is still possible (see below).
+
+Development and test runs may leave the socket unset; their TCP listener then
+serves the full API and trusts no forwarding headers.
 
 ### How access is granted
 
 The Core unit creates `/run/jarvis-core` as a systemd `RuntimeDirectory` and
 sets it to `jarvis:caddy`, mode `2750`. The setgid bit gives the socket that
 Core creates (mode `0660`) the `caddy` group, so Caddy can connect without Core
-joining the `caddy` group or Caddy joining the `jarvis` group. The socket path
-must be directly inside `/run/jarvis-core`. Core opens it only if that
+joining the `caddy` group or Caddy joining the `jarvis` group. Production
+requires exactly `/run/jarvis-core/api.sock`, the path the Caddyfile uses.
+Core opens it only if that
 directory is owned by Core, has the `caddy` user's group and grants nothing to
 other users, and only if `caddy` is a different account from Core. Trust is
 decided by the peer uid, not by the file mode.
@@ -120,57 +132,75 @@ If any of these checks fails, Core does not start at all, including its TCP
 listener. Check `sudo journalctl -u jarvis-core.service -n 50` and use the
 rollback below.
 
-### Enable
+### Switch an existing host before updating
 
-Requires a Core release that contains this feature. The TCP listener on
-`127.0.0.1:8080` keeps serving everything, so local health checks are
-unchanged.
+A host that still proxies to `127.0.0.1:8080` must switch to the socket while
+it runs a Core release that already supports the optional socket, before the
+updater installs a release that requires it:
 
-1. Check the runtime directory after the release is active:
+1. Pause automatic updates for the switch:
+   `sudo systemctl stop jarvis-updater.timer`. Check the runtime directory:
    `stat -c '%U:%G %a' /run/jarvis-core` must print `jarvis:caddy 2750`.
-2. In `/etc/caddy/Caddyfile`, inside the final `handle` block, comment out
-   `reverse_proxy 127.0.0.1:8080` and uncomment
+2. Back up: `sudo cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak-api-tcp`.
+3. In `/etc/caddy/Caddyfile`, inside the final `handle` block, replace
+   `reverse_proxy 127.0.0.1:8080` with
    `reverse_proxy unix//run/jarvis-core/api.sock`. Validate with
-   `sudo caddy validate --config /etc/caddy/Caddyfile`, but do not reload yet.
-3. Add `JARVIS_API_UNIX_SOCKET=/run/jarvis-core/api.sock` to
+   `sudo sh -c 'set -a; . /etc/jarvis/public.env; caddy validate --config /etc/caddy/Caddyfile'`,
+   but do not reload yet.
+4. Add `JARVIS_API_UNIX_SOCKET=/run/jarvis-core/api.sock` to
    `/etc/jarvis/core.env` with `sudoedit`. Leave the `JARVIS_TRUSTED_PROXY_*`
-   lines as they are; they keep rollback a one-line change.
-4. Reload Caddy first, then restart Core:
+   lines for now; they keep the rollback below a small change.
+5. Reload Caddy first, then restart Core:
    `sudo systemctl reload caddy && sudo systemctl restart jarvis-core.service`.
    Until Core has created the socket, Caddy answers API requests with a short
-   502. The reverse order would instead let Core reject Caddy's TCP requests
-   as untrusted (401s and one shared rate-limit bucket). The unit is
-   `Type=exec`, so `systemctl restart` returns before Core has finished
-   starting.
-5. Verify:
+   502. The unit is `Type=exec`, so `systemctl restart` returns before Core has
+   finished starting.
+6. Verify:
    - `sudo journalctl -u jarvis-core.service -n 50` shows
      `jarvis-api listening on Unix socket` and no startup error;
    - `curl --fail http://127.0.0.1:8080/readyz` succeeds;
    - `stat -c '%U:%G %a' /run/jarvis-core/api.sock` prints `jarvis:caddy 660`;
+   - `sudo jarvis health` passes "Caddy does not proxy to Core over TCP" and
+     "Caddy reaches Core through its API socket";
    - a client can sign in and use the API through the public hostname.
+7. Resume automatic updates: `sudo systemctl start jarvis-updater.timer`.
+
+What happens when this is skipped:
+
+- Without the socket line, the new Core exits at startup with a configuration
+  error. The installer refuses before activating; the updater's `/readyz`
+  check fails and it restores the previous release automatically, after a
+  minute or two without Core. The verified release stays staged in
+  `/opt/jarvis/releases`, so later automatic runs stop with "release directory
+  already exists". After the switch above, activate it explicitly:
+  `sudo /usr/local/libexec/jarvis/update-core-release --rollback-version vX.Y.Z`
+  (this selects any verified, staged release with the active schema).
+- With the socket line but Caddy still on `127.0.0.1:8080`, Core starts and
+  `/readyz` passes, but every API request through Caddy gets a 404. Releases
+  that support the optional socket already rejected that combination (no
+  trusted HTTPS proxy on TCP), so it is not new. Finish steps 3 and 5;
+  `verify-home-node.sh` reports it.
 
 ### Roll back
 
-1. In `/etc/caddy/Caddyfile`, make `reverse_proxy 127.0.0.1:8080` the active
-   upstream again and comment out the Unix line.
-2. Remove `JARVIS_API_UNIX_SOCKET` from `/etc/jarvis/core.env` (or leave it
-   empty). This step is required: while it is set, Core does not trust
-   forwarding headers on TCP.
-3. Restart Core first, then reload Caddy:
-   `sudo systemctl restart jarvis-core.service && sudo systemctl reload caddy`.
+- To a Core release that supports the optional socket: roll back Core as
+  usual. Caddy can stay on the socket; that release still serves the full API
+  there.
+- To the TCP upstream (only with such a release active): restore
+  `/etc/caddy/Caddyfile.bak-api-tcp` (or make `reverse_proxy 127.0.0.1:8080`
+  the active upstream again), remove `JARVIS_API_UNIX_SOCKET` from
+  `/etc/jarvis/core.env` and make sure the previous `JARVIS_TRUSTED_PROXY_*`
+  lines are present. Then restart Core first and reload Caddy:
+  `sudo systemctl restart jarvis-core.service && sudo systemctl reload caddy`.
+  A release that requires the socket must not be active in this state; it
+  would not start.
 
 ### Core release rollbacks
 
-A Core release from before this feature has no socket. If Caddy points at
-`unix//run/jarvis-core/api.sock` when such a release is activated, every API
+A Core release from before the optional socket has no socket. If Caddy points
+at `unix//run/jarvis-core/api.sock` when such a release is activated, every API
 request gets a 502 until the Caddyfile is switched back. Switch Caddy back to
 the TCP upstream (and reload it) before rolling Core back to such a release.
-
-### Next step
-
-A later release makes the Unix socket the only API path for Caddy: it removes
-the TCP API listener and with it all TCP-based forwarding trust
-(`JARVIS_TRUSTED_PROXY_*`). Enabling the socket now is the migration path to
-that release. The same caution applies there in reverse: Caddy must already
-use the Unix upstream before that release is activated, and rolling back from
-it to a release before this feature needs the TCP upstream restored first.
+That release also needs `JARVIS_TRUSTED_PROXY_HOPS=1` and
+`JARVIS_TRUSTED_PROXY_IPS=127.0.0.1` in `/etc/jarvis/core.env`; without them
+every authenticated request through Caddy fails with 401.

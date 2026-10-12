@@ -241,6 +241,20 @@ pub fn build_router(state: AppState) -> Router {
         ))
 }
 
+/// The router for the loopback TCP listener. In production the full API is
+/// served only on the Caddy-owned Unix socket, so TCP answers just the
+/// liveness and readiness probes the service manager and updater use.
+pub fn build_tcp_router(state: AppState) -> Router {
+    if state.environment != "production" {
+        return build_router(state);
+    }
+    Router::new()
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
+        .layer(middleware::map_response(no_store_by_default))
+        .with_state(state)
+}
+
 /// API responses carry session tokens and personal data, so nothing may
 /// cache them unless a handler chose its own policy (ASVS 14.3.2).
 async fn no_store_by_default(mut response: axum::response::Response) -> axum::response::Response {
