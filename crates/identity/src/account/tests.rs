@@ -4,6 +4,12 @@ use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
 
 const PASSWORD: &str = "fixture account password never used in production";
 
+fn login_proof(key: &SigningKey, device_id: Uuid, challenge: &crate::Challenge) -> [u8; 64] {
+    let message = jarvis_client_core::login_message(challenge.id, device_id, &challenge.nonce)
+        .expect("fixture challenge nonce is valid");
+    key.sign(&message).to_bytes()
+}
+
 #[tokio::test]
 #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
 async fn first_account_is_atomic_expiring_and_cannot_be_reopened(
@@ -55,7 +61,7 @@ async fn first_account_is_atomic_expiring_and_cannot_be_reopened(
         &db,
         device.id,
         challenge.id,
-        &key.sign(&challenge.nonce).to_bytes()
+        &login_proof(&key, device.id, &challenge)
     )
     .await
     .is_err());
@@ -64,7 +70,7 @@ async fn first_account_is_atomic_expiring_and_cannot_be_reopened(
         &db,
         device.id,
         challenge.id,
-        &key.sign(&challenge.nonce).to_bytes(),
+        &login_proof(&key, device.id, &challenge),
         Some(AccountPassword::new(PASSWORD.to_owned())?),
     )
     .await
@@ -74,7 +80,7 @@ async fn first_account_is_atomic_expiring_and_cannot_be_reopened(
         &db,
         device.id,
         challenge.id,
-        &key.sign(&challenge.nonce).to_bytes(),
+        &login_proof(&key, device.id, &challenge),
         Some(AccountPassword::new(PASSWORD.to_owned())?),
     )
     .await?;
@@ -128,7 +134,7 @@ async fn signed_account_changes_enforce_password_and_revoke_sessions(
         &db,
         device.id,
         challenge.id,
-        &key.sign(&challenge.nonce).to_bytes(),
+        &login_proof(&key, device.id, &challenge),
     )
     .await?;
     let stored = PasswordService::shared()
@@ -159,10 +165,10 @@ async fn signed_account_changes_enforce_password_and_revoke_sessions(
             .is_err()
     );
     let challenge = create_challenge(&db, device.id).await?;
-    let signed = key.sign(&challenge.nonce).to_bytes();
+    let signed = login_proof(&key, device.id, &challenge);
     assert!(login(&db, device.id, challenge.id, &signed).await.is_err());
     let challenge = create_challenge(&db, device.id).await?;
-    let signed = key.sign(&challenge.nonce).to_bytes();
+    let signed = login_proof(&key, device.id, &challenge);
     assert!(login_with_password(
         &db,
         device.id,
@@ -185,7 +191,7 @@ async fn signed_account_changes_enforce_password_and_revoke_sessions(
     .await
     .is_err());
     let challenge = create_challenge(&db, device.id).await?;
-    let signed = key.sign(&challenge.nonce).to_bytes();
+    let signed = login_proof(&key, device.id, &challenge);
     let session = login_with_password(
         &db,
         device.id,
@@ -276,7 +282,7 @@ async fn password_change_after_bootstrap_replaces_the_bootstrap_verifier(
         let password = password.to_owned();
         async move {
             let challenge = create_challenge(db, device.id).await?;
-            let signed = key.sign(&challenge.nonce).to_bytes();
+            let signed = login_proof(key, device.id, &challenge);
             login_with_password(
                 db,
                 device.id,

@@ -599,8 +599,20 @@ async fn enroll_login(app: &axum::Router, signing: &SigningKey) -> (String, Vec<
         .unwrap();
     let challenge = json_body(challenge).await;
     let nonce = hex::decode(challenge["nonce"].as_str().unwrap()).unwrap();
-    let login = app.clone().oneshot(Request::builder().method("POST").uri("/v1/auth/login")
-        .header(header::CONTENT_TYPE, "application/json").body(Body::from(serde_json::to_vec(&json!({"device_id": device_id, "challenge_id": challenge["challenge_id"], "signature": hex::encode(signing.sign(&nonce).to_bytes())})).unwrap())).unwrap()).await.unwrap();
+    let login = |signature: [u8; 64]| {
+        app.clone().oneshot(Request::builder().method("POST").uri("/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json").body(Body::from(serde_json::to_vec(&json!({"device_id": device_id, "challenge_id": challenge["challenge_id"], "signature": hex::encode(signature)})).unwrap())).unwrap())
+    };
+    // A signature over the bare nonce is not a login proof.
+    let raw = login(signing.sign(&nonce).to_bytes()).await.unwrap();
+    assert_eq!(raw.status(), StatusCode::UNAUTHORIZED);
+    let message = jarvis_client_core::login_message(
+        challenge["challenge_id"].as_str().unwrap().parse().unwrap(),
+        device_id.parse().unwrap(),
+        &nonce,
+    )
+    .unwrap();
+    let login = login(signing.sign(&message).to_bytes()).await.unwrap();
     assert_eq!(login.status(), StatusCode::OK);
     (
         json_body(login).await["token"]
