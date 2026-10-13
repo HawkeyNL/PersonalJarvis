@@ -404,7 +404,9 @@ commit must be signed by a key in the allowed signers file (see "Signed agent
 updates"), even when the agent updater itself does not require signing, and
 the checkout must be root-controlled. The persona must be valid UTF-8 of at
 most `PERSONA_MAX_BYTES` (32 KiB, in `crates/privileged/src/persona.rs`), start with a `# ` heading, contain no control characters other
-than tab and line endings, and contain nothing that looks like a key or token.
+than tab and line endings and no invisible bidirectional or zero-width
+formatting characters, and contain nothing that looks like a key or token.
+Only SSH signatures count; OpenPGP and X.509 signatures are never accepted.
 The installer is then bound to that exact SHA-256: if the working tree differs
 from the signed commit, nothing is installed. `--yes` requires
 `--expect-sha256`, copied from `status`.

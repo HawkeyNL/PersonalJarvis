@@ -3,6 +3,8 @@
 # or restore a version from the root-only persona history. This is
 # intentionally root-operated and is never called by the public updater.
 set -euo pipefail
+# History pruning sorts timestamps; keep the decimal point locale-independent.
+export LC_ALL=C
 
 readonly destination_dir=/etc/jarvis
 readonly destination="$destination_dir/Jarvis.md"
@@ -33,6 +35,10 @@ done
 [[ ${EUID} -eq 0 ]] || fail "must run as root"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
 getent group jarvis >/dev/null || fail "jarvis group is missing; run prepare-home-node first"
+# Serialize direct runs; `jarvis persona` also holds the administration locks.
+exec 8>/run/jarvis-persona-install.lock
+flock -n 8 || fail "another persona installation is running"
+[[ ! -L $history_dir ]] || fail "persona history must not be a symlink"
 
 if [[ -n $restore ]]; then
     [[ -z $source_root && -z $expected ]] && is_sha256 "$restore" || usage
@@ -80,10 +86,11 @@ chmod 0640 "$stage"
 [[ $(file_sha256 "$stage") == "$source_hash" ]] || fail "staged persona hash mismatch"
 
 # Keep root-controlled rollback copies without printing their private
-# contents. Re-archiving an existing entry marks it as recently used.
+# contents. Re-archiving an intact entry marks it as recently used; a damaged
+# one is replaced, so a later restore finds the right bytes.
 archive() {
     local file=$1 hash=$2 entry="$history_dir/$2"
-    if [[ -f $entry && ! -L $entry ]]; then
+    if [[ -f $entry && ! -L $entry && $(file_sha256 "$entry") == "$hash" ]]; then
         touch -- "$entry"
         return
     fi
@@ -95,13 +102,14 @@ archive() {
     mv -Tf -- "$archive_temporary" "$entry"
 }
 
-# Keep the most recently used versions; never remove the installed one.
+# Keep the most recently used versions; never remove the installed one or the
+# one it replaced, which an automatic restore needs even if the clock moved.
 prune_history() {
     local count=0 name
     while IFS= read -r -d '' name; do
         is_sha256 "$name" || continue
         count=$((count + 1))
-        if ((count > history_keep)) && [[ $name != "$source_hash" ]]; then
+        if ((count > history_keep)) && [[ $name != "$source_hash" && $name != "$current_hash" ]]; then
             rm -f -- "${history_dir:?}/$name"
         fi
     done < <(find "$history_dir" -mindepth 1 -maxdepth 1 -type f -printf '%T@ %f\0' |
@@ -110,7 +118,7 @@ prune_history() {
 
 [[ -z $current_hash ]] || archive "$destination" "$current_hash"
 archive "$stage" "$source_hash"
-mv -f -- "$stage" "$destination"
+mv -Tf -- "$stage" "$destination"
 [[ $(stat -c '%U:%G:%a' "$destination") == root:jarvis:640 ]] || fail "installed persona has unsafe ownership or mode"
 [[ $(file_sha256 "$destination") == "$source_hash" ]] || fail "installed persona hash mismatch"
 prune_history

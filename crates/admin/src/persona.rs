@@ -38,6 +38,7 @@ const SOURCE_PERSONA: &str = "personaljarvis/jarvis-core/Jarvis.md";
 const UPDATER_LOCK: &str = "/run/jarvis-updater.lock";
 const AGENT_LOCK: &str = "/run/jarvis-private-agent-update.lock";
 const GIT: &str = "/usr/bin/git";
+const SSH_KEYGEN: &str = "/usr/bin/ssh-keygen";
 const LOGGER: &str = "/usr/bin/logger";
 
 #[derive(Debug, Subcommand)]
@@ -171,6 +172,7 @@ enum Plan {
     Unchanged(String),
     Install {
         source: PathBuf,
+        commit: String,
         from: Option<String>,
         to: String,
     },
@@ -198,17 +200,17 @@ pub(crate) fn run(command: PersonaCommand, json: bool) -> Result<()> {
             (yes, command)
         }
     };
-    let _config = mutation_lock(CONFIG_LOCK)?;
-    let _updater = mutation_lock(UPDATER_LOCK)?;
-    let _agents = mutation_lock(AGENT_LOCK)?;
-    let plan = match command {
+    let plan = || match &command {
         PersonaCommand::Install { expect_sha256, .. } => {
-            plan_install(&layout, &host, expect_sha256.as_deref())?
+            plan_install(&layout, &host, expect_sha256.as_deref())
         }
-        PersonaCommand::Rollback { to, .. } => plan_rollback(&layout, &to)?,
+        PersonaCommand::Rollback { to, .. } => plan_rollback(&layout, to),
         PersonaCommand::Status => unreachable!("handled above"),
     };
-    if let Plan::Install { from, to, .. } | Plan::Rollback { from, to } = &plan {
+    // Confirm before taking the locks, so an unanswered prompt does not block
+    // updates or backups; then plan again under the locks.
+    let confirmed = plan()?;
+    if let Plan::Install { from, to, .. } | Plan::Rollback { from, to } = &confirmed {
         if !yes {
             confirm(&format!(
                 "Replace persona {} with {} and restart Core?",
@@ -217,8 +219,29 @@ pub(crate) fn run(command: PersonaCommand, json: bool) -> Result<()> {
             ))?;
         }
     }
+    let _config = mutation_lock(CONFIG_LOCK)?;
+    let _updater = mutation_lock(UPDATER_LOCK)?;
+    let _agents = mutation_lock(AGENT_LOCK)?;
+    let plan = plan()?;
+    ensure!(
+        plan == confirmed,
+        "the persona or candidate changed after confirmation; nothing changed"
+    );
+    ignore_interruptions();
     println!("jarvis persona: {}", apply(&layout, &host, &plan)?);
     Ok(())
+}
+
+/// An interrupted activation could leave a new persona in place without the
+/// readiness check, restore or final audit record. The command is short and
+/// bounded by the readiness timeout, so it runs to completion.
+fn ignore_interruptions() {
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: sets the ignore disposition; no handler code is installed.
+        unsafe {
+            libc::signal(signal, libc::SIG_IGN);
+        }
+    }
 }
 
 /// Hash a file without following a final symlink. Only the first bytes up to
@@ -350,10 +373,11 @@ fn print_status(status: &Status) {
                 "Candidate   {}  commit {}  signature {}  {}",
                 candidate.sha256.as_deref().unwrap_or("(too large)"),
                 candidate.commit,
-                serde_json::to_value(candidate.signature)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_default(),
+                match candidate.signature {
+                    Signature::Verified => "verified",
+                    Signature::Untrusted => "untrusted",
+                    Signature::NoAllowedSigners => "no allowed signers",
+                },
                 problem(&candidate.problem)
             );
             let installed = status.installed.as_ref().map(|version| &version.sha256);
@@ -402,6 +426,7 @@ fn plan_install(layout: &Layout, host: &dyn Host, expect: Option<&str>) -> Resul
     } else {
         Plan::Install {
             source: source.root,
+            commit: source.commit,
             from,
             to,
         }
@@ -436,20 +461,32 @@ fn apply(layout: &Layout, host: &dyn Host, plan: &Plan) -> Result<String> {
         Plan::Unchanged(sha256) => {
             return Ok(format!("persona {} is already installed", short(sha256)))
         }
-        Plan::Install { from, to, .. } => ("install", from.as_deref(), to.as_str()),
-        Plan::Rollback { from, to } => ("rollback", from.as_deref(), to.as_str()),
+        Plan::Install {
+            commit, from, to, ..
+        } => (
+            format!("action=install commit={commit}"),
+            from.as_deref(),
+            to.as_str(),
+        ),
+        Plan::Rollback { from, to } => ("action=rollback".to_owned(), from.as_deref(), to.as_str()),
     };
     let record = |outcome: &str| {
         format!(
-            "action={action} from={} to={to} outcome={outcome}",
+            "{action} from={} to={to} outcome={outcome}",
             from.unwrap_or("none")
         )
     };
     host.audit(&record("initiated"))
         .context("audit event could not be recorded; nothing changed")?;
     let (outcome, result) = activate(layout, host, plan, from, to);
-    host.audit(&record(outcome))
-        .context("persona action may have completed but its audit event failed")?;
+    if let Err(error) = host.audit(&record(outcome)) {
+        // Keep the real outcome visible: it may be a failed restore.
+        let outcome = match result {
+            Ok(message) => message,
+            Err(failure) => format!("{failure:#}"),
+        };
+        bail!("persona audit event failed ({error:#}) after: {outcome}");
+    }
     result
 }
 
@@ -517,7 +554,9 @@ fn activate(
 /// configuration, parsed with the same rules as the updater.
 fn parse_source_config(text: &str) -> Result<String> {
     let (mut source, mut repository, mut signed) = (None, None, None);
-    for line in text.lines() {
+    // Split on '\n' only, like the updater's `read`: a '\r' stays in the
+    // value and fails validation there and here.
+    for line in text.strip_suffix('\n').unwrap_or(text).split('\n') {
         let Some((key, value)) = line.split_once('=') else {
             ensure!(
                 line.is_empty(),
@@ -555,6 +594,52 @@ fn root_controlled(metadata: &fs::Metadata) -> bool {
     !metadata.file_type().is_symlink() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0
 }
 
+/// Most entries walked below a checkout's `.git`.
+const GIT_TREE_LIMIT: usize = 200_000;
+
+/// Every entry below `path` (not following symlinks) must belong to `owner`
+/// and, unless it is a symlink, be writable by nobody else: a writable
+/// config, object or ref could change what root's Git reads or runs.
+fn owner_controlled_tree(path: &Path, owner: u32, budget: &mut usize) -> Result<()> {
+    ensure!(
+        *budget > 0,
+        "the private checkout's Git directory is too large to check"
+    );
+    *budget -= 1;
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.uid() == owner
+            && (metadata.file_type().is_symlink() || metadata.mode() & 0o022 == 0),
+        "{} is not root-controlled",
+        path.display()
+    );
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            owner_controlled_tree(&entry?.path(), owner, budget)?;
+        }
+    }
+    Ok(())
+}
+
+/// Overrides for Git running as root in the private checkout: the checkout
+/// cannot select hooks, fsmonitor or a signature program, and only SSH
+/// signatures checked against `signers` verify. `gpg.format` selects only the
+/// signing backend; verification follows the signature's own type, so the
+/// OpenPGP and X.509 programs are disabled outright.
+fn git_overrides(signers: &str) -> Vec<String> {
+    [
+        "core.hooksPath=/dev/null",
+        "core.fsmonitor=false",
+        &format!("gpg.ssh.program={SSH_KEYGEN}"),
+        "gpg.openpgp.program=/bin/false",
+        "gpg.x509.program=/bin/false",
+        &format!("gpg.ssh.allowedSignersFile={signers}"),
+    ]
+    .into_iter()
+    .flat_map(|setting| ["-c".to_owned(), setting.to_owned()])
+    .collect()
+}
+
 struct System;
 
 impl System {
@@ -582,10 +667,12 @@ impl System {
             );
         }
         ensure!(
-            fs::symlink_metadata(root.join(".git"))
-                .is_ok_and(|metadata| metadata.is_dir() && root_controlled(&metadata)),
-            "private agent checkout is not a root-controlled Git checkout"
+            fs::symlink_metadata(root.join(".git")).is_ok_and(|metadata| metadata.is_dir()),
+            "private agent checkout is not a Git checkout"
         );
+        let mut budget = GIT_TREE_LIMIT;
+        owner_controlled_tree(&root.join(".git"), 0, &mut budget)
+            .context("private agent checkout is not root-controlled")?;
         Ok(root)
     }
 
@@ -599,24 +686,12 @@ impl System {
         })
     }
 
-    /// Git with the checkout's own hooks, fsmonitor and signature program
-    /// overridden. Output is read up to `limit` bytes.
+    /// Git with `git_overrides`. Output is read up to `limit` bytes.
     fn git(root: &Path, args: &[&str], limit: u64) -> Result<(bool, Vec<u8>)> {
         let mut child = trusted_command(GIT)
             .arg("-C")
             .arg(root)
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "gpg.format=ssh",
-                "-c",
-                "gpg.ssh.program=/usr/bin/ssh-keygen",
-                "-c",
-            ])
-            .arg(format!("gpg.ssh.allowedSignersFile={ALLOWED_SIGNERS}"))
+            .args(git_overrides(ALLOWED_SIGNERS))
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -664,7 +739,9 @@ impl Host for System {
             .context("private agent checkout has no valid commit")?;
         let signature = if !Self::allowed_signers_safe() {
             Signature::NoAllowedSigners
-        } else if Self::git(&root, &["verify-commit", &commit], 4096)?.0 {
+        } else if validate_system_executable(SSH_KEYGEN).is_ok()
+            && Self::git(&root, &["verify-commit", &commit], 4096)?.0
+        {
             Signature::Verified
         } else {
             Signature::Untrusted
@@ -738,7 +815,7 @@ mod tests {
         cell::{Cell, RefCell},
         collections::VecDeque,
         fs::File,
-        os::unix::fs::symlink,
+        os::unix::fs::{symlink, PermissionsExt},
         time::{Duration, UNIX_EPOCH},
     };
 
@@ -754,7 +831,8 @@ mod tests {
         installer_fails: Cell<bool>,
         installer_fails_after_replace: Cell<bool>,
         restore_fails: Cell<bool>,
-        audit_fails: Cell<bool>,
+        /// Audit records containing this text fail.
+        audit_fails: Cell<Option<&'static str>>,
     }
 
     impl Fake {
@@ -806,7 +884,13 @@ mod tests {
             Ok(())
         }
         fn audit(&self, record: &str) -> Result<()> {
-            ensure!(!self.audit_fails.get(), "logger failed");
+            ensure!(
+                !self
+                    .audit_fails
+                    .get()
+                    .is_some_and(|text| record.contains(text)),
+                "logger failed"
+            );
             self.record(format!("audit {record}"));
             Ok(())
         }
@@ -853,7 +937,12 @@ mod tests {
 
     fn audit(action: &str, from: &[u8], to: &[u8], outcome: &str) -> String {
         format!(
-            "audit action={action} from={} to={} outcome={outcome}",
+            "audit action={action}{} from={} to={} outcome={outcome}",
+            if action == "install" {
+                format!(" commit={}", "a".repeat(40))
+            } else {
+                String::new()
+            },
             sha256_hex(from),
             sha256_hex(to)
         )
@@ -904,7 +993,7 @@ mod tests {
     #[test]
     fn nothing_changes_without_an_audit_trail() {
         let (_directory, layout, fake) = fixture(Some(OLD), NEW);
-        fake.audit_fails.set(true);
+        fake.audit_fails.set(Some(""));
         assert!(install(&layout, &fake).is_err());
         assert!(fake.calls().is_empty());
         assert_eq!(installed(&layout), Some(sha256_hex(OLD)));
@@ -1090,5 +1179,112 @@ mod tests {
         ] {
             assert!(parse_source_config(invalid).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn failed_final_audit_still_reports_the_outcome() {
+        let (_directory, layout, fake) = fixture(Some(OLD), NEW);
+        fake.restarts.borrow_mut().extend([false, false]);
+        fake.audit_fails.set(Some("outcome=restore-failed"));
+        let error = format!("{:#}", install(&layout, &fake).unwrap_err());
+        assert!(
+            error.contains("audit event failed") && error.contains("also failed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn git_tree_check_refuses_foreign_writable_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let git = directory.path().join(".git");
+        fs::create_dir_all(git.join("objects/ab")).unwrap();
+        fs::write(git.join("config"), b"").unwrap();
+        fs::write(git.join("objects/ab/cd"), b"").unwrap();
+        let owner = fs::metadata(&git).unwrap().uid();
+        for path in [&git, &git.join("objects"), &git.join("objects/ab")] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for path in [git.join("config"), git.join("objects/ab/cd")] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert!(owner_controlled_tree(&git, owner, &mut 100).is_ok());
+        assert!(owner_controlled_tree(&git, owner, &mut 3).is_err());
+        assert!(owner_controlled_tree(&git, owner + 1, &mut 100).is_err());
+        for (path, mode) in [("config", 0o664), ("objects/ab", 0o777)] {
+            fs::set_permissions(git.join(path), fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                owner_controlled_tree(&git, owner, &mut 100).is_err(),
+                "{path}"
+            );
+            let safe = if mode == 0o664 { 0o644 } else { 0o755 };
+            fs::set_permissions(git.join(path), fs::Permissions::from_mode(safe)).unwrap();
+        }
+    }
+
+    /// `gpg.format=ssh` does not stop Git from verifying an OpenPGP signature
+    /// with gpg. The overrides must make such a commit fail even when the
+    /// OpenPGP program would report a good signature.
+    #[test]
+    fn only_ssh_signatures_can_verify() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = |args: &[&str], input: Option<&[u8]>| {
+            let mut child = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            if let Some(input) = input {
+                std::io::Write::write_all(&mut child.stdin.take().unwrap(), input).unwrap();
+            }
+            drop(child.stdin.take());
+            let output = child.wait_with_output().unwrap();
+            (
+                output.status.success(),
+                String::from_utf8(output.stdout).unwrap().trim().to_owned(),
+            )
+        };
+        assert!(git(&["init", "--quiet"], None).0);
+        let (_, tree) = git(&["mktree"], Some(b""));
+        let commit = format!(
+            "tree {tree}\nauthor A <a@example.invalid> 0 +0000\n\
+             committer A <a@example.invalid> 0 +0000\n\
+             gpgsig -----BEGIN PGP SIGNATURE-----\n \n fixture\n -----END PGP SIGNATURE-----\n\n\
+             fixture\n"
+        );
+        let (ok, commit) = git(
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            Some(commit.as_bytes()),
+        );
+        assert!(ok);
+        let fake_gpg = root.join("fake-gpg");
+        fs::write(
+            &fake_gpg,
+            "#!/bin/sh\ncat >/dev/null\nprintf '\\n[GNUPG:] GOODSIG 0123456789ABCDEF fixture\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_gpg, fs::Permissions::from_mode(0o755)).unwrap();
+        let program = format!("gpg.openpgp.program={}", fake_gpg.display());
+        let signers = root.join("allowed_signers");
+        fs::write(&signers, b"").unwrap();
+        let signers = signers.to_str().unwrap();
+        // Without the overrides the fake program is trusted.
+        assert!(git(&["-c", &program, "verify-commit", &commit], None).0);
+        let mut args = vec!["-c", &program];
+        let overrides = git_overrides(signers);
+        args.extend(overrides.iter().map(String::as_str));
+        args.extend(["verify-commit", &commit]);
+        assert!(!git(&args, None).0);
+    }
+
+    #[test]
+    fn source_configuration_rejects_carriage_returns() {
+        let text = "JARVIS_PRIVATE_AGENT_SOURCE=/a\r\n\
+                    JARVIS_PRIVATE_AGENT_REPOSITORY=HawkeyNL/PersonalJarvisAgents\n";
+        assert!(parse_source_config(text).is_err());
     }
 }

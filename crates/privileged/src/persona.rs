@@ -14,7 +14,7 @@ pub enum PersonaError {
     TooLarge,
     #[error("persona is not valid UTF-8")]
     NotUtf8,
-    #[error("persona contains a control character")]
+    #[error("persona contains a control or invisible formatting character")]
     ControlCharacter,
     #[error("persona must start with a \"# \" heading")]
     MissingHeading,
@@ -24,9 +24,12 @@ pub enum PersonaError {
 
 /// Token prefixes and the minimum number of token characters that must
 /// follow them. A match must start at a word boundary, so prose such as
-/// "risk-based" is not mistaken for an `sk-` key.
+/// "risk-based" is not mistaken for an `sk-` key, and the tail must contain a
+/// digit, so long kebab-case or snake_case words are not either.
 const SECRET_PREFIXES: &[(&str, usize)] = &[
     ("sk-", 20),
+    ("sk_live_", 20),
+    ("rk_live_", 20),
     ("ghp_", 30),
     ("gho_", 30),
     ("ghu_", 30),
@@ -38,6 +41,7 @@ const SECRET_PREFIXES: &[(&str, usize)] = &[
     ("xoxp-", 10),
     ("xoxa-", 10),
     ("xoxs-", 10),
+    ("xapp-", 10),
     ("xai-", 40),
     ("hf_", 30),
     ("AKIA", 16),
@@ -56,14 +60,28 @@ fn looks_like_secret(text: &str) -> bool {
     let bytes = text.as_bytes();
     SECRET_PREFIXES.iter().any(|&(prefix, min)| {
         text.match_indices(prefix).any(|(start, _)| {
+            let tail: Vec<u8> = bytes[start + prefix.len()..]
+                .iter()
+                .copied()
+                .take_while(|byte| token_byte(*byte))
+                .collect();
             (start == 0 || !token_byte(bytes[start - 1]))
-                && bytes[start + prefix.len()..]
-                    .iter()
-                    .take_while(|byte| token_byte(**byte))
-                    .count()
-                    >= min
+                && tail.len() >= min
+                && tail.iter().any(u8::is_ascii_digit)
         })
     })
+}
+
+/// Control characters (C0, DEL, C1) except tab and line endings, and
+/// invisible characters that can hide or reorder text in a reviewed diff:
+/// bidirectional overrides and isolates, zero-width space, word joiner and a
+/// byte order mark.
+fn forbidden_char(character: char) -> bool {
+    (character.is_control() && !matches!(character, '\t' | '\n' | '\r'))
+        || matches!(
+            character,
+            '\u{200b}' | '\u{202a}'..='\u{202e}' | '\u{2060}' | '\u{2066}'..='\u{2069}' | '\u{feff}'
+        )
 }
 
 /// Validate persona bytes and return them as text.
@@ -75,11 +93,7 @@ pub fn validate_persona(bytes: &[u8]) -> Result<&str, PersonaError> {
         return Err(PersonaError::TooLarge);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| PersonaError::NotUtf8)?;
-    // C0 controls and DEL, except tab and line endings.
-    if text
-        .bytes()
-        .any(|byte| byte.is_ascii_control() && !matches!(byte, b'\t' | b'\n' | b'\r'))
-    {
+    if text.chars().any(forbidden_char) {
         return Err(PersonaError::ControlCharacter);
     }
     if !text
@@ -124,7 +138,18 @@ mod tests {
             validate_persona(b"# Jarvis\n\xff\xfe"),
             Err(PersonaError::NotUtf8)
         );
-        for control in ["\0", "\u{1b}[31m", "\u{7f}", "\u{8}", "\u{c}"] {
+        for control in [
+            "\0",
+            "\u{1b}[31m",
+            "\u{7f}",
+            "\u{8}",
+            "\u{c}",
+            "\u{85}",
+            "\u{202e}",
+            "\u{2066}",
+            "\u{200b}",
+            "\u{feff}",
+        ] {
             let text = format!("# Jarvis\n{control}");
             assert_eq!(
                 validate_persona(text.as_bytes()),
@@ -141,7 +166,6 @@ mod tests {
             "#Jarvis",
             "## Jarvis",
             " # Jarvis",
-            "\u{feff}# Jarvis",
             "   \n\n",
         ] {
             assert_eq!(
@@ -156,16 +180,18 @@ mod tests {
     fn rejects_obvious_keys_and_tokens() {
         // Built at runtime so this file holds no realistic secret literal.
         let samples = [
-            format!("sk-ant-api03-{}", "a".repeat(40)),
-            format!("sk-proj-{}", "B".repeat(40)),
-            format!("ghp_{}", "c".repeat(36)),
-            format!("github_pat_{}", "d".repeat(40)),
-            format!("AKIA{}", "E".repeat(16)),
-            format!("AIza{}", "f".repeat(35)),
+            format!("sk-ant-api03-{}", "a1".repeat(20)),
+            format!("sk-proj-{}", "B2".repeat(20)),
+            format!("sk_live_{}", "k3".repeat(12)),
+            format!("ghp_{}", "c4".repeat(18)),
+            format!("github_pat_{}", "d5".repeat(20)),
+            format!("AKIA{}", "E6".repeat(8)),
+            format!("AIza{}", "f7".repeat(18)),
             format!("xoxb-{}", "1".repeat(20)),
-            format!("hf_{}", "g".repeat(34)),
-            format!("glpat-{}", "h".repeat(20)),
-            format!("eyJ{}.{}", "i".repeat(30), "j".repeat(30)),
+            format!("xapp-{}", "1-a".repeat(5)),
+            format!("hf_{}", "g8".repeat(17)),
+            format!("glpat-{}", "h9".repeat(10)),
+            format!("eyJ{}.{}", "i0".repeat(15), "j".repeat(30)),
             format!("-----BEGIN OPENSSH {}-----", "PRIVATE KEY"),
         ];
         for secret in samples {
@@ -182,7 +208,8 @@ mod tests {
     fn ordinary_prose_is_not_mistaken_for_a_secret() {
         let text = "# Jarvis\nA risk-assessment-framework-for-everything-here, the \
                     xai-api provider, task-scoped-and-carefully-bounded-work, sk-short, \
-                    AKIA and the word eyJ alone.\n";
+                    sk-learn-compatible-pipelines-and-models, hf_hub_download_with_cache_dir_set, \
+                    AKIA and the word eyJ alone. Emoji with a joiner: \u{1f469}\u{200d}\u{1f4bb}.\n";
         assert!(validate_persona(text.as_bytes()).is_ok());
     }
 

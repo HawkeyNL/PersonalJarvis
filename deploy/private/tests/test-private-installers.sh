@@ -109,6 +109,17 @@ for arguments in "--restore $v11" "--restore $(printf '0%.0s' {1..64})" "--resto
     fi
 done
 [[ $(installed_hash) == "$v12" ]]
+# A damaged archive of the replaced version is rewritten from the installed file.
+printf 'damaged\n' > "$history/$v12"
+v14=$(write_persona 14)
+bash "$installer" --source "$fixture/private" >/dev/null
+[[ $(sha256sum "$history/$v12" | awk '{print $1}') == "$v12" ]]
+# Pruning keeps the installed and the replaced version even when other entries
+# look newer, for example after the clock moved backwards.
+find "$history" -mindepth 1 -type f -exec touch -d '2099-01-01' {} +
+v15=$(write_persona 15)
+bash "$installer" --source "$fixture/private" >/dev/null
+[[ -f $history/$v14 && -f $history/$v15 && $(installed_hash) == "$v15" ]]
 
 JARVIS_AGENT_BUNDLE_VALIDATOR="$fixture/validator" bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"
 bundle=$(readlink -f /var/lib/jarvis/agents/current)
