@@ -809,7 +809,8 @@ pub async fn revoke_session(db: &Database, session_id: Uuid) -> Result<(), Ident
 /// and agent actions). Login and the local root path do not go through here.
 /// The mobile apps require a biometric prompt for every approval, and the
 /// macOS app requires Touch ID without a password fallback. Linux and Windows
-/// cannot enforce a biometric-only prompt, so they never approve.
+/// cannot enforce a biometric-only prompt, so they never sign these approvals
+/// (broker approvals use their own trusted-key check).
 const APPROVER_PLATFORMS: [&str; 3] = ["ios", "android", "macos"];
 
 pub async fn verify_device_signature(
@@ -1318,7 +1319,7 @@ mod tests {
             }
         }
 
-        // A desktop device cannot approve pairing; the local root path still can.
+        // A Linux desktop cannot approve pairing; the local root path still can.
         let desktop = SigningKey::from_bytes(&rand::random());
         let (desktop_device, _) = register_device(
             &db,

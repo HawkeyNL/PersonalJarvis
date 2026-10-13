@@ -236,7 +236,8 @@ pub(crate) async fn agent_pending(authed: Authed, State(state): State<AppState>)
 /// Approve a pending mutation by signing its `agent-approval-v1` message with a
 /// trusted device, then execute it once (ADR-029 4b). Raw-nonce signatures (the
 /// pre-v1 format, and what login/unlock sign) are refused. The signature proves
-/// owner presence (the device key is biometric-gated); the stored action is what
+/// owner presence (the approving device asks for biometrics; on mobile the key
+/// itself is biometric-bound); the stored action is what
 /// runs — the LLM can propose, only a signed human can commit.
 pub(crate) async fn agent_pending_approve(
     authed: Authed,
