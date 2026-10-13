@@ -978,6 +978,12 @@ fn print_status(status: &LayaStatus) {
 
 struct System;
 
+/// Restart Core and wait until it reports `/readyz`; shared with persona
+/// activation.
+pub(crate) fn restart_core_ready() -> Result<()> {
+    System.restart_core()
+}
+
 impl System {
     /// Bounded stdout of a fixed root-run program with a cleared environment.
     fn output(program: &str, args: &[&str], limit: u64) -> Result<(bool, Vec<u8>)> {

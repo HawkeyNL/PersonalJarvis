@@ -63,6 +63,64 @@ if bash "$repo_dir/deploy/private/install-private-config.sh" --source "$fixture/
 fi
 [[ $(sha256sum /etc/jarvis/Jarvis.md | awk '{print $1}') == "$before" ]]
 
+installer="$repo_dir/deploy/private/install-private-config.sh"
+history=/etc/jarvis/persona-history
+persona="$fixture/private/personaljarvis/jarvis-core/Jarvis.md"
+installed_hash() { sha256sum /etc/jarvis/Jarvis.md | awk '{print $1}'; }
+write_persona() {
+    printf '# Synthetic persona %s\n' "$1" > "$persona"
+    sha256sum "$persona" | awk '{print $1}'
+}
+rm "$persona"
+v1=$(write_persona 1)
+# --expect-sha256 binds the installed bytes to the version validated earlier.
+if bash "$installer" --source "$fixture/private" --expect-sha256 "$(printf '0%.0s' {1..64})"; then
+    echo "persona with an unexpected hash was installed" >&2
+    exit 1
+fi
+[[ $(installed_hash) == "$before" ]]
+bash "$installer" --source "$fixture/private" --expect-sha256 "$v1"
+[[ $(installed_hash) == "$v1" ]]
+# The replaced version is archived for rollback.
+[[ $(stat -c '%U:%G:%a' "$history") == root:root:700 ]]
+[[ $(stat -c '%U:%G:%a' "$history/$before") == root:jarvis:640 ]]
+[[ $(bash "$installer" --source "$fixture/private") == "UNCHANGED protected persona sha256=${v1:0:12}" ]]
+# Only the ten most recently used versions are kept, the installed one included.
+for version in $(seq 2 13); do
+    latest=$(write_persona "$version")
+    [[ $version != 11 ]] || v11=$latest
+    [[ $version != 12 ]] || v12=$latest
+    bash "$installer" --source "$fixture/private" >/dev/null
+done
+[[ $(find "$history" -mindepth 1 -type f | wc -l) == 10 ]]
+[[ -f $history/$latest && ! -e $history/$v1 && ! -e $history/$before ]]
+# Restore selects an archived version by hash only.
+[[ $(bash "$installer" --restore "$v12") == "RESTORE protected persona sha256=${v12:0:12}" ]]
+[[ $(installed_hash) == "$v12" ]]
+[[ $(stat -c '%U:%G:%a' /etc/jarvis/Jarvis.md) == root:jarvis:640 ]]
+[[ -f $history/$latest && $(find "$history" -mindepth 1 -type f | wc -l) == 10 ]]
+printf 'tampered\n' >> "$history/$v11"
+for arguments in "--restore $v11" "--restore $(printf '0%.0s' {1..64})" "--restore ../Jarvis.md" \
+    "--restore $latest --source $fixture/private" "--restore $latest --expect-sha256 $latest"; do
+    # shellcheck disable=SC2086 # deliberate word splitting of fixed arguments
+    if bash "$installer" $arguments 2>/dev/null; then
+        echo "persona restore accepted: $arguments" >&2
+        exit 1
+    fi
+done
+[[ $(installed_hash) == "$v12" ]]
+# A damaged archive of the replaced version is rewritten from the installed file.
+printf 'damaged\n' > "$history/$v12"
+v14=$(write_persona 14)
+bash "$installer" --source "$fixture/private" >/dev/null
+[[ $(sha256sum "$history/$v12" | awk '{print $1}') == "$v12" ]]
+# Pruning keeps the installed and the replaced version even when other entries
+# look newer, for example after the clock moved backwards.
+find "$history" -mindepth 1 -type f -exec touch -d '2099-01-01' {} +
+v15=$(write_persona 15)
+bash "$installer" --source "$fixture/private" >/dev/null
+[[ -f $history/$v14 && -f $history/$v15 && $(installed_hash) == "$v15" ]]
+
 JARVIS_AGENT_BUNDLE_VALIDATOR="$fixture/validator" bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"
 bundle=$(readlink -f /var/lib/jarvis/agents/current)
 [[ -f $bundle/manifest.json ]]
