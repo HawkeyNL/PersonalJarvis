@@ -807,7 +807,10 @@ pub async fn revoke_session(db: &Database, session_id: Uuid) -> Result<(), Ident
 
 /// Platforms whose device keys may sign approvals (pairing, unlock, account
 /// and agent actions). Login and the local root path do not go through here.
-const APPROVER_PLATFORMS: [&str; 2] = ["ios", "android"];
+/// The mobile apps require a biometric prompt for every approval, and the
+/// macOS app requires Touch ID without a password fallback. Linux and Windows
+/// cannot enforce a biometric-only prompt, so they never approve.
+const APPROVER_PLATFORMS: [&str; 3] = ["ios", "android", "macos"];
 
 pub async fn verify_device_signature(
     db: &Database,
@@ -1275,7 +1278,7 @@ mod tests {
         assert_eq!(consumed.status, "approved");
         assert!(activate_pairing_request(&db, consumed, None).await.is_err());
 
-        // Only mobile device keys sign approvals.
+        // Only mobile and macOS device keys sign approvals.
         let message = b"approval fixture";
         for platform in [
             Platform::Linux,
@@ -1297,7 +1300,10 @@ mod tests {
             let signature = signing.sign(message).to_bytes();
             let result =
                 verify_device_signature(&db, owner.id, device.id, message, &signature).await;
-            if matches!(platform, Platform::Ios | Platform::Android) {
+            if matches!(
+                platform,
+                Platform::Ios | Platform::Android | Platform::Macos
+            ) {
                 result?;
             } else {
                 assert!(
