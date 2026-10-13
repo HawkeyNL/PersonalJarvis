@@ -70,6 +70,7 @@ impl LlmProvider for Fake {
         "fixture"
     }
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
+        assert_eq!(req.system.as_deref(), Some(JARVIS_SYSTEM_FALLBACK));
         self.1
             .lock()
             .unwrap()
@@ -123,7 +124,10 @@ async fn device_token(db: &jarvis_store::Database, owner: Uuid) -> (Uuid, String
         db,
         device.id,
         challenge.id,
-        &key.sign(&challenge.nonce).to_bytes(),
+        &key.sign(
+            &jarvis_client_core::login_message(challenge.id, device.id, &challenge.nonce).unwrap(),
+        )
+        .to_bytes(),
     )
     .await
     .unwrap();
@@ -508,7 +512,8 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
         &token_a,
         "/v1/assistant/chat",
         json!({
-            "messages":[{"role":"user","content":"Legacy client question"}]
+            "messages":[{"role":"user","content":"Legacy client question"}],
+            "system":"X"
         }),
     )
     .await;

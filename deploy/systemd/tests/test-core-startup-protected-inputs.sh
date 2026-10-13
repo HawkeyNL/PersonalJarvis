@@ -8,7 +8,7 @@ api_bin=${JARVIS_API_BINARY:?set JARVIS_API_BINARY to the built jarvis-api}
 [[ -x $api_bin ]] || { echo "jarvis-api binary is unavailable" >&2; exit 1; }
 # This fixture owns fixed production-shaped paths only on an empty CI host.
 # Refuse before registering cleanup or creating anything on an installed host.
-for path in /etc/jarvis /var/lib/jarvis/agents /run/jarvis-core-admin; do
+for path in /etc/jarvis /var/lib/jarvis/agents /run/jarvis-core-admin /run/jarvis-core; do
     [[ ! -e $path && ! -L $path ]] || { echo "refusing existing host path: $path" >&2; exit 1; }
 done
 
@@ -19,11 +19,13 @@ install -o root -g root -m 0755 "$api_bin" "$fixture/bin/jarvis-api"
 api_bin="$fixture/bin/jarvis-api"
 pid=
 created_user=false
+created_caddy=false
 cleanup() {
     if [[ -n ${pid:-} ]]; then kill "$pid" 2>/dev/null || true; fi
     wait "${pid:-}" 2>/dev/null || true
-    rm -rf -- "$fixture" /etc/jarvis /var/lib/jarvis/agents /run/jarvis-core-admin
+    rm -rf -- "$fixture" /etc/jarvis /var/lib/jarvis/agents /run/jarvis-core-admin /run/jarvis-core
     if [[ ${created_user:-false} == true ]]; then userdel jarvis 2>/dev/null || true; fi
+    if [[ ${created_caddy:-false} == true ]]; then userdel caddy 2>/dev/null || true; fi
 }
 trap cleanup EXIT
 
@@ -31,9 +33,14 @@ if ! getent passwd jarvis >/dev/null; then
     useradd --system --user-group --home-dir /nonexistent --shell /usr/sbin/nologin jarvis
     created_user=true
 fi
+if ! getent passwd caddy >/dev/null; then
+    useradd --system --user-group --home-dir /nonexistent --shell /usr/sbin/nologin caddy
+    created_caddy=true
+fi
 # runuser does not run systemd's RuntimeDirectory setup. Reproduce the exact
 # unit contract, rather than weakening Core's required ownership/mode checks.
 install -d -o jarvis -g jarvis -m 0700 /run/jarvis-core-admin
+install -d -o jarvis -g caddy -m 2750 /run/jarvis-core
 install -d -o root -g jarvis -m 0750 /etc/jarvis
 install -o root -g jarvis -m 0640 /dev/stdin /etc/jarvis/Jarvis.md <<'EOF'
 Synthetic protected persona.
@@ -69,6 +76,7 @@ printf "DEFINE USER core ON DATABASE PASSWORD 'ci-core-password' ROLES EDITOR;\n
 
 runuser -u jarvis -- env \
     JARVIS_ENVIRONMENT=production JARVIS_BIND_ADDR=127.0.0.1:18080 \
+    JARVIS_API_UNIX_SOCKET=/run/jarvis-core/api.sock \
     JARVIS_SURREAL_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_NAMESPACE=jarvis \
     JARVIS_SURREAL_DATABASE=core JARVIS_SURREAL_USERNAME=core \
     JARVIS_SURREAL_PASSWORD=ci-core-password JARVIS_LLM_PROVIDER=ollama \
@@ -86,6 +94,11 @@ for _attempt in $(seq 1 20); do
 done
 curl --fail --silent http://127.0.0.1:18080/livez >/dev/null
 curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null
+# Production TCP answers health probes only; the API lives on the socket.
+[[ $(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:18080/) == 404 ]]
+[[ -S /run/jarvis-core/api.sock && ! -L /run/jarvis-core/api.sock ]]
+[[ $(stat -c '%U:%G:%a' /run/jarvis-core/api.sock) == jarvis:caddy:660 ]]
+[[ $(curl --silent --output /dev/null --write-out '%{http_code}' --unix-socket /run/jarvis-core/api.sock http://core/) == 200 ]]
 grep -Fq 'Jarvis persona loaded' "$fixture/api.log"
 grep -Fq 'private AgentRegistry loaded' "$fixture/api.log"
 grep -Fq 'model routing loaded' "$fixture/api.log"

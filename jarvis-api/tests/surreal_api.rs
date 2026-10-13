@@ -16,7 +16,9 @@ use sha2::Digest as _;
 use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
 use tower::ServiceExt;
 
-use jarvis_api::{build_router, AppState, AuthLimits, RateLimiter, JARVIS_SYSTEM_FALLBACK};
+use jarvis_api::{
+    build_router, build_tcp_router, AppState, AuthLimits, RateLimiter, JARVIS_SYSTEM_FALLBACK,
+};
 
 #[path = "realtime/mod.rs"]
 mod realtime;
@@ -88,8 +90,6 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         agent_sandbox: sandbox.map(Arc::new),
         rate_limiter: Arc::new(RateLimiter::new()),
         auth_limits: AuthLimits::default(),
-        trusted_proxy_hops: 0,
-        trusted_proxy_ips: Arc::new(Vec::new()),
         unix_proxy_uid: None,
         bootstrap_enrollment: None,
         app_update_mirror: None,
@@ -338,6 +338,46 @@ async fn api_responses_are_never_cached_by_default() {
             "{path}"
         );
     }
+}
+
+#[tokio::test]
+async fn production_tcp_listener_serves_only_health_probes() {
+    let mut fixture = state(jarvis_store::Database::init(), None).await;
+    fixture.environment = "production".to_string();
+    let app = build_tcp_router(fixture);
+    let get = |path: &str| {
+        Request::builder()
+            .uri(path)
+            // A local process forging the proxy's headers gains nothing.
+            .header("x-forwarded-for", "10.23.45.10")
+            .header("x-forwarded-proto", "https")
+            .header(header::AUTHORIZATION, "Bearer forged")
+            .body(Body::empty())
+            .unwrap()
+    };
+    for path in [
+        "/",
+        "/v1/auth/me",
+        "/v1/auth/challenge",
+        "/v1/events",
+        "/mcp",
+    ] {
+        let response = app.clone().oneshot(get(path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let response = app.clone().oneshot(get("/livez")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Routed to the probe: an unconnected database reports not ready.
+    let response = app.oneshot(get("/readyz")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json_body(response).await["status"], "degraded");
+
+    // Outside production TCP keeps the full API for development and tests.
+    let response = build_tcp_router(state(jarvis_store::Database::init(), None).await)
+        .oneshot(get("/v1/auth/me"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -599,8 +639,20 @@ async fn enroll_login(app: &axum::Router, signing: &SigningKey) -> (String, Vec<
         .unwrap();
     let challenge = json_body(challenge).await;
     let nonce = hex::decode(challenge["nonce"].as_str().unwrap()).unwrap();
-    let login = app.clone().oneshot(Request::builder().method("POST").uri("/v1/auth/login")
-        .header(header::CONTENT_TYPE, "application/json").body(Body::from(serde_json::to_vec(&json!({"device_id": device_id, "challenge_id": challenge["challenge_id"], "signature": hex::encode(signing.sign(&nonce).to_bytes())})).unwrap())).unwrap()).await.unwrap();
+    let login = |signature: [u8; 64]| {
+        app.clone().oneshot(Request::builder().method("POST").uri("/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json").body(Body::from(serde_json::to_vec(&json!({"device_id": device_id, "challenge_id": challenge["challenge_id"], "signature": hex::encode(signature)})).unwrap())).unwrap())
+    };
+    // A signature over the bare nonce is not a login proof.
+    let raw = login(signing.sign(&nonce).to_bytes()).await.unwrap();
+    assert_eq!(raw.status(), StatusCode::UNAUTHORIZED);
+    let message = jarvis_client_core::login_message(
+        challenge["challenge_id"].as_str().unwrap().parse().unwrap(),
+        device_id.parse().unwrap(),
+        &nonce,
+    )
+    .unwrap();
+    let login = login(signing.sign(&message).to_bytes()).await.unwrap();
     assert_eq!(login.status(), StatusCode::OK);
     (
         json_body(login).await["token"]

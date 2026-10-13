@@ -634,10 +634,7 @@ pub async fn login_with_password(
     let _key_created_at = key.created_at;
     let message = jarvis_client_core::login_message(challenge_id, device_id, &challenge.nonce)
         .map_err(|_| IdentityError::AuthFailed)?;
-    verify_signature(&key.public_key, &message, signature)
-        // Transition: clients before the v1 login message sign the raw nonce.
-        // Remove once every client signs `login_message` (apps 0.1.19+).
-        .or_else(|_| verify_signature(&key.public_key, &challenge.nonce, signature))?;
+    verify_signature(&key.public_key, &message, signature)?;
     let owner: DeviceOwner = one(
         db,
         "SELECT user_id FROM devices WHERE record::id(id) = $id AND status = 'active' LIMIT 1",
@@ -808,6 +805,10 @@ pub async fn revoke_session(db: &Database, session_id: Uuid) -> Result<(), Ident
     Ok(())
 }
 
+/// Platforms whose device keys may sign approvals (pairing, unlock, account
+/// and agent actions). Login and the local root path do not go through here.
+const APPROVER_PLATFORMS: [&str; 2] = ["ios", "android"];
+
 pub async fn verify_device_signature(
     db: &Database,
     user_id: Uuid,
@@ -815,7 +816,10 @@ pub async fn verify_device_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), IdentityError> {
-    let public_key = active_device_public_key(db, user_id, device_id).await?;
+    let (device, public_key) = active_device_and_key(db, user_id, device_id).await?;
+    if !APPROVER_PLATFORMS.contains(&device.platform.as_str()) {
+        return Err(IdentityError::AuthFailed);
+    }
     verify_signature(&public_key, message, signature)
 }
 
@@ -826,6 +830,14 @@ pub async fn active_device_public_key(
     user_id: Uuid,
     device_id: Uuid,
 ) -> Result<Vec<u8>, IdentityError> {
+    Ok(active_device_and_key(db, user_id, device_id).await?.1)
+}
+
+async fn active_device_and_key(
+    db: &Database,
+    user_id: Uuid,
+    device_id: Uuid,
+) -> Result<(Device, Vec<u8>), IdentityError> {
     let device = get_device(db, device_id)
         .await?
         .ok_or(IdentityError::AuthFailed)?;
@@ -841,7 +853,7 @@ pub async fn active_device_public_key(
     .await?
     .ok_or(IdentityError::AuthFailed)?;
     let _key_created_at = key.created_at;
-    Ok(key.public_key)
+    Ok((device, key.public_key))
 }
 
 /// Create a short-lived cross-device unlock request.
@@ -973,14 +985,7 @@ pub async fn approve_unlock_request(
     let message =
         jarvis_client_core::unlock_approval_message(id, approver_device_id, &pending.nonce)
             .map_err(|_| IdentityError::AuthFailed)?;
-    if verify_device_signature(db, user_id, approver_device_id, &message, signature)
-        .await
-        .is_err()
-    {
-        // Transition: clients before the v1 unlock message sign the raw
-        // nonce. Remove once every client signs `unlock_approval_message`.
-        verify_device_signature(db, user_id, approver_device_id, &pending.nonce, signature).await?;
-    }
+    verify_device_signature(db, user_id, approver_device_id, &message, signature).await?;
 
     // Claiming repeats every decision-relevant predicate. A second concurrent
     // approval cannot overwrite the first device or resolve an expired request.
@@ -1096,6 +1101,12 @@ mod tests {
         )
         .await?;
         let challenge = create_challenge(&db, device.id).await?;
+        // A signature over the bare nonce is not a login proof.
+        let raw_nonce = signing.sign(&challenge.nonce).to_bytes();
+        assert!(matches!(
+            login(&db, device.id, challenge.id, &raw_nonce).await,
+            Err(IdentityError::AuthFailed)
+        ));
         let signature = signing
             .sign(&jarvis_client_core::login_message(
                 challenge.id,
@@ -1126,8 +1137,8 @@ mod tests {
         let (approver, _) = register_device(
             &db,
             owner.id,
-            "MacBook",
-            Platform::Macos,
+            "Pixel",
+            Platform::Android,
             "ed25519",
             &approver_signing.verifying_key().to_bytes(),
         )
@@ -1148,6 +1159,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        // A signature over the bare nonce is not an approval.
+        let raw_nonce = approver_signing.sign(&unlock_nonce).to_bytes();
+        assert!(matches!(
+            approve_unlock_request(&db, unlock_id, owner.id, approver.id, &raw_nonce).await,
+            Err(IdentityError::AuthFailed)
+        ));
         // A login proof over the same id, device and nonce is not an approval.
         let login_proof = approver_signing
             .sign(&jarvis_client_core::login_message(
@@ -1257,6 +1274,81 @@ mod tests {
         let consumed = pairing_request(&db, local_id, owner.id).await?.unwrap();
         assert_eq!(consumed.status, "approved");
         assert!(activate_pairing_request(&db, consumed, None).await.is_err());
+
+        // Only mobile device keys sign approvals.
+        let message = b"approval fixture";
+        for platform in [
+            Platform::Linux,
+            Platform::Windows,
+            Platform::Macos,
+            Platform::Ios,
+            Platform::Android,
+        ] {
+            let signing = SigningKey::from_bytes(&rand::random());
+            let (device, _) = register_device(
+                &db,
+                owner.id,
+                platform.as_str(),
+                platform,
+                "ed25519",
+                &signing.verifying_key().to_bytes(),
+            )
+            .await?;
+            let signature = signing.sign(message).to_bytes();
+            let result =
+                verify_device_signature(&db, owner.id, device.id, message, &signature).await;
+            if matches!(platform, Platform::Ios | Platform::Android) {
+                result?;
+            } else {
+                assert!(
+                    matches!(result, Err(IdentityError::AuthFailed)),
+                    "{platform:?}"
+                );
+                // The trusted-key and broker key lookup is unaffected.
+                assert_eq!(
+                    active_device_public_key(&db, owner.id, device.id).await?,
+                    signing.verifying_key().to_bytes()
+                );
+            }
+        }
+
+        // A desktop device cannot approve pairing; the local root path still can.
+        let desktop = SigningKey::from_bytes(&rand::random());
+        let (desktop_device, _) = register_device(
+            &db,
+            owner.id,
+            "Desktop",
+            Platform::Linux,
+            "ed25519",
+            &desktop.verifying_key().to_bytes(),
+        )
+        .await?;
+        let request = create_pairing_request(
+            &db,
+            owner.id,
+            "New phone",
+            Platform::Ios,
+            &SigningKey::from_bytes(&rand::random())
+                .verifying_key()
+                .to_bytes(),
+        )
+        .await?;
+        let signature = desktop
+            .sign(&super::super::pairing_approval_message(
+                request.id,
+                &request.nonce,
+                &request.candidate_public_key,
+                owner.id,
+                desktop_device.id,
+                request.expires_at,
+            )?)
+            .to_bytes();
+        assert!(matches!(
+            approve_pairing_request(&db, request.id, owner.id, desktop_device.id, &signature).await,
+            Err(IdentityError::AuthFailed)
+        ));
+        let root_paired = activate_pairing_request(&db, request, None).await?;
+        assert_eq!(root_paired.user_id, owner.id);
 
         // Revoking a device invalidates every existing bearer session at once;
         // a stolen token must not remain useful until its normal expiry.
