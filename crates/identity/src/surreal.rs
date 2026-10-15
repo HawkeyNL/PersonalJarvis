@@ -860,7 +860,11 @@ async fn active_device_and_key(
     Ok((device, key.public_key))
 }
 
-/// Create a short-lived cross-device unlock request.
+/// Create a short-lived cross-device unlock request. It supersedes the
+/// device's older live pending requests: they become `denied` with no
+/// deciding device and leave the approvers' list. Two concurrent creates can
+/// still both stay pending; a write conflict with an approval fails this
+/// transaction and the caller retries.
 pub async fn create_unlock_request(
     db: &Database,
     user_id: Uuid,
@@ -871,9 +875,14 @@ pub async fn create_unlock_request(
     let id = Uuid::now_v7();
     execute(
         db,
-        "CREATE unlock_requests SET id = $id, user_id = $user_id, requesting_device_id = $requesting_device_id, \
+        "BEGIN TRANSACTION; \
+         UPDATE unlock_requests SET status = 'denied', resolved_at = time::now() \
+           WHERE user_id = $user_id AND requesting_device_id = $requesting_device_id \
+           AND status = 'pending' AND expires_at > time::now() RETURN NONE; \
+         CREATE unlock_requests SET id = $id, user_id = $user_id, requesting_device_id = $requesting_device_id, \
          nonce = <bytes>$nonce, status = 'pending', approved_by_device_id = NONE, created_at = time::now(), \
-         expires_at = time::now() + 2m, resolved_at = NONE RETURN NONE",
+         expires_at = time::now() + 2m, resolved_at = NONE RETURN NONE; \
+         COMMIT TRANSACTION;",
         UnlockCreateBindings {
             id: id.to_string(),
             user_id: user_id.to_string(),
@@ -888,6 +897,8 @@ pub async fn create_unlock_request(
 #[derive(serde::Deserialize)]
 struct UnlockStatusRow {
     status: String,
+    #[serde(default)]
+    approved_by_device_id: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     expires_at: OffsetDateTime,
 }
@@ -899,13 +910,22 @@ pub async fn unlock_request_status(
 ) -> Result<Option<String>, IdentityError> {
     let row: Option<UnlockStatusRow> = one(
         db,
-        "SELECT status, expires_at FROM unlock_requests WHERE record::id(id) = $id AND user_id = $user_id LIMIT 1",
+        "SELECT status, approved_by_device_id, expires_at FROM unlock_requests \
+         WHERE record::id(id) = $id AND user_id = $user_id LIMIT 1",
         serde_json::json!({ "id": id.to_string(), "user_id": user_id.to_string() }),
     )
     .await?;
     Ok(row.map(|row| {
-        if row.status == "pending" && row.expires_at < OffsetDateTime::now_utc() {
-            "expired".to_string()
+        // Only superseding denies without a deciding device. Its requester
+        // keeps seeing `pending` until expiry, as before superseding existed,
+        // so a client still polling it never reports a false denial.
+        let superseded = row.status == "denied" && row.approved_by_device_id.is_none();
+        if row.status == "pending" || superseded {
+            if row.expires_at < OffsetDateTime::now_utc() {
+                "expired".to_string()
+            } else {
+                "pending".to_string()
+            }
         } else {
             row.status
         }
@@ -1198,6 +1218,36 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        // A new request supersedes only the same device's older pending one;
+        // resolved requests and other devices' requests are left alone. The
+        // superseded one leaves the approvers' list and cannot be approved,
+        // but its requester still reads `pending` until it expires.
+        let (other, _) = create_unlock_request(&db, owner.id, approver.id).await?;
+        let (older, older_nonce) = create_unlock_request(&db, owner.id, device.id).await?;
+        let (newer, _) = create_unlock_request(&db, owner.id, device.id).await?;
+        let status = |id| unlock_request_status(&db, id, owner.id);
+        assert_eq!(status(older).await?.as_deref(), Some("pending"));
+        assert_eq!(status(newer).await?.as_deref(), Some("pending"));
+        assert_eq!(status(other).await?.as_deref(), Some("pending"));
+        assert_eq!(status(unlock_id).await?.as_deref(), Some("approved"));
+        let pending: Vec<Uuid> = pending_unlock_requests(&db, owner.id, approver.id)
+            .await?
+            .iter()
+            .map(|request| request.id)
+            .collect();
+        assert_eq!(pending, vec![newer]);
+        let older_message =
+            jarvis_client_core::unlock_approval_message(older, approver.id, &older_nonce)?;
+        assert!(approve_unlock_request(
+            &db,
+            older,
+            owner.id,
+            approver.id,
+            &approver_signing.sign(&older_message).to_bytes(),
+        )
+        .await
+        .is_err());
 
         // Pairing uses a different, canonical protocol. Its conditional update,
         // device creation and request activation are one database transaction:
