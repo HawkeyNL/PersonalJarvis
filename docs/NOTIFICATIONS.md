@@ -22,7 +22,8 @@ Behaviour in Core:
 - Handlers only enqueue (bounded queue of 16; a full queue drops the event
   and logs a count). One worker publishes with a 5 s timeout per request and
   up to 3 attempts with backoff; 4xx answers other than 429 are not retried.
-- The same event kind is sent at most once per 60 s.
+- The same event kind is sent at most once per 60 s; for unlock requests
+  that holds per requesting device.
 - The budget marker is kept in memory. At startup a month that is already at
   or above 90% counts as notified, so restarts do not repeat the push.
 - Logs name the event kind and HTTP status only, never the token or topic.
@@ -153,7 +154,7 @@ keeps using ntfy.
   Touch ID; a notification has no actions.
 - It goes to the owner's active devices that turned on **Approval
   notifications** in the app, never to the device that asked, at most 8
-  devices per event. The same coalescing (one push per kind per 60 s),
+  devices per event, within 30 s. The same coalescing (see above),
   queue, 5 s timeout and retries as ntfy apply. Headers: `apns-push-type:
   alert`, `apns-priority: 10`, `apns-expiration` two minutes ahead (the
   approval expires by then) and an `apns-collapse-id` per kind.
