@@ -425,24 +425,28 @@ async fn signed_revoke_keeps_the_last_approver_but_local_root_does_not(
 async fn concurrent_revokes_of_the_last_two_approvers_leave_one(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = fixture_db("approver_race_fixture").await?;
-    let owner = create_user(&db, "fixture owner").await?.id;
-    let phone = device(&db, owner, Platform::Android).await?;
-    let laptop = device(&db, owner, Platform::Macos).await?;
-    let revoke_laptop = revoke_request(&db, owner, &phone, laptop.0.id).await?;
-    let revoke_phone = revoke_request(&db, owner, &laptop, phone.0.id).await?;
-    let (first, second) = tokio::join!(
-        approve_signed(&db, owner, &phone, &revoke_laptop),
-        approve_signed(&db, owner, &laptop, &revoke_phone),
-    );
-    let refused = [&first, &second]
-        .iter()
-        .filter(|result| matches!(result, Err(IdentityError::LastApprover)))
-        .count();
-    assert_eq!(
-        (first.is_ok() as u8 + second.is_ok() as u8, refused),
-        (1, 1),
-        "{first:?} {second:?}"
-    );
-    assert_eq!(list_active_devices(&db, owner).await?.len(), 1);
+    // Each approver revokes itself, so neither signer check depends on the
+    // other revoke. Repeated so the two transactions overlap in some rounds.
+    for _ in 0..10 {
+        let owner = create_user(&db, "fixture owner").await?.id;
+        let phone = device(&db, owner, Platform::Android).await?;
+        let laptop = device(&db, owner, Platform::Macos).await?;
+        let revoke_phone = revoke_request(&db, owner, &phone, phone.0.id).await?;
+        let revoke_laptop = revoke_request(&db, owner, &laptop, laptop.0.id).await?;
+        let (first, second) = tokio::join!(
+            approve_signed(&db, owner, &phone, &revoke_phone),
+            approve_signed(&db, owner, &laptop, &revoke_laptop),
+        );
+        let refused = [&first, &second]
+            .iter()
+            .filter(|result| matches!(result, Err(IdentityError::LastApprover)))
+            .count();
+        assert_eq!(
+            (first.is_ok() as u8 + second.is_ok() as u8, refused),
+            (1, 1),
+            "{first:?} {second:?}"
+        );
+        assert_eq!(list_active_devices(&db, owner).await?.len(), 1);
+    }
     Ok(())
 }
