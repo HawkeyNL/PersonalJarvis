@@ -76,9 +76,10 @@ pub fn unlock_approval_message(
     )
 }
 
-/// Two-digit number-matching code (0..=99) for one unlock request. The
-/// requesting device shows it and the approver must pick it before approving.
-/// Both sides derive it from the request id and nonce they already hold.
+/// Number-matching code (0..=99, always shown as two digits: 0 is "00") for
+/// one unlock request. The requesting device shows it and the approver must
+/// pick it before approving. Both sides derive it from the request id and the
+/// server-generated nonce they already hold.
 pub fn unlock_code(request_id: Uuid, nonce: &[u8]) -> Result<u8, ProtocolError> {
     if nonce.len() != 32 {
         return Err(ProtocolError::InvalidChallenge);
