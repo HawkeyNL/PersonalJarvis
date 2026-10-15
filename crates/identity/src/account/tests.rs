@@ -298,3 +298,221 @@ async fn password_change_after_bootstrap_replaces_the_bootstrap_verifier(
     login_as(changed).await?;
     Ok(())
 }
+
+/// Forgotten-password recovery needs an approver device signature and local
+/// root confirmation; it is one-use, expiring and rate limited.
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn password_recovery_needs_signature_and_root_confirmation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(std::env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &std::env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &std::env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("recovery_fixture_{}", Uuid::now_v7().simple()))
+        .use_db("fixture")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let key = SigningKey::from_bytes(&rand::random());
+    let hash = |password: &str| {
+        PasswordService::shared().hash(AccountPassword::new(password.to_owned()).unwrap())
+    };
+    let deadline = OffsetDateTime::now_utc().unix_timestamp() + 600;
+    let (owner, device) = bootstrap_account(
+        &db,
+        "fixture phone",
+        Platform::Ios,
+        &key.verifying_key().to_bytes(),
+        hash(PASSWORD).await?,
+        deadline,
+    )
+    .await?;
+    let login_as = |password: &str| {
+        let (db, key, password) = (&db, &key, password.to_owned());
+        async move {
+            let challenge = create_challenge(db, device.id).await?;
+            let signed = login_proof(key, device.id, &challenge);
+            login_with_password(
+                db,
+                device.id,
+                challenge.id,
+                &signed,
+                Some(AccountPassword::new(password)?),
+            )
+            .await
+            .map_err(Box::<dyn std::error::Error>::from)
+        }
+    };
+    let session = login_as(PASSWORD).await?;
+    let recovered = "recovered fixture account password never used in production";
+    let sign = |request: &AccountApproval| key.sign(&account_approval_message(request).unwrap());
+
+    // A desktop device cannot even prepare a reset.
+    let desktop_key = SigningKey::from_bytes(&rand::random());
+    let (desktop, _) = register_device(
+        &db,
+        owner.id,
+        "fixture desktop",
+        Platform::Linux,
+        "ed25519",
+        &desktop_key.verifying_key().to_bytes(),
+    )
+    .await?;
+    assert!(request_action(
+        &db,
+        owner.id,
+        desktop.id,
+        AccountAction::PasswordReset,
+        owner.id,
+        Some(hash(recovered).await?)
+    )
+    .await
+    .is_err());
+
+    // Signing records the recovery but changes nothing yet.
+    recovery_available(&db, owner.id).await?;
+    let request = request_action(
+        &db,
+        owner.id,
+        device.id,
+        AccountAction::PasswordReset,
+        owner.id,
+        Some(hash(recovered).await?),
+    )
+    .await?;
+    let signature = sign(&request).to_bytes();
+    // A password-set signature over the same request is not a reset approval.
+    let as_set = AccountApproval {
+        action: AccountAction::PasswordSet,
+        ..request.clone()
+    };
+    assert!(approve_action(
+        &db,
+        request.request_id,
+        owner.id,
+        device.id,
+        &sign(&as_set).to_bytes()
+    )
+    .await
+    .is_err());
+    approve_action(&db, request.request_id, owner.id, device.id, &signature).await?;
+    assert!(authenticate(&db, &session.token).await.is_ok());
+    assert!(
+        approve_action(&db, request.request_id, owner.id, device.id, &signature)
+            .await
+            .is_err()
+    );
+    let pending = pending_recoveries(&db, owner.id).await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, request.request_id);
+    assert_eq!(pending[0].device_name, "fixture phone");
+    let shown = serde_json::to_string(&pending)?;
+    assert!(!shown.contains("argon2") && !shown.contains("nonce"));
+    // One pending recovery per owner.
+    assert!(recovery_available(&db, owner.id).await.is_err());
+
+    // Pending pairing and unlock requests are cancelled by the confirmation.
+    let candidate = SigningKey::from_bytes(&rand::random());
+    let pairing = create_pairing_request(
+        &db,
+        owner.id,
+        "candidate",
+        Platform::Android,
+        &candidate.verifying_key().to_bytes(),
+    )
+    .await?;
+    let (unlock, _) = create_unlock_request(&db, owner.id, desktop.id).await?;
+
+    assert!(deny_recovery(&db, owner.id, Uuid::now_v7()).await.is_err());
+    assert!(confirm_recovery(&db, owner.id, Uuid::now_v7())
+        .await
+        .is_err());
+    let other = create_user(&db, "other fixture owner").await?;
+    assert!(confirm_recovery(&db, other.id, request.request_id)
+        .await
+        .is_err());
+    confirm_recovery(&db, owner.id, request.request_id).await?;
+    assert!(confirm_recovery(&db, owner.id, request.request_id)
+        .await
+        .is_err());
+    assert!(authenticate(&db, &session.token).await.is_err());
+    assert_eq!(
+        pairing_request_status(&db, pairing.id, owner.id)
+            .await?
+            .as_deref(),
+        Some("denied")
+    );
+    assert_eq!(
+        unlock_request_status(&db, unlock, owner.id)
+            .await?
+            .as_deref(),
+        Some("denied")
+    );
+    assert!(pending_recoveries(&db, owner.id).await?.is_empty());
+    let verifiers: Option<i64> = db
+        .query("RETURN array::len(SELECT id FROM account_recoveries WHERE verifier IS NOT NONE)")
+        .await?
+        .take(0)?;
+    assert_eq!(verifiers, Some(0));
+    assert!(login_as(PASSWORD).await.is_err());
+    login_as(recovered).await?;
+
+    // At most one completed recovery per cooldown.
+    assert!(recovery_available(&db, owner.id).await.is_err());
+    db.query("UPDATE account_recoveries SET resolved_at = time::now() - 8d, created_at = time::now() - 8d")
+        .await?
+        .check()?;
+    let fresh = |db: &Database| {
+        let (db, key) = (db.clone(), key.clone());
+        async move {
+            let request = request_action(
+                &db,
+                owner.id,
+                device.id,
+                AccountAction::PasswordReset,
+                owner.id,
+                Some(
+                    PasswordService::shared()
+                        .hash(AccountPassword::new(
+                            "another fixture account password never used".to_owned(),
+                        )?)
+                        .await?,
+                ),
+            )
+            .await?;
+            let signature = key.sign(&account_approval_message(&request)?).to_bytes();
+            approve_action(&db, request.request_id, owner.id, device.id, &signature).await?;
+            Ok::<_, Box<dyn std::error::Error>>(request.request_id)
+        }
+    };
+
+    // Expired recoveries cannot be confirmed and free the pending slot.
+    let expired = fresh(&db).await?;
+    db.query(
+        "UPDATE account_recoveries SET expires_at = time::now() - 1s WHERE record::id(id) = $id",
+    )
+    .bind(("id", expired.to_string()))
+    .await?
+    .check()?;
+    assert!(pending_recoveries(&db, owner.id).await?.is_empty());
+    assert!(confirm_recovery(&db, owner.id, expired).await.is_err());
+
+    // A password change after signing makes the recovery stale.
+    let stale = fresh(&db).await?;
+    db.query("UPDATE account_passwords SET updated_at = time::now() + 1s")
+        .await?
+        .check()?;
+    assert!(confirm_recovery(&db, owner.id, stale).await.is_err());
+    deny_recovery(&db, owner.id, stale).await?;
+    assert!(deny_recovery(&db, owner.id, stale).await.is_err());
+    assert!(confirm_recovery(&db, owner.id, stale).await.is_err());
+
+    // A small number of signed requests per day.
+    let third = fresh(&db).await?;
+    deny_recovery(&db, owner.id, third).await?;
+    assert!(recovery_available(&db, owner.id).await.is_err());
+    assert!(fresh(&db).await.is_err());
+    Ok(())
+}

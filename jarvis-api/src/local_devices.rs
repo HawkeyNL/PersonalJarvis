@@ -147,6 +147,27 @@ async fn execute(
                 state.realtime.disconnect_owner(owner.id, Some(device_id));
                 ("local.device.revoke", json!({"status":"revoked"}))
             }),
+        DeviceRequest::RecoveryStatus {} => {
+            return Ok(
+                json!({"requests": local_devices::pending_recoveries(&state.db, peer).await?}),
+            );
+        }
+        DeviceRequest::RecoveryConfirm { request_id } => {
+            local_devices::confirm_recovery(&state.db, peer, request_id)
+                .await
+                .map(|owner| {
+                    state.realtime.disconnect_owner(owner.id, None);
+                    (
+                        "local.account.recovery.confirm",
+                        json!({"status":"confirmed"}),
+                    )
+                })
+        }
+        DeviceRequest::RecoveryDeny { request_id } => {
+            local_devices::deny_recovery(&state.db, peer, request_id)
+                .await
+                .map(|()| ("local.account.recovery.deny", json!({"status":"denied"})))
+        }
     };
     match result {
         Ok((action, value)) => {

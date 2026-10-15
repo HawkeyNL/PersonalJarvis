@@ -421,6 +421,25 @@ After activation, pin the new device for privileged changes with
 `sudo jarvis devices trust <device-uuid>` (see
 [Trusted device keys](#trusted-device-keys-for-privileged-changes)).
 
+### Forgotten account password
+
+A forgotten account password is reset from a signed-in iOS, Android or macOS
+approver device ("Forgot password?") and confirmed here:
+
+```bash
+sudo jarvis account recovery status            # pending id, device, expiry
+sudo jarvis account recovery confirm <request-uuid>   # asks; or --yes
+sudo jarvis account recovery deny <request-uuid>
+```
+
+The device signs a `password-reset` approval after a biometric prompt; the new
+password reaches Core only as its Argon2 verifier. Nothing changes until local
+root confirms the request shown on that device. A request expires after 15
+minutes; there is one pending request at a time, at most three signed requests
+per day and one completed recovery per seven days. Confirming sets the new
+password, ends every session and cancels pending pairing, unlock and account
+requests. Only confirm a reset you started yourself.
+
 ### Schema-changing releases
 
 Routine `update --latest` and `update --version` intentionally refuse a changed

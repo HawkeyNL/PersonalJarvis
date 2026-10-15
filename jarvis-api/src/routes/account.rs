@@ -30,6 +30,14 @@ pub(crate) struct PasswordChange {
     current_password: Option<AccountPassword>,
 }
 
+/// Forgotten-password recovery carries no current password: the device
+/// signature and local root confirmation on the Home Node replace it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PasswordReset {
+    password: AccountPassword,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Approval {
@@ -114,6 +122,64 @@ pub(crate) async fn password_request(
     Ok(Json(json!(request)))
 }
 
+pub(crate) async fn password_reset_request(
+    auth: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<PasswordReset>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let unavailable = || {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(
+                json!({"error":"account recovery unavailable; one is pending or the limit is reached"}),
+            ),
+        )
+    };
+    // Bounds password hashing by a session that cannot sign; the database
+    // enforces the per-day limit on signed recoveries.
+    if !state.rate_limiter.check(
+        &format!("account-recovery:{}", auth.user.id),
+        10,
+        std::time::Duration::from_secs(24 * 60 * 60),
+    ) {
+        return Err(unavailable());
+    }
+    account::recovery_available(&state.db, auth.user.id)
+        .await
+        .map_err(|_| unavailable())?;
+    let stored =
+        PasswordService::shared()
+            .hash(req.password)
+            .await
+            .map_err(|error| match error {
+                PasswordError::Common => bad_request("password is too common; choose another"),
+                _ => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error":"password service unavailable"})),
+                ),
+            })?;
+    // Refused for a device that cannot sign approvals.
+    let request = account::request_action(
+        &state.db,
+        auth.user.id,
+        auth.device.id,
+        AccountAction::PasswordReset,
+        auth.user.id,
+        Some(stored),
+    )
+    .await
+    .map_err(|_| unauthorized())?;
+    record_security_event(
+        &state,
+        Some(auth.device.id),
+        "account.recovery.request",
+        "prepared",
+        None,
+    )
+    .await;
+    Ok(Json(json!(request)))
+}
+
 pub(crate) async fn revoke_request(
     auth: Authed,
     State(state): State<AppState>,
@@ -155,10 +221,23 @@ pub(crate) async fn approve(
         .await;
         return Err(unauthorized());
     };
+    if approved.action == AccountAction::PasswordReset {
+        record_security_event(
+            &state,
+            Some(auth.device.id),
+            "account.recovery.request",
+            "signed",
+            None,
+        )
+        .await;
+        return Ok(Json(json!({"status":"pending_confirmation",
+            "request_id":approved.request_id,
+            "expires_in_seconds":account::RECOVERY_TTL_MINUTES * 60})));
+    }
     state.realtime.disconnect_owner(
         auth.user.id,
         match approved.action {
-            AccountAction::PasswordSet => None,
+            AccountAction::PasswordSet | AccountAction::PasswordReset => None,
             AccountAction::DeviceRevoke => Some(approved.target),
         },
     );
