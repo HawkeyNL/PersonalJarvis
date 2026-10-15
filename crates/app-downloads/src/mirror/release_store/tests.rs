@@ -276,6 +276,10 @@ fn altstore_source_lists_only_activated_retained_verified_releases_newest_first(
     let doc = source(&public);
     assert_eq!(doc["apps"][0]["bundleIdentifier"], "com.hawkeynl.jarvis");
     assert_eq!(
+        doc["apps"][0]["appPermissions"]["entitlements"],
+        serde_json::json!(["aps-environment"])
+    );
+    assert_eq!(
         doc["sourceURL"],
         "https://jarvis.example.com/downloads/altstore.json"
     );

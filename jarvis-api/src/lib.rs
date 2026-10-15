@@ -65,7 +65,8 @@ use routes::app_updates::{
 use routes::auth::{
     auth_bootstrap, auth_challenge, auth_enroll, auth_login, auth_logout, auth_me, delete_device,
     list_devices, pairing_approve, pairing_create, pairing_deny, pairing_pending, pairing_status,
-    unlock_approve, unlock_deny, unlock_pending, unlock_request, unlock_status,
+    push_target_delete, push_target_set, unlock_approve, unlock_deny, unlock_pending,
+    unlock_request, unlock_status,
 };
 use routes::broker::{ibkr_positions, ibkr_status};
 use routes::chat::{
@@ -143,6 +144,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/unlock/{id}/approve", post(unlock_approve))
         .route("/v1/auth/unlock/{id}/deny", post(unlock_deny))
         .route("/v1/devices", get(list_devices))
+        .route(
+            "/v1/devices/self/push",
+            put(push_target_set)
+                .delete(push_target_delete)
+                .layer(DefaultBodyLimit::max(1024)),
+        )
         .route("/v1/devices/{id}", delete(delete_device))
         .route("/v1/app-updates/capability", get(app_update_capability))
         .route(

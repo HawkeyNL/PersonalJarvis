@@ -279,7 +279,8 @@ pub async fn approve_action(
         AccountAction::DeviceRevoke => "UPDATE devices SET status = 'revoked', updated_at = time::now() \
             WHERE record::id(id) = $target AND user_id = $user; \
             UPDATE device_keys SET revoked_at = time::now() WHERE device_id = $target AND revoked_at IS NONE; \
-            UPDATE sessions SET revoked_at = time::now() WHERE device_id = $target AND user_id = $user AND revoked_at IS NONE;",
+            UPDATE sessions SET revoked_at = time::now() WHERE device_id = $target AND user_id = $user AND revoked_at IS NONE; \
+            DELETE device_push_targets WHERE device_id = $target;",
     };
     let query = format!("BEGIN TRANSACTION; \
         LET $active = SELECT id FROM devices WHERE record::id(id) = $device AND user_id = $user AND status = 'active'; \

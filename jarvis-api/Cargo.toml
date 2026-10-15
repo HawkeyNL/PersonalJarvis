@@ -66,8 +66,12 @@ url.workspace = true
 libc = "0.2"
 tempfile = "3"
 surrealdb.workspace = true
+# ES256 provider tokens for APNs (already in the tree through surrealdb).
+jsonwebtoken = "9.3"
 
 [dev-dependencies]
+# Generates a throwaway P-256 key for the APNs tests (already in the tree).
+ring = "0.17"
 async-trait = "0.1"
 tokio-tungstenite = "0.29"
 futures-util = "0.3"

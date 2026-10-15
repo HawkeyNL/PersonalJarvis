@@ -26,7 +26,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 10);
+    assert_eq!(version.unwrap().version, 13);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
@@ -39,12 +39,34 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     db.use_db("from_nine").await?;
     apply_through_nine(&db).await?;
     apply_baseline_schema(&db).await?;
+    db.use_db("from_ten").await?;
+    apply_through_ten(&db).await?;
+    apply_baseline_schema(&db).await?;
     let mut migrated = db
         .query("SELECT version FROM schema_version:baseline")
         .await?
         .check()?;
     let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
-    assert_eq!(migrated_version.unwrap().version, 10);
+    assert_eq!(migrated_version.unwrap().version, 13);
+    // One push target per device; malformed kinds, tokens and environments
+    // are refused by the schema itself.
+    let token = "ab".repeat(32);
+    let create = |device: &str, kind: &str, target: &str, env: &str| {
+        format!("CREATE device_push_targets SET id = '{device}', device_id = '{device}', kind = '{kind}', target = '{target}', apns_env = '{env}', updated_at = time::now();")
+    };
+    db.query(create("d", "apns", &token, "sandbox"))
+        .await?
+        .check()?;
+    for bad in [
+        // A second row for the same device.
+        create("e", "apns", &token, "sandbox").replace("device_id = 'e'", "device_id = 'd'"),
+        create("e", "fcm", &token, "sandbox"),
+        create("e", "apns", &"ab".repeat(16), "sandbox"),
+        create("e", "apns", &"ab".repeat(101), "sandbox"),
+        create("e", "apns", &token, "development"),
+    ] {
+        assert!(db.query(&bad).await?.check().is_err(), "{bad}");
+    }
     db.query("UPDATE schema_version:baseline SET version = 99;")
         .await?
         .check()?;
