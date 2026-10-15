@@ -32,6 +32,9 @@ const QUEUE_CAPACITY: usize = 16;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_ATTEMPTS: u32 = 3;
+/// Longest one event may spend on app pushes, so an unreachable APNs never
+/// holds the worker past the approval's two-minute lifetime.
+const APP_PUSH_BUDGET: Duration = Duration::from_secs(30);
 /// At most one push per event kind in this window; bursts collapse.
 const MIN_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_TOKEN_BYTES: usize = 256;
@@ -127,7 +130,9 @@ pub struct Notifier {
 
 struct Inner {
     queue: mpsc::Sender<Job>,
-    last_sent: Mutex<HashMap<NotifyEvent, Instant>>,
+    /// Per kind and requesting device, so one device's request never hides
+    /// another's.
+    last_sent: Mutex<HashMap<(NotifyEvent, Option<Uuid>), Instant>>,
     /// (year, month) in UTC of the last budget notification, matching the
     /// calendar month `jarvis_usage::month_total_eur` sums over.
     budget_month: Mutex<Option<(i32, u8)>>,
@@ -181,6 +186,7 @@ impl Notifier {
 
     fn enqueue(&self, job: Job) {
         let event = job.event;
+        let key = (event, job.audience.and_then(|audience| audience.except));
         let Some(inner) = &self.inner else {
             return;
         };
@@ -191,12 +197,12 @@ impl Notifier {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             if last
-                .get(&event)
+                .get(&key)
                 .is_some_and(|at| now.duration_since(*at) < MIN_INTERVAL)
             {
                 return;
             }
-            last.insert(event, now);
+            last.insert(key, now);
         }
         if inner.queue.try_send(job).is_err() {
             let dropped = inner.dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -280,7 +286,15 @@ async fn run(
         // The app push first: an approval expires in two minutes, and a slow
         // ntfy must not hold it back.
         if let (Some(apns), Some(audience)) = (apns.as_mut(), job.audience) {
-            apns.send(job.event, audience, backoff).await;
+            if tokio::time::timeout(APP_PUSH_BUDGET, apns.send(job.event, audience, backoff))
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    kind = job.event.kind(),
+                    "app push gave up after its time budget"
+                );
+            }
         }
         if let Some(ntfy) = &ntfy {
             publish_with_retry(&client, ntfy, job.event, backoff).await;
@@ -577,8 +591,11 @@ mod tests {
         let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
         notifier.notify_approval(NotifyEvent::UnlockRequested, user, Some(device));
         notifier.notify(NotifyEvent::BudgetNinetyPercent);
-        // Coalesced per kind, whichever entry point is used.
-        notifier.notify_approval(NotifyEvent::UnlockRequested, user, None);
+        // Coalesced per kind and requesting device; another device's request
+        // still goes out.
+        notifier.notify_approval(NotifyEvent::UnlockRequested, user, Some(device));
+        let other = Uuid::now_v7();
+        notifier.notify_approval(NotifyEvent::UnlockRequested, user, Some(other));
         assert_eq!(
             receiver.try_recv(),
             Ok(Job {
@@ -595,6 +612,13 @@ mod tests {
                 event: NotifyEvent::BudgetNinetyPercent,
                 audience: None,
             })
+        );
+        assert_eq!(
+            receiver.try_recv().map(|job| job.audience),
+            Ok(Some(Audience {
+                user,
+                except: Some(other)
+            }))
         );
         assert!(receiver.try_recv().is_err());
     }

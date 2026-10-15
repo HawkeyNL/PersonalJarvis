@@ -50,7 +50,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     assert_eq!(migrated_version.unwrap().version, 13);
     // One push target per device; malformed kinds, tokens and environments
     // are refused by the schema itself.
-    let token = "ab".repeat(32);
+    let (token, other) = ("ab".repeat(32), "cd".repeat(32));
     let create = |device: &str, kind: &str, target: &str, env: &str| {
         format!("CREATE device_push_targets SET id = '{device}', device_id = '{device}', kind = '{kind}', target = '{target}', apns_env = '{env}', updated_at = time::now();")
     };
@@ -59,14 +59,19 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .check()?;
     for bad in [
         // A second row for the same device.
-        create("e", "apns", &token, "sandbox").replace("device_id = 'e'", "device_id = 'd'"),
-        create("e", "fcm", &token, "sandbox"),
+        create("e", "apns", &other, "sandbox").replace("device_id = 'e'", "device_id = 'd'"),
+        // The same token on a second device.
+        create("e", "apns", &token, "sandbox"),
+        create("e", "fcm", &other, "sandbox"),
         create("e", "apns", &"ab".repeat(16), "sandbox"),
         create("e", "apns", &"ab".repeat(101), "sandbox"),
-        create("e", "apns", &token, "development"),
+        create("e", "apns", &other, "development"),
     ] {
         assert!(db.query(&bad).await?.check().is_err(), "{bad}");
     }
+    db.query(create("e", "apns", &other, "production"))
+        .await?
+        .check()?;
     db.query("UPDATE schema_version:baseline SET version = 99;")
         .await?
         .check()?;

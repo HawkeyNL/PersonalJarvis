@@ -13,6 +13,6 @@ DEFINE FIELD target ON device_push_targets TYPE string ASSERT string::len($value
 DEFINE FIELD apns_env ON device_push_targets TYPE string ASSERT $value IN ['sandbox', 'production'];
 DEFINE FIELD updated_at ON device_push_targets TYPE datetime;
 DEFINE INDEX IF NOT EXISTS device_push_targets_device ON device_push_targets FIELDS device_id UNIQUE;
-DEFINE INDEX IF NOT EXISTS device_push_targets_target ON device_push_targets FIELDS target;
+DEFINE INDEX IF NOT EXISTS device_push_targets_target ON device_push_targets FIELDS target UNIQUE;
 UPDATE schema_version:baseline SET version = 13, applied_at = time::now();
 COMMIT TRANSACTION;
