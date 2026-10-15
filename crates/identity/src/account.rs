@@ -273,6 +273,14 @@ pub async fn approve_action(
     let message = account_approval_message(&challenge).map_err(|_| IdentityError::AuthFailed)?;
     verify_device_signature(db, user, device, &message, signature).await?;
     let recovery = record_recovery();
+    // A password change or a revoked signing device makes a pending recovery stale.
+    let cancel_recovery = match action {
+        AccountAction::PasswordSet => format!("{CANCEL_RECOVERIES} WHERE user_id = $user AND status = 'pending' RETURN NONE;"),
+        AccountAction::DeviceRevoke => format!(
+            "{CANCEL_RECOVERIES} WHERE user_id = $user AND device_id = $target AND status = 'pending' RETURN NONE;"
+        ),
+        AccountAction::PasswordReset => String::new(),
+    };
     let mutation = match action {
         // Bootstrap stores the first verifier under a generated record id:
         // replace the owner's row wherever it lives (the owner index is UNIQUE).
@@ -301,7 +309,7 @@ pub async fn approve_action(
         WHERE record::id(id) = $id AND user_id = $user AND device_id = $device \
         AND action = $action AND target = $target AND consumed_at IS NONE AND expires_at > time::now() RETURN AFTER; \
         IF array::len($claim) != 1 {{ THROW 'account action unavailable'; }}; \
-        {mutation} DELETE account_actions WHERE record::id(id) = $id; COMMIT TRANSACTION;");
+        {mutation} {cancel_recovery} DELETE account_actions WHERE record::id(id) = $id; COMMIT TRANSACTION;");
     execute(
         db,
         &query,
@@ -327,6 +335,11 @@ pub const RECOVERY_REQUESTS_PER_DAY: u32 = 3;
 /// `slot` is the owner id while pending and the record id afterwards: the
 /// UNIQUE index then allows one pending recovery per owner even when two
 /// approvals race. Resolving always drops the stored verifier.
+const CANCEL_RECOVERIES: &str =
+    "UPDATE account_recoveries SET status = 'expired', verifier = NONE, \
+    slot = record::id(id), resolved_at = time::now()";
+
+/// Run by every recovery operation, so an expired verifier does not linger.
 const EXPIRE_RECOVERIES: &str = "UPDATE account_recoveries SET status = 'expired', verifier = NONE, \
     slot = record::id(id), resolved_at = time::now() WHERE status = 'pending' AND expires_at <= time::now() RETURN NONE;";
 
@@ -358,7 +371,12 @@ fn record_recovery() -> String {
 /// A cheap pre-check so a refused recovery costs no password hashing. The
 /// signed approval and the root confirmation enforce the same limits again.
 pub async fn recovery_available(db: &Database, user_id: Uuid) -> Result<(), IdentityError> {
-    execute(db, &recovery_guard(), json!({"user": user_id.to_string()})).await
+    execute(
+        db,
+        &format!("{EXPIRE_RECOVERIES} {}", recovery_guard()),
+        json!({"user": user_id.to_string()}),
+    )
+    .await
 }
 
 #[derive(serde::Deserialize)]
@@ -392,6 +410,7 @@ pub(crate) async fn pending_recoveries(
     db: &Database,
     user_id: Uuid,
 ) -> Result<Vec<PendingRecovery>, IdentityError> {
+    execute(db, EXPIRE_RECOVERIES, json!({})).await?;
     let rows: Vec<RecoveryRow> = many(
         db,
         "SELECT record::id(id) AS id, device_id, created_at, expires_at FROM account_recoveries \
@@ -420,7 +439,9 @@ pub(crate) async fn pending_recoveries(
 }
 
 /// Sets the recovered password, ends every session and cancels pending
-/// pairing, unlock and account requests in one transaction. Refused when the
+/// pairing, unlock and account requests in one transaction. Writing the
+/// signing device's row makes a concurrent revocation conflict instead of
+/// passing unnoticed. Refused when the
 /// recovery expired, its device is no longer active, the password changed
 /// after it was signed, or another recovery completed within the cooldown.
 pub(crate) async fn confirm_recovery(
@@ -428,6 +449,7 @@ pub(crate) async fn confirm_recovery(
     user_id: Uuid,
     id: Uuid,
 ) -> Result<(), IdentityError> {
+    execute(db, EXPIRE_RECOVERIES, json!({})).await?;
     execute(
         db,
         &format!(
@@ -438,8 +460,9 @@ pub(crate) async fn confirm_recovery(
                 slot = record::id(id), resolved_at = time::now() WHERE record::id(id) = $id AND user_id = $user \
                 AND status = 'pending' AND expires_at > time::now() RETURN BEFORE; \
             IF array::len($claim) != 1 {{ THROW 'recovery unavailable'; }}; \
-            IF array::len(SELECT id FROM devices WHERE record::id(id) = $claim[0].device_id AND user_id = $user \
-                AND status = 'active') != 1 {{ THROW 'recovery unavailable'; }}; \
+            LET $device = UPDATE devices SET updated_at = time::now() WHERE record::id(id) = $claim[0].device_id \
+                AND user_id = $user AND status = 'active' RETURN VALUE record::id(id); \
+            IF array::len($device) != 1 {{ THROW 'recovery unavailable'; }}; \
             IF array::len(SELECT id FROM account_passwords WHERE user_id = $user \
                 AND updated_at > $claim[0].created_at) != 0 {{ THROW 'recovery unavailable'; }}; \
             LET $set = UPDATE account_passwords SET verifier = $claim[0].verifier, revision = $id, \
@@ -463,6 +486,7 @@ pub(crate) async fn deny_recovery(
     user_id: Uuid,
     id: Uuid,
 ) -> Result<(), IdentityError> {
+    execute(db, EXPIRE_RECOVERIES, json!({})).await?;
     let claimed: Option<ClaimedRecord> = one(
         db,
         "UPDATE account_recoveries SET status = 'denied', verifier = NONE, slot = record::id(id), \

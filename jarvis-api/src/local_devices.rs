@@ -96,6 +96,17 @@ async fn execute(
     request: DeviceRequest,
 ) -> anyhow::Result<Value> {
     let owner = jarvis_identity::first_user(&state.db).await?;
+    // Recovery events name the request; it is not secret.
+    let (failure, detail) = match &request {
+        DeviceRequest::RecoveryConfirm { request_id } => (
+            "local.account.recovery.confirm",
+            Some(request_id.to_string()),
+        ),
+        DeviceRequest::RecoveryDeny { request_id } => {
+            ("local.account.recovery.deny", Some(request_id.to_string()))
+        }
+        _ => ("local.device.mutation", None),
+    };
     let result = match request {
         DeviceRequest::List {} => {
             let mut devices = Vec::new();
@@ -171,11 +182,11 @@ async fn execute(
     };
     match result {
         Ok((action, value)) => {
-            record_security_event(state, None, action, "ok", None).await;
+            record_security_event(state, None, action, "ok", detail.as_deref()).await;
             Ok(value)
         }
         Err(error) => {
-            record_security_event(state, None, "local.device.mutation", "denied", None).await;
+            record_security_event(state, None, failure, "denied", detail.as_deref()).await;
             Err(error.into())
         }
     }

@@ -371,6 +371,30 @@ async fn password_recovery_needs_signature_and_root_confirmation(
     .await
     .is_err());
 
+    // A reset signature over a password-set request does not approve it.
+    let set = request_action(
+        &db,
+        owner.id,
+        device.id,
+        AccountAction::PasswordSet,
+        owner.id,
+        Some(hash(recovered).await?),
+    )
+    .await?;
+    let as_reset = AccountApproval {
+        action: AccountAction::PasswordReset,
+        ..set.clone()
+    };
+    assert!(approve_action(
+        &db,
+        set.request_id,
+        owner.id,
+        device.id,
+        &sign(&as_reset).to_bytes()
+    )
+    .await
+    .is_err());
+
     // Signing records the recovery but changes nothing yet.
     recovery_available(&db, owner.id).await?;
     let request = request_action(
@@ -459,18 +483,13 @@ async fn password_recovery_needs_signature_and_root_confirmation(
     assert!(login_as(PASSWORD).await.is_err());
     login_as(recovered).await?;
 
-    // At most one completed recovery per cooldown.
-    assert!(recovery_available(&db, owner.id).await.is_err());
-    db.query("UPDATE account_recoveries SET resolved_at = time::now() - 8d, created_at = time::now() - 8d")
-        .await?
-        .check()?;
-    let fresh = |db: &Database| {
-        let (db, key) = (db.clone(), key.clone());
+    let fresh = |device: Uuid, key: SigningKey| {
+        let db = db.clone();
         async move {
             let request = request_action(
                 &db,
                 owner.id,
-                device.id,
+                device,
                 AccountAction::PasswordReset,
                 owner.id,
                 Some(
@@ -483,13 +502,29 @@ async fn password_recovery_needs_signature_and_root_confirmation(
             )
             .await?;
             let signature = key.sign(&account_approval_message(&request)?).to_bytes();
-            approve_action(&db, request.request_id, owner.id, device.id, &signature).await?;
+            approve_action(&db, request.request_id, owner.id, device, &signature).await?;
             Ok::<_, Box<dyn std::error::Error>>(request.request_id)
         }
     };
+    let verifiers = || async {
+        let count: Option<i64> = db
+            .query(
+                "RETURN array::len(SELECT id FROM account_recoveries WHERE verifier IS NOT NONE)",
+            )
+            .await?
+            .take(0)?;
+        Ok::<_, Box<dyn std::error::Error>>(count)
+    };
 
-    // Expired recoveries cannot be confirmed and free the pending slot.
-    let expired = fresh(&db).await?;
+    // At most one completed recovery per cooldown, also on the signing path.
+    assert!(recovery_available(&db, owner.id).await.is_err());
+    assert!(fresh(device.id, key.clone()).await.is_err());
+    db.query("UPDATE account_recoveries SET resolved_at = time::now() - 8d, created_at = time::now() - 8d")
+        .await?
+        .check()?;
+
+    // Expired recoveries cannot be confirmed, free the slot and drop the verifier.
+    let expired = fresh(device.id, key.clone()).await?;
     db.query(
         "UPDATE account_recoveries SET expires_at = time::now() - 1s WHERE record::id(id) = $id",
     )
@@ -497,22 +532,75 @@ async fn password_recovery_needs_signature_and_root_confirmation(
     .await?
     .check()?;
     assert!(pending_recoveries(&db, owner.id).await?.is_empty());
+    assert_eq!(verifiers().await?, Some(0));
     assert!(confirm_recovery(&db, owner.id, expired).await.is_err());
 
-    // A password change after signing makes the recovery stale.
-    let stale = fresh(&db).await?;
-    db.query("UPDATE account_passwords SET updated_at = time::now() + 1s")
+    // The cooldown is enforced again at confirmation.
+    let stale = fresh(device.id, key.clone()).await?;
+    db.query("CREATE account_recoveries SET id = 'recent', user_id = $user, device_id = $device, slot = 'recent', verifier = NONE, status = 'confirmed', created_at = time::now(), expires_at = time::now(), resolved_at = time::now()")
+        .bind(("user", owner.id.to_string()))
+        .bind(("device", device.id.to_string()))
         .await?
         .check()?;
     assert!(confirm_recovery(&db, owner.id, stale).await.is_err());
-    deny_recovery(&db, owner.id, stale).await?;
-    assert!(deny_recovery(&db, owner.id, stale).await.is_err());
+    db.query("DELETE account_recoveries:recent")
+        .await?
+        .check()?;
+
+    // A signed password change cancels the pending recovery.
+    let set = request_action(
+        &db,
+        owner.id,
+        device.id,
+        AccountAction::PasswordSet,
+        owner.id,
+        Some(hash(PASSWORD).await?),
+    )
+    .await?;
+    approve_action(
+        &db,
+        set.request_id,
+        owner.id,
+        device.id,
+        &sign(&set).to_bytes(),
+    )
+    .await?;
+    assert!(pending_recoveries(&db, owner.id).await?.is_empty());
+    assert_eq!(verifiers().await?, Some(0));
     assert!(confirm_recovery(&db, owner.id, stale).await.is_err());
+    assert!(deny_recovery(&db, owner.id, stale).await.is_err());
+
+    // Deny is one-use and drops the verifier.
+    let android_key = SigningKey::from_bytes(&rand::random());
+    let (android, _) = register_device(
+        &db,
+        owner.id,
+        "fixture tablet",
+        Platform::Android,
+        "ed25519",
+        &android_key.verifying_key().to_bytes(),
+    )
+    .await?;
+    let third = fresh(android.id, android_key.clone()).await?;
+    deny_recovery(&db, owner.id, third).await?;
+    assert!(deny_recovery(&db, owner.id, third).await.is_err());
+    assert!(confirm_recovery(&db, owner.id, third).await.is_err());
+    assert_eq!(verifiers().await?, Some(0));
 
     // A small number of signed requests per day.
-    let third = fresh(&db).await?;
-    deny_recovery(&db, owner.id, third).await?;
     assert!(recovery_available(&db, owner.id).await.is_err());
-    assert!(fresh(&db).await.is_err());
+    assert!(fresh(device.id, key.clone()).await.is_err());
+
+    // Revoking the signing device cancels its pending recovery.
+    db.query(
+        "UPDATE account_recoveries SET created_at = time::now() - 2d WHERE status != 'confirmed'",
+    )
+    .await?
+    .check()?;
+    let revoked = fresh(android.id, android_key).await?;
+    revoke_device(&db, android.id).await?;
+    assert!(pending_recoveries(&db, owner.id).await?.is_empty());
+    assert!(confirm_recovery(&db, owner.id, revoked).await.is_err());
+    assert_eq!(verifiers().await?, Some(0));
     Ok(())
 }

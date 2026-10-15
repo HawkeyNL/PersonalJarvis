@@ -536,6 +536,8 @@ pub async fn revoke_device(db: &Database, device_id: Uuid) -> Result<(), Identit
              UPDATE devices SET status = 'revoked', updated_at = time::now() WHERE record::id(id) = $id; \
              UPDATE device_keys SET revoked_at = time::now() WHERE device_id = $id AND revoked_at IS NONE; \
              UPDATE sessions SET revoked_at = time::now() WHERE device_id = $id AND revoked_at IS NONE; \
+             UPDATE account_recoveries SET status = 'expired', verifier = NONE, slot = record::id(id), \
+             resolved_at = time::now() WHERE device_id = $id AND status = 'pending' RETURN NONE; \
              COMMIT TRANSACTION;",
         )
         .bind(json!({ "id": device_id.to_string() }))
@@ -811,7 +813,7 @@ pub async fn revoke_session(db: &Database, session_id: Uuid) -> Result<(), Ident
 /// macOS app requires Touch ID without a password fallback. Linux and Windows
 /// cannot enforce a biometric-only prompt, so they never sign these approvals
 /// (broker approvals use their own trusted-key check).
-const APPROVER_PLATFORMS: [&str; 3] = ["ios", "android", "macos"];
+pub const APPROVER_PLATFORMS: [&str; 3] = ["ios", "android", "macos"];
 
 pub async fn verify_device_signature(
     db: &Database,

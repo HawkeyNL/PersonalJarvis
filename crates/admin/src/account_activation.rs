@@ -56,9 +56,8 @@ pub enum RecoveryCommand {
         #[arg(long)]
         yes: bool,
     },
-    Deny {
-        request_id: Uuid,
-    },
+    /// Refuse a pending reset; nothing changes.
+    Deny { request_id: Uuid },
 }
 
 pub fn run(command: AccountCommand, json: bool) -> Result<()> {
@@ -138,16 +137,23 @@ fn recovery(command: RecoveryCommand, json: bool) -> Result<()> {
         bail!("JSON mode is read-only");
     }
     match command {
-        RecoveryCommand::Status => print(&exchange(&DeviceRequest::RecoveryStatus {})?),
+        RecoveryCommand::Status if json => print(&exchange(&DeviceRequest::RecoveryStatus {})?),
+        RecoveryCommand::Status => {
+            let pending =
+                PendingRecoveries::deserialize(exchange(&DeviceRequest::RecoveryStatus {})?)
+                    .context("invalid recovery status from Core")?;
+            if pending.requests.is_empty() {
+                println!("No pending password reset.");
+            }
+            for request in &pending.requests {
+                println!("{}", describe(request));
+            }
+            Ok(())
+        }
         RecoveryCommand::Confirm { request_id, yes } => {
             let pending = exchange(&DeviceRequest::RecoveryStatus {})?;
             let request = pending_request(&pending, request_id)?;
-            println!(
-                "{request_id}  from {} ({}), expires {}",
-                shown(&request.device_name),
-                shown(&request.platform),
-                request.expires_at
-            );
+            println!("{}", describe(&request));
             if !yes {
                 crate::confirm("Only confirm a reset you started on this device. Set the new password and sign out every device?")?;
             }
@@ -169,7 +175,20 @@ struct PendingRecovery {
     id: Uuid,
     device_name: String,
     platform: String,
+    created_at: String,
     expires_at: String,
+}
+
+/// Device names come from remote clients: `shown` escapes bidi and controls.
+fn describe(request: &PendingRecovery) -> String {
+    format!(
+        "{}  from {} ({}), created {}, expires {}",
+        request.id,
+        shown(&request.device_name),
+        shown(&request.platform),
+        shown(&request.created_at),
+        shown(&request.expires_at)
+    )
 }
 
 fn pending_request(data: &serde_json::Value, request_id: Uuid) -> Result<PendingRecovery> {
@@ -207,7 +226,9 @@ mod tests {
         let data = serde_json::json!({"requests":[{"id":id,"device_id":Uuid::nil(),
             "device_name":"phone","platform":"ios","created_at":"2026-10-15T10:00:00Z",
             "expires_at":"2026-10-15T10:15:00Z"}]});
-        assert_eq!(pending_request(&data, id).unwrap().device_name, "phone");
+        let request = pending_request(&data, id).unwrap();
+        assert_eq!(request.device_name, "phone");
+        assert!(describe(&request).starts_with(&format!("{id}  from \"phone\" (\"ios\")")));
         assert!(pending_request(&data, Uuid::from_u128(8)).is_err());
         assert!(pending_request(&serde_json::json!({}), id).is_err());
     }

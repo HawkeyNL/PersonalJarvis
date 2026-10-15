@@ -135,18 +135,23 @@ pub(crate) async fn password_reset_request(
             ),
         )
     };
-    // Bounds password hashing by a session that cannot sign; the database
-    // enforces the per-day limit on signed recoveries.
+    // Only a device that can sign the approval may start a recovery (checked
+    // again when the request is stored and when it is signed).
+    if !jarvis_identity::surreal::APPROVER_PLATFORMS.contains(&auth.device.platform.as_str()) {
+        return Err(unauthorized());
+    }
+    account::recovery_available(&state.db, auth.user.id)
+        .await
+        .map_err(|_| unavailable())?;
+    // Bounds password hashing by unsigned requests from this device; the
+    // database enforces the per-day limit on signed recoveries.
     if !state.rate_limiter.check(
-        &format!("account-recovery:{}", auth.user.id),
+        &format!("account-recovery:{}", auth.device.id),
         10,
         std::time::Duration::from_secs(24 * 60 * 60),
     ) {
         return Err(unavailable());
     }
-    account::recovery_available(&state.db, auth.user.id)
-        .await
-        .map_err(|_| unavailable())?;
     let stored =
         PasswordService::shared()
             .hash(req.password)
