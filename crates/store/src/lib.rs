@@ -105,6 +105,22 @@ async fn schema_version(db: &Database) -> Result<Option<SchemaVersion>, StoreErr
 /// Node only. Later schema changes must be explicit, versioned migrations.
 pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
     let current = schema_version(db).await?;
+    if current.is_some_and(|v| v.version == 11) {
+        return Ok(());
+    }
+    apply_through_ten(db).await?;
+    db.query(include_str!(
+        "../../../schema/surreal/0011_account_recovery.surql"
+    ))
+    .await
+    .map_err(StoreError::schema)?
+    .check()
+    .map_err(StoreError::schema)?;
+    Ok(())
+}
+
+async fn apply_through_ten(db: &Database) -> Result<(), StoreError> {
+    let current = schema_version(db).await?;
     if current.is_some_and(|v| v.version == 10) {
         return Ok(());
     }
