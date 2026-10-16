@@ -78,6 +78,21 @@ fn approval_message(
     jarvis_client_core::agent_approval_message(pending_id, nonce, &action_sha256, device_id).ok()
 }
 
+/// Whether a device on `platform` may approve `action`. The macOS app shows the
+/// full action; a phone approves only the kinds it can render and only actions
+/// small enough to be listed in full. Any other platform or kind is refused.
+fn approvable_on(platform: &str, action: &agent::Action, action_json: &str) -> bool {
+    match platform {
+        "macos" => true,
+        "ios" | "android" => {
+            jarvis_client_core::MOBILE_APPROVABLE_AGENT_ACTIONS
+                .contains(&agent::action_type(action))
+                && action_json.len() <= jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN
+        }
+        _ => false,
+    }
+}
+
 /// Run a single read-only agent action (ADR-029 phase 4a). Gated by the kill
 /// switch + a configured sandbox; only `Auto` (read-only) actions run; every
 /// attempt — ok, denied, or error — is written to the append-only audit log.
@@ -223,9 +238,15 @@ pub(crate) async fn agent_pending(authed: Authed, State(state): State<AppState>)
     let entries: Vec<Value> = rows
         .into_iter()
         .map(|row| {
+            // The exact bytes `action_sha256` hashes, so an approver can show and
+            // re-hash them; omitted (null) when too large to review on a phone.
+            let action_json = (row.action.len()
+                <= jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN)
+                .then_some(row.action.as_str());
             json!({ "pending_id": row.id, "action": row.action_type, "preview": row.preview,
                 "nonce": hex::encode(row.nonce),
                 "action_sha256": hex::encode(Sha256::digest(row.action.as_bytes())),
+                "action_json": action_json,
                 "approval_message": jarvis_client_core::AGENT_APPROVAL_MESSAGE_V1,
                 "created_at": row.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() })
         })
@@ -281,6 +302,19 @@ pub(crate) async fn agent_pending_approve(
         )
     })?;
 
+    let action: agent::Action = serde_json::from_str(&action_json).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "corrupt pending action" })),
+        )
+    })?;
+    if !approvable_on(&authed.device.platform, &action, &action_json) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "this action cannot be approved on this device" })),
+        ));
+    }
+
     // Verify the owner's device signature over the action-bound v1 message.
     let message =
         approval_message(id, &nonce, &action_json, authed.device.id).ok_or_else(|| {
@@ -318,13 +352,6 @@ pub(crate) async fn agent_pending_approve(
             Json(json!({ "error": "already resolved" })),
         ));
     }
-
-    let action: agent::Action = serde_json::from_str(&action_json).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "corrupt pending action" })),
-        )
-    })?;
 
     match agent::execute(&sandbox, &action).await {
         Ok(outcome) => {
@@ -441,6 +468,60 @@ mod tests {
             assert!(!verify(&other.unwrap(), &signature));
         }
         assert!(approval_message(id, &nonce[..31], action, device).is_none());
+    }
+
+    #[test]
+    fn phones_approve_only_listed_kinds_they_can_show_in_full() {
+        let write = |content: String| agent::Action::WriteFile {
+            path: "note.txt".into(),
+            content,
+        };
+        let json = |action: &agent::Action| serde_json::to_string(action).unwrap();
+        let small = write("ok".into());
+        let commit = agent::Action::GitCommit {
+            message: "x".into(),
+        };
+        let code = agent::Action::ClaudeCode { prompt: "x".into() };
+        let large = write("x".repeat(jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN));
+        for phone in ["ios", "android"] {
+            assert!(approvable_on(phone, &small, &json(&small)));
+            assert!(approvable_on(phone, &commit, &json(&commit)));
+            assert!(!approvable_on(phone, &code, &json(&code)));
+            assert!(!approvable_on(phone, &large, &json(&large)));
+        }
+        for action in [&small, &commit, &code, &large] {
+            assert!(approvable_on("macos", action, &json(action)));
+            for other in ["linux", "windows", "", "iOS"] {
+                assert!(!approvable_on(other, action, &json(action)));
+            }
+        }
+    }
+
+    /// serde_json's escaping, which the phone apps re-create to hash what they
+    /// show: `"`, `\\`, \b \f \n \r \t, other controls as lowercase `\u00xx`;
+    /// DEL, `/`, U+2028 and non-ASCII stay raw UTF-8.
+    #[test]
+    fn stored_action_json_escaping_matches_the_mobile_vector() {
+        let action = agent::Action::WriteFile {
+            path: "a/\"b\".txt".into(),
+            content: "\\\u{8}\u{c}\n\r\t\u{1}\u{1f}\u{7f}é\u{2028}😀".into(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(
+            json,
+            "{\"type\":\"write_file\",\"path\":\"a/\\\"b\\\".txt\",\"content\":\"\\\\\\b\\f\\n\\r\\t\\u0001\\u001f\u{7f}é\u{2028}😀\"}"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(json.as_bytes())),
+            "e151c338cf311d5531b50c2451032bb04fe5bb8e6bfb5e6ab6535a1080f51aa5"
+        );
+        let commit = agent::Action::GitCommit {
+            message: "Fix \"x\"\n\nBody".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&commit).unwrap(),
+            r#"{"type":"git_commit","message":"Fix \"x\"\n\nBody"}"#
+        );
     }
 
     #[test]

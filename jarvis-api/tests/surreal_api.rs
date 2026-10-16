@@ -1031,8 +1031,51 @@ async fn signed_agent_approval_is_single_use_and_core_stays_denied(
             br#"{"type":"write_file","path":"note.txt","content":"ok"}"#
         ))
     );
+    // The list carries the exact bytes `action_sha256` hashes.
+    assert_eq!(
+        a_entry["action_json"],
+        r#"{"type":"write_file","path":"note.txt","content":"ok"}"#
+    );
     let a_signature = sign_listed(&listed, &a_id);
     let b_signature = sign_listed(&listed, &b_id);
+
+    // A phone cannot approve an action too large to list in full, nor a kind
+    // outside the mobile allowlist, even with a valid signature.
+    let large = json_body(
+        app.clone()
+            .oneshot(propose(
+                &"x".repeat(jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let large_id = large["pending_id"].as_str().unwrap().to_string();
+    let other = json_body(app.clone().oneshot(propose("kind")).await.unwrap()).await;
+    let other_id = other["pending_id"].as_str().unwrap().to_string();
+    db.query("UPDATE agent_pending_actions SET action = $action WHERE record::id(id) = $id")
+        .bind(json!({"id": other_id, "action": r#"{"type":"claude_code","prompt":"x"}"#}))
+        .await?
+        .check()?;
+    let listed = json_body(app.clone().oneshot(list()).await.unwrap()).await;
+    let large_entry = listed["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["pending_id"] == large_id.as_str())
+        .unwrap();
+    assert!(large_entry["action_json"].is_null());
+    for id in [&large_id, &other_id] {
+        let signature = sign_listed(&listed, id);
+        assert_eq!(
+            app.clone()
+                .oneshot(approve(id, &signature))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
 
     // A login/unlock-style raw nonce signature is refused.
     let raw = hex::encode(
