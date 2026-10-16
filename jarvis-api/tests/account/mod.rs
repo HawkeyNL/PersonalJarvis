@@ -415,3 +415,32 @@ async fn password_reset_waits_for_local_confirmation_after_signing(
     assert_eq!(again.status(), StatusCode::TOO_MANY_REQUESTS);
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn last_approver_revoke_request_is_a_conflict() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!(
+        "last_approver_http_{}",
+        uuid::Uuid::now_v7().simple()
+    ))
+    .use_db("fixture")
+    .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db.clone(), None).await);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let auth = jarvis_identity::authenticate(&db, &token).await?;
+    let path = format!("/v1/devices/{}/revoke-request", auth.device.id);
+    let refused = request(&app, &path, &token, json!({})).await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert!(json_body(refused).await["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("last approver device")));
+    assert_eq!(jarvis_identity::active_device_count(&db).await?, 1);
+    Ok(())
+}

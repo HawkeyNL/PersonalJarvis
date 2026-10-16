@@ -39,6 +39,8 @@ pub enum NotifyEvent {
     BudgetNinetyPercent,
     /// A new device pairing request awaits approval in the app.
     PairingRequested,
+    /// A signed-in device asks another device to approve its unlock.
+    UnlockRequested,
 }
 
 impl NotifyEvent {
@@ -46,6 +48,7 @@ impl NotifyEvent {
         match self {
             Self::BudgetNinetyPercent => "budget",
             Self::PairingRequested => "pairing",
+            Self::UnlockRequested => "unlock",
         }
     }
 
@@ -53,13 +56,14 @@ impl NotifyEvent {
         match self {
             Self::BudgetNinetyPercent => "Budget reached 90% this month",
             Self::PairingRequested => "New device wants to pair — open Jarvis to review",
+            Self::UnlockRequested => "Approval waiting — open Jarvis",
         }
     }
 
     fn priority(self) -> &'static str {
         match self {
             Self::BudgetNinetyPercent => "default",
-            Self::PairingRequested => "high",
+            Self::PairingRequested | Self::UnlockRequested => "high",
         }
     }
 
@@ -67,6 +71,7 @@ impl NotifyEvent {
         match self {
             Self::BudgetNinetyPercent => "moneybag",
             Self::PairingRequested => "key",
+            Self::UnlockRequested => "lock",
         }
     }
 
@@ -75,6 +80,7 @@ impl NotifyEvent {
         match self {
             Self::BudgetNinetyPercent => "jarvis://health/usage",
             Self::PairingRequested => "jarvis://approvals/pairing",
+            Self::UnlockRequested => "jarvis://approvals/unlock",
         }
     }
 }
@@ -428,6 +434,18 @@ mod tests {
         assert!(request.contains("priority: default\r\n"));
         assert!(request.contains("click: jarvis://health/usage\r\n"));
         assert!(request.ends_with("\r\n\r\nBudget reached 90% this month"));
+
+        let (url, mut requests) = mock(Some(200)).await;
+        fast(&url).notify(NotifyEvent::UnlockRequested);
+        let request = next(&mut requests).await;
+        for header in [
+            "priority: high\r\n",
+            "tags: lock\r\n",
+            "click: jarvis://approvals/unlock\r\n",
+        ] {
+            assert!(request.contains(header), "missing {header:?}");
+        }
+        assert!(request.ends_with("\r\n\r\nApproval waiting — open Jarvis"));
     }
 
     #[tokio::test]
