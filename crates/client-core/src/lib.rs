@@ -5,6 +5,7 @@
 //! platform application.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -18,6 +19,7 @@ pub const PAIRING_APPROVAL_DOMAIN: &[u8] = b"jarvis-device-pairing-v1\0";
 pub const AGENT_APPROVAL_DOMAIN: &[u8] = b"jarvis/agent-approval/v1\0";
 pub const LOGIN_DOMAIN: &[u8] = b"jarvis-login-v1\0";
 pub const UNLOCK_APPROVAL_DOMAIN: &[u8] = b"jarvis-unlock-approval-v1\0";
+pub const UNLOCK_CODE_DOMAIN: &[u8] = b"jarvis-unlock-code-v1\0";
 /// `approval_message` value in `GET /v1/agent/pending` for [`agent_approval_message`].
 pub const AGENT_APPROVAL_MESSAGE_V1: &str = "agent-approval-v1";
 
@@ -72,6 +74,22 @@ pub fn unlock_approval_message(
         approver_device_id,
         nonce,
     )
+}
+
+/// Number-matching code (0..=99, always shown as two digits: 0 is "00") for
+/// one unlock request. The requesting device shows it and the approver must
+/// pick it before approving. Both sides derive it from the request id and the
+/// server-generated nonce they already hold.
+pub fn unlock_code(request_id: Uuid, nonce: &[u8]) -> Result<u8, ProtocolError> {
+    if nonce.len() != 32 {
+        return Err(ProtocolError::InvalidChallenge);
+    }
+    let digest = Sha256::new()
+        .chain_update(UNLOCK_CODE_DOMAIN)
+        .chain_update(request_id.as_bytes())
+        .chain_update(nonce)
+        .finalize();
+    Ok((u16::from_be_bytes([digest[0], digest[1]]) % 100) as u8)
 }
 
 fn challenge_message(
@@ -349,6 +367,20 @@ mod tests {
         );
         assert_eq!(
             login_message(id, device, &nonce[..31]),
+            Err(ProtocolError::InvalidChallenge)
+        );
+    }
+
+    /// Fixed unlock-code vectors shared with the TypeScript, Swift and Kotlin clients.
+    #[test]
+    fn unlock_code_v1_matches_golden_vectors() {
+        let first = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let second = Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap();
+        let nonce: Vec<u8> = (0_u8..32).collect();
+        assert_eq!(unlock_code(first, &nonce), Ok(89));
+        assert_eq!(unlock_code(second, &[0x0b; 32]), Ok(0));
+        assert_eq!(
+            unlock_code(first, &nonce[..31]),
             Err(ProtocolError::InvalidChallenge)
         );
     }
