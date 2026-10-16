@@ -78,9 +78,15 @@ fn approval_message(
     jarvis_client_core::agent_approval_message(pending_id, nonce, &action_sha256, device_id).ok()
 }
 
-/// Whether a device on `platform` may approve `action`. The macOS app shows the
-/// full action; a phone approves only the kinds it can render and only actions
-/// small enough to be listed in full. Any other platform or kind is refused.
+/// Pending actions one user may have waiting. Bounds the pending list (each
+/// entry can carry up to 16 KiB of `action_json` plus its preview) so approver
+/// clients can always read it.
+const MAX_PENDING_AGENT_ACTIONS: u64 = 16;
+
+/// Whether a device on `platform` may approve `action`. A phone approves only
+/// the kinds it can show in full and only actions small enough to be listed in
+/// full. macOS keeps its earlier rule (every kind) until the desktop app shows
+/// and re-hashes `action_json` too. Any other platform or kind is refused.
 fn approvable_on(platform: &str, action: &agent::Action, action_json: &str) -> bool {
     match platform {
         "macos" => true,
@@ -142,6 +148,14 @@ pub(crate) async fn agent_action(
                 ));
             }
         };
+        // ponytail: count-then-create, so concurrent proposals can pass the cap
+        // by a few; a transaction if that ever matters.
+        if pending_count(&state, authed.user.id).await >= MAX_PENDING_AGENT_ACTIONS {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "too many agent actions are waiting for approval" })),
+            ));
+        }
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
         let id = Uuid::now_v7();
@@ -217,6 +231,29 @@ pub(crate) async fn agent_action(
     }
 }
 
+/// Live pending actions of `user_id`; a failed read counts as full (fail closed).
+async fn pending_count(state: &AppState, user_id: Uuid) -> u64 {
+    let rows: Result<Vec<Value>, surrealdb::Error> = async {
+        state
+            .db
+            .query(
+                "SELECT count() AS n FROM agent_pending_actions WHERE user_id = $user_id \
+                 AND status = 'pending' AND expires_at > time::now() GROUP ALL",
+            )
+            .bind(json!({"user_id": user_id.to_string()}))
+            .await?
+            .take(0)
+    }
+    .await;
+    match rows {
+        Ok(rows) => rows.first().and_then(|row| row["n"].as_u64()).unwrap_or(0),
+        Err(error) => {
+            tracing::warn!(%error, "failed to count pending actions");
+            u64::MAX
+        }
+    }
+}
+
 /// Mutating actions awaiting the owner's device-signed approval (ADR-029 4b).
 pub(crate) async fn agent_pending(authed: Authed, State(state): State<AppState>) -> Json<Value> {
     let rows: Vec<PendingListRow> = match state
@@ -235,13 +272,15 @@ pub(crate) async fn agent_pending(authed: Authed, State(state): State<AppState>)
             Vec::new()
         }
     };
+    let approver = identity::surreal::APPROVER_PLATFORMS.contains(&authed.device.platform.as_str());
     let entries: Vec<Value> = rows
         .into_iter()
         .map(|row| {
             // The exact bytes `action_sha256` hashes, so an approver can show and
-            // re-hash them; omitted (null) when too large to review on a phone.
-            let action_json = (row.action.len()
-                <= jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN)
+            // re-hash them; omitted (null) when too large to review on a phone,
+            // and for devices that cannot approve.
+            let action_json = (approver
+                && row.action.len() <= jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN)
                 .then_some(row.action.as_str());
             json!({ "pending_id": row.id, "action": row.action_type, "preview": row.preview,
                 "nonce": hex::encode(row.nonce),
@@ -309,6 +348,16 @@ pub(crate) async fn agent_pending_approve(
         )
     })?;
     if !approvable_on(&authed.device.platform, &action, &action_json) {
+        record_agent_audit(
+            &state,
+            authed.device.id,
+            &at,
+            None,
+            agent::RiskClass::NeedsApproval,
+            "denied",
+            Some("not approvable on this platform"),
+        )
+        .await;
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({ "error": "this action cannot be approved on this device" })),
@@ -485,7 +534,7 @@ mod tests {
         let large = write("x".repeat(jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN));
         for phone in ["ios", "android"] {
             assert!(approvable_on(phone, &small, &json(&small)));
-            assert!(approvable_on(phone, &commit, &json(&commit)));
+            assert!(!approvable_on(phone, &commit, &json(&commit)));
             assert!(!approvable_on(phone, &code, &json(&code)));
             assert!(!approvable_on(phone, &large, &json(&large)));
         }

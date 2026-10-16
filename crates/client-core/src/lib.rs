@@ -27,8 +27,10 @@ pub const AGENT_APPROVAL_MESSAGE_V1: &str = "agent-approval-v1";
 /// approve it: phones approve only what they can show in full.
 pub const MAX_REVIEWABLE_ACTION_JSON_LEN: usize = 16 * 1024;
 /// Agent action kinds (`action` in `GET /v1/agent/pending`) a phone may
-/// approve. Any other kind, including one added later, is refused on phones.
-pub const MOBILE_APPROVABLE_AGENT_ACTIONS: [&str; 2] = ["write_file", "git_commit"];
+/// approve: kinds whose whole effect is in the signed JSON. `git_commit` is
+/// not one (it commits whatever the workspace holds when it runs). Any other
+/// kind, including one added later, is refused on phones.
+pub const MOBILE_APPROVABLE_AGENT_ACTIONS: [&str; 1] = ["write_file"];
 
 pub const MAX_DEVICE_NAME_LEN: usize = 128;
 pub const MAX_PLATFORM_LEN: usize = 32;

@@ -1154,6 +1154,7 @@ async fn signed_agent_approval_is_single_use_and_core_stays_denied(
         StatusCode::NOT_FOUND
     );
     let core = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -1171,6 +1172,19 @@ async fn signed_agent_approval_is_single_use_and_core_stays_denied(
         .await
         .unwrap();
     assert_eq!(core.status(), StatusCode::FORBIDDEN);
+    // At most 16 live pending actions per user; two (large, other) are live.
+    for _ in 0..14 {
+        let created = app.clone().oneshot(propose("more")).await.unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(propose("one too many"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
