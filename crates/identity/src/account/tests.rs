@@ -810,5 +810,29 @@ async fn only_a_live_revoke_claim_reports_the_last_approver(
         approve_signed(&db, owner, &phone, &request).await,
         Err(IdentityError::AuthFailed)
     ));
+
+    // A live claim from a signer that was revoked meanwhile is a plain
+    // failure, even when its target is now the last approver.
+    let owner = create_user(&db, "fixture owner").await?.id;
+    let phone = device(&db, owner, Platform::Ios).await?;
+    let laptop = device(&db, owner, Platform::Macos).await?;
+    let request = revoke_request(&db, owner, &laptop, phone.0.id).await?;
+    revoke_device(&db, laptop.0.id).await?;
+    assert!(matches!(
+        revoke_failure(
+            &db,
+            request.request_id,
+            owner,
+            laptop.0.id,
+            phone.0.id,
+            IdentityError::AuthFailed,
+        )
+        .await,
+        IdentityError::AuthFailed
+    ));
+    assert!(matches!(
+        approve_signed(&db, owner, &laptop, &request).await,
+        Err(IdentityError::AuthFailed)
+    ));
     Ok(())
 }

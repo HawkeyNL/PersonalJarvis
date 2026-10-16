@@ -866,9 +866,11 @@ async fn active_device_and_key(
 /// device's older live pending requests: they become `denied` with no
 /// deciding device and leave the approvers' list. Two concurrent creates can
 /// still both stay pending; a write conflict with an approval fails this
-/// transaction and the caller retries. Rows a day past expiry are purged here,
-/// so the table stays bounded without a separate sweep; the grace day keeps a
-/// late poll answering `expired` instead of not found.
+/// transaction and the caller retries. This user's rows a day past expiry are
+/// purged here, so the table stays bounded without a separate sweep; the
+/// grace day keeps a late poll answering `expired` instead of not found. The
+/// purge stays on the user's own rows so it never conflicts with another
+/// user's unlock transactions.
 pub async fn create_unlock_request(
     db: &Database,
     user_id: Uuid,
@@ -880,7 +882,7 @@ pub async fn create_unlock_request(
     execute(
         db,
         "BEGIN TRANSACTION; \
-         DELETE unlock_requests WHERE expires_at < time::now() - 1d RETURN NONE; \
+         DELETE unlock_requests WHERE user_id = $user_id AND expires_at < time::now() - 1d RETURN NONE; \
          UPDATE unlock_requests SET status = 'denied', resolved_at = time::now() \
            WHERE user_id = $user_id AND requesting_device_id = $requesting_device_id \
            AND status = 'pending' AND expires_at > time::now() RETURN NONE; \
@@ -922,10 +924,11 @@ pub async fn unlock_request_status(
     .await?;
     Ok(row.map(|row| {
         // Convention: a deny without a deciding device was made by the system
-        // (superseding), never by a person: `deny_unlock_request` always
-        // records the denier. Its requester keeps seeing `pending` until
-        // expiry, as before superseding existed, so a client still polling it
-        // never reports a false denial. An explicit `superseded` status would
+        // (superseding, or `confirm_recovery` cancelling every pending unlock
+        // request), never by a person: `deny_unlock_request` always records
+        // the denier. Its requester keeps seeing `pending` until expiry, as
+        // before superseding existed, so a client still polling it never
+        // reports a false denial. An explicit `superseded` status would
         // need a schema migration (the `status` ASSERT in 0001), so the
         // marker is the missing device.
         let superseded = row.status == "denied" && row.approved_by_device_id.is_none();

@@ -345,8 +345,10 @@ pub async fn approve_action(
 /// Reports the guard, not an opaque failure, when it is what refused a signed
 /// revoke (directly or by losing a race to a concurrent revoke). Only a claim
 /// that is still live can have reached the guard: the transaction rolled back
-/// and left it unconsumed. A replayed, expired or already consumed request
-/// keeps its original error, so it is audited as a failure.
+/// and left it unconsumed, and only while the signing device is still active
+/// (a revoked signer was refused by the transaction itself). A replayed,
+/// expired or already consumed request, or one from a revoked signer, keeps
+/// its original error, so it is audited as a failure.
 async fn revoke_failure(
     db: &Database,
     id: Uuid,
@@ -355,7 +357,12 @@ async fn revoke_failure(
     target: Uuid,
     error: IdentityError,
 ) -> IdentityError {
-    if load_action(db, id, user, device).await.is_ok()
+    let signer_active = matches!(
+        get_device(db, device).await,
+        Ok(Some(signer)) if signer.user_id == user && signer.status == "active"
+    );
+    if signer_active
+        && load_action(db, id, user, device).await.is_ok()
         && matches!(
             ensure_other_approver(db, user, target).await,
             Err(IdentityError::LastApprover)
