@@ -614,7 +614,14 @@ pub(crate) async fn push_target_set(
     }
     identity::set_push_target(&state.db, authed.device.id, &token, &req.apns_env)
         .await
-        .map_err(internal)?;
+        .map_err(|error| match error {
+            // Held by another account's device: never moved across accounts.
+            identity::IdentityError::AuthFailed => (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "apns_token unavailable" })),
+            ),
+            error => internal(error),
+        })?;
     record_security_event(&state, Some(authed.device.id), "push.target", "set", None).await;
     Ok(StatusCode::NO_CONTENT)
 }

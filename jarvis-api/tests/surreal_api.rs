@@ -891,6 +891,41 @@ async fn push_targets_are_bound_to_the_caller_validated_and_revoked_with_the_dev
         .await?
         .take(0)?;
     assert!(left.is_empty());
+
+    // A token held by another account's device never moves across accounts,
+    // and the stranger's device cannot take this account's token either.
+    let stranger = jarvis_identity::create_user(&db, "other fixture owner").await?;
+    let (stranger_device, _) = jarvis_identity::register_device(
+        &db,
+        stranger.id,
+        "other phone",
+        jarvis_identity::Platform::Ios,
+        "ed25519",
+        &SigningKey::from_bytes(&rand::random())
+            .verifying_key()
+            .to_bytes(),
+    )
+    .await?;
+    let stranger_token = "ef".repeat(32);
+    jarvis_identity::set_push_target(&db, stranger_device.id, &stranger_token, "sandbox").await?;
+    assert_eq!(
+        set(&laptop, &stranger_token).await?.status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        set(&laptop, &"cd".repeat(32)).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(matches!(
+        jarvis_identity::set_push_target(&db, stranger_device.id, &"cd".repeat(32), "sandbox")
+            .await,
+        Err(jarvis_identity::IdentityError::AuthFailed)
+    ));
+    assert_eq!(
+        jarvis_identity::apns_targets(&db, stranger.id, None, "sandbox", 8).await?,
+        [stranger_token]
+    );
+    assert_eq!(targets(None).await?, ["cd".repeat(32)]);
     Ok(())
 }
 

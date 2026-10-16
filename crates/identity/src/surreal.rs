@@ -550,28 +550,47 @@ pub async fn revoke_device(db: &Database, device_id: Uuid) -> Result<(), Identit
     Ok(())
 }
 
+/// True when `$target` is registered to a device of another user than
+/// `$device`'s (or `$device` does not exist).
+const FOREIGN_PUSH_TARGET: &str = "array::len(SELECT id FROM device_push_targets \
+    WHERE target = $target AND device_id NOT IN (SELECT VALUE record::id(id) FROM devices \
+    WHERE user_id IN (SELECT VALUE user_id FROM devices WHERE record::id(id) = $device))) != 0";
+
 /// Register or replace the APNs target of an active device. A token another
-/// device registered before (the same phone re-paired) moves to this device,
-/// so one phone never receives a push twice or as the requesting device.
-/// Token and environment are validated by the caller and again by the schema.
+/// device of the same user registered before (the same phone re-paired) moves
+/// to this device, so one phone never receives a push twice or as the
+/// requesting device. A token held by another user's device is refused with
+/// `AuthFailed`: it never moves across accounts. Token and environment are
+/// validated by the caller and again by the schema.
 pub async fn set_push_target(
     db: &Database,
     device_id: Uuid,
     target: &str,
     apns_env: &str,
 ) -> Result<(), IdentityError> {
-    execute(
+    let bindings = || json!({ "device": device_id.to_string(), "target": target, "env": apns_env });
+    let result = execute(
         db,
-        "BEGIN TRANSACTION; \
-         LET $active = SELECT id FROM devices WHERE record::id(id) = $device AND status = 'active'; \
-         IF array::len($active) != 1 { THROW 'device unavailable'; }; \
-         DELETE device_push_targets WHERE device_id = $device OR target = $target; \
-         CREATE device_push_targets SET id = $device, device_id = $device, kind = 'apns', \
-            target = $target, apns_env = $env, updated_at = time::now() RETURN NONE; \
-         COMMIT TRANSACTION;",
-        json!({ "device": device_id.to_string(), "target": target, "env": apns_env }),
+        &format!(
+            "BEGIN TRANSACTION; \
+             LET $active = SELECT id FROM devices WHERE record::id(id) = $device AND status = 'active'; \
+             IF array::len($active) != 1 {{ THROW 'device unavailable'; }}; \
+             IF {FOREIGN_PUSH_TARGET} {{ THROW 'push target unavailable'; }}; \
+             DELETE device_push_targets WHERE device_id = $device OR target = $target; \
+             CREATE device_push_targets SET id = $device, device_id = $device, kind = 'apns', \
+                target = $target, apns_env = $env, updated_at = time::now() RETURN NONE; \
+             COMMIT TRANSACTION;"
+        ),
+        bindings(),
     )
-    .await
+    .await;
+    if result.is_err()
+        && one::<bool, _>(db, &format!("RETURN {FOREIGN_PUSH_TARGET}"), bindings()).await?
+            == Some(true)
+    {
+        return Err(IdentityError::AuthFailed);
+    }
+    result
 }
 
 pub async fn delete_push_target(db: &Database, device_id: Uuid) -> Result<(), IdentityError> {
