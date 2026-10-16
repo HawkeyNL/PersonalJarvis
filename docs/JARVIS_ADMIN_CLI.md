@@ -440,6 +440,16 @@ per day and one completed recovery per seven days. Confirming sets the new
 password, ends every session and cancels pending pairing, unlock and account
 requests. Only confirm a reset you started yourself.
 
+Starting a recovery needs a live session on that approver device: the app
+requests and signs the reset over the authenticated API. If no approver device
+is still signed in (every session ended or expired, and a new login would need
+the forgotten password), there is no reset path. The local-root fallback is to
+revoke the device (`sudo jarvis devices revoke <device-uuid>`) and pair it
+again with local approval (see
+[Local device administration](#local-device-administration)), but that pairing
+request still asks for the existing account password: it restores a lost or
+broken device, not a forgotten password.
+
 ### Schema-changing releases
 
 Routine `update --latest` and `update --version` intentionally refuse a changed

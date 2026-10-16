@@ -43,7 +43,7 @@ write_candidate() {
     done
     install -m 0644 "$repo_dir/deploy/systemd/pricing-registry.json" "$release/pricing-registry.json"
     jq -n --arg tag "$tag" --arg revision "$revision" \
-        '{tag:$tag,revision:$revision,schema_sha256:("b" * 64),schema_migration:{version:1,target:10,from_sha256:[("a" * 64)]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1,model_policy_directory:1,model_catalog:1,laya_runtime:1,subscription_workers:1,codex_chat_worker:1,codex_runtime:1,backup_timer:1,housekeeping_timer:1}}' \
+        '{tag:$tag,revision:$revision,schema_sha256:("b" * 64),schema_migration:{version:1,target:10,from_sha256:[range(9) | "a" * 64]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1,model_policy_directory:1,model_catalog:1,laya_runtime:1,subscription_workers:1,codex_chat_worker:1,codex_runtime:1,backup_timer:1,housekeeping_timer:1}}' \
         > "$release/release.json"
     (
         cd "$release"
@@ -151,7 +151,7 @@ fi
 grep -Fq 'managed unit is missing or unsafe: jarvis-config-broker.service' \
     "$fixture/bad-unit.stderr"
 
-for defect in missing tampered symlink capability missing-backup unsupported-schema missing-migration unsafe-migration unsupported-layout missing-catalog-service missing-catalog-timer unsupported-catalog missing-laya-unit missing-laya-socket missing-laya-wrapper unsupported-laya missing-claude-worker missing-claude-socket unsupported-subscription missing-codex-chat-worker tampered-codex-chat-worker missing-codex-chat-socket unsupported-codex-chat undeclared-codex-chat missing-codex-runtime tampered-codex-runtime symlink-codex-runtime unsupported-codex-runtime missing-backup-service missing-backup-timer unsupported-backup-timer undeclared-backup-timer unsafe-backup-helper missing-housekeeping-helper missing-housekeeping-service missing-housekeeping-timer unsupported-housekeeping-timer undeclared-housekeeping-timer unsafe-housekeeping-helper tampered-housekeeping-helper; do
+for defect in missing tampered symlink capability missing-backup unsupported-schema oversized-migration-sources missing-migration unsafe-migration unsupported-layout missing-catalog-service missing-catalog-timer unsupported-catalog missing-laya-unit missing-laya-socket missing-laya-wrapper unsupported-laya missing-claude-worker missing-claude-socket unsupported-subscription missing-codex-chat-worker tampered-codex-chat-worker missing-codex-chat-socket unsupported-codex-chat undeclared-codex-chat missing-codex-runtime tampered-codex-runtime symlink-codex-runtime unsupported-codex-runtime missing-backup-service missing-backup-timer unsupported-backup-timer undeclared-backup-timer unsafe-backup-helper missing-housekeeping-helper missing-housekeeping-service missing-housekeeping-timer unsupported-housekeeping-timer undeclared-housekeeping-timer unsafe-housekeeping-helper tampered-housekeeping-helper; do
     write_candidate v9.8.10
     policy="$fixture/candidate/jarvis-core-v9.8.10/com.hawkeynl.jarvis.devices.policy"
     case $defect in
@@ -238,6 +238,11 @@ for defect in missing tampered symlink capability missing-backup unsupported-sch
             jq '.schema_migration.target = 99' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
             cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
             ;;
+        oversized-migration-sources)
+            # A migration to 10 has at most nine earlier schema fingerprints.
+            jq '.schema_migration.from_sha256 += ["a" * 64]' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
+            cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
+            ;;
     esac
     if bash "$builder" package v9.8.10 "$revision" "$fixture" >"$fixture/policy.log" 2>&1; then
         echo "packager accepted device policy defect: $defect" >&2
@@ -245,6 +250,7 @@ for defect in missing tampered symlink capability missing-backup unsupported-sch
     fi
     expected=
     case $defect in
+        unsupported-schema|oversized-migration-sources) expected='unsupported schema migration declaration' ;;
         missing-backup-service) expected='managed unit is missing or unsafe: jarvis-backup.service' ;;
         missing-backup-timer) expected='managed unit is missing or unsafe: jarvis-backup.timer' ;;
         unsupported-backup-timer|undeclared-backup-timer) expected='release candidate does not declare backup-timer capability 1' ;;
