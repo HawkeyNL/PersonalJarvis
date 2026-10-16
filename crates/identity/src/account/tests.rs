@@ -762,3 +762,53 @@ async fn password_recovery_needs_signature_and_root_confirmation(
     assert_eq!(verifiers().await?, Some(0));
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn only_a_live_revoke_claim_reports_the_last_approver(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = fixture_db("revoke_claim_fixture").await?;
+    let owner = create_user(&db, "fixture owner").await?.id;
+    let phone = device(&db, owner, Platform::Ios).await?;
+    let laptop = device(&db, owner, Platform::Macos).await?;
+    let request = revoke_request(&db, owner, &phone, phone.0.id).await?;
+    revoke_device(&db, laptop.0.id).await?;
+    let refusal = || {
+        revoke_failure(
+            &db,
+            request.request_id,
+            owner,
+            phone.0.id,
+            phone.0.id,
+            IdentityError::AuthFailed,
+        )
+    };
+    // A rolled-back transaction leaves the claim live: the guard refused it.
+    assert!(matches!(refusal().await, IdentityError::LastApprover));
+    // Consumed (a concurrent or replayed approval) or expired: plain failure.
+    for state in [
+        "consumed_at = time::now(), expires_at = time::now() + 5m",
+        "consumed_at = NONE, expires_at = time::now() - 1s",
+    ] {
+        db.query(format!(
+            "UPDATE account_actions SET {state} WHERE record::id(id) = $id"
+        ))
+        .bind(("id", request.request_id.to_string()))
+        .await?
+        .check()?;
+        assert!(
+            matches!(refusal().await, IdentityError::AuthFailed),
+            "{state}"
+        );
+    }
+    db.query("DELETE account_actions WHERE record::id(id) = $id")
+        .bind(("id", request.request_id.to_string()))
+        .await?
+        .check()?;
+    assert!(matches!(refusal().await, IdentityError::AuthFailed));
+    assert!(matches!(
+        approve_signed(&db, owner, &phone, &request).await,
+        Err(IdentityError::AuthFailed)
+    ));
+    Ok(())
+}
