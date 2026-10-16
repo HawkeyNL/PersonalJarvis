@@ -144,7 +144,7 @@ schema_transition() {
 # migration would refuse after the owner confirmed it.
 candidate_migration_supported() {
     jq -e --arg previous "$current_schema_sha256" '
-        .schema_migration.version == 1 and (.schema_migration.target == 8 or .schema_migration.target == 9 or .schema_migration.target == 10 or .schema_migration.target == 11) and
+        .schema_migration.version == 1 and (.schema_migration.target == 8 or .schema_migration.target == 9 or .schema_migration.target == 10 or .schema_migration.target == 11 or .schema_migration.target == 12) and
         (.schema_migration.from_sha256 | type == "array") and
         (.schema_migration.from_sha256 | index($previous) != null) and
         .tooling.systemd_units == 1 and .tooling.local_devices == 1

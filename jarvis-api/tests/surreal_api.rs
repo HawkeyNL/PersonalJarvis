@@ -725,6 +725,212 @@ async fn unlock_requests_are_rate_limited_superseded_and_audited(
 
 #[tokio::test]
 #[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn push_targets_are_bound_to_the_caller_validated_and_revoked_with_the_device(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db.clone(), None).await);
+    let (phone, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let (laptop, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let call = |token: &str, method: &str, body: Option<Value>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/v1/devices/self/push")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if body.is_some() {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        app.clone().oneshot(
+            request
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                .unwrap(),
+        )
+    };
+    let device_of = |token: String| {
+        let app = app.clone();
+        async move {
+            let me = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/auth/me")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            json_body(me).await["device_id"]
+                .as_str()
+                .unwrap()
+                .parse::<uuid::Uuid>()
+                .unwrap()
+        }
+    };
+    let (phone_id, laptop_id) = (
+        device_of(phone.clone()).await,
+        device_of(laptop.clone()).await,
+    );
+    let user = jarvis_identity::get_device(&db, phone_id)
+        .await?
+        .unwrap()
+        .user_id;
+    let phone_token = "AB".repeat(32);
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/devices/self/push")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"apns_token": phone_token, "apns_env": "sandbox"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await?;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    for bad in [
+        json!({"apns_token": "ab".repeat(31), "apns_env": "sandbox"}),
+        json!({"apns_token": "ab".repeat(101), "apns_env": "sandbox"}),
+        json!({"apns_token": "zz".repeat(32), "apns_env": "sandbox"}),
+        json!({"apns_token": "ab".repeat(32), "apns_env": "development"}),
+    ] {
+        assert_eq!(
+            call(&phone, "PUT", Some(bad)).await?.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // Unknown fields (such as another device id) are refused, not ignored.
+    let foreign =
+        json!({"apns_token": "ab".repeat(32), "apns_env": "sandbox", "device_id": laptop_id});
+    assert!(call(&phone, "PUT", Some(foreign))
+        .await?
+        .status()
+        .is_client_error());
+    let set = |token: &str, apns: &str| {
+        call(
+            token,
+            "PUT",
+            Some(json!({"apns_token": apns, "apns_env": "sandbox"})),
+        )
+    };
+    // The rate limit counts every write, valid or not: continue on a fresh
+    // limiter so the budget below is exact.
+    assert_eq!(
+        set(&laptop, &"cd".repeat(32)).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    let fresh = build_router(state(db.clone(), None).await);
+    let set_fresh = |token: &str, apns: String| {
+        fresh.clone().oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/devices/self/push")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"apns_token": apns, "apns_env": "sandbox"}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        set_fresh(&phone, phone_token.clone()).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    // Stored lowercase, one row per device; the requester is never a target.
+    let targets = |except| jarvis_identity::apns_targets(&db, user, except, "sandbox", 8);
+    let mut all = targets(None).await?;
+    all.sort();
+    assert_eq!(all, ["ab".repeat(32), "cd".repeat(32)]);
+    assert_eq!(targets(Some(laptop_id)).await?, ["ab".repeat(32)]);
+    assert!(
+        jarvis_identity::apns_targets(&db, user, None, "production", 8)
+            .await?
+            .is_empty()
+    );
+    // A token re-registered by another device moves to it.
+    assert_eq!(
+        set_fresh(&laptop, phone_token.clone()).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(targets(Some(laptop_id)).await?, Vec::<String>::new());
+    assert_eq!(
+        set_fresh(&phone, phone_token.clone()).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    // Six writes per minute: two used above.
+    for _ in 0..4 {
+        assert_eq!(
+            set_fresh(&phone, phone_token.clone()).await?.status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+    assert_eq!(
+        set_fresh(&phone, phone_token.clone()).await?.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // DELETE removes only the caller's own target.
+    assert_eq!(
+        call(&laptop, "DELETE", None).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(targets(None).await?, ["ab".repeat(32)]);
+    // Revoking the device deletes its target with it.
+    jarvis_identity::revoke_device(&db, phone_id).await?;
+    let left: Vec<Value> = db
+        .query("SELECT * FROM device_push_targets")
+        .await?
+        .take(0)?;
+    assert!(left.is_empty());
+
+    // A token held by another account's device never moves across accounts,
+    // and the stranger's device cannot take this account's token either.
+    let stranger = jarvis_identity::create_user(&db, "other fixture owner").await?;
+    let (stranger_device, _) = jarvis_identity::register_device(
+        &db,
+        stranger.id,
+        "other phone",
+        jarvis_identity::Platform::Ios,
+        "ed25519",
+        &SigningKey::from_bytes(&rand::random())
+            .verifying_key()
+            .to_bytes(),
+    )
+    .await?;
+    let stranger_token = "ef".repeat(32);
+    jarvis_identity::set_push_target(&db, stranger_device.id, &stranger_token, "sandbox").await?;
+    assert_eq!(
+        set(&laptop, &stranger_token).await?.status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        set(&laptop, &"cd".repeat(32)).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(matches!(
+        jarvis_identity::set_push_target(&db, stranger_device.id, &"cd".repeat(32), "sandbox")
+            .await,
+        Err(jarvis_identity::IdentityError::AuthFailed)
+    ));
+    assert_eq!(
+        jarvis_identity::apns_targets(&db, stranger.id, None, "sandbox", 8).await?,
+        [stranger_token]
+    );
+    assert_eq!(targets(None).await?, ["cd".repeat(32)]);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
 async fn signed_agent_approval_is_single_use_and_core_stays_denied(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;

@@ -121,6 +121,13 @@ In production:
 Development and test runs may leave the socket unset; their TCP listener then
 serves the full API and trusts no forwarding headers.
 
+Keep the upstream on HTTP/1.1, which is Caddy's default for a plain-HTTP or
+Unix-socket upstream: do not add `transport http { versions h2c }` to the
+`reverse_proxy`. Core's listeners also accept HTTP/2 cleartext with prior
+knowledge (a side effect of the HTTP/2 client Core uses for APNs), but the
+API, including its WebSocket upgrade, is served and tested over HTTP/1.1
+only.
+
 ### How access is granted
 
 The Core unit creates `/run/jarvis-core` as a systemd `RuntimeDirectory` and

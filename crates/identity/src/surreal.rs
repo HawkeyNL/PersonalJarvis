@@ -536,6 +536,7 @@ pub async fn revoke_device(db: &Database, device_id: Uuid) -> Result<(), Identit
              UPDATE devices SET status = 'revoked', updated_at = time::now() WHERE record::id(id) = $id; \
              UPDATE device_keys SET revoked_at = time::now() WHERE device_id = $id AND revoked_at IS NONE; \
              UPDATE sessions SET revoked_at = time::now() WHERE device_id = $id AND revoked_at IS NONE; \
+             DELETE device_push_targets WHERE device_id = $id; \
              UPDATE account_recoveries SET status = 'expired', verifier = NONE, slot = record::id(id), \
              resolved_at = time::now() WHERE device_id = $id AND status = 'pending' RETURN NONE; \
              COMMIT TRANSACTION;",
@@ -547,6 +548,93 @@ pub async fn revoke_device(db: &Database, device_id: Uuid) -> Result<(), Identit
         .check()
         .map_err(|_| IdentityError::DatabaseSurreal)?;
     Ok(())
+}
+
+/// True when `$target` is registered to a device of another user than
+/// `$device`'s (or `$device` does not exist).
+const FOREIGN_PUSH_TARGET: &str = "array::len(SELECT id FROM device_push_targets \
+    WHERE target = $target AND device_id NOT IN (SELECT VALUE record::id(id) FROM devices \
+    WHERE user_id IN (SELECT VALUE user_id FROM devices WHERE record::id(id) = $device))) != 0";
+
+/// Register or replace the APNs target of an active device. A token another
+/// device of the same user registered before (the same phone re-paired) moves
+/// to this device, so one phone never receives a push twice or as the
+/// requesting device. A token held by another user's device is refused with
+/// `AuthFailed`: it never moves across accounts. Token and environment are
+/// validated by the caller and again by the schema.
+pub async fn set_push_target(
+    db: &Database,
+    device_id: Uuid,
+    target: &str,
+    apns_env: &str,
+) -> Result<(), IdentityError> {
+    let bindings = || json!({ "device": device_id.to_string(), "target": target, "env": apns_env });
+    let result = execute(
+        db,
+        &format!(
+            "BEGIN TRANSACTION; \
+             LET $active = SELECT id FROM devices WHERE record::id(id) = $device AND status = 'active'; \
+             IF array::len($active) != 1 {{ THROW 'device unavailable'; }}; \
+             IF {FOREIGN_PUSH_TARGET} {{ THROW 'push target unavailable'; }}; \
+             DELETE device_push_targets WHERE device_id = $device OR target = $target; \
+             CREATE device_push_targets SET id = $device, device_id = $device, kind = 'apns', \
+                target = $target, apns_env = $env, updated_at = time::now() RETURN NONE; \
+             COMMIT TRANSACTION;"
+        ),
+        bindings(),
+    )
+    .await;
+    if result.is_err()
+        && one::<bool, _>(db, &format!("RETURN {FOREIGN_PUSH_TARGET}"), bindings()).await?
+            == Some(true)
+    {
+        return Err(IdentityError::AuthFailed);
+    }
+    result
+}
+
+pub async fn delete_push_target(db: &Database, device_id: Uuid) -> Result<(), IdentityError> {
+    execute(
+        db,
+        "DELETE device_push_targets WHERE device_id = $device",
+        json!({ "device": device_id.to_string() }),
+    )
+    .await
+}
+
+/// APNs tokens of the user's active devices in one environment, without the
+/// `except` device, at most `limit`.
+pub async fn apns_targets(
+    db: &Database,
+    user_id: Uuid,
+    except: Option<Uuid>,
+    apns_env: &str,
+    limit: usize,
+) -> Result<Vec<String>, IdentityError> {
+    many(
+        db,
+        "SELECT VALUE target FROM device_push_targets WHERE kind = 'apns' AND apns_env = $env \
+         AND device_id != $except AND device_id IN \
+         (SELECT VALUE record::id(id) FROM devices WHERE user_id = $user AND status = 'active') \
+         LIMIT $limit",
+        json!({
+            "user": user_id.to_string(),
+            "except": except.map(|id| id.to_string()).unwrap_or_default(),
+            "env": apns_env,
+            "limit": limit,
+        }),
+    )
+    .await
+}
+
+/// Forget a token APNs reported as no longer valid.
+pub async fn delete_apns_target(db: &Database, target: &str) -> Result<(), IdentityError> {
+    execute(
+        db,
+        "DELETE device_push_targets WHERE kind = 'apns' AND target = $target",
+        json!({ "target": target }),
+    )
+    .await
 }
 
 pub async fn create_challenge(db: &Database, device_id: Uuid) -> Result<Challenge, IdentityError> {
