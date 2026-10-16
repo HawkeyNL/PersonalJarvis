@@ -141,10 +141,8 @@ pub(crate) async fn password_reset_request(
     if !jarvis_identity::surreal::APPROVER_PLATFORMS.contains(&auth.device.platform.as_str()) {
         return Err(unauthorized());
     }
-    account::recovery_available(&state.db, auth.user.id)
-        .await
-        .map_err(|_| unavailable())?;
-    // Bounds password hashing by unsigned requests from this device; the
+    // Bounds database writes (`recovery_available` expires stale recoveries)
+    // and password hashing by unsigned requests from this device; the
     // database enforces the per-day limit on signed recoveries.
     if !state.rate_limiter.check(
         &format!("account-recovery:{}", auth.device.id),
@@ -153,6 +151,9 @@ pub(crate) async fn password_reset_request(
     ) {
         return Err(unavailable());
     }
+    account::recovery_available(&state.db, auth.user.id)
+        .await
+        .map_err(|_| unavailable())?;
     let stored =
         PasswordService::shared()
             .hash(req.password)
@@ -270,10 +271,7 @@ pub(crate) async fn approve(
     }
     state.realtime.disconnect_owner(
         auth.user.id,
-        match approved.action {
-            AccountAction::PasswordSet | AccountAction::PasswordReset => None,
-            AccountAction::DeviceRevoke => Some(approved.target),
-        },
+        (approved.action == AccountAction::DeviceRevoke).then_some(approved.target),
     );
     record_security_event(
         &state,

@@ -954,7 +954,11 @@ async fn active_device_and_key(
 /// device's older live pending requests: they become `denied` with no
 /// deciding device and leave the approvers' list. Two concurrent creates can
 /// still both stay pending; a write conflict with an approval fails this
-/// transaction and the caller retries.
+/// transaction and the caller retries. This user's rows a day past expiry are
+/// purged here, so the table stays bounded without a separate sweep; the
+/// grace day keeps a late poll answering `expired` instead of not found. The
+/// purge stays on the user's own rows so it never conflicts with another
+/// user's unlock transactions.
 pub async fn create_unlock_request(
     db: &Database,
     user_id: Uuid,
@@ -966,6 +970,7 @@ pub async fn create_unlock_request(
     execute(
         db,
         "BEGIN TRANSACTION; \
+         DELETE unlock_requests WHERE user_id = $user_id AND expires_at < time::now() - 1d RETURN NONE; \
          UPDATE unlock_requests SET status = 'denied', resolved_at = time::now() \
            WHERE user_id = $user_id AND requesting_device_id = $requesting_device_id \
            AND status = 'pending' AND expires_at > time::now() RETURN NONE; \
@@ -1006,9 +1011,14 @@ pub async fn unlock_request_status(
     )
     .await?;
     Ok(row.map(|row| {
-        // Only superseding denies without a deciding device. Its requester
-        // keeps seeing `pending` until expiry, as before superseding existed,
-        // so a client still polling it never reports a false denial.
+        // Convention: a deny without a deciding device was made by the system
+        // (superseding, or `confirm_recovery` cancelling every pending unlock
+        // request), never by a person: `deny_unlock_request` always records
+        // the denier. Its requester keeps seeing `pending` until expiry, as
+        // before superseding existed, so a client still polling it never
+        // reports a false denial. An explicit `superseded` status would
+        // need a schema migration (the `status` ASSERT in 0001), so the
+        // marker is the missing device.
         let superseded = row.status == "denied" && row.approved_by_device_id.is_none();
         if row.status == "pending" || superseded {
             if row.expires_at < OffsetDateTime::now_utc() {
@@ -1338,6 +1348,28 @@ mod tests {
         )
         .await
         .is_err());
+
+        // Creating a request purges rows a day past expiry and keeps newer
+        // expired ones answering `expired`.
+        let (stale, recent) = (Uuid::now_v7(), Uuid::now_v7());
+        db.query(
+            "CREATE unlock_requests SET id = $stale, user_id = $user, requesting_device_id = $device, \
+             nonce = <bytes>'n', status = 'pending', approved_by_device_id = NONE, \
+             created_at = time::now() - 2d, expires_at = time::now() - 2d, resolved_at = NONE; \
+             CREATE unlock_requests SET id = $recent, user_id = $user, requesting_device_id = $device, \
+             nonce = <bytes>'n', status = 'pending', approved_by_device_id = NONE, \
+             created_at = time::now() - 1h, expires_at = time::now() - 1h, resolved_at = NONE;",
+        )
+        .bind(("stale", stale.to_string()))
+        .bind(("recent", recent.to_string()))
+        .bind(("user", owner.id.to_string()))
+        .bind(("device", approver.id.to_string()))
+        .await?
+        .check()?;
+        assert_eq!(status(stale).await?.as_deref(), Some("expired"));
+        create_unlock_request(&db, owner.id, device.id).await?;
+        assert_eq!(status(stale).await?, None);
+        assert_eq!(status(recent).await?.as_deref(), Some("expired"));
 
         // Pairing uses a different, canonical protocol. Its conditional update,
         // device creation and request activation are one database transaction:
