@@ -25,6 +25,15 @@ pub enum DeviceRequest {
     Revoke {
         device_id: Uuid,
     },
+    /// Pending forgotten-password recoveries; never verifiers or nonces.
+    RecoveryStatus {},
+    /// The backend rechecks expiry, device and limits and consumes once.
+    RecoveryConfirm {
+        request_id: Uuid,
+    },
+    RecoveryDeny {
+        request_id: Uuid,
+    },
 }
 
 impl DeviceRequest {
@@ -62,6 +71,13 @@ mod tests {
             DeviceRequest::Revoke {
                 device_id: Uuid::nil(),
             },
+            DeviceRequest::RecoveryStatus {},
+            DeviceRequest::RecoveryConfirm {
+                request_id: Uuid::nil(),
+            },
+            DeviceRequest::RecoveryDeny {
+                request_id: Uuid::nil(),
+            },
         ] {
             assert_eq!(
                 DeviceRequest::parse(&serde_json::to_vec(&operation).unwrap()),
@@ -73,6 +89,8 @@ mod tests {
             r#"{"operation":"list","approved":true}"#,
             r#"{"operation":"list","uid":0}"#,
             r#"{"operation":"revoke","device_id":"../../etc/passwd"}"#,
+            r#"{"operation":"recovery_confirm"}"#,
+            r#"{"operation":"recovery_confirm","request_id":"00000000-0000-0000-0000-000000000000","password":"x"}"#,
         ] {
             assert!(DeviceRequest::parse(input.as_bytes()).is_err());
         }

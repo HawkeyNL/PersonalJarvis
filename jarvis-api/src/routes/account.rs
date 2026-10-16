@@ -18,6 +18,7 @@ use jarvis_client_core::account::AccountAction;
 use jarvis_identity::{
     password::{AccountPassword, PasswordError, PasswordService},
     surreal::account,
+    IdentityError,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -28,6 +29,14 @@ use uuid::Uuid;
 pub(crate) struct PasswordChange {
     password: AccountPassword,
     current_password: Option<AccountPassword>,
+}
+
+/// Forgotten-password recovery carries no current password: the device
+/// signature and local root confirmation on the Home Node replace it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PasswordReset {
+    password: AccountPassword,
 }
 
 #[derive(Deserialize)]
@@ -114,6 +123,69 @@ pub(crate) async fn password_request(
     Ok(Json(json!(request)))
 }
 
+pub(crate) async fn password_reset_request(
+    auth: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<PasswordReset>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let unavailable = || {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(
+                json!({"error":"account recovery unavailable; one is pending or the limit is reached"}),
+            ),
+        )
+    };
+    // Only a device that can sign the approval may start a recovery (checked
+    // again when the request is stored and when it is signed).
+    if !jarvis_identity::surreal::APPROVER_PLATFORMS.contains(&auth.device.platform.as_str()) {
+        return Err(unauthorized());
+    }
+    account::recovery_available(&state.db, auth.user.id)
+        .await
+        .map_err(|_| unavailable())?;
+    // Bounds password hashing by unsigned requests from this device; the
+    // database enforces the per-day limit on signed recoveries.
+    if !state.rate_limiter.check(
+        &format!("account-recovery:{}", auth.device.id),
+        10,
+        std::time::Duration::from_secs(24 * 60 * 60),
+    ) {
+        return Err(unavailable());
+    }
+    let stored =
+        PasswordService::shared()
+            .hash(req.password)
+            .await
+            .map_err(|error| match error {
+                PasswordError::Common => bad_request("password is too common; choose another"),
+                _ => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error":"password service unavailable"})),
+                ),
+            })?;
+    // Refused for a device that cannot sign approvals.
+    let request = account::request_action(
+        &state.db,
+        auth.user.id,
+        auth.device.id,
+        AccountAction::PasswordReset,
+        auth.user.id,
+        Some(stored),
+    )
+    .await
+    .map_err(|_| unauthorized())?;
+    record_security_event(
+        &state,
+        Some(auth.device.id),
+        "account.recovery.request",
+        "prepared",
+        None,
+    )
+    .await;
+    Ok(Json(json!(request)))
+}
+
 pub(crate) async fn revoke_request(
     auth: Authed,
     State(state): State<AppState>,
@@ -128,8 +200,22 @@ pub(crate) async fn revoke_request(
         None,
     )
     .await
-    .map_err(|_| unauthorized())?;
+    .map_err(|error| match error {
+        IdentityError::LastApprover => last_approver(),
+        _ => unauthorized(),
+    })?;
     Ok(Json(json!(request)))
+}
+
+/// Not opaque on purpose: the owner's client must explain that another
+/// approver device has to be paired first (or local root used on the node).
+fn last_approver() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(
+            json!({"error":"cannot revoke the last approver device; pair another iOS, Android or macOS device first"}),
+        ),
+    )
 }
 
 pub(crate) async fn approve(
@@ -142,23 +228,50 @@ pub(crate) async fn approve(
         return Err(unauthorized());
     }
     let signature = hex::decode(req.signature).map_err(|_| unauthorized())?;
-    let Ok(approved) =
-        account::approve_action(&state.db, id, auth.user.id, auth.device.id, &signature).await
-    else {
+    let approved = match account::approve_action(
+        &state.db,
+        id,
+        auth.user.id,
+        auth.device.id,
+        &signature,
+    )
+    .await
+    {
+        Ok(approved) => approved,
+        Err(error) => {
+            let last = matches!(error, IdentityError::LastApprover);
+            record_security_event(
+                &state,
+                Some(auth.device.id),
+                "account.approve",
+                if last { "last_approver" } else { "fail" },
+                None,
+            )
+            .await;
+            return Err(if last {
+                last_approver()
+            } else {
+                unauthorized()
+            });
+        }
+    };
+    if approved.action == AccountAction::PasswordReset {
         record_security_event(
             &state,
             Some(auth.device.id),
-            "account.approve",
-            "fail",
+            "account.recovery.request",
+            "signed",
             None,
         )
         .await;
-        return Err(unauthorized());
-    };
+        return Ok(Json(json!({"status":"pending_confirmation",
+            "request_id":approved.request_id,
+            "expires_in_seconds":account::RECOVERY_TTL_MINUTES * 60})));
+    }
     state.realtime.disconnect_owner(
         auth.user.id,
         match approved.action {
-            AccountAction::PasswordSet => None,
+            AccountAction::PasswordSet | AccountAction::PasswordReset => None,
             AccountAction::DeviceRevoke => Some(approved.target),
         },
     );

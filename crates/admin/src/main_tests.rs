@@ -632,6 +632,41 @@ fn device_trust_needs_one_target_and_never_auto_confirms_bulk_or_replacement() {
 }
 
 #[test]
+fn account_recovery_commands_take_one_typed_request_id() {
+    use account_activation::{AccountCommand, RecoveryCommand};
+    let id = "0192abcd-0000-7000-8000-0000000000ef";
+    let parse = |args: &[&str]| {
+        Cli::try_parse_from(["jarvis", "account", "recovery"].iter().chain(args)).map(|cli| {
+            match cli.command {
+                Some(Commands::Account {
+                    command: AccountCommand::Recovery { command },
+                }) => command,
+                _ => panic!("expected account recovery"),
+            }
+        })
+    };
+    assert!(matches!(
+        parse(&["status"]).unwrap(),
+        RecoveryCommand::Status
+    ));
+    assert!(matches!(
+        parse(&["confirm", id, "--yes"]).unwrap(),
+        RecoveryCommand::Confirm { yes: true, .. }
+    ));
+    assert!(matches!(
+        parse(&["confirm", id]).unwrap(),
+        RecoveryCommand::Confirm { yes: false, .. }
+    ));
+    assert!(matches!(
+        parse(&["deny", id]).unwrap(),
+        RecoveryCommand::Deny { .. }
+    ));
+    assert!(parse(&["confirm"]).is_err());
+    assert!(parse(&["confirm", "not-a-uuid", "--yes"]).is_err());
+    assert!(parse(&["deny", id, "--yes"]).is_err());
+}
+
+#[test]
 fn confirmation_is_explicit_and_non_secret() {
     assert!(confirmation_answer("yes\n"));
     assert!(confirmation_answer("Y"));

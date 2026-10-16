@@ -2,8 +2,6 @@
 -- device token and environment; no message content is ever stored. Device
 -- revocation deletes the row in the same transaction, and the sender only
 -- reads rows of active devices.
--- Numbered 13 because open changes claim 11 and 12; it is applied after
--- whichever of them lands first and must be re-chained behind them.
 BEGIN TRANSACTION;
 DEFINE TABLE IF NOT EXISTS device_push_targets SCHEMAFULL PERMISSIONS NONE;
 DEFINE FIELD id ON device_push_targets TYPE string;
@@ -14,5 +12,5 @@ DEFINE FIELD apns_env ON device_push_targets TYPE string ASSERT $value IN ['sand
 DEFINE FIELD updated_at ON device_push_targets TYPE datetime;
 DEFINE INDEX IF NOT EXISTS device_push_targets_device ON device_push_targets FIELDS device_id UNIQUE;
 DEFINE INDEX IF NOT EXISTS device_push_targets_target ON device_push_targets FIELDS target UNIQUE;
-UPDATE schema_version:baseline SET version = 13, applied_at = time::now();
+UPDATE schema_version:baseline SET version = 12, applied_at = time::now();
 COMMIT TRANSACTION;

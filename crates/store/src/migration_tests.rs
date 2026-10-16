@@ -26,7 +26,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 13);
+    assert_eq!(version.unwrap().version, 12);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
@@ -39,15 +39,45 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     db.use_db("from_nine").await?;
     apply_through_nine(&db).await?;
     apply_baseline_schema(&db).await?;
+    db.use_db("from_eleven").await?;
+    apply_through_eleven(&db).await?;
+    apply_baseline_schema(&db).await?;
+    let from_eleven: Option<SchemaVersion> = db
+        .query("SELECT version FROM schema_version:baseline")
+        .await?
+        .check()?
+        .take(0)?;
+    assert_eq!(from_eleven.unwrap().version, 12);
     db.use_db("from_ten").await?;
     apply_through_ten(&db).await?;
+    // A pending v10 account action stays valid across the migration.
+    db.query("CREATE account_actions SET id = 'legacy', user_id = 'fixture', device_id = 'd', action = 'password-set', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
+        .await?.check()?;
+    assert!(db
+        .query("CREATE account_actions SET id = 'early', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
+        .await?
+        .check()
+        .is_err());
     apply_baseline_schema(&db).await?;
     let mut migrated = db
-        .query("SELECT version FROM schema_version:baseline")
+        .query("SELECT version FROM schema_version:baseline; SELECT VALUE action FROM account_actions:legacy;")
         .await?
         .check()?;
     let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
-    assert_eq!(migrated_version.unwrap().version, 13);
+    assert_eq!(migrated_version.unwrap().version, 12);
+    let legacy: Vec<String> = migrated.take(1)?;
+    assert_eq!(legacy, ["password-set"]);
+    db.query("CREATE account_actions SET id = 'reset', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
+        .await?.check()?;
+    // The database itself allows one pending recovery per owner.
+    let pending = "CREATE account_recoveries SET id = $id, user_id = 'fixture', device_id = 'd', slot = 'fixture', verifier = NONE, status = 'pending', created_at = time::now(), expires_at = time::now() + 15m, resolved_at = NONE;";
+    db.query(pending).bind(("id", "first")).await?.check()?;
+    assert!(db
+        .query(pending)
+        .bind(("id", "second"))
+        .await?
+        .check()
+        .is_err());
     // One push target per device; malformed kinds, tokens and environments
     // are refused by the schema itself.
     let (token, other) = ("ab".repeat(32), "cd".repeat(32));
