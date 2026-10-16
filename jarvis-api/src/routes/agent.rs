@@ -149,12 +149,34 @@ pub(crate) async fn agent_action(
             }
         };
         // ponytail: count-then-create, so concurrent proposals can pass the cap
-        // by a few; a transaction if that ever matters.
-        if pending_count(&state, authed.user.id).await >= MAX_PENDING_AGENT_ACTIONS {
-            return Err((
+        // by a few (the list stays capped); a transaction if that ever matters.
+        let refusal = match pending_count(&state, authed.user.id).await {
+            Some(count) if count < MAX_PENDING_AGENT_ACTIONS => None,
+            Some(_) => Some((
+                "denied",
+                "pending cap",
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({ "error": "too many agent actions are waiting for approval" })),
-            ));
+                "too many agent actions are waiting for approval",
+            )),
+            None => Some((
+                "error",
+                "pending count failed",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "could not check pending actions",
+            )),
+        };
+        if let Some((outcome, note, status, error)) = refusal {
+            record_agent_audit(
+                &state,
+                authed.device.id,
+                &at,
+                detail,
+                risk,
+                outcome,
+                Some(note),
+            )
+            .await;
+            return Err((status, Json(json!({ "error": error }))));
         }
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
@@ -231,8 +253,8 @@ pub(crate) async fn agent_action(
     }
 }
 
-/// Live pending actions of `user_id`; a failed read counts as full (fail closed).
-async fn pending_count(state: &AppState, user_id: Uuid) -> u64 {
+/// Live pending actions of `user_id`; `None` when the count failed.
+async fn pending_count(state: &AppState, user_id: Uuid) -> Option<u64> {
     let rows: Result<Vec<Value>, surrealdb::Error> = async {
         state
             .db
@@ -246,10 +268,10 @@ async fn pending_count(state: &AppState, user_id: Uuid) -> u64 {
     }
     .await;
     match rows {
-        Ok(rows) => rows.first().and_then(|row| row["n"].as_u64()).unwrap_or(0),
+        Ok(rows) => Some(rows.first().and_then(|row| row["n"].as_u64()).unwrap_or(0)),
         Err(error) => {
             tracing::warn!(%error, "failed to count pending actions");
-            u64::MAX
+            None
         }
     }
 }
@@ -258,11 +280,12 @@ async fn pending_count(state: &AppState, user_id: Uuid) -> u64 {
 pub(crate) async fn agent_pending(authed: Authed, State(state): State<AppState>) -> Json<Value> {
     let rows: Vec<PendingListRow> = match state
         .db
-        .query(
+        .query(format!(
             "SELECT record::id(id) AS id, action_type, action, preview, nonce, created_at \
          FROM agent_pending_actions WHERE user_id = $user_id AND status = 'pending' \
-         AND expires_at > time::now() ORDER BY created_at DESC",
-        )
+         AND expires_at > time::now() ORDER BY created_at DESC \
+         LIMIT {MAX_PENDING_AGENT_ACTIONS}"
+        ))
         .bind(json!({"user_id": authed.user.id.to_string()}))
         .await
     {
@@ -531,9 +554,19 @@ mod tests {
             message: "x".into(),
         };
         let code = agent::Action::ClaudeCode { prompt: "x".into() };
-        let large = write("x".repeat(jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN));
+        // Exactly at the limit, and one byte over.
+        let overhead = json(&write(String::new())).len();
+        let limit =
+            write("x".repeat(jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN - overhead));
+        assert_eq!(
+            json(&limit).len(),
+            jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN
+        );
+        let large =
+            write("x".repeat(jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN + 1 - overhead));
         for phone in ["ios", "android"] {
             assert!(approvable_on(phone, &small, &json(&small)));
+            assert!(approvable_on(phone, &limit, &json(&limit)));
             assert!(!approvable_on(phone, &commit, &json(&commit)));
             assert!(!approvable_on(phone, &code, &json(&code)));
             assert!(!approvable_on(phone, &large, &json(&large)));

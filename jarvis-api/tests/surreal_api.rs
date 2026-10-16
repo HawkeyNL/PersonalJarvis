@@ -1040,12 +1040,21 @@ async fn signed_agent_approval_is_single_use_and_core_stays_denied(
     let b_signature = sign_listed(&listed, &b_id);
 
     // A phone cannot approve an action too large to list in full, nor a kind
-    // outside the mobile allowlist, even with a valid signature.
+    // outside the mobile allowlist, even with a valid signature. The limit is
+    // on the stored JSON: 16384 bytes are listed, 16385 are not.
+    let overhead = r#"{"type":"write_file","path":"note.txt","content":""}"#.len();
+    let max = jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN;
+    let at_limit = json_body(
+        app.clone()
+            .oneshot(propose(&"x".repeat(max - overhead)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let at_limit_id = at_limit["pending_id"].as_str().unwrap().to_string();
     let large = json_body(
         app.clone()
-            .oneshot(propose(
-                &"x".repeat(jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN),
-            ))
+            .oneshot(propose(&"x".repeat(max + 1 - overhead)))
             .await
             .unwrap(),
     )
@@ -1065,6 +1074,34 @@ async fn signed_agent_approval_is_single_use_and_core_stays_denied(
         .find(|entry| entry["pending_id"] == large_id.as_str())
         .unwrap();
     assert!(large_entry["action_json"].is_null());
+    let at_limit_entry = listed["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["pending_id"] == at_limit_id.as_str())
+        .unwrap();
+    assert_eq!(
+        at_limit_entry["action_json"].as_str().map(str::len),
+        Some(max)
+    );
+    // A device that cannot approve never receives action_json.
+    let set_platform = |platform: &'static str| {
+        let db = db.clone();
+        async move {
+            db.query("UPDATE devices SET platform = $platform WHERE record::id(id) = $id")
+                .bind(json!({"platform": platform, "id": device_id.to_string()}))
+                .await?
+                .check()
+        }
+    };
+    set_platform("linux").await?;
+    let as_linux = json_body(app.clone().oneshot(list()).await.unwrap()).await;
+    set_platform("ios").await?;
+    assert!(as_linux["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["action_json"].is_null()));
     for id in [&large_id, &other_id] {
         let signature = sign_listed(&listed, id);
         assert_eq!(
@@ -1172,18 +1209,52 @@ async fn signed_agent_approval_is_single_use_and_core_stays_denied(
         .await
         .unwrap();
     assert_eq!(core.status(), StatusCode::FORBIDDEN);
-    // At most 16 live pending actions per user; two (large, other) are live.
-    for _ in 0..14 {
+    // At most 16 live pending actions per user; three (at_limit, large,
+    // other) are live. A deny or an expiry frees a slot.
+    let mut more = Vec::new();
+    for _ in 0..13 {
         let created = app.clone().oneshot(propose("more")).await.unwrap();
         assert_eq!(created.status(), StatusCode::OK);
+        more.push(
+            json_body(created).await["pending_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
     }
+    let status = |response: axum::response::Response| response.status();
     assert_eq!(
-        app.clone()
-            .oneshot(propose("one too many"))
-            .await
-            .unwrap()
-            .status(),
+        status(app.clone().oneshot(propose("one too many")).await.unwrap()),
         StatusCode::TOO_MANY_REQUESTS
+    );
+    let listed = json_body(app.clone().oneshot(list()).await.unwrap()).await;
+    assert_eq!(listed["pending"].as_array().map(Vec::len), Some(16));
+    let denied = app
+        .clone()
+        .oneshot(post(
+            format!("/v1/agent/pending/{}/deny", more[0]),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::OK);
+    assert_eq!(
+        status(app.clone().oneshot(propose("after deny")).await.unwrap()),
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(app.clone().oneshot(propose("full again")).await.unwrap()),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    db.query(
+        "UPDATE agent_pending_actions SET expires_at = time::now() - 1s WHERE record::id(id) = $id",
+    )
+    .bind(json!({"id": more[1]}))
+    .await?
+    .check()?;
+    assert_eq!(
+        status(app.clone().oneshot(propose("after expiry")).await.unwrap()),
+        StatusCode::OK
     );
     std::fs::remove_dir_all(root)?;
     Ok(())
