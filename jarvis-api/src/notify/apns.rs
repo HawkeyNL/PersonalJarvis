@@ -11,7 +11,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::json;
 
-use super::{Audience, NotifyEvent, MAX_ATTEMPTS};
+use super::{Audience, NotifyEvent, APP_PUSH_BUDGET, MAX_ATTEMPTS};
 
 pub const TEAM_ID_ENV: &str = "JARVIS_APNS_TEAM_ID";
 pub const KEY_ID_ENV: &str = "JARVIS_APNS_KEY_ID";
@@ -190,6 +190,8 @@ pub struct Apns {
     db: jarvis_store::Database,
     client: reqwest::Client,
     token: Option<(HeaderValue, Instant)>,
+    /// `APP_PUSH_BUDGET`; tests shorten it.
+    budget: Duration,
 }
 
 impl Apns {
@@ -211,6 +213,7 @@ impl Apns {
             db,
             client,
             token: None,
+            budget: APP_PUSH_BUDGET,
         })
     }
 
@@ -226,8 +229,20 @@ impl Apns {
     }
 
     /// Push `event` to the audience's active devices in the configured
-    /// environment, skipping the requesting device.
+    /// environment, skipping the requesting device, within the time budget.
     pub(super) async fn send(&mut self, event: NotifyEvent, audience: Audience, backoff: Duration) {
+        if tokio::time::timeout(self.budget, self.send_unbounded(event, audience, backoff))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                kind = event.kind(),
+                "app push gave up after its time budget"
+            );
+        }
+    }
+
+    async fn send_unbounded(&mut self, event: NotifyEvent, audience: Audience, backoff: Duration) {
         let targets = match jarvis_identity::apns_targets(
             &self.db,
             audience.user,
@@ -549,5 +564,199 @@ mod tests {
         ] {
             assert!(!valid_token(&bad), "{bad}");
         }
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// Loopback h2c stand-in for APNs. Records (device token, authorization)
+    /// per request and answers `reply`'s status and reason; `None` never
+    /// answers.
+    async fn mock_apns(reply: fn(&str, &str) -> Option<(u16, &'static str)>) -> (String, Seen) {
+        use axum::{
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            routing::post,
+            Router,
+        };
+        let seen = Seen::default();
+        let app = Router::new()
+            .route(
+                "/3/device/{token}",
+                post(
+                    move |State(seen): State<Seen>,
+                          Path(token): Path<String>,
+                          headers: HeaderMap| async move {
+                        let auth = headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        seen.lock().unwrap().push((token.clone(), auth.clone()));
+                        let Some((status, reason)) = reply(&token, &auth) else {
+                            return std::future::pending().await;
+                        };
+                        (
+                            StatusCode::from_u16(status).unwrap(),
+                            json!({ "reason": reason }).to_string(),
+                        )
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (url, seen)
+    }
+
+    /// An `Apns` sending to `url` (h2c, prior knowledge) with a fresh key.
+    fn fixture_apns(db: jarvis_store::Database, url: String, timeout: Duration) -> (Apns, Vec<u8>) {
+        let (key, public) = fixture_key();
+        let config = Config::from_vars(vars(&key)).unwrap().unwrap();
+        let mut apns = Apns::new(config, db, timeout).unwrap();
+        apns.base_url = url;
+        (apns, public)
+    }
+
+    async fn fixture_db() -> Result<jarvis_store::Database, Box<dyn std::error::Error>> {
+        use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
+        let db = Surreal::new::<Ws>(std::env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+        db.signin(Root {
+            username: &std::env::var("JARVIS_SURREAL_TEST_USER")?,
+            password: &std::env::var("JARVIS_SURREAL_TEST_PASS")?,
+        })
+        .await?;
+        db.use_ns(format!("apns_fixture_{}", uuid::Uuid::now_v7().simple()))
+            .use_db("fixture")
+            .await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+        Ok(db)
+    }
+
+    /// A fresh owner with one active iOS device per sandbox token.
+    async fn owner_with_targets(
+        db: &jarvis_store::Database,
+        tokens: &[&str],
+    ) -> Result<uuid::Uuid, Box<dyn std::error::Error>> {
+        let owner = jarvis_identity::create_user(db, "fixture owner").await?.id;
+        for token in tokens {
+            let key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+            let (device, _) = jarvis_identity::register_device(
+                db,
+                owner,
+                "fixture phone",
+                jarvis_identity::Platform::Ios,
+                "ed25519",
+                &key.verifying_key().to_bytes(),
+            )
+            .await?;
+            jarvis_identity::set_push_target(db, device.id, token, "sandbox").await?;
+        }
+        Ok(owner)
+    }
+
+    #[tokio::test]
+    async fn an_expired_provider_token_is_minted_again_and_retried() {
+        let (url, seen) = mock_apns(|_, auth| {
+            Some(if auth == "bearer stale" {
+                (403, "ExpiredProviderToken")
+            } else {
+                (200, "")
+            })
+        })
+        .await;
+        // Never connected: this path needs no database.
+        let (mut apns, public) =
+            fixture_apns(surrealdb::Surreal::init(), url, Duration::from_secs(5));
+        apns.token = Some((HeaderValue::from_static("bearer stale"), Instant::now()));
+        let target = "0b".repeat(32);
+        apns.deliver(
+            NotifyEvent::UnlockRequested,
+            &target,
+            Duration::from_millis(10),
+        )
+        .await;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0], (target.clone(), "bearer stale".to_string()));
+        let jwt = seen[1].1.strip_prefix("bearer ").unwrap();
+        let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
+        validation.set_required_spec_claims::<&str>(&[]);
+        validation.validate_exp = false;
+        let fresh = jsonwebtoken::decode::<serde_json::Value>(
+            jwt,
+            &jsonwebtoken::DecodingKey::from_ec_der(&public),
+            &validation,
+        )
+        .unwrap();
+        assert_eq!(fresh.claims["iss"], "TEAM123456");
+        // The new token is cached for the next push.
+        assert_eq!(apns.token.as_ref().unwrap().0, seen[1].1.as_str());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn an_unregistered_token_is_forgotten_without_retry(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let db = fixture_db().await?;
+        let (gone, live) = ("0a".repeat(32), "0c".repeat(32));
+        let owner = owner_with_targets(&db, &[&gone, &live]).await?;
+        let (url, seen) = mock_apns(|token, _| {
+            Some(if token.starts_with("0a") {
+                (410, "Unregistered")
+            } else {
+                (200, "")
+            })
+        })
+        .await;
+        let (mut apns, _) = fixture_apns(db.clone(), url, Duration::from_secs(5));
+        let audience = Audience {
+            user: owner,
+            except: None,
+        };
+        apns.send(
+            NotifyEvent::UnlockRequested,
+            audience,
+            Duration::from_millis(10),
+        )
+        .await;
+        let mut tokens: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(t, _)| t.clone())
+            .collect();
+        tokens.sort();
+        assert_eq!(tokens, [gone, live.clone()]);
+        assert_eq!(
+            jarvis_identity::apns_targets(&db, owner, None, "sandbox", 8).await?,
+            [live]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn the_time_budget_cancels_a_hanging_push() -> Result<(), Box<dyn std::error::Error>> {
+        let db = fixture_db().await?;
+        let owner = owner_with_targets(&db, &[&"0d".repeat(32)]).await?;
+        let (url, seen) = mock_apns(|_, _| None).await;
+        // Only the budget can end this push: the request timeout is an hour.
+        let (mut apns, _) = fixture_apns(db, url, Duration::from_secs(3600));
+        apns.budget = Duration::from_millis(500);
+        let started = Instant::now();
+        let audience = Audience {
+            user: owner,
+            except: None,
+        };
+        apns.send(
+            NotifyEvent::UnlockRequested,
+            audience,
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        Ok(())
     }
 }

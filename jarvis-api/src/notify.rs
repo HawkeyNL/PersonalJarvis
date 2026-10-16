@@ -286,15 +286,7 @@ async fn run(
         // The app push first: an approval expires in two minutes, and a slow
         // ntfy must not hold it back.
         if let (Some(apns), Some(audience)) = (apns.as_mut(), job.audience) {
-            if tokio::time::timeout(APP_PUSH_BUDGET, apns.send(job.event, audience, backoff))
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    kind = job.event.kind(),
-                    "app push gave up after its time budget"
-                );
-            }
+            apns.send(job.event, audience, backoff).await;
         }
         if let Some(ntfy) = &ntfy {
             publish_with_retry(&client, ntfy, job.event, backoff).await;

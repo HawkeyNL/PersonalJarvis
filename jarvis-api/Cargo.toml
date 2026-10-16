@@ -29,7 +29,10 @@ axum.workspace = true
 tower-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# APNs only speaks HTTP/2; the other binaries keep HTTP/1.1-only clients.
+# APNs only speaks HTTP/2. Cargo unifies features, so every reqwest client in
+# a build that links jarvis-api can now negotiate HTTP/2 over TLS (ALPN);
+# plain-HTTP clients stay on HTTP/1.1. A client that must keep HTTP/1.1 over
+# TLS has to call `http1_only()`.
 reqwest = { workspace = true, features = ["http2"] }
 async-trait = "0.1"
 serde_bytes.workspace = true
