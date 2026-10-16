@@ -5,7 +5,7 @@
 //! authenticated API and approval still needs the device signature. Tokens
 //! and device ids never reach the log.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE};
@@ -24,8 +24,9 @@ pub const KEY_ENV: &str = "JARVIS_APNS_KEY_P8";
 /// Pushes per event: the owner has a handful of devices.
 const MAX_TARGETS: usize = 8;
 /// Apple accepts a provider token for 60 minutes and refuses refreshing more
-/// often than every 20.
-const JWT_LIFETIME: Duration = Duration::from_secs(45 * 60);
+/// often than every 20 (`TooManyProviderTokenUpdates`).
+const JWT_LIFETIME_SECS: u64 = 45 * 60;
+const MIN_REFRESH_SECS: u64 = 20 * 60;
 /// An approval request expires after two minutes; a later push is useless.
 const EXPIRATION_SECS: u64 = 120;
 const MAX_KEY_BYTES: usize = 1024;
@@ -189,7 +190,8 @@ pub struct Apns {
     base_url: String,
     db: jarvis_store::Database,
     client: reqwest::Client,
-    token: Option<(HeaderValue, Instant)>,
+    /// The cached provider token and its `iat` (Unix seconds).
+    token: Option<(HeaderValue, u64)>,
     /// `APP_PUSH_BUDGET`; tests shorten it.
     budget: Duration,
 }
@@ -218,14 +220,22 @@ impl Apns {
     }
 
     fn provider_token(&mut self) -> Option<HeaderValue> {
+        let now = unix_now();
         if let Some((token, minted)) = &self.token {
-            if minted.elapsed() < JWT_LIFETIME {
+            if now.saturating_sub(*minted) < JWT_LIFETIME_SECS {
                 return Some(token.clone());
             }
         }
-        let token = self.config.provider_token(unix_now())?;
-        self.token = Some((token.clone(), Instant::now()));
+        let token = self.config.provider_token(now)?;
+        self.token = Some((token.clone(), now));
         Some(token)
+    }
+
+    /// Whether Apple would accept a replacement for the cached token.
+    fn token_replaceable(&self) -> bool {
+        self.token
+            .as_ref()
+            .is_none_or(|(_, minted)| unix_now().saturating_sub(*minted) >= MIN_REFRESH_SECS)
     }
 
     /// Push `event` to the audience's active devices in the configured
@@ -280,6 +290,15 @@ impl Apns {
                         .await
                         .is_ok();
                     tracing::info!(kind = event.kind(), removed, "app push target unregistered");
+                    return;
+                }
+                // Refused although younger than 20 minutes (e.g. clock skew):
+                // a new token now would only draw TooManyProviderTokenUpdates.
+                Outcome::RefreshToken if !self.token_replaceable() => {
+                    tracing::warn!(
+                        kind = event.kind(),
+                        "APNs refused a provider token too new to replace"
+                    );
                     return;
                 }
                 Outcome::Retry | Outcome::RefreshToken if attempt < MAX_ATTEMPTS => {
@@ -668,7 +687,11 @@ mod tests {
         // Never connected: this path needs no database.
         let (mut apns, public) =
             fixture_apns(surrealdb::Surreal::init(), url, Duration::from_secs(5));
-        apns.token = Some((HeaderValue::from_static("bearer stale"), Instant::now()));
+        // Old enough that Apple accepts a replacement.
+        apns.token = Some((
+            HeaderValue::from_static("bearer stale"),
+            unix_now() - MIN_REFRESH_SECS,
+        ));
         let target = "0b".repeat(32);
         apns.deliver(
             NotifyEvent::UnlockRequested,
@@ -692,6 +715,25 @@ mod tests {
         assert_eq!(fresh.claims["iss"], "TEAM123456");
         // The new token is cached for the next push.
         assert_eq!(apns.token.as_ref().unwrap().0, seen[1].1.as_str());
+    }
+
+    #[tokio::test]
+    async fn a_provider_token_younger_than_twenty_minutes_is_not_replaced() {
+        let (url, seen) = mock_apns(|_, _| Some((403, "ExpiredProviderToken"))).await;
+        let (mut apns, _) = fixture_apns(surrealdb::Surreal::init(), url, Duration::from_secs(5));
+        let minted = unix_now() - MIN_REFRESH_SECS + 60;
+        apns.token = Some((HeaderValue::from_static("bearer recent"), minted));
+        apns.deliver(
+            NotifyEvent::UnlockRequested,
+            &"0b".repeat(32),
+            Duration::from_millis(10),
+        )
+        .await;
+        // One attempt, no new token: Apple would answer a replacement with
+        // TooManyProviderTokenUpdates.
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let (token, kept) = apns.token.as_ref().unwrap();
+        assert_eq!((token.to_str().unwrap(), *kept), ("bearer recent", minted));
     }
 
     #[tokio::test]
@@ -744,7 +786,7 @@ mod tests {
         // Only the budget can end this push: the request timeout is an hour.
         let (mut apns, _) = fixture_apns(db, url, Duration::from_secs(3600));
         apns.budget = Duration::from_millis(500);
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let audience = Audience {
             user: owner,
             except: None,
