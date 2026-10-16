@@ -10,6 +10,7 @@ until `JARVIS_NOTIFY_NTFY_URL` is set.
 |---|---|---|---|
 | Monthly LLM spend reaches 90% of the hard budget (`JARVIS_LLM_MONTHLY_BUDGET_EUR`), once per calendar month (UTC) | Budget reached 90% this month | default | `jarvis://health/usage` |
 | A new device pairing request was created with a verified account password | New device wants to pair — open Jarvis to review | high | `jarvis://approvals/pairing` |
+| A signed-in device asks another device to approve its unlock | Approval waiting — open Jarvis | high | `jarvis://approvals/unlock` |
 
 Every push has the title `Jarvis` and nothing else: no amounts, IP addresses,
 device names or key fingerprints. The app shows the details after the owner
@@ -28,6 +29,10 @@ Behaviour in Core:
 - A pairing request accepted without a password check (an owner with no
   stored account password) sends no push, so an unauthenticated caller cannot
   trigger one.
+- An unlock request needs a device session, so only a signed-in device can
+  trigger that push. Each device may create 3 unlock requests per minute. A
+  new one supersedes the same device's older pending request: it disappears
+  from the approval list and can no longer be approved.
 - An invalid URL or a missing or malformed token is logged at startup and
   leaves notifications off; Core keeps running.
 

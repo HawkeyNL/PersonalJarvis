@@ -24,8 +24,8 @@ use jarvis_identity as identity;
 use crate::audit::{record_security_event, record_unauthenticated_event};
 use crate::error::{bad_request, internal, unauthorized};
 use crate::rate_limit::{
-    device_password_key, note_password_failure, note_password_verified, password_backoff,
-    ACCOUNT_PASSWORD_BACKOFF, ACCOUNT_PASSWORD_KEY, DEVICE_PASSWORD_BACKOFF,
+    allow_authenticated_device, device_password_key, note_password_failure, note_password_verified,
+    password_backoff, ACCOUNT_PASSWORD_BACKOFF, ACCOUNT_PASSWORD_KEY, DEVICE_PASSWORD_BACKOFF,
 };
 use crate::validation;
 use crate::{AppState, Authed};
@@ -589,15 +589,48 @@ pub(crate) async fn auth_logout(
     Ok(Json(json!({ "status": "logged out" })))
 }
 
+/// Unlock requests one device may create per minute. Bounds the rows and
+/// audit entries a signed-in device can create (pushes are already coalesced
+/// per kind); a retry only needs one, as a new request supersedes the
+/// device's older pending one.
+const UNLOCK_REQUESTS_PER_MIN: u32 = 3;
+
 /// Ask a trusted device to approve unlocking this (requesting) device.
 /// Returns the request id and the nonce an approver must sign.
 pub(crate) async fn unlock_request(
     authed: Authed,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !allow_authenticated_device(
+        &state,
+        authed.device.id,
+        "unlock-request",
+        UNLOCK_REQUESTS_PER_MIN,
+    ) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "rate limited",
+                "hint": "too many attempts; try again later",
+            })),
+        ));
+    }
     let (id, nonce) = identity::create_unlock_request(&state.db, authed.user.id, authed.device.id)
         .await
         .map_err(internal)?;
+    // Enqueue only: a full queue or an unreachable ntfy never delays or fails
+    // the request.
+    state
+        .notifier
+        .notify(crate::notify::NotifyEvent::UnlockRequested);
+    record_security_event(
+        &state,
+        Some(authed.device.id),
+        "unlock.request",
+        "created",
+        Some(&id.to_string()),
+    )
+    .await;
     Ok(Json(json!({
         "request_id": id,
         "nonce": hex::encode(nonce),

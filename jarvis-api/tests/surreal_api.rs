@@ -665,6 +665,66 @@ async fn enroll_login(app: &axum::Router, signing: &SigningKey) -> (String, Vec<
 
 #[tokio::test]
 #[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn unlock_requests_are_rate_limited_superseded_and_audited(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db.clone(), None).await);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let request = |uri: String, method: &str| {
+        app.clone().oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let response = request("/v1/auth/unlock/request".into(), "POST").await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        ids.push(
+            json_body(response).await["request_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let limited = request("/v1/auth/unlock/request".into(), "POST").await?;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    // Superseded requests are denied in storage but still read as pending.
+    let live: Vec<String> = db
+        .query("SELECT VALUE record::id(id) FROM unlock_requests WHERE status = 'pending'")
+        .await?
+        .take(0)?;
+    assert_eq!(live, vec![ids[2].clone()]);
+    let status = request(format!("/v1/auth/unlock/{}", ids[0]), "GET").await?;
+    assert_eq!(json_body(status).await["status"], "pending");
+    let mut audited: Vec<String> = db
+        .query("SELECT VALUE detail FROM security_audit WHERE event = 'unlock.request' AND outcome = 'created'")
+        .await?
+        .take(0)?;
+    audited.sort();
+    ids.sort();
+    assert_eq!(audited, ids);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
 async fn signed_agent_approval_is_single_use_and_core_stays_denied(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
