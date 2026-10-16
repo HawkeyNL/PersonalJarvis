@@ -185,6 +185,7 @@ pub async fn request_action(
         if target.user_id != user_id || target.status != "active" {
             return Err(IdentityError::AuthFailed);
         }
+        ensure_other_approver(db, user_id, target.id).await?;
     }
     let id = Uuid::now_v7();
     let mut nonce = vec![0_u8; 32];
@@ -276,7 +277,16 @@ pub async fn approve_action(
             }; \
             UPDATE sessions SET revoked_at = time::now() WHERE user_id = $user AND revoked_at IS NONE; \
             DELETE account_actions WHERE user_id = $user;",
-        AccountAction::DeviceRevoke => "UPDATE devices SET status = 'revoked', updated_at = time::now() \
+        // Concurrent revokes of two different approvers write disjoint device
+        // rows, so snapshot isolation alone would let both pass the count
+        // (write skew). Writing the owner row too makes them conflict.
+        AccountAction::DeviceRevoke => "LET $owner = UPDATE users SET updated_at = time::now() \
+            WHERE record::id(id) = $user RETURN AFTER; \
+            IF array::len($owner) != 1 { THROW 'account action unavailable'; }; \
+            LET $approvers = SELECT VALUE record::id(id) FROM devices WHERE user_id = $user \
+            AND status = 'active' AND platform IN $approver_platforms; \
+            IF $target IN $approvers AND array::len($approvers) < 2 { THROW 'last approver device'; }; \
+            UPDATE devices SET status = 'revoked', updated_at = time::now() \
             WHERE record::id(id) = $target AND user_id = $user; \
             UPDATE device_keys SET revoked_at = time::now() WHERE device_id = $target AND revoked_at IS NONE; \
             UPDATE sessions SET revoked_at = time::now() WHERE device_id = $target AND user_id = $user AND revoked_at IS NONE;",
@@ -289,20 +299,48 @@ pub async fn approve_action(
         AND action = $action AND target = $target AND consumed_at IS NONE AND expires_at > time::now() RETURN AFTER; \
         IF array::len($claim) != 1 {{ THROW 'account action unavailable'; }}; \
         {mutation} DELETE account_actions WHERE record::id(id) = $id; COMMIT TRANSACTION;");
-    execute(
+    let result = execute(
         db,
         &query,
         ApprovalBindings {
             fields: json!({"id":id.to_string(), "user":user.to_string(), "device":device.to_string(),
-            "action":action.as_str(), "target":challenge.target.to_string()}),
+            "action":action.as_str(), "target":challenge.target.to_string(),
+            "approver_platforms":APPROVER_PLATFORMS}),
             password_record: surrealdb::RecordId::from_table_key(
                 "account_passwords",
                 user.to_string(),
             ),
         },
     )
-    .await?;
+    .await;
+    if result.is_err() && action == AccountAction::DeviceRevoke {
+        // Report the guard, not an opaque failure, when it is what refused
+        // the revoke (directly or by losing a race to a concurrent revoke).
+        ensure_other_approver(db, user, challenge.target).await?;
+    }
+    result?;
     Ok(challenge)
+}
+
+/// Signed approvals need an approver-platform device and bootstrap never
+/// reopens, so the API refuses to revoke the user's last active one. The local
+/// root path (`local_devices::revoke`) deliberately skips this: it is the
+/// recovery route when no approver device is left or usable.
+async fn ensure_other_approver(
+    db: &Database,
+    user: Uuid,
+    target: Uuid,
+) -> Result<(), IdentityError> {
+    let approvers: Vec<Uuid> = list_active_devices(db, user)
+        .await?
+        .into_iter()
+        .filter(|device| APPROVER_PLATFORMS.contains(&device.platform.as_str()))
+        .map(|device| device.id)
+        .collect();
+    if approvers.contains(&target) && approvers.len() < 2 {
+        return Err(IdentityError::LastApprover);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

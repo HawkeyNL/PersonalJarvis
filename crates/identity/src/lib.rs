@@ -32,6 +32,10 @@ pub enum IdentityError {
     /// No password-check capacity right now: retryable, never a failed guess.
     #[error("authentication busy")]
     Busy,
+    /// A signed revoke would leave the user without an active approver
+    /// device. Only local root may do that.
+    #[error("last approver device")]
+    LastApprover,
 }
 
 /// A device platform. Persisted as text.

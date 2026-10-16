@@ -18,6 +18,7 @@ use jarvis_client_core::account::AccountAction;
 use jarvis_identity::{
     password::{AccountPassword, PasswordError, PasswordService},
     surreal::account,
+    IdentityError,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -128,8 +129,22 @@ pub(crate) async fn revoke_request(
         None,
     )
     .await
-    .map_err(|_| unauthorized())?;
+    .map_err(|error| match error {
+        IdentityError::LastApprover => last_approver(),
+        _ => unauthorized(),
+    })?;
     Ok(Json(json!(request)))
+}
+
+/// Not opaque on purpose: the owner's client must explain that another
+/// approver device has to be paired first (or local root used on the node).
+fn last_approver() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(
+            json!({"error":"cannot revoke the last approver device; pair another iOS, Android or macOS device first"}),
+        ),
+    )
 }
 
 pub(crate) async fn approve(
@@ -142,18 +157,32 @@ pub(crate) async fn approve(
         return Err(unauthorized());
     }
     let signature = hex::decode(req.signature).map_err(|_| unauthorized())?;
-    let Ok(approved) =
-        account::approve_action(&state.db, id, auth.user.id, auth.device.id, &signature).await
-    else {
-        record_security_event(
-            &state,
-            Some(auth.device.id),
-            "account.approve",
-            "fail",
-            None,
-        )
-        .await;
-        return Err(unauthorized());
+    let approved = match account::approve_action(
+        &state.db,
+        id,
+        auth.user.id,
+        auth.device.id,
+        &signature,
+    )
+    .await
+    {
+        Ok(approved) => approved,
+        Err(error) => {
+            let last = matches!(error, IdentityError::LastApprover);
+            record_security_event(
+                &state,
+                Some(auth.device.id),
+                "account.approve",
+                if last { "last_approver" } else { "fail" },
+                None,
+            )
+            .await;
+            return Err(if last {
+                last_approver()
+            } else {
+                unauthorized()
+            });
+        }
     };
     state.realtime.disconnect_owner(
         auth.user.id,
