@@ -3,6 +3,9 @@
 # GitHub Actions because it deliberately exercises canonical system paths.
 set -euo pipefail
 [[ ${GITHUB_ACTIONS:-} == true && ${EUID} -eq 0 ]] || { echo "CI root fixture only" >&2; exit 1; }
+# The persona installer checks content with the real `jarvis` validator.
+[[ -x ${JARVIS_PERSONA_VALIDATOR:-} ]] || { echo "set JARVIS_PERSONA_VALIDATOR to the built jarvis binary" >&2; exit 1; }
+export JARVIS_PERSONA_VALIDATOR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 fixture=$(mktemp -d)
@@ -18,7 +21,7 @@ if ! getent passwd jarvis >/dev/null; then
     created_user=true
 fi
 mkdir -p "$fixture/private/personaljarvis/jarvis-core" "$fixture/private/agents"
-printf 'Synthetic owner persona.\n' > "$fixture/private/personaljarvis/jarvis-core/Jarvis.md"
+printf '# Synthetic owner persona\n' > "$fixture/private/personaljarvis/jarvis-core/Jarvis.md"
 cat > "$fixture/private/agents/01_TEST_AGENT.md" <<'EOF'
 ---
 schema_version: 1
@@ -120,6 +123,30 @@ find "$history" -mindepth 1 -type f -exec touch -d '2099-01-01' {} +
 v15=$(write_persona 15)
 bash "$installer" --source "$fixture/private" >/dev/null
 [[ -f $history/$v14 && -f $history/$v15 && $(installed_hash) == "$v15" ]]
+
+# An identical persona with an unsafe mode is reinstalled, not left as is.
+chmod 0660 /etc/jarvis/Jarvis.md
+[[ $(bash "$installer" --source "$fixture/private") == "UPDATE protected persona sha256=${v15:0:12}" ]]
+[[ $(stat -c '%U:%G:%a' /etc/jarvis/Jarvis.md) == root:jarvis:640 ]]
+
+# Content production Core would refuse is never installed, and the installer
+# never prints it.
+refuse_persona() {
+    if bash "$installer" --source "$fixture/private" >"$fixture/refused.log" 2>&1; then
+        echo "invalid persona was installed" >&2
+        exit 1
+    fi
+    grep -Fq 'persona failed validation' "$fixture/refused.log"
+    if grep -Fq 'SYNTHETIC-INVALID-BODY' "$fixture/refused.log"; then
+        echo "installer printed persona text" >&2
+        exit 1
+    fi
+    [[ $(installed_hash) == "$v15" ]]
+}
+printf 'SYNTHETIC-INVALID-BODY without a heading\n' > "$persona"
+refuse_persona
+{ printf '# Synthetic persona\nSYNTHETIC-INVALID-BODY\n'; head -c 40000 /dev/zero | tr '\0' a; } > "$persona"
+refuse_persona
 
 JARVIS_AGENT_BUNDLE_VALIDATOR="$fixture/validator" bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"
 bundle=$(readlink -f /var/lib/jarvis/agents/current)

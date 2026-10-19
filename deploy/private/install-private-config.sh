@@ -11,6 +11,8 @@ readonly destination="$destination_dir/Jarvis.md"
 readonly history_dir="$destination_dir/persona-history"
 # Persona versions kept in the history, including the installed one.
 readonly history_keep=10
+# The release's `jarvis` binary checks content with the rules Core enforces.
+readonly validator=${JARVIS_PERSONA_VALIDATOR:-/usr/local/sbin/jarvis}
 
 fail() { echo "private persona: $*" >&2; exit 1; }
 usage() {
@@ -34,6 +36,7 @@ while (($#)); do
 done
 [[ ${EUID} -eq 0 ]] || fail "must run as root"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
+[[ -x $validator && ! -L $validator ]] || fail "persona validator is unavailable"
 getent group jarvis >/dev/null || fail "jarvis group is missing; run prepare-home-node first"
 # Serialize direct runs; `jarvis persona` also holds the administration locks.
 exec 8>/run/jarvis-persona-install.lock
@@ -69,10 +72,6 @@ install -d -o root -g root -m 0700 "$history_dir"
 current_hash=
 if [[ -f $destination && ! -L $destination ]]; then
     current_hash=$(file_sha256 "$destination")
-    if [[ $current_hash == "$source_hash" ]]; then
-        echo "UNCHANGED protected persona sha256=${source_hash:0:12}"
-        exit 0
-    fi
 fi
 
 umask 077
@@ -84,6 +83,15 @@ chown root:jarvis "$stage"
 chmod 0640 "$stage"
 [[ $(stat -c '%U:%G:%a' "$stage") == root:jarvis:640 ]] || fail "cannot secure staged persona"
 [[ $(file_sha256 "$stage") == "$source_hash" ]] || fail "staged persona hash mismatch"
+# Production Core refuses an invalid persona, so never install one. The exact
+# staged bytes go through stdin; the validator prints only the problem.
+"$validator" persona validate <"$stage" || fail "persona failed validation; nothing changed"
+# An identical persona is left alone only while its ownership and mode are safe.
+if [[ $current_hash == "$source_hash" ]] \
+    && [[ $(stat -c '%U:%G:%a' "$destination") == root:jarvis:640 ]]; then
+    echo "UNCHANGED protected persona sha256=${source_hash:0:12}"
+    exit 0
+fi
 
 # Keep root-controlled rollback copies without printing their private
 # contents. Re-archiving an intact entry marks it as recently used; a damaged

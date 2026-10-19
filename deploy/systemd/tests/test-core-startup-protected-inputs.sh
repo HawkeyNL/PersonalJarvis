@@ -89,12 +89,16 @@ core_env=(
 # Production Core must refuse an invalid persona without echoing its text.
 printf 'SYNTHETIC-PERSONA-BODY-7f3a\n' \
     | install -o root -g jarvis -m 0640 /dev/stdin /etc/jarvis/Jarvis-invalid.md
-if runuser -u jarvis -- env "${core_env[@]}" JARVIS_LLM_PERSONA_PATH=/etc/jarvis/Jarvis-invalid.md \
-    timeout 20 "$api_bin" >"$fixture/invalid-persona.log" 2>&1; then
-    echo "Core started with an invalid persona" >&2
+status=0
+runuser -u jarvis -- env "${core_env[@]}" JARVIS_LLM_PERSONA_PATH=/etc/jarvis/Jarvis-invalid.md \
+    timeout 20 "$api_bin" >"$fixture/invalid-persona.log" 2>&1 || status=$?
+# A timeout (124) means Core kept running, for example on a fallback persona.
+if ((status == 0 || status == 124)); then
+    echo "Core did not refuse an invalid persona (exit $status)" >&2
     exit 1
 fi
-grep -Fq 'persona must start with' "$fixture/invalid-persona.log"
+# Only the production refusal says "is unusable"; the fallback warning does not.
+grep -Fq 'is unusable: persona must start with' "$fixture/invalid-persona.log"
 if grep -Fq 'SYNTHETIC-PERSONA-BODY' "$fixture/invalid-persona.log"; then
     echo "Core logged persona text" >&2
     exit 1

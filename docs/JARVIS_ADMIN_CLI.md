@@ -392,6 +392,7 @@ option is checked against the commit date, which the committer chooses.
 sudo jarvis persona status [--json]
 sudo jarvis persona install [--expect-sha256 <sha256> [--yes]]
 sudo jarvis persona rollback --to <sha256> [--yes]
+sudo jarvis persona validate < candidate.md
 ```
 
 `status` shows the SHA-256, size and time of the installed persona, of the
@@ -428,20 +429,24 @@ root-owned and not writable by group or others (the installer sets
 `root:jarvis 0640`). In production a missing, empty, oversized or invalid
 persona, a symlink, a non-regular file or an unsafe owner or mode stops Core
 from starting; the error names the problem, never the content. Development and
-test environments fall back to a built-in persona instead.
+test environments fall back to a built-in persona instead. `status` reports
+the same problems, including a persona writable by group or others, and the
+protected installer refuses content that fails `sudo jarvis persona validate`
+(which reads a candidate from standard input and prints only the problem).
 
 **Upgrade note (persona check).** Before installing the release that adds
 this startup check, run:
 
 ```bash
 sudo jarvis persona status
+sudo stat -c '%U:%G:%a' /etc/jarvis/Jarvis.md
 ```
 
-and confirm the `Installed` line shows a persona marked `valid`. A persona
-installed by `jarvis persona` or the protected installer is already
-`root:jarvis 0640`; `sudo stat -c '%U:%G:%a' /etc/jarvis/Jarvis.md` shows it
-for a hand-placed file. Otherwise Core will not start after the update; fix the
-persona with `sudo jarvis persona install` or `rollback` first.
+and confirm the `Installed` line shows a persona marked `valid` and the mode
+is `root:jarvis:640`; `status` from earlier releases does not check the mode.
+A persona installed by `jarvis persona` or the protected installer already has
+it. Otherwise Core will not start after the update; fix the persona with
+`sudo jarvis persona install` or `rollback` first.
 
 Destructive operations prompt only on a controlling TTY. In automation they
 fail closed unless their explicit `--yes` option is supplied. Credential input
