@@ -1,6 +1,6 @@
 # Goal: owner-only Jarvis persona management in Core Admin
 
-> **Status (2026-10-11):** Not started — `deploy/private/install-private-config.sh` installs the protected persona, but Core Admin has no persona editing, validation or rollback workflow.
+> **Status (2026-10-19):** In progress — `sudo jarvis persona status | install | rollback` validates, installs or restores the protected persona, restarts Core, checks readiness and restores the previous persona on failure. The Core Admin **Persona** view (Administration) shows hashes, sizes, times, the candidate's signature state and validation problem codes, and runs install (bound to the shown candidate SHA-256) and rollback (to a history SHA-256) through the existing polkit/root broker as typed, hash-only requests. Open/Edit source is not offered in Core Admin: the persona changes only through signed commits in the private checkout.
 
 Add a safe owner workflow for updating the protected private `Jarvis.md` from the Jarvis Core Admin experience without creating a Jarvis self-modification capability.
 
