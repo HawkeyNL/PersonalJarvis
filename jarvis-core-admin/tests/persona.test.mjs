@@ -11,6 +11,7 @@ const candidate = (overrides = {}) => ({ commit: "0123456789ab", signature: "ver
 test("problem codes map to fixed labels only", () => {
   assert.equal(problemLabel(null), "Valid");
   assert.equal(problemLabel("missing_heading"), "Does not start with a \"# \" heading");
+  assert.equal(problemLabel("unsafe_mode"), "Writable by group or others");
   assert.equal(problemLabel("unrecognized"), "Refused by validation");
   assert.equal(shortHash(B), "bbbbbbbbbbbb");
 });

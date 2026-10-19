@@ -10,6 +10,7 @@ const problems: Record<string, string> = {
   missing_heading: "Does not start with a \"# \" heading",
   secret_like: "Appears to contain a key or token",
   hash_mismatch: "Content does not match its hash",
+  unsafe_mode: "Writable by group or others",
 };
 
 const sourceProblems: Record<string, string> = {

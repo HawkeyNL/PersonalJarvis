@@ -1302,6 +1302,7 @@ fn persona_problem_code(message: &str) -> String {
         "persona must start with a \"# \" heading" => "missing_heading",
         "persona appears to contain a key or token" => "secret_like",
         "content does not match its hash" => "hash_mismatch",
+        "persona is writable by group or others" => "unsafe_mode",
         message if message.starts_with("persona exceeds ") => "too_large",
         _ => "unrecognized",
     }
@@ -3128,6 +3129,10 @@ mod tests {
         assert_eq!(candidate.problem.as_deref(), Some("missing_heading"));
         assert!(status.history[0].installed);
         assert_eq!(status.history[1].problem.as_deref(), Some("hash_mismatch"));
+        assert_eq!(
+            persona_problem_code("persona is writable by group or others"),
+            "unsafe_mode"
+        );
 
         for (error, code) in [
             (

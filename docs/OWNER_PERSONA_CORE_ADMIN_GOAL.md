@@ -1,6 +1,6 @@
 # Goal: owner-only Jarvis persona management in Core Admin
 
-> **Status (2026-10-19):** In progress — `sudo jarvis persona status | install | rollback` validates, installs or restores the protected persona, restarts Core, checks readiness and restores the previous persona on failure. The Core Admin **Persona** view (Administration) shows hashes, sizes, times, the candidate's signature state and validation problem codes, and runs install (bound to the shown candidate SHA-256) and rollback (to a history SHA-256) through the existing polkit/root broker as typed, hash-only requests. Open/Edit source is not offered in Core Admin: the persona changes only through signed commits in the private checkout.
+> **Status (2026-10-19):** In progress — `sudo jarvis persona status | install | rollback` validates, installs or restores the protected persona, restarts Core, checks readiness and restores the previous persona on failure. The Core Admin **Persona** view (Administration) shows hashes, sizes, times, the candidate's signature state and validation problem codes, and runs install (bound to the shown candidate SHA-256) and rollback (to a history SHA-256) through the existing polkit/root broker as typed, hash-only requests. Open/Edit source is not offered in Core Admin: the persona changes only through signed commits in the private checkout. Core checks the persona with the same validator at startup: in production a missing or invalid persona stops Core from starting.
 
 Add a safe owner workflow for updating the protected private `Jarvis.md` from the Jarvis Core Admin experience without creating a Jarvis self-modification capability.
 
@@ -88,7 +88,7 @@ Do not let an LLM be the security validator for persona installation.
 
 ## Reload/restart
 
-The current Core loads the persona at startup. Until a separately reviewed hot-reload mechanism exists, a successful install should perform or offer a controlled Core restart through the trusted admin path, then verify `/readyz`.
+The current Core loads and validates the persona once at startup and, in production, refuses to start when it is missing or invalid. Until a separately reviewed hot-reload mechanism exists, a successful install should perform or offer a controlled Core restart through the trusted admin path, then verify `/readyz`.
 
 If restart/readiness fails, report clearly. Do not silently overwrite the source checkout or fabricate success.
 

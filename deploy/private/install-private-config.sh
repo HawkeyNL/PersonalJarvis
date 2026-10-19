@@ -11,6 +11,8 @@ readonly destination="$destination_dir/Jarvis.md"
 readonly history_dir="$destination_dir/persona-history"
 # Persona versions kept in the history, including the installed one.
 readonly history_keep=10
+# The release's `jarvis` binary checks content with the rules Core enforces.
+readonly validator=${JARVIS_PERSONA_VALIDATOR:-/usr/local/sbin/jarvis}
 
 fail() { echo "private persona: $*" >&2; exit 1; }
 usage() {
@@ -34,6 +36,15 @@ while (($#)); do
 done
 [[ ${EUID} -eq 0 ]] || fail "must run as root"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
+[[ -f $validator && -x $validator && ! -L $validator ]] || fail "persona validator is unavailable"
+validator_owner_mode=$(stat -c '%u %a' -- "$validator")
+[[ ${validator_owner_mode% *} == 0 ]] && (((8#${validator_owner_mode#* } & 8#022) == 0)) \
+    || fail "persona validator must be root-owned and not writable by group or others"
+# A capable validator refuses empty input as invalid (exit 1); a `jarvis`
+# from before `persona validate` rejects the subcommand as usage (exit 2).
+probe=0
+"$validator" persona validate </dev/null >/dev/null 2>&1 || probe=$?
+((probe == 1)) || fail "release predates persona validation; install a release with \`jarvis persona validate\` first"
 getent group jarvis >/dev/null || fail "jarvis group is missing; run prepare-home-node first"
 # Serialize direct runs; `jarvis persona` also holds the administration locks.
 exec 8>/run/jarvis-persona-install.lock
@@ -69,10 +80,6 @@ install -d -o root -g root -m 0700 "$history_dir"
 current_hash=
 if [[ -f $destination && ! -L $destination ]]; then
     current_hash=$(file_sha256 "$destination")
-    if [[ $current_hash == "$source_hash" ]]; then
-        echo "UNCHANGED protected persona sha256=${source_hash:0:12}"
-        exit 0
-    fi
 fi
 
 umask 077
@@ -84,6 +91,15 @@ chown root:jarvis "$stage"
 chmod 0640 "$stage"
 [[ $(stat -c '%U:%G:%a' "$stage") == root:jarvis:640 ]] || fail "cannot secure staged persona"
 [[ $(file_sha256 "$stage") == "$source_hash" ]] || fail "staged persona hash mismatch"
+# Production Core refuses an invalid persona, so never install one. The exact
+# staged bytes go through stdin; the validator prints only the problem.
+"$validator" persona validate <"$stage" || fail "persona failed validation; nothing changed"
+# An identical persona is left alone only while its ownership and mode are safe.
+if [[ $current_hash == "$source_hash" ]] \
+    && [[ $(stat -c '%U:%G:%a' "$destination") == root:jarvis:640 ]]; then
+    echo "UNCHANGED protected persona sha256=${source_hash:0:12}"
+    exit 0
+fi
 
 # Keep root-controlled rollback copies without printing their private
 # contents. Re-archiving an intact entry marks it as recently used; a damaged

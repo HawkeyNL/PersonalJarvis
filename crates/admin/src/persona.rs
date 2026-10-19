@@ -63,6 +63,9 @@ pub(crate) enum PersonaCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Check a persona on standard input with the rules Core enforces; prints
+    /// only the problem, never content. Used by the protected installer.
+    Validate,
 }
 
 fn parse_sha256(input: &str) -> Result<String, String> {
@@ -196,6 +199,7 @@ pub(crate) fn run(command: PersonaCommand, json: bool) -> Result<()> {
             return Ok(());
         }
         _ if json => bail!("--json is supported only for read-only persona status"),
+        PersonaCommand::Validate => return validate_from(io::stdin().lock()),
         PersonaCommand::Install { yes, .. } | PersonaCommand::Rollback { yes, .. } => {
             (yes, command)
         }
@@ -205,7 +209,7 @@ pub(crate) fn run(command: PersonaCommand, json: bool) -> Result<()> {
             plan_install(&layout, &host, expect_sha256.as_deref())
         }
         PersonaCommand::Rollback { to, .. } => plan_rollback(&layout, to),
-        PersonaCommand::Status => unreachable!("handled above"),
+        PersonaCommand::Status | PersonaCommand::Validate => unreachable!("handled above"),
     };
     // Confirm before taking the locks, so an unanswered prompt does not block
     // updates or backups; then plan again under the locks.
@@ -273,8 +277,24 @@ fn inspect(path: &Path, owner: u32) -> Result<Option<Version>> {
         sha256: hex::encode(hasher.finalize()),
         bytes: head.len() as u64 + rest,
         modified: u64::try_from(metadata.mtime()).unwrap_or(0),
-        problem: validate_persona(&head).err().map(|error| error.to_string()),
+        // Core refuses a persona others can write, so status reports it too.
+        problem: if metadata.mode() & 0o022 != 0 {
+            Some("persona is writable by group or others".to_owned())
+        } else {
+            validate_persona(&head).err().map(|error| error.to_string())
+        },
     }))
+}
+
+/// Check a candidate the protected installer streams in, so it passes no
+/// path. Reads at most one byte past the cap; errors never echo content.
+fn validate_from(input: impl Read) -> Result<()> {
+    let mut bytes = Vec::new();
+    input
+        .take(PERSONA_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    validate_persona(&bytes)?;
+    Ok(())
 }
 
 fn installed_sha256(layout: &Layout) -> Result<Option<String>> {
@@ -849,6 +869,12 @@ mod tests {
             }
             fs::write(self.history.join(sha256_hex(bytes)), bytes).unwrap();
             fs::write(&self.persona, bytes).unwrap();
+            // The installer's 0640, independent of the test umask.
+            let history = fs::read_dir(&self.history).unwrap();
+            for path in history.map(|entry| entry.unwrap().path()) {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            fs::set_permissions(&self.persona, fs::Permissions::from_mode(0o640)).unwrap();
         }
     }
 
@@ -1143,6 +1169,38 @@ mod tests {
         assert!(
             !json.contains("marker") && !json.contains("Jarvis"),
             "{json}"
+        );
+    }
+
+    #[test]
+    fn status_flags_a_persona_others_can_write_like_core() {
+        let (_directory, layout, fake) = fixture(Some(OLD), NEW);
+        let problem = |mode| {
+            fs::set_permissions(&layout.persona, fs::Permissions::from_mode(mode)).unwrap();
+            status(&layout, &fake).unwrap().installed.unwrap().problem
+        };
+        assert_eq!(problem(0o640), None);
+        for mode in [0o660, 0o646] {
+            assert_eq!(
+                problem(mode).as_deref(),
+                Some("persona is writable by group or others")
+            );
+        }
+    }
+
+    #[test]
+    fn validate_reads_a_bounded_stream_and_never_echoes_it() {
+        assert!(validate_from(OLD).is_ok());
+        // An endless stream ends in a size error instead of being read whole.
+        let endless = io::Read::chain(&b"# Jarvis\n"[..], io::repeat(b'a'));
+        let error = validate_from(endless).unwrap_err().to_string();
+        assert!(error.contains("exceeds"), "{error}");
+        let error = validate_from(&b"no heading marker\n"[..])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("heading") && !error.contains("marker"),
+            "{error}"
         );
     }
 
