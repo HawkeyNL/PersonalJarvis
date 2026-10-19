@@ -2,7 +2,7 @@
 //!
 //! The Core deliberately owns no HTTP transport, policy rules, approval state,
 //! sandbox, or executor. Those remain in their dedicated crates. Today it owns
-//! the canonical Jarvis persona loaded by the native Home-Node process; future
+//! the built-in fallback persona and the private agent registry; future
 //! orchestration may move here only when it has a real ownership boundary.
 
 use std::{
@@ -21,26 +21,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-/// Fallback persona used when the protected on-disk persona cannot be read.
-/// This keeps development and CI functional while production logs the failed
-/// load at startup.
+/// Fallback persona used outside production when the protected on-disk
+/// persona is missing or invalid, so development and CI keep working.
+/// Production refuses to start instead.
 pub const JARVIS_SYSTEM_FALLBACK: &str = "You are Jarvis, the personal AI assistant on the user's HUD dashboard. \
 Answer in Dutch, short and clear, in a calm and helpful tone. \
 You help with the system, the portfolio and trading insights. \
 Say so honestly when you are not sure about something instead of guessing. \
 Never execute trades or irreversible actions — those always require explicit confirmation from the user.";
-
-/// Load Jarvis' canonical persona from `path`.
-///
-/// A missing, unreadable, or empty file fails safely to the built-in persona.
-/// The caller is responsible for recording that degraded startup state without
-/// exposing the file contents or filesystem details to API clients.
-pub fn load_persona(path: &str) -> (Arc<str>, bool) {
-    match std::fs::read_to_string(path) {
-        Ok(text) if !text.trim().is_empty() => (Arc::from(text.trim()), true),
-        _ => (Arc::from(JARVIS_SYSTEM_FALLBACK), false),
-    }
-}
 
 /// A validated private agent definition. The public runtime deliberately knows
 /// only the schema; real instructions live in the separately provisioned,
@@ -630,23 +618,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn persona_falls_back_when_file_is_absent() {
-        let (text, loaded) = load_persona("does/not/exist/Jarvis.md");
-        assert!(!loaded);
-        assert_eq!(&*text, JARVIS_SYSTEM_FALLBACK);
-    }
-
-    #[test]
-    fn persona_loads_from_file_when_present() {
-        let path = std::env::temp_dir().join("jarvis_persona_test.md");
-        std::fs::write(&path, "  Je bent Jarvis, de kern.  \n").unwrap();
-        let (text, loaded) = load_persona(path.to_str().unwrap());
-        assert!(loaded);
-        assert_eq!(&*text, "Je bent Jarvis, de kern.");
-        let _ = std::fs::remove_file(&path);
-    }
 
     fn fixture_registry() -> (std::path::PathBuf, String) {
         let directory =

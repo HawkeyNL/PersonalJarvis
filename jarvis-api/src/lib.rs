@@ -38,6 +38,7 @@ mod metering;
 pub mod model_control;
 pub mod notify;
 mod peer;
+mod persona;
 mod rate_limit;
 pub mod realtime;
 mod routes;
@@ -46,12 +47,11 @@ mod validation;
 
 pub use audit::{prune_security_audit, run_audit_maintenance};
 pub use extract::Authed;
+pub use jarvis_core::JARVIS_SYSTEM_FALLBACK;
 pub use metering::refresh_usage_snapshot;
 pub use peer::{bind_api_socket, proxy_identity, Peer, ProxyIdentity};
+pub use persona::startup_persona;
 pub use state::{AppState, AppUpdateMirror};
-// Compatibility re-export: persona ownership is in `jarvis-core`, while the
-// transport crate keeps this public helper available to existing callers.
-pub use jarvis_core::{load_persona, JARVIS_SYSTEM_FALLBACK};
 
 use audit::{agent_audit_log, security_audit_log};
 use mcp::mcp_endpoint;

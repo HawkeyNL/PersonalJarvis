@@ -60,6 +60,16 @@ async fn main() -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?;
     jarvis_observability::init(config.log_json);
 
+    // Load Jarvis' protected identity (/etc/jarvis/Jarvis.md) as the system
+    // prompt: the single source of truth for "what Jarvis is". Production
+    // refuses to start without a valid persona, before touching the database;
+    // development falls back to a built-in one.
+    let jarvis_system = jarvis_api::startup_persona(
+        Path::new(&config.llm_persona_path),
+        config.environment.eq_ignore_ascii_case("production"),
+    )
+    .map_err(anyhow::Error::msg)?;
+
     // `config`'s Debug impl redacts database credentials, so this is safe to log.
     tracing::info!(?config, "starting jarvis-api");
 
@@ -380,16 +390,6 @@ async fn main() -> anyhow::Result<()> {
         model_routing.clone(),
     );
     tracing::info!(brain = %llm.label(), "llm brain configured");
-
-    // Load Jarvis' protected identity (/etc/jarvis/Jarvis.md) as the system prompt — the single
-    // source of truth for "what Jarvis is". Falls back to a built-in persona if
-    // the file is absent, so the brain always has an identity.
-    let (jarvis_system, persona_loaded) = jarvis_api::load_persona(&config.llm_persona_path);
-    if persona_loaded {
-        tracing::info!(path = %config.llm_persona_path, chars = jarvis_system.len(), "Jarvis persona loaded");
-    } else {
-        tracing::warn!(path = %config.llm_persona_path, "no persona file; using built-in fallback persona");
-    }
 
     // Private agent definitions are installed by the owner as an immutable
     // bundle. Public releases never contain them. Production fails closed when

@@ -420,6 +420,29 @@ and says whether the restore worked. Each change is recorded in the system log
 (tag `jarvis-persona`) with the old and new SHA-256 before anything changes;
 if that record cannot be written, nothing changes.
 
+Core reads the persona once at startup and checks its content with the same
+validator: it opens `JARVIS_LLM_PERSONA_PATH` without following a symlink,
+requires a regular file, reads at most `PERSONA_MAX_BYTES` plus one byte and
+logs only the path, SHA-256 and size. In production the file must also be
+root-owned and not writable by group or others (the installer sets
+`root:jarvis 0640`). In production a missing, empty, oversized or invalid
+persona, a symlink, a non-regular file or an unsafe owner or mode stops Core
+from starting; the error names the problem, never the content. Development and
+test environments fall back to a built-in persona instead.
+
+**Upgrade note (persona check).** Before installing the release that adds
+this startup check, run:
+
+```bash
+sudo jarvis persona status
+```
+
+and confirm the `Installed` line shows a persona marked `valid`. A persona
+installed by `jarvis persona` or the protected installer is already
+`root:jarvis 0640`; `sudo stat -c '%U:%G:%a' /etc/jarvis/Jarvis.md` shows it
+for a hand-placed file. Otherwise Core will not start after the update; fix the
+persona with `sudo jarvis persona install` or `rollback` first.
+
 Destructive operations prompt only on a controlling TTY. In automation they
 fail closed unless their explicit `--yes` option is supplied. Credential input
 is never rendered by the TUI or emitted in JSON.

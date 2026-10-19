@@ -43,6 +43,8 @@ install -d -o jarvis -g jarvis -m 0700 /run/jarvis-core-admin
 install -d -o jarvis -g caddy -m 2750 /run/jarvis-core
 install -d -o root -g jarvis -m 0750 /etc/jarvis
 install -o root -g jarvis -m 0640 /dev/stdin /etc/jarvis/Jarvis.md <<'EOF'
+# Jarvis
+
 Synthetic protected persona.
 EOF
 install -o root -g root -m 0600 /dev/null /etc/jarvis/surrealdb.env
@@ -74,15 +76,31 @@ printf "DEFINE USER core ON DATABASE PASSWORD 'ci-core-password' ROLES EDITOR;\n
         --endpoint ws://127.0.0.1:8000 --username root --password test-root-password \
         --auth-level root --namespace jarvis --database core >/dev/null
 
-runuser -u jarvis -- env \
-    JARVIS_ENVIRONMENT=production JARVIS_BIND_ADDR=127.0.0.1:18080 \
-    JARVIS_API_UNIX_SOCKET=/run/jarvis-core/api.sock \
-    JARVIS_SURREAL_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_NAMESPACE=jarvis \
-    JARVIS_SURREAL_DATABASE=core JARVIS_SURREAL_USERNAME=core \
-    JARVIS_SURREAL_PASSWORD=ci-core-password JARVIS_LLM_PROVIDER=ollama \
-    JARVIS_LLM_PERSONA_PATH=/etc/jarvis/Jarvis.md \
-    JARVIS_AGENT_BUNDLE_PATH=/var/lib/jarvis/agents/current \
-    "$api_bin" >"$fixture/api.log" 2>&1 &
+core_env=(
+    JARVIS_ENVIRONMENT=production JARVIS_BIND_ADDR=127.0.0.1:18080
+    JARVIS_API_UNIX_SOCKET=/run/jarvis-core/api.sock
+    JARVIS_SURREAL_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_NAMESPACE=jarvis
+    JARVIS_SURREAL_DATABASE=core JARVIS_SURREAL_USERNAME=core
+    JARVIS_SURREAL_PASSWORD=ci-core-password JARVIS_LLM_PROVIDER=ollama
+    JARVIS_LLM_PERSONA_PATH=/etc/jarvis/Jarvis.md
+    JARVIS_AGENT_BUNDLE_PATH=/var/lib/jarvis/agents/current
+)
+
+# Production Core must refuse an invalid persona without echoing its text.
+printf 'SYNTHETIC-PERSONA-BODY-7f3a\n' \
+    | install -o root -g jarvis -m 0640 /dev/stdin /etc/jarvis/Jarvis-invalid.md
+if runuser -u jarvis -- env "${core_env[@]}" JARVIS_LLM_PERSONA_PATH=/etc/jarvis/Jarvis-invalid.md \
+    timeout 20 "$api_bin" >"$fixture/invalid-persona.log" 2>&1; then
+    echo "Core started with an invalid persona" >&2
+    exit 1
+fi
+grep -Fq 'persona must start with' "$fixture/invalid-persona.log"
+if grep -Fq 'SYNTHETIC-PERSONA-BODY' "$fixture/invalid-persona.log"; then
+    echo "Core logged persona text" >&2
+    exit 1
+fi
+
+runuser -u jarvis -- env "${core_env[@]}" "$api_bin" >"$fixture/api.log" 2>&1 &
 pid=$!
 for _attempt in $(seq 1 20); do
     if curl --fail --silent --max-time 1 http://127.0.0.1:18080/livez >/dev/null \

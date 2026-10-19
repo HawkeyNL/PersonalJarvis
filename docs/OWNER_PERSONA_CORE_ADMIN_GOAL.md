@@ -1,6 +1,6 @@
 # Goal: owner-only Jarvis persona management in Core Admin
 
-> **Status (2026-10-11):** Not started — `deploy/private/install-private-config.sh` installs the protected persona, but Core Admin has no persona editing, validation or rollback workflow.
+> **Status (2026-10-19):** In progress — `sudo jarvis persona status|install|rollback` validates, installs and rolls back the protected persona from the CLI, and Core checks the persona with the same validator at startup: in production a missing or invalid persona stops Core from starting. Core Admin has no persona view yet.
 
 Add a safe owner workflow for updating the protected private `Jarvis.md` from the Jarvis Core Admin experience without creating a Jarvis self-modification capability.
 
@@ -88,7 +88,7 @@ Do not let an LLM be the security validator for persona installation.
 
 ## Reload/restart
 
-The current Core loads the persona at startup. Until a separately reviewed hot-reload mechanism exists, a successful install should perform or offer a controlled Core restart through the trusted admin path, then verify `/readyz`.
+The current Core loads and validates the persona once at startup and, in production, refuses to start when it is missing or invalid. Until a separately reviewed hot-reload mechanism exists, a successful install should perform or offer a controlled Core restart through the trusted admin path, then verify `/readyz`.
 
 If restart/readiness fails, report clearly. Do not silently overwrite the source checkout or fabricate success.
 
