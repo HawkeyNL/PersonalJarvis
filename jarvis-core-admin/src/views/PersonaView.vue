@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { api, errorText, type OperationResult, type PersonaMutation, type PersonaStatus } from "../admin";
-import { installBlocker, problemLabel, shortHash } from "../persona";
+import { installBlocker, problemLabel, shortHash, sourceProblemLabel } from "../persona";
 import ConfirmDialog from "../components/ConfirmDialog.vue";
 import ErrorPanel from "../components/ErrorPanel.vue";
 import JvStatusDot from "../components/jv/JvStatusDot.vue";
@@ -44,7 +44,7 @@ onMounted(() => load());
       <article class="metric-card">
         <span class="card-label">CANDIDATE</span>
         <template v-if="data.candidate"><strong class="mono">{{ data.candidate.sha256 ? shortHash(data.candidate.sha256) : "too large" }}</strong><span class="persona-meta">commit <span class="mono">{{ data.candidate.commit }}</span><template v-if="data.candidate.bytes !== null"> · {{ data.candidate.bytes }} bytes</template></span><JvStatusDot :tone="data.candidate.signature === 'verified' ? 'ok' : 'error'" :label="signatures[data.candidate.signature]" :size="7" /><JvStatusDot :tone="data.candidate.problem ? 'error' : 'ok'" :label="problemLabel(data.candidate.problem)" :size="7" /></template>
-        <template v-else><strong>Unavailable</strong><span class="persona-meta wrap-anywhere">{{ data.candidate_error ?? "No candidate" }}</span></template>
+        <template v-else><strong>Unavailable</strong><span class="persona-meta wrap-anywhere">{{ sourceProblemLabel(data.candidate_error) }}</span></template>
       </article>
     </section>
     <section class="action-card">

@@ -250,6 +250,7 @@ export interface PersonaStatus {
   max_bytes: number;
   installed: PersonaVersion | null;
   candidate: PersonaCandidate | null;
+  /** A source problem code (see persona.ts), never free text. */
   candidate_error: string | null;
   history: PersonaVersion[];
 }

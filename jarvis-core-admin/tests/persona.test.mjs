@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { installBlocker, problemLabel, shortHash } from "../src/persona.ts";
+import { installBlocker, problemLabel, shortHash, sourceProblemLabel } from "../src/persona.ts";
 
 const A = "a".repeat(64);
 const B = "b".repeat(64);
@@ -23,6 +23,8 @@ test("only a verified, valid and different candidate can be installed", () => {
   assert.match(installBlocker(status(candidate({ sha256: null, bytes: null, problem: "too_large" }))), /size limit/);
   assert.match(installBlocker(status(candidate({ problem: "secret_like" }))), /key or token/);
   assert.match(installBlocker(status(candidate({ sha256: A }))), /already installed/);
-  assert.equal(installBlocker({ ...status(null), candidate_error: "private agent checkout is unavailable" }), "private agent checkout is unavailable");
-  assert.match(installBlocker(status(null)), /No candidate/);
+  assert.equal(installBlocker({ ...status(null), candidate_error: "checkout_not_git" }), "The private checkout is not a Git checkout.");
+  assert.match(installBlocker({ ...status(null), candidate_error: "unavailable" }), /persona status/);
+  assert.match(installBlocker(status(null)), /persona status/);
+  assert.match(sourceProblemLabel("/home/owner/agents"), /candidate is unavailable/);
 });

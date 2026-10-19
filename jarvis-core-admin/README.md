@@ -167,11 +167,14 @@ path before the refreshed safe tree is displayed.
 
 The Persona page (Administration) shows only the installed, candidate and
 history SHA-256 hashes, sizes, times, the candidate's signature state and
-fixed validation problem codes; persona text never reaches the GUI. **Install
+fixed validation and source problem codes; persona text and host paths never
+reach the GUI. **Install
 candidate** sends only the candidate SHA-256 the owner confirmed, and
 **Roll back** only a full history SHA-256. Both are checked as 64 lowercase hex
 digits in the GUI backend and again in the root broker, which runs `jarvis
 persona install --expect-sha256 <hash> --yes` or `jarvis persona rollback --to
 <hash> --yes`. The trusted admin CLI resolves the source checkout itself; the
 GUI cannot choose a path. A failed activation that restored the previous persona is
-reported as such. Editing stays outside the GUI, through signed commits.
+reported as such. Like a schema migration, a started persona change is never
+killed by the GUI's broker, so the CLI always completes its restore and audit
+steps. Editing stays outside the GUI, through signed commits.

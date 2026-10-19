@@ -1287,7 +1287,7 @@ fn validate_persona_status(mut status: PersonaStatus) -> AdminResult<PersonaStat
         }
         candidate.problem = candidate.problem.as_deref().map(persona_problem_code);
     }
-    status.candidate_error = status.candidate_error.map(|error| sanitize(&error, 512));
+    status.candidate_error = status.candidate_error.as_deref().map(persona_source_code);
     status.history.truncate(PERSONA_HISTORY_LIMIT);
     Ok(status)
 }
@@ -1308,12 +1308,41 @@ fn persona_problem_code(message: &str) -> String {
     .to_owned()
 }
 
+/// Maps why the CLI could not read the candidate to a stable code; the
+/// messages can name host paths, so none of their text is passed on.
+fn persona_source_code(message: &str) -> String {
+    let code = if message.starts_with("private agent configuration is unavailable")
+        || message.starts_with("read private agent configuration")
+    {
+        "configuration_unavailable"
+    } else if message.starts_with("private agent configuration")
+        || message.starts_with("private agent checkout path is invalid")
+    {
+        "configuration_invalid"
+    } else if message.starts_with("private agent checkout is unavailable") {
+        "checkout_unavailable"
+    } else if message.starts_with("private agent checkout path is not root-controlled")
+        || message.starts_with("private agent checkout is not root-controlled")
+    {
+        "checkout_not_root_controlled"
+    } else if message.starts_with("private agent checkout is not a Git checkout") {
+        "checkout_not_git"
+    } else if message.starts_with("private agent checkout has no valid commit") {
+        "no_commit"
+    } else if message.starts_with("commit ") && message.contains(" has no persona") {
+        "no_persona"
+    } else {
+        "unavailable"
+    };
+    code.to_owned()
+}
+
 pub fn persona_mutation(
     session: &SessionManager,
     request: PersonaMutation,
 ) -> AdminResult<OperationResult> {
     // Validate before the request reaches the broker; it validates again.
-    persona_arguments(&request)?;
+    persona_request(&request)?;
     let rollback = matches!(request, PersonaMutation::Rollback { .. });
     persona_outcome(
         rollback,
@@ -1354,7 +1383,12 @@ fn persona_outcome(
     }
 }
 
-fn persona_arguments(request: &PersonaMutation) -> AdminResult<Vec<String>> {
+/// Fixed argv and wait for a persona mutation. Like a migration it is never
+/// killed: the CLI ignores interruptions so that a failed activation still
+/// restores the previous persona and writes the final audit record, and a
+/// SIGKILL would skip both. The CLI bounds its own steps (installer, Core
+/// restart and readiness polling).
+fn persona_request(request: &PersonaMutation) -> AdminResult<(Vec<String>, Duration)> {
     let (args, hash) = match request {
         PersonaMutation::Install { expect_sha256 } => {
             (["persona", "install", "--expect-sha256"], expect_sha256)
@@ -1364,11 +1398,12 @@ fn persona_arguments(request: &PersonaMutation) -> AdminResult<Vec<String>> {
     if !valid_sha256(hash) {
         return Err("persona hash must be a full lowercase SHA-256".to_owned());
     }
-    Ok(args
+    let args = args
         .into_iter()
         .map(str::to_owned)
         .chain([hash.clone(), "--yes".to_owned()])
-        .collect())
+        .collect();
+    Ok((args, MIGRATE_WAIT))
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -2080,13 +2115,10 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
             ["--json", "persona", "status"].map(str::to_owned).to_vec(),
             Duration::from_secs(120),
         ),
-        // Install or restore, Core restart and readiness, and possibly a
-        // restore with a second restart: generous, since a timeout kills it.
-        BrokerRequest::PersonaMutation { request } => (
-            ADMIN,
-            persona_arguments(&request)?,
-            Duration::from_secs(900),
-        ),
+        BrokerRequest::PersonaMutation { request } => {
+            let (args, wait) = persona_request(&request)?;
+            (ADMIN, args, wait)
+        }
         BrokerRequest::Logs { query } => {
             if !(1..=2_000).contains(&query.lines) {
                 return Err("log line count must be between 1 and 2000".to_owned());
@@ -3008,16 +3040,26 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            persona_arguments(&install).unwrap(),
-            ["persona", "install", "--expect-sha256", HASH_A, "--yes"]
+            persona_request(&install).unwrap(),
+            (
+                ["persona", "install", "--expect-sha256", HASH_A, "--yes"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                MIGRATE_WAIT
+            )
         );
         let rollback = parse(&format!(
             r#"{{"action":"rollback","to_sha256":"{HASH_B}"}}"#
         ))
         .unwrap();
         assert_eq!(
-            persona_arguments(&rollback).unwrap(),
-            ["persona", "rollback", "--to", HASH_B, "--yes"]
+            persona_request(&rollback).unwrap(),
+            (
+                ["persona", "rollback", "--to", HASH_B, "--yes"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                MIGRATE_WAIT
+            )
         );
     }
 
@@ -3047,7 +3089,7 @@ mod tests {
                     to_sha256: hash.to_owned(),
                 },
             ] {
-                assert!(persona_arguments(&request).is_err(), "{hash}");
+                assert!(persona_request(&request).is_err(), "{hash}");
                 // The privileged side refuses it before running anything.
                 assert_eq!(
                     run_broker_request(BrokerRequest::PersonaMutation { request }).err(),
@@ -3087,13 +3129,37 @@ mod tests {
         assert!(status.history[0].installed);
         assert_eq!(status.history[1].problem.as_deref(), Some("hash_mismatch"));
 
-        let unavailable = r#"{"max_bytes":32768,"installed":null,"candidate":null,
-            "candidate_error":"private agent configuration is unavailable","history":[]}"#;
-        let status = validate_persona_status(parse_json(unavailable).unwrap()).unwrap();
-        assert_eq!(
-            status.candidate_error.as_deref(),
-            Some("private agent configuration is unavailable")
-        );
+        for (error, code) in [
+            (
+                "private agent configuration is unavailable: No such file or directory (os error 2)",
+                "configuration_unavailable",
+            ),
+            ("private agent configuration is unsafe", "configuration_invalid"),
+            ("private agent checkout path is invalid", "configuration_invalid"),
+            (
+                "private agent checkout is unavailable: No such file or directory (os error 2)",
+                "checkout_unavailable",
+            ),
+            (
+                "private agent checkout path is not root-controlled: /home/owner/agents",
+                "checkout_not_root_controlled",
+            ),
+            (
+                "private agent checkout is not root-controlled: /srv/agents/.git/config is not root-controlled",
+                "checkout_not_root_controlled",
+            ),
+            ("private agent checkout is not a Git checkout", "checkout_not_git"),
+            ("private agent checkout has no valid commit", "no_commit"),
+            ("commit 0123456789ab has no persona", "no_persona"),
+            ("/usr/bin/git is not a root-owned executable", "unavailable"),
+        ] {
+            let json = format!(
+                r#"{{"max_bytes":32768,"installed":null,"candidate":null,"candidate_error":{},"history":[]}}"#,
+                serde_json::to_string(error).unwrap()
+            );
+            let status = validate_persona_status(parse_json(&json).unwrap()).unwrap();
+            assert_eq!(status.candidate_error.as_deref(), Some(code), "{error}");
+        }
         // A too-large candidate has no hash.
         let large = r#"{"max_bytes":32768,"installed":null,"candidate":{"commit":"abc","signature":"untrusted","sha256":null,"bytes":null,"problem":"persona exceeds 32768 bytes"},"candidate_error":null,"history":[]}"#;
         let status = validate_persona_status(parse_json(large).unwrap()).unwrap();
