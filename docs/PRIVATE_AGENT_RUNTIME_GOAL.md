@@ -190,7 +190,7 @@ Do NOT give Core a GitHub credential for `PersonalJarvisAgents`.
 
 The canonical Jarvis persona is especially protected.
 
-The current public Core already loads a persona from an on-disk path through `load_persona`. Preserve that read-only model and strengthen deployment protections.
+The current public Core already loads a persona from an on-disk path through `startup_persona`. Preserve that read-only model and strengthen deployment protections.
 
 The running system MUST NOT have a supported self-modification path for `Jarvis.md`.
 

@@ -13,7 +13,7 @@ use wait_timeout::ChildExt;
 
 use crate::admin::{
     self, ClaudeRuntimeMutation, CodexRuntimeMutation, LayaMutation, LogQuery, ModelMutation,
-    ProgramOutput, RouteMutation, UpdateMutation,
+    PersonaMutation, ProgramOutput, RouteMutation, UpdateMutation,
 };
 
 const PKEXEC: &str = "/usr/bin/pkexec";
@@ -54,6 +54,8 @@ pub(crate) enum BrokerRequest {
     LayaMutation { request: LayaMutation },
     CodexRuntime,
     CodexRuntimeMutation { request: CodexRuntimeMutation },
+    PersonaStatus,
+    PersonaMutation { request: PersonaMutation },
     Devices { pending: bool },
     Logs { query: LogQuery },
 }

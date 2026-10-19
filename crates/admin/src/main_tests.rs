@@ -1237,3 +1237,45 @@ fn laya_cli_accepts_only_fixed_modes_and_no_paths() {
         assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
     }
 }
+
+#[test]
+fn persona_cli_accepts_only_hashes_and_no_paths() {
+    let hash = "0123456789abcdef".repeat(4);
+    for args in [
+        vec!["jarvis", "persona", "status"],
+        vec!["jarvis", "persona", "install"],
+        vec!["jarvis", "persona", "install", "--expect-sha256", &hash],
+        vec![
+            "jarvis",
+            "persona",
+            "install",
+            "--expect-sha256",
+            &hash,
+            "--yes",
+        ],
+        vec!["jarvis", "persona", "rollback", "--to", &hash],
+        vec!["jarvis", "persona", "rollback", "--to", &hash, "--yes"],
+    ] {
+        assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
+    }
+    let upper = hash.to_uppercase();
+    for args in [
+        // --yes without an explicit target hash.
+        vec!["jarvis", "persona", "install", "--yes"],
+        vec!["jarvis", "persona", "install", "--source", "/tmp/checkout"],
+        vec![
+            "jarvis",
+            "persona",
+            "install",
+            "--expect-sha256",
+            &hash[..12],
+        ],
+        vec!["jarvis", "persona", "rollback"],
+        vec!["jarvis", "persona", "rollback", "--to", &hash[..12]],
+        vec!["jarvis", "persona", "rollback", "--to", &upper],
+        vec!["jarvis", "persona", "rollback", "--to", "../../etc/shadow"],
+        vec!["jarvis", "persona", "edit"],
+    ] {
+        assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+    }
+}
