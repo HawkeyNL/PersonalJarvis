@@ -73,7 +73,9 @@ else
     ui_warning "Verified release $release_tag already staged"
 fi
 ui_step "[4/7] Protected configuration"
-ui_run "Protected persona installed" bash /usr/local/libexec/jarvis/install-private-config --source "$private_agents"
+jq -e '.tooling.persona_validate == 1' "/opt/jarvis/releases/$release_tag/release.json" >/dev/null \
+    || fail "release $release_tag predates persona validation; install a release with \`jarvis persona validate\` first"
+ui_run "Protected persona installed" env JARVIS_PERSONA_VALIDATOR="/opt/jarvis/releases/$release_tag/jarvis" bash /usr/local/libexec/jarvis/install-private-config --source "$private_agents"
 ui_run "Private agent bundle activated" env JARVIS_AGENT_BUNDLE_VALIDATOR="/opt/jarvis/releases/$release_tag/jarvis-agent-bundle" bash /usr/local/libexec/jarvis/install-agent-bundle --source "$private_agents"
 if jq -e '.tooling.model_policy_directory == 1' "/opt/jarvis/releases/$release_tag/release.json" >/dev/null; then
     ui_warning "Model policy storage is initialized/migrated by the verified release installer; remote models remain owner-controlled"

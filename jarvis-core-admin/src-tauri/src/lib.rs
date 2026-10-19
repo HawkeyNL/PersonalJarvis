@@ -276,6 +276,26 @@ async fn codex_runtime_mutation(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+async fn persona(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+) -> Result<admin::PersonaStatus, String> {
+    with_session(session, |session| admin::persona(&session)).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn persona_mutation(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+    request: admin::PersonaMutation,
+) -> Result<admin::OperationResult, String> {
+    with_session(session, move |session| {
+        admin::persona_mutation(&session, request)
+    })
+    .await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 async fn ai_account_action(
     session: tauri::State<'_, Arc<session::SessionManager>>,
     provider: admin::AiAccountProvider,
@@ -373,6 +393,8 @@ pub fn run() {
             laya_mutation,
             codex_runtime,
             codex_runtime_mutation,
+            persona,
+            persona_mutation,
             credential_set,
             devices_overview,
             device_action,

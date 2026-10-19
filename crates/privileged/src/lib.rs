@@ -9,6 +9,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod local_devices;
+pub mod persona;
 pub mod trusted_keys;
 
 pub const ACTION_MODEL_SET_ENABLED: &str = "model.set_enabled";
