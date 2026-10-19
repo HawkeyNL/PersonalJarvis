@@ -21,9 +21,13 @@ fail() {
 
 # Root runs git in a checkout it does not fully control: never let the
 # repository's own config pick hooks, fsmonitor or the signature program.
+# gpg.format selects only the signing backend; verification follows the
+# signature's own type, so the OpenPGP and X.509 programs are disabled and only
+# SSH signatures can verify.
 source_git() {
     git -C "$source_root" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-        -c gpg.ssh.program=/usr/bin/ssh-keygen "$@"
+        -c gpg.ssh.program=/usr/bin/ssh-keygen -c gpg.openpgp.program=/bin/false \
+        -c gpg.x509.program=/bin/false "$@"
 }
 
 usage() {

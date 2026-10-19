@@ -11,6 +11,7 @@ repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 poller=$repo_dir/deploy/private/jarvis-private-agent-poll.sh
 fixture=$(mktemp -d)
 fake_bin=$fixture/bin
+real_git=$(command -v git)
 source_root=/var/lib/jarvis/agents-source
 mkdir -p "$fake_bin" "$source_root/.git"
 
@@ -39,15 +40,21 @@ fixture=$JARVIS_PRIVATE_AGENT_TEST_FIXTURE
 [[ ${1:-} == -C && ${2:-} == /var/lib/jarvis/agents-source ]] || exit 1
 shift 2
 # Every call must neutralise repository-controlled programs.
-[[ "$*" == "-c core.hooksPath=/dev/null -c core.fsmonitor=false -c gpg.ssh.program=/usr/bin/ssh-keygen "* ]] || exit 1
-shift 6
+[[ "$*" == "-c core.hooksPath=/dev/null -c core.fsmonitor=false -c gpg.ssh.program=/usr/bin/ssh-keygen -c gpg.openpgp.program=/bin/false -c gpg.x509.program=/bin/false "* ]] || exit 1
+overrides=("${@:1:10}")
+shift 10
 case "$*" in
     'remote get-url origin') printf '%s\n' 'https://github.com/HawkeyNL/PersonalJarvisAgents.git' ;;
     'fetch --quiet origin refs/heads/main') printf 'fetch\n' >> "$fixture/git-events" ;;
     'rev-parse FETCH_HEAD') cat "$fixture/remote-revision" ;;
     'rev-parse HEAD') cat "$fixture/current-revision" ;;
     "-c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/etc/jarvis/private-agent-allowed-signers verify-commit $(cat "$fixture/remote-revision")")
-        [[ -f $fixture/signed ]]
+        if [[ -d $fixture/openpgp-repo ]]; then
+            # Real verification with exactly the poller's overrides.
+            "$JARVIS_PRIVATE_AGENT_REAL_GIT" -C "$fixture/openpgp-repo" "${overrides[@]}" "$@"
+        else
+            [[ -f $fixture/signed ]]
+        fi
         ;;
     'status --porcelain --untracked-files=all') [[ ! -f $fixture/dirty ]] || printf '?? stray.md\n' ;;
     merge\ --ff-only\ *)
@@ -117,6 +124,7 @@ seed_bundle() {
 run_poll() {
     PATH="$fake_bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         JARVIS_PRIVATE_AGENT_TEST_FIXTURE="$fixture" \
+        JARVIS_PRIVATE_AGENT_REAL_GIT="$real_git" \
         JARVIS_PRIVATE_AGENT_NEXT_BUNDLE="${JARVIS_PRIVATE_AGENT_NEXT_BUNDLE:-bundle-new}" \
         JARVIS_PRIVATE_AGENT_READY_FAIL_ONCE="${JARVIS_PRIVATE_AGENT_READY_FAIL_ONCE:-false}" \
         bash "$poller" "$@"
@@ -183,6 +191,32 @@ if run_poll; then
 fi
 [[ ! -s $fixture/update-events ]] && ! grep -qx merge "$fixture/git-events"
 [[ $(readlink /var/lib/jarvis/agents/current) == releases/bundle-stable ]]
+
+# gpg.format=ssh does not stop Git from verifying an OpenPGP signature with
+# gpg. An OpenPGP-signed tip must stay untrusted even when gpg reports a good
+# signature.
+openpgp_repo=$fixture/openpgp-repo
+"$real_git" init --quiet "$openpgp_repo"
+tree=$("$real_git" -C "$openpgp_repo" mktree < /dev/null)
+printf 'tree %s\nauthor A <a@example.invalid> 0 +0000\ncommitter A <a@example.invalid> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n fixture\n -----END PGP SIGNATURE-----\n\nfixture\n' \
+    "$tree" | "$real_git" -C "$openpgp_repo" hash-object -t commit -w --stdin > "$fixture/remote-revision"
+cat > "$fake_bin/gpg" <<'EOF'
+#!/bin/sh
+cat >/dev/null
+printf '\n[GNUPG:] GOODSIG 0123456789ABCDEF fixture\n'
+EOF
+chmod 0755 "$fake_bin/gpg"
+# Without the overrides the fake gpg is trusted.
+PATH="$fake_bin:$PATH" "$real_git" -C "$openpgp_repo" verify-commit "$(cat "$fixture/remote-revision")"
+grep -Fq 'Signed:  untrusted' <<< "$(run_poll --check)"
+if run_poll; then
+    echo "OpenPGP-signed agent revision unexpectedly deployed" >&2
+    exit 1
+fi
+[[ ! -s $fixture/update-events ]] && ! grep -qx merge "$fixture/git-events"
+rm -rf -- "$openpgp_repo" "$fake_bin/gpg"
+printf '%040d\n' 2 > "$fixture/remote-revision"
+
 : > "$fixture/signed"
 grep -Fq 'Signed:  verified' <<< "$(run_poll --check)"
 # A modified or untracked file in the checkout is never bundled.
