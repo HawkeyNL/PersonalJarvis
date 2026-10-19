@@ -680,6 +680,60 @@ pub enum CodexRuntimeMutation {
     Rollback {},
 }
 
+/// `jarvis --json persona status`: hashes, sizes, times and fixed validation
+/// messages only. The CLI never emits persona text; unknown fields are
+/// rejected so nothing else can reach the webview.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonaStatus {
+    pub max_bytes: u64,
+    pub installed: Option<PersonaVersion>,
+    pub candidate: Option<PersonaCandidate>,
+    pub candidate_error: Option<String>,
+    pub history: Vec<PersonaVersion>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonaVersion {
+    pub sha256: String,
+    pub bytes: u64,
+    /// Unix time of the last change; for history entries, the last use.
+    pub modified: u64,
+    /// A problem code from `persona_problem_code` once validated.
+    pub problem: Option<String>,
+    /// Only history entries carry this flag.
+    #[serde(default)]
+    pub installed: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonaCandidate {
+    pub commit: String,
+    pub signature: PersonaSignature,
+    pub sha256: Option<String>,
+    pub bytes: Option<u64>,
+    pub problem: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonaSignature {
+    Verified,
+    Untrusted,
+    NoAllowedSigners,
+}
+
+/// Owner persona mutations. The only input is a full SHA-256 the owner saw in
+/// `persona_status`; the source checkout is fixed on the privileged side.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PersonaMutation {
+    Install { expect_sha256: String },
+    Rollback { to_sha256: String },
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CredentialProvider {
@@ -1199,6 +1253,129 @@ pub fn codex_runtime_mutation(
         session.run(BrokerRequest::CodexRuntimeMutation { request })?,
         summary,
     )
+}
+
+/// Well above the ten versions the history keeps; more are not shown.
+const PERSONA_HISTORY_LIMIT: usize = 32;
+
+pub fn persona(session: &SessionManager) -> AdminResult<PersonaStatus> {
+    validate_persona_status(parse_json(
+        &session.run(BrokerRequest::PersonaStatus)?.stdout,
+    )?)
+}
+
+fn validate_persona_status(mut status: PersonaStatus) -> AdminResult<PersonaStatus> {
+    let invalid = || Err("persona status contained unexpected metadata".to_owned());
+    for version in status.installed.iter_mut().chain(&mut status.history) {
+        if !valid_sha256(&version.sha256) {
+            return invalid();
+        }
+        version.problem = version.problem.as_deref().map(persona_problem_code);
+    }
+    if let Some(candidate) = &mut status.candidate {
+        if !(1..=40).contains(&candidate.commit.len())
+            || !candidate
+                .commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || candidate
+                .sha256
+                .as_deref()
+                .is_some_and(|hash| !valid_sha256(hash))
+        {
+            return invalid();
+        }
+        candidate.problem = candidate.problem.as_deref().map(persona_problem_code);
+    }
+    status.candidate_error = status.candidate_error.map(|error| sanitize(&error, 512));
+    status.history.truncate(PERSONA_HISTORY_LIMIT);
+    Ok(status)
+}
+
+/// Maps the CLI's fixed validation messages to stable codes. Anything else
+/// becomes `unrecognized`, so no other text is passed on.
+fn persona_problem_code(message: &str) -> String {
+    match message {
+        "persona is empty" => "empty",
+        "persona is not valid UTF-8" => "not_utf8",
+        "persona contains a control or invisible formatting character" => "control_character",
+        "persona must start with a \"# \" heading" => "missing_heading",
+        "persona appears to contain a key or token" => "secret_like",
+        "content does not match its hash" => "hash_mismatch",
+        message if message.starts_with("persona exceeds ") => "too_large",
+        _ => "unrecognized",
+    }
+    .to_owned()
+}
+
+pub fn persona_mutation(
+    session: &SessionManager,
+    request: PersonaMutation,
+) -> AdminResult<OperationResult> {
+    // Validate before the request reaches the broker; it validates again.
+    persona_arguments(&request)?;
+    let rollback = matches!(request, PersonaMutation::Rollback { .. });
+    persona_outcome(
+        rollback,
+        session.run(BrokerRequest::PersonaMutation { request }),
+    )
+}
+
+/// The CLI prints `jarvis persona: <outcome>` on success and fails with a
+/// message that says whether the previous persona was restored.
+fn persona_outcome(
+    rollback: bool,
+    result: AdminResult<ProgramOutput>,
+) -> AdminResult<OperationResult> {
+    match result {
+        Ok(output) if output.stdout.contains("is already installed") => {
+            operation(output, "This persona is already installed; nothing changed")
+        }
+        Ok(output) => operation(
+            output,
+            if rollback {
+                "Persona rolled back and Core is ready"
+            } else {
+                "Persona installed and Core is ready"
+            },
+        ),
+        // A failed final audit record also quotes the outcome; keep it an error.
+        Err(message)
+            if message.contains("restored the previous persona")
+                && !message.contains("persona audit event failed") =>
+        {
+            Ok(OperationResult {
+                success: false,
+                summary: "Core did not become ready; the previous persona was restored".to_owned(),
+                detail: message,
+            })
+        }
+        Err(message) => Err(message),
+    }
+}
+
+fn persona_arguments(request: &PersonaMutation) -> AdminResult<Vec<String>> {
+    let (args, hash) = match request {
+        PersonaMutation::Install { expect_sha256 } => {
+            (["persona", "install", "--expect-sha256"], expect_sha256)
+        }
+        PersonaMutation::Rollback { to_sha256 } => (["persona", "rollback", "--to"], to_sha256),
+    };
+    if !valid_sha256(hash) {
+        return Err("persona hash must be a full lowercase SHA-256".to_owned());
+    }
+    Ok(args
+        .into_iter()
+        .map(str::to_owned)
+        .chain([hash.clone(), "--yes".to_owned()])
+        .collect())
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Fixed argv for each typed Laya request; the mode is the only input.
@@ -1898,6 +2075,18 @@ pub(crate) fn run_broker_request(request: BrokerRequest) -> AdminResult<ProgramO
             let (args, timeout) = codex_runtime_arguments(&request)?;
             (ADMIN, args, timeout)
         }
+        BrokerRequest::PersonaStatus => (
+            ADMIN,
+            ["--json", "persona", "status"].map(str::to_owned).to_vec(),
+            Duration::from_secs(120),
+        ),
+        // Install or restore, Core restart and readiness, and possibly a
+        // restore with a second restart: generous, since a timeout kills it.
+        BrokerRequest::PersonaMutation { request } => (
+            ADMIN,
+            persona_arguments(&request)?,
+            Duration::from_secs(900),
+        ),
         BrokerRequest::Logs { query } => {
             if !(1..=2_000).contains(&query.lines) {
                 return Err("log line count must be between 1 and 2000".to_owned());
@@ -2789,5 +2978,247 @@ mod tests {
         assert!(validate_ai_accounts(vec![unknown, codex.clone()]).is_err());
         assert!(validate_ai_accounts(vec![claude, row("codex", "jarvis-codex-chat")]).is_err());
         assert!(serde_json::from_str::<AiAccountProvider>("\"codex-chat\"").is_err());
+    }
+
+    const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn persona_hashes_are_strict() {
+        assert!(valid_sha256(HASH_A) && valid_sha256(HASH_B));
+        for hash in [
+            "",
+            &HASH_B[..63],
+            &format!("{HASH_B}0"),
+            &HASH_B.to_uppercase(),
+            &format!("{}g", &HASH_B[..63]),
+            &format!("{} ", &HASH_B[..63]),
+            &format!("-{}", &HASH_B[..63]),
+            "../../../../etc/jarvis/Jarvis.md",
+        ] {
+            assert!(!valid_sha256(hash), "{hash}");
+        }
+    }
+
+    #[test]
+    fn persona_requests_map_to_fixed_arguments() {
+        let parse = |json: &str| serde_json::from_str::<PersonaMutation>(json);
+        let install = parse(&format!(
+            r#"{{"action":"install","expect_sha256":"{HASH_A}"}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            persona_arguments(&install).unwrap(),
+            ["persona", "install", "--expect-sha256", HASH_A, "--yes"]
+        );
+        let rollback = parse(&format!(
+            r#"{{"action":"rollback","to_sha256":"{HASH_B}"}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            persona_arguments(&rollback).unwrap(),
+            ["persona", "rollback", "--to", HASH_B, "--yes"]
+        );
+    }
+
+    #[test]
+    fn persona_requests_reject_paths_free_arguments_and_bad_hashes() {
+        for payload in [
+            r#"{"action":"install"}"#,
+            r#"{"action":"rollback"}"#,
+            r#"{"action":"edit","path":"/etc/jarvis/Jarvis.md"}"#,
+            r#"{"action":"validate"}"#,
+            &format!(r#"{{"action":"install","expect_sha256":"{HASH_A}","source":"/tmp/x"}}"#),
+            &format!(r#"{{"action":"install","expect_sha256":"{HASH_A}","yes":false}}"#),
+            &format!(r#"{{"action":"rollback","to_sha256":"{HASH_A}","args":["--help"]}}"#),
+            &format!(r#"{{"action":"rollback","expect_sha256":"{HASH_A}"}}"#),
+        ] {
+            assert!(
+                serde_json::from_str::<PersonaMutation>(payload).is_err(),
+                "{payload}"
+            );
+        }
+        for hash in ["--help", "HEAD", &HASH_A.to_uppercase(), &HASH_A[..12]] {
+            for request in [
+                PersonaMutation::Install {
+                    expect_sha256: hash.to_owned(),
+                },
+                PersonaMutation::Rollback {
+                    to_sha256: hash.to_owned(),
+                },
+            ] {
+                assert!(persona_arguments(&request).is_err(), "{hash}");
+                // The privileged side refuses it before running anything.
+                assert_eq!(
+                    run_broker_request(BrokerRequest::PersonaMutation { request }).err(),
+                    Some("persona hash must be a full lowercase SHA-256".to_owned())
+                );
+            }
+        }
+        // The broker protocol only carries the typed request.
+        assert!(serde_json::from_str::<BrokerRequest>(&format!(
+            r#"{{"operation":"persona_mutation","request":{{"action":"install","expect_sha256":"{HASH_A}","path":"/tmp/x"}}}}"#
+        ))
+        .is_err());
+        assert!(serde_json::from_str::<BrokerRequest>(
+            r#"{"operation":"persona_mutation","request":{"action":"install","expect_sha256":"--yes"}}"#
+        )
+        .is_ok_and(|request| run_broker_request(request).is_err()));
+    }
+
+    #[test]
+    fn persona_status_parses_the_cli_json_into_safe_metadata() {
+        let json = format!(
+            r##"{{"max_bytes":32768,
+                "installed":{{"sha256":"{HASH_A}","bytes":120,"modified":1760000000,"problem":null}},
+                "candidate":{{"commit":"0123456789ab","signature":"verified","sha256":"{HASH_B}","bytes":130,"problem":"persona must start with a \"# \" heading"}},
+                "candidate_error":null,
+                "history":[
+                  {{"sha256":"{HASH_A}","bytes":120,"modified":1760000000,"problem":null,"installed":true}},
+                  {{"sha256":"{HASH_B}","bytes":99,"modified":1750000000,"problem":"content does not match its hash","installed":false}}
+                ]}}"##
+        );
+        let status = validate_persona_status(parse_json(&json).unwrap()).unwrap();
+        assert_eq!(status.installed.as_ref().unwrap().sha256, HASH_A);
+        assert!(!status.installed.as_ref().unwrap().installed);
+        let candidate = status.candidate.as_ref().unwrap();
+        assert!(matches!(candidate.signature, PersonaSignature::Verified));
+        assert_eq!(candidate.problem.as_deref(), Some("missing_heading"));
+        assert!(status.history[0].installed);
+        assert_eq!(status.history[1].problem.as_deref(), Some("hash_mismatch"));
+
+        let unavailable = r#"{"max_bytes":32768,"installed":null,"candidate":null,
+            "candidate_error":"private agent configuration is unavailable","history":[]}"#;
+        let status = validate_persona_status(parse_json(unavailable).unwrap()).unwrap();
+        assert_eq!(
+            status.candidate_error.as_deref(),
+            Some("private agent configuration is unavailable")
+        );
+        // A too-large candidate has no hash.
+        let large = r#"{"max_bytes":32768,"installed":null,"candidate":{"commit":"abc","signature":"untrusted","sha256":null,"bytes":null,"problem":"persona exceeds 32768 bytes"},"candidate_error":null,"history":[]}"#;
+        let status = validate_persona_status(parse_json(large).unwrap()).unwrap();
+        assert_eq!(
+            status.candidate.unwrap().problem.as_deref(),
+            Some("too_large")
+        );
+    }
+
+    #[test]
+    fn persona_status_rejects_content_and_unexpected_metadata() {
+        let with = |installed: &str, candidate: &str| {
+            format!(
+                r#"{{"max_bytes":32768,"installed":{installed},"candidate":{candidate},"candidate_error":null,"history":[]}}"#
+            )
+        };
+        let version = |hash: &str, extra: &str| {
+            format!(r#"{{"sha256":"{hash}","bytes":1,"modified":1,"problem":null{extra}}}"#)
+        };
+        for json in [
+            with(&version(HASH_A, r##","text":"# Jarvis""##), "null"),
+            with(
+                "null",
+                r#"{"commit":"abc","signature":"verified","sha256":null,"bytes":null,"problem":null,"content":"x"}"#,
+            ),
+            with(
+                "null",
+                r#"{"commit":"abc","signature":"maybe","sha256":null,"bytes":null,"problem":null}"#,
+            ),
+        ] {
+            assert!(parse_json::<PersonaStatus>(&json).is_err(), "{json}");
+        }
+        for json in [
+            with(&version("not-a-hash", ""), "null"),
+            with(&version(&HASH_A.to_uppercase(), ""), "null"),
+            with(
+                "null",
+                r#"{"commit":"main;id","signature":"verified","sha256":null,"bytes":null,"problem":null}"#,
+            ),
+            with(
+                "null",
+                r#"{"commit":"abc","signature":"verified","sha256":"ABC","bytes":null,"problem":null}"#,
+            ),
+        ] {
+            assert!(
+                validate_persona_status(parse_json(&json).unwrap()).is_err(),
+                "{json}"
+            );
+        }
+        // Unknown problem text is never passed on.
+        let json = with(
+            &version(HASH_A, "").replace("null", r##""# Jarvis persona text""##),
+            "null",
+        );
+        let status = validate_persona_status(parse_json(&json).unwrap()).unwrap();
+        assert_eq!(
+            status.installed.unwrap().problem.as_deref(),
+            Some("unrecognized")
+        );
+        // The history is bounded.
+        let entry = version(HASH_A, "");
+        let json = format!(
+            r#"{{"max_bytes":1,"installed":null,"candidate":null,"candidate_error":null,"history":[{}]}}"#,
+            vec![entry; 40].join(",")
+        );
+        let status = validate_persona_status(parse_json(&json).unwrap()).unwrap();
+        assert_eq!(status.history.len(), PERSONA_HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn persona_outcomes_include_restored_and_unchanged_results() {
+        let output = |stdout: &str| {
+            Ok(ProgramOutput {
+                success: true,
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+            })
+        };
+        let installed = persona_outcome(
+            false,
+            output("jarvis persona: persona aaaaaaaaaaaa is active and Core is ready\n"),
+        )
+        .unwrap();
+        assert!(installed.success);
+        assert_eq!(installed.summary, "Persona installed and Core is ready");
+        assert!(installed.detail.contains("is active and Core is ready"));
+
+        let rolled_back = persona_outcome(
+            true,
+            output("jarvis persona: persona aaaaaaaaaaaa is active and Core is ready\n"),
+        )
+        .unwrap();
+        assert_eq!(rolled_back.summary, "Persona rolled back and Core is ready");
+
+        let unchanged = persona_outcome(
+            false,
+            output("jarvis persona: persona aaaaaaaaaaaa is already installed\n"),
+        )
+        .unwrap();
+        assert!(unchanged.success);
+        assert!(unchanged.summary.contains("nothing changed"));
+
+        let restored = persona_outcome(
+            false,
+            Err("jarvis: Core did not become ready with aaaaaaaaaaaa: not ready; restored the previous persona bbbbbbbbbbbb and Core is ready".to_owned()),
+        )
+        .unwrap();
+        assert!(!restored.success);
+        assert!(restored.summary.contains("previous persona was restored"));
+        assert!(restored.detail.contains("bbbbbbbbbbbb"));
+
+        let restore_failed = "jarvis: Core did not become ready; restoring the previous persona bbbbbbbbbbbb also failed: x";
+        assert_eq!(
+            persona_outcome(false, Err(restore_failed.to_owned())).err(),
+            Some(restore_failed.to_owned())
+        );
+        let audit_failed = "jarvis: persona audit event failed (logger failed) after: Core did not become ready; restored the previous persona bbbbbbbbbbbb and Core is ready";
+        assert_eq!(
+            persona_outcome(false, Err(audit_failed.to_owned())).err(),
+            Some(audit_failed.to_owned())
+        );
+        let refused = "jarvis: candidate persona aaaaaaaaaaaa does not match --expect-sha256";
+        assert_eq!(
+            persona_outcome(false, Err(refused.to_owned())).err(),
+            Some(refused.to_owned())
+        );
     }
 }

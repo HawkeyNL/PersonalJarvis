@@ -420,6 +420,10 @@ and says whether the restore worked. Each change is recorded in the system log
 (tag `jarvis-persona`) with the old and new SHA-256 before anything changes;
 if that record cannot be written, nothing changes.
 
+Core Admin's Persona page runs `install --expect-sha256 <hash> --yes` and
+`rollback --to <hash> --yes` through its root broker, with the hash the owner
+confirmed in the GUI.
+
 Destructive operations prompt only on a controlling TTY. In automation they
 fail closed unless their explicit `--yes` option is supplied. Credential input
 is never rendered by the TUI or emitted in JSON.

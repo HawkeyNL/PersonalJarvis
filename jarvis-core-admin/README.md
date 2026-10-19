@@ -16,7 +16,8 @@ surface is the explicitly registered command list in
 
 - read-only status, health, service, update, model, credential and log queries;
 - a fixed read of the root-controlled active agent manifest;
-- explicitly typed Core update, agent update and model-policy mutations;
+- explicitly typed Core update, agent update, model-policy and persona
+  install/rollback mutations;
 - a typed credential-provider action that opens a separate trusted terminal.
 
 Privileged calls use `/usr/bin/pkexec` and the system's GNOME polkit agent. A
@@ -133,7 +134,7 @@ an update when Core, CLI, the graphical app, or multiple components changed.
 The app uses the Jarvis redesign's visual language (bundled OFL fonts, no
 remote assets) and groups its views into four nodes: Overview, Operations
 (Health, Services, Logs), Intelligence (Agents, Models, Usage & Costs) and
-Administration (Devices, AI Accounts, Credentials, Update, System). Overview
+Administration (Devices, AI Accounts, Credentials, Persona, Update, System). Overview
 is a read-only dashboard of service health, release and update state, monthly
 spend, latency and reliability, models and routing, agents, devices, AI
 accounts and credentials; each card opens its detail view. The Models view
@@ -163,3 +164,14 @@ or Markdown prompt bodies. **Check** compares the configured, allowlisted
 `HawkeyNL/PersonalJarvisAgents` checkout with `origin/main`; **Update bundle**
 uses the existing trusted validator and transactional Core-readiness rollback
 path before the refreshed safe tree is displayed.
+
+The Persona page (Administration) shows only the installed, candidate and
+history SHA-256 hashes, sizes, times, the candidate's signature state and
+fixed validation problem codes; persona text never reaches the GUI. **Install
+candidate** sends only the candidate SHA-256 the owner confirmed, and
+**Roll back** only a full history SHA-256. Both are checked as 64 lowercase hex
+digits in the GUI backend and again in the root broker, which runs `jarvis
+persona install --expect-sha256 <hash> --yes` or `jarvis persona rollback --to
+<hash> --yes`. The trusted admin CLI resolves the source checkout itself; the
+GUI cannot choose a path. A failed activation that restored the previous persona is
+reported as such. Editing stays outside the GUI, through signed commits.
