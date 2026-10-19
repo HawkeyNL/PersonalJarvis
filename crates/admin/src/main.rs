@@ -41,6 +41,7 @@ mod ai_accounts;
 mod credential_setup;
 mod laya;
 mod local_devices;
+mod persona;
 mod sandbox_preflight;
 mod terminal_ui;
 mod tui_app;
@@ -106,6 +107,11 @@ enum Commands {
     Account {
         #[command(subcommand)]
         command: account_activation::AccountCommand,
+    },
+    /// Owner-only persona status, install and rollback; never exposed through Core HTTP.
+    Persona {
+        #[command(subcommand)]
+        command: persona::PersonaCommand,
     },
     Version,
     /// Report safe, non-secret terminal and Crossterm capabilities.
@@ -582,6 +588,7 @@ fn run() -> Result<()> {
         Commands::Accounts { command } => ai_accounts::run(command, cli.json),
         Commands::Account { command } => account_activation::run(command, cli.json),
         Commands::Devices { command } => local_devices::run(command, cli.json),
+        Commands::Persona { command } => persona::run(command, cli.json),
         Commands::Version => version(&presentation),
         Commands::TerminalDiagnostics => unreachable!("handled before root-only commands"),
         Commands::Status => status(&presentation),

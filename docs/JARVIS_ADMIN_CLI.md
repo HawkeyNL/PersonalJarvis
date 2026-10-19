@@ -386,6 +386,40 @@ history it fast-forwards over. Remove the setting to return to unsigned
 tracking of `main`. To retire a key, delete its line: a `valid-before`
 option is checked against the commit date, which the committer chooses.
 
+### Persona
+
+```bash
+sudo jarvis persona status [--json]
+sudo jarvis persona install [--expect-sha256 <sha256> [--yes]]
+sudo jarvis persona rollback --to <sha256> [--yes]
+```
+
+`status` shows the SHA-256, size and time of the installed persona, of the
+candidate in the private checkout's current commit (with its signature state)
+and of the versions in the root-only history. It never prints persona text.
+
+`install` takes the persona from the private checkout's current commit; edits
+reach that checkout as signed commits through the private agent updater. The
+commit must be signed by a key in the allowed signers file (see "Signed agent
+updates"), even when the agent updater itself does not require signing, and
+the checkout must be root-controlled. The persona must be valid UTF-8 of at
+most `PERSONA_MAX_BYTES` (32 KiB, in `crates/privileged/src/persona.rs`), start with a `# ` heading, contain no control characters other
+than tab and line endings and no invisible bidirectional or zero-width
+formatting characters, and contain nothing that looks like a key or token.
+Only SSH signatures count; OpenPGP and X.509 signatures are never accepted.
+The installer is then bound to that exact SHA-256: if the working tree differs
+from the signed commit, nothing is installed. `--yes` requires
+`--expect-sha256`, copied from `status`.
+
+`rollback --to` accepts only the full SHA-256 of an intact, valid version in
+the history. The history keeps the ten most recently used versions.
+
+Both restart Core and wait for `/readyz`. When Core does not become ready, the
+previous persona is restored and Core restarted again; the command still fails
+and says whether the restore worked. Each change is recorded in the system log
+(tag `jarvis-persona`) with the old and new SHA-256 before anything changes;
+if that record cannot be written, nothing changes.
+
 Destructive operations prompt only on a controlling TTY. In automation they
 fail closed unless their explicit `--yes` option is supplied. Credential input
 is never rendered by the TUI or emitted in JSON.
