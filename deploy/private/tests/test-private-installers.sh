@@ -3,9 +3,7 @@
 # GitHub Actions because it deliberately exercises canonical system paths.
 set -euo pipefail
 [[ ${GITHUB_ACTIONS:-} == true && ${EUID} -eq 0 ]] || { echo "CI root fixture only" >&2; exit 1; }
-# The persona installer checks content with the real `jarvis` validator.
 [[ -x ${JARVIS_PERSONA_VALIDATOR:-} ]] || { echo "set JARVIS_PERSONA_VALIDATOR to the built jarvis binary" >&2; exit 1; }
-export JARVIS_PERSONA_VALIDATOR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 fixture=$(mktemp -d)
@@ -14,6 +12,11 @@ cleanup() {
     if [[ ${created_user:-false} == true ]]; then userdel jarvis 2>/dev/null || true; fi
 }
 trap cleanup EXIT
+# The persona installer checks content with the real `jarvis` validator, which
+# it accepts only as a root-owned file nobody else can write.
+install -d -o root -g root -m 0755 "$fixture/bin"
+install -o root -g root -m 0755 "$JARVIS_PERSONA_VALIDATOR" "$fixture/bin/jarvis"
+export JARVIS_PERSONA_VALIDATOR="$fixture/bin/jarvis"
 
 created_user=false
 if ! getent passwd jarvis >/dev/null; then
@@ -129,24 +132,44 @@ chmod 0660 /etc/jarvis/Jarvis.md
 [[ $(bash "$installer" --source "$fixture/private") == "UPDATE protected persona sha256=${v15:0:12}" ]]
 [[ $(stat -c '%U:%G:%a' /etc/jarvis/Jarvis.md) == root:jarvis:640 ]]
 
-# Content production Core would refuse is never installed, and the installer
-# never prints it.
+# Content production Core would refuse is never installed, the installer never
+# prints it and a refusal leaves no staged copy behind.
 refuse_persona() {
-    if bash "$installer" --source "$fixture/private" >"$fixture/refused.log" 2>&1; then
-        echo "invalid persona was installed" >&2
+    local reason=$1
+    shift
+    if bash "$installer" "$@" >"$fixture/refused.log" 2>&1; then
+        echo "installer accepted: $reason" >&2
         exit 1
     fi
-    grep -Fq 'persona failed validation' "$fixture/refused.log"
+    grep -Fq "$reason" "$fixture/refused.log"
     if grep -Fq 'SYNTHETIC-INVALID-BODY' "$fixture/refused.log"; then
         echo "installer printed persona text" >&2
         exit 1
     fi
     [[ $(installed_hash) == "$v15" ]]
+    if compgen -G '/etc/jarvis/.Jarvis.md.*' >/dev/null; then
+        echo "refused install left a staged persona" >&2
+        exit 1
+    fi
 }
 printf 'SYNTHETIC-INVALID-BODY without a heading\n' > "$persona"
-refuse_persona
+refuse_persona 'persona failed validation' --source "$fixture/private"
 { printf '# Synthetic persona\nSYNTHETIC-INVALID-BODY\n'; head -c 40000 /dev/zero | tr '\0' a; } > "$persona"
-refuse_persona
+refuse_persona 'persona failed validation' --source "$fixture/private"
+# A root-owned, correctly named history entry is still validated on restore.
+printf 'SYNTHETIC-INVALID-BODY in the history\n' > "$fixture/invalid-entry"
+invalid_entry=$(sha256sum "$fixture/invalid-entry" | awk '{print $1}')
+install -o root -g jarvis -m 0640 "$fixture/invalid-entry" "$history/$invalid_entry"
+refuse_persona 'persona failed validation' --restore "$invalid_entry"
+# The validator must be trusted and new enough.
+install -o root -g root -m 0775 "$fixture/bin/jarvis" "$fixture/bin/writable-jarvis"
+JARVIS_PERSONA_VALIDATOR="$fixture/bin/writable-jarvis"
+refuse_persona 'persona validator must be root-owned' --restore "$v14"
+printf '#!/bin/sh\necho "error: unrecognized subcommand" >&2\nexit 2\n' \
+    | install -o root -g root -m 0755 /dev/stdin "$fixture/bin/old-jarvis"
+JARVIS_PERSONA_VALIDATOR="$fixture/bin/old-jarvis"
+refuse_persona 'release predates persona validation' --restore "$v14"
+JARVIS_PERSONA_VALIDATOR="$fixture/bin/jarvis"
 
 JARVIS_AGENT_BUNDLE_VALIDATOR="$fixture/validator" bash "$repo_dir/deploy/private/install-agent-bundle.sh" --source "$fixture/private"
 bundle=$(readlink -f /var/lib/jarvis/agents/current)

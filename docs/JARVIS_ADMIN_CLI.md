@@ -433,6 +433,10 @@ test environments fall back to a built-in persona instead. `status` reports
 the same problems, including a persona writable by group or others, and the
 protected installer refuses content that fails `sudo jarvis persona validate`
 (which reads a candidate from standard input and prints only the problem).
+The installer accepts only a root-owned validator that group and others cannot
+write, and stops with "release predates persona validation" when the installed
+`jarvis` is older than this subcommand; setup checks the release's
+`tooling.persona_validate` flag for the same reason.
 
 **Upgrade note (persona check).** Before installing the release that adds
 this startup check, run:
