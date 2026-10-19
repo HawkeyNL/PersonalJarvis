@@ -128,6 +128,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::account::password_request).layer(DefaultBodyLimit::max(8192)),
         )
         .route(
+            "/v1/auth/account/password/reset-requests",
+            post(routes::account::password_reset_request).layer(DefaultBodyLimit::max(8192)),
+        )
+        .route(
             "/v1/auth/account/requests/{id}/approve",
             post(routes::account::approve).layer(DefaultBodyLimit::max(1024)),
         )

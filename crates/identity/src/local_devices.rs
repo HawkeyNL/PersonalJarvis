@@ -77,6 +77,35 @@ pub async fn deny(
     Ok(())
 }
 
+pub async fn pending_recoveries(
+    db: &Database,
+    _peer: &LocalRootPeer<'_>,
+) -> Result<Vec<account::PendingRecovery>, IdentityError> {
+    let owner = first_user(db).await?.ok_or(IdentityError::AuthFailed)?;
+    account::pending_recoveries(db, owner.id).await
+}
+
+/// The local root half of a forgotten-password recovery; the device-signed
+/// half is `account::approve_action` with `AccountAction::PasswordReset`.
+pub async fn confirm_recovery(
+    db: &Database,
+    _peer: &LocalRootPeer<'_>,
+    request_id: Uuid,
+) -> Result<User, IdentityError> {
+    let owner = first_user(db).await?.ok_or(IdentityError::AuthFailed)?;
+    account::confirm_recovery(db, owner.id, request_id).await?;
+    Ok(owner)
+}
+
+pub async fn deny_recovery(
+    db: &Database,
+    _peer: &LocalRootPeer<'_>,
+    request_id: Uuid,
+) -> Result<(), IdentityError> {
+    let owner = first_user(db).await?.ok_or(IdentityError::AuthFailed)?;
+    account::deny_recovery(db, owner.id, request_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

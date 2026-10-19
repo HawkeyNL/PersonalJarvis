@@ -7,6 +7,9 @@ use uuid::Uuid;
 pub enum AccountAction {
     PasswordSet,
     DeviceRevoke,
+    /// Forgotten-password recovery: carries no current password and only
+    /// takes effect after local root confirmation on the Home Node.
+    PasswordReset,
 }
 
 impl AccountAction {
@@ -14,6 +17,7 @@ impl AccountAction {
         match self {
             Self::PasswordSet => "password-set",
             Self::DeviceRevoke => "device-revoke",
+            Self::PasswordReset => "password-reset",
         }
     }
 }
@@ -52,6 +56,44 @@ pub fn account_approval_message(request: &AccountApproval) -> Result<Vec<u8>, &'
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fixed password-reset vector for the Swift and Kotlin clients. Only the
+    /// action label differs from password-set, so the domains never collide.
+    #[test]
+    fn password_reset_approval_matches_golden_bytes() {
+        let request = AccountApproval {
+            request_id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
+            user_id: Uuid::parse_str("10213243-5465-7687-98a9-bacbdcedfe0f").unwrap(),
+            device_id: Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap(),
+            action: AccountAction::PasswordReset,
+            target: Uuid::parse_str("10213243-5465-7687-98a9-bacbdcedfe0f").unwrap(),
+            nonce: hex::encode((0_u8..32).collect::<Vec<_>>()),
+            expires_at: 1_800_000_000,
+        };
+        let reset = account_approval_message(&request).unwrap();
+        assert_eq!(
+            hex::encode(&reset),
+            concat!(
+                "6a61727669732d6163636f756e742d617070726f76616c2d763100",
+                "70617373776f72642d726573657400",
+                "00112233445566778899aabbccddeeff",
+                "102132435465768798a9bacbdcedfe0f",
+                "ffeeddccbbaa99887766554433221100",
+                "102132435465768798a9bacbdcedfe0f",
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                "000000006b49d200"
+            )
+        );
+        let set = AccountApproval {
+            action: AccountAction::PasswordSet,
+            ..request
+        };
+        assert_ne!(reset, account_approval_message(&set).unwrap());
+        assert_eq!(
+            serde_json::to_value(AccountAction::PasswordReset).unwrap(),
+            "password-reset"
+        );
+    }
 
     /// Fixed account approval vectors for the Swift and Kotlin clients.
     #[test]
