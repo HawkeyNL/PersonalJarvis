@@ -1,9 +1,12 @@
-//! Owner notifications through a self-hosted ntfy server (docs/NOTIFICATIONS.md).
+//! Owner notifications through a self-hosted ntfy server and, for approvals,
+//! APNs straight to the Jarvis iOS app (docs/NOTIFICATIONS.md).
 //!
 //! A push only says that something needs attention: no amounts, addresses,
 //! device names or key fingerprints. Details stay behind the authenticated
 //! app. Handlers enqueue without waiting; one worker publishes with a bounded
 //! timeout and retry, and a full queue drops the event and counts it.
+
+pub mod apns;
 
 use std::{
     collections::HashMap,
@@ -17,6 +20,7 @@ use std::{
 use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use tokio::sync::mpsc;
 use url::{Host, Url};
+use uuid::Uuid;
 
 /// Environment variable naming the full publish URL including the topic.
 pub const URL_ENV: &str = "JARVIS_NOTIFY_NTFY_URL";
@@ -28,6 +32,9 @@ const QUEUE_CAPACITY: usize = 16;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_ATTEMPTS: u32 = 3;
+/// Longest one event may spend on app pushes, so an unreachable APNs never
+/// holds the worker past the approval's two-minute lifetime.
+const APP_PUSH_BUDGET: Duration = Duration::from_secs(30);
 /// At most one push per event kind in this window; bursts collapse.
 const MIN_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_TOKEN_BYTES: usize = 256;
@@ -85,6 +92,36 @@ impl NotifyEvent {
     }
 }
 
+/// Whose devices an approval push goes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Audience {
+    pub user: Uuid,
+    /// The device that asked; it never receives its own approval push.
+    pub except: Option<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Job {
+    event: NotifyEvent,
+    /// Only approvals have one; they also go to the user's app push targets.
+    audience: Option<Audience>,
+}
+
+/// The validated ntfy publish URL and bearer token.
+pub struct Ntfy {
+    url: Url,
+    token: HeaderValue,
+}
+
+impl Ntfy {
+    pub fn parse(raw_url: &str, token: &str) -> Result<Self, &'static str> {
+        Ok(Self {
+            url: parse_url(raw_url)?,
+            token: parse_token(token.as_bytes())?,
+        })
+    }
+}
+
 /// Cheap to clone. The default value is disabled and ignores every event.
 #[derive(Clone, Default)]
 pub struct Notifier {
@@ -92,8 +129,10 @@ pub struct Notifier {
 }
 
 struct Inner {
-    queue: mpsc::Sender<NotifyEvent>,
-    last_sent: Mutex<HashMap<NotifyEvent, Instant>>,
+    queue: mpsc::Sender<Job>,
+    /// Per kind and requesting device, so one device's request never hides
+    /// another's.
+    last_sent: Mutex<HashMap<(NotifyEvent, Option<Uuid>), Instant>>,
     /// (year, month) in UTC of the last budget notification, matching the
     /// calendar month `jarvis_usage::month_total_eur` sums over.
     budget_month: Mutex<Option<(i32, u8)>>,
@@ -101,18 +140,22 @@ struct Inner {
 }
 
 impl Notifier {
-    /// Validate the URL and token and spawn the publish worker. `Err` is a
-    /// stable, non-sensitive reason; the caller keeps notifications disabled.
-    pub fn start(raw_url: &str, token: &str) -> Result<Self, &'static str> {
-        start_with(
-            parse_url(raw_url)?,
-            parse_token(token.as_bytes())?,
-            REQUEST_TIMEOUT,
-            FIRST_BACKOFF,
-        )
+    /// Spawn the publish worker for the configured channels; with neither,
+    /// notifications stay off. `Err` is a stable, non-sensitive reason.
+    pub fn start(
+        ntfy: Option<Ntfy>,
+        apns: Option<(apns::Config, jarvis_store::Database)>,
+    ) -> Result<Self, &'static str> {
+        let apns = apns
+            .map(|(config, db)| apns::Apns::new(config, db, REQUEST_TIMEOUT))
+            .transpose()?;
+        if ntfy.is_none() && apns.is_none() {
+            return Ok(Self::default());
+        }
+        start_with(ntfy, apns, REQUEST_TIMEOUT, FIRST_BACKOFF)
     }
 
-    fn with_queue(queue: mpsc::Sender<NotifyEvent>) -> Self {
+    fn with_queue(queue: mpsc::Sender<Job>) -> Self {
         Self {
             inner: Some(Arc::new(Inner {
                 queue,
@@ -126,6 +169,24 @@ impl Notifier {
     /// Enqueue without waiting. Repeats within `MIN_INTERVAL` are coalesced;
     /// a full queue drops the event and counts it.
     pub fn notify(&self, event: NotifyEvent) {
+        self.enqueue(Job {
+            event,
+            audience: None,
+        });
+    }
+
+    /// Like `notify`, and also push to `user`'s app push targets except the
+    /// requesting device.
+    pub fn notify_approval(&self, event: NotifyEvent, user: Uuid, except: Option<Uuid>) {
+        self.enqueue(Job {
+            event,
+            audience: Some(Audience { user, except }),
+        });
+    }
+
+    fn enqueue(&self, job: Job) {
+        let event = job.event;
+        let key = (event, job.audience.and_then(|audience| audience.except));
         let Some(inner) = &self.inner else {
             return;
         };
@@ -136,14 +197,14 @@ impl Notifier {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             if last
-                .get(&event)
+                .get(&key)
                 .is_some_and(|at| now.duration_since(*at) < MIN_INTERVAL)
             {
                 return;
             }
-            last.insert(event, now);
+            last.insert(key, now);
         }
-        if inner.queue.try_send(event).is_err() {
+        if inner.queue.try_send(job).is_err() {
             let dropped = inner.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::warn!(
                 kind = event.kind(),
@@ -197,8 +258,8 @@ fn current_month() -> (i32, u8) {
 }
 
 fn start_with(
-    url: Url,
-    token: HeaderValue,
+    ntfy: Option<Ntfy>,
+    apns: Option<apns::Apns>,
     timeout: Duration,
     backoff: Duration,
 ) -> Result<Notifier, &'static str> {
@@ -210,33 +271,49 @@ fn start_with(
         .build()
         .map_err(|_| "notification client unavailable")?;
     let (queue, receiver) = mpsc::channel(QUEUE_CAPACITY);
-    tokio::spawn(run(client, url, token, receiver, backoff));
+    tokio::spawn(run(client, ntfy, apns, receiver, backoff));
     Ok(Notifier::with_queue(queue))
 }
 
 async fn run(
     client: reqwest::Client,
-    url: Url,
-    token: HeaderValue,
-    mut receiver: mpsc::Receiver<NotifyEvent>,
+    ntfy: Option<Ntfy>,
+    mut apns: Option<apns::Apns>,
+    mut receiver: mpsc::Receiver<Job>,
     backoff: Duration,
 ) {
-    while let Some(event) = receiver.recv().await {
-        let mut delay = backoff;
-        for attempt in 1..=MAX_ATTEMPTS {
-            match publish(&client, &url, &token, event).await {
-                Ok(()) => {
-                    tracing::info!(kind = event.kind(), "owner notification sent");
-                    break;
-                }
-                Err(retry) if retry && attempt < MAX_ATTEMPTS => {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-                Err(_) => {
-                    tracing::warn!(kind = event.kind(), attempt, "owner notification failed");
-                    break;
-                }
+    while let Some(job) = receiver.recv().await {
+        // The app push first: an approval expires in two minutes, and a slow
+        // ntfy must not hold it back.
+        if let (Some(apns), Some(audience)) = (apns.as_mut(), job.audience) {
+            apns.send(job.event, audience, backoff).await;
+        }
+        if let Some(ntfy) = &ntfy {
+            publish_with_retry(&client, ntfy, job.event, backoff).await;
+        }
+    }
+}
+
+async fn publish_with_retry(
+    client: &reqwest::Client,
+    ntfy: &Ntfy,
+    event: NotifyEvent,
+    backoff: Duration,
+) {
+    let mut delay = backoff;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match publish(client, &ntfy.url, &ntfy.token, event).await {
+            Ok(()) => {
+                tracing::info!(kind = event.kind(), "owner notification sent");
+                break;
+            }
+            Err(retry) if retry && attempt < MAX_ATTEMPTS => {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            Err(_) => {
+                tracing::warn!(kind = event.kind(), attempt, "owner notification failed");
+                break;
             }
         }
     }
@@ -389,8 +466,8 @@ mod tests {
 
     fn fast(url: &str) -> Notifier {
         start_with(
-            parse_url(url).unwrap(),
-            parse_token(b"tk_fixture\n").unwrap(),
+            Some(Ntfy::parse(url, "tk_fixture\n").unwrap()),
+            None,
             Duration::from_millis(200),
             Duration::from_millis(10),
         )
@@ -474,7 +551,10 @@ mod tests {
         notifier.notify(NotifyEvent::BudgetNinetyPercent);
         let inner = notifier.inner.as_ref().unwrap();
         assert_eq!(inner.dropped.load(Ordering::Relaxed), 1);
-        assert_eq!(receiver.try_recv(), Ok(NotifyEvent::PairingRequested));
+        assert_eq!(
+            receiver.try_recv().map(|job| job.event),
+            Ok(NotifyEvent::PairingRequested)
+        );
     }
 
     #[tokio::test]
@@ -485,8 +565,53 @@ mod tests {
             notifier.notify(NotifyEvent::PairingRequested);
         }
         notifier.notify(NotifyEvent::BudgetNinetyPercent);
-        assert_eq!(receiver.try_recv(), Ok(NotifyEvent::PairingRequested));
-        assert_eq!(receiver.try_recv(), Ok(NotifyEvent::BudgetNinetyPercent));
+        assert_eq!(
+            receiver.try_recv().map(|job| job.event),
+            Ok(NotifyEvent::PairingRequested)
+        );
+        assert_eq!(
+            receiver.try_recv().map(|job| job.event),
+            Ok(NotifyEvent::BudgetNinetyPercent)
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn only_approvals_carry_an_app_push_audience() {
+        let (queue, mut receiver) = mpsc::channel(8);
+        let notifier = Notifier::with_queue(queue);
+        let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
+        notifier.notify_approval(NotifyEvent::UnlockRequested, user, Some(device));
+        notifier.notify(NotifyEvent::BudgetNinetyPercent);
+        // Coalesced per kind and requesting device; another device's request
+        // still goes out.
+        notifier.notify_approval(NotifyEvent::UnlockRequested, user, Some(device));
+        let other = Uuid::now_v7();
+        notifier.notify_approval(NotifyEvent::UnlockRequested, user, Some(other));
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(Job {
+                event: NotifyEvent::UnlockRequested,
+                audience: Some(Audience {
+                    user,
+                    except: Some(device)
+                }),
+            })
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(Job {
+                event: NotifyEvent::BudgetNinetyPercent,
+                audience: None,
+            })
+        );
+        assert_eq!(
+            receiver.try_recv().map(|job| job.audience),
+            Ok(Some(Audience {
+                user,
+                except: Some(other)
+            }))
+        );
         assert!(receiver.try_recv().is_err());
     }
 
@@ -517,7 +642,10 @@ mod tests {
         notifier.budget_spend(899, 1_000);
         assert!(receiver.try_recv().is_err());
         notifier.budget_spend(900, 1_000);
-        assert_eq!(receiver.try_recv(), Ok(NotifyEvent::BudgetNinetyPercent));
+        assert_eq!(
+            receiver.try_recv().map(|job| job.event),
+            Ok(NotifyEvent::BudgetNinetyPercent)
+        );
         notifier.budget_spend(1_000, 1_000);
         assert!(receiver.try_recv().is_err());
     }

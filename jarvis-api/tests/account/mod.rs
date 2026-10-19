@@ -164,8 +164,11 @@ async fn ntfy_mock() -> Result<
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let ntfy = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let notifier = jarvis_api::notify::Notifier::start(
-        &format!("http://{}/jarvis-test", ntfy.local_addr()?),
-        "tk_fixture",
+        Some(jarvis_api::notify::Ntfy::parse(
+            &format!("http://{}/jarvis-test", ntfy.local_addr()?),
+            "tk_fixture",
+        )?),
+        None,
     )?;
     let (published, publishes) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {

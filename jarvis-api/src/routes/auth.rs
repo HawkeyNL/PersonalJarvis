@@ -323,7 +323,7 @@ pub(crate) async fn pairing_create(
     if password_verified {
         state
             .notifier
-            .notify(crate::notify::NotifyEvent::PairingRequested);
+            .notify_approval(crate::notify::NotifyEvent::PairingRequested, user.id, None);
     }
     // A password-verified request is rare and always worth a row; one without
     // a password check (legacy owner) is budgeted like other anonymous events.
@@ -571,6 +571,83 @@ pub(crate) async fn list_devices(
     Ok(Json(json!({ "devices": items })))
 }
 
+/// Push-target writes (set and delete together) one device may make per minute.
+const PUSH_TARGET_WRITES_PER_MIN: u32 = 6;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PushTargetReq {
+    apns_token: String,
+    apns_env: String,
+}
+
+/// An APNs device token: 64 to 200 hex characters, stored lowercase.
+fn apns_token(raw: &str) -> Option<String> {
+    ((64..=200).contains(&raw.len()) && raw.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| raw.to_ascii_lowercase())
+}
+
+fn push_target_rate_limited(state: &AppState, device: Uuid) -> Option<(StatusCode, Json<Value>)> {
+    (!allow_authenticated_device(state, device, "push-target", PUSH_TARGET_WRITES_PER_MIN)).then(
+        || {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "rate limited" })),
+            )
+        },
+    )
+}
+
+/// Register the calling device's APNs token. Always bound to the session's
+/// own device; a push only says that an approval is waiting.
+pub(crate) async fn push_target_set(
+    authed: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<PushTargetReq>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    if let Some(limited) = push_target_rate_limited(&state, authed.device.id) {
+        return Err(limited);
+    }
+    let token = apns_token(&req.apns_token).ok_or_else(|| bad_request("invalid apns_token"))?;
+    if !matches!(req.apns_env.as_str(), "sandbox" | "production") {
+        return Err(bad_request("invalid apns_env"));
+    }
+    identity::set_push_target(&state.db, authed.device.id, &token, &req.apns_env)
+        .await
+        .map_err(|error| match error {
+            // Held by another account's device: never moved across accounts.
+            identity::IdentityError::AuthFailed => (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "apns_token unavailable" })),
+            ),
+            error => internal(error),
+        })?;
+    record_security_event(&state, Some(authed.device.id), "push.target", "set", None).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove the calling device's push target; idempotent.
+pub(crate) async fn push_target_delete(
+    authed: Authed,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    if let Some(limited) = push_target_rate_limited(&state, authed.device.id) {
+        return Err(limited);
+    }
+    identity::delete_push_target(&state.db, authed.device.id)
+        .await
+        .map_err(internal)?;
+    record_security_event(
+        &state,
+        Some(authed.device.id),
+        "push.target",
+        "deleted",
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Minimal authenticated identity metadata used to bind native pairing signing
 /// without exposing user details to untrusted candidates.
 pub(crate) async fn auth_me(authed: Authed) -> Json<Value> {
@@ -620,9 +697,11 @@ pub(crate) async fn unlock_request(
         .map_err(internal)?;
     // Enqueue only: a full queue or an unreachable ntfy never delays or fails
     // the request.
-    state
-        .notifier
-        .notify(crate::notify::NotifyEvent::UnlockRequested);
+    state.notifier.notify_approval(
+        crate::notify::NotifyEvent::UnlockRequested,
+        authed.user.id,
+        Some(authed.device.id),
+    );
     record_security_event(
         &state,
         Some(authed.device.id),

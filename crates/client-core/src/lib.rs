@@ -22,6 +22,15 @@ pub const UNLOCK_APPROVAL_DOMAIN: &[u8] = b"jarvis-unlock-approval-v1\0";
 pub const UNLOCK_CODE_DOMAIN: &[u8] = b"jarvis-unlock-code-v1\0";
 /// `approval_message` value in `GET /v1/agent/pending` for [`agent_approval_message`].
 pub const AGENT_APPROVAL_MESSAGE_V1: &str = "agent-approval-v1";
+/// Largest stored action JSON (UTF-8 bytes) that `GET /v1/agent/pending` lists
+/// as `action_json`. A larger action is listed without it, and a phone cannot
+/// approve it: phones approve only what they can show in full.
+pub const MAX_REVIEWABLE_ACTION_JSON_LEN: usize = 16 * 1024;
+/// Agent action kinds (`action` in `GET /v1/agent/pending`) a phone may
+/// approve: kinds whose whole effect is in the signed JSON. `git_commit` is
+/// not one (it commits whatever the workspace holds when it runs). Any other
+/// kind, including one added later, is refused on phones.
+pub const MOBILE_APPROVABLE_AGENT_ACTIONS: [&str; 1] = ["write_file"];
 
 pub const MAX_DEVICE_NAME_LEN: usize = 128;
 pub const MAX_PLATFORM_LEN: usize = 32;
@@ -135,7 +144,9 @@ pub fn pairing_approval_message(
 /// Canonical, domain-separated v1 bytes a trusted device signs to approve one
 /// pending agent action. `action_sha256` is the SHA-256 of the pending action's
 /// stored canonical JSON (compact serde_json, UTF-8), exactly as hex-encoded in
-/// `action_sha256` of `GET /v1/agent/pending`. Every field has a fixed width.
+/// `action_sha256` of `GET /v1/agent/pending`; the same list carries that JSON
+/// as `action_json` (up to [`MAX_REVIEWABLE_ACTION_JSON_LEN`]), so an approver
+/// can hash what it shows. Every field has a fixed width.
 pub fn agent_approval_message(
     pending_id: Uuid,
     nonce: &[u8],
