@@ -1,6 +1,9 @@
+use crate::local_devices::{exchange, print, shown};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use jarvis_config::activation::{ActivationPolicy, ACTIVATION_FILE};
+use jarvis_privileged::local_devices::DeviceRequest;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -11,6 +14,7 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 // 32 equally likely, readable symbols: 12 characters retain 60 bits of entropy.
@@ -34,13 +38,36 @@ pub enum AccountCommand {
         #[arg(long, required = true)]
         allow_cidr: Vec<String>,
     },
+    /// Confirm a forgotten-password reset signed on an approver device.
+    Recovery {
+        #[command(subcommand)]
+        command: RecoveryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecoveryCommand {
+    /// Pending password resets; shows no secrets.
+    Status,
+    /// Set the new password, end every session and cancel pending requests.
+    Confirm {
+        request_id: Uuid,
+        /// Skip the confirmation after checking the request on the device.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Refuse a pending reset; nothing changes.
+    Deny { request_id: Uuid },
 }
 
 pub fn run(command: AccountCommand, json: bool) -> Result<()> {
+    let allow_cidr = match command {
+        AccountCommand::ActivationCode { allow_cidr } => allow_cidr,
+        AccountCommand::Recovery { command } => return recovery(command, json),
+    };
     if json || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("activation codes require an interactive owner terminal; JSON/redirection refused");
     }
-    let AccountCommand::ActivationCode { allow_cidr } = command;
     for parent in ["/etc", "/etc/jarvis"] {
         let metadata = fs::symlink_metadata(parent).context("activation directory unavailable")?;
         if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
@@ -102,6 +129,77 @@ pub fn run(command: AccountCommand, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn recovery(command: RecoveryCommand, json: bool) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("account recovery requires the host owner root path");
+    }
+    if json && !matches!(command, RecoveryCommand::Status) {
+        bail!("JSON mode is read-only");
+    }
+    match command {
+        RecoveryCommand::Status if json => print(&exchange(&DeviceRequest::RecoveryStatus {})?),
+        RecoveryCommand::Status => {
+            let pending =
+                PendingRecoveries::deserialize(exchange(&DeviceRequest::RecoveryStatus {})?)
+                    .context("invalid recovery status from Core")?;
+            if pending.requests.is_empty() {
+                println!("No pending password reset.");
+            }
+            for request in &pending.requests {
+                println!("{}", describe(request));
+            }
+            Ok(())
+        }
+        RecoveryCommand::Confirm { request_id, yes } => {
+            let pending = exchange(&DeviceRequest::RecoveryStatus {})?;
+            let request = pending_request(&pending, request_id)?;
+            println!("{}", describe(&request));
+            if !yes {
+                crate::confirm("Only confirm a reset you started on this device. Set the new password and sign out every device?")?;
+            }
+            print(&exchange(&DeviceRequest::RecoveryConfirm { request_id })?)
+        }
+        RecoveryCommand::Deny { request_id } => {
+            print(&exchange(&DeviceRequest::RecoveryDeny { request_id })?)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PendingRecoveries {
+    requests: Vec<PendingRecovery>,
+}
+
+#[derive(Deserialize)]
+struct PendingRecovery {
+    id: Uuid,
+    device_name: String,
+    platform: String,
+    created_at: String,
+    expires_at: String,
+}
+
+/// Device names come from remote clients: `shown` escapes bidi and controls.
+fn describe(request: &PendingRecovery) -> String {
+    format!(
+        "{}  from {} ({}), created {}, expires {}",
+        request.id,
+        shown(&request.device_name),
+        shown(&request.platform),
+        shown(&request.created_at),
+        shown(&request.expires_at)
+    )
+}
+
+fn pending_request(data: &serde_json::Value, request_id: Uuid) -> Result<PendingRecovery> {
+    PendingRecoveries::deserialize(data)
+        .context("invalid recovery status from Core")?
+        .requests
+        .into_iter()
+        .find(|request| request.id == request_id)
+        .context("no pending recovery with this id; run `sudo jarvis account recovery status`")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +218,19 @@ mod tests {
             counts[index] += 1;
         }
         assert_eq!(counts, [8; 32]);
+    }
+
+    #[test]
+    fn recovery_confirm_needs_a_listed_pending_request() {
+        let id = Uuid::from_u128(7);
+        let data = serde_json::json!({"requests":[{"id":id,"device_id":Uuid::nil(),
+            "device_name":"phone","platform":"ios","created_at":"2026-10-15T10:00:00Z",
+            "expires_at":"2026-10-15T10:15:00Z"}]});
+        let request = pending_request(&data, id).unwrap();
+        assert_eq!(request.device_name, "phone");
+        assert!(describe(&request).starts_with(&format!("{id}  from \"phone\" (\"ios\")")));
+        assert!(pending_request(&data, Uuid::from_u128(8)).is_err());
+        assert!(pending_request(&serde_json::json!({}), id).is_err());
     }
 
     #[test]
