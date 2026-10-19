@@ -478,10 +478,11 @@ pub(super) fn altstore_source(
             "bundleIdentifier": IOS_BUNDLE_ID,
             "developerName": "HawkeyNL",
             "localizedDescription": "Jarvis client for your own Home Node. Signed on this device by AltStore or SideStore.",
-            // AltStore 2 compares these with the IPA: no extra entitlements,
-            // and the usage descriptions from the App's Info.plist.
+            // AltStore 2 refuses an IPA with entitlements this list lacks:
+            // `aps-environment` from the App's `ios/Jarvis/Jarvis.entitlements`,
+            // and the usage descriptions from its Info.plist.
             "appPermissions": {
-                "entitlements": [],
+                "entitlements": ["aps-environment"],
                 "privacy": {
                     "NSFaceIDUsageDescription": "Jarvis uses Face ID to unlock your authenticated conversations.",
                     "NSLocalNetworkUsageDescription": "Jarvis connects to your Home Node on the local network.",

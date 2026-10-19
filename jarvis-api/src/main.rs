@@ -502,27 +502,43 @@ async fn main() -> anyhow::Result<()> {
         None => app_update_mirror,
     };
 
-    // Owner notifications are optional; an unusable configuration is logged
-    // and leaves them off rather than stopping Core.
-    let notifier = match std::env::var(jarvis_api::notify::URL_ENV)
+    // Owner notifications and app push are optional; an unusable
+    // configuration is logged and leaves that channel off rather than
+    // stopping Core.
+    let ntfy = match std::env::var(jarvis_api::notify::URL_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
     {
-        None => jarvis_api::notify::Notifier::default(),
-        Some(url) => match jarvis_api::notify::Notifier::start(
+        None => None,
+        Some(url) => match jarvis_api::notify::Ntfy::parse(
             &url,
             &std::env::var(jarvis_api::notify::TOKEN_ENV).unwrap_or_default(),
         ) {
-            Ok(notifier) => {
+            Ok(ntfy) => {
                 tracing::info!("owner notifications enabled");
-                notifier
+                Some(ntfy)
             }
             Err(reason) => {
                 tracing::error!(reason, "owner notifications disabled");
-                jarvis_api::notify::Notifier::default()
+                None
             }
         },
     };
+    let apns = match jarvis_api::notify::apns::Config::from_env() {
+        Ok(None) => None,
+        Ok(Some(config)) => {
+            tracing::info!("app push enabled");
+            Some((config, db.clone()))
+        }
+        Err(reason) => {
+            tracing::error!(reason, "app push disabled");
+            None
+        }
+    };
+    let notifier = jarvis_api::notify::Notifier::start(ntfy, apns).unwrap_or_else(|reason| {
+        tracing::error!(reason, "owner notifications disabled");
+        jarvis_api::notify::Notifier::default()
+    });
     notifier.seed_budget(
         spent_cents.load(std::sync::atomic::Ordering::Relaxed),
         budget_cents,

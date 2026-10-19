@@ -307,7 +307,8 @@ pub async fn approve_action(
             UPDATE devices SET status = 'revoked', updated_at = time::now() \
             WHERE record::id(id) = $target AND user_id = $user; \
             UPDATE device_keys SET revoked_at = time::now() WHERE device_id = $target AND revoked_at IS NONE; \
-            UPDATE sessions SET revoked_at = time::now() WHERE device_id = $target AND user_id = $user AND revoked_at IS NONE;",
+            UPDATE sessions SET revoked_at = time::now() WHERE device_id = $target AND user_id = $user AND revoked_at IS NONE; \
+            DELETE device_push_targets WHERE device_id = $target;",
         // Signing only records the recovery; nothing changes until local root
         // confirms it (`confirm_recovery`).
         AccountAction::PasswordReset => &recovery,
