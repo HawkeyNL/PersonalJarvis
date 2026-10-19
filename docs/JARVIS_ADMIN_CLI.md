@@ -421,6 +421,10 @@ and says whether the restore worked. Each change is recorded in the system log
 (tag `jarvis-persona`) with the old and new SHA-256 before anything changes;
 if that record cannot be written, nothing changes.
 
+Core Admin's Persona page runs `install --expect-sha256 <hash> --yes` and
+`rollback --to <hash> --yes` through its root broker, with the hash the owner
+confirmed in the GUI.
+
 Core reads the persona once at startup and checks its content with the same
 validator: it opens `JARVIS_LLM_PERSONA_PATH` without following a symlink,
 requires a regular file, reads at most `PERSONA_MAX_BYTES` plus one byte and
