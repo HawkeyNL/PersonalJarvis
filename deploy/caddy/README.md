@@ -104,8 +104,9 @@ those two settings are ignored for trust but still validated at startup.
 
 ### How access is granted
 
-The Core unit creates `/run/jarvis-core` as a systemd `RuntimeDirectory` and
-sets it to `jarvis:caddy`, mode `2750`. The setgid bit gives the socket that
+Before every start the Core unit creates `/run/jarvis-core` with `install -d`
+as `jarvis:caddy`, mode `2750`. It is not a systemd `RuntimeDirectory`: systemd
+would reset that to `jarvis:jarvis 0700` before each command. The setgid bit gives the socket that
 Core creates (mode `0660`) the `caddy` group, so Caddy can connect without Core
 joining the `caddy` group or Caddy joining the `jarvis` group. The socket path
 must be directly inside `/run/jarvis-core`. Core opens it only if that
@@ -122,7 +123,8 @@ rollback below.
 
 ### Enable
 
-Requires a Core release that contains this feature. The TCP listener on
+Requires v0.0.61 or later: v0.0.55 leaves `/run/jarvis-core` at
+`jarvis:jarvis 700`, so Core refuses the socket and does not start. The TCP listener on
 `127.0.0.1:8080` keeps serving everything, so local health checks are
 unchanged.
 
@@ -161,7 +163,7 @@ unchanged.
 
 ### Core release rollbacks
 
-A Core release from before this feature has no socket. If Caddy points at
+A Core release from before v0.0.61 has no usable socket. If Caddy points at
 `unix//run/jarvis-core/api.sock` when such a release is activated, every API
 request gets a 502 until the Caddyfile is switched back. Switch Caddy back to
 the TCP upstream (and reload it) before rolling Core back to such a release.

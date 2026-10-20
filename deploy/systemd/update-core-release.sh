@@ -1301,6 +1301,7 @@ while IFS= read -r archive_entry; do
         -rw*|drw*) ;;
         *) fail "archive contains a non-regular entry" ;;
     esac
+    [[ ${archive_entry:0:10} != *[sStT]* ]] || fail "archive contains a setuid, setgid or sticky entry"
 done < <(tar -tvzf "$archive")
 tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$staging_dir"
 
