@@ -4,7 +4,10 @@
 # /run/jarvis-core to stay jarvis:caddy 2750 across start, reload and restart.
 # systemd resets RuntimeDirectory= owner and mode before every Exec* command,
 # which a grep of the unit text cannot see.
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "test-core-socket-dir-systemd: failed at line $LINENO" >&2
+      ls -ld /run/jarvis-core /run/jarvis-core/api.sock >&2 || true
+      systemctl status --no-pager jarvis-core.service >&2 || true' ERR
 
 [[ ${GITHUB_ACTIONS:-} == true && ${EUID} -eq 0 ]] || {
     echo "refusing to run outside GitHub Actions as root" >&2

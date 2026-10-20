@@ -163,10 +163,10 @@ pub fn bind_api_socket(path: &Path, proxy_gid: u32) -> anyhow::Result<UnixListen
         bail!("unsafe API socket directory: must be owned by Core with no group write or other access");
     }
     if dir.gid() != proxy_gid {
-        bail!("API socket directory group is not the reverse proxy's group; check the jarvis-core unit's chgrp step");
+        bail!("API socket directory group is not the reverse proxy's group; check the jarvis-core unit's ExecStartPre install step");
     }
     if dir.mode() & 0o2000 == 0 {
-        bail!("API socket directory must be setgid so the socket gets the reverse proxy's group; check the jarvis-core unit's chmod step");
+        bail!("API socket directory must be setgid so the socket gets the reverse proxy's group; check the jarvis-core unit's ExecStartPre install step");
     }
     match fs::symlink_metadata(path) {
         Ok(info) if info.file_type().is_socket() && info.uid() == euid => fs::remove_file(path)?,
@@ -321,7 +321,7 @@ mod tests {
     fn unsafe_socket_directories_are_refused() {
         let (dir, gid) = private_dir();
         let path = dir.path().join("api.sock");
-        // Without the proxy's group (a failed chgrp) Core must not listen.
+        // Without the proxy's group (a failed install -d) Core must not listen.
         assert!(bind_api_socket(&path, gid.wrapping_add(1)).is_err());
         // No setgid bit (the socket would get Core's group), or too open.
         for mode in [0o750, 0o2755, 0o2770] {

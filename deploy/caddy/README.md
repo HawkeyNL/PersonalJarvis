@@ -130,8 +130,9 @@ only.
 
 ### How access is granted
 
-The Core unit creates `/run/jarvis-core` as a systemd `RuntimeDirectory` and
-sets it to `jarvis:caddy`, mode `2750`. The setgid bit gives the socket that
+Before every start the Core unit creates `/run/jarvis-core` with `install -d`
+as `jarvis:caddy`, mode `2750`. It is not a systemd `RuntimeDirectory`: systemd
+would reset that to `jarvis:jarvis 0700` before each command. The setgid bit gives the socket that
 Core creates (mode `0660`) the `caddy` group, so Caddy can connect without Core
 joining the `caddy` group or Caddy joining the `jarvis` group. Production
 requires exactly `/run/jarvis-core/api.sock`, the path the Caddyfile uses.
@@ -152,7 +153,9 @@ rollback below.
 
 A host that still proxies to `127.0.0.1:8080` must switch to the socket while
 it runs a Core release that already supports the optional socket, before the
-updater installs a release that requires it:
+updater installs a release that requires it. v0.0.55 cannot be used for this:
+its unit leaves `/run/jarvis-core` at `jarvis:jarvis 700`. Switch on v0.0.61,
+and switch back to TCP before rolling back to v0.0.55.
 
 1. Pause automatic updates for the switch:
    `sudo systemctl stop jarvis-updater.timer`. Check the runtime directory:
@@ -199,9 +202,9 @@ What happens when this is skipped:
 
 ### Roll back
 
-- To a Core release that supports the optional socket: roll back Core as
-  usual. Caddy can stay on the socket; that release still serves the full API
-  there.
+- To a Core release that supports the optional socket with a working socket
+  directory (v0.0.61 or later): roll back Core as usual. Caddy can stay on the
+  socket; that release still serves the full API there.
 - To the TCP upstream (only with such a release active): restore
   `/etc/caddy/Caddyfile.bak-api-tcp` (or make `reverse_proxy 127.0.0.1:8080`
   the active upstream again), remove `JARVIS_API_UNIX_SOCKET` from
