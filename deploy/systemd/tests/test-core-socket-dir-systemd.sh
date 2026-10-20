@@ -87,6 +87,7 @@ check
 systemctl reload "$unit"
 check
 # As left by the old RuntimeDirectory= unit; install -d repairs it.
+chgrp jarvis /run/jarvis-core
 chmod 0700 /run/jarvis-core
 systemctl restart "$unit"
 check
