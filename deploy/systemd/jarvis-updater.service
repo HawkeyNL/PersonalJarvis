@@ -19,7 +19,9 @@ UMask=0077
 NoNewPrivileges=true
 CapabilityBoundingSet=
 LockPersonality=true
-RestrictSUIDSGID=true
+# No RestrictSUIDSGID=: systemd blocks openat2() with ENOSYS under it, and tar
+# 1.35+dfsg-4ubuntu0.2 and later extracts with openat2() without a fallback.
+# The updater refuses archive entries with setuid, setgid or sticky bits instead.
 PrivateTmp=true
 PrivateDevices=true
 ProtectHome=true

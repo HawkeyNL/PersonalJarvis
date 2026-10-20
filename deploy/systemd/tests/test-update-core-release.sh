@@ -603,6 +603,23 @@ fi
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v1.0.4 ]]
 [[ ! -e /opt/jarvis/releases/v1.0.5 ]]
 
+# The updater unit cannot use RestrictSUIDSGID= (tar extracts with openat2), so
+# a checksummed archive with a setuid entry is refused before extraction.
+seed_active_release v1.0.6 "$same_migrations"
+prepare_candidate v1.0.7 "$same_migrations"
+chmod 4755 "$fixture_dir/asset/jarvis-core-v1.0.7/jarvis-api"
+tar -C "$fixture_dir/asset" -czf "$fixture_dir/jarvis-core-v1.0.7-linux-x86_64.tar.gz" jarvis-core-v1.0.7
+(
+    cd "$fixture_dir"
+    sha256sum jarvis-core-v1.0.7-linux-x86_64.tar.gz > jarvis-core-v1.0.7-linux-x86_64.tar.gz.sha256
+)
+if run_updater --version v1.0.7; then
+    echo "archive with a setuid entry unexpectedly succeeded" >&2
+    exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v1.0.6 ]]
+[[ ! -e /opt/jarvis/releases/v1.0.7 ]]
+
 # A shell-supplied repository must not redirect a configured root update.
 seed_active_release v1.1.0 "$same_migrations"
 prepare_candidate v1.1.1 "$same_migrations"
