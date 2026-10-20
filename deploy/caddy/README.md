@@ -153,9 +153,10 @@ rollback below.
 
 A host that still proxies to `127.0.0.1:8080` must switch to the socket while
 it runs a Core release that already supports the optional socket, before the
-updater installs a release that requires it. v0.0.55 cannot be used for this:
-its unit leaves `/run/jarvis-core` at `jarvis:jarvis 700`. Switch on v0.0.61,
-and switch back to TCP before rolling back to v0.0.55.
+updater installs a release that requires it. Releases before v0.0.61 cannot be
+used for this: their unit leaves `/run/jarvis-core` at `jarvis:jarvis 700`.
+Switch on v0.0.61 or later, and switch back to TCP before rolling back to an
+earlier release.
 
 1. Pause automatic updates for the switch:
    `sudo systemctl stop jarvis-updater.timer`. Check the runtime directory:

@@ -150,7 +150,7 @@ pub fn proxy_identity() -> anyhow::Result<ProxyIdentity> {
     Ok(ProxyIdentity { uid, gid })
 }
 
-/// Bind the API socket inside its systemd-managed runtime directory. The
+/// Bind the API socket inside the directory the Core unit creates. The
 /// directory must carry the proxy's group (setgid, so the socket inherits it)
 /// and grant nothing to anyone else; the socket itself is group read/write
 /// only. Trust still comes from the peer uid, not the mode.
