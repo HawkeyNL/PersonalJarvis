@@ -118,7 +118,12 @@ jobs:
       - name: Check dependency-exception expiry
         # RUSTSEC-2026-0235 (rkyv 0.7) is locked through rust_decimal's
         # optional dependency but compiled for no target or feature set.
-        run: test "$(date -u +%F)" \< "2026-12-31"
+        # RUSTSEC-2026-0381 is ignored only for webpki-roots 0.26.11, a shim
+        # (via surrealdb's tokio-tungstenite) that re-exports webpki-roots 1.x;
+        # the guard below keeps 1.x at the patched 1.0.10 or later.
+        run: |
+          test "$(date -u +%F)" \< "2026-12-31"
+          ! grep -A1 '^name = "webpki-roots"$' Cargo.lock | grep -Eq '^version = "1\.0\.[0-9]"$'
       - run: cargo audit
 
   # Desktop, Android, and iOS CI live in HawkeyNL/PersonalJarvisApp.
