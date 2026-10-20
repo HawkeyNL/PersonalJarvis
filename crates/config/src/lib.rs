@@ -391,7 +391,7 @@ pub struct AppConfig {
     pub bootstrap_allowed_cidrs: String,
 }
 
-/// The systemd `RuntimeDirectory` that holds Core's API socket.
+/// The directory that holds Core's API socket, created by the Core unit.
 pub const API_SOCKET_DIR: &str = "/run/jarvis-core";
 /// The production API socket: the deploy assets point Caddy at this path.
 pub const API_SOCKET_PATH: &str = "/run/jarvis-core/api.sock";
