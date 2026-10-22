@@ -691,6 +691,17 @@ cmp "$fixture_dir/admin-before-readiness-failure" /usr/local/sbin/jarvis
 cmp "$fixture_dir/updater-before-readiness-failure" /usr/local/libexec/jarvis/update-core-release
 cmp "$fixture_dir/unit-before-readiness-failure" "$systemd_fixture/jarvis-config-broker.service"
 grep -Fq 'daemon-reload' "$fixture_dir/systemctl.log"
+# The kept directory stops timer retries and names the manual recovery; it is
+# not a release staged for a schema migration.
+if run_updater 2>"$fixture_dir/leftover-release.err"; then
+    echo "update retried over a failed activation's release directory" >&2
+    exit 1
+fi
+grep -Fq 'kept after a failed activation or a rollback' "$fixture_dir/leftover-release.err"
+if grep -Fq -- '--migrate' "$fixture_dir/leftover-release.err"; then
+    echo "failed activation was reported as a staged migration" >&2
+    exit 1
+fi
 
 # A config-broker activation failure restores the old link and unit bytes, then
 # successfully restarts the previous service set.
@@ -993,6 +1004,10 @@ if grep -Evq '^(is-active|is-enabled)( |$)' "$fixture_dir/systemctl.log"; then
     echo 'stage changed service state' >&2; exit 1
 fi
 grep -Fq 'already staged' <<< "$(run_updater --stage v10.1.1)"
+if run_updater 2>"$fixture_dir/staged-latest.err"; then
+    echo 'routine update activated a staged migration' >&2; exit 1
+fi
+grep -Fq 'staged for a schema migration, run: sudo jarvis update --migrate v10.1.1' "$fixture_dir/staged-latest.err"
 
 # A directory with the stale full-path marker is named for manual removal and
 # never deleted automatically.
