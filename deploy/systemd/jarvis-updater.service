@@ -32,5 +32,6 @@ ProtectKernelTunables=true
 # The fixed updater owns immutable releases, the canonical copies of its
 # versioned tooling/application, and the fixed Jarvis unit set. Directory-level
 # write access is required for same-filesystem atomic rename; caller-selected
-# paths and unit names are never accepted.
-ReadWritePaths=/opt/jarvis /etc/systemd/system /usr/local/sbin /usr/local/libexec/jarvis /usr/bin /usr/share/applications /usr/share/icons/hicolor/128x128/apps /usr/share/jarvis-core-admin
+# paths and unit names are never accepted. The release-owned device PolicyKit
+# action is installed there too; "-" keeps the unit startable without polkit.
+ReadWritePaths=/opt/jarvis /etc/systemd/system /usr/local/sbin /usr/local/libexec/jarvis /usr/bin /usr/share/applications /usr/share/icons/hicolor/128x128/apps /usr/share/jarvis-core-admin -/usr/share/polkit-1/actions

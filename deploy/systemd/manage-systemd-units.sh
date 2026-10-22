@@ -542,66 +542,88 @@ install_units() {
             continue
         fi
         if ! mv -Tf "$systemd_root/.$unit.jarvis-new" "$systemd_root/$unit"; then
-            restore_units "$backup"
-            [[ ! -e $backup/model-policy-layout ]] || systemctl start jarvis-config-broker.service jarvis-core.service
             rm -f -- "${staged_units[@]}"
+            rollback_install "$backup" || fail "managed unit replacement failed; rollback is incomplete"
             fail "managed unit replacement failed; prior units restored"
         fi
     done
     if ! (install_device_policy "$release") || ! (check_installed "$release"); then
-        restore_units "$backup"
-        [[ ! -e $backup/model-policy-layout ]] || systemctl start jarvis-config-broker.service jarvis-core.service
+        rollback_install "$backup" || fail "installed unit verification failed; rollback is incomplete"
         fail "installed unit verification failed; prior units restored"
     fi
 }
 
+# Restore what the backup records, then reload systemd and restart the services
+# prepare_policy_layout stopped, even when part of the restore failed. Older
+# updaters neither reload nor restart after a failed install.
+rollback_install() {
+    local backup=$1 status=0
+    restore_units "$backup" || status=1
+    systemctl daemon-reload || status=1
+    if [[ -e $backup/model-policy-layout ]]; then
+        systemctl start jarvis-config-broker.service jarvis-core.service || status=1
+    fi
+    return "$status"
+}
+
+# Every step is checked explicitly: callers may run this where errexit is off.
+# Identical installed bytes need no write, so a sandbox that cannot write the
+# PolicyKit directory does not block a release with an unchanged policy.
+install_policy_file() {
+    local source=$1 target="$polkit_root/$device_policy" staged
+    if [[ -f $target && ! -L $target && $(stat -c '%u:%g:%a' "$target") == 0:0:644 ]] && cmp -s -- "$source" "$target"; then
+        return 0
+    fi
+    [[ -d $polkit_root ]] || install -d -o root -g root -m 0755 "$polkit_root" || return 1
+    staged=$(mktemp "$polkit_root/.jarvis-device-policy.XXXXXXXX") || return 1
+    if ! install -o root -g root -m 0644 "$source" "$staged" || ! mv -Tf "$staged" "$target"; then
+        rm -f -- "$staged"
+        return 1
+    fi
+}
+
 install_device_policy() {
-    local release=$1 staged
+    local release=$1
     if [[ $(device_capability "$release") == 1 ]]; then
-        install -d -o root -g root -m 0755 "$polkit_root"
-        staged=$(mktemp "$polkit_root/.jarvis-device-policy.XXXXXXXX")
-        if ! install -o root -g root -m 0644 "$release/$device_policy" "$staged" || \
-            ! mv -Tf "$staged" "$polkit_root/$device_policy"; then
-            rm -f -- "$staged"
-            return 1
-        fi
+        install_policy_file "$release/$device_policy"
     else
         rm -f -- "$polkit_root/$device_policy"
     fi
 }
 
+# Units are restored before the device policy, and a device policy failure is
+# reported only after every unit has been restored.
 restore_units() {
-    local backup=$1 unit state staged
+    local backup=$1 unit state staged restored=true
     [[ -d $backup && ! -L $backup && -f $backup/state && ! -L $backup/state ]] ||
         fail "unit rollback state is unavailable"
-    restore_policy_layout "$backup"
-    validate_policy_target
-    if [[ -f $backup/device-policy-state && ! -L $backup/device-policy-state ]]; then
-        case $(<"$backup/device-policy-state") in
-            present)
-                [[ -f $backup/$device_policy && ! -L $backup/$device_policy ]] || fail "device policy rollback file missing"
-                install -d -o root -g root -m 0755 "$polkit_root"
-                staged=$(mktemp "$polkit_root/.jarvis-device-policy.XXXXXXXX")
-                install -o root -g root -m 0644 "$backup/$device_policy" "$staged"
-                mv -Tf "$staged" "$polkit_root/$device_policy"
-                ;;
-            absent) rm -f -- "$polkit_root/$device_policy" ;;
-            *) fail "invalid device policy rollback state" ;;
-        esac
-    fi
+    restore_policy_layout "$backup" || fail "policy rollback failed; services remain stopped"
     for unit in "${managed_units[@]}"; do
         read -r _ state < <(awk -v unit="$unit" '$1 == unit { print; exit }' "$backup/state")
         case $state in
             present)
                 [[ -f $backup/$unit && ! -L $backup/$unit ]] || fail "unit rollback file is missing: $unit"
                 staged="$systemd_root/.$unit.jarvis-restore"
-                install -o root -g root -m 0644 "$backup/$unit" "$staged"
-                mv -Tf "$staged" "$systemd_root/$unit"
+                if ! install -o root -g root -m 0644 "$backup/$unit" "$staged" || ! mv -Tf "$staged" "$systemd_root/$unit"; then
+                    rm -f -- "$staged"
+                    restored=false
+                fi
                 ;;
-            absent) rm -f -- "$systemd_root/$unit" ;;
+            absent) rm -f -- "$systemd_root/$unit" || restored=false ;;
             *) fail "unit rollback state is malformed: $unit" ;;
         esac
     done
+    if [[ -f $backup/device-policy-state && ! -L $backup/device-policy-state ]]; then
+        case $(<"$backup/device-policy-state") in
+            present)
+                [[ -f $backup/$device_policy && ! -L $backup/$device_policy ]] && (validate_policy_target) &&
+                    install_policy_file "$backup/$device_policy" || restored=false
+                ;;
+            absent) (validate_policy_target) && rm -f -- "$polkit_root/$device_policy" || restored=false ;;
+            *) restored=false ;;
+        esac
+    fi
+    [[ $restored == true ]] || { echo "jarvis systemd units: unit or device policy rollback failed" >&2; return 1; }
 }
 
 [[ $# -ge 2 && $# -le 3 ]] || usage
