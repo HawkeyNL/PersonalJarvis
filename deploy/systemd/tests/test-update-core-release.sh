@@ -697,7 +697,7 @@ if run_updater 2>"$fixture_dir/leftover-release.err"; then
     echo "update retried over a failed activation's release directory" >&2
     exit 1
 fi
-grep -Fq 'kept after a failed activation or a rollback'"$fixture_dir/leftover-release.err"
+grep -Fq 'kept after a failed activation or a rollback' "$fixture_dir/leftover-release.err"
 if grep -Fq -- '--migrate' "$fixture_dir/leftover-release.err"; then
     echo "failed activation was reported as a staged migration" >&2
     exit 1
