@@ -31,15 +31,16 @@ RestartSec=5s
 TimeoutStartSec=30s
 TimeoutStopSec=30s
 UMask=0077
-RuntimeDirectory=jarvis-core-admin jarvis-core
+RuntimeDirectory=jarvis-core-admin
 RuntimeDirectoryMode=0700
 # Home of the API socket for Caddy (JARVIS_API_UNIX_SOCKET, required in
-# production). The directory becomes jarvis:caddy 2750: Caddy may traverse it,
-# and the setgid bit gives the socket Core creates (mode 0660) the caddy group
-# without adding Core to that group. If the chgrp fails the directory stays
-# jarvis:jarvis and Core refuses to open the socket and to start.
-ExecStartPre=-+/usr/bin/chgrp caddy /run/jarvis-core
-ExecStartPre=+/usr/bin/chmod 2750 /run/jarvis-core
+# production): jarvis:caddy 2750, so Caddy may traverse it and the setgid bit
+# gives the socket Core creates (mode 0660) the caddy group without adding Core
+# to that group. Not a RuntimeDirectory=: systemd resets those to User:Group
+# and RuntimeDirectoryMode before every Exec* command, including ExecReload.
+# install -d also repairs a directory left by an earlier unit. Without a caddy
+# group it creates nothing and Core refuses to open the socket and to start.
+ExecStartPre=-+/usr/bin/install -d -o jarvis -g caddy -m 2750 /run/jarvis-core
 
 # Core owns no host files at runtime: durable application state is SurrealDB.
 # Keep the release read-only and make host compromise harder without granting
@@ -55,6 +56,8 @@ ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ReadWritePaths=/var/lib/jarvis
+# ProtectSystem=strict makes /run read-only; "-": absent without a caddy group.
+ReadWritePaths=-/run/jarvis-core
 # Agent releases are a root-activated read-only subtree even though Core may
 # retain unrelated runtime state below /var/lib/jarvis.
 ReadOnlyPaths=/var/lib/jarvis/agents
