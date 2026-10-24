@@ -993,8 +993,9 @@ activate_managed_release() {
             systemctl start jarvis-surrealdb.service || true
             systemctl start jarvis-core.service || true
         fi
-        rm -rf -- "$backup"
-        return 1
+        # The unit manager reports whether its own rollback completed; keep its
+        # backup, the only copy of the previous units, for manual recovery.
+        fail "managed unit installation failed; see the unit manager messages above; recovery files retained at $backup"
     fi
     rm -f -- "$temporary_link"
     ln -s "$release" "$temporary_link"
@@ -1286,8 +1287,14 @@ checksum_url=$(asset_url "$checksum") || fail "release is missing $checksum"
 [[ $artifact_url == https://github.com/* && $checksum_url == https://github.com/* ]] || \
     fail "release asset URL is not a GitHub HTTPS URL"
 
-[[ ! -e $releases_dir/$tag ]] || \
-    fail "release directory already exists: $tag; if it was staged for a schema migration, run: sudo jarvis update --migrate $tag"
+if [[ -e $releases_dir/$tag || -L $releases_dir/$tag ]]; then
+    [[ $(schema_transition "$releases_dir/$tag/release.json") != 'migration required' ]] || \
+        fail "release directory already exists: $tag; it is staged for a schema migration, run: sudo jarvis update --migrate $tag"
+    # A failed activation or a rollback keeps the directory, so the five-minute
+    # timer does not stop and restart Core again on every run. Retrying is the
+    # owner's call.
+    fail "release directory already exists: $tag; it was kept after a failed activation or a rollback; to retry $tag, inspect sudo jarvis logs core, then remove $releases_dir/$tag"
+fi
 staging_dir=$(mktemp -d "$releases_dir/.staging.XXXXXXXX")
 archive="$staging_dir/$artifact"
 
@@ -1311,6 +1318,7 @@ while IFS= read -r archive_entry; do
         -rw*|drw*) ;;
         *) fail "archive contains a non-regular entry" ;;
     esac
+    [[ ${archive_entry:0:10} != *[sStT]* ]] || fail "archive contains a setuid, setgid or sticky entry"
 done < <(tar -tvzf "$archive")
 tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$staging_dir"
 

@@ -19,7 +19,9 @@ UMask=0077
 NoNewPrivileges=true
 CapabilityBoundingSet=
 LockPersonality=true
-RestrictSUIDSGID=true
+# No RestrictSUIDSGID=: systemd blocks openat2() with ENOSYS under it, and tar
+# 1.35+dfsg-4ubuntu0.2 and later extracts with openat2() without a fallback.
+# The updater refuses archive entries with setuid, setgid or sticky bits instead.
 PrivateTmp=true
 PrivateDevices=true
 ProtectHome=true
@@ -30,5 +32,6 @@ ProtectKernelTunables=true
 # The fixed updater owns immutable releases, the canonical copies of its
 # versioned tooling/application, and the fixed Jarvis unit set. Directory-level
 # write access is required for same-filesystem atomic rename; caller-selected
-# paths and unit names are never accepted.
-ReadWritePaths=/opt/jarvis /etc/systemd/system /usr/local/sbin /usr/local/libexec/jarvis /usr/bin /usr/share/applications /usr/share/icons/hicolor/128x128/apps /usr/share/jarvis-core-admin
+# paths and unit names are never accepted. The release-owned device PolicyKit
+# action is installed there too; "-" keeps the unit startable without polkit.
+ReadWritePaths=/opt/jarvis /etc/systemd/system /usr/local/sbin /usr/local/libexec/jarvis /usr/bin /usr/share/applications /usr/share/icons/hicolor/128x128/apps /usr/share/jarvis-core-admin -/usr/share/polkit-1/actions
