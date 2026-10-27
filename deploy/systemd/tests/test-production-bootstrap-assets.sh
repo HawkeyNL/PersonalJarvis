@@ -85,6 +85,8 @@ grep -Fq 'RuntimeDirectory=jarvis-config-broker' "$repo_dir/deploy/systemd/jarvi
 grep -Fq 'StateDirectory=jarvis-config-broker' "$repo_dir/deploy/systemd/jarvis-config-broker.service"
 grep -Fq 'ui_run_tty "Root configuration checked"' "$repo_dir/deploy/systemd/setup-home-node.sh"
 grep -Fq 'ExecStart=/usr/local/sbin/jarvis update --latest' "$repo_dir/deploy/systemd/jarvis-updater.service"
+# The sandboxed timer installs and restores the release-owned device policy.
+grep -Eq '^ReadWritePaths=.* -/usr/share/polkit-1/actions( |$)' "$repo_dir/deploy/systemd/jarvis-updater.service"
 grep -Fq "'JARVIS_UPDATE_CHANNEL=stable'" "$repo_dir/deploy/systemd/setup-home-node.sh"
 
 echo "Production Home Node bootstrap asset checks passed"
