@@ -17,6 +17,7 @@
 //! The Core (`jarvis-core/**`, policy, secrets) is never agent-writable — not via a
 //! `write_file`, not via Claude Code, not even with a signed approval.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -26,6 +27,8 @@ use tokio::process::Command;
 const MAX_OUTPUT: usize = 64 * 1024;
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const EXEC_TIMEOUT: Duration = Duration::from_secs(20);
+/// The only environment variables a workspace subprocess inherits.
+const CHILD_ENV: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL"];
 /// A read-only action Jarvis may perform. This enum *is* the allowlist: anything
 /// not expressible here cannot be requested (4a has no mutating variants).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -211,7 +214,9 @@ impl Sandbox {
     /// must exist inside the sandbox, and the target may never be the Core, a
     /// secret, or inside `.git`. Absolute protected configuration (including
     /// `/etc/jarvis/Jarvis.md`) is rejected before this resolver is entered.
-    fn resolve_write(&self, rel: &str) -> Result<PathBuf, AgentError> {
+    /// Returns the existing file's metadata, if any, so the writer can check it
+    /// opened that same file.
+    fn resolve_write(&self, rel: &str) -> Result<(PathBuf, Option<std::fs::Metadata>), AgentError> {
         if Path::new(rel).is_absolute() {
             return Err(AgentError::OutsideSandbox);
         }
@@ -236,7 +241,17 @@ impl Sandbox {
                 "protected path (Core / .git / secret) — owner-only".into(),
             ));
         }
-        Ok(target)
+        // The leaf itself is not canonicalized, so a symlink there (even a
+        // dangling one) or a hard link would redirect the write past every
+        // guard above.
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if !meta.file_type().is_file() || meta.nlink() > 1 => Err(AgentError::Denied(
+                "write target is not a plain regular file".into(),
+            )),
+            Ok(meta) => Ok((target, Some(meta))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((target, None)),
+            Err(_) => Err(AgentError::NotFound),
+        }
     }
 
     /// The Core and version-control internals are never agent-writable. `jarvis-core/**`
@@ -305,8 +320,8 @@ pub async fn execute(sandbox: &Sandbox, action: &Action) -> Result<Outcome, Agen
 pub async fn preview(sandbox: &Sandbox, action: &Action) -> Result<String, AgentError> {
     match action {
         Action::WriteFile { path, content } => {
-            let target = sandbox.resolve_write(path)?; // enforces Core/secret denial
-            let verb = if target.exists() {
+            let (_, existing) = sandbox.resolve_write(path)?; // enforces Core/secret denial
+            let verb = if existing.is_some() {
                 "OVERWRITES"
             } else {
                 "new file"
@@ -335,8 +350,39 @@ pub async fn preview(sandbox: &Sandbox, action: &Action) -> Result<String, Agent
 }
 
 fn write_file(sandbox: &Sandbox, path: &str, content: &str) -> Result<String, AgentError> {
-    let target = sandbox.resolve_write(path)?;
-    std::fs::write(&target, content).map_err(|e| AgentError::Exec(e.to_string()))?;
+    use std::io::Write;
+
+    let exec = |e: std::io::Error| AgentError::Exec(e.to_string());
+    let (target, existing) = sandbox.resolve_write(path)?;
+    let mut file = match existing {
+        // O_EXCL never follows a symlink planted after `resolve_write`.
+        None => std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(exec)?,
+        // Open without truncating, then prove it is the file that was checked
+        // before any byte changes: a leaf swapped for a link fails here.
+        Some(checked) => {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&target)
+                .map_err(exec)?;
+            let opened = file.metadata().map_err(exec)?;
+            if opened.dev() != checked.dev() || opened.ino() != checked.ino() || opened.nlink() != 1
+            {
+                return Err(AgentError::Denied(
+                    "write target changed while writing".into(),
+                ));
+            }
+            file.set_len(0).map_err(exec)?;
+            file
+        }
+    };
+    // ponytail: a parent directory swapped for a symlink after `resolve_write`
+    // canonicalized it is still followed; closing that needs openat2
+    // (RESOLVE_BENEATH), worth it only if workspaces get concurrent untrusted writers.
+    file.write_all(content.as_bytes()).map_err(exec)?;
     Ok(format!("written: {path} ({} bytes)", content.len()))
 }
 
@@ -529,6 +575,14 @@ async fn git(sandbox: &Sandbox, sub: GitRead) -> Result<String, AgentError> {
 /// with a timeout. Returns stdout; falls back to stderr when stdout is empty.
 async fn run_cmd(root: &Path, program: &str, args: &[&str]) -> Result<String, AgentError> {
     let mut cmd = Command::new(program);
+    // Never hand Core's environment (database password, provider keys) to a
+    // workspace subprocess: git reads repository config that can run commands.
+    cmd.env_clear();
+    for key in CHILD_ENV {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
     cmd.args(args).current_dir(root).kill_on_drop(true);
     let out = tokio::time::timeout(EXEC_TIMEOUT, cmd.output())
         .await
@@ -772,6 +826,74 @@ mod tests {
 
         // And the Core stays untouched on disk.
         assert!(!dir.join("jarvis-core/Jarvis.md").exists());
+    }
+
+    #[tokio::test]
+    async fn write_never_follows_a_leaf_link_or_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(workspace.path()).unwrap();
+        let dir = sb.root().to_path_buf();
+        std::fs::create_dir_all(dir.join(".git/hooks")).unwrap();
+        std::fs::create_dir(dir.join("subdir")).unwrap();
+        std::fs::write(outside.path().join("existing"), "keep").unwrap();
+        std::fs::write(outside.path().join("victim"), "keep").unwrap();
+        let link = std::os::unix::fs::symlink;
+        link(outside.path().join("pwn"), dir.join("out.txt")).unwrap();
+        link(dir.join(".git/hooks/pre-commit"), dir.join("hook.txt")).unwrap();
+        link(outside.path().join("existing"), dir.join("existing.txt")).unwrap();
+        std::fs::hard_link(outside.path().join("victim"), dir.join("hard.txt")).unwrap();
+
+        for name in ["out.txt", "hook.txt", "existing.txt", "hard.txt", "subdir"] {
+            let action = Action::WriteFile {
+                path: name.into(),
+                content: "payload".into(),
+            };
+            assert!(
+                matches!(preview(&sb, &action).await, Err(AgentError::Denied(_))),
+                "preview must refuse {name}"
+            );
+            assert!(
+                matches!(execute(&sb, &action).await, Err(AgentError::Denied(_))),
+                "write must refuse {name}"
+            );
+        }
+        assert!(!outside.path().join("pwn").exists());
+        assert!(!dir.join(".git/hooks/pre-commit").exists());
+        for kept in ["existing", "victim"] {
+            assert_eq!(
+                std::fs::read_to_string(outside.path().join(kept)).unwrap(),
+                "keep"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_overwrites_an_existing_regular_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(workspace.path()).unwrap();
+        let dir = sb.root().to_path_buf();
+        std::fs::write(dir.join("note.txt"), "old content").unwrap();
+        let action = Action::WriteFile {
+            path: "note.txt".into(),
+            content: "new".into(),
+        };
+        assert!(preview(&sb, &action).await.unwrap().contains("OVERWRITES"));
+        execute(&sb, &action).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("note.txt")).unwrap(),
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn subprocesses_get_only_the_allowlisted_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_cmd(dir.path(), "env", &[]).await.unwrap();
+        for line in out.lines() {
+            let key = line.split('=').next().unwrap_or_default();
+            assert!(CHILD_ENV.contains(&key), "unexpected variable {key}");
+        }
     }
 
     #[tokio::test]
