@@ -641,11 +641,22 @@ pub async fn create_challenge(db: &Database, device_id: Uuid) -> Result<Challeng
     let mut nonce = vec![0_u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
     let id = Uuid::now_v7();
+    // Anyone may request a challenge. One for a device that cannot log in is
+    // answered but never stored, so anonymous callers cannot grow the table.
+    let active: Option<DeviceOwner> = one(
+        db,
+        "SELECT user_id FROM devices WHERE record::id(id) = $id AND status = 'active' LIMIT 1",
+        json!({ "id": device_id.to_string() }),
+    )
+    .await?;
+    if active.is_none() {
+        return Ok(Challenge { id, nonce });
+    }
     execute(
         db,
-        // Anyone may request a challenge, so expired ones are dropped here
-        // instead of accumulating; nothing reads a challenge after expiry.
-        "DELETE auth_challenges WHERE expires_at < time::now(); \
+        // Only this device's expired challenges are dropped here (indexed by
+        // device_id); the hourly `prune_expired_auth_state` sweep clears the rest.
+        "DELETE auth_challenges WHERE device_id = $device_id AND expires_at < time::now(); \
          CREATE auth_challenges SET id = $id, device_id = $device_id, nonce = <bytes>$nonce, \
          created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE RETURN AFTER",
         ChallengeBindings {
@@ -656,6 +667,58 @@ pub async fn create_challenge(db: &Database, device_id: Uuid) -> Result<Challeng
     )
     .await?;
     Ok(Challenge { id, nonce })
+}
+
+/// Unapproved pairing requests stay this long after expiry, so a candidate
+/// polling late still sees `expired`, then they are deleted.
+const PAIRING_REQUEST_RETENTION: &str = "1d";
+/// Rows deleted per statement and statements per sweep, so one sweep never
+/// holds a huge transaction; a backlog drains over several hours.
+const PRUNE_BATCH: usize = 5_000;
+const PRUNE_MAX_BATCHES: usize = 20;
+
+fn prune_queries() -> [String; 2] {
+    let batch = |table: &str, filter: &str| {
+        format!(
+            "LET $ids = (SELECT VALUE id FROM {table} WHERE {filter} LIMIT {PRUNE_BATCH}); \
+             DELETE $ids RETURN NONE; RETURN array::len($ids);"
+        )
+    };
+    [
+        batch("auth_challenges", "expires_at < time::now()"),
+        // Anonymous callers can create pending requests; approved ones are
+        // kept as the record of how a device was paired.
+        batch(
+            "device_pairing_requests",
+            &format!(
+                "status != 'approved' AND expires_at < time::now() - {PAIRING_REQUEST_RETENTION}"
+            ),
+        ),
+    ]
+}
+
+/// Delete expired login challenges and stale unapproved pairing requests in
+/// bounded batches. Returns the number of rows deleted.
+pub async fn prune_expired_auth_state(db: &Database) -> Result<usize, IdentityError> {
+    let mut total = 0;
+    for query in prune_queries() {
+        for _ in 0..PRUNE_MAX_BATCHES {
+            let deleted: Option<usize> = db
+                .query(query.as_str())
+                .await
+                .map_err(|_| IdentityError::DatabaseSurreal)?
+                .check()
+                .map_err(|_| IdentityError::DatabaseSurreal)?
+                .take(2)
+                .map_err(|_| IdentityError::DatabaseSurreal)?;
+            let deleted = deleted.unwrap_or(0);
+            total += deleted;
+            if deleted < PRUNE_BATCH {
+                break;
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[derive(serde::Deserialize)]
@@ -1533,6 +1596,88 @@ mod tests {
         // a stolen token must not remain useful until its normal expiry.
         revoke_device(&db, device.id).await?;
         assert!(authenticate(&db, &result.token).await.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_keeps_live_and_approved_rows() {
+        let [challenges, pairing] = prune_queries();
+        assert!(challenges.contains("FROM auth_challenges WHERE expires_at < time::now()"));
+        assert!(pairing.contains("status != 'approved'"));
+        assert!(pairing.contains("expires_at < time::now() - 1d"));
+        for query in [challenges, pairing] {
+            assert!(query.contains(&format!("LIMIT {PRUNE_BATCH}")));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires JARVIS_SURREAL_TEST_ENDPOINT and a disposable SurrealDB server"]
+    async fn anonymous_auth_state_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+        let username = env::var("JARVIS_SURREAL_TEST_USER")?;
+        let password = env::var("JARVIS_SURREAL_TEST_PASS")?;
+        let namespace = format!("jarvis_test_{}", Uuid::now_v7().simple());
+        let db = Surreal::new::<Ws>(&endpoint).await?;
+        db.signin(Root {
+            username: &username,
+            password: &password,
+        })
+        .await?;
+        db.use_ns(&namespace).use_db("core").await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+        let count = |table: &'static str| {
+            let db = db.clone();
+            async move {
+                let rows: Option<usize> = db
+                    .query(format!("RETURN count(SELECT id FROM {table})"))
+                    .await?
+                    .take(0)?;
+                Ok::<usize, surrealdb::Error>(rows.unwrap_or(0))
+            }
+        };
+
+        // A challenge for a device that cannot log in is answered, not stored.
+        create_challenge(&db, Uuid::now_v7()).await?;
+        assert_eq!(count("auth_challenges").await?, 0);
+        let owner = create_user(&db, "Gus").await?;
+        let signing = SigningKey::from_bytes(&rand::random());
+        let (device, _) = register_device(
+            &db,
+            owner.id,
+            "iPhone",
+            Platform::Ios,
+            "ed25519",
+            &signing.verifying_key().to_bytes(),
+        )
+        .await?;
+        create_challenge(&db, device.id).await?;
+        assert_eq!(count("auth_challenges").await?, 1);
+
+        // Expired challenges and stale unapproved pairing requests are swept;
+        // live challenges and approved requests stay.
+        db.query(
+            "CREATE auth_challenges SET id = 'expired', device_id = $device, \
+             nonce = <bytes>'n', created_at = time::now() - 1h, \
+             expires_at = time::now() - 55m, consumed_at = NONE; \
+             FOR $status IN ['pending', 'denied', 'approved'] { \
+             CREATE device_pairing_requests SET id = 'old-' + $status, user_id = $user, \
+             candidate_name = 'x', candidate_platform = 'linux', \
+             candidate_public_key = <bytes>'k', candidate_fingerprint = $status, \
+             nonce = <bytes>'n', status = $status, created_at = time::now() - 9d, \
+             expires_at = time::now() - 8d, resolved_at = NONE, \
+             approved_by_device_id = NONE, activated_device_id = NONE; };",
+        )
+        .bind(("device", device.id.to_string()))
+        .bind(("user", owner.id.to_string()))
+        .await?
+        .check()?;
+        assert_eq!(prune_expired_auth_state(&db).await?, 3);
+        assert_eq!(count("auth_challenges").await?, 1);
+        let kept: Vec<String> = db
+            .query("SELECT VALUE status FROM device_pairing_requests")
+            .await?
+            .take(0)?;
+        assert_eq!(kept, vec!["approved".to_string()]);
         Ok(())
     }
 }
