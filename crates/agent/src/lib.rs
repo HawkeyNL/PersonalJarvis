@@ -17,6 +17,7 @@
 //! The Core (`jarvis-core/**`, policy, secrets) is never agent-writable — not via a
 //! `write_file`, not via Claude Code, not even with a signed approval.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -26,6 +27,8 @@ use tokio::process::Command;
 const MAX_OUTPUT: usize = 64 * 1024;
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const EXEC_TIMEOUT: Duration = Duration::from_secs(20);
+/// The only environment variables a workspace subprocess inherits.
+const CHILD_ENV: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL"];
 /// A read-only action Jarvis may perform. This enum *is* the allowlist: anything
 /// not expressible here cannot be requested (4a has no mutating variants).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -211,7 +214,9 @@ impl Sandbox {
     /// must exist inside the sandbox, and the target may never be the Core, a
     /// secret, or inside `.git`. Absolute protected configuration (including
     /// `/etc/jarvis/Jarvis.md`) is rejected before this resolver is entered.
-    fn resolve_write(&self, rel: &str) -> Result<PathBuf, AgentError> {
+    /// Returns the existing file's metadata, if any, so the writer can check it
+    /// opened that same file.
+    fn resolve_write(&self, rel: &str) -> Result<(PathBuf, Option<std::fs::Metadata>), AgentError> {
         if Path::new(rel).is_absolute() {
             return Err(AgentError::OutsideSandbox);
         }
@@ -236,7 +241,17 @@ impl Sandbox {
                 "protected path (Core / .git / secret) — owner-only".into(),
             ));
         }
-        Ok(target)
+        // The leaf itself is not canonicalized, so a symlink there (even a
+        // dangling one) or a hard link would redirect the write past every
+        // guard above.
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if !meta.file_type().is_file() || meta.nlink() > 1 => Err(AgentError::Denied(
+                "write target is not a plain regular file".into(),
+            )),
+            Ok(meta) => Ok((target, Some(meta))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((target, None)),
+            Err(_) => Err(AgentError::NotFound),
+        }
     }
 
     /// The Core and version-control internals are never agent-writable. `jarvis-core/**`
@@ -248,15 +263,26 @@ impl Sandbox {
 }
 
 /// Secret paths are off-limits even to read, even inside the sandbox (ADR-029).
+/// Matching is ASCII case-insensitive on the lossy name, so neither case
+/// variants nor non-UTF-8 names slip through.
 fn is_secret(path: &Path) -> bool {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    name == ".env"
-        || name.starts_with(".env.")
-        || name.ends_with(".pem")
-        || name.ends_with(".key")
-        || name.starts_with("id_rsa")
-        || name.starts_with("id_ed25519")
-        || path.components().any(|c| c.as_os_str() == ".ssh")
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    name.starts_with(".env.")
+        || [".env", ".pem", ".key", ".p12", ".pfx"]
+            .iter()
+            .any(|ext| name.ends_with(ext))
+        || ["id_rsa", "id_ed25519", "id_ecdsa"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        || name == ".netrc"
+        || name == ".git-credentials"
+        || path.components().any(|c| {
+            let c = c.as_os_str().to_string_lossy();
+            c.eq_ignore_ascii_case(".ssh") || c.eq_ignore_ascii_case(".git")
+        })
 }
 
 /// The result of a successful action.
@@ -294,8 +320,8 @@ pub async fn execute(sandbox: &Sandbox, action: &Action) -> Result<Outcome, Agen
 pub async fn preview(sandbox: &Sandbox, action: &Action) -> Result<String, AgentError> {
     match action {
         Action::WriteFile { path, content } => {
-            let target = sandbox.resolve_write(path)?; // enforces Core/secret denial
-            let verb = if target.exists() {
+            let (_, existing) = sandbox.resolve_write(path)?; // enforces Core/secret denial
+            let verb = if existing.is_some() {
                 "OVERWRITES"
             } else {
                 "new file"
@@ -324,8 +350,39 @@ pub async fn preview(sandbox: &Sandbox, action: &Action) -> Result<String, Agent
 }
 
 fn write_file(sandbox: &Sandbox, path: &str, content: &str) -> Result<String, AgentError> {
-    let target = sandbox.resolve_write(path)?;
-    std::fs::write(&target, content).map_err(|e| AgentError::Exec(e.to_string()))?;
+    use std::io::Write;
+
+    let exec = |e: std::io::Error| AgentError::Exec(e.to_string());
+    let (target, existing) = sandbox.resolve_write(path)?;
+    let mut file = match existing {
+        // O_EXCL never follows a symlink planted after `resolve_write`.
+        None => std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(exec)?,
+        // Open without truncating, then prove it is the file that was checked
+        // before any byte changes: a leaf swapped for a link fails here.
+        Some(checked) => {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&target)
+                .map_err(exec)?;
+            let opened = file.metadata().map_err(exec)?;
+            if opened.dev() != checked.dev() || opened.ino() != checked.ino() || opened.nlink() != 1
+            {
+                return Err(AgentError::Denied(
+                    "write target changed while writing".into(),
+                ));
+            }
+            file.set_len(0).map_err(exec)?;
+            file
+        }
+    };
+    // ponytail: a parent directory swapped for a symlink after `resolve_write`
+    // canonicalized it is still followed; closing that needs openat2
+    // (RESOLVE_BENEATH), worth it only if workspaces get concurrent untrusted writers.
+    file.write_all(content.as_bytes()).map_err(exec)?;
     Ok(format!("written: {path} ({} bytes)", content.len()))
 }
 
@@ -443,8 +500,8 @@ fn list_dir(sandbox: &Sandbox, path: &str) -> Result<String, AgentError> {
 fn read_file(sandbox: &Sandbox, path: &str) -> Result<String, AgentError> {
     let file = sandbox.resolve(path)?;
     let meta = std::fs::metadata(&file).map_err(|_| AgentError::NotFound)?;
-    if meta.is_dir() {
-        return Err(AgentError::Exec("path is a directory".into()));
+    if !meta.is_file() {
+        return Err(AgentError::Exec("not a regular file".into()));
     }
     if meta.len() > MAX_FILE_BYTES {
         return Err(AgentError::Denied(format!(
@@ -455,16 +512,54 @@ fn read_file(sandbox: &Sandbox, path: &str) -> Result<String, AgentError> {
     std::fs::read_to_string(&file).map_err(|e| AgentError::Exec(e.to_string()))
 }
 
+/// `grep` exclusions mirroring [`is_secret`], so a recursive search never opens
+/// a file that `read_file` would refuse. grep globs are case-sensitive, so
+/// only the lower- and upper-case spellings are excluded here; mixed-case
+/// names are still removed from the output by the `is_secret` re-check.
+const GREP_SECRET_EXCLUDES: &[&str] = &[
+    "--exclude=.env",
+    "--exclude=.env.*",
+    "--exclude=.ENV.*",
+    "--exclude=*.env",
+    "--exclude=*.ENV",
+    "--exclude=*.pem",
+    "--exclude=*.PEM",
+    "--exclude=*.key",
+    "--exclude=*.KEY",
+    "--exclude=*.p12",
+    "--exclude=*.P12",
+    "--exclude=*.pfx",
+    "--exclude=*.PFX",
+    "--exclude=id_rsa*",
+    "--exclude=id_ed25519*",
+    "--exclude=id_ecdsa*",
+    "--exclude=.netrc",
+    "--exclude=.git-credentials",
+    "--exclude-dir=.ssh",
+    "--exclude-dir=.git",
+];
+
 async fn grep(sandbox: &Sandbox, pattern: &str, path: &str) -> Result<String, AgentError> {
     let target = sandbox.resolve(path)?;
+    let target_arg = target.to_string_lossy();
     // `-e` guards a pattern starting with `-`; `--` ends option parsing. Args are
-    // passed directly (no shell), so the pattern can't inject commands.
-    run_cmd(
-        sandbox.root(),
-        "grep",
-        &["-rnI", "-e", pattern, "--", &target.to_string_lossy()],
-    )
-    .await
+    // passed directly (no shell), so the pattern can't inject commands. `-r`
+    // does not follow symlinks below the (canonical) target; `-D skip` never
+    // reads devices, FIFOs or sockets.
+    let mut args = vec!["-rnIHZ", "-D", "skip"];
+    args.extend_from_slice(GREP_SECRET_EXCLUDES);
+    args.extend_from_slice(&["-e", pattern, "--", &target_arg]);
+    let out = run_cmd(sandbox.root(), "grep", &args).await?;
+    // `-HZ` prints every file name, ending it with NUL. Keep only names under
+    // the target and re-check each with `is_secret`, so the read filter stays
+    // the single source of truth; a line without a name is dropped (fail
+    // closed).
+    Ok(out
+        .lines()
+        .filter_map(|line| line.split_once('\0'))
+        .filter(|(file, _)| Path::new(file).starts_with(&target) && !is_secret(Path::new(file)))
+        .map(|(file, rest)| format!("{file}:{rest}\n"))
+        .collect())
 }
 
 async fn git(sandbox: &Sandbox, sub: GitRead) -> Result<String, AgentError> {
@@ -480,6 +575,14 @@ async fn git(sandbox: &Sandbox, sub: GitRead) -> Result<String, AgentError> {
 /// with a timeout. Returns stdout; falls back to stderr when stdout is empty.
 async fn run_cmd(root: &Path, program: &str, args: &[&str]) -> Result<String, AgentError> {
     let mut cmd = Command::new(program);
+    // Never hand Core's environment (database password, provider keys) to a
+    // workspace subprocess: git reads repository config that can run commands.
+    cmd.env_clear();
+    for key in CHILD_ENV {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
     cmd.args(args).current_dir(root).kill_on_drop(true);
     let out = tokio::time::timeout(EXEC_TIMEOUT, cmd.output())
         .await
@@ -501,11 +604,12 @@ fn cap(mut s: String) -> (String, bool) {
     if s.len() <= MAX_OUTPUT {
         return (s, false);
     }
-    s.truncate(MAX_OUTPUT);
-    // Trim to a char boundary.
-    while !s.is_char_boundary(s.len()) {
-        s.pop();
+    // `truncate` panics inside a multi-byte character: cut at a boundary.
+    let mut end = MAX_OUTPUT;
+    while !s.is_char_boundary(end) {
+        end -= 1;
     }
+    s.truncate(end);
     (s, true)
 }
 
@@ -538,6 +642,30 @@ mod tests {
         assert!(is_secret(Path::new("/x/id_rsa")));
         assert!(is_secret(Path::new("/home/.ssh/known_hosts")));
         assert!(!is_secret(Path::new("/x/main.rs")));
+        for secret in [
+            "/x/.ENV",
+            "/x/.Env.Local",
+            "/x/prod.env",
+            "/x/Cert.PEM",
+            "/x/tls.Key",
+            "/x/store.p12",
+            "/x/store.PFX",
+            "/x/ID_ECDSA",
+            "/x/.netrc",
+            "/x/.git-credentials",
+            "/r/.git/config",
+            "/r/.GIT/HEAD",
+            "/r/.SSH/config",
+        ] {
+            assert!(is_secret(Path::new(secret)), "{secret}");
+        }
+        for public in ["/x/.gitignore", "/x/.github/ci.yml", "/x/keyboard.rs"] {
+            assert!(!is_secret(Path::new(public)), "{public}");
+        }
+        // A non-UTF-8 name cannot bypass the filter.
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"/x/\xffcert.PEM");
+        assert!(is_secret(Path::new(raw)));
     }
 
     #[tokio::test]
@@ -701,6 +829,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_never_follows_a_leaf_link_or_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(workspace.path()).unwrap();
+        let dir = sb.root().to_path_buf();
+        std::fs::create_dir_all(dir.join(".git/hooks")).unwrap();
+        std::fs::create_dir(dir.join("subdir")).unwrap();
+        std::fs::write(outside.path().join("existing"), "keep").unwrap();
+        std::fs::write(outside.path().join("victim"), "keep").unwrap();
+        let link = std::os::unix::fs::symlink;
+        link(outside.path().join("pwn"), dir.join("out.txt")).unwrap();
+        link(dir.join(".git/hooks/pre-commit"), dir.join("hook.txt")).unwrap();
+        link(outside.path().join("existing"), dir.join("existing.txt")).unwrap();
+        std::fs::hard_link(outside.path().join("victim"), dir.join("hard.txt")).unwrap();
+
+        for name in ["out.txt", "hook.txt", "existing.txt", "hard.txt", "subdir"] {
+            let action = Action::WriteFile {
+                path: name.into(),
+                content: "payload".into(),
+            };
+            assert!(
+                matches!(preview(&sb, &action).await, Err(AgentError::Denied(_))),
+                "preview must refuse {name}"
+            );
+            assert!(
+                matches!(execute(&sb, &action).await, Err(AgentError::Denied(_))),
+                "write must refuse {name}"
+            );
+        }
+        assert!(!outside.path().join("pwn").exists());
+        assert!(!dir.join(".git/hooks/pre-commit").exists());
+        for kept in ["existing", "victim"] {
+            assert_eq!(
+                std::fs::read_to_string(outside.path().join(kept)).unwrap(),
+                "keep"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_overwrites_an_existing_regular_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(workspace.path()).unwrap();
+        let dir = sb.root().to_path_buf();
+        std::fs::write(dir.join("note.txt"), "old content").unwrap();
+        let action = Action::WriteFile {
+            path: "note.txt".into(),
+            content: "new".into(),
+        };
+        assert!(preview(&sb, &action).await.unwrap().contains("OVERWRITES"));
+        execute(&sb, &action).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("note.txt")).unwrap(),
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn subprocesses_get_only_the_allowlisted_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_cmd(dir.path(), "env", &[]).await.unwrap();
+        for line in out.lines() {
+            let key = line.split('=').next().unwrap_or_default();
+            assert!(CHILD_ENV.contains(&key), "unexpected variable {key}");
+        }
+    }
+
+    #[tokio::test]
     async fn preview_of_a_write_shows_the_content_and_denies_the_core() {
         let (sb, _dir) = temp_sandbox("preview");
         let p = preview(
@@ -729,6 +925,67 @@ mod tests {
         let (s, truncated) = cap("x".repeat(MAX_OUTPUT + 100));
         assert!(truncated);
         assert_eq!(s.len(), MAX_OUTPUT);
+    }
+
+    #[test]
+    fn cap_cuts_on_a_char_boundary() {
+        // A 3-byte character straddles the cap.
+        let s = format!("{}€tail", "x".repeat(MAX_OUTPUT - 1));
+        let (s, truncated) = cap(s);
+        assert!(truncated);
+        assert_eq!(s.len(), MAX_OUTPUT - 1);
+        assert!(s.bytes().all(|b| b == b'x'));
+    }
+
+    #[tokio::test]
+    async fn grep_never_returns_secret_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let sb = Sandbox::new(dir).unwrap();
+        std::fs::create_dir_all(dir.join("sub/.ssh")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        for secret in [
+            ".env",
+            ".env.local",
+            "prod.env",
+            "sub/cert.pem",
+            "sub/Mixed.Key",
+            "sub/store.p12",
+            "id_rsa",
+            "sub/id_ed25519.pub",
+            "sub/.ssh/config",
+            ".netrc",
+            ".git-credentials",
+            ".git/config",
+        ] {
+            std::fs::write(dir.join(secret), "TOKEN=leak\n").unwrap();
+        }
+        std::fs::write(dir.join("sub/notes.txt"), "TOKEN=public\n").unwrap();
+        let out = execute(
+            &sb,
+            &Action::Grep {
+                pattern: "TOKEN".into(),
+                path: ".".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .output;
+        assert!(!out.contains("leak"), "secret content leaked: {out}");
+        assert!(out.contains("notes.txt:1:TOKEN=public"), "{out}");
+
+        // A single-file target still reports its matches.
+        let one = execute(
+            &sb,
+            &Action::Grep {
+                pattern: "TOKEN".into(),
+                path: "sub/notes.txt".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .output;
+        assert!(one.contains("notes.txt:1:TOKEN=public"), "{one}");
     }
 
     // ---- 4c: Claude Code executor -----------------------------------------

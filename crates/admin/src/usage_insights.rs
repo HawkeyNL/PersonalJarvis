@@ -448,13 +448,19 @@ pub(super) fn display_model_price(value: Option<f64>, status: &str) -> String {
     }
 }
 
-pub(super) fn read_usage_report() -> Result<UsageReport> {
-    let path = Path::new(USAGE_SUMMARY);
-    let directory = fs::symlink_metadata("/var/lib/jarvis").context("inspect Jarvis state")?;
-    let metadata = fs::symlink_metadata(path)
+/// Core owns `directory` and can swap `path` at any time, so the checks and the
+/// bounded read use one descriptor: no symlink, no FIFO/device, no growth.
+fn read_core_document(path: &Path, directory: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = fs::symlink_metadata(directory).context("inspect Jarvis state")?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
         .context("usage statistics are unavailable; restart Core or complete one model request")?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
+    let metadata = file.metadata().context("inspect usage summary")?;
+    if !metadata.is_file()
         || metadata.uid() != directory.uid()
         || metadata.gid() != directory.gid()
         || metadata.permissions().mode() & 0o777 != 0o600
@@ -462,9 +468,22 @@ pub(super) fn read_usage_report() -> Result<UsageReport> {
     {
         bail!("usage summary ownership, permissions, or size are unsafe");
     }
-    let report: UsageReport =
-        serde_json::from_slice(&fs::read(path).context("read usage summary")?)
-            .context("parse usage summary")?;
+    let mut content = Vec::new();
+    file.take(MAX_DOCUMENT_SIZE + 1)
+        .read_to_end(&mut content)
+        .context("read usage summary")?;
+    if content.len() as u64 > MAX_DOCUMENT_SIZE {
+        bail!("usage summary ownership, permissions, or size are unsafe");
+    }
+    Ok(content)
+}
+
+pub(super) fn read_usage_report() -> Result<UsageReport> {
+    let report: UsageReport = serde_json::from_slice(&read_core_document(
+        Path::new(USAGE_SUMMARY),
+        Path::new("/var/lib/jarvis"),
+    )?)
+    .context("parse usage summary")?;
     if report.period != "current_calendar_month"
         || report.by_backend.len() > 32
         || report.by_model.len() > 250
@@ -677,5 +696,33 @@ mod tests {
             assert_eq!(value[field], serde_json::Value::Null, "{field}");
         }
         assert_eq!(value["by_backend"][0]["failures"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn core_document_read_refuses_links_fifos_and_oversize_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("usage-summary.json");
+        fs::write(&file, b"{}").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_core_document(&file, dir.path()).unwrap(), b"{}");
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_core_document(&file, dir.path()).is_err());
+
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_core_document(&link, dir.path()).is_err());
+
+        // A FIFO must fail fast instead of blocking the root process.
+        let fifo = dir.path().join("fifo.json");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_core_document(&fifo, dir.path()).is_err());
+
+        let big = dir.path().join("big.json");
+        fs::write(&big, vec![b' '; MAX_DOCUMENT_SIZE as usize + 1]).unwrap();
+        fs::set_permissions(&big, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_core_document(&big, dir.path()).is_err());
     }
 }

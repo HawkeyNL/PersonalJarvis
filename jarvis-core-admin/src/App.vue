@@ -17,6 +17,7 @@ import LogsView from "./views/LogsView.vue";
 import ModelsView from "./views/ModelsView.vue";
 import UsageView from "./views/UsageView.vue";
 import OverviewView from "./views/OverviewView.vue";
+import PersonaView from "./views/PersonaView.vue";
 import ServicesView from "./views/ServicesView.vue";
 import SystemView from "./views/SystemView.vue";
 import UpdateView from "./views/UpdateView.vue";
@@ -37,10 +38,10 @@ const nodes: { id: NodeId; label: string; subtitle: string; icon: IconName; view
     { id: "agents", label: "Agents", icon: "agents" }, { id: "models", label: "Models", icon: "chip" }, { id: "usage", label: "Usage & Costs", icon: "chart" },
   ] },
   { id: "administration", label: "Administration", subtitle: "DEVICES · ACCOUNTS · UPDATES", icon: "shield", views: [
-    { id: "devices", label: "Devices", icon: "monitor" }, { id: "ai-accounts", label: "AI Accounts", icon: "link-2" }, { id: "credentials", label: "Credentials", icon: "key" }, { id: "update", label: "Update", icon: "download" }, { id: "system", label: "System", icon: "gear" },
+    { id: "devices", label: "Devices", icon: "monitor" }, { id: "ai-accounts", label: "AI Accounts", icon: "link-2" }, { id: "credentials", label: "Credentials", icon: "key" }, { id: "persona", label: "Persona", icon: "user" }, { id: "update", label: "Update", icon: "download" }, { id: "system", label: "System", icon: "gear" },
   ] },
 ];
-const views = { overview: OverviewView, health: HealthView, services: ServicesView, update: UpdateView, agents: AgentsView, models: ModelsView, usage: UsageView, credentials: CredentialsView, "ai-accounts": AiAccountsView, devices: DevicesView, logs: LogsView, system: SystemView };
+const views = { overview: OverviewView, health: HealthView, services: ServicesView, update: UpdateView, agents: AgentsView, models: ModelsView, usage: UsageView, credentials: CredentialsView, "ai-accounts": AiAccountsView, devices: DevicesView, persona: PersonaView, logs: LogsView, system: SystemView };
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const TOUCH_INTERVAL_MS = 5 * 1000;
 const active = ref<ViewName>("overview");

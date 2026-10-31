@@ -241,7 +241,7 @@ struct PairingRow {
     created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     expires_at: OffsetDateTime,
-    // Absent (NONE) on rows written before schema v11 or without a value.
+    // Absent (NONE) on rows written before schema v13 or without a value.
     #[serde(default)]
     candidate_ip: Option<String>,
     #[serde(default)]
@@ -382,18 +382,6 @@ pub async fn pending_pairing_requests(
         json!({ "user_id": user_id.to_string() }),
     ).await?;
     Ok(rows.into_iter().map(pairing_from_row).collect())
-}
-
-/// Pairing rows hold the candidate's IP address and User-Agent, so they are
-/// deleted a day after expiry. The grace lets an approved candidate still
-/// fetch its device ID with the request nonce.
-pub async fn purge_expired_pairing_requests(db: &Database) -> Result<(), IdentityError> {
-    execute(
-        db,
-        "DELETE device_pairing_requests WHERE expires_at < time::now() - 1d RETURN NONE",
-        json!({}),
-    )
-    .await
 }
 
 /// Verify a request-bound approval, then conditionally consume and activate it
@@ -568,6 +556,9 @@ pub async fn revoke_device(db: &Database, device_id: Uuid) -> Result<(), Identit
              UPDATE devices SET status = 'revoked', updated_at = time::now() WHERE record::id(id) = $id; \
              UPDATE device_keys SET revoked_at = time::now() WHERE device_id = $id AND revoked_at IS NONE; \
              UPDATE sessions SET revoked_at = time::now() WHERE device_id = $id AND revoked_at IS NONE; \
+             DELETE device_push_targets WHERE device_id = $id; \
+             UPDATE account_recoveries SET status = 'expired', verifier = NONE, slot = record::id(id), \
+             resolved_at = time::now() WHERE device_id = $id AND status = 'pending' RETURN NONE; \
              COMMIT TRANSACTION;",
         )
         .bind(json!({ "id": device_id.to_string() }))
@@ -579,15 +570,113 @@ pub async fn revoke_device(db: &Database, device_id: Uuid) -> Result<(), Identit
     Ok(())
 }
 
+/// True when `$target` is registered to a device of another user than
+/// `$device`'s (or `$device` does not exist).
+const FOREIGN_PUSH_TARGET: &str = "array::len(SELECT id FROM device_push_targets \
+    WHERE target = $target AND device_id NOT IN (SELECT VALUE record::id(id) FROM devices \
+    WHERE user_id IN (SELECT VALUE user_id FROM devices WHERE record::id(id) = $device))) != 0";
+
+/// Register or replace the APNs target of an active device. A token another
+/// device of the same user registered before (the same phone re-paired) moves
+/// to this device, so one phone never receives a push twice or as the
+/// requesting device. A token held by another user's device is refused with
+/// `AuthFailed`: it never moves across accounts. Token and environment are
+/// validated by the caller and again by the schema.
+pub async fn set_push_target(
+    db: &Database,
+    device_id: Uuid,
+    target: &str,
+    apns_env: &str,
+) -> Result<(), IdentityError> {
+    let bindings = || json!({ "device": device_id.to_string(), "target": target, "env": apns_env });
+    let result = execute(
+        db,
+        &format!(
+            "BEGIN TRANSACTION; \
+             LET $active = SELECT id FROM devices WHERE record::id(id) = $device AND status = 'active'; \
+             IF array::len($active) != 1 {{ THROW 'device unavailable'; }}; \
+             IF {FOREIGN_PUSH_TARGET} {{ THROW 'push target unavailable'; }}; \
+             DELETE device_push_targets WHERE device_id = $device OR target = $target; \
+             CREATE device_push_targets SET id = $device, device_id = $device, kind = 'apns', \
+                target = $target, apns_env = $env, updated_at = time::now() RETURN NONE; \
+             COMMIT TRANSACTION;"
+        ),
+        bindings(),
+    )
+    .await;
+    if result.is_err()
+        && one::<bool, _>(db, &format!("RETURN {FOREIGN_PUSH_TARGET}"), bindings()).await?
+            == Some(true)
+    {
+        return Err(IdentityError::AuthFailed);
+    }
+    result
+}
+
+pub async fn delete_push_target(db: &Database, device_id: Uuid) -> Result<(), IdentityError> {
+    execute(
+        db,
+        "DELETE device_push_targets WHERE device_id = $device",
+        json!({ "device": device_id.to_string() }),
+    )
+    .await
+}
+
+/// APNs tokens of the user's active devices in one environment, without the
+/// `except` device, at most `limit`.
+pub async fn apns_targets(
+    db: &Database,
+    user_id: Uuid,
+    except: Option<Uuid>,
+    apns_env: &str,
+    limit: usize,
+) -> Result<Vec<String>, IdentityError> {
+    many(
+        db,
+        "SELECT VALUE target FROM device_push_targets WHERE kind = 'apns' AND apns_env = $env \
+         AND device_id != $except AND device_id IN \
+         (SELECT VALUE record::id(id) FROM devices WHERE user_id = $user AND status = 'active') \
+         LIMIT $limit",
+        json!({
+            "user": user_id.to_string(),
+            "except": except.map(|id| id.to_string()).unwrap_or_default(),
+            "env": apns_env,
+            "limit": limit,
+        }),
+    )
+    .await
+}
+
+/// Forget a token APNs reported as no longer valid.
+pub async fn delete_apns_target(db: &Database, target: &str) -> Result<(), IdentityError> {
+    execute(
+        db,
+        "DELETE device_push_targets WHERE kind = 'apns' AND target = $target",
+        json!({ "target": target }),
+    )
+    .await
+}
+
 pub async fn create_challenge(db: &Database, device_id: Uuid) -> Result<Challenge, IdentityError> {
     let mut nonce = vec![0_u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
     let id = Uuid::now_v7();
+    // Anyone may request a challenge. One for a device that cannot log in is
+    // answered but never stored, so anonymous callers cannot grow the table.
+    let active: Option<DeviceOwner> = one(
+        db,
+        "SELECT user_id FROM devices WHERE record::id(id) = $id AND status = 'active' LIMIT 1",
+        json!({ "id": device_id.to_string() }),
+    )
+    .await?;
+    if active.is_none() {
+        return Ok(Challenge { id, nonce });
+    }
     execute(
         db,
-        // Anyone may request a challenge, so expired ones are dropped here
-        // instead of accumulating; nothing reads a challenge after expiry.
-        "DELETE auth_challenges WHERE expires_at < time::now(); \
+        // Only this device's expired challenges are dropped here (indexed by
+        // device_id); the hourly `prune_expired_auth_state` sweep clears the rest.
+        "DELETE auth_challenges WHERE device_id = $device_id AND expires_at < time::now(); \
          CREATE auth_challenges SET id = $id, device_id = $device_id, nonce = <bytes>$nonce, \
          created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE RETURN AFTER",
         ChallengeBindings {
@@ -598,6 +687,72 @@ pub async fn create_challenge(db: &Database, device_id: Uuid) -> Result<Challeng
     )
     .await?;
     Ok(Challenge { id, nonce })
+}
+
+/// Unapproved pairing requests stay this long after expiry, so a candidate
+/// polling late still sees `expired`, then they are deleted.
+const PAIRING_REQUEST_RETENTION: &str = "1d";
+/// Rows deleted per statement and statements per sweep, so one sweep never
+/// holds a huge transaction; a backlog drains over several hours.
+const PRUNE_BATCH: usize = 5_000;
+const PRUNE_MAX_BATCHES: usize = 20;
+
+fn prune_queries() -> [String; 3] {
+    let batch = |table: &str, filter: &str, action: &str| {
+        format!(
+            "LET $ids = (SELECT VALUE id FROM {table} WHERE {filter} LIMIT {PRUNE_BATCH}); \
+             {action} RETURN NONE; RETURN array::len($ids);"
+        )
+    };
+    [
+        batch("auth_challenges", "expires_at < time::now()", "DELETE $ids"),
+        // Anonymous callers can create pending requests; approved ones are
+        // kept as the record of how a device was paired.
+        batch(
+            "device_pairing_requests",
+            &format!(
+                "status != 'approved' AND expires_at < time::now() - {PAIRING_REQUEST_RETENTION}"
+            ),
+            "DELETE $ids",
+        ),
+        // The kept approved rows lose the candidate's IP address, User-Agent,
+        // app version and model after the same retention.
+        batch(
+            "device_pairing_requests",
+            &format!(
+                "status = 'approved' AND expires_at < time::now() - {PAIRING_REQUEST_RETENTION} \
+                 AND (candidate_ip IS NOT NONE OR candidate_user_agent IS NOT NONE \
+                 OR candidate_app_version IS NOT NONE OR candidate_model IS NOT NONE)"
+            ),
+            "UPDATE $ids SET candidate_ip = NONE, candidate_user_agent = NONE, \
+             candidate_app_version = NONE, candidate_model = NONE",
+        ),
+    ]
+}
+
+/// Delete expired login challenges and stale unapproved pairing requests, and
+/// clear the candidate details of stale approved ones, in bounded batches.
+/// Returns the number of rows deleted or cleared.
+pub async fn prune_expired_auth_state(db: &Database) -> Result<usize, IdentityError> {
+    let mut total = 0;
+    for query in prune_queries() {
+        for _ in 0..PRUNE_MAX_BATCHES {
+            let deleted: Option<usize> = db
+                .query(query.as_str())
+                .await
+                .map_err(|_| IdentityError::DatabaseSurreal)?
+                .check()
+                .map_err(|_| IdentityError::DatabaseSurreal)?
+                .take(2)
+                .map_err(|_| IdentityError::DatabaseSurreal)?;
+            let deleted = deleted.unwrap_or(0);
+            total += deleted;
+            if deleted < PRUNE_BATCH {
+                break;
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[derive(serde::Deserialize)]
@@ -666,10 +821,7 @@ pub async fn login_with_password(
     let _key_created_at = key.created_at;
     let message = jarvis_client_core::login_message(challenge_id, device_id, &challenge.nonce)
         .map_err(|_| IdentityError::AuthFailed)?;
-    verify_signature(&key.public_key, &message, signature)
-        // Transition: clients before the v1 login message sign the raw nonce.
-        // Remove once every client signs `login_message` (apps 0.1.19+).
-        .or_else(|_| verify_signature(&key.public_key, &challenge.nonce, signature))?;
+    verify_signature(&key.public_key, &message, signature)?;
     let owner: DeviceOwner = one(
         db,
         "SELECT user_id FROM devices WHERE record::id(id) = $id AND status = 'active' LIMIT 1",
@@ -840,6 +992,14 @@ pub async fn revoke_session(db: &Database, session_id: Uuid) -> Result<(), Ident
     Ok(())
 }
 
+/// Platforms whose device keys may sign approvals (pairing, unlock, account
+/// and agent actions). Login and the local root path do not go through here.
+/// The mobile apps require a biometric prompt for every approval, and the
+/// macOS app requires Touch ID without a password fallback. Linux and Windows
+/// cannot enforce a biometric-only prompt, so they never sign these approvals
+/// (broker approvals use their own trusted-key check).
+pub const APPROVER_PLATFORMS: [&str; 3] = ["ios", "android", "macos"];
+
 pub async fn verify_device_signature(
     db: &Database,
     user_id: Uuid,
@@ -847,7 +1007,10 @@ pub async fn verify_device_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), IdentityError> {
-    let public_key = active_device_public_key(db, user_id, device_id).await?;
+    let (device, public_key) = active_device_and_key(db, user_id, device_id).await?;
+    if !APPROVER_PLATFORMS.contains(&device.platform.as_str()) {
+        return Err(IdentityError::AuthFailed);
+    }
     verify_signature(&public_key, message, signature)
 }
 
@@ -858,6 +1021,14 @@ pub async fn active_device_public_key(
     user_id: Uuid,
     device_id: Uuid,
 ) -> Result<Vec<u8>, IdentityError> {
+    Ok(active_device_and_key(db, user_id, device_id).await?.1)
+}
+
+async fn active_device_and_key(
+    db: &Database,
+    user_id: Uuid,
+    device_id: Uuid,
+) -> Result<(Device, Vec<u8>), IdentityError> {
     let device = get_device(db, device_id)
         .await?
         .ok_or(IdentityError::AuthFailed)?;
@@ -873,10 +1044,18 @@ pub async fn active_device_public_key(
     .await?
     .ok_or(IdentityError::AuthFailed)?;
     let _key_created_at = key.created_at;
-    Ok(key.public_key)
+    Ok((device, key.public_key))
 }
 
-/// Create a short-lived cross-device unlock request.
+/// Create a short-lived cross-device unlock request. It supersedes the
+/// device's older live pending requests: they become `denied` with no
+/// deciding device and leave the approvers' list. Two concurrent creates can
+/// still both stay pending; a write conflict with an approval fails this
+/// transaction and the caller retries. This user's rows a day past expiry are
+/// purged here, so the table stays bounded without a separate sweep; the
+/// grace day keeps a late poll answering `expired` instead of not found. The
+/// purge stays on the user's own rows so it never conflicts with another
+/// user's unlock transactions.
 pub async fn create_unlock_request(
     db: &Database,
     user_id: Uuid,
@@ -887,9 +1066,15 @@ pub async fn create_unlock_request(
     let id = Uuid::now_v7();
     execute(
         db,
-        "CREATE unlock_requests SET id = $id, user_id = $user_id, requesting_device_id = $requesting_device_id, \
+        "BEGIN TRANSACTION; \
+         DELETE unlock_requests WHERE user_id = $user_id AND expires_at < time::now() - 1d RETURN NONE; \
+         UPDATE unlock_requests SET status = 'denied', resolved_at = time::now() \
+           WHERE user_id = $user_id AND requesting_device_id = $requesting_device_id \
+           AND status = 'pending' AND expires_at > time::now() RETURN NONE; \
+         CREATE unlock_requests SET id = $id, user_id = $user_id, requesting_device_id = $requesting_device_id, \
          nonce = <bytes>$nonce, status = 'pending', approved_by_device_id = NONE, created_at = time::now(), \
-         expires_at = time::now() + 2m, resolved_at = NONE RETURN NONE",
+         expires_at = time::now() + 2m, resolved_at = NONE RETURN NONE; \
+         COMMIT TRANSACTION;",
         UnlockCreateBindings {
             id: id.to_string(),
             user_id: user_id.to_string(),
@@ -904,6 +1089,8 @@ pub async fn create_unlock_request(
 #[derive(serde::Deserialize)]
 struct UnlockStatusRow {
     status: String,
+    #[serde(default)]
+    approved_by_device_id: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     expires_at: OffsetDateTime,
 }
@@ -915,13 +1102,27 @@ pub async fn unlock_request_status(
 ) -> Result<Option<String>, IdentityError> {
     let row: Option<UnlockStatusRow> = one(
         db,
-        "SELECT status, expires_at FROM unlock_requests WHERE record::id(id) = $id AND user_id = $user_id LIMIT 1",
+        "SELECT status, approved_by_device_id, expires_at FROM unlock_requests \
+         WHERE record::id(id) = $id AND user_id = $user_id LIMIT 1",
         serde_json::json!({ "id": id.to_string(), "user_id": user_id.to_string() }),
     )
     .await?;
     Ok(row.map(|row| {
-        if row.status == "pending" && row.expires_at < OffsetDateTime::now_utc() {
-            "expired".to_string()
+        // Convention: a deny without a deciding device was made by the system
+        // (superseding, or `confirm_recovery` cancelling every pending unlock
+        // request), never by a person: `deny_unlock_request` always records
+        // the denier. Its requester keeps seeing `pending` until expiry, as
+        // before superseding existed, so a client still polling it never
+        // reports a false denial. An explicit `superseded` status would
+        // need a schema migration (the `status` ASSERT in 0001), so the
+        // marker is the missing device.
+        let superseded = row.status == "denied" && row.approved_by_device_id.is_none();
+        if row.status == "pending" || superseded {
+            if row.expires_at < OffsetDateTime::now_utc() {
+                "expired".to_string()
+            } else {
+                "pending".to_string()
+            }
         } else {
             row.status
         }
@@ -1005,14 +1206,7 @@ pub async fn approve_unlock_request(
     let message =
         jarvis_client_core::unlock_approval_message(id, approver_device_id, &pending.nonce)
             .map_err(|_| IdentityError::AuthFailed)?;
-    if verify_device_signature(db, user_id, approver_device_id, &message, signature)
-        .await
-        .is_err()
-    {
-        // Transition: clients before the v1 unlock message sign the raw
-        // nonce. Remove once every client signs `unlock_approval_message`.
-        verify_device_signature(db, user_id, approver_device_id, &pending.nonce, signature).await?;
-    }
+    verify_device_signature(db, user_id, approver_device_id, &message, signature).await?;
 
     // Claiming repeats every decision-relevant predicate. A second concurrent
     // approval cannot overwrite the first device or resolve an expired request.
@@ -1128,6 +1322,12 @@ mod tests {
         )
         .await?;
         let challenge = create_challenge(&db, device.id).await?;
+        // A signature over the bare nonce is not a login proof.
+        let raw_nonce = signing.sign(&challenge.nonce).to_bytes();
+        assert!(matches!(
+            login(&db, device.id, challenge.id, &raw_nonce).await,
+            Err(IdentityError::AuthFailed)
+        ));
         let signature = signing
             .sign(&jarvis_client_core::login_message(
                 challenge.id,
@@ -1158,8 +1358,8 @@ mod tests {
         let (approver, _) = register_device(
             &db,
             owner.id,
-            "MacBook",
-            Platform::Macos,
+            "Pixel",
+            Platform::Android,
             "ed25519",
             &approver_signing.verifying_key().to_bytes(),
         )
@@ -1180,6 +1380,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        // A signature over the bare nonce is not an approval.
+        let raw_nonce = approver_signing.sign(&unlock_nonce).to_bytes();
+        assert!(matches!(
+            approve_unlock_request(&db, unlock_id, owner.id, approver.id, &raw_nonce).await,
+            Err(IdentityError::AuthFailed)
+        ));
         // A login proof over the same id, device and nonce is not an approval.
         let login_proof = approver_signing
             .sign(&jarvis_client_core::login_message(
@@ -1209,6 +1415,58 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        // A new request supersedes only the same device's older pending one;
+        // resolved requests and other devices' requests are left alone. The
+        // superseded one leaves the approvers' list and cannot be approved,
+        // but its requester still reads `pending` until it expires.
+        let (other, _) = create_unlock_request(&db, owner.id, approver.id).await?;
+        let (older, older_nonce) = create_unlock_request(&db, owner.id, device.id).await?;
+        let (newer, _) = create_unlock_request(&db, owner.id, device.id).await?;
+        let status = |id| unlock_request_status(&db, id, owner.id);
+        assert_eq!(status(older).await?.as_deref(), Some("pending"));
+        assert_eq!(status(newer).await?.as_deref(), Some("pending"));
+        assert_eq!(status(other).await?.as_deref(), Some("pending"));
+        assert_eq!(status(unlock_id).await?.as_deref(), Some("approved"));
+        let pending: Vec<Uuid> = pending_unlock_requests(&db, owner.id, approver.id)
+            .await?
+            .iter()
+            .map(|request| request.id)
+            .collect();
+        assert_eq!(pending, vec![newer]);
+        let older_message =
+            jarvis_client_core::unlock_approval_message(older, approver.id, &older_nonce)?;
+        assert!(approve_unlock_request(
+            &db,
+            older,
+            owner.id,
+            approver.id,
+            &approver_signing.sign(&older_message).to_bytes(),
+        )
+        .await
+        .is_err());
+
+        // Creating a request purges rows a day past expiry and keeps newer
+        // expired ones answering `expired`.
+        let (stale, recent) = (Uuid::now_v7(), Uuid::now_v7());
+        db.query(
+            "CREATE unlock_requests SET id = $stale, user_id = $user, requesting_device_id = $device, \
+             nonce = <bytes>'n', status = 'pending', approved_by_device_id = NONE, \
+             created_at = time::now() - 2d, expires_at = time::now() - 2d, resolved_at = NONE; \
+             CREATE unlock_requests SET id = $recent, user_id = $user, requesting_device_id = $device, \
+             nonce = <bytes>'n', status = 'pending', approved_by_device_id = NONE, \
+             created_at = time::now() - 1h, expires_at = time::now() - 1h, resolved_at = NONE;",
+        )
+        .bind(("stale", stale.to_string()))
+        .bind(("recent", recent.to_string()))
+        .bind(("user", owner.id.to_string()))
+        .bind(("device", approver.id.to_string()))
+        .await?
+        .check()?;
+        assert_eq!(status(stale).await?.as_deref(), Some("expired"));
+        create_unlock_request(&db, owner.id, device.id).await?;
+        assert_eq!(status(stale).await?, None);
+        assert_eq!(status(recent).await?.as_deref(), Some("expired"));
 
         // Pairing uses a different, canonical protocol. Its conditional update,
         // device creation and request activation are one database transaction:
@@ -1303,23 +1561,186 @@ mod tests {
         assert_eq!(consumed.status, "approved");
         assert!(activate_pairing_request(&db, consumed, None).await.is_err());
 
-        // Rows a day past expiry, with their candidate details, are purged;
-        // recent rows of any status stay.
-        let stale = Uuid::now_v7();
-        db.query("CREATE device_pairing_requests SET id = $id, user_id = $user, candidate_name = 'old', candidate_platform = 'ios', candidate_public_key = <bytes>'k', candidate_fingerprint = 'f', nonce = <bytes>'n', status = 'expired', created_at = time::now() - 2d, expires_at = time::now() - 2d, candidate_ip = '192.0.2.9'")
-            .bind(("id", stale.to_string()))
-            .bind(("user", owner.id.to_string()))
-            .await?
-            .check()?;
-        assert!(pairing_request(&db, stale, owner.id).await?.is_some());
-        purge_expired_pairing_requests(&db).await?;
-        assert!(pairing_request(&db, stale, owner.id).await?.is_none());
-        assert!(pairing_request(&db, local_id, owner.id).await?.is_some());
+        // Only mobile and macOS device keys sign approvals.
+        let message = b"approval fixture";
+        for platform in [
+            Platform::Linux,
+            Platform::Windows,
+            Platform::Macos,
+            Platform::Ios,
+            Platform::Android,
+        ] {
+            let signing = SigningKey::from_bytes(&rand::random());
+            let (device, _) = register_device(
+                &db,
+                owner.id,
+                platform.as_str(),
+                platform,
+                "ed25519",
+                &signing.verifying_key().to_bytes(),
+            )
+            .await?;
+            let signature = signing.sign(message).to_bytes();
+            let result =
+                verify_device_signature(&db, owner.id, device.id, message, &signature).await;
+            if matches!(
+                platform,
+                Platform::Ios | Platform::Android | Platform::Macos
+            ) {
+                result?;
+            } else {
+                assert!(
+                    matches!(result, Err(IdentityError::AuthFailed)),
+                    "{platform:?}"
+                );
+                // The trusted-key and broker key lookup is unaffected.
+                assert_eq!(
+                    active_device_public_key(&db, owner.id, device.id).await?,
+                    signing.verifying_key().to_bytes()
+                );
+            }
+        }
+
+        // A Linux desktop cannot approve pairing; the local root path still can.
+        let desktop = SigningKey::from_bytes(&rand::random());
+        let (desktop_device, _) = register_device(
+            &db,
+            owner.id,
+            "Desktop",
+            Platform::Linux,
+            "ed25519",
+            &desktop.verifying_key().to_bytes(),
+        )
+        .await?;
+        let request = create_pairing_request(
+            &db,
+            owner.id,
+            "New phone",
+            Platform::Ios,
+            &SigningKey::from_bytes(&rand::random())
+                .verifying_key()
+                .to_bytes(),
+            &PairingDetails::default(),
+        )
+        .await?;
+        let signature = desktop
+            .sign(&super::super::pairing_approval_message(
+                request.id,
+                &request.nonce,
+                &request.candidate_public_key,
+                owner.id,
+                desktop_device.id,
+                request.expires_at,
+            )?)
+            .to_bytes();
+        assert!(matches!(
+            approve_pairing_request(&db, request.id, owner.id, desktop_device.id, &signature).await,
+            Err(IdentityError::AuthFailed)
+        ));
+        let root_paired = activate_pairing_request(&db, request, None).await?;
+        assert_eq!(root_paired.user_id, owner.id);
 
         // Revoking a device invalidates every existing bearer session at once;
         // a stolen token must not remain useful until its normal expiry.
         revoke_device(&db, device.id).await?;
         assert!(authenticate(&db, &result.token).await.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_keeps_live_and_approved_rows() {
+        let [challenges, pairing, details] = prune_queries();
+        assert!(challenges.contains("FROM auth_challenges WHERE expires_at < time::now()"));
+        assert!(pairing.contains("status != 'approved'"));
+        assert!(pairing.contains("expires_at < time::now() - 1d"));
+        // Approved rows are never deleted, only cleared of candidate details.
+        assert!(details.contains("status = 'approved'"));
+        assert!(details.contains("expires_at < time::now() - 1d"));
+        assert!(
+            details.contains("UPDATE $ids SET candidate_ip = NONE") && !details.contains("DELETE")
+        );
+        for query in [challenges, pairing, details] {
+            assert!(query.contains(&format!("LIMIT {PRUNE_BATCH}")));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires JARVIS_SURREAL_TEST_ENDPOINT and a disposable SurrealDB server"]
+    async fn anonymous_auth_state_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+        let username = env::var("JARVIS_SURREAL_TEST_USER")?;
+        let password = env::var("JARVIS_SURREAL_TEST_PASS")?;
+        let namespace = format!("jarvis_test_{}", Uuid::now_v7().simple());
+        let db = Surreal::new::<Ws>(&endpoint).await?;
+        db.signin(Root {
+            username: &username,
+            password: &password,
+        })
+        .await?;
+        db.use_ns(&namespace).use_db("core").await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+        let count = |table: &'static str| {
+            let db = db.clone();
+            async move {
+                let rows: Option<usize> = db
+                    .query(format!("RETURN count(SELECT id FROM {table})"))
+                    .await?
+                    .take(0)?;
+                Ok::<usize, surrealdb::Error>(rows.unwrap_or(0))
+            }
+        };
+
+        // A challenge for a device that cannot log in is answered, not stored.
+        create_challenge(&db, Uuid::now_v7()).await?;
+        assert_eq!(count("auth_challenges").await?, 0);
+        let owner = create_user(&db, "Gus").await?;
+        let signing = SigningKey::from_bytes(&rand::random());
+        let (device, _) = register_device(
+            &db,
+            owner.id,
+            "iPhone",
+            Platform::Ios,
+            "ed25519",
+            &signing.verifying_key().to_bytes(),
+        )
+        .await?;
+        create_challenge(&db, device.id).await?;
+        assert_eq!(count("auth_challenges").await?, 1);
+
+        // Expired challenges and stale unapproved pairing requests are swept;
+        // live challenges and approved requests stay.
+        db.query(
+            "CREATE auth_challenges SET id = 'expired', device_id = $device, \
+             nonce = <bytes>'n', created_at = time::now() - 1h, \
+             expires_at = time::now() - 55m, consumed_at = NONE; \
+             FOR $status IN ['pending', 'denied', 'approved'] { \
+             CREATE device_pairing_requests SET id = 'old-' + $status, user_id = $user, \
+             candidate_name = 'x', candidate_platform = 'linux', \
+             candidate_public_key = <bytes>'k', candidate_fingerprint = $status, \
+             nonce = <bytes>'n', status = $status, created_at = time::now() - 9d, \
+             expires_at = time::now() - 8d, resolved_at = NONE, \
+             approved_by_device_id = NONE, activated_device_id = NONE, \
+             candidate_ip = '192.0.2.9', candidate_user_agent = 'ua'; };",
+        )
+        .bind(("device", device.id.to_string()))
+        .bind(("user", owner.id.to_string()))
+        .await?
+        .check()?;
+        // Three rows deleted, one approved row cleared of candidate details.
+        assert_eq!(prune_expired_auth_state(&db).await?, 4);
+        assert_eq!(count("auth_challenges").await?, 1);
+        let mut kept = db
+            .query(
+                "SELECT VALUE status FROM device_pairing_requests; \
+                 SELECT VALUE status FROM device_pairing_requests \
+                 WHERE candidate_ip = NONE AND candidate_user_agent = NONE;",
+            )
+            .await?;
+        let all: Vec<String> = kept.take(0)?;
+        let cleared: Vec<String> = kept.take(1)?;
+        assert_eq!(all, vec!["approved".to_string()]);
+        assert_eq!(cleared, all);
+        assert_eq!(prune_expired_auth_state(&db).await?, 0);
         Ok(())
     }
 }

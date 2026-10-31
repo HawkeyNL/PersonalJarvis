@@ -6,5 +6,5 @@ DEFINE FIELD IF NOT EXISTS candidate_ip ON device_pairing_requests TYPE option<s
 DEFINE FIELD IF NOT EXISTS candidate_user_agent ON device_pairing_requests TYPE option<string> ASSERT $value = NONE OR string::len($value) <= 256;
 DEFINE FIELD IF NOT EXISTS candidate_app_version ON device_pairing_requests TYPE option<string> ASSERT $value = NONE OR string::len($value) <= 32;
 DEFINE FIELD IF NOT EXISTS candidate_model ON device_pairing_requests TYPE option<string> ASSERT $value = NONE OR string::len($value) <= 64;
-UPDATE schema_version:baseline SET version = 11, applied_at = time::now();
+UPDATE schema_version:baseline SET version = 13, applied_at = time::now();
 COMMIT TRANSACTION;

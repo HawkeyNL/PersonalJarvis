@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -61,6 +62,34 @@ pub struct RateLimiter {
     /// Consecutive *failed* attempts per key, for failure-based lockout — kept
     /// separate from `hits` so a successful call can clear a caller's penalty.
     failures: Mutex<Windows>,
+    /// Wrong account passwords per device/account: (count, last failure).
+    /// Source-address independent. Only verified devices and the owner
+    /// account are ever keyed, so the map stays small.
+    password_failures: Mutex<HashMap<String, (u32, Instant)>>,
+    /// Unauthenticated audit events dropped since the last summary row.
+    dropped_audit: AtomicU64,
+}
+
+/// Exponential password backoff: after `free` failures each further failure
+/// doubles the wait from `PASSWORD_BACKOFF_BASE`, capped at `max` so nobody
+/// is ever locked out for longer.
+#[derive(Clone, Copy, Debug)]
+pub struct PasswordBackoff {
+    pub free: u32,
+    pub max: Duration,
+}
+
+const PASSWORD_BACKOFF_BASE: Duration = Duration::from_secs(2);
+/// A key's failures are forgotten after this long without a new one.
+const PASSWORD_FAILURE_MEMORY: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn password_delay(failures: u32, policy: PasswordBackoff) -> Duration {
+    match failures.checked_sub(policy.free) {
+        None | Some(0) => Duration::ZERO,
+        Some(over) => PASSWORD_BACKOFF_BASE
+            .saturating_mul(1 << (over - 1).min(16))
+            .min(policy.max),
+    }
 }
 
 const MAX_TRACKED_KEYS: usize = 4096;
@@ -133,6 +162,57 @@ impl RateLimiter {
         let mut map = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         map.remove(key);
     }
+
+    /// Time `key` must still wait before its next password check, if any.
+    /// In memory only: a restart forgets all backoff.
+    pub fn password_backoff(&self, key: &str, policy: PasswordBackoff) -> Option<Duration> {
+        let mut map = self
+            .password_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (failures, last) = *map.get(key)?;
+        let since = last.elapsed();
+        if since >= PASSWORD_FAILURE_MEMORY {
+            map.remove(key);
+            return None;
+        }
+        Some(password_delay(failures, policy).saturating_sub(since)).filter(|d| !d.is_zero())
+    }
+
+    /// Record one wrong password for `key`; returns its running count.
+    // ponytail: check-then-verify is not atomic, so up to the Argon2 slot
+    // count of guesses can be in flight at a backoff boundary.
+    pub fn note_password_failure(&self, key: &str) -> u32 {
+        let mut map = self
+            .password_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let entry = map.entry(key.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) >= PASSWORD_FAILURE_MEMORY {
+            entry.0 = 0;
+        }
+        *entry = (entry.0.saturating_add(1), now);
+        entry.0
+    }
+
+    /// A verified password clears the key's backoff.
+    pub fn clear_password_failures(&self, key: &str) {
+        self.password_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
+    /// Count one dropped audit event; returns the previous count.
+    pub(crate) fn note_dropped_audit(&self) -> u64 {
+        self.dropped_audit.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Take (and reset) the number of dropped audit events.
+    pub(crate) fn take_dropped_audit(&self) -> u64 {
+        self.dropped_audit.swap(0, Ordering::Relaxed)
+    }
 }
 
 // ---- HTTP middleware --------------------------------------------------------
@@ -183,6 +263,79 @@ pub(crate) fn allow_authenticated_device(
         &format!("{profile}:device:{device_id}"),
         per_min,
         Duration::from_secs(60),
+    )
+}
+
+// ---- Password guessing -----------------------------------------------------
+//
+// Wrong account passwords are counted per device and for the (single) owner
+// account, independent of the source address:
+// - a device's counter only grows after a valid device signature (login) or
+//   with that device's session (password change), so an anonymous caller can
+//   never put the owner's devices into backoff; it gates login and password
+//   change for that device;
+// - the account counter grows on every wrong password (login, pairing,
+//   password change) and gates only the anonymous pairing check. Gating login
+//   with it would let anyone lock the owner out through the pairing endpoint;
+//   the cost is that a holder of several device keys gets each device's
+//   budget. Its cap is short because `pairing:global` already bounds the
+//   Argon2 work, and any verified password clears it.
+// Backoff is bounded and forgotten after a day without failures or on a
+// restart.
+
+/// Per device: 3 free failures (typos), then up to 15 minutes.
+pub(crate) const DEVICE_PASSWORD_BACKOFF: PasswordBackoff = PasswordBackoff {
+    free: 3,
+    max: Duration::from_secs(15 * 60),
+};
+/// Account-wide, gating pairing only: 10 free failures, then up to 60 s.
+pub(crate) const ACCOUNT_PASSWORD_BACKOFF: PasswordBackoff = PasswordBackoff {
+    free: 10,
+    max: Duration::from_secs(60),
+};
+/// Jarvis has one owner account.
+pub(crate) const ACCOUNT_PASSWORD_KEY: &str = "password:account";
+
+pub(crate) fn device_password_key(device_id: uuid::Uuid) -> String {
+    format!("password:device:{device_id}")
+}
+
+/// Count a wrong password for `device` (when the caller proved it holds one)
+/// and for the account.
+pub(crate) fn note_password_failure(state: &AppState, device: Option<uuid::Uuid>) {
+    if let Some(id) = device {
+        let n = state
+            .rate_limiter
+            .note_password_failure(&device_password_key(id));
+        tracing::warn!(device_id = %id, failures = n, "wrong account password");
+    }
+    let n = state
+        .rate_limiter
+        .note_password_failure(ACCOUNT_PASSWORD_KEY);
+    tracing::warn!(failures = n, "wrong account password (account)");
+}
+
+/// A verified password clears the account counter and, when given, the
+/// device's counter.
+pub(crate) fn note_password_verified(state: &AppState, device: Option<uuid::Uuid>) {
+    if let Some(id) = device {
+        state
+            .rate_limiter
+            .clear_password_failures(&device_password_key(id));
+    }
+    state
+        .rate_limiter
+        .clear_password_failures(ACCOUNT_PASSWORD_KEY);
+}
+
+/// The response while a password check is in backoff.
+pub(crate) fn password_backoff() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "error": "rate limited",
+            "hint": "too many failed attempts; try again later",
+        })),
     )
 }
 
@@ -296,6 +449,44 @@ mod tests {
         assert_eq!(rl.failures_in_window("ip", w), 2);
         rl.clear_failures("ip"); // a success wipes the penalty
         assert_eq!(rl.failures_in_window("ip", w), 0);
+    }
+
+    #[test]
+    fn password_backoff_is_free_then_exponential_then_bounded() {
+        let device = DEVICE_PASSWORD_BACKOFF;
+        assert_eq!(password_delay(3, device), Duration::ZERO);
+        assert_eq!(password_delay(4, device), Duration::from_secs(2));
+        assert_eq!(password_delay(5, device), Duration::from_secs(4));
+        assert_eq!(password_delay(12, device), Duration::from_secs(512));
+        assert_eq!(password_delay(13, device), device.max);
+        assert_eq!(password_delay(u32::MAX, device), device.max);
+        // The account backoff starts later and stays short.
+        let account = ACCOUNT_PASSWORD_BACKOFF;
+        assert_eq!(password_delay(10, account), Duration::ZERO);
+        assert_eq!(password_delay(11, account), Duration::from_secs(2));
+        assert_eq!(password_delay(u32::MAX, account), Duration::from_secs(60));
+
+        let rl = RateLimiter::new();
+        for n in 1..=3 {
+            assert_eq!(rl.note_password_failure("device:a"), n);
+            assert_eq!(rl.password_backoff("device:a", device), None);
+        }
+        rl.note_password_failure("device:a");
+        let wait = rl.password_backoff("device:a", device).unwrap();
+        assert!(wait > Duration::from_secs(1) && wait <= Duration::from_secs(2));
+        // Keys are independent of each other and of the caller's address.
+        assert_eq!(rl.password_backoff("device:b", device), None);
+        rl.clear_password_failures("device:a");
+        assert_eq!(rl.password_backoff("device:a", device), None);
+    }
+
+    #[test]
+    fn dropped_audit_events_are_counted_and_taken_once() {
+        let rl = RateLimiter::new();
+        assert_eq!(rl.note_dropped_audit(), 0);
+        assert_eq!(rl.note_dropped_audit(), 1);
+        assert_eq!(rl.take_dropped_audit(), 2);
+        assert_eq!(rl.take_dropped_audit(), 0);
     }
 
     #[test]

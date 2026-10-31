@@ -208,9 +208,14 @@ impl PasswordService {
         self.work(move || {
             let hash = PasswordHash::new(stored.as_storage_str())
                 .map_err(|_| PasswordError::InvalidVerifier)?;
+            // Only a mismatch is a failed guess; anything else is an
+            // internal fault and must not count against the caller.
             engine()?
                 .verify_password(password.0.as_bytes(), &hash)
-                .map_err(|_| PasswordError::AuthenticationFailed)
+                .map_err(|error| match error {
+                    argon2::password_hash::Error::Password => PasswordError::AuthenticationFailed,
+                    _ => PasswordError::Unavailable,
+                })
         })
         .await
     }

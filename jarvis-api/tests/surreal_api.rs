@@ -16,7 +16,9 @@ use sha2::Digest as _;
 use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
 use tower::ServiceExt;
 
-use jarvis_api::{build_router, AppState, AuthLimits, RateLimiter, JARVIS_SYSTEM_FALLBACK};
+use jarvis_api::{
+    build_router, build_tcp_router, AppState, AuthLimits, RateLimiter, JARVIS_SYSTEM_FALLBACK,
+};
 
 #[path = "realtime/mod.rs"]
 mod realtime;
@@ -88,8 +90,6 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         agent_sandbox: sandbox.map(Arc::new),
         rate_limiter: Arc::new(RateLimiter::new()),
         auth_limits: AuthLimits::default(),
-        trusted_proxy_hops: 0,
-        trusted_proxy_ips: Arc::new(Vec::new()),
         unix_proxy_uid: None,
         bootstrap_enrollment: None,
         app_update_mirror: None,
@@ -341,6 +341,46 @@ async fn api_responses_are_never_cached_by_default() {
 }
 
 #[tokio::test]
+async fn production_tcp_listener_serves_only_health_probes() {
+    let mut fixture = state(jarvis_store::Database::init(), None).await;
+    fixture.environment = "production".to_string();
+    let app = build_tcp_router(fixture);
+    let get = |path: &str| {
+        Request::builder()
+            .uri(path)
+            // A local process forging the proxy's headers gains nothing.
+            .header("x-forwarded-for", "10.23.45.10")
+            .header("x-forwarded-proto", "https")
+            .header(header::AUTHORIZATION, "Bearer forged")
+            .body(Body::empty())
+            .unwrap()
+    };
+    for path in [
+        "/",
+        "/v1/auth/me",
+        "/v1/auth/challenge",
+        "/v1/events",
+        "/mcp",
+    ] {
+        let response = app.clone().oneshot(get(path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let response = app.clone().oneshot(get("/livez")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Routed to the probe: an unconnected database reports not ready.
+    let response = app.oneshot(get("/readyz")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json_body(response).await["status"], "degraded");
+
+    // Outside production TCP keeps the full API for development and tests.
+    let response = build_tcp_router(state(jarvis_store::Database::init(), None).await)
+        .oneshot(get("/v1/auth/me"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn dev_enrollment_is_refused_unless_enabled_outside_production() {
     let body = json!({"name": "attacker", "platform": "ios", "public_key": hex::encode([7u8; 32])});
     for (environment, dev_enrollment) in [("test", false), ("production", true)] {
@@ -490,6 +530,91 @@ async fn owner_brain_preference_round_trips() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn security_audit_retention_and_dropped_summary() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("audit_fixture_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("test")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let mut fixture = state(db.clone(), None).await;
+    // Let every failed login reach the handler; only the audit budget applies.
+    fixture.auth_limits.login_per_min = 100;
+    fixture.auth_limits.login_max_failures = 100;
+    let app = build_router(fixture.clone());
+
+    // Eleven unauthenticated failures: ten fill the per-kind budget, one is
+    // dropped and counted.
+    for _ in 0..11 {
+        let body = json!({
+            "device_id": uuid::Uuid::now_v7(),
+            "challenge_id": uuid::Uuid::now_v7(),
+            "signature": "00".repeat(64),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    for (age, event) in [
+        ("181d", "fixture.old"),
+        ("200d", "fixture.old"),
+        ("1000d", "fixture.old"),
+        ("1d", "fixture.recent"),
+        ("179d", "fixture.recent"),
+    ] {
+        db.query(format!(
+            "CREATE security_audit SET id = $id, ts = time::now() - {age}, \
+             device_id = NONE, event = $event, outcome = 'ok', detail = NONE RETURN NONE"
+        ))
+        .bind(json!({"id": uuid::Uuid::now_v7().to_string(), "event": event}))
+        .await?
+        .check()?;
+    }
+
+    assert_eq!(jarvis_api::prune_security_audit(&db).await?, 3);
+    jarvis_api::run_audit_maintenance(&fixture).await;
+
+    let count = |event: &'static str| {
+        let db = db.clone();
+        async move {
+            let mut response = db
+                .query("SELECT count() AS n FROM security_audit WHERE event = $event GROUP ALL")
+                .bind(json!({"event": event}))
+                .await?
+                .check()?;
+            let rows: Vec<Value> = response.take(0)?;
+            Ok::<_, surrealdb::Error>(rows.first().and_then(|r| r["n"].as_u64()).unwrap_or(0))
+        }
+    };
+    assert_eq!(count("fixture.old").await?, 0);
+    assert_eq!(count("fixture.recent").await?, 2);
+    assert_eq!(count("auth.login").await?, 10);
+    let mut summary = db
+        .query("SELECT outcome, detail FROM security_audit WHERE event = 'audit.unauthenticated'")
+        .await?
+        .check()?;
+    let summary: Vec<Value> = summary.take(0)?;
+    assert_eq!(summary, vec![json!({"outcome": "dropped", "detail": "1"})]);
+    // Nothing left to prune or report.
+    assert_eq!(jarvis_api::prune_security_audit(&db).await?, 0);
+    Ok(())
+}
+
 async fn enroll_login(app: &axum::Router, signing: &SigningKey) -> (String, Vec<u8>) {
     let enroll = app.clone().oneshot(Request::builder().method("POST").uri("/v1/auth/enroll")
         .header(header::CONTENT_TYPE, "application/json").body(Body::from(serde_json::to_vec(&json!({"name":"test", "platform":"ios", "public_key": hex::encode(signing.verifying_key().to_bytes())})).unwrap())).unwrap()).await.unwrap();
@@ -514,8 +639,20 @@ async fn enroll_login(app: &axum::Router, signing: &SigningKey) -> (String, Vec<
         .unwrap();
     let challenge = json_body(challenge).await;
     let nonce = hex::decode(challenge["nonce"].as_str().unwrap()).unwrap();
-    let login = app.clone().oneshot(Request::builder().method("POST").uri("/v1/auth/login")
-        .header(header::CONTENT_TYPE, "application/json").body(Body::from(serde_json::to_vec(&json!({"device_id": device_id, "challenge_id": challenge["challenge_id"], "signature": hex::encode(signing.sign(&nonce).to_bytes())})).unwrap())).unwrap()).await.unwrap();
+    let login = |signature: [u8; 64]| {
+        app.clone().oneshot(Request::builder().method("POST").uri("/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json").body(Body::from(serde_json::to_vec(&json!({"device_id": device_id, "challenge_id": challenge["challenge_id"], "signature": hex::encode(signature)})).unwrap())).unwrap())
+    };
+    // A signature over the bare nonce is not a login proof.
+    let raw = login(signing.sign(&nonce).to_bytes()).await.unwrap();
+    assert_eq!(raw.status(), StatusCode::UNAUTHORIZED);
+    let message = jarvis_client_core::login_message(
+        challenge["challenge_id"].as_str().unwrap().parse().unwrap(),
+        device_id.parse().unwrap(),
+        &nonce,
+    )
+    .unwrap();
+    let login = login(signing.sign(&message).to_bytes()).await.unwrap();
     assert_eq!(login.status(), StatusCode::OK);
     (
         json_body(login).await["token"]
@@ -524,6 +661,272 @@ async fn enroll_login(app: &axum::Router, signing: &SigningKey) -> (String, Vec<
             .to_string(),
         nonce,
     )
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn unlock_requests_are_rate_limited_superseded_and_audited(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db.clone(), None).await);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let request = |uri: String, method: &str| {
+        app.clone().oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let response = request("/v1/auth/unlock/request".into(), "POST").await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        ids.push(
+            json_body(response).await["request_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let limited = request("/v1/auth/unlock/request".into(), "POST").await?;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    // Superseded requests are denied in storage but still read as pending.
+    let live: Vec<String> = db
+        .query("SELECT VALUE record::id(id) FROM unlock_requests WHERE status = 'pending'")
+        .await?
+        .take(0)?;
+    assert_eq!(live, vec![ids[2].clone()]);
+    let status = request(format!("/v1/auth/unlock/{}", ids[0]), "GET").await?;
+    assert_eq!(json_body(status).await["status"], "pending");
+    let mut audited: Vec<String> = db
+        .query("SELECT VALUE detail FROM security_audit WHERE event = 'unlock.request' AND outcome = 'created'")
+        .await?
+        .take(0)?;
+    audited.sort();
+    ids.sort();
+    assert_eq!(audited, ids);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn push_targets_are_bound_to_the_caller_validated_and_revoked_with_the_device(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db.clone(), None).await);
+    let (phone, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let (laptop, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let call = |token: &str, method: &str, body: Option<Value>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/v1/devices/self/push")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if body.is_some() {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        app.clone().oneshot(
+            request
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                .unwrap(),
+        )
+    };
+    let device_of = |token: String| {
+        let app = app.clone();
+        async move {
+            let me = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/auth/me")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            json_body(me).await["device_id"]
+                .as_str()
+                .unwrap()
+                .parse::<uuid::Uuid>()
+                .unwrap()
+        }
+    };
+    let (phone_id, laptop_id) = (
+        device_of(phone.clone()).await,
+        device_of(laptop.clone()).await,
+    );
+    let user = jarvis_identity::get_device(&db, phone_id)
+        .await?
+        .unwrap()
+        .user_id;
+    let phone_token = "AB".repeat(32);
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/devices/self/push")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"apns_token": phone_token, "apns_env": "sandbox"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await?;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    for bad in [
+        json!({"apns_token": "ab".repeat(31), "apns_env": "sandbox"}),
+        json!({"apns_token": "ab".repeat(101), "apns_env": "sandbox"}),
+        json!({"apns_token": "zz".repeat(32), "apns_env": "sandbox"}),
+        json!({"apns_token": "ab".repeat(32), "apns_env": "development"}),
+    ] {
+        assert_eq!(
+            call(&phone, "PUT", Some(bad)).await?.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // Unknown fields (such as another device id) are refused, not ignored.
+    let foreign =
+        json!({"apns_token": "ab".repeat(32), "apns_env": "sandbox", "device_id": laptop_id});
+    assert!(call(&phone, "PUT", Some(foreign))
+        .await?
+        .status()
+        .is_client_error());
+    let set = |token: &str, apns: &str| {
+        call(
+            token,
+            "PUT",
+            Some(json!({"apns_token": apns, "apns_env": "sandbox"})),
+        )
+    };
+    // The rate limit counts every write, valid or not: continue on a fresh
+    // limiter so the budget below is exact.
+    assert_eq!(
+        set(&laptop, &"cd".repeat(32)).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    let fresh = build_router(state(db.clone(), None).await);
+    let set_fresh = |token: &str, apns: String| {
+        fresh.clone().oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/devices/self/push")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"apns_token": apns, "apns_env": "sandbox"}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        set_fresh(&phone, phone_token.clone()).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    // Stored lowercase, one row per device; the requester is never a target.
+    let targets = |except| jarvis_identity::apns_targets(&db, user, except, "sandbox", 8);
+    let mut all = targets(None).await?;
+    all.sort();
+    assert_eq!(all, ["ab".repeat(32), "cd".repeat(32)]);
+    assert_eq!(targets(Some(laptop_id)).await?, ["ab".repeat(32)]);
+    assert!(
+        jarvis_identity::apns_targets(&db, user, None, "production", 8)
+            .await?
+            .is_empty()
+    );
+    // A token re-registered by another device moves to it.
+    assert_eq!(
+        set_fresh(&laptop, phone_token.clone()).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(targets(Some(laptop_id)).await?, Vec::<String>::new());
+    assert_eq!(
+        set_fresh(&phone, phone_token.clone()).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    // Six writes per minute: two used above.
+    for _ in 0..4 {
+        assert_eq!(
+            set_fresh(&phone, phone_token.clone()).await?.status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+    assert_eq!(
+        set_fresh(&phone, phone_token.clone()).await?.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // DELETE removes only the caller's own target.
+    assert_eq!(
+        call(&laptop, "DELETE", None).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(targets(None).await?, ["ab".repeat(32)]);
+    // Revoking the device deletes its target with it.
+    jarvis_identity::revoke_device(&db, phone_id).await?;
+    let left: Vec<Value> = db
+        .query("SELECT * FROM device_push_targets")
+        .await?
+        .take(0)?;
+    assert!(left.is_empty());
+
+    // A token held by another account's device never moves across accounts,
+    // and the stranger's device cannot take this account's token either.
+    let stranger = jarvis_identity::create_user(&db, "other fixture owner").await?;
+    let (stranger_device, _) = jarvis_identity::register_device(
+        &db,
+        stranger.id,
+        "other phone",
+        jarvis_identity::Platform::Ios,
+        "ed25519",
+        &SigningKey::from_bytes(&rand::random())
+            .verifying_key()
+            .to_bytes(),
+    )
+    .await?;
+    let stranger_token = "ef".repeat(32);
+    jarvis_identity::set_push_target(&db, stranger_device.id, &stranger_token, "sandbox").await?;
+    assert_eq!(
+        set(&laptop, &stranger_token).await?.status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        set(&laptop, &"cd".repeat(32)).await?.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(matches!(
+        jarvis_identity::set_push_target(&db, stranger_device.id, &"cd".repeat(32), "sandbox")
+            .await,
+        Err(jarvis_identity::IdentityError::AuthFailed)
+    ));
+    assert_eq!(
+        jarvis_identity::apns_targets(&db, stranger.id, None, "sandbox", 8).await?,
+        [stranger_token]
+    );
+    assert_eq!(targets(None).await?, ["cd".repeat(32)]);
+    Ok(())
 }
 
 #[tokio::test]
@@ -628,8 +1031,88 @@ async fn signed_agent_approval_is_single_use_and_core_stays_denied(
             br#"{"type":"write_file","path":"note.txt","content":"ok"}"#
         ))
     );
+    // The list carries the exact bytes `action_sha256` hashes.
+    assert_eq!(
+        a_entry["action_json"],
+        r#"{"type":"write_file","path":"note.txt","content":"ok"}"#
+    );
     let a_signature = sign_listed(&listed, &a_id);
     let b_signature = sign_listed(&listed, &b_id);
+
+    // A phone cannot approve an action too large to list in full, nor a kind
+    // outside the mobile allowlist, even with a valid signature. The limit is
+    // on the stored JSON: 16384 bytes are listed, 16385 are not.
+    let overhead = r#"{"type":"write_file","path":"note.txt","content":""}"#.len();
+    let max = jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN;
+    let at_limit = json_body(
+        app.clone()
+            .oneshot(propose(&"x".repeat(max - overhead)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let at_limit_id = at_limit["pending_id"].as_str().unwrap().to_string();
+    let large = json_body(
+        app.clone()
+            .oneshot(propose(&"x".repeat(max + 1 - overhead)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let large_id = large["pending_id"].as_str().unwrap().to_string();
+    let other = json_body(app.clone().oneshot(propose("kind")).await.unwrap()).await;
+    let other_id = other["pending_id"].as_str().unwrap().to_string();
+    db.query("UPDATE agent_pending_actions SET action = $action WHERE record::id(id) = $id")
+        .bind(json!({"id": other_id, "action": r#"{"type":"claude_code","prompt":"x"}"#}))
+        .await?
+        .check()?;
+    let listed = json_body(app.clone().oneshot(list()).await.unwrap()).await;
+    let large_entry = listed["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["pending_id"] == large_id.as_str())
+        .unwrap();
+    assert!(large_entry["action_json"].is_null());
+    let at_limit_entry = listed["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["pending_id"] == at_limit_id.as_str())
+        .unwrap();
+    assert_eq!(
+        at_limit_entry["action_json"].as_str().map(str::len),
+        Some(max)
+    );
+    // A device that cannot approve never receives action_json.
+    let set_platform = |platform: &'static str| {
+        let db = db.clone();
+        async move {
+            db.query("UPDATE devices SET platform = $platform WHERE record::id(id) = $id")
+                .bind(json!({"platform": platform, "id": device_id.to_string()}))
+                .await?
+                .check()
+        }
+    };
+    set_platform("linux").await?;
+    let as_linux = json_body(app.clone().oneshot(list()).await.unwrap()).await;
+    set_platform("ios").await?;
+    assert!(as_linux["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["action_json"].is_null()));
+    for id in [&large_id, &other_id] {
+        let signature = sign_listed(&listed, id);
+        assert_eq!(
+            app.clone()
+                .oneshot(approve(id, &signature))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
 
     // A login/unlock-style raw nonce signature is refused.
     let raw = hex::encode(
@@ -708,6 +1191,7 @@ async fn signed_agent_approval_is_single_use_and_core_stays_denied(
         StatusCode::NOT_FOUND
     );
     let core = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -725,6 +1209,53 @@ async fn signed_agent_approval_is_single_use_and_core_stays_denied(
         .await
         .unwrap();
     assert_eq!(core.status(), StatusCode::FORBIDDEN);
+    // At most 16 live pending actions per user; three (at_limit, large,
+    // other) are live. A deny or an expiry frees a slot.
+    let mut more = Vec::new();
+    for _ in 0..13 {
+        let created = app.clone().oneshot(propose("more")).await.unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        more.push(
+            json_body(created).await["pending_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let status = |response: axum::response::Response| response.status();
+    assert_eq!(
+        status(app.clone().oneshot(propose("one too many")).await.unwrap()),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let listed = json_body(app.clone().oneshot(list()).await.unwrap()).await;
+    assert_eq!(listed["pending"].as_array().map(Vec::len), Some(16));
+    let denied = app
+        .clone()
+        .oneshot(post(
+            format!("/v1/agent/pending/{}/deny", more[0]),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::OK);
+    assert_eq!(
+        status(app.clone().oneshot(propose("after deny")).await.unwrap()),
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(app.clone().oneshot(propose("full again")).await.unwrap()),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    db.query(
+        "UPDATE agent_pending_actions SET expires_at = time::now() - 1s WHERE record::id(id) = $id",
+    )
+    .bind(json!({"id": more[1]}))
+    .await?
+    .check()?;
+    assert_eq!(
+        status(app.clone().oneshot(propose("after expiry")).await.unwrap()),
+        StatusCode::OK
+    );
     std::fs::remove_dir_all(root)?;
     Ok(())
 }

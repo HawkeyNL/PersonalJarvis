@@ -11,6 +11,7 @@ export type ViewName =
   | "credentials"
   | "ai-accounts"
   | "devices"
+  | "persona"
   | "logs"
   | "system";
 
@@ -229,6 +230,31 @@ export interface CodexRuntimeStatus {
 export type CodexRuntimeMutation = { action: "install_latest" } | { action: "install_version"; version: string } | { action: "rollback" };
 /** Strict `MAJOR.MINOR.PATCH`, as the broker and the installer require. */
 export const strictRuntimeVersion = (version: string): boolean => /^\d{1,9}\.\d{1,9}\.\d{1,9}$/.test(version);
+export interface PersonaVersion {
+  sha256: string;
+  bytes: number;
+  /** Unix seconds of the last change; for history entries, the last use. */
+  modified: number;
+  /** A problem code (see persona.ts), never persona text. */
+  problem: string | null;
+  installed: boolean;
+}
+export interface PersonaCandidate {
+  commit: string;
+  signature: "verified" | "untrusted" | "no_allowed_signers";
+  sha256: string | null;
+  bytes: number | null;
+  problem: string | null;
+}
+export interface PersonaStatus {
+  max_bytes: number;
+  installed: PersonaVersion | null;
+  candidate: PersonaCandidate | null;
+  /** A source problem code (see persona.ts), never free text. */
+  candidate_error: string | null;
+  history: PersonaVersion[];
+}
+export type PersonaMutation = { action: "install"; expect_sha256: string } | { action: "rollback"; to_sha256: string };
 export type LogService =
   | "core"
   | "surrealdb"
@@ -295,6 +321,9 @@ export const api = {
   codexRuntime: () => invoke<CodexRuntimeStatus>("codex_runtime"),
   codexRuntimeMutation: (request: CodexRuntimeMutation) =>
     invoke<OperationResult>("codex_runtime_mutation", { request }),
+  persona: () => invoke<PersonaStatus>("persona"),
+  personaMutation: (request: PersonaMutation) =>
+    invoke<OperationResult>("persona_mutation", { request }),
   credentialSet: (provider: CredentialProvider) =>
     invoke<OperationResult>("credential_set", { provider }),
   logs: (service: LogService, lines = 500) =>

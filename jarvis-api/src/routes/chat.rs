@@ -43,9 +43,6 @@ pub(crate) struct ChatReq {
     /// clients and maps to the same semantic routing floor.
     #[serde(default)]
     mode: Option<String>,
-    /// Optional system-prompt override (defaults to the Jarvis persona).
-    #[serde(default)]
-    system: Option<String>,
     /// Absent starts a fresh conversation; present continues the owned one.
     #[serde(default)]
     pub(super) conversation_id: Option<Uuid>,
@@ -66,7 +63,6 @@ impl ChatReq {
                 .iter()
                 .any(|m| m.content.len() > validation::MAX_CHAT_CONTENT_LEN)
             || self.messages.iter().map(|m| m.content.len()).sum::<usize>() > 128_000
-            || self.system.as_ref().is_some_and(|s| s.len() > 24_000)
         {
             return Err(bad_request("chat payload too large"));
         }
@@ -339,10 +335,8 @@ pub(super) async fn execute_chat(
     // model-selection prompt is substituted for the owner's request.
     let requirements = llm::classify_task(mode, &new_msg);
     let mut chat = llm::ChatRequest {
-        system: Some(
-            req.system
-                .unwrap_or_else(|| state.jarvis_system.to_string()),
-        ),
+        // Always the server persona; clients cannot replace it.
+        system: Some(state.jarvis_system.to_string()),
         tier: requirements.tier,
         mode,
         messages,
@@ -1017,5 +1011,16 @@ mod tests {
         let reply = research_reply(&on, &brain, "nieuws?").await;
         assert_eq!(reply.text, RESEARCH_UNAVAILABLE);
         assert!(reply.backend.is_none());
+    }
+
+    #[test]
+    fn client_system_prompt_is_dropped_not_obeyed() {
+        let req: ChatReq = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": "X",
+        }))
+        .unwrap();
+        let kept = serde_json::to_value(&req).unwrap();
+        assert!(kept.get("system").is_none(), "{kept}");
     }
 }

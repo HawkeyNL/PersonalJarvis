@@ -386,6 +386,76 @@ history it fast-forwards over. Remove the setting to return to unsigned
 tracking of `main`. To retire a key, delete its line: a `valid-before`
 option is checked against the commit date, which the committer chooses.
 
+### Persona
+
+```bash
+sudo jarvis persona status [--json]
+sudo jarvis persona install [--expect-sha256 <sha256> [--yes]]
+sudo jarvis persona rollback --to <sha256> [--yes]
+sudo jarvis persona validate < candidate.md
+```
+
+`status` shows the SHA-256, size and time of the installed persona, of the
+candidate in the private checkout's current commit (with its signature state)
+and of the versions in the root-only history. It never prints persona text.
+
+`install` takes the persona from the private checkout's current commit; edits
+reach that checkout as signed commits through the private agent updater. The
+commit must be signed by a key in the allowed signers file (see "Signed agent
+updates"), even when the agent updater itself does not require signing, and
+the checkout must be root-controlled. The persona must be valid UTF-8 of at
+most `PERSONA_MAX_BYTES` (32 KiB, in `crates/privileged/src/persona.rs`), start with a `# ` heading, contain no control characters other
+than tab and line endings and no invisible bidirectional or zero-width
+formatting characters, and contain nothing that looks like a key or token.
+Only SSH signatures count; OpenPGP and X.509 signatures are never accepted.
+The installer is then bound to that exact SHA-256: if the working tree differs
+from the signed commit, nothing is installed. `--yes` requires
+`--expect-sha256`, copied from `status`.
+
+`rollback --to` accepts only the full SHA-256 of an intact, valid version in
+the history. The history keeps the ten most recently used versions.
+
+Both restart Core and wait for `/readyz`. When Core does not become ready, the
+previous persona is restored and Core restarted again; the command still fails
+and says whether the restore worked. Each change is recorded in the system log
+(tag `jarvis-persona`) with the old and new SHA-256 before anything changes;
+if that record cannot be written, nothing changes.
+
+Core Admin's Persona page runs `install --expect-sha256 <hash> --yes` and
+`rollback --to <hash> --yes` through its root broker, with the hash the owner
+confirmed in the GUI.
+
+Core reads the persona once at startup and checks its content with the same
+validator: it opens `JARVIS_LLM_PERSONA_PATH` without following a symlink,
+requires a regular file, reads at most `PERSONA_MAX_BYTES` plus one byte and
+logs only the path, SHA-256 and size. In production the file must also be
+root-owned and not writable by group or others (the installer sets
+`root:jarvis 0640`). In production a missing, empty, oversized or invalid
+persona, a symlink, a non-regular file or an unsafe owner or mode stops Core
+from starting; the error names the problem, never the content. Development and
+test environments fall back to a built-in persona instead. `status` reports
+the same problems, including a persona writable by group or others, and the
+protected installer refuses content that fails `sudo jarvis persona validate`
+(which reads a candidate from standard input and prints only the problem).
+The installer accepts only a root-owned validator that group and others cannot
+write, and stops with "release predates persona validation" when the installed
+`jarvis` is older than this subcommand; setup checks the release's
+`tooling.persona_validate` flag for the same reason.
+
+**Upgrade note (persona check).** Before installing the release that adds
+this startup check, run:
+
+```bash
+sudo jarvis persona status
+sudo stat -c '%U:%G:%a' /etc/jarvis/Jarvis.md
+```
+
+and confirm the `Installed` line shows a persona marked `valid` and the mode
+is `root:jarvis:640`; `status` from earlier releases does not check the mode.
+A persona installed by `jarvis persona` or the protected installer already has
+it. Otherwise Core will not start after the update; fix the persona with
+`sudo jarvis persona install` or `rollback` first.
+
 Destructive operations prompt only on a controlling TTY. In automation they
 fail closed unless their explicit `--yes` option is supplied. Credential input
 is never rendered by the TUI or emitted in JSON.
@@ -420,6 +490,35 @@ hexadecimal activation codes remain supported by the verifier and clients.
 After activation, pin the new device for privileged changes with
 `sudo jarvis devices trust <device-uuid>` (see
 [Trusted device keys](#trusted-device-keys-for-privileged-changes)).
+
+### Forgotten account password
+
+A forgotten account password is reset from a signed-in iOS, Android or macOS
+approver device ("Forgot password?") and confirmed here:
+
+```bash
+sudo jarvis account recovery status            # pending id, device, expiry
+sudo jarvis account recovery confirm <request-uuid>   # asks; or --yes
+sudo jarvis account recovery deny <request-uuid>
+```
+
+The device signs a `password-reset` approval after a biometric prompt; the new
+password reaches Core only as its Argon2 verifier. Nothing changes until local
+root confirms the request shown on that device. A request expires after 15
+minutes; there is one pending request at a time, at most three signed requests
+per day and one completed recovery per seven days. Confirming sets the new
+password, ends every session and cancels pending pairing, unlock and account
+requests. Only confirm a reset you started yourself.
+
+Starting a recovery needs a live session on that approver device: the app
+requests and signs the reset over the authenticated API. If no approver device
+is still signed in (every session ended or expired, and a new login would need
+the forgotten password), there is no reset path. The local-root fallback is to
+revoke the device (`sudo jarvis devices revoke <device-uuid>`) and pair it
+again with local approval (see
+[Local device administration](#local-device-administration)), but that pairing
+request still asks for the existing account password: it restores a lost or
+broken device, not a forgotten password.
 
 ### Schema-changing releases
 
@@ -512,10 +611,13 @@ sudo jarvis devices trust --all-active
 
 Check the pending fingerprint against the requesting device before approving.
 
-Every pairing request (`POST /v1/auth/pairing/requests`) needs the owner's
+A pairing request (`POST /v1/auth/pairing/requests`) needs the owner's
 stored account password. An owner without one, such as a development-enrolled
 setup, gets `403` with `"code": "pairing_password_not_set"` and must first set
-a password from an active device. Each pending request also records the
+a password from an active iOS, Android or macOS device. An owner without a
+password who has no such device cannot set one, so Core still accepts a request
+without a password check for them, sends no push for it, and only
+`jarvis devices approve` can approve it. Each pending request also records the
 candidate's IP address, `User-Agent`, and the optional `app_version` and
 `model` it sent; `devices pending` lists them with control and bidi
 characters escaped. These are unauthenticated hints for the approver, not proof
@@ -524,14 +626,12 @@ show the fingerprint they compute from the candidate key themselves.
 
 - The IP address is the client address the reverse proxy reports (the last
   `X-Forwarded-For` entry). Behind the Unix-socket proxy that is Caddy's own
-  view of the client. In the legacy TCP mode (`JARVIS_TRUSTED_PROXY_*`) it is
-  only as trustworthy as the allowlisted proxies, and anything that can reach
-  Core through them can make it up.
+  view of the client.
 - Clients may send `app_version` and `model` only to a Core that accepts
   them (this release or newer). An older Core rejects the unknown fields with
   `422`, so the apps check the Core version first.
-- Core deletes pairing requests, with these details, one day after they
-  expire. Deleted rows can remain in database backups and pre-migration
+- Core deletes unapproved pairing requests, and clears these details from
+  approved ones, one day after they expire. Deleted rows can remain in database backups and pre-migration
   snapshots until those are removed, and in SurrealDB's on-disk (RocksDB)
   files until it compacts them.
 

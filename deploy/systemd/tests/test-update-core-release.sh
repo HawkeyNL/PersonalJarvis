@@ -437,7 +437,7 @@ prepare_migration_candidate() {
     install -m 0755 "$repo_dir/deploy/systemd/schema-backup.sh" "$asset/schema-backup"
     install -m 0644 "$repo_dir/jarvis-core-admin/packaging/com.hawkeynl.jarvis.devices.policy" \
         "$asset/com.hawkeynl.jarvis.devices.policy"
-    jq --arg previous "$from" '.tooling.local_devices = 1 | .schema_migration = {version:1,target:10,from_sha256:[$previous]}' \
+    jq --arg previous "$from" '.tooling.local_devices = 1 | .schema_migration = {version:1,target:13,from_sha256:[$previous]}' \
         "$asset/release.json" > "$fixture_dir/migration-manifest"
     install -m 0644 "$fixture_dir/migration-manifest" "$asset/release.json"
     (cd "$asset" && sha256sum schema-backup com.hawkeynl.jarvis.devices.policy >> artifact-binaries.sha256)
@@ -603,6 +603,23 @@ fi
 [[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v1.0.4 ]]
 [[ ! -e /opt/jarvis/releases/v1.0.5 ]]
 
+# The updater unit cannot use RestrictSUIDSGID= (tar extracts with openat2), so
+# a checksummed archive with a setuid entry is refused before extraction.
+seed_active_release v1.0.6 "$same_migrations"
+prepare_candidate v1.0.7 "$same_migrations"
+chmod 4755 "$fixture_dir/asset/jarvis-core-v1.0.7/jarvis-api"
+tar -C "$fixture_dir/asset" -czf "$fixture_dir/jarvis-core-v1.0.7-linux-x86_64.tar.gz" jarvis-core-v1.0.7
+(
+    cd "$fixture_dir"
+    sha256sum jarvis-core-v1.0.7-linux-x86_64.tar.gz > jarvis-core-v1.0.7-linux-x86_64.tar.gz.sha256
+)
+if run_updater --version v1.0.7; then
+    echo "archive with a setuid entry unexpectedly succeeded" >&2
+    exit 1
+fi
+[[ $(readlink -f /opt/jarvis/current) == /opt/jarvis/releases/v1.0.6 ]]
+[[ ! -e /opt/jarvis/releases/v1.0.7 ]]
+
 # A shell-supplied repository must not redirect a configured root update.
 seed_active_release v1.1.0 "$same_migrations"
 prepare_candidate v1.1.1 "$same_migrations"
@@ -674,6 +691,17 @@ cmp "$fixture_dir/admin-before-readiness-failure" /usr/local/sbin/jarvis
 cmp "$fixture_dir/updater-before-readiness-failure" /usr/local/libexec/jarvis/update-core-release
 cmp "$fixture_dir/unit-before-readiness-failure" "$systemd_fixture/jarvis-config-broker.service"
 grep -Fq 'daemon-reload' "$fixture_dir/systemctl.log"
+# The kept directory stops timer retries and names the manual recovery; it is
+# not a release staged for a schema migration.
+if run_updater 2>"$fixture_dir/leftover-release.err"; then
+    echo "update retried over a failed activation's release directory" >&2
+    exit 1
+fi
+grep -Fq 'kept after a failed activation or a rollback' "$fixture_dir/leftover-release.err"
+if grep -Fq -- '--migrate' "$fixture_dir/leftover-release.err"; then
+    echo "failed activation was reported as a staged migration" >&2
+    exit 1
+fi
 
 # A config-broker activation failure restores the old link and unit bytes, then
 # successfully restarts the previous service set.
@@ -976,6 +1004,10 @@ if grep -Evq '^(is-active|is-enabled)( |$)' "$fixture_dir/systemctl.log"; then
     echo 'stage changed service state' >&2; exit 1
 fi
 grep -Fq 'already staged' <<< "$(run_updater --stage v10.1.1)"
+if run_updater 2>"$fixture_dir/staged-latest.err"; then
+    echo 'routine update activated a staged migration' >&2; exit 1
+fi
+grep -Fq 'staged for a schema migration, run: sudo jarvis update --migrate v10.1.1' "$fixture_dir/staged-latest.err"
 
 # A directory with the stale full-path marker is named for manual removal and
 # never deleted automatically.

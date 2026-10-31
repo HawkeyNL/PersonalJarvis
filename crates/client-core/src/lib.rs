@@ -5,6 +5,7 @@
 //! platform application.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -18,8 +19,18 @@ pub const PAIRING_APPROVAL_DOMAIN: &[u8] = b"jarvis-device-pairing-v1\0";
 pub const AGENT_APPROVAL_DOMAIN: &[u8] = b"jarvis/agent-approval/v1\0";
 pub const LOGIN_DOMAIN: &[u8] = b"jarvis-login-v1\0";
 pub const UNLOCK_APPROVAL_DOMAIN: &[u8] = b"jarvis-unlock-approval-v1\0";
+pub const UNLOCK_CODE_DOMAIN: &[u8] = b"jarvis-unlock-code-v1\0";
 /// `approval_message` value in `GET /v1/agent/pending` for [`agent_approval_message`].
 pub const AGENT_APPROVAL_MESSAGE_V1: &str = "agent-approval-v1";
+/// Largest stored action JSON (UTF-8 bytes) that `GET /v1/agent/pending` lists
+/// as `action_json`. A larger action is listed without it, and a phone cannot
+/// approve it: phones approve only what they can show in full.
+pub const MAX_REVIEWABLE_ACTION_JSON_LEN: usize = 16 * 1024;
+/// Agent action kinds (`action` in `GET /v1/agent/pending`) a phone may
+/// approve: kinds whose whole effect is in the signed JSON. `git_commit` is
+/// not one (it commits whatever the workspace holds when it runs). Any other
+/// kind, including one added later, is refused on phones.
+pub const MOBILE_APPROVABLE_AGENT_ACTIONS: [&str; 1] = ["write_file"];
 
 pub const MAX_DEVICE_NAME_LEN: usize = 128;
 pub const MAX_PLATFORM_LEN: usize = 32;
@@ -84,6 +95,22 @@ pub fn unlock_approval_message(
     )
 }
 
+/// Number-matching code (0..=99, always shown as two digits: 0 is "00") for
+/// one unlock request. The requesting device shows it and the approver must
+/// pick it before approving. Both sides derive it from the request id and the
+/// server-generated nonce they already hold.
+pub fn unlock_code(request_id: Uuid, nonce: &[u8]) -> Result<u8, ProtocolError> {
+    if nonce.len() != 32 {
+        return Err(ProtocolError::InvalidChallenge);
+    }
+    let digest = Sha256::new()
+        .chain_update(UNLOCK_CODE_DOMAIN)
+        .chain_update(request_id.as_bytes())
+        .chain_update(nonce)
+        .finalize();
+    Ok((u16::from_be_bytes([digest[0], digest[1]]) % 100) as u8)
+}
+
 fn challenge_message(
     domain: &[u8],
     id: Uuid,
@@ -127,7 +154,9 @@ pub fn pairing_approval_message(
 /// Canonical, domain-separated v1 bytes a trusted device signs to approve one
 /// pending agent action. `action_sha256` is the SHA-256 of the pending action's
 /// stored canonical JSON (compact serde_json, UTF-8), exactly as hex-encoded in
-/// `action_sha256` of `GET /v1/agent/pending`. Every field has a fixed width.
+/// `action_sha256` of `GET /v1/agent/pending`; the same list carries that JSON
+/// as `action_json` (up to [`MAX_REVIEWABLE_ACTION_JSON_LEN`]), so an approver
+/// can hash what it shows. Every field has a fixed width.
 pub fn agent_approval_message(
     pending_id: Uuid,
     nonce: &[u8],
@@ -322,8 +351,6 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<Uuid>,
 }
 
@@ -399,6 +426,20 @@ mod tests {
         );
         assert_eq!(
             login_message(id, device, &nonce[..31]),
+            Err(ProtocolError::InvalidChallenge)
+        );
+    }
+
+    /// Fixed unlock-code vectors shared with the TypeScript, Swift and Kotlin clients.
+    #[test]
+    fn unlock_code_v1_matches_golden_vectors() {
+        let first = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let second = Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap();
+        let nonce: Vec<u8> = (0_u8..32).collect();
+        assert_eq!(unlock_code(first, &nonce), Ok(89));
+        assert_eq!(unlock_code(second, &[0x0b; 32]), Ok(0));
+        assert_eq!(
+            unlock_code(first, &nonce[..31]),
             Err(ProtocolError::InvalidChallenge)
         );
     }

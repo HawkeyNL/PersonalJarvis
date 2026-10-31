@@ -38,19 +38,20 @@ mod metering;
 pub mod model_control;
 pub mod notify;
 mod peer;
+mod persona;
 mod rate_limit;
 pub mod realtime;
 mod routes;
 mod state;
 mod validation;
 
+pub use audit::{prune_security_audit, run_audit_maintenance};
 pub use extract::Authed;
+pub use jarvis_core::JARVIS_SYSTEM_FALLBACK;
 pub use metering::refresh_usage_snapshot;
 pub use peer::{bind_api_socket, proxy_identity, Peer, ProxyIdentity};
+pub use persona::startup_persona;
 pub use state::{AppState, AppUpdateMirror};
-// Compatibility re-export: persona ownership is in `jarvis-core`, while the
-// transport crate keeps this public helper available to existing callers.
-pub use jarvis_core::{load_persona, JARVIS_SYSTEM_FALLBACK};
 
 use audit::{agent_audit_log, security_audit_log};
 use mcp::mcp_endpoint;
@@ -64,7 +65,8 @@ use routes::app_updates::{
 use routes::auth::{
     auth_bootstrap, auth_challenge, auth_enroll, auth_login, auth_logout, auth_me, delete_device,
     list_devices, pairing_approve, pairing_create, pairing_deny, pairing_pending, pairing_status,
-    unlock_approve, unlock_deny, unlock_pending, unlock_request, unlock_status,
+    push_target_delete, push_target_set, unlock_approve, unlock_deny, unlock_pending,
+    unlock_request, unlock_status,
 };
 use routes::broker::{ibkr_positions, ibkr_status};
 use routes::chat::{
@@ -127,6 +129,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::account::password_request).layer(DefaultBodyLimit::max(8192)),
         )
         .route(
+            "/v1/auth/account/password/reset-requests",
+            post(routes::account::password_reset_request).layer(DefaultBodyLimit::max(8192)),
+        )
+        .route(
             "/v1/auth/account/requests/{id}/approve",
             post(routes::account::approve).layer(DefaultBodyLimit::max(1024)),
         )
@@ -142,6 +148,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/unlock/{id}/approve", post(unlock_approve))
         .route("/v1/auth/unlock/{id}/deny", post(unlock_deny))
         .route("/v1/devices", get(list_devices))
+        .route(
+            "/v1/devices/self/push",
+            put(push_target_set)
+                .delete(push_target_delete)
+                .layer(DefaultBodyLimit::max(1024)),
+        )
         .route("/v1/devices/{id}", delete(delete_device))
         .route("/v1/app-updates/capability", get(app_update_capability))
         .route(
@@ -238,6 +250,20 @@ pub fn build_router(state: AppState) -> Router {
                 tracing::info_span!("http", method = %request.method(), path = request.uri().path())
             },
         ))
+}
+
+/// The router for the loopback TCP listener. In production the full API is
+/// served only on the Caddy-owned Unix socket, so TCP answers just the
+/// liveness and readiness probes the service manager and updater use.
+pub fn build_tcp_router(state: AppState) -> Router {
+    if state.environment != "production" {
+        return build_router(state);
+    }
+    Router::new()
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
+        .layer(middleware::map_response(no_store_by_default))
+        .with_state(state)
 }
 
 /// API responses carry session tokens and personal data, so nothing may

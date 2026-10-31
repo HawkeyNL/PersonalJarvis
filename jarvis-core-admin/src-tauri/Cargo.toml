@@ -1,6 +1,6 @@
 [package]
 name = "jarvis-core-admin"
-version = "0.1.21"
+version = "0.1.34"
 description = "Linux graphical administration console for the Jarvis Home Node"
 authors = ["PersonalJarvis contributors"]
 edition = "2021"

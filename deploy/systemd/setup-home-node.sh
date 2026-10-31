@@ -32,6 +32,7 @@ done
 [[ -n $private_agents && -n $bootstrap_cidr ]] || usage
 for command in docker systemctl curl jq openssl; do command -v "$command" >/dev/null 2>&1 || fail "missing prerequisite: $command"; done
 systemctl is-active --quiet docker.service || fail "Docker is not active"
+getent passwd caddy >/dev/null || fail "install Caddy first: Core serves its API only on a socket for the caddy account (deploy/caddy/README.md)"
 
 ui_heading "Jarvis Home Node Setup — $release_tag"
 ui_step "[1/7] Preparing host"
@@ -72,7 +73,9 @@ else
     ui_warning "Verified release $release_tag already staged"
 fi
 ui_step "[4/7] Protected configuration"
-ui_run "Protected persona installed" bash /usr/local/libexec/jarvis/install-private-config --source "$private_agents"
+jq -e '.tooling.persona_validate == 1' "/opt/jarvis/releases/$release_tag/release.json" >/dev/null \
+    || fail "release $release_tag predates persona validation; install a release with \`jarvis persona validate\` first"
+ui_run "Protected persona installed" env JARVIS_PERSONA_VALIDATOR="/opt/jarvis/releases/$release_tag/jarvis" bash /usr/local/libexec/jarvis/install-private-config --source "$private_agents"
 ui_run "Private agent bundle activated" env JARVIS_AGENT_BUNDLE_VALIDATOR="/opt/jarvis/releases/$release_tag/jarvis-agent-bundle" bash /usr/local/libexec/jarvis/install-agent-bundle --source "$private_agents"
 if jq -e '.tooling.model_policy_directory == 1' "/opt/jarvis/releases/$release_tag/release.json" >/dev/null; then
     ui_warning "Model policy storage is initialized/migrated by the verified release installer; remote models remain owner-controlled"
@@ -90,4 +93,4 @@ ui_run "Home Node security verification passed" bash /usr/local/libexec/jarvis/v
 agents=$(jq -r '.agents | length' "$(readlink -f /var/lib/jarvis/agents/current)/manifest.json")
 ui_step "[7/7] Complete"
 ui_success "Jarvis Home Node ready"
-printf 'Release: %s\nCore: active\nSurrealDB: healthy\nAgents: %s\nAPI: http://127.0.0.1:8080\nPublic ingress: not configured\nUpdater timer: enabled\n' "$release_tag" "$agents"
+printf 'Release: %s\nCore: active\nSurrealDB: healthy\nAgents: %s\nAPI: unix//run/jarvis-core/api.sock (health: http://127.0.0.1:8080)\nPublic ingress: deploy/caddy/README.md\nUpdater timer: enabled\n' "$release_tag" "$agents"

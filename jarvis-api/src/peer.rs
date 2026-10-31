@@ -1,10 +1,9 @@
 //! Who a request came from. Every client-IP and HTTPS decision routes
 //! through here so no handler reads forwarding headers on its own.
 //!
-//! With `JARVIS_API_UNIX_SOCKET` set, forwarding headers are honoured only
-//! for a connection on that socket whose kernel-reported (`SO_PEERCRED`) uid
-//! is the reverse proxy's; the TCP listener is never trusted. Without the
-//! socket, the legacy `JARVIS_TRUSTED_PROXY_*` peer allowlist applies.
+//! Forwarding headers are honoured only for a connection on the
+//! `JARVIS_API_UNIX_SOCKET` whose kernel-reported (`SO_PEERCRED`) uid is the
+//! reverse proxy's. A TCP peer is never trusted, whatever its address.
 
 use std::ffi::CStr;
 use std::fs;
@@ -50,60 +49,44 @@ impl Connected<IncomingStream<'_, UnixListener>> for Peer {
     }
 }
 
-/// How many trailing `X-Forwarded-For` entries this connection may assert;
-/// 0 means forwarding headers are ignored.
-fn trusted_hops(
-    peer: Option<Peer>,
-    unix_proxy_uid: Option<u32>,
-    tcp_hops: u32,
-    tcp_proxies: &[IpAddr],
-) -> u32 {
-    match (peer, unix_proxy_uid) {
-        // The socket is reachable only by the single local Caddy proxy.
-        (Some(Peer::Unix { uid: Some(uid) }), Some(proxy)) if uid == proxy => 1,
-        (Some(Peer::Tcp(addr)), None) if tcp_proxies.contains(&addr.ip()) => tcp_hops,
-        _ => 0,
-    }
+/// Whether this connection may assert forwarding headers: only the single
+/// local Caddy proxy on the API socket.
+fn is_trusted_proxy(peer: Option<Peer>, unix_proxy_uid: Option<u32>) -> bool {
+    matches!(
+        (peer, unix_proxy_uid),
+        (Some(Peer::Unix { uid: Some(uid) }), Some(proxy)) if uid == proxy
+    )
 }
 
-/// The client address behind `hops` trusted proxies. A trusted proxy that
-/// sent no usable header yields `None`: the client is unknown, and callers
-/// fail closed (bootstrap) or share one throttling bucket (rate limits).
-fn forwarded_client(peer: Option<Peer>, headers: &HeaderMap, hops: u32) -> Option<IpAddr> {
-    let direct = match peer {
-        Some(Peer::Tcp(addr)) => Some(addr.ip()),
-        _ => None,
-    };
-    if hops == 0 {
-        return direct;
+/// The client address. An untrusted peer is keyed by its own TCP address
+/// (or `None` on the socket); a trusted proxy that sent no usable header also
+/// yields `None`: the client is unknown, and callers fail closed (bootstrap)
+/// or share one throttling bucket (rate limits).
+fn forwarded_client(peer: Option<Peer>, headers: &HeaderMap, trusted: bool) -> Option<IpAddr> {
+    if !trusted {
+        return match peer {
+            Some(Peer::Tcp(addr)) => Some(addr.ip()),
+            _ => None,
+        };
     }
+    // Only the entry the trusted proxy appended matters; anything before it
+    // is client-supplied and may be garbage without affecting the result.
     // Repeated header lines form one list in order (RFC 9110 §5.3), so a
     // client line sent ahead of the proxy's cannot displace its entry. An
     // unreadable line still counts as one (unparsable) entry.
-    let entries: Vec<&str> = headers
+    headers
         .get_all("x-forwarded-for")
         .iter()
         .flat_map(|line| line.to_str().unwrap_or("unparsable").split(','))
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    // Only the entry the trusted proxy appended matters; anything before it
-    // is client-supplied and may be garbage without affecting the result.
-    entries
-        .get(entries.len().checked_sub(hops as usize)?)?
+        .rfind(|s| !s.is_empty())?
         .parse()
         .ok()
 }
 
-fn peer_hops(extensions: &Extensions, state: &AppState) -> (Option<Peer>, u32) {
+fn peer_trust(extensions: &Extensions, state: &AppState) -> (Option<Peer>, bool) {
     let peer = extensions.get::<ConnectInfo<Peer>>().map(|info| info.0);
-    let hops = trusted_hops(
-        peer,
-        state.unix_proxy_uid,
-        state.trusted_proxy_hops,
-        &state.trusted_proxy_ips,
-    );
-    (peer, hops)
+    (peer, is_trusted_proxy(peer, state.unix_proxy_uid))
 }
 
 /// The client IP used for rate limiting, login lockout, bootstrap network
@@ -113,8 +96,8 @@ pub(crate) fn client_ip(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Option<IpAddr> {
-    let (peer, hops) = peer_hops(extensions, state);
-    forwarded_client(peer, headers, hops)
+    let (peer, trusted) = peer_trust(extensions, state);
+    forwarded_client(peer, headers, trusted)
 }
 
 /// In production TLS ends at Caddy; only a trusted proxy may assert that the
@@ -124,7 +107,7 @@ pub(crate) fn arrived_via_https_proxy(
     headers: &HeaderMap,
     state: &AppState,
 ) -> bool {
-    peer_hops(extensions, state).1 > 0
+    peer_trust(extensions, state).1
         && headers
             .get("x-forwarded-proto")
             .and_then(|value| value.to_str().ok())
@@ -169,7 +152,7 @@ pub fn proxy_identity() -> anyhow::Result<ProxyIdentity> {
     Ok(ProxyIdentity { uid, gid })
 }
 
-/// Bind the API socket inside its systemd-managed runtime directory. The
+/// Bind the API socket inside the directory the Core unit creates. The
 /// directory must carry the proxy's group (setgid, so the socket inherits it)
 /// and grant nothing to anyone else; the socket itself is group read/write
 /// only. Trust still comes from the peer uid, not the mode.
@@ -182,7 +165,10 @@ pub fn bind_api_socket(path: &Path, proxy_gid: u32) -> anyhow::Result<UnixListen
         bail!("unsafe API socket directory: must be owned by Core with no group write or other access");
     }
     if dir.gid() != proxy_gid {
-        bail!("API socket directory group is not the reverse proxy's group; check the jarvis-core unit's chgrp step");
+        bail!("API socket directory group is not the reverse proxy's group; check the jarvis-core unit's ExecStartPre install step");
+    }
+    if dir.mode() & 0o2000 == 0 {
+        bail!("API socket directory must be setgid so the socket gets the reverse proxy's group; check the jarvis-core unit's ExecStartPre install step");
     }
     match fs::symlink_metadata(path) {
         Ok(info) if info.file_type().is_socket() && info.uid() == euid => fs::remove_file(path)?,
@@ -192,6 +178,11 @@ pub fn bind_api_socket(path: &Path, proxy_gid: u32) -> anyhow::Result<UnixListen
     }
     let listener = UnixListener::bind(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o660))?;
+    // Without the proxy's group Caddy could not connect while Core still
+    // looked ready on TCP; refuse to start instead.
+    if fs::symlink_metadata(path)?.gid() != proxy_gid {
+        bail!("API socket did not inherit the reverse proxy's group");
+    }
     Ok(listener)
 }
 
@@ -218,75 +209,75 @@ mod tests {
         headers
     }
 
-    fn loopback() -> Vec<IpAddr> {
-        vec!["127.0.0.1".parse().unwrap()]
-    }
-
     #[test]
     fn unix_socket_trusts_only_the_proxy_uid() {
-        assert_eq!(trusted_hops(unix(PROXY), Some(PROXY), 0, &[]), 1);
-        assert_eq!(
-            trusted_hops(unix(PROXY + 1), Some(PROXY), 1, &loopback()),
-            0
-        );
-        assert_eq!(
-            trusted_hops(Some(Peer::Unix { uid: None }), Some(PROXY), 0, &[]),
-            0
-        );
+        assert!(is_trusted_proxy(unix(PROXY), Some(PROXY)));
+        assert!(!is_trusted_proxy(unix(PROXY + 1), Some(PROXY)));
+        assert!(!is_trusted_proxy(
+            Some(Peer::Unix { uid: None }),
+            Some(PROXY)
+        ));
+        assert!(!is_trusted_proxy(unix(PROXY), None));
     }
 
     #[test]
-    fn tcp_is_never_trusted_once_the_socket_is_enabled() {
-        assert_eq!(trusted_hops(tcp(LOOPBACK), Some(PROXY), 1, &loopback()), 0);
+    fn tcp_is_never_trusted() {
+        for addr in [LOOPBACK, "[::1]:41000", "10.0.0.2:5000"] {
+            assert!(!is_trusted_proxy(tcp(addr), Some(PROXY)));
+            assert!(!is_trusted_proxy(tcp(addr), None));
+        }
+        assert!(!is_trusted_proxy(None, Some(PROXY)));
     }
 
+    /// A loopback TCP peer that forges every forwarding header is keyed by
+    /// its own address, even with the proxy socket configured.
     #[test]
-    fn tcp_keeps_the_legacy_allowlist_without_the_socket() {
-        assert_eq!(trusted_hops(tcp(LOOPBACK), None, 1, &loopback()), 1);
-        assert_eq!(trusted_hops(tcp("10.0.0.2:5000"), None, 1, &loopback()), 0);
-        assert_eq!(trusted_hops(tcp(LOOPBACK), None, 0, &loopback()), 0);
-        assert_eq!(trusted_hops(None, None, 1, &loopback()), 0);
+    fn forged_forwarding_headers_from_tcp_are_ignored() {
+        let headers = xff("10.23.45.10");
+        for proxy in [Some(PROXY), None] {
+            let trusted = is_trusted_proxy(tcp(LOOPBACK), proxy);
+            assert_eq!(
+                forwarded_client(tcp(LOOPBACK), &headers, trusted),
+                Some("127.0.0.1".parse().unwrap())
+            );
+        }
     }
 
     #[test]
     fn untrusted_peers_are_keyed_by_their_own_address() {
         let headers = xff("6.6.6.6");
         assert_eq!(
-            forwarded_client(tcp(LOOPBACK), &headers, 0),
+            forwarded_client(tcp(LOOPBACK), &headers, false),
             Some("127.0.0.1".parse().unwrap())
         );
-        assert_eq!(forwarded_client(unix(PROXY + 1), &headers, 0), None);
-        assert_eq!(forwarded_client(None, &headers, 0), None);
+        assert_eq!(forwarded_client(unix(PROXY + 1), &headers, false), None);
+        assert_eq!(forwarded_client(None, &headers, false), None);
     }
 
     #[test]
-    fn trusted_hops_select_the_client_before_the_proxy_chain() {
+    fn the_trusted_proxy_selects_the_entry_it_appended() {
         let headers = xff("9.9.9.9, 203.0.113.7, 10.0.0.9");
         assert_eq!(
-            forwarded_client(unix(PROXY), &headers, 1),
+            forwarded_client(unix(PROXY), &headers, true),
             Some("10.0.0.9".parse().unwrap())
-        );
-        assert_eq!(
-            forwarded_client(tcp(LOOPBACK), &headers, 2),
-            Some("203.0.113.7".parse().unwrap())
         );
     }
 
     #[test]
     fn trusted_proxy_without_a_usable_header_yields_no_client() {
-        for headers in [HeaderMap::new(), xff("not-an-ip"), xff("9.9.9.9")] {
-            assert_eq!(forwarded_client(tcp(LOOPBACK), &headers, 2), None);
+        for headers in [HeaderMap::new(), xff("not-an-ip"), xff(" , ")] {
+            assert_eq!(forwarded_client(unix(PROXY), &headers, true), None);
         }
         // The selected entry itself must parse.
         let headers = xff("203.0.113.7, not-an-ip");
-        assert_eq!(forwarded_client(unix(PROXY), &headers, 1), None);
+        assert_eq!(forwarded_client(unix(PROXY), &headers, true), None);
     }
 
     #[test]
     fn client_supplied_garbage_before_the_proxy_entry_is_ignored() {
         let headers = xff("not-an-ip, , 203.0.113.7");
         assert_eq!(
-            forwarded_client(unix(PROXY), &headers, 1),
+            forwarded_client(unix(PROXY), &headers, true),
             Some("203.0.113.7".parse().unwrap())
         );
     }
@@ -300,22 +291,22 @@ mod tests {
             axum::http::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
         );
         headers.append("x-forwarded-for", "203.0.113.7".parse().unwrap());
-        // The Unix-socket proxy (one hop) is the last entry of the last line.
+        // The proxy's entry is the last entry of the last line.
         assert_eq!(
-            forwarded_client(unix(PROXY), &headers, 1),
+            forwarded_client(unix(PROXY), &headers, true),
             Some("203.0.113.7".parse().unwrap())
         );
-        // A trusted entry that is the unreadable line yields no client.
-        assert_eq!(forwarded_client(tcp(LOOPBACK), &headers, 2), None);
-        assert_eq!(
-            forwarded_client(tcp(LOOPBACK), &headers, 3),
-            Some("9.9.9.9".parse().unwrap())
+        // An unreadable last line yields no client.
+        headers.append(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
         );
+        assert_eq!(forwarded_client(unix(PROXY), &headers, true), None);
     }
 
     fn private_dir() -> (tempfile::TempDir, u32) {
         let dir = tempfile::tempdir().unwrap();
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o2750)).unwrap();
         let gid = fs::metadata(dir.path()).unwrap().gid();
         (dir, gid)
     }
@@ -354,9 +345,10 @@ mod tests {
     fn unsafe_socket_directories_are_refused() {
         let (dir, gid) = private_dir();
         let path = dir.path().join("api.sock");
-        // Without the proxy's group (a failed chgrp) Core must not listen.
+        // Without the proxy's group (a failed install -d) Core must not listen.
         assert!(bind_api_socket(&path, gid.wrapping_add(1)).is_err());
-        for mode in [0o755, 0o770] {
+        // No setgid bit (the socket would get Core's group), or too open.
+        for mode in [0o750, 0o2755, 0o2770] {
             fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
             assert!(bind_api_socket(&path, gid).is_err());
         }
@@ -372,8 +364,8 @@ mod tests {
             ConnectInfo(peer): ConnectInfo<Peer>,
             headers: HeaderMap,
         ) -> String {
-            let hops = trusted_hops(Some(peer), Some(proxy), 0, &[]);
-            format!("{:?}", forwarded_client(Some(peer), &headers, hops))
+            let trusted = is_trusted_proxy(Some(peer), Some(proxy));
+            format!("{:?}", forwarded_client(Some(peer), &headers, trusted))
         }
         async fn request(dir: &Path, proxy: u32) -> String {
             let path = dir.join(format!("{proxy}.sock"));

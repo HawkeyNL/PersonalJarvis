@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
-use jarvis_api::{build_router, AppState, BrainAvailability};
+use jarvis_api::{build_router, build_tcp_router, AppState, BrainAvailability};
 use jarvis_config::AppConfig;
 
 /// `Some(trimmed)` for a non-empty secret, `None` otherwise — so an unset key
@@ -59,6 +59,16 @@ async fn main() -> anyhow::Result<()> {
         .validate_runtime_security()
         .map_err(anyhow::Error::msg)?;
     jarvis_observability::init(config.log_json);
+
+    // Load Jarvis' protected identity (/etc/jarvis/Jarvis.md) as the system
+    // prompt: the single source of truth for "what Jarvis is". Production
+    // refuses to start without a valid persona, before touching the database;
+    // development falls back to a built-in one.
+    let jarvis_system = jarvis_api::startup_persona(
+        Path::new(&config.llm_persona_path),
+        config.environment.eq_ignore_ascii_case("production"),
+    )
+    .map_err(anyhow::Error::msg)?;
 
     // `config`'s Debug impl redacts database credentials, so this is safe to log.
     tracing::info!(?config, "starting jarvis-api");
@@ -381,16 +391,6 @@ async fn main() -> anyhow::Result<()> {
     );
     tracing::info!(brain = %llm.label(), "llm brain configured");
 
-    // Load Jarvis' protected identity (/etc/jarvis/Jarvis.md) as the system prompt — the single
-    // source of truth for "what Jarvis is". Falls back to a built-in persona if
-    // the file is absent, so the brain always has an identity.
-    let (jarvis_system, persona_loaded) = jarvis_api::load_persona(&config.llm_persona_path);
-    if persona_loaded {
-        tracing::info!(path = %config.llm_persona_path, chars = jarvis_system.len(), "Jarvis persona loaded");
-    } else {
-        tracing::warn!(path = %config.llm_persona_path, "no persona file; using built-in fallback persona");
-    }
-
     // Private agent definitions are installed by the owner as an immutable
     // bundle. Public releases never contain them. Production fails closed when
     // the registry is absent or malformed; development can still run without a
@@ -463,7 +463,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let trusted_proxy_ips = config.trusted_proxy_ips().map_err(anyhow::Error::msg)?;
     let unix_proxy = if config.api_unix_socket.is_empty() {
         None
     } else {
@@ -503,27 +502,43 @@ async fn main() -> anyhow::Result<()> {
         None => app_update_mirror,
     };
 
-    // Owner notifications are optional; an unusable configuration is logged
-    // and leaves them off rather than stopping Core.
-    let notifier = match std::env::var(jarvis_api::notify::URL_ENV)
+    // Owner notifications and app push are optional; an unusable
+    // configuration is logged and leaves that channel off rather than
+    // stopping Core.
+    let ntfy = match std::env::var(jarvis_api::notify::URL_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
     {
-        None => jarvis_api::notify::Notifier::default(),
-        Some(url) => match jarvis_api::notify::Notifier::start(
+        None => None,
+        Some(url) => match jarvis_api::notify::Ntfy::parse(
             &url,
             &std::env::var(jarvis_api::notify::TOKEN_ENV).unwrap_or_default(),
         ) {
-            Ok(notifier) => {
+            Ok(ntfy) => {
                 tracing::info!("owner notifications enabled");
-                notifier
+                Some(ntfy)
             }
             Err(reason) => {
                 tracing::error!(reason, "owner notifications disabled");
-                jarvis_api::notify::Notifier::default()
+                None
             }
         },
     };
+    let apns = match jarvis_api::notify::apns::Config::from_env() {
+        Ok(None) => None,
+        Ok(Some(config)) => {
+            tracing::info!("app push enabled");
+            Some((config, db.clone()))
+        }
+        Err(reason) => {
+            tracing::error!(reason, "app push disabled");
+            None
+        }
+    };
+    let notifier = jarvis_api::notify::Notifier::start(ntfy, apns).unwrap_or_else(|reason| {
+        tracing::error!(reason, "owner notifications disabled");
+        jarvis_api::notify::Notifier::default()
+    });
     notifier.seed_budget(
         spent_cents.load(std::sync::atomic::Ordering::Relaxed),
         budget_cents,
@@ -606,8 +621,6 @@ async fn main() -> anyhow::Result<()> {
             authenticated_per_min: config.authenticated_rate_per_min,
             llm_per_min: config.llm_rate_per_min,
         },
-        trusted_proxy_hops: config.trusted_proxy_hops,
-        trusted_proxy_ips: Arc::new(trusted_proxy_ips),
         unix_proxy_uid: unix_proxy.map(|proxy| proxy.uid),
         bootstrap_enrollment,
         app_update_mirror,
@@ -635,18 +648,14 @@ async fn main() -> anyhow::Result<()> {
             budget_gate.sweep().await;
         }
     });
-    // Expired pairing requests hold the candidate's IP address and User-Agent.
-    let pairing_db = state.db.clone();
+    // Hourly audit housekeeping (dropped-event summary, retention); one run
+    // at a time, each bounded by a timeout.
+    let audit_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
         loop {
             interval.tick().await;
-            let purge = jarvis_identity::purge_expired_pairing_requests(&pairing_db);
-            match tokio::time::timeout(std::time::Duration::from_secs(5), purge).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "pairing request purge failed"),
-                Err(_) => tracing::warn!("pairing request purge timed out"),
-            }
+            jarvis_api::run_audit_maintenance(&audit_state).await;
         }
     });
     let _local_device_admin = if state.environment == "production" {
@@ -658,12 +667,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(addr = %config.bind_addr, "jarvis-api listening");
     // Connect info carries the transport peer (TCP address or Unix peer uid)
     // that decides the client IP and whether forwarding headers are trusted.
-    let router = build_router(state);
+    // Production TCP serves only the health probes; the API is socket-only.
     let tcp = axum::serve(
         listener,
-        router
-            .clone()
-            .into_make_service_with_connect_info::<jarvis_api::Peer>(),
+        build_tcp_router(state.clone()).into_make_service_with_connect_info::<jarvis_api::Peer>(),
     );
     if let Some(proxy) = unix_proxy {
         let socket = Path::new(&config.api_unix_socket);
@@ -671,7 +678,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(path = %socket.display(), "jarvis-api listening on Unix socket");
         let unix = axum::serve(
             unix,
-            router.into_make_service_with_connect_info::<jarvis_api::Peer>(),
+            build_router(state).into_make_service_with_connect_info::<jarvis_api::Peer>(),
         );
         tokio::try_join!(tcp.into_future(), unix.into_future())?;
     } else {

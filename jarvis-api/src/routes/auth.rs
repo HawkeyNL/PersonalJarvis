@@ -21,15 +21,19 @@ use jarvis_client_core::{
 };
 use jarvis_identity as identity;
 
-use crate::audit::record_security_event;
+use crate::audit::{record_security_event, record_unauthenticated_event};
 use crate::error::{bad_request, internal, unauthorized};
+use crate::rate_limit::{
+    allow_authenticated_device, device_password_key, note_password_failure, note_password_verified,
+    password_backoff, ACCOUNT_PASSWORD_BACKOFF, ACCOUNT_PASSWORD_KEY, DEVICE_PASSWORD_BACKOFF,
+};
 use crate::validation;
 use crate::{AppState, Authed};
 
-/// Pre-auth attempts on `/v1/auth/pairing/requests` (each a password check),
-/// for all sources. A correct guess only yields a pending request that a
-/// device or the local root operator must still approve; the budget bounds
-/// guessing and CPU.
+/// Pre-auth attempts on `/v1/auth/pairing/requests` (each a password check
+/// when the owner has a stored password), for all sources. A correct guess
+/// only yields a pending request that a device or the local root operator
+/// must still approve; the budget bounds guessing and CPU.
 const PAIRING_PASSWORD_CHECKS_PER_MIN: u32 = 60;
 
 /// Retryable: no password-check capacity. Never counted as a failed login.
@@ -139,7 +143,8 @@ pub(crate) async fn auth_bootstrap(
     // a direct caller can never make one count.
     let client_ip = crate::peer::client_ip(&extensions, &headers, &state);
     if !client_ip.is_some_and(|ip| policy.allows(ip)) {
-        record_security_event(&state, None, "auth.bootstrap", "rejected_network", None).await;
+        record_unauthenticated_event(&state, None, "auth.bootstrap", "rejected_network", None)
+            .await;
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({ "error": "bootstrap unavailable" })),
@@ -150,7 +155,7 @@ pub(crate) async fn auth_bootstrap(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !policy.verifies(secret) {
-        record_security_event(&state, None, "auth.bootstrap", "invalid_secret", None).await;
+        record_unauthenticated_event(&state, None, "auth.bootstrap", "invalid_secret", None).await;
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({ "error": "bootstrap unavailable" })),
@@ -296,14 +301,22 @@ pub(crate) async fn pairing_create(
             Json(json!({ "error": "first device bootstrap required" })),
         ));
     }
-    // Every pairing request needs the owner's stored account password. An
-    // owner without one (a legacy, dev-enrolled setup) must set it from an
-    // active device first; pairing stays closed until then. A request never
+    // A pairing request needs the owner's stored account password. An owner
+    // without one (a legacy, dev-enrolled setup) must set it from an approver
+    // device first; see below for an owner who has none. A request never
     // grants device authority: an existing device or the local root operator
     // must still approve it.
     // Every attempt spends this global budget, which caps the Argon2 runs
     // across all sources so address rotation buys neither online guesses nor
-    // memory pressure. Validation failures above do not spend it.
+    // memory pressure. Validation failures above do not spend it, and neither
+    // does a request refused by the account-wide password backoff.
+    if state
+        .rate_limiter
+        .password_backoff(ACCOUNT_PASSWORD_KEY, ACCOUNT_PASSWORD_BACKOFF)
+        .is_some()
+    {
+        return Err(password_backoff());
+    }
     if !state.rate_limiter.check_reserved(
         "pairing:global",
         PAIRING_PASSWORD_CHECKS_PER_MIN,
@@ -311,26 +324,56 @@ pub(crate) async fn pairing_create(
     ) {
         return Err(busy());
     }
-    let verified = identity::surreal::account::verify_password(
+    let password_verified = match identity::surreal::account::verify_password(
         &state.db,
         identity::password::PasswordService::pre_auth(),
         user.id,
         password,
     )
     .await
-    .map_err(|error| match error {
-        identity::IdentityError::Busy => busy(),
-        _ => unauthorized(),
-    })?;
-    if verified.is_none() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "account password required",
-                "code": "pairing_password_not_set",
-            })),
-        ));
-    }
+    {
+        Ok(Some(_)) => {
+            note_password_verified(&state, None);
+            true
+        }
+        // A legacy owner without a stored password sets one from an approver
+        // device first. With no approver device that is impossible, so the
+        // request stays possible without a password check, as before; only
+        // the local root operator can approve it then.
+        Ok(None) => {
+            let has_approver = identity::list_active_devices(&state.db, user.id)
+                .await
+                .map_err(internal)?
+                .iter()
+                .any(|device| {
+                    identity::surreal::APPROVER_PLATFORMS.contains(&device.platform.as_str())
+                });
+            if has_approver {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "account password required",
+                        "code": "pairing_password_not_set",
+                    })),
+                ));
+            }
+            false
+        }
+        Err(identity::IdentityError::Busy) => return Err(busy()),
+        Err(identity::IdentityError::PasswordRejected) => {
+            note_password_failure(&state, None);
+            record_unauthenticated_event(
+                &state,
+                None,
+                "device.pairing_request",
+                "password_failed",
+                None,
+            )
+            .await;
+            return Err(unauthorized());
+        }
+        Err(_) => return Err(unauthorized()),
+    };
     let platform =
         identity::Platform::parse(&req.platform).map_err(|_| bad_request("unknown platform"))?;
     let key =
@@ -344,19 +387,35 @@ pub(crate) async fn pairing_create(
                     Json(json!({ "error": "pairing request unavailable" })),
                 )
             })?;
-    // Only a password-verified request gets here, so an unauthenticated
-    // caller cannot trigger a push to the owner's phone.
-    state
-        .notifier
-        .notify(crate::notify::NotifyEvent::PairingRequested);
-    record_security_event(
-        &state,
-        None,
-        "device.pairing_request",
-        "created",
-        Some(&pairing.candidate_fingerprint[..16]),
-    )
-    .await;
+    // Only a password-verified request may reach the owner's phone; an
+    // unauthenticated caller must not be able to trigger pushes.
+    if password_verified {
+        state
+            .notifier
+            .notify_approval(crate::notify::NotifyEvent::PairingRequested, user.id, None);
+    }
+    // A password-verified request is rare and always worth a row; one without
+    // a password check (legacy owner) is budgeted like other anonymous events.
+    let fingerprint = Some(&pairing.candidate_fingerprint[..16]);
+    if password_verified {
+        record_security_event(
+            &state,
+            None,
+            "device.pairing_request",
+            "created",
+            fingerprint,
+        )
+        .await;
+    } else {
+        record_unauthenticated_event(
+            &state,
+            None,
+            "device.pairing_request",
+            "created",
+            fingerprint,
+        )
+        .await;
+    }
     Ok(Json(
         json!({ "request_id": pairing.id, "nonce": hex::encode(pairing.nonce), "expires_at": pairing.expires_at.unix_timestamp() }),
     ))
@@ -405,7 +464,7 @@ pub(crate) async fn pairing_status(
         return Err(unauthorized());
     };
     if just_expired {
-        record_security_event(
+        record_unauthenticated_event(
             &state,
             None,
             "device.pairing_request",
@@ -517,6 +576,14 @@ pub(crate) async fn auth_login(
             Json(json!({ "error": "invalid signature encoding" })),
         )
     })?;
+    // Only a caller holding this device's key can put it into backoff.
+    if state
+        .rate_limiter
+        .password_backoff(&device_password_key(req.device_id), DEVICE_PASSWORD_BACKOFF)
+        .is_some()
+    {
+        return Err(password_backoff());
+    }
     let result = match identity::surreal::login_with_password(
         &state.db,
         req.device_id,
@@ -528,11 +595,27 @@ pub(crate) async fn auth_login(
     {
         Ok(r) => r,
         Err(identity::IdentityError::Busy) => return Err(busy()),
+        // Valid device signature, wrong password: bounded by the device
+        // backoff, so it is always recorded.
+        Err(identity::IdentityError::PasswordRejected) => {
+            note_password_failure(&state, Some(req.device_id));
+            record_security_event(
+                &state,
+                Some(req.device_id),
+                "auth.login",
+                "password_failed",
+                None,
+            )
+            .await;
+            return Err(unauthorized());
+        }
         Err(_) => {
-            record_security_event(&state, Some(req.device_id), "auth.login", "fail", None).await;
+            record_unauthenticated_event(&state, Some(req.device_id), "auth.login", "fail", None)
+                .await;
             return Err(unauthorized());
         }
     };
+    note_password_verified(&state, Some(req.device_id));
     record_security_event(&state, Some(req.device_id), "auth.login", "ok", None).await;
     Ok(Json(json!({
         "token": result.token,
@@ -563,6 +646,83 @@ pub(crate) async fn list_devices(
     Ok(Json(json!({ "devices": items })))
 }
 
+/// Push-target writes (set and delete together) one device may make per minute.
+const PUSH_TARGET_WRITES_PER_MIN: u32 = 6;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PushTargetReq {
+    apns_token: String,
+    apns_env: String,
+}
+
+/// An APNs device token: 64 to 200 hex characters, stored lowercase.
+fn apns_token(raw: &str) -> Option<String> {
+    ((64..=200).contains(&raw.len()) && raw.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| raw.to_ascii_lowercase())
+}
+
+fn push_target_rate_limited(state: &AppState, device: Uuid) -> Option<(StatusCode, Json<Value>)> {
+    (!allow_authenticated_device(state, device, "push-target", PUSH_TARGET_WRITES_PER_MIN)).then(
+        || {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "rate limited" })),
+            )
+        },
+    )
+}
+
+/// Register the calling device's APNs token. Always bound to the session's
+/// own device; a push only says that an approval is waiting.
+pub(crate) async fn push_target_set(
+    authed: Authed,
+    State(state): State<AppState>,
+    Json(req): Json<PushTargetReq>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    if let Some(limited) = push_target_rate_limited(&state, authed.device.id) {
+        return Err(limited);
+    }
+    let token = apns_token(&req.apns_token).ok_or_else(|| bad_request("invalid apns_token"))?;
+    if !matches!(req.apns_env.as_str(), "sandbox" | "production") {
+        return Err(bad_request("invalid apns_env"));
+    }
+    identity::set_push_target(&state.db, authed.device.id, &token, &req.apns_env)
+        .await
+        .map_err(|error| match error {
+            // Held by another account's device: never moved across accounts.
+            identity::IdentityError::AuthFailed => (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "apns_token unavailable" })),
+            ),
+            error => internal(error),
+        })?;
+    record_security_event(&state, Some(authed.device.id), "push.target", "set", None).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove the calling device's push target; idempotent.
+pub(crate) async fn push_target_delete(
+    authed: Authed,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    if let Some(limited) = push_target_rate_limited(&state, authed.device.id) {
+        return Err(limited);
+    }
+    identity::delete_push_target(&state.db, authed.device.id)
+        .await
+        .map_err(internal)?;
+    record_security_event(
+        &state,
+        Some(authed.device.id),
+        "push.target",
+        "deleted",
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Minimal authenticated identity metadata used to bind native pairing signing
 /// without exposing user details to untrusted candidates.
 pub(crate) async fn auth_me(authed: Authed) -> Json<Value> {
@@ -581,15 +741,50 @@ pub(crate) async fn auth_logout(
     Ok(Json(json!({ "status": "logged out" })))
 }
 
+/// Unlock requests one device may create per minute. Bounds the rows and
+/// audit entries a signed-in device can create (pushes are already coalesced
+/// per kind); a retry only needs one, as a new request supersedes the
+/// device's older pending one.
+const UNLOCK_REQUESTS_PER_MIN: u32 = 3;
+
 /// Ask a trusted device to approve unlocking this (requesting) device.
 /// Returns the request id and the nonce an approver must sign.
 pub(crate) async fn unlock_request(
     authed: Authed,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !allow_authenticated_device(
+        &state,
+        authed.device.id,
+        "unlock-request",
+        UNLOCK_REQUESTS_PER_MIN,
+    ) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "rate limited",
+                "hint": "too many attempts; try again later",
+            })),
+        ));
+    }
     let (id, nonce) = identity::create_unlock_request(&state.db, authed.user.id, authed.device.id)
         .await
         .map_err(internal)?;
+    // Enqueue only: a full queue or an unreachable ntfy never delays or fails
+    // the request.
+    state.notifier.notify_approval(
+        crate::notify::NotifyEvent::UnlockRequested,
+        authed.user.id,
+        Some(authed.device.id),
+    );
+    record_security_event(
+        &state,
+        Some(authed.device.id),
+        "unlock.request",
+        "created",
+        Some(&id.to_string()),
+    )
+    .await;
     Ok(Json(json!({
         "request_id": id,
         "nonce": hex::encode(nonce),

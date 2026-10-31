@@ -1,6 +1,6 @@
 [package]
 name = "jarvis-api"
-version = "0.1.21"
+version = "0.1.34"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
@@ -29,7 +29,15 @@ axum.workspace = true
 tower-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-reqwest.workspace = true
+# APNs only speaks HTTP/2. Cargo unifies features, so every reqwest client in
+# a build that links jarvis-api can now negotiate HTTP/2 over TLS (ALPN);
+# plain-HTTP clients stay on HTTP/1.1. A client that must keep HTTP/1.1 over
+# TLS has to call `http1_only()`. Server side, the same unification enables
+# hyper-util's `http2`, so every `axum::serve` listener in jarvis-api (the API
+# Unix socket and the loopback TCP listener) also accepts h2c with prior
+# knowledge. Caddy must keep proxying with HTTP/1.1 upstream (its default;
+# no `versions h2c`), see deploy/caddy/README.md.
+reqwest = { workspace = true, features = ["http2"] }
 async-trait = "0.1"
 serde_bytes.workspace = true
 anyhow.workspace = true
@@ -66,8 +74,12 @@ url.workspace = true
 libc = "0.2"
 tempfile = "3"
 surrealdb.workspace = true
+# ES256 provider tokens for APNs (already in the tree through surrealdb).
+jsonwebtoken = "9.3"
 
 [dev-dependencies]
+# Generates a throwaway P-256 key for the APNs tests (already in the tree).
+ring = "0.17"
 async-trait = "0.1"
 tokio-tungstenite = "0.29"
 futures-util = "0.3"

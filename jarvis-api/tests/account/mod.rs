@@ -164,8 +164,11 @@ async fn ntfy_mock() -> Result<
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let ntfy = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let notifier = jarvis_api::notify::Notifier::start(
-        &format!("http://{}/jarvis-test", ntfy.local_addr()?),
-        "tk_fixture",
+        Some(jarvis_api::notify::Ntfy::parse(
+            &format!("http://{}/jarvis-test", ntfy.local_addr()?),
+            "tk_fixture",
+        )?),
+        None,
     )?;
     let (published, publishes) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -207,7 +210,7 @@ async fn assert_no_push(publishes: &mut tokio::sync::mpsc::UnboundedReceiver<Str
 
 #[tokio::test]
 #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
-async fn pairing_is_refused_while_the_owner_has_no_password(
+async fn pairing_needs_a_password_once_the_owner_can_set_one(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
     db.signin(Root {
@@ -250,6 +253,30 @@ async fn pairing_is_refused_while_the_owner_has_no_password(
     assert!(jarvis_identity::pending_pairing_requests(&db, owner.id)
         .await?
         .is_empty());
+    // Without an approver device the owner cannot set a password, so the
+    // request is still accepted, unpushed, for local root approval.
+    db.query("UPDATE devices SET platform = 'linux'")
+        .await?
+        .check()?;
+    let accepted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/pairing/requests")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({"name":"candidate",
+                    "platform":"android",
+                    "public_key":hex::encode(candidate.verifying_key().to_bytes())}))?))?,
+        )
+        .await?;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    assert_eq!(
+        jarvis_identity::pending_pairing_requests(&db, owner.id)
+            .await?
+            .len(),
+        1
+    );
     assert_no_push(&mut publishes).await;
     Ok(())
 }
@@ -513,5 +540,129 @@ async fn password_activation_requires_signed_approval_and_invalidates_live_sessi
     assert!(subscription.receiver.is_closed());
     assert!(jarvis_identity::authenticate(&db, &token).await.is_err());
     assert!(jarvis_identity::surreal::account::password_required(&db, auth.user.id).await?);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn password_reset_waits_for_local_confirmation_after_signing(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _argon2 = argon2_guard().await;
+    use jarvis_client_core::account::AccountAction;
+    use jarvis_identity::{
+        password::{AccountPassword, PasswordService},
+        surreal::account,
+    };
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("recovery_http_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("fixture")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db.clone(), None).await);
+    let key = SigningKey::from_bytes(&rand::random());
+    let (token, _) = enroll_login(&app, &key).await;
+    let auth = jarvis_identity::authenticate(&db, &token).await?;
+    let path = "/v1/auth/account/password/reset-requests";
+    let new_password = "a disposable recovered HTTP fixture password";
+    // Without a password there is nothing to recover; use password-set.
+    let refused = request(&app, path, &token, json!({"password":new_password})).await;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let hash = |password: &str| {
+        PasswordService::shared().hash(AccountPassword::new(password.to_owned()).unwrap())
+    };
+    let set = account::request_action(
+        &db,
+        auth.user.id,
+        auth.device.id,
+        AccountAction::PasswordSet,
+        auth.user.id,
+        Some(hash("a disposable forgotten HTTP fixture password").await?),
+    )
+    .await?;
+    let signature = key.sign(&account_approval_message(&set)?).to_bytes();
+    account::approve_action(
+        &db,
+        set.request_id,
+        auth.user.id,
+        auth.device.id,
+        &signature,
+    )
+    .await?;
+    let challenge = jarvis_identity::create_challenge(&db, auth.device.id).await?;
+    let proof = jarvis_client_core::login_message(challenge.id, auth.device.id, &challenge.nonce)?;
+    let token = jarvis_identity::surreal::login_with_password(
+        &db,
+        auth.device.id,
+        challenge.id,
+        &key.sign(&proof).to_bytes(),
+        Some(AccountPassword::new(
+            "a disposable forgotten HTTP fixture password".to_owned(),
+        )?),
+    )
+    .await?
+    .token;
+
+    // No current password; unknown fields are refused.
+    let extra = request(
+        &app,
+        path,
+        &token,
+        json!({"password":new_password, "current_password":"x"}),
+    )
+    .await;
+    assert!(extra.status().is_client_error());
+    let prepared = request(&app, path, &token, json!({"password":new_password})).await;
+    assert_eq!(prepared.status(), StatusCode::OK);
+    let body = json_body(prepared).await;
+    assert!(!body.to_string().contains(new_password));
+    assert!(!body.to_string().contains("argon2"));
+    let approval: AccountApproval = serde_json::from_value(body)?;
+    assert_eq!(approval.action, AccountAction::PasswordReset);
+    let approve = format!("/v1/auth/account/requests/{}/approve", approval.request_id);
+    let signature = hex::encode(key.sign(&account_approval_message(&approval)?).to_bytes());
+    let accepted = request(&app, &approve, &token, json!({"signature":signature})).await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let body = json_body(accepted).await;
+    assert_eq!(body["status"], "pending_confirmation");
+    assert_eq!(body["request_id"], approval.request_id.to_string());
+    // Nothing changes until local root confirms on the Home Node.
+    assert!(jarvis_identity::authenticate(&db, &token).await.is_ok());
+    let again = request(&app, path, &token, json!({"password":new_password})).await;
+    assert_eq!(again.status(), StatusCode::TOO_MANY_REQUESTS);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn last_approver_revoke_request_is_a_conflict() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!(
+        "last_approver_http_{}",
+        uuid::Uuid::now_v7().simple()
+    ))
+    .use_db("fixture")
+    .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db.clone(), None).await);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let auth = jarvis_identity::authenticate(&db, &token).await?;
+    let path = format!("/v1/devices/{}/revoke-request", auth.device.id);
+    let refused = request(&app, &path, &token, json!({})).await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert!(json_body(refused).await["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("last approver device")));
+    assert_eq!(jarvis_identity::active_device_count(&db).await?, 1);
     Ok(())
 }

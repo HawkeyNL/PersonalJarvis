@@ -9,7 +9,8 @@ until `JARVIS_NOTIFY_NTFY_URL` is set.
 | Event | Message | Priority | Tap opens |
 |---|---|---|---|
 | Monthly LLM spend reaches 90% of the hard budget (`JARVIS_LLM_MONTHLY_BUDGET_EUR`), once per calendar month (UTC) | Budget reached 90% this month | default | `jarvis://health/usage` |
-| A new device pairing request was created (always with a verified account password) | New device wants to pair — open Jarvis to review | high | `jarvis://approvals/pairing` |
+| A new device pairing request was created with a verified account password | New device wants to pair — open Jarvis to review | high | `jarvis://approvals/pairing` |
+| A signed-in device asks another device to approve its unlock | Approval waiting — open Jarvis | high | `jarvis://approvals/unlock` |
 
 Every push has the title `Jarvis` and nothing else: no amounts, IP addresses,
 device names or key fingerprints. The app shows the details after the owner
@@ -21,13 +22,18 @@ Behaviour in Core:
 - Handlers only enqueue (bounded queue of 16; a full queue drops the event
   and logs a count). One worker publishes with a 5 s timeout per request and
   up to 3 attempts with backoff; 4xx answers other than 429 are not retried.
-- The same event kind is sent at most once per 60 s.
+- The same event kind is sent at most once per 60 s; for unlock requests
+  that holds per requesting device.
 - The budget marker is kept in memory. At startup a month that is already at
   or above 90% counts as notified, so restarts do not repeat the push.
 - Logs name the event kind and HTTP status only, never the token or topic.
-- Core only creates a pairing request after verifying the owner's account
-  password; an owner without one gets `403` (`pairing_password_not_set`) and
-  no push, so an unauthenticated caller cannot trigger one.
+- A pairing request accepted without a password check (an owner with no
+  stored account password) sends no push, so an unauthenticated caller cannot
+  trigger one.
+- An unlock request needs a device session, so only a signed-in device can
+  trigger that push. Each device may create 3 unlock requests per minute. A
+  new one supersedes the same device's older pending request: it disappears
+  from the approval list and can no longer be approved.
 - An invalid URL or a missing or malformed token is logged at startup and
   leaves notifications off; Core keeps running.
 
@@ -135,6 +141,118 @@ journalctl -u jarvis-core --since -5min | grep 'owner notifications'
 
 Expect `owner notifications enabled`. Test by starting a pairing request from
 a new device: the phone shows "New device wants to pair".
+
+## App push to the iOS app (APNs)
+
+Approval events (pairing and unlock requests) can also go straight to the
+Jarvis iOS app through Apple's push service, independent of ntfy. Android
+keeps using ntfy.
+
+- Every push reads `Jarvis` / `Approval waiting` and carries only the
+  approval's deep link. The app fetches the details over the authenticated
+  API, and approving still needs the device signature behind Face ID /
+  Touch ID; a notification has no actions.
+- It goes to the owner's active devices that turned on **Approval
+  notifications** in the app, never to the device that asked, at most 8
+  devices per event, within 30 s. The same coalescing (see above),
+  queue, 5 s timeout and retries as ntfy apply. Headers: `apns-push-type:
+  alert`, `apns-priority: 10`, `apns-expiration` two minutes ahead (the
+  approval expires by then) and an `apns-collapse-id` per kind.
+- A device registers its token with `PUT /v1/devices/self/push`
+  (`{"apns_token": "<hex>", "apns_env": "sandbox"|"production"}`) and
+  removes it with `DELETE`. Both only touch the calling device, at most 6
+  writes per minute. Revoking a device deletes its token in the same
+  transaction. A token APNs reports as gone (`410`, or `400
+  BadDeviceToken`) is deleted.
+- Core only pushes to tokens registered for the configured environment.
+- Logs name the event kind and APNs status only, never a token or device id.
+- What leaves the Home Node: an HTTP/2 request to Apple
+  (`api.sandbox.push.apple.com` or `api.push.apple.com`) with the device
+  token, app id and the static text. Apple sees that and the timing.
+- A missing or invalid setting is logged at startup (`app push disabled`)
+  and leaves app push off; Core keeps running.
+
+### Sideloading and the app id
+
+AltStore and SideStore re-sign the app with the owner's own Apple team:
+
+- They register the app as `com.hawkeynl.jarvis.<TEAMID>` (the bundle id
+  plus the team id), not `com.hawkeynl.jarvis`. The APNs topic is that
+  effective id.
+- They sign with a **development** provisioning profile and take the
+  entitlements from that profile, not from the app. The profile only carries
+  `aps-environment` after the owner enables Push Notifications on that app
+  id (step 3), and its value is then `development`: use the APNs
+  **sandbox**.
+- Neither tool turns the Push Notifications capability on by itself. Not yet
+  verified on a device: whether a later refresh by the tool keeps it on. If
+  approval pushes stop after a refresh, check the capability (step 3).
+
+This needs a paid Apple Developer account; a free account cannot use push.
+
+### Owner setup, in order
+
+1. **APNs key.** Apple Developer portal: Certificates, Identifiers &
+   Profiles → Keys → **+**. Name it (for example `Jarvis APNs`), enable
+   **Apple Push Notifications service (APNs)**, register it and download
+   `AuthKey_<KEYID>.p8`. Apple offers the download only once: keep the file
+   in the password manager. Note the 10-character **Key ID**; the
+   10-character **Team ID** is under Membership details. One key works for
+   every app id of the team, in both environments.
+2. **Install with the paid team.** Sign in to AltStore or SideStore with the
+   Apple account of the paid team and install Jarvis (or refresh it once).
+   This registers the app id `com.hawkeynl.jarvis.<TEAMID>`.
+3. **Push capability.** Portal → Identifiers → that app id → enable **Push
+   Notifications** → Save. No push certificate is needed; the key from
+   step 1 replaces it.
+4. **Re-sign.** In AltStore or SideStore, refresh Jarvis so it fetches a new
+   profile that includes `aps-environment`. If turning on Settings →
+   **Approval notifications** in Jarvis reports a missing push entitlement,
+   check step 3 and refresh again.
+5. **Core settings.** Add to `/etc/jarvis/core.env`:
+
+   ```bash
+   JARVIS_APNS_TEAM_ID=<TEAMID>
+   JARVIS_APNS_KEY_ID=<KEYID>
+   JARVIS_APNS_TOPIC=com.hawkeynl.jarvis.<TEAMID>
+   JARVIS_APNS_ENVIRONMENT=sandbox
+   ```
+
+   `production` is only for a build signed with a distribution (ad hoc or
+   App Store) profile, which this project does not use.
+6. **Signing key.** The key is a Core secret like the provider credentials:
+   one line with the base64 body of the `.p8` file in
+   `/etc/jarvis/secrets/apns.env`, `root:jarvis 0640` (checked by
+   `verify-home-node.sh` for every file in that directory; loaded by
+   `jarvis-core.service` through
+   `EnvironmentFile=-/etc/jarvis/secrets/apns.env`). Copy the `.p8` file to
+   the Home Node over SSH, then:
+
+   ```bash
+   sudo install -o root -g jarvis -m 0640 /dev/null /etc/jarvis/secrets/apns.env
+   { printf 'JARVIS_APNS_KEY_P8='; grep -v -- '-----' AuthKey_<KEYID>.p8 | tr -d '\r\n'; echo; } \
+     | sudo tee /etc/jarvis/secrets/apns.env >/dev/null
+   shred -u AuthKey_<KEYID>.p8
+   ```
+
+   Never paste the key into a chat, ticket or the repository.
+7. **Restart and check.**
+
+   ```bash
+   sudo systemctl restart jarvis-core
+   journalctl -u jarvis-core --since -5min | grep 'app push'
+   ```
+
+   Expect `app push enabled`.
+8. **Phone.** In Jarvis, turn on Settings → **Approval notifications** and
+   allow notifications when iOS asks. Test by requesting
+   an unlock from another signed-in device: the iPhone shows "Approval
+   waiting".
+
+To stop app push, remove the `JARVIS_APNS_*` lines from `core.env`, delete
+`/etc/jarvis/secrets/apns.env` and restart Core. Stored tokens stay unused;
+turning the toggle off in the app deletes its token. Revoking the key in the
+Apple Developer portal stops every push signed with it.
 
 ## Rollback
 

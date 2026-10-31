@@ -37,7 +37,16 @@ grep -Fq '/etc/jarvis' "$prepare"
 grep -Fq 'root -g jarvis -m 0750 /etc/jarvis' "$prepare"
 grep -Fq 'JARVIS_AGENT_ENABLED=false' "$config"
 grep -Fq 'JARVIS_AGENT_CLAUDE_CODE_ENABLED=false' "$config"
-grep -Fq 'JARVIS_TRUSTED_PROXY_HOPS=0' "$config"
+grep -Fxq 'JARVIS_API_UNIX_SOCKET=/run/jarvis-core/api.sock' "$config"
+if grep -Fq 'TRUSTED_PROXY' "$config" "$repo_dir/deploy/systemd/install-home-node-core.sh"; then
+    echo "removed proxy-trust settings are still referenced" >&2
+    exit 1
+fi
+grep -Fq 'production requires JARVIS_API_UNIX_SOCKET=/run/jarvis-core/api.sock' "$repo_dir/deploy/systemd/install-home-node-core.sh"
+grep -Fq 'caddy_not_on_core_tcp' "$verify"
+grep -Fq 'core_tcp_serves_only_health' "$verify"
+grep -Fq 'core_socket_ready || return 1' "$repo_dir/deploy/systemd/update-core-release.sh"
+grep -Fq 'getent passwd caddy' "$repo_dir/deploy/systemd/setup-home-node.sh"
 grep -Fq 'JARVIS_BOOTSTRAP_SECRET_SHA256=' "$config"
 grep -Fq 'sha256sum' "$config"
 grep -Fq 'root:jarvis' "$config"
@@ -76,6 +85,8 @@ grep -Fq 'RuntimeDirectory=jarvis-config-broker' "$repo_dir/deploy/systemd/jarvi
 grep -Fq 'StateDirectory=jarvis-config-broker' "$repo_dir/deploy/systemd/jarvis-config-broker.service"
 grep -Fq 'ui_run_tty "Root configuration checked"' "$repo_dir/deploy/systemd/setup-home-node.sh"
 grep -Fq 'ExecStart=/usr/local/sbin/jarvis update --latest' "$repo_dir/deploy/systemd/jarvis-updater.service"
+# The sandboxed timer installs and restores the release-owned device policy.
+grep -Eq '^ReadWritePaths=.* -/usr/share/polkit-1/actions( |$)' "$repo_dir/deploy/systemd/jarvis-updater.service"
 grep -Fq "'JARVIS_UPDATE_CHANNEL=stable'" "$repo_dir/deploy/systemd/setup-home-node.sh"
 
 echo "Production Home Node bootstrap asset checks passed"

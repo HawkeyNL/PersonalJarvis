@@ -66,8 +66,7 @@ JARVIS_SURREAL_PASSWORD=$db_password
 JARVIS_AGENT_ENABLED=false
 JARVIS_AGENT_CLAUDE_CODE_ENABLED=false
 JARVIS_AGENT_WORKSPACE_ROOT=
-JARVIS_TRUSTED_PROXY_HOPS=0
-JARVIS_TRUSTED_PROXY_IPS=
+JARVIS_API_UNIX_SOCKET=/run/jarvis-core/api.sock
 JARVIS_BOOTSTRAP_SECRET_SHA256=$bootstrap_hash
 JARVIS_BOOTSTRAP_ALLOWED_CIDRS=$bootstrap_cidr
 JARVIS_AUTHENTICATED_RATE_PER_MIN=300
@@ -103,4 +102,4 @@ trap - EXIT
 
 # The raw secret is deliberately written once to the operator's terminal only.
 printf '\nFIRST-OWNER BOOTSTRAP SECRET (show/store once; never paste into logs):\n%s\n\n' "$bootstrap_secret" >/dev/tty
-echo "Core configuration: created $env_file with a verifier only; local-first mode has no public hostname or trusted proxy."
+echo "Core configuration: created $env_file with a verifier only; Caddy reaches the API only through /run/jarvis-core/api.sock."

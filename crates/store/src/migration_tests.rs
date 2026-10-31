@@ -26,7 +26,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 11);
+    assert_eq!(version.unwrap().version, 13);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
@@ -39,19 +39,28 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     db.use_db("from_nine").await?;
     apply_through_nine(&db).await?;
     apply_baseline_schema(&db).await?;
-    db.use_db("from_ten").await?;
-    apply_through_ten(&db).await?;
-    // A v10 pairing row has none of the new optional fields and stays valid.
+    db.use_db("from_eleven").await?;
+    apply_through_eleven(&db).await?;
+    apply_baseline_schema(&db).await?;
+    let from_eleven: Option<SchemaVersion> = db
+        .query("SELECT version FROM schema_version:baseline")
+        .await?
+        .check()?
+        .take(0)?;
+    assert_eq!(from_eleven.unwrap().version, 13);
+    db.use_db("from_twelve").await?;
+    apply_through_twelve(&db).await?;
+    // A v12 pairing row has none of the new optional fields and stays valid.
     db.query("CREATE device_pairing_requests SET id = 'legacy', user_id = 'fixture', candidate_name = 'old', candidate_platform = 'ios', candidate_public_key = <bytes>'k', candidate_fingerprint = 'f', nonce = <bytes>'n', status = 'pending', created_at = time::now(), expires_at = time::now() + 5m;")
         .await?.check()?;
     apply_baseline_schema(&db).await?;
-    let mut migrated = db
+    let mut from_twelve = db
         .query("SELECT version FROM schema_version:baseline; SELECT VALUE candidate_ip = NONE FROM device_pairing_requests:legacy;")
         .await?
         .check()?;
-    let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
-    assert_eq!(migrated_version.unwrap().version, 11);
-    let legacy_has_no_ip: Vec<bool> = migrated.take(1)?;
+    let from_twelve_version: Option<SchemaVersion> = from_twelve.take(0)?;
+    assert_eq!(from_twelve_version.unwrap().version, 13);
+    let legacy_has_no_ip: Vec<bool> = from_twelve.take(1)?;
     assert_eq!(legacy_has_no_ip, [true]);
     // The database bounds the new fields even if Core validation regressed.
     let too_long = db
@@ -61,6 +70,60 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .check();
     assert!(too_long.is_err());
     db.query("UPDATE device_pairing_requests:legacy SET candidate_ip = '192.0.2.1', candidate_user_agent = 'ua', candidate_app_version = '0.1.14', candidate_model = 'Pixel 9';")
+        .await?
+        .check()?;
+    db.use_db("from_ten").await?;
+    apply_through_ten(&db).await?;
+    // A pending v10 account action stays valid across the migration.
+    db.query("CREATE account_actions SET id = 'legacy', user_id = 'fixture', device_id = 'd', action = 'password-set', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
+        .await?.check()?;
+    assert!(db
+        .query("CREATE account_actions SET id = 'early', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
+        .await?
+        .check()
+        .is_err());
+    apply_baseline_schema(&db).await?;
+    let mut migrated = db
+        .query("SELECT version FROM schema_version:baseline; SELECT VALUE action FROM account_actions:legacy;")
+        .await?
+        .check()?;
+    let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
+    assert_eq!(migrated_version.unwrap().version, 13);
+    let legacy: Vec<String> = migrated.take(1)?;
+    assert_eq!(legacy, ["password-set"]);
+    db.query("CREATE account_actions SET id = 'reset', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
+        .await?.check()?;
+    // The database itself allows one pending recovery per owner.
+    let pending = "CREATE account_recoveries SET id = $id, user_id = 'fixture', device_id = 'd', slot = 'fixture', verifier = NONE, status = 'pending', created_at = time::now(), expires_at = time::now() + 15m, resolved_at = NONE;";
+    db.query(pending).bind(("id", "first")).await?.check()?;
+    assert!(db
+        .query(pending)
+        .bind(("id", "second"))
+        .await?
+        .check()
+        .is_err());
+    // One push target per device; malformed kinds, tokens and environments
+    // are refused by the schema itself.
+    let (token, other) = ("ab".repeat(32), "cd".repeat(32));
+    let create = |device: &str, kind: &str, target: &str, env: &str| {
+        format!("CREATE device_push_targets SET id = '{device}', device_id = '{device}', kind = '{kind}', target = '{target}', apns_env = '{env}', updated_at = time::now();")
+    };
+    db.query(create("d", "apns", &token, "sandbox"))
+        .await?
+        .check()?;
+    for bad in [
+        // A second row for the same device.
+        create("e", "apns", &other, "sandbox").replace("device_id = 'e'", "device_id = 'd'"),
+        // The same token on a second device.
+        create("e", "apns", &token, "sandbox"),
+        create("e", "fcm", &other, "sandbox"),
+        create("e", "apns", &"ab".repeat(16), "sandbox"),
+        create("e", "apns", &"ab".repeat(101), "sandbox"),
+        create("e", "apns", &other, "development"),
+    ] {
+        assert!(db.query(&bad).await?.check().is_err(), "{bad}");
+    }
+    db.query(create("e", "apns", &other, "production"))
         .await?
         .check()?;
     db.query("UPDATE schema_version:baseline SET version = 99;")

@@ -92,7 +92,7 @@ pub fn run(command: DeviceCommand, json: bool) -> Result<()> {
     }
 }
 
-fn print(data: &serde_json::Value) -> Result<()> {
+pub(crate) fn print(data: &serde_json::Value) -> Result<()> {
     // JSON escaping neutralizes ASCII control characters in remote device
     // names, not Unicode bidi/format characters; `trust` shows names next to
     // fingerprints with `shown`. Never initialize a transient TUI here.
@@ -243,7 +243,7 @@ fn escaped(value: &str, max_chars: usize) -> String {
 
 /// Remote device names are capped and debug-escaped (control and bidi
 /// characters) so they cannot disguise a fingerprint.
-fn shown(value: &str) -> String {
+pub(crate) fn shown(value: &str) -> String {
     let capped: String = value.chars().take(64).collect();
     format!("{capped:?}")
 }
@@ -336,7 +336,7 @@ fn jarvis_gid() -> Result<u32> {
 }
 
 /// One request over the root-peer local socket; returns the reply's `data`.
-fn exchange(request: &DeviceRequest) -> Result<serde_json::Value> {
+pub(crate) fn exchange(request: &DeviceRequest) -> Result<serde_json::Value> {
     let mut bytes = serde_json::to_vec(request)?;
     DeviceRequest::parse(&bytes).map_err(anyhow::Error::msg)?;
     let account = unsafe { libc::getpwnam(c"jarvis".as_ptr()) };

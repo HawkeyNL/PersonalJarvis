@@ -22,6 +22,8 @@ EnvironmentFile=-/etc/jarvis/secrets/huggingface.env
 EnvironmentFile=-/etc/jarvis/secrets/jev.env
 # Optional owner-notification publisher token (docs/NOTIFICATIONS.md).
 EnvironmentFile=-/etc/jarvis/secrets/ntfy.env
+# Optional APNs signing key for approval pushes to the iOS app.
+EnvironmentFile=-/etc/jarvis/secrets/apns.env
 ExecStart=/opt/jarvis/current/jarvis-api
 # `systemctl reload` re-reads the staged private agent bundle only. A failed
 # reload keeps the previous bundle and reports the registry degraded.
@@ -31,15 +33,16 @@ RestartSec=5s
 TimeoutStartSec=30s
 TimeoutStopSec=30s
 UMask=0077
-RuntimeDirectory=jarvis-core-admin jarvis-core
+RuntimeDirectory=jarvis-core-admin
 RuntimeDirectoryMode=0700
-# Home of the opt-in API socket for Caddy (JARVIS_API_UNIX_SOCKET). The
-# directory becomes jarvis:caddy 2750: Caddy may traverse it, and the setgid
-# bit gives the socket Core creates (mode 0660) the caddy group without adding
-# Core to that group. If the chgrp fails the directory stays jarvis:jarvis and
-# Core refuses to open the socket (and to start) while it is configured.
-ExecStartPre=-+/usr/bin/chgrp caddy /run/jarvis-core
-ExecStartPre=+/usr/bin/chmod 2750 /run/jarvis-core
+# Home of the API socket for Caddy (JARVIS_API_UNIX_SOCKET, required in
+# production): jarvis:caddy 2750, so Caddy may traverse it and the setgid bit
+# gives the socket Core creates (mode 0660) the caddy group without adding Core
+# to that group. Not a RuntimeDirectory=: systemd resets those to User:Group
+# and RuntimeDirectoryMode before every Exec* command, including ExecReload.
+# install -d also repairs a directory left by an earlier unit. Without a caddy
+# group it creates nothing and Core refuses to open the socket and to start.
+ExecStartPre=-+/usr/bin/install -d -o jarvis -g caddy -m 2750 /run/jarvis-core
 
 # Core owns no host files at runtime: durable application state is SurrealDB.
 # Keep the release read-only and make host compromise harder without granting
@@ -55,6 +58,8 @@ ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ReadWritePaths=/var/lib/jarvis
+# ProtectSystem=strict makes /run read-only; "-": absent without a caddy group.
+ReadWritePaths=-/run/jarvis-core
 # Agent releases are a root-activated read-only subtree even though Core may
 # retain unrelated runtime state below /var/lib/jarvis.
 ReadOnlyPaths=/var/lib/jarvis/agents

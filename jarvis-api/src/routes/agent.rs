@@ -78,6 +78,27 @@ fn approval_message(
     jarvis_client_core::agent_approval_message(pending_id, nonce, &action_sha256, device_id).ok()
 }
 
+/// Pending actions one user may have waiting. Bounds the pending list (each
+/// entry can carry up to 16 KiB of `action_json` plus its preview) so approver
+/// clients can always read it.
+const MAX_PENDING_AGENT_ACTIONS: u64 = 16;
+
+/// Whether a device on `platform` may approve `action`. A phone approves only
+/// the kinds it can show in full and only actions small enough to be listed in
+/// full. macOS keeps its earlier rule (every kind) until the desktop app shows
+/// and re-hashes `action_json` too. Any other platform or kind is refused.
+fn approvable_on(platform: &str, action: &agent::Action, action_json: &str) -> bool {
+    match platform {
+        "macos" => true,
+        "ios" | "android" => {
+            jarvis_client_core::MOBILE_APPROVABLE_AGENT_ACTIONS
+                .contains(&agent::action_type(action))
+                && action_json.len() <= jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN
+        }
+        _ => false,
+    }
+}
+
 /// Run a single read-only agent action (ADR-029 phase 4a). Gated by the kill
 /// switch + a configured sandbox; only `Auto` (read-only) actions run; every
 /// attempt — ok, denied, or error — is written to the append-only audit log.
@@ -127,6 +148,36 @@ pub(crate) async fn agent_action(
                 ));
             }
         };
+        // ponytail: count-then-create, so concurrent proposals can pass the cap
+        // by a few (the list stays capped); a transaction if that ever matters.
+        let refusal = match pending_count(&state, authed.user.id).await {
+            Some(count) if count < MAX_PENDING_AGENT_ACTIONS => None,
+            Some(_) => Some((
+                "denied",
+                "pending cap",
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many agent actions are waiting for approval",
+            )),
+            None => Some((
+                "error",
+                "pending count failed",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "could not check pending actions",
+            )),
+        };
+        if let Some((outcome, note, status, error)) = refusal {
+            record_agent_audit(
+                &state,
+                authed.device.id,
+                &at,
+                detail,
+                risk,
+                outcome,
+                Some(note),
+            )
+            .await;
+            return Err((status, Json(json!({ "error": error }))));
+        }
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
         let id = Uuid::now_v7();
@@ -202,15 +253,39 @@ pub(crate) async fn agent_action(
     }
 }
 
+/// Live pending actions of `user_id`; `None` when the count failed.
+async fn pending_count(state: &AppState, user_id: Uuid) -> Option<u64> {
+    let rows: Result<Vec<Value>, surrealdb::Error> = async {
+        state
+            .db
+            .query(
+                "SELECT count() AS n FROM agent_pending_actions WHERE user_id = $user_id \
+                 AND status = 'pending' AND expires_at > time::now() GROUP ALL",
+            )
+            .bind(json!({"user_id": user_id.to_string()}))
+            .await?
+            .take(0)
+    }
+    .await;
+    match rows {
+        Ok(rows) => Some(rows.first().and_then(|row| row["n"].as_u64()).unwrap_or(0)),
+        Err(error) => {
+            tracing::warn!(%error, "failed to count pending actions");
+            None
+        }
+    }
+}
+
 /// Mutating actions awaiting the owner's device-signed approval (ADR-029 4b).
 pub(crate) async fn agent_pending(authed: Authed, State(state): State<AppState>) -> Json<Value> {
     let rows: Vec<PendingListRow> = match state
         .db
-        .query(
+        .query(format!(
             "SELECT record::id(id) AS id, action_type, action, preview, nonce, created_at \
          FROM agent_pending_actions WHERE user_id = $user_id AND status = 'pending' \
-         AND expires_at > time::now() ORDER BY created_at DESC",
-        )
+         AND expires_at > time::now() ORDER BY created_at DESC \
+         LIMIT {MAX_PENDING_AGENT_ACTIONS}"
+        ))
         .bind(json!({"user_id": authed.user.id.to_string()}))
         .await
     {
@@ -220,12 +295,20 @@ pub(crate) async fn agent_pending(authed: Authed, State(state): State<AppState>)
             Vec::new()
         }
     };
+    let approver = identity::surreal::APPROVER_PLATFORMS.contains(&authed.device.platform.as_str());
     let entries: Vec<Value> = rows
         .into_iter()
         .map(|row| {
+            // The exact bytes `action_sha256` hashes, so an approver can show and
+            // re-hash them; omitted (null) when too large to review on a phone,
+            // and for devices that cannot approve.
+            let action_json = (approver
+                && row.action.len() <= jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN)
+                .then_some(row.action.as_str());
             json!({ "pending_id": row.id, "action": row.action_type, "preview": row.preview,
                 "nonce": hex::encode(row.nonce),
                 "action_sha256": hex::encode(Sha256::digest(row.action.as_bytes())),
+                "action_json": action_json,
                 "approval_message": jarvis_client_core::AGENT_APPROVAL_MESSAGE_V1,
                 "created_at": row.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() })
         })
@@ -236,7 +319,8 @@ pub(crate) async fn agent_pending(authed: Authed, State(state): State<AppState>)
 /// Approve a pending mutation by signing its `agent-approval-v1` message with a
 /// trusted device, then execute it once (ADR-029 4b). Raw-nonce signatures (the
 /// pre-v1 format, and what login/unlock sign) are refused. The signature proves
-/// owner presence (the device key is biometric-gated); the stored action is what
+/// owner presence (the approving device asks for biometrics; on mobile the key
+/// itself is biometric-bound); the stored action is what
 /// runs — the LLM can propose, only a signed human can commit.
 pub(crate) async fn agent_pending_approve(
     authed: Authed,
@@ -280,6 +364,29 @@ pub(crate) async fn agent_pending_approve(
         )
     })?;
 
+    let action: agent::Action = serde_json::from_str(&action_json).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "corrupt pending action" })),
+        )
+    })?;
+    if !approvable_on(&authed.device.platform, &action, &action_json) {
+        record_agent_audit(
+            &state,
+            authed.device.id,
+            &at,
+            None,
+            agent::RiskClass::NeedsApproval,
+            "denied",
+            Some("not approvable on this platform"),
+        )
+        .await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "this action cannot be approved on this device" })),
+        ));
+    }
+
     // Verify the owner's device signature over the action-bound v1 message.
     let message =
         approval_message(id, &nonce, &action_json, authed.device.id).ok_or_else(|| {
@@ -317,13 +424,6 @@ pub(crate) async fn agent_pending_approve(
             Json(json!({ "error": "already resolved" })),
         ));
     }
-
-    let action: agent::Action = serde_json::from_str(&action_json).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "corrupt pending action" })),
-        )
-    })?;
 
     match agent::execute(&sandbox, &action).await {
         Ok(outcome) => {
@@ -440,6 +540,70 @@ mod tests {
             assert!(!verify(&other.unwrap(), &signature));
         }
         assert!(approval_message(id, &nonce[..31], action, device).is_none());
+    }
+
+    #[test]
+    fn phones_approve_only_listed_kinds_they_can_show_in_full() {
+        let write = |content: String| agent::Action::WriteFile {
+            path: "note.txt".into(),
+            content,
+        };
+        let json = |action: &agent::Action| serde_json::to_string(action).unwrap();
+        let small = write("ok".into());
+        let commit = agent::Action::GitCommit {
+            message: "x".into(),
+        };
+        let code = agent::Action::ClaudeCode { prompt: "x".into() };
+        // Exactly at the limit, and one byte over.
+        let overhead = json(&write(String::new())).len();
+        let limit =
+            write("x".repeat(jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN - overhead));
+        assert_eq!(
+            json(&limit).len(),
+            jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN
+        );
+        let large =
+            write("x".repeat(jarvis_client_core::MAX_REVIEWABLE_ACTION_JSON_LEN + 1 - overhead));
+        for phone in ["ios", "android"] {
+            assert!(approvable_on(phone, &small, &json(&small)));
+            assert!(approvable_on(phone, &limit, &json(&limit)));
+            assert!(!approvable_on(phone, &commit, &json(&commit)));
+            assert!(!approvable_on(phone, &code, &json(&code)));
+            assert!(!approvable_on(phone, &large, &json(&large)));
+        }
+        for action in [&small, &commit, &code, &large] {
+            assert!(approvable_on("macos", action, &json(action)));
+            for other in ["linux", "windows", "", "iOS"] {
+                assert!(!approvable_on(other, action, &json(action)));
+            }
+        }
+    }
+
+    /// serde_json's escaping, which the phone apps re-create to hash what they
+    /// show: `"`, `\\`, \b \f \n \r \t, other controls as lowercase `\u00xx`;
+    /// DEL, `/`, U+2028 and non-ASCII stay raw UTF-8.
+    #[test]
+    fn stored_action_json_escaping_matches_the_mobile_vector() {
+        let action = agent::Action::WriteFile {
+            path: "a/\"b\".txt".into(),
+            content: "\\\u{8}\u{c}\n\r\t\u{1}\u{1f}\u{7f}é\u{2028}😀".into(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(
+            json,
+            "{\"type\":\"write_file\",\"path\":\"a/\\\"b\\\".txt\",\"content\":\"\\\\\\b\\f\\n\\r\\t\\u0001\\u001f\u{7f}é\u{2028}😀\"}"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(json.as_bytes())),
+            "e151c338cf311d5531b50c2451032bb04fe5bb8e6bfb5e6ab6535a1080f51aa5"
+        );
+        let commit = agent::Action::GitCommit {
+            message: "Fix \"x\"\n\nBody".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&commit).unwrap(),
+            r#"{"type":"git_commit","message":"Fix \"x\"\n\nBody"}"#
+        );
     }
 
     #[test]
