@@ -553,6 +553,50 @@ async fn password_activation_requires_signed_approval_and_invalidates_live_sessi
 
 #[tokio::test]
 #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn desktop_devices_cannot_approve_setting_a_password(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The pairing fallback for a password-less owner without an approver
+    // device relies on exactly this: a Linux or Windows device cannot set one.
+    let _argon2 = argon2_guard().await;
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("account_desktop_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("fixture")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db.clone(), None).await);
+    let key = SigningKey::from_bytes(&rand::random());
+    let (token, _) = enroll_login(&app, &key).await;
+    let auth = jarvis_identity::authenticate(&db, &token).await?;
+    for platform in ["linux", "windows"] {
+        db.query("UPDATE devices SET platform = $platform")
+            .bind(("platform", platform))
+            .await?
+            .check()?;
+        let prepared = request(
+            &app,
+            "/v1/auth/account/password/requests",
+            &token,
+            json!({"password":"only a disposable desktop fixture password"}),
+        )
+        .await;
+        assert_eq!(prepared.status(), StatusCode::OK, "{platform}");
+        let approval: AccountApproval = serde_json::from_value(json_body(prepared).await)?;
+        let path = format!("/v1/auth/account/requests/{}/approve", approval.request_id);
+        let signature = hex::encode(key.sign(&account_approval_message(&approval)?).to_bytes());
+        let refused = request(&app, &path, &token, json!({"signature":signature})).await;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{platform}");
+        assert!(!jarvis_identity::surreal::account::password_required(&db, auth.user.id).await?);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
 async fn password_reset_waits_for_local_confirmation_after_signing(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _argon2 = argon2_guard().await;

@@ -35,16 +35,20 @@ pub fn printable_ascii(value: &str, max_len: usize) -> bool {
         && value.bytes().all(|b| (b' '..=b'~').contains(&b))
 }
 
-/// No control, zero-width or bidi formatting characters, so a device name
-/// shown next to a fingerprint cannot hide or reorder what the owner reads.
+/// No control, zero-width, bidi, line/paragraph separator, variation
+/// selector, tag, Hangul filler or interlinear annotation characters, so a
+/// device name shown next to a fingerprint cannot hide or reorder what the
+/// owner reads.
 /// Other Unicode stays allowed: default names such as "Gus’s iPhone" use it.
 /// ponytail: explicit denylist of the invisible/bidi code points, not the
 /// whole Unicode `Cf` category; switch to a category table if one is needed.
 pub fn no_hidden_chars(value: &str) -> bool {
     !value.chars().any(|c| {
         c.is_control()
-            || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+            || matches!(c, '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}'
+                | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}')
     })
 }
 
@@ -104,6 +108,19 @@ mod tests {
             "a\u{2066}b",
             "\u{FEFF}a",
             "a\u{AD}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{E0000}b",
+            "a\u{E0041}b",
+            "a\u{E007F}b",
+            "a\u{FE00}b",
+            "a\u{FE0F}b",
+            "a\u{34F}b",
+            "a\u{115F}b",
+            "a\u{1160}b",
+            "a\u{3164}b",
+            "a\u{FFF9}b",
+            "a\u{FFFB}b",
         ] {
             assert!(!no_hidden_chars(bad), "{bad:?}");
         }
