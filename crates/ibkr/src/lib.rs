@@ -4,10 +4,15 @@
 //! Gateway; this client only performs read-only GETs against the gateway.
 //! Broker-provided market values are surfaced as `f64` (display only) — our own
 //! money math uses Decimal elsewhere.
+//!
+//! [`oauth`] is the token-only replacement: a first-party OAuth 1.0a client that
+//! talks to `api.ibkr.com` directly, without the gateway.
 
 use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+pub mod oauth;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -20,16 +25,30 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 pub enum IbkrError {
     #[error("gateway base URL must be a credential-free https URL")]
     InvalidBaseUrl,
-    #[error("gateway request failed")]
+    #[error("IBKR request failed")]
     Http(#[source] reqwest::Error),
-    #[error("gateway response exceeds {MAX_BODY_BYTES} bytes")]
+    #[error("IBKR response exceeds {MAX_BODY_BYTES} bytes")]
     TooLarge,
-    #[error("gateway response is not valid JSON")]
+    #[error("IBKR response is not valid JSON")]
     Decode(#[source] serde_json::Error),
-    #[error("gateway is not authenticated")]
+    #[error("IBKR session is not authenticated")]
     NotAuthenticated,
     #[error("no account available")]
     NoAccount,
+    #[error("IBKR OAuth credential is invalid: {0}")]
+    Credential(&'static str),
+    #[error("IBKR OAuth handshake failed: {0}")]
+    Handshake(&'static str),
+    #[error("IBKR rejected the request as unauthorized")]
+    Unauthorized,
+    #[error("IBKR rate limit hit; retry in {retry_after_secs} s")]
+    RateLimited { retry_after_secs: u64 },
+    #[error("too many queued IBKR requests")]
+    Busy,
+    #[error("IBKR session token unavailable; retry in {retry_after_secs} s")]
+    MintCooldown { retry_after_secs: u64 },
+    #[error("invalid IBKR request parameter: {0}")]
+    InvalidInput(&'static str),
 }
 
 impl From<reqwest::Error> for IbkrError {
@@ -99,11 +118,7 @@ impl IbkrClient {
         {
             return Err(IbkrError::InvalidBaseUrl);
         }
-        let http = reqwest::Client::builder()
-            .https_only(true)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .build()?;
+        let http = hardened_http().build()?;
         Ok(Self {
             base: base_url.trim_end_matches('/').to_string(),
             http,
@@ -127,27 +142,42 @@ impl IbkrClient {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, IbkrError> {
-        let mut response = self
+        let response = self
             .http
             .get(format!("{}{path}", self.base))
             .send()
             .await?
             .error_for_status()?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_BODY_BYTES as u64)
-        {
-            return Err(IbkrError::TooLarge);
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            if body.len() + chunk.len() > MAX_BODY_BYTES {
-                return Err(IbkrError::TooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = read_capped(response).await?;
         serde_json::from_slice(&body).map_err(IbkrError::Decode)
     }
+}
+
+/// HTTP client builder shared by both IBKR clients: https only, verified TLS
+/// (the rustls default) and bounded connect/request time.
+fn hardened_http() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .https_only(true)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+}
+
+/// Read a response body, refusing more than [`MAX_BODY_BYTES`] while reading.
+async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, IbkrError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_BODY_BYTES as u64)
+    {
+        return Err(IbkrError::TooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(IbkrError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]

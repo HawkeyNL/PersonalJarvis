@@ -13,6 +13,20 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
+tokio = { workspace = true }
+rust_decimal.workspace = true
+rand.workspace = true
+sha2.workspace = true
+hex.workspace = true
+zeroize = "1"
+# OAuth 1.0a: RSA for the access-token secret and the LST request signature,
+# DER/PEM for the DH parameters, HMAC-SHA1/SHA256 for the session token.
+rsa = { version = "0.9", features = ["sha2"] }
+der = { version = "0.7", features = ["pem"] }
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+percent-encoding = "2"
 
 [dev-dependencies]
-tokio.workspace = true
+tempfile = "3"
