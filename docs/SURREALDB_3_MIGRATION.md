@@ -220,7 +220,7 @@ The statements were extracted from all Rust string literals.
   them only through `--stage` plus `--migrate-staged`, which
   `jarvis update --migrate <tag>` wraps. It works like this:
   - The candidate's `release.json` must declare
-    `schema_migration.version == 1`, a target of 8 to 12 (`:147`), and
+    `schema_migration.version == 1`, a target of 8 to 15 (`:147`), and
     the active fingerprint in `from_sha256`.
   - `schema-backup create` takes a cold snapshot, then
     `activate_managed_release` runs and Core migrates itself at startup.
