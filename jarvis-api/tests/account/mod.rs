@@ -333,6 +333,14 @@ async fn pairing_records_validated_candidate_details_for_the_approver(
     )
     .await;
     let nonce = hex::decode(challenge["nonce"].as_str().ok_or("no nonce")?)?;
+    let proof = jarvis_client_core::login_message(
+        challenge["challenge_id"]
+            .as_str()
+            .ok_or("no challenge")?
+            .parse()?,
+        device.id,
+        &nonce,
+    )?;
     let login = app
         .clone()
         .oneshot(
@@ -343,7 +351,7 @@ async fn pairing_records_validated_candidate_details_for_the_approver(
                 .body(Body::from(serde_json::to_vec(
                     &json!({"device_id": device.id,
                     "challenge_id": challenge["challenge_id"], "password": password,
-                    "signature": hex::encode(owner_key.sign(&nonce).to_bytes())}),
+                    "signature": hex::encode(owner_key.sign(&proof).to_bytes())}),
                 )?))?,
         )
         .await?;
