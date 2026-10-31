@@ -550,7 +550,10 @@ async fn main() -> anyhow::Result<()> {
         environment: config.environment.clone(),
         require_https: config.environment.eq_ignore_ascii_case("production"),
         dev_enrollment: config.dev_enrollment,
-        ibkr_gateway_url: config.ibkr_gateway_url.clone(),
+        ibkr: jarvis_ibkr::IbkrClient::new(&config.ibkr_gateway_url)
+            .map_err(|error| tracing::warn!(%error, "IBKR gateway client disabled"))
+            .ok()
+            .map(Arc::new),
         llm,
         fast_intent_router: {
             use jarvis_api::intent::{

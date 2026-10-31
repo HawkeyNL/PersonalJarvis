@@ -11,8 +11,6 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use jarvis_ibkr as ibkr;
-
 use crate::{AppState, Authed};
 
 pub(crate) fn ibkr_down() -> (StatusCode, Json<Value>) {
@@ -27,9 +25,8 @@ pub(crate) fn ibkr_down() -> (StatusCode, Json<Value>) {
 
 /// IBKR gateway reachability + auth status (read-only).
 pub(crate) async fn ibkr_status(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
-    let client = match ibkr::IbkrClient::new(&state.ibkr_gateway_url) {
-        Ok(c) => c,
-        Err(_) => return Json(json!({ "reachable": false, "authenticated": false })),
+    let Some(client) = state.ibkr.as_deref() else {
+        return Json(json!({ "reachable": false, "authenticated": false }));
     };
     match client.auth_status().await {
         Ok(s) => Json(json!({
@@ -52,7 +49,7 @@ pub(crate) async fn ibkr_positions(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let client = ibkr::IbkrClient::new(&state.ibkr_gateway_url).map_err(|_| ibkr_down())?;
+    let client = state.ibkr.as_deref().ok_or_else(ibkr_down)?;
     let status = client.auth_status().await.map_err(|_| ibkr_down())?;
     if !status.authenticated {
         return Err(ibkr_down());

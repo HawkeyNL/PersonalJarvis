@@ -40,7 +40,9 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         environment: "test".to_string(),
         require_https: false,
         dev_enrollment: true,
-        ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
+        ibkr: jarvis_ibkr::IbkrClient::new("https://localhost:5000/v1/api")
+            .ok()
+            .map(Arc::new),
         llm: jarvis_llm::stub(),
         fast_intent_router: None,
         llm_max_tokens: 256,
