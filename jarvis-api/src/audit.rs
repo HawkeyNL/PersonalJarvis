@@ -169,7 +169,8 @@ pub async fn prune_security_audit(db: &jarvis_store::Database) -> Result<usize, 
 }
 
 /// Hourly audit housekeeping: report dropped unauthenticated events even when
-/// no new one arrives, then apply retention.
+/// no new one arrives, then apply retention to audit rows and to the expired
+/// login challenges and pairing requests that anonymous callers can create.
 pub async fn run_audit_maintenance(state: &AppState) {
     flush_dropped_audit(state).await;
     match tokio::time::timeout(
@@ -182,6 +183,17 @@ pub async fn run_audit_maintenance(state: &AppState) {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => tracing::warn!(%error, "security audit retention failed"),
         Err(_) => tracing::warn!("security audit retention timed out"),
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        jarvis_identity::prune_expired_auth_state(&state.db),
+    )
+    .await
+    {
+        Ok(Ok(deleted)) if deleted > 0 => tracing::info!(deleted, "expired auth state pruned"),
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "expired auth state pruning failed"),
+        Err(_) => tracing::warn!("expired auth state pruning timed out"),
     }
 }
 
