@@ -4,12 +4,12 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use der::{asn1::UintRef, Reader as _};
 use hmac::{Hmac, Mac};
+use num_bigint::BigUint;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::{rngs::OsRng, RngCore};
-use rsa::{
-    pkcs1v15::SigningKey,
-    signature::{RandomizedSigner, SignatureEncoding},
-    BigUint,
+use ring::{
+    rand::SystemRandom,
+    signature::{RsaKeyPair, RSA_PKCS1_SHA256},
 };
 use sha1::Sha1;
 use sha2::Sha256;
@@ -61,9 +61,27 @@ pub(crate) fn authorization_header(realm: &str, params: &[(&str, &str)]) -> Stri
 }
 
 /// Percent-encoded base64 RSA-SHA256 (PKCS#1 v1.5) signature, for the LST request.
-pub(crate) fn rsa_sha256_signature(key: &SigningKey<Sha256>, base: &str) -> String {
-    let signature = key.sign_with_rng(&mut OsRng, base.as_bytes());
-    encode(&B64.encode(signature.to_bytes()))
+pub(crate) fn rsa_sha256_signature(key: &RsaKeyPair, base: &str) -> Result<String, IbkrError> {
+    let mut signature = vec![0; key.public().modulus_len()];
+    key.sign(
+        &RSA_PKCS1_SHA256,
+        &SystemRandom::new(),
+        base.as_bytes(),
+        &mut signature,
+    )
+    .map_err(|_| IbkrError::Handshake("signing the LST request failed"))?;
+    Ok(encode(&B64.encode(signature)))
+}
+
+/// DER body of the first PEM block with exactly this label.
+pub(crate) fn pem_body(pem: &str, label: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let start = pem.find(&begin)? + begin.len();
+    let body = &pem[start..start + pem[start..].find(&end)?];
+    let text: Zeroizing<String> =
+        Zeroizing::new(body.chars().filter(|c| !c.is_whitespace()).collect());
+    B64.decode(text.as_bytes()).ok().map(Zeroizing::new)
 }
 
 /// Percent-encoded base64 HMAC-SHA256 signature keyed by the LST bytes.
@@ -81,10 +99,12 @@ pub(crate) fn random_hex(bytes: usize) -> String {
 }
 
 /// A fresh 256-bit DH private value `a`.
-pub(crate) fn dh_private() -> Zeroizing<BigUint> {
+// ponytail: num-bigint has no Zeroize, so `a` and K stay in memory until the
+// allocator reuses them; they live for one mint and protect a 24 h token.
+pub(crate) fn dh_private() -> BigUint {
     let mut buf = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(buf.as_mut());
-    Zeroizing::new(BigUint::from_bytes_be(buf.as_ref()))
+    BigUint::from_bytes_be(buf.as_ref())
 }
 
 /// Java `BigInteger.toByteArray()` encoding of a positive integer: minimal
@@ -116,7 +136,7 @@ pub(crate) fn live_session_token(
     if b <= one || b >= prime - &one {
         return Err(IbkrError::Handshake("DH response out of range"));
     }
-    let k = Zeroizing::new(b.modpow(a, prime));
+    let k = b.modpow(a, prime);
     let mut mac = Hmac::<Sha1>::new_from_slice(&java_bytes(&k)).expect("HMAC takes any key length");
     mac.update(secret);
     Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
@@ -136,11 +156,8 @@ pub(crate) fn lst_signature_matches(lst: &[u8], consumer_key: &str, expected_hex
 /// which IBKR uses and the challenge is computed with.
 pub(crate) fn dh_prime(pem: &str) -> Result<BigUint, IbkrError> {
     const INVALID: IbkrError = IbkrError::Credential("DH parameters");
-    let (label, document) = der::Document::from_pem(pem).map_err(|_| INVALID)?;
-    if label != "DH PARAMETERS" {
-        return Err(INVALID);
-    }
-    let mut reader = der::SliceReader::new(document.as_bytes()).map_err(|_| INVALID)?;
+    let document = pem_body(pem, "DH PARAMETERS").ok_or(INVALID)?;
+    let mut reader = der::SliceReader::new(&document).map_err(|_| INVALID)?;
     let (prime, generator) = reader
         .sequence(|nested| {
             let prime = BigUint::from_bytes_be(nested.decode::<UintRef<'_>>()?.as_bytes());
@@ -195,10 +212,10 @@ pub(crate) mod tests {
         .encode_to_vec(&mut der)
         .unwrap();
         der.extend_from_slice(&body);
-        let document = der::Document::try_from(der).unwrap();
-        document
-            .to_pem("DH PARAMETERS", der::pem::LineEnding::LF)
-            .unwrap()
+        format!(
+            "-----BEGIN DH PARAMETERS-----\n{}\n-----END DH PARAMETERS-----\n",
+            B64.encode(der)
+        )
     }
 
     const TEST_LST: &str = "YBWbLw+9RYP2nWrPQHxHZkBb1aM=";

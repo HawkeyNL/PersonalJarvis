@@ -9,6 +9,13 @@
 //!
 //! The public API only exposes fixed read endpoints: there is no generic
 //! request method, and no order, reply, what-if, cancel or account-switch call.
+//!
+//! Expected setup: the portal shows the access token secret RSA-encrypted
+//! (base64). It is decrypted once, at credential setup and outside Core, e.g.
+//! `base64 -d secret.b64 | openssl pkeyutl -decrypt -inkey
+//! private_encryption.pem | xxd -p -c0`, and only that lowercase hex (the
+//! base-string "prepend") is stored in a root-only file. Core never loads the
+//! encryption key and does no RSA decryption at runtime.
 
 mod crypto;
 mod types;
@@ -19,14 +26,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use num_bigint::BigUint;
 use reqwest::{header, Method, StatusCode};
-use rsa::{
-    pkcs1::DecodeRsaPrivateKey, pkcs1v15::SigningKey, pkcs8::DecodePrivateKey, BigUint,
-    Pkcs1v15Encrypt, RsaPrivateKey,
-};
+use ring::signature::RsaKeyPair;
 use serde::{de::DeserializeOwned, Deserialize};
-use sha2::Sha256;
 use tokio::{sync::Mutex, time::Instant};
 use zeroize::Zeroizing;
 
@@ -65,10 +68,10 @@ const SSODH_INIT_BODY: &str = r#"{"publish":true,"compete":false}"#;
 pub struct OAuthCredentialFiles {
     pub consumer_key: PathBuf,
     pub access_token: PathBuf,
-    /// Base64 RSA ciphertext of the access token secret, as shown by the portal.
-    pub encrypted_access_token_secret: PathBuf,
+    /// The decrypted access token secret as hex (see the module docs).
+    pub access_token_secret_prepend_hex: PathBuf,
+    /// RSA private signature key, PKCS#8 or PKCS#1 PEM.
     pub signature_key: PathBuf,
-    pub encryption_key: PathBuf,
     pub dh_param: PathBuf,
 }
 
@@ -79,7 +82,7 @@ pub struct OAuthCredentials {
     access_token: Zeroizing<String>,
     /// Decrypted access token secret.
     secret: Zeroizing<Vec<u8>>,
-    signing_key: SigningKey<Sha256>,
+    signing_key: RsaKeyPair,
     dh_prime: BigUint,
     realm: String,
 }
@@ -98,10 +101,17 @@ fn read_secret(path: &PathBuf, what: &'static str) -> Result<Zeroizing<String>, 
         .map_err(|_| IbkrError::Credential(what))
 }
 
-fn rsa_key(pem: &str, what: &'static str) -> Result<RsaPrivateKey, IbkrError> {
-    RsaPrivateKey::from_pkcs8_pem(pem)
-        .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
-        .map_err(|_| IbkrError::Credential(what))
+/// PKCS#8 (`BEGIN PRIVATE KEY`, OpenSSL 3) or PKCS#1 (`BEGIN RSA PRIVATE
+/// KEY`, OpenSSL 1.x) RSA key; ring requires 2048 to 8192 bits.
+fn signing_key(pem: &str) -> Result<RsaKeyPair, IbkrError> {
+    let key = if let Some(der) = crypto::pem_body(pem, "PRIVATE KEY") {
+        RsaKeyPair::from_pkcs8(&der)
+    } else if let Some(der) = crypto::pem_body(pem, "RSA PRIVATE KEY") {
+        RsaKeyPair::from_der(&der)
+    } else {
+        return Err(IbkrError::Credential("signature key"));
+    };
+    key.map_err(|_| IbkrError::Credential("signature key"))
 }
 
 fn is_token(value: &str, max: usize, allowed: impl Fn(char) -> bool) -> bool {
@@ -109,8 +119,7 @@ fn is_token(value: &str, max: usize, allowed: impl Fn(char) -> bool) -> bool {
 }
 
 impl OAuthCredentials {
-    /// Load and validate all credential files and decrypt the access token
-    /// secret. `realm` is `limited_poa` for individual accounts (live and
+    /// Load and validate all credential files. `realm` is `limited_poa` for individual accounts (live and
     /// paper). Blocking file I/O: call once at startup or via `spawn_blocking`.
     pub fn load(files: &OAuthCredentialFiles, realm: &str) -> Result<Self, IbkrError> {
         if !is_token(realm, 32, |c| c.is_ascii_lowercase() || c == '_') {
@@ -129,26 +138,15 @@ impl OAuthCredentials {
         if !is_token(&access_token, 128, |c| c.is_ascii_alphanumeric()) {
             return Err(IbkrError::Credential("access token"));
         }
-        let encrypted = read_secret(&files.encrypted_access_token_secret, "access token secret")?;
-        let ciphertext = B64
-            .decode(encrypted.trim())
-            .map_err(|_| IbkrError::Credential("access token secret"))?;
-        let encryption_key = rsa_key(
-            &read_secret(&files.encryption_key, "encryption key")?,
-            "encryption key",
-        )?;
+        const PREPEND: &str = "access token secret prepend";
+        let prepend = read_secret(&files.access_token_secret_prepend_hex, PREPEND)?;
         let secret = Zeroizing::new(
-            encryption_key
-                .decrypt_blinded(&mut rand::rngs::OsRng, Pkcs1v15Encrypt, &ciphertext)
-                .map_err(|_| IbkrError::Credential("access token secret"))?,
+            hex::decode(prepend.trim()).map_err(|_| IbkrError::Credential(PREPEND))?,
         );
         if secret.is_empty() {
-            return Err(IbkrError::Credential("access token secret"));
+            return Err(IbkrError::Credential(PREPEND));
         }
-        let signing_key = SigningKey::new(rsa_key(
-            &read_secret(&files.signature_key, "signature key")?,
-            "signature key",
-        )?);
+        let signing_key = signing_key(&read_secret(&files.signature_key, "signature key")?)?;
         let dh_prime = crypto::dh_prime(&read_secret(&files.dh_param, "DH parameters")?)?;
         Ok(Self {
             consumer_key,
@@ -534,7 +532,7 @@ impl IbkrOAuthClient {
         ];
         let prepend = Zeroizing::new(hex::encode(&*creds.secret));
         let base = Zeroizing::new(crypto::base_string(&prepend, "POST", &url, &params));
-        let signature = crypto::rsa_sha256_signature(&creds.signing_key, &base);
+        let signature = crypto::rsa_sha256_signature(&creds.signing_key, &base)?;
         params.push(("oauth_signature", &signature));
         let authorization = crypto::authorization_header(&creds.realm, &params);
         let request = self

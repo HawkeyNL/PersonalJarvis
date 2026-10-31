@@ -1,23 +1,19 @@
 //! Client tests against an in-process fake of the IBKR OAuth endpoints. The
 //! fake checks the RSA and HMAC signatures independently of the client state,
-//! so a wrongly signed request fails with 401. All keys are generated here.
+//! so a wrongly signed request fails with 401. The RSA key under `testdata/`
+//! was generated for these tests only and is not used anywhere else.
 
 use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex as StdMutex, OnceLock,
+        Arc, Mutex as StdMutex,
     },
 };
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use percent_encoding::percent_decode_str;
-use rsa::{
-    pkcs1::EncodeRsaPrivateKey,
-    pkcs1v15::{Signature, VerifyingKey},
-    pkcs8::{EncodePrivateKey, LineEnding},
-    signature::Verifier,
-    RsaPublicKey,
-};
+use ring::signature::{UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
@@ -26,9 +22,11 @@ const CONSUMER_KEY: &str = "TESTCONS";
 const ACCESS_TOKEN: &str = "6f531f8fd316915af53f";
 const SECRET: &[u8] = b"test-access-token-secret";
 
-fn test_key() -> &'static RsaPrivateKey {
-    static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
-    KEY.get_or_init(|| RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).unwrap())
+const TEST_KEY_PKCS8: &str = include_str!("testdata/test_only_rsa.pkcs8.pem");
+const TEST_KEY_PKCS1: &str = include_str!("testdata/test_only_rsa.pkcs1.pem");
+
+fn test_key() -> RsaKeyPair {
+    signing_key(TEST_KEY_PKCS8).unwrap()
 }
 
 fn credentials() -> OAuthCredentials {
@@ -36,7 +34,7 @@ fn credentials() -> OAuthCredentials {
         consumer_key: Zeroizing::new(CONSUMER_KEY.into()),
         access_token: Zeroizing::new(ACCESS_TOKEN.into()),
         secret: Zeroizing::new(SECRET.to_vec()),
-        signing_key: SigningKey::new(test_key().clone()),
+        signing_key: test_key(),
         dh_prime: crypto::tests::prime(),
         realm: "limited_poa".into(),
     }
@@ -125,11 +123,8 @@ impl Fake {
                         .as_bytes(),
                 )
                 .unwrap();
-            VerifyingKey::<Sha256>::new(RsaPublicKey::from(test_key()))
-                .verify(
-                    base.as_bytes(),
-                    &Signature::try_from(raw.as_slice()).unwrap(),
-                )
+            UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, test_key().public().as_ref())
+                .verify(base.as_bytes(), &raw)
                 .expect("LST request signature");
             let p = crypto::tests::prime();
             let challenge = param("diffie_hellman_challenge").unwrap();
@@ -497,22 +492,17 @@ fn pacer_spaces_requests_and_blocks_after_429() {
 #[test]
 fn loads_credential_files_and_redacts_debug() {
     let dir = tempfile::tempdir().unwrap();
-    let key = test_key();
     let write = |name: &str, contents: &str| {
         let path = dir.path().join(name);
         std::fs::write(&path, contents).unwrap();
         path
     };
-    let ciphertext = RsaPublicKey::from(key)
-        .encrypt(&mut rand::rngs::OsRng, Pkcs1v15Encrypt, SECRET)
-        .unwrap();
     let files = OAuthCredentialFiles {
         consumer_key: write("consumer_key", "TESTCONS\n"),
         access_token: write("access_token", ACCESS_TOKEN),
-        encrypted_access_token_secret: write("secret", &format!("{}\n", B64.encode(ciphertext))),
-        // PKCS#8 (OpenSSL 3) and PKCS#1 (OpenSSL 1.x) are both accepted.
-        signature_key: write("sig.pem", &key.to_pkcs8_pem(LineEnding::LF).unwrap()),
-        encryption_key: write("enc.pem", &key.to_pkcs1_pem(LineEnding::LF).unwrap()),
+        // What the setup step stores after decrypting the portal's ciphertext.
+        access_token_secret_prepend_hex: write("prepend", &format!("{}\n", hex::encode(SECRET))),
+        signature_key: write("sig.pem", TEST_KEY_PKCS8),
         dh_param: write(
             "dhparam.pem",
             &crypto::tests::dhparam_pem(&crypto::tests::prime(), 2, None),
@@ -544,12 +534,32 @@ fn loads_credential_files_and_redacts_debug() {
         OAuthCredentials::load(&files, "Limited POA"),
         Err(IbkrError::Credential("realm"))
     ));
-    let wrong_ciphertext = OAuthCredentialFiles {
-        encrypted_access_token_secret: write("bad", &B64.encode([7u8; 128])),
-        ..files
+    // PKCS#1 (OpenSSL 1.x) is accepted as well as PKCS#8 (OpenSSL 3).
+    let pkcs1 = OAuthCredentialFiles {
+        signature_key: write("sig1.pem", TEST_KEY_PKCS1),
+        ..files.clone()
+    };
+    OAuthCredentials::load(&pkcs1, "limited_poa").unwrap();
+    let not_a_key = OAuthCredentialFiles {
+        signature_key: write(
+            "sig2.pem",
+            "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
+        ),
+        ..files.clone()
     };
     assert!(matches!(
-        OAuthCredentials::load(&wrong_ciphertext, "limited_poa"),
-        Err(IbkrError::Credential("access token secret"))
+        OAuthCredentials::load(&not_a_key, "limited_poa"),
+        Err(IbkrError::Credential("signature key"))
     ));
+    for bad in ["", "abc", "zz", "6162 63"] {
+        let prepend = OAuthCredentialFiles {
+            access_token_secret_prepend_hex: write("bad", bad),
+            ..files.clone()
+        };
+        let error = OAuthCredentials::load(&prepend, "limited_poa").unwrap_err();
+        assert!(
+            matches!(error, IbkrError::Credential("access token secret prepend")),
+            "{bad}"
+        );
+    }
 }
