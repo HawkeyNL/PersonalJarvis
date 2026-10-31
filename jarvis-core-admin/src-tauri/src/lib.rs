@@ -359,7 +359,7 @@ async fn device_action(
 
 #[cfg(feature = "desktop")]
 pub fn run() {
-    if let Err(error) = admin::root_guard() {
+    if let Err(error) = admin::root_guard().and_then(|()| admin::mark_non_dumpable()) {
         eprintln!("jarvis-core-admin: {error}");
         std::process::exit(1);
     }

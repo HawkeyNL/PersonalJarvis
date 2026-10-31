@@ -856,6 +856,19 @@ pub fn root_guard() -> AdminResult<()> {
     }
 }
 
+/// The app holds the pipes of the authenticated root broker. A dumpable process
+/// lets any other process of the desktop user reopen them through
+/// `/proc/<pid>/fd` and send root operations without the password.
+pub fn mark_non_dumpable() -> AdminResult<()> {
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(format!(
+            "could not protect the administration session: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 pub fn overview(session: &SessionManager) -> AdminResult<OverviewResponse> {
     let status = status(session)?;
     let update = update_values(session, false).ok();
@@ -2410,6 +2423,12 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_process_becomes_non_dumpable() {
+        mark_non_dumpable().unwrap();
+        assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
+    }
 
     #[test]
     fn housekeeping_record_is_summarized_or_absent() {
