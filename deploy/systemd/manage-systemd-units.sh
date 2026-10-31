@@ -340,7 +340,7 @@ validate_artifacts() {
         # a migration to N has at most N - 1 of them. The bound grows with
         # every migration instead of a fixed cap needing a bump each time,
         # and stays small because the target itself is allowlisted.
-        jq -e '.schema_migration | .version == 1 and (.target == 8 or .target == 9 or .target == 10 or .target == 11 or .target == 12 or .target == 13) and
+        jq -e '.schema_migration | .version == 1 and (.target == 8 or .target == 9 or .target == 10 or .target == 11 or .target == 12 or .target == 13 or .target == 14 or .target == 15) and
             (.from_sha256 | type == "array" and length > 0) and (.from_sha256 | length) < .target and
             (.from_sha256 | all(type == "string" and test("^[0-9a-f]{64}$")))' "$release/release.json" >/dev/null || fail "unsupported schema migration declaration"
         [[ -f $release/schema-backup && ! -L $release/schema-backup && -x $release/schema-backup ]] || fail "schema backup helper is missing or unsafe"
