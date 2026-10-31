@@ -157,7 +157,9 @@ pub struct AppState {
     pub require_https: bool,
     /// Dev-only `/v1/auth/enroll`; config refuses it in production.
     pub dev_enrollment: bool,
-    pub ibkr_gateway_url: String,
+    /// One IBKR gateway client shared by every request. `None` when the
+    /// configured gateway URL is refused (e.g. not https).
+    pub ibkr: Option<Arc<jarvis_ibkr::IbkrClient>>,
     /// The brain (DEC-001) — provider-abstracted, swappable at runtime.
     pub llm: Arc<dyn llm::LlmProvider>,
     /// Optional provider-neutral advisory classifier cascade, never authority.
