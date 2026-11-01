@@ -154,13 +154,16 @@ build_members() {
 # untrusted: owner names could shift fields, so the split listing is numeric,
 # and the size is matched, never evaluated arithmetically.
 check_members() {
-    local archive=$1 listing mode size name
+    local archive=$1 listing mode owner size name
     listing=$(tar --numeric-owner -tvf "$archive" 2>/dev/null) || fail 'archive is not a readable tar'
     [[ $(tar -tf "$archive" | LC_ALL=C sort) == "$(printf '%s\n' "${members[@]}")" ]] || fail 'unexpected archive members'
-    while read -r mode _ size _ _ name; do
+    # Owner names (even "0" or ones holding a newline) make the named listing
+    # differ from the numeric one.
+    [[ $(tar -tvf "$archive" 2>/dev/null) == "$listing" ]] || fail 'unexpected member owner'
+    while read -r mode owner size _ _ name; do
+        [[ $owner == 0/0 ]] || fail 'unexpected member owner'
         [[ $mode == -* && $size =~ ^[1-9][0-9]*$ ]] || fail "member $name is not a non-empty regular file"
     done <<< "$listing"
-    tar -tvf "$archive" | awk '$2 != "0/0" { bad = 1 } END { exit bad }' || fail 'unexpected member owner'
 }
 
 # Publish $staging as <dest>/jarvis-backup-<day>.tar(.sha256). The tar is
@@ -266,7 +269,7 @@ decrypt_archive() {
     gpg --batch --quiet --homedir "$gnupg_home" --import 2>/dev/null || fail 'cannot import the private key from stdin'
     gpg --batch --homedir "$gnupg_home" --list-secret-keys --with-colons 2>/dev/null \
         | awk -F: '$1 == "sec" { found = 1 } END { exit !found }' || fail 'stdin holds no private key'
-    tar -C "$run_dir/members" -xf "$copy" "${members[@]}"
+    tar -C "$run_dir/members" --no-same-owner -xf "$copy" "${members[@]}"
     rm -f -- "$copy" "$copy.sha256"
     ( ulimit -f "$max_manifest_kib" && decrypt_member manifest.json.gpg > "$out/manifest.json" ) \
         || fail 'cannot decrypt the manifest (wrong key or over 1 MiB?)'

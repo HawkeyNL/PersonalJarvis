@@ -319,6 +319,11 @@ message=$( (cd "$local_root/inj" && verify "$local_archive") 2>&1 ) && exit 1
 [[ $message == *'unexpected member owner'* && ! -e $local_root/inj/PWNED ]]
 message=$( (cd "$local_root/inj" && verify_decrypt "$local_archive") < "$local_root/key.asc" 2>&1 ) && exit 1
 [[ $message == *'unexpected member owner'* && ! -e $local_root/inj/PWNED ]]
+# An owner name "0" over uid 1000 looks like 0/0 in the named listing only.
+tar -C "$local_root/open.good" --owner=0:1000 --group=0:1000 -cf "$local_archive" "${members[@]}"
+(cd "$local_root/dest" && sha256sum -- "${local_archive##*/}") > "$local_archive.sha256"
+message=$(verify "$local_archive" 2>&1) && exit 1
+[[ $message == *'unexpected member owner'* ]]
 # A configuration tar with a symlink is refused, like in disaster recovery.
 mkdir -p "$local_root/linked/etc/jarvis" "$local_root/stage2"
 ln -s /etc/shadow "$local_root/linked/etc/jarvis/link"
