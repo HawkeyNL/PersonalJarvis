@@ -100,6 +100,10 @@ if jq -e '.tooling.codex_chat_worker? == 1' "$release_dir/release.json" >/dev/nu
     [[ -x $release_dir/jarvis-codex-chat-worker && ! -L $release_dir/jarvis-codex-chat-worker ]] ||
         fail "Codex chat worker is invalid"
 fi
+if jq -e '.tooling.ibkr_broker? == 1' "$release_dir/release.json" >/dev/null 2>&1; then
+    [[ -x $release_dir/jarvis-ibkr-broker && ! -L $release_dir/jarvis-ibkr-broker ]] ||
+        fail "IBKR broker is invalid"
+fi
 [[ -x $release_dir/jarvis-agent-bundle && ! -L $release_dir/jarvis-agent-bundle ]] || fail "agent-bundle validator is invalid"
 [[ -x $release_dir/jarvis && ! -L $release_dir/jarvis ]] || fail "Jarvis admin binary is invalid"
 [[ -x $release_dir/update-core-release && ! -L $release_dir/update-core-release ]] || \

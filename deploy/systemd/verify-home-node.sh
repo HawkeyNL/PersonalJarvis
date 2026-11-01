@@ -274,6 +274,21 @@ if systemctl is-active --quiet jarvis-codex-chat.socket; then
 else
     ui_detail "Codex chat worker: inactive (optional)"
 fi
+# Optional owner-enabled IBKR broker: when it runs, its identity and socket
+# boundary are mandatory.
+if systemctl is-active --quiet jarvis-ibkr-broker.service; then
+    check "IBKR broker uses its own identity with Core's socket group" bash -c \
+        '[[ $(systemctl show -p User --value jarvis-ibkr-broker.service) == jarvis-ibkr && $(systemctl show -p Group --value jarvis-ibkr-broker.service) == jarvis ]]'
+    check "IBKR identity has no extra group access" bash -c \
+        '[[ $(id -nG jarvis-ibkr) == jarvis-ibkr ]]'
+    check "IBKR broker socket is private to Core's group" bash -c \
+        '[[ -S /run/jarvis-ibkr-broker/broker.sock && ! -L /run/jarvis-ibkr-broker/broker.sock && $(stat -c "%U:%G:%a" /run/jarvis-ibkr-broker/broker.sock) == jarvis-ibkr:jarvis:660 ]]'
+    check "IBKR credential directory is root-only" bash -c \
+        '[[ -d /etc/jarvis/secrets/ibkr-oauth && ! -L /etc/jarvis/secrets/ibkr-oauth && $(stat -c "%U:%G:%a" /etc/jarvis/secrets/ibkr-oauth) == root:root:700 ]]'
+    ui_detail "IBKR broker: active (optional; read-only)"
+else
+    ui_detail "IBKR broker: inactive (optional)"
+fi
 # Never removed automatically: the owner deletes the retired chat login.
 if getent passwd jarvis-codex-chat >/dev/null || [[ -e /var/lib/jarvis-codex-chat || -L /var/lib/jarvis-codex-chat ]]; then
     ui_warning "legacy jarvis-codex-chat identity or /var/lib/jarvis-codex-chat is no longer used and can be removed (docs/SUBSCRIPTION_WORKERS.md)"

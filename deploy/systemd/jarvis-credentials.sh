@@ -15,11 +15,109 @@ fail() { echo "jarvis-credentials: $*" >&2; exit 1; }
 usage() {
     cat >&2 <<'EOF'
 Usage: sudo jarvis-credentials <set|list|test|remove> [provider]
+       sudo jarvis-credentials <set|status> ibkr-oauth
 
 Providers: anthropic, openai, deepseek, xai, zai, ollama-cloud, huggingface, jev.
 Local Ollama has no credential; configure its loopback URL/model in core.env.
+ibkr-oauth: the read-only IBKR broker; never readable by Core.
 EOF
     exit 64
+}
+
+# IBKR OAuth for the read-only broker. The values sit beside the owner-made
+# keys in a root-only directory; systemd hands them to the broker with
+# LoadCredential=. Core never reads them. Tests may point these elsewhere.
+ibkr_oauth_dir=$secret_dir/ibkr-oauth
+ibkr_root_uid=0
+readonly -a ibkr_oauth_items=(consumer_key access_token access_token_secret private_signature.pem dhparam.pem)
+
+# Regular, not a link, non-empty, root-owned, no group/other permissions.
+ibkr_private_ok() {
+    local metadata
+    [[ -e $1 && ! -L $1 ]] || return 1
+    metadata=$(stat -c '%u:%a' "$1") || return 1
+    [[ ${metadata%%:*} == "$ibkr_root_uid" ]] && (( (8#${metadata#*:} & 077) == 0 ))
+}
+
+ibkr_read_hidden() {
+    local value
+    printf 'Enter IBKR %s (input hidden): ' "$1" >/dev/tty
+    IFS= read -r -s value </dev/tty || return 1
+    printf '\n' >/dev/tty
+    printf '%s' "$value"
+}
+
+# Base64 ciphertext on stdin, lowercase hex of the secret on stdout. Implicit
+# rejection is off: OpenSSL 3.2+ otherwise answers a wrong key or damaged
+# ciphertext with random bytes instead of an error.
+ibkr_decrypt_secret() {
+    base64 -d 2>/dev/null |
+        openssl pkeyutl -decrypt -inkey "$1" -pkeyopt rsa_padding_mode:pkcs1 \
+            -pkeyopt rsa_pkcs1_implicit_rejection:0 2>/dev/null |
+        od -An -v -tx1 | tr -d ' \n'
+}
+
+ensure_ibkr_identity() {
+    getent passwd jarvis-ibkr >/dev/null ||
+        useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin jarvis-ibkr
+}
+
+# NAME VALUE ...: stage every file root-only 0400, then rename all in place.
+ibkr_install_values() (
+    local -a names=() staged=()
+    local tmp index
+    trap 'rm -f -- "${staged[@]}"' EXIT
+    while (($# >= 2)); do
+        tmp=$(mktemp "$ibkr_oauth_dir/.$1.XXXXXX") || return 1
+        staged+=("$tmp")
+        names+=("$1")
+        printf '%s\n' "$2" > "$tmp" && chown root:root "$tmp" && chmod 0400 "$tmp" || return 1
+        shift 2
+    done
+    for index in "${!names[@]}"; do
+        mv -f -- "${staged[$index]}" "$ibkr_oauth_dir/${names[$index]}" || return 1
+    done
+)
+
+set_ibkr_oauth() (
+    local consumer_key access_token encrypted prepend key
+    require_tty
+    command -v openssl >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 ||
+        fail "openssl and base64 are required"
+    [[ -d $ibkr_oauth_dir ]] && ibkr_private_ok "$ibkr_oauth_dir" ||
+        fail "$ibkr_oauth_dir must be a root-only directory holding the generated keys"
+    for key in private_encryption.pem private_signature.pem dhparam.pem; do
+        [[ -f $ibkr_oauth_dir/$key && -s $ibkr_oauth_dir/$key ]] && ibkr_private_ok "$ibkr_oauth_dir/$key" ||
+            fail "$key is missing or not root-only in $ibkr_oauth_dir"
+    done
+    trap 'unset consumer_key access_token encrypted prepend' EXIT
+    umask 077
+    consumer_key=$(ibkr_read_hidden "consumer key") || fail "could not read the consumer key"
+    [[ $consumer_key =~ ^[A-Z0-9]{1,32}$ ]] || fail "the consumer key must be 1-32 uppercase letters or digits"
+    access_token=$(ibkr_read_hidden "access token") || fail "could not read the access token"
+    [[ $access_token =~ ^[A-Za-z0-9]{1,128}$ ]] || fail "the access token must be 1-128 letters or digits"
+    encrypted=$(ibkr_read_hidden "access token secret (encrypted, base64)") ||
+        fail "could not read the access token secret"
+    [[ $encrypted =~ ^[A-Za-z0-9+/]+={0,2}$ && ${#encrypted} -le 4096 ]] ||
+        fail "the access token secret must be the base64 text shown by IBKR"
+    prepend=$(printf '%s' "$encrypted" | ibkr_decrypt_secret "$ibkr_oauth_dir/private_encryption.pem") &&
+        [[ $prepend =~ ^[0-9a-f]+$ ]] ||
+        fail "the access token secret does not decrypt with private_encryption.pem; nothing was changed"
+    ensure_ibkr_identity || fail "could not create the jarvis-ibkr service identity"
+    ibkr_install_values consumer_key "$consumer_key" access_token "$access_token" \
+        access_token_secret "$prepend" || fail "could not save the IBKR credentials"
+    # A running broker loads the new values; a stopped one stays stopped.
+    systemctl try-restart jarvis-ibkr-broker.service >/dev/null 2>&1 || true
+    echo "jarvis-credentials: IBKR OAuth credentials saved. Enable the broker with: sudo systemctl enable --now jarvis-ibkr-broker.service"
+)
+
+ibkr_oauth_status() {
+    local item state
+    for item in "${ibkr_oauth_items[@]}"; do
+        state=empty
+        [[ -f $ibkr_oauth_dir/$item && -s $ibkr_oauth_dir/$item ]] && ibkr_private_ok "$ibkr_oauth_dir/$item" && state=set
+        printf '%-24s %s\n' "$item" "$state"
+    done
 }
 
 provider_var() {
@@ -315,7 +413,11 @@ remove_credential() {
 main() {
     [[ ${EUID} -eq 0 ]] || fail "must run as root"
     case ${1:-} in
-        set) (($# == 2)) || usage; set_credential "$2" ;;
+        set)
+            (($# == 2)) || usage
+            if [[ $2 == ibkr-oauth ]]; then set_ibkr_oauth; else set_credential "$2"; fi
+            ;;
+        status) (($# == 2)) && [[ $2 == ibkr-oauth ]] || usage; ibkr_oauth_status ;;
         list) (($# == 1)) || usage; list_credentials ;;
         test) (($# == 2)) || usage; test_credential "$2" ;;
         remove) (($# == 2)) || usage; remove_credential "$2" ;;

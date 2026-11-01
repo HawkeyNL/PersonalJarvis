@@ -19,6 +19,7 @@ bash deploy/systemd/tests/test-systemd-runtime-lifecycle.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-core-socket-dir-systemd.sh
 bash deploy/systemd/tests/test-laya-release-artifacts.sh
 bash deploy/systemd/tests/test-subscription-worker-release.sh
+bash deploy/systemd/tests/test-ibkr-broker-release.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-laya-provision-retry.sh
 sudo env GITHUB_ACTIONS=true python3 deploy/systemd/tests/test-laya-networkless.py
 python3 -m unittest discover -s tools/laya -p 'test_*.py'
@@ -28,6 +29,7 @@ bash deploy/systemd/tests/test-model-credential-boundaries.sh
 bash deploy/systemd/tests/test-model-discovery-pipeline.sh
 bash deploy/systemd/tests/test-hourly-model-catalog.sh
 bash deploy/systemd/tests/test-credential-candidate.sh
+bash deploy/systemd/tests/test-ibkr-oauth-credentials.sh
 bash deploy/systemd/tests/test-huggingface-credential-probe.sh
 bash deploy/systemd/tests/test-jev-credential-probe.sh
 sudo env GITHUB_ACTIONS=true bash deploy/surrealdb/tests/test-provision-core-user-shellless.sh

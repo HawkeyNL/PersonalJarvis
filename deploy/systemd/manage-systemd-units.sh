@@ -31,6 +31,7 @@ readonly -a managed_units=(
     jarvis-backup.timer
     jarvis-housekeeping.service
     jarvis-housekeeping.timer
+    jarvis-ibkr-broker.service
 )
 
 subscription_capability() {
@@ -52,6 +53,17 @@ codex_chat_capability() {
     fi
     jq -e '.tooling.codex_chat_worker == 1 and (.tooling.codex_chat_worker | type) == "number" and .tooling.systemd_units == 1' "$release/release.json" >/dev/null ||
         fail "unsupported Codex chat worker capability"
+    echo 1
+}
+
+ibkr_broker_capability() {
+    local release=$1
+    if ! jq -e '.tooling | has("ibkr_broker")' "$release/release.json" >/dev/null; then
+        echo legacy
+        return
+    fi
+    jq -e '.tooling.ibkr_broker == 1 and (.tooling.ibkr_broker | type) == "number" and .tooling.systemd_units == 1' "$release/release.json" >/dev/null ||
+        fail "unsupported IBKR broker capability"
     echo 1
 }
 
@@ -113,6 +125,8 @@ unit_required() {
             [[ $(subscription_capability "$1") == 1 ]] ;;
         jarvis-codex-chat.service|jarvis-codex-chat.socket)
             [[ $(codex_chat_capability "$1") == 1 ]] ;;
+        jarvis-ibkr-broker.service)
+            [[ $(ibkr_broker_capability "$1") == 1 ]] ;;
         *) return 0 ;;
     esac
 }
@@ -264,13 +278,14 @@ validate_checksum_manifest() {
 }
 
 validate_artifacts() {
-    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version laya_version subscription_version codex_chat_version backup_version housekeeping_version
+    local release=$1 unit path mode matches packaged expected managed_version device_version policy_version laya_version subscription_version codex_chat_version ibkr_broker_version backup_version housekeeping_version
     managed_version=$(capability "$release") || return 1
     device_version=$(device_capability "$release") || return 1
     policy_version=$(policy_capability "$release") || return 1
     laya_version=$(laya_capability "$release") || return 1
     subscription_version=$(subscription_capability "$release") || return 1
     codex_chat_version=$(codex_chat_capability "$release") || return 1
+    ibkr_broker_version=$(ibkr_broker_capability "$release") || return 1
     backup_version=$(backup_capability "$release") || return 1
     housekeeping_version=$(housekeeping_capability "$release") || return 1
     if jq -e '.tooling | has("codex_runtime")' "$release/release.json" >/dev/null; then
@@ -297,6 +312,14 @@ validate_artifacts() {
         (( (8#$mode & 0022) == 0 )) || fail "Codex chat worker permissions are unsafe"
         matches=$(awk '$2 == "jarvis-codex-chat-worker" { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
         [[ $matches == 1 ]] || fail "Codex chat worker is not uniquely checksum-bound"
+    fi
+    if [[ $ibkr_broker_version == 1 ]]; then
+        [[ -f $release/jarvis-ibkr-broker && ! -L $release/jarvis-ibkr-broker && -x $release/jarvis-ibkr-broker ]] ||
+            fail "IBKR broker is missing or unsafe"
+        mode=$(stat -c '%a' "$release/jarvis-ibkr-broker")
+        (( (8#$mode & 0022) == 0 )) || fail "IBKR broker permissions are unsafe"
+        matches=$(awk '$2 == "jarvis-ibkr-broker" { count++ } END { print count + 0 }' "$release/artifact-binaries.sha256")
+        [[ $matches == 1 ]] || fail "IBKR broker is not uniquely checksum-bound"
     fi
     if [[ $laya_version == 1 ]]; then
         [[ -f $release/laya-offline.py && ! -L $release/laya-offline.py ]] || fail "Laya runtime wrapper is missing or unsafe"
@@ -330,6 +353,7 @@ validate_artifacts() {
         [[ $policy_version == legacy ]] || fail "model-policy directory capability requires managed systemd policy"
         [[ $subscription_version == legacy ]] || fail "subscription workers require managed systemd policy"
         [[ $codex_chat_version == legacy ]] || fail "Codex chat worker requires managed systemd policy"
+        [[ $ibkr_broker_version == legacy ]] || fail "IBKR broker requires managed systemd policy"
         return 0
     fi
     validate_checksum_manifest "$release"
