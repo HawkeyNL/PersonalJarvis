@@ -28,6 +28,11 @@ hmac = "0.12"
 sha1 = "0.10"
 base64 = "0.22"
 percent-encoding = "2"
+# Local read broker (jarvis-ibkr-broker): peer uid lookup, audit logging.
+libc = "0.2"
+tracing.workspace = true
+jarvis-observability.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber.workspace = true

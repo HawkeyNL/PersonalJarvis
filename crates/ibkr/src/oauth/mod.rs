@@ -475,6 +475,20 @@ impl IbkrOAuthClient {
         .await
     }
 
+    /// [`Self::tickle`], but only while a brokerage session is open, so an
+    /// idle client never mints a session just to keep it alive. A failed
+    /// tickle stops the keep-alive until the next `/iserver` read re-opens it.
+    pub async fn keep_alive(&self) -> Result<(), IbkrError> {
+        if *self.brokerage.lock().await == 0 {
+            return Ok(());
+        }
+        let result = self.tickle().await.map(|_| ());
+        if result.is_err() {
+            *self.brokerage.lock().await = 0;
+        }
+        result
+    }
+
     /// Keep the brokerage session alive; call about once a minute. When the
     /// session is gone the next `/iserver` call re-opens it.
     pub async fn tickle(&self) -> Result<AuthStatus, IbkrError> {
@@ -734,4 +748,4 @@ impl IbkrOAuthClient {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

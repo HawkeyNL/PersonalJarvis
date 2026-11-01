@@ -18,9 +18,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 
-const CONSUMER_KEY: &str = "TESTCONS";
-const ACCESS_TOKEN: &str = "6f531f8fd316915af53f";
-const SECRET: &[u8] = b"test-access-token-secret";
+pub(crate) const CONSUMER_KEY: &str = "TESTCONS";
+pub(crate) const ACCESS_TOKEN: &str = "6f531f8fd316915af53f";
+pub(crate) const SECRET: &[u8] = b"test-access-token-secret";
 
 const TEST_KEY_PKCS8: &str = include_str!("testdata/test_only_rsa.pkcs8.pem");
 const TEST_KEY_PKCS1: &str = include_str!("testdata/test_only_rsa.pkcs1.pem");
@@ -41,13 +41,13 @@ fn credentials() -> OAuthCredentials {
 }
 
 #[derive(Default)]
-struct Fake {
+pub(crate) struct Fake {
     /// Status to return instead of the normal answer, per path suffix.
-    fail: StdMutex<HashMap<&'static str, u16>>,
+    pub(crate) fail: StdMutex<HashMap<&'static str, u16>>,
     bad_lst_signature: StdMutex<bool>,
     lst: StdMutex<Option<Vec<u8>>>,
     mints: AtomicUsize,
-    requests: StdMutex<Vec<String>>,
+    pub(crate) requests: StdMutex<Vec<String>>,
     snapshot_calls: AtomicUsize,
 }
 
@@ -202,7 +202,7 @@ impl Fake {
         (200, body.to_string())
     }
 
-    fn count(&self, path: &str) -> usize {
+    pub(crate) fn count(&self, path: &str) -> usize {
         self.requests
             .lock()
             .unwrap()
@@ -260,7 +260,7 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Request> {
     })
 }
 
-async fn fake_client() -> (IbkrOAuthClient, Arc<Fake>) {
+pub(crate) async fn fake_client() -> (IbkrOAuthClient, Arc<Fake>) {
     let fake = Arc::new(Fake::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/v1/api", listener.local_addr().unwrap());
