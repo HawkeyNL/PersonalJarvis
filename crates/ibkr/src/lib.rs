@@ -6,12 +6,14 @@
 //! money math uses Decimal elsewhere.
 //!
 //! [`oauth`] is the token-only replacement: a first-party OAuth 1.0a client that
-//! talks to `api.ibkr.com` directly, without the gateway.
+//! talks to `api.ibkr.com` directly, without the gateway. [`broker`] runs it
+//! in a dedicated credential-holding process behind a local Unix socket.
 
 use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+pub mod broker;
 pub mod oauth;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

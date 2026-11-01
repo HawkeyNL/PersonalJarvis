@@ -5,7 +5,7 @@
 use std::{collections::BTreeMap, str::FromStr};
 
 use rust_decimal::Decimal;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 fn decimal_from_text(text: &str) -> Option<Decimal> {
@@ -41,7 +41,7 @@ fn conid<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
 }
 
 /// `GET /portfolio/accounts` entry.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Account {
     #[serde(rename = "accountId")]
     pub account_id: String,
@@ -55,7 +55,7 @@ pub struct Account {
 }
 
 /// `GET /portfolio/{account}/positions/{page}` entry.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Position {
     #[serde(deserialize_with = "conid")]
     pub conid: i64,
@@ -85,7 +85,7 @@ pub struct Position {
 
 /// One currency of `GET /portfolio/{account}/ledger`, keyed by currency
 /// (`BASE`, `USD`, ...). Field names are unverified (from memory of IBKR docs).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LedgerEntry {
     #[serde(default, deserialize_with = "opt_decimal")]
     pub cashbalance: Option<Decimal>,
@@ -106,7 +106,7 @@ pub struct LedgerEntry {
 pub type Ledger = BTreeMap<String, LedgerEntry>;
 
 /// `GET /iserver/secdef/search` entry. Fields beyond `conid` are unverified.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecdefMatch {
     #[serde(deserialize_with = "conid")]
     pub conid: i64,
@@ -121,7 +121,7 @@ pub struct SecdefMatch {
     pub sections: Vec<SecdefSection>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecdefSection {
     #[serde(rename = "secType", default)]
     pub sec_type: Option<String>,
@@ -134,7 +134,8 @@ pub(crate) const SNAPSHOT_FIELDS: &str = "31,55,82,83,84,86,6509,7296,7741";
 const DATA_FIELDS: [&str; 8] = ["31", "55", "82", "83", "84", "86", "7296", "7741"];
 
 /// Market data availability (snapshot field 6509, first character).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MarketDataAvailability {
     RealTime,
     Delayed,
@@ -158,7 +159,7 @@ impl MarketDataAvailability {
 }
 
 /// One contract of `GET /iserver/marketdata/snapshot`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Snapshot {
     pub conid: i64,
     pub symbol: Option<String>,
@@ -221,7 +222,7 @@ impl RawSnapshot {
 
 /// `GET /iserver/marketdata/history`. The top-level `high`/`low` composite
 /// strings are ignored in favour of the bars.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct History {
     #[serde(default)]
     pub symbol: Option<String>,
@@ -229,7 +230,7 @@ pub struct History {
     pub bars: Vec<Bar>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Bar {
     /// Bar start, epoch milliseconds (unverified: the IBKR sample looks off).
     #[serde(rename = "t")]

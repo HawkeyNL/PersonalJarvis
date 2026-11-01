@@ -2491,6 +2491,8 @@ dependencies = [
  "der",
  "hex",
  "hmac",
+ "jarvis-observability",
+ "libc",
  "num-bigint",
  "percent-encoding",
  "rand 0.8.7",
@@ -2504,6 +2506,8 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 
