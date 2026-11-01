@@ -258,6 +258,16 @@ cmp "$local_root/restored/export.surql" "$fixture/run/export.surql"
 [[ $(tar -xOf "$local_root/restored/etc-jarvis.tar" etc/jarvis/secrets/provider.env) == "PROVIDER_KEY=$canary" ]]
 jq -e '.format_version == 1' "$local_root/restored/manifest.json" >/dev/null
 [[ -z $(find "$lock_dir" -mindepth 1 -maxdepth 1 -name 'jarvis-backup.*' -type d) ]]
+# The archive is swapped right after verification: extraction reads the
+# verified private copy, so decryption still succeeds.
+cp -a "$local_archive" "$local_root/good.tar"
+(
+    eval "real_$(declare -f verify)"
+    # shellcheck disable=SC2317  # invoked through verify_decrypt
+    verify() { real_verify "$@"; printf 'swapped' > "$local_archive"; }
+    verify_decrypt "$local_archive"
+) < "$local_root/key.asc" 2>/dev/null
+cp -a "$local_root/good.tar" "$local_archive"
 # Refused: an existing or relative target, a wrong key, no key.
 expect_fail restore_to "$local_archive" "$local_root/restored" < "$local_root/key.asc"
 expect_fail restore_to "$local_archive" restored-here < "$local_root/key.asc"
@@ -294,6 +304,21 @@ jq -c --arg h "$(sha256sum < "$local_root/open/surrealdb.surql.zst.gpg" | cut -d
     '.members["surrealdb.surql.zst.gpg"].sha256 = $h' "$local_root/restored/manifest.json" \
     | encrypt_to > "$local_root/open/manifest.json.gpg"
 repack 'export does not match the manifest'
+# A manifest that decompresses past the cap is refused before it lands.
+rm -r "$local_root/open"
+cp -a "$local_root/open.good" "$local_root/open"
+head -c $((2 * 1024 * 1024)) /dev/zero | encrypt_to > "$local_root/open/manifest.json.gpg"
+repack 'cannot decrypt the manifest'
+# An owner name crafted to shift the listing fields into bash arithmetic
+# (which would run the command substitution) is refused and runs nothing.
+mkdir "$local_root/inj"
+# shellcheck disable=SC2016  # literal command-substitution text is the input
+tar -C "$local_root/open.good" --owner='a a[$(touch${IFS}PWNED)]:0' --group=0 -cf "$local_archive" "${members[@]}"
+(cd "$local_root/dest" && sha256sum -- "${local_archive##*/}") > "$local_archive.sha256"
+message=$( (cd "$local_root/inj" && verify "$local_archive") 2>&1 ) && exit 1
+[[ $message == *'unexpected member owner'* && ! -e $local_root/inj/PWNED ]]
+message=$( (cd "$local_root/inj" && verify_decrypt "$local_archive") < "$local_root/key.asc" 2>&1 ) && exit 1
+[[ $message == *'unexpected member owner'* && ! -e $local_root/inj/PWNED ]]
 # A configuration tar with a symlink is refused, like in disaster recovery.
 mkdir -p "$local_root/linked/etc/jarvis" "$local_root/stage2"
 ln -s /etc/shadow "$local_root/linked/etc/jarvis/link"

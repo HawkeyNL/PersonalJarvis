@@ -26,6 +26,7 @@ readonly members=(etc-jarvis.tar.zst.gpg manifest.json.gpg surrealdb.surql.zst.g
 readonly keep_daily=7 keep_weekly=4
 # The disposable restore container has 1 GiB; a larger export cannot be tested.
 readonly max_export_kib=$((1024 * 1024))
+readonly max_manifest_kib=1024
 
 fail() { echo "jarvis backup: $*" >&2; exit 1; }
 log() { echo "jarvis backup: $*" >&2; }
@@ -148,14 +149,18 @@ build_members() {
         | encrypt_to > "$staging/manifest.json.gpg"
 }
 
-# The tar must hold exactly the expected members, each a non-empty regular file.
+# The tar must hold exactly the expected members, each a non-empty regular file
+# owned by 0/0 without owner names, as publish writes them. The listing is
+# untrusted: owner names could shift fields, so the split listing is numeric,
+# and the size is matched, never evaluated arithmetically.
 check_members() {
     local archive=$1 listing mode size name
-    listing=$(tar -tvf "$archive" 2>/dev/null) || fail 'archive is not a readable tar'
+    listing=$(tar --numeric-owner -tvf "$archive" 2>/dev/null) || fail 'archive is not a readable tar'
     [[ $(tar -tf "$archive" | LC_ALL=C sort) == "$(printf '%s\n' "${members[@]}")" ]] || fail 'unexpected archive members'
     while read -r mode _ size _ _ name; do
-        [[ $mode == -* && $size -gt 0 ]] || fail "member $name is not a non-empty regular file"
+        [[ $mode == -* && $size =~ ^[1-9][0-9]*$ ]] || fail "member $name is not a non-empty regular file"
     done <<< "$listing"
+    tar -tvf "$archive" | awk '$2 != "0/0" { bad = 1 } END { exit bad }' || fail 'unexpected member owner'
 }
 
 # Publish $staging as <dest>/jarvis-backup-<day>.tar(.sha256). The tar is
@@ -240,18 +245,31 @@ decrypt_member() {
 # manifest.json, export.surql and etc-jarvis.tar in $run_dir/out (tmpfs below
 # /run, removed on exit). Each plaintext output is capped like the export.
 decrypt_archive() {
-    local archive=$1 out="$run_dir/out" name want
-    verify "$archive"
-    # The ciphertext members plus up to 1 GiB per plaintext output share /run.
-    (( $(df --output=avail -B1 "$lock_dir" | tail -1) >= $(stat -c %s "$archive") + 2 * 1024 * 1024 * 1024 )) \
+    local archive=$1 out="$run_dir/out" copy name want size
+    [[ ${archive##*/} =~ ^$archive_pattern$ && -f $archive && ! -L $archive ]] || fail 'not a jarvis backup archive'
+    [[ -f $archive.sha256 && ! -L $archive.sha256 ]] || fail 'checksum file missing'
+    size=$(stat -c %s -- "$archive")
+    # A private copy, the ciphertext members and up to 1 GiB per plaintext
+    # output share /run.
+    (( $(df --output=avail -B1 "$lock_dir" | tail -1) >= 2 * size + 2 * 1024 * 1024 * 1024 )) \
         || fail 'not enough free space below /run to decrypt'
+    # Verify and extract the same private copy: the archive directory may be
+    # writable by others, who could swap the file between the two steps. The
+    # copy is capped at the size checked above.
+    copy="$run_dir/${archive##*/}"
+    ( ulimit -f $(( size / 1024 + 1 )) \
+        && cp -P -- "$archive" "$copy" && cp -P -- "$archive.sha256" "$copy.sha256" ) \
+        || fail 'cannot copy the archive'
+    verify "$copy"
     install -d -m 0700 "$gnupg_home" "$run_dir/members" "$out"
     [[ ! -t 0 ]] || log 'paste the backup private key, then press Ctrl-D'
     gpg --batch --quiet --homedir "$gnupg_home" --import 2>/dev/null || fail 'cannot import the private key from stdin'
     gpg --batch --homedir "$gnupg_home" --list-secret-keys --with-colons 2>/dev/null \
         | awk -F: '$1 == "sec" { found = 1 } END { exit !found }' || fail 'stdin holds no private key'
-    tar -C "$run_dir/members" -xf "$archive" "${members[@]}"
-    decrypt_member manifest.json.gpg > "$out/manifest.json" || fail 'cannot decrypt the manifest (wrong key?)'
+    tar -C "$run_dir/members" -xf "$copy" "${members[@]}"
+    rm -f -- "$copy" "$copy.sha256"
+    ( ulimit -f "$max_manifest_kib" && decrypt_member manifest.json.gpg > "$out/manifest.json" ) \
+        || fail 'cannot decrypt the manifest (wrong key or over 1 MiB?)'
     jq -e '.format_version == 1' "$out/manifest.json" >/dev/null 2>&1 || fail 'unsupported manifest'
     for name in etc-jarvis.tar.zst.gpg surrealdb.surql.zst.gpg; do
         want=$(jq -r --arg n "$name" '.members[$n].sha256 // ""' "$out/manifest.json")
@@ -322,7 +340,7 @@ init_local() {
         --quick-gen-key "Jarvis local backup $(date -u +%F)" default default never 2>/dev/null \
         || fail 'cannot generate the backup key'
     fpr=$(gpg --batch --homedir "$gnupg_home" --with-colons --list-keys 2>/dev/null \
-        | awk -F: '$1 == "fpr" { print $10; exit }')
+        | awk -F: '$1 == "fpr" && !f { print $10; f = 1 }')
     printf 'destination=%s\nrecipients=%s\n' "$dest" "$fpr" > "$run_dir/backup.conf"
     read_config "$run_dir/backup.conf"
     gpg --batch --homedir "$gnupg_home" --armor --export "$fpr" > "$run_dir/recipients.asc"

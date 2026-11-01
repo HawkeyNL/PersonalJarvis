@@ -99,6 +99,11 @@ key. Copy the whole block, including the `BEGIN` and `END` lines, into your
 password manager (a paper copy as well is wise), then run `clear`. It refuses
 to run when either file already exists.
 
+The private key goes to stdout. Do not redirect or pipe it into a file (for
+example `> key.asc` or `| tee`): a plaintext key on the host's disk defeats
+the point of keeping only the public key here, and `rm` does not reliably
+erase it from an SSD.
+
 ### First run and decrypt check
 
 ```bash
@@ -170,13 +175,21 @@ Core is down while you do this.
    sudo mv /var/lib/jarvis/surrealdb /var/lib/jarvis/surrealdb.before-restore
    ```
    The `ps` command must print nothing.
-3. Follow steps 4 to 6 of [Disaster recovery](#disaster-recovery-onto-a-fresh-home-node),
-   with `/run/jarvis-restore/export.surql` in place of
-   `/root/restore/export.surql`. In step 4, use
-   `sudo systemctl start jarvis-surrealdb.service` instead of the start
-   helper. It starts SurrealDB on a new, empty data directory. Restore
-   `/etc/jarvis` (step 3) only when it is damaged or the password changed,
-   and then from the same archive.
+3. Follow steps 4 to 6 of [Disaster recovery](#disaster-recovery-onto-a-fresh-home-node).
+   Read `/run/jarvis-restore` for `/root/restore` throughout: for
+   `export.surql`, for `etc-jarvis.tar` and in the final "Delete" step. In
+   step 4, use `sudo systemctl start jarvis-surrealdb.service` instead of the
+   start helper. It starts SurrealDB on a new, empty data directory.
+   Restore `/etc/jarvis` (step 3, before step 4) only when it is damaged or
+   the password changed, and then from the same archive. Keep the current tree first, and
+   replace it rather than extract over it: a merge keeps files that are not
+   in the archive.
+   ```bash
+   (umask 077 && sudo tar -C / -cpf /root/etc-jarvis.before-restore.tar etc/jarvis) \
+     && sudo tar -tf /root/etc-jarvis.before-restore.tar >/dev/null \
+     && sudo rm -r /etc/jarvis
+   ```
+   Then run the checked extraction of step 3.
 4. `sudo systemctl start jarvis-backup.timer`, and delete `/run/jarvis-restore`.
 
 To undo the rollback:
@@ -185,10 +198,14 @@ To undo the rollback:
 sudo systemctl stop jarvis-core.service jarvis-surrealdb.service
 sudo rm -r /var/lib/jarvis/surrealdb
 sudo mv /var/lib/jarvis/surrealdb.before-restore /var/lib/jarvis/surrealdb
+# Only if you restored /etc/jarvis:
+sudo rm -r /etc/jarvis && sudo tar -C / -xpf /root/etc-jarvis.before-restore.tar
 sudo systemctl start jarvis-surrealdb.service jarvis-core.service
 ```
 
-Delete `/var/lib/jarvis/surrealdb.before-restore` once Core works.
+Delete `/var/lib/jarvis/surrealdb.before-restore` and
+`/root/etc-jarvis.before-restore.tar` (it holds plaintext secrets) once Core
+works.
 
 ### Turning it off
 
