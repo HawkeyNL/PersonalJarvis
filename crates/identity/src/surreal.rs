@@ -784,7 +784,9 @@ struct ClaimedRecord {
     id: String,
 }
 
-/// Verify and atomically consume a challenge before issuing a session.
+/// Verify and atomically consume a challenge before issuing a session. With
+/// an account password set, this is a biometric renewal (see
+/// [`BIOMETRIC_RENEWAL_PLATFORMS`]) or fails.
 pub async fn login(
     db: &Database,
     device_id: Uuid,
@@ -848,6 +850,13 @@ pub async fn login_with_password(
         return Err(IdentityError::DatabaseSurreal);
     }
 
+    // Without a password, a biometric device may renew from its last
+    // password login instead. That path never checks a password, so it never
+    // reports `PasswordRejected` and never counts toward the backoff.
+    if password.is_none() && account::password_required(db, owner.user_id).await? {
+        return renew_session(db, owner.user_id, device_id).await;
+    }
+
     let account_revision = account::verify_password(
         db,
         crate::password::PasswordService::shared(),
@@ -856,21 +865,29 @@ pub async fn login_with_password(
     )
     .await?;
 
-    let mut token = vec![0_u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
-    let token_hash = sha2::Sha256::digest(&token).to_vec();
+    let (token, token_hash) = new_token();
+    // A session minted after a password check anchors biometric renewal, for
+    // as long as the password keeps this revision.
+    let anchor = if account_revision.is_some() {
+        "time::now(), password_revision = $account_revision"
+    } else {
+        "NONE, password_revision = NONE"
+    };
     execute(
         db,
-        "BEGIN TRANSACTION; \
-         LET $account = SELECT revision FROM account_passwords WHERE user_id = $user_id; \
-         IF (array::len($account) = 0 AND $account_revision != '') OR \
-            (array::len($account) > 0 AND $account[0].revision != $account_revision) \
-            { THROW 'authentication failed'; }; \
-         LET $active = SELECT id FROM devices WHERE record::id(id) = $device_id AND user_id = $user_id AND status = 'active'; \
-         IF array::len($active) != 1 { THROW 'authentication failed'; }; \
-         CREATE sessions SET id = $id, user_id = $user_id, device_id = $device_id, token_hash = <bytes>$token_hash, \
-         created_at = time::now(), expires_at = time::now() + 7d, last_used_at = NONE, revoked_at = NONE; \
-         COMMIT TRANSACTION;",
+        &format!(
+            "BEGIN TRANSACTION; \
+             LET $account = SELECT revision FROM account_passwords WHERE user_id = $user_id; \
+             IF (array::len($account) = 0 AND $account_revision != '') OR \
+                (array::len($account) > 0 AND $account[0].revision != $account_revision) \
+                {{ THROW 'authentication failed'; }}; \
+             LET $active = SELECT id FROM devices WHERE record::id(id) = $device_id AND user_id = $user_id AND status = 'active'; \
+             IF array::len($active) != 1 {{ THROW 'authentication failed'; }}; \
+             CREATE sessions SET id = $id, user_id = $user_id, device_id = $device_id, token_hash = <bytes>$token_hash, \
+             created_at = time::now(), expires_at = time::now() + 7d, last_used_at = NONE, revoked_at = NONE, \
+             password_verified_at = {anchor}; \
+             COMMIT TRANSACTION;"
+        ),
         SessionBindings {
             id: Uuid::now_v7().to_string(),
             user_id: owner.user_id.to_string(),
@@ -880,18 +897,113 @@ pub async fn login_with_password(
         },
     )
     .await?;
+    issued(db, token, token_hash, false).await
+}
+
+/// Platforms whose device key needs a biometric check for every signature:
+/// the iOS Keychain item is bound to `.biometryCurrentSet` and the Android
+/// Keystore key requires strong biometrics per operation. Their signed login
+/// challenge may renew a session without the account password. macOS is not
+/// listed: Core cannot tell whether a Mac's key is biometry-bound, and Linux
+/// and Windows keys are not.
+pub const BIOMETRIC_RENEWAL_PLATFORMS: [&str; 2] = ["ios", "android"];
+
+/// Days a password login keeps anchoring renewals. A renewed session never
+/// outlives its anchor plus this window, so the password is asked again at
+/// least this often.
+const PASSWORD_RENEWAL_DAYS: u32 = 30;
+
+#[derive(Serialize)]
+struct RenewalBindings {
+    id: String,
+    user_id: String,
+    device_id: String,
+    #[serde(with = "serde_bytes")]
+    token_hash: Vec<u8>,
+    platforms: [&'static str; 2],
+}
+
+/// Replace the device's sessions with a new one carrying the password anchor
+/// of its latest session. Refused unless that session is unrevoked, its
+/// password login is less than [`PASSWORD_RENEWAL_DAYS`] old and was made
+/// with the current password revision. Logout, password change or reset and
+/// device revocation all revoke that session; the revision check also covers
+/// a password login that committed beside a password change and so escaped
+/// its revocation (write skew). Revoking the device's live sessions here
+/// writes the anchor row, so a concurrent revocation conflicts with this
+/// transaction instead of passing.
+async fn renew_session(
+    db: &Database,
+    user_id: Uuid,
+    device_id: Uuid,
+) -> Result<LoginResult, IdentityError> {
+    let (token, token_hash) = new_token();
+    execute(
+        db,
+        &renewal_query(),
+        RenewalBindings {
+            id: Uuid::now_v7().to_string(),
+            user_id: user_id.to_string(),
+            device_id: device_id.to_string(),
+            token_hash: token_hash.clone(),
+            platforms: BIOMETRIC_RENEWAL_PLATFORMS,
+        },
+    )
+    .await
+    .map_err(|_| IdentityError::AuthFailed)?;
+    issued(db, token, token_hash, true).await
+}
+
+/// One transaction: check the device and its anchor, rotate, mint.
+fn renewal_query() -> String {
+    format!(
+        "BEGIN TRANSACTION; \
+         LET $active = SELECT id FROM devices WHERE record::id(id) = $device_id AND user_id = $user_id \
+            AND status = 'active' AND platform IN $platforms; \
+         IF array::len($active) != 1 {{ THROW 'authentication failed'; }}; \
+         LET $anchor = SELECT created_at, revoked_at, password_verified_at, password_revision FROM sessions \
+            WHERE device_id = $device_id AND user_id = $user_id ORDER BY created_at DESC LIMIT 1; \
+         LET $verified = $anchor[0].password_verified_at; \
+         LET $revision = $anchor[0].password_revision; \
+         LET $account = SELECT revision FROM account_passwords WHERE user_id = $user_id; \
+         IF array::len($anchor) != 1 OR $anchor[0].revoked_at IS NOT NONE OR $verified IS NONE \
+            OR $verified <= time::now() - {PASSWORD_RENEWAL_DAYS}d OR $revision IS NONE \
+            OR array::len($account) != 1 OR $account[0].revision != $revision \
+            {{ THROW 'authentication failed'; }}; \
+         UPDATE sessions SET revoked_at = time::now() WHERE device_id = $device_id AND revoked_at IS NONE RETURN NONE; \
+         CREATE sessions SET id = $id, user_id = $user_id, device_id = $device_id, token_hash = <bytes>$token_hash, \
+            created_at = time::now(), expires_at = time::min([time::now() + 7d, $verified + {PASSWORD_RENEWAL_DAYS}d]), \
+            last_used_at = NONE, revoked_at = NONE, password_verified_at = $verified, \
+            password_revision = $revision RETURN NONE; \
+         COMMIT TRANSACTION;"
+    )
+}
+
+/// A fresh random session token and its stored hash.
+fn new_token() -> (Vec<u8>, Vec<u8>) {
+    let mut token = vec![0_u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
+    let token_hash = sha2::Sha256::digest(&token).to_vec();
+    (token, token_hash)
+}
+
+async fn issued(
+    db: &Database,
+    token: Vec<u8>,
+    token_hash: Vec<u8>,
+    renewed: bool,
+) -> Result<LoginResult, IdentityError> {
     let session: Session = one(
         db,
         &format!("SELECT {SESSION_FIELDS} FROM sessions WHERE token_hash = $token_hash LIMIT 1"),
-        TokenHashBindings {
-            token_hash: token_hash.clone(),
-        },
+        TokenHashBindings { token_hash },
     )
     .await?
     .ok_or(IdentityError::DatabaseSurreal)?;
     Ok(LoginResult {
         token: hex::encode(token),
         session,
+        renewed,
     })
 }
 
@@ -982,10 +1094,13 @@ pub async fn session_is_active(
     Ok(device.is_some_and(|device| device.user_id == user_id))
 }
 
+/// Log out: revoke the session and every other live session of its device,
+/// so no older session of that device can anchor a biometric renewal.
 pub async fn revoke_session(db: &Database, session_id: Uuid) -> Result<(), IdentityError> {
     let _: Option<serde_json::Value> = one(
         db,
-        "UPDATE sessions SET revoked_at = time::now() WHERE record::id(id) = $id AND revoked_at IS NONE RETURN NONE",
+        "UPDATE sessions SET revoked_at = time::now() WHERE revoked_at IS NONE AND device_id IN \
+         (SELECT VALUE device_id FROM sessions WHERE record::id(id) = $id) RETURN NONE",
         json!({ "id": session_id.to_string() }),
     )
     .await?;
@@ -1262,6 +1377,13 @@ mod tests {
     use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
 
     use super::*;
+
+    #[test]
+    fn renewal_query_parses() {
+        let query = renewal_query();
+        assert!(query.contains("time::now() - 30d"));
+        surrealdb::syn::parse(&query).unwrap();
+    }
 
     #[test]
     fn sessions_end_on_revocation_expiry_or_idleness() {

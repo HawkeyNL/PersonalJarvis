@@ -718,3 +718,77 @@ async fn last_approver_revoke_request_is_a_conflict() -> Result<(), Box<dyn std:
     assert_eq!(jarvis_identity::active_device_count(&db).await?, 1);
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn passwordless_login_renews_only_after_a_password_login(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jarvis_identity::password::{AccountPassword, PasswordService};
+    let _argon2 = argon2_guard().await;
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("renewal_http_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("fixture")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db.clone(), None).await);
+    let password = "disposable renewal fixture password";
+    let key = SigningKey::from_bytes(&rand::random());
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64
+        + 600;
+    let (_, device) = jarvis_identity::surreal::account::bootstrap_account(
+        &db,
+        "owner",
+        jarvis_identity::Platform::Ios,
+        &key.verifying_key().to_bytes(),
+        PasswordService::shared()
+            .hash(AccountPassword::new(password.into())?)
+            .await?,
+        expires,
+    )
+    .await?;
+    let login = |password: Option<&'static str>| {
+        let (app, db, key, device) = (app.clone(), &db, &key, &device);
+        async move {
+            let challenge = jarvis_identity::create_challenge(db, device.id).await?;
+            let proof =
+                jarvis_client_core::login_message(challenge.id, device.id, &challenge.nonce)?;
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/auth/login")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&json!({
+                            "device_id": device.id,
+                            "challenge_id": challenge.id,
+                            "password": password,
+                            "signature": hex::encode(key.sign(&proof).to_bytes()),
+                        }))?))?,
+                )
+                .await?;
+            Ok::<_, Box<dyn std::error::Error>>(response.status())
+        }
+    };
+    // Without a password login to renew from: a plain 401. Four of them
+    // would put the device into password backoff (3 free failures) if they
+    // counted; they stay below the per-source lockout of five.
+    for _ in 0..4 {
+        assert_eq!(login(None).await?, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(login(Some(password)).await?, StatusCode::OK);
+    assert_eq!(login(None).await?, StatusCode::OK);
+    let mut renewed = db
+        .query("SELECT VALUE outcome FROM security_audit WHERE event = 'auth.login' AND outcome = 'renewed'")
+        .await?
+        .check()?;
+    let renewed: Vec<String> = renewed.take(0)?;
+    assert_eq!(renewed, ["renewed"]);
+    Ok(())
+}

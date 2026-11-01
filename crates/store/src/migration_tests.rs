@@ -26,7 +26,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 15);
+    assert_eq!(version.unwrap().version, 16);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
@@ -47,7 +47,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_eleven.unwrap().version, 15);
+    assert_eq!(from_eleven.unwrap().version, 16);
     db.use_db("from_twelve").await?;
     apply_through_twelve(&db).await?;
     // A v12 pairing row has none of the new optional fields and stays valid.
@@ -59,7 +59,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_twelve_version: Option<SchemaVersion> = from_twelve.take(0)?;
-    assert_eq!(from_twelve_version.unwrap().version, 15);
+    assert_eq!(from_twelve_version.unwrap().version, 16);
     let legacy_has_no_ip: Vec<bool> = from_twelve.take(1)?;
     assert_eq!(legacy_has_no_ip, [true]);
     // The database bounds the new fields even if Core validation regressed.
@@ -88,7 +88,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
-    assert_eq!(migrated_version.unwrap().version, 15);
+    assert_eq!(migrated_version.unwrap().version, 16);
     let legacy: Vec<String> = migrated.take(1)?;
     assert_eq!(legacy, ["password-set"]);
     db.query("CREATE account_actions SET id = 'reset', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
@@ -134,7 +134,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_thirteen.unwrap().version, 15);
+    assert_eq!(from_thirteen.unwrap().version, 16);
     // The paper tables enforce their shape even if Core validation regressed.
     let (mint, other) = (
         "So11111111111111111111111111111111111111112",
@@ -187,7 +187,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_fourteen.unwrap().version, 15);
+    assert_eq!(from_fourteen.unwrap().version, 16);
     // The IBKR read model enforces its shape even if Core validation regressed.
     let position = |id: &str, extra: &str| {
         format!("CREATE ibkr_positions SET id = '{id}', conid = {id}, symbol = 'VWCE', asset_class = 'STK', currency = 'EUR', quantity = '12.5', avg_cost = '101.25', last_price = '120', market_value = '1500', unrealized_pnl = '-3.5'{extra};")
@@ -216,6 +216,38 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         "UPSERT ibkr_portfolio:current SET skipped_positions = [{ symbol: '' }];".to_string(),
         format!("UPSERT ibkr_portfolio:current SET skipped_positions = [{}];", ["{ symbol: 'X' }"; 51].join(", ")),
         "CREATE ibkr_portfolio_history SET id = 'x', t = time::now(), value = 'NaN';".to_string(),
+    ] {
+        assert!(db.query(&bad).await?.check().is_err(), "{bad}");
+    }
+    db.use_db("from_fifteen").await?;
+    apply_through_fifteen(&db).await?;
+    // A v15 session has no password anchor and stays valid.
+    let session = |id: &str, extra: &str| {
+        format!("CREATE sessions SET id = '{id}', user_id = 'u', device_id = 'd', token_hash = <bytes>'{id}', created_at = time::now(), expires_at = time::now() + 7d{extra};")
+    };
+    db.query(session("legacy", "")).await?.check()?;
+    apply_baseline_schema(&db).await?;
+    let mut from_fifteen = db
+        .query("SELECT version FROM schema_version:baseline; SELECT VALUE password_verified_at = NONE FROM sessions:legacy;")
+        .await?
+        .check()?;
+    let from_fifteen_version: Option<SchemaVersion> = from_fifteen.take(0)?;
+    assert_eq!(from_fifteen_version.unwrap().version, 16);
+    let legacy_has_no_anchor: Vec<bool> = from_fifteen.take(1)?;
+    assert_eq!(legacy_has_no_anchor, [true]);
+    db.query(session(
+        "anchored",
+        ", password_verified_at = time::now(), password_revision = 'r'",
+    ))
+    .await?
+    .check()?;
+    // The anchor keeps its shape even if Core validation regressed.
+    for bad in [
+        session("bad_time", ", password_verified_at = 'yesterday'"),
+        session(
+            "bad_revision",
+            &format!(", password_revision = '{}'", "r".repeat(65)),
+        ),
     ] {
         assert!(db.query(&bad).await?.check().is_err(), "{bad}");
     }

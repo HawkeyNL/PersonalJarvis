@@ -615,6 +615,19 @@ async fn password_recovery_needs_signature_and_root_confirmation(
         .await
         .is_err());
     assert!(authenticate(&db, &session.token).await.is_err());
+    // The reset also revoked the session that anchored biometric renewal.
+    let challenge = create_challenge(&db, device.id).await?;
+    assert!(matches!(
+        login_with_password(
+            &db,
+            device.id,
+            challenge.id,
+            &login_proof(&key, device.id, &challenge),
+            None,
+        )
+        .await,
+        Err(IdentityError::AuthFailed)
+    ));
     assert_eq!(
         pairing_request_status(&db, pairing.id, owner.id)
             .await?
@@ -835,5 +848,220 @@ async fn only_a_live_revoke_claim_reports_the_last_approver(
         approve_signed(&db, owner, &laptop, &request).await,
         Err(IdentityError::AuthFailed)
     ));
+    Ok(())
+}
+
+const CHANGED: &str = "changed fixture account password never used in production";
+
+/// Sign a fresh login challenge, with or without the account password.
+async fn sign_in(
+    db: &Database,
+    (device, key): &(Device, SigningKey),
+    password: Option<&str>,
+) -> Result<LoginResult, IdentityError> {
+    let password = password
+        .map(|password| AccountPassword::new(password.to_owned()))
+        .transpose()
+        .map_err(|_| IdentityError::AuthFailed)?;
+    let challenge = create_challenge(db, device.id).await?;
+    let signed = login_proof(key, device.id, &challenge);
+    login_with_password(db, device.id, challenge.id, &signed, password).await
+}
+
+async fn password_request(
+    db: &Database,
+    owner: Uuid,
+    (signer, _): &(Device, SigningKey),
+    password: &str,
+) -> Result<AccountApproval, Box<dyn std::error::Error>> {
+    let stored = PasswordService::shared()
+        .hash(AccountPassword::new(password.to_owned())?)
+        .await?;
+    Ok(request_action(
+        db,
+        owner,
+        signer.id,
+        AccountAction::PasswordSet,
+        owner,
+        Some(stored),
+    )
+    .await?)
+}
+
+/// Move a session's password anchor `age` (a SurrealQL duration) into the past.
+async fn age_anchor(
+    db: &Database,
+    session: &LoginResult,
+    age: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    db.query(format!(
+        "UPDATE sessions SET password_verified_at = time::now() - {age} WHERE record::id(id) = $id"
+    ))
+    .bind(("id", session.session.id.to_string()))
+    .await?
+    .check()?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn biometric_renewal_needs_a_live_password_login_of_at_most_30_days(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = fixture_db("renewal_fixture").await?;
+    let owner = create_user(&db, "fixture owner").await?.id;
+    let phone = device(&db, owner, Platform::Ios).await?;
+    let request = password_request(&db, owner, &phone, PASSWORD).await?;
+    approve_signed(&db, owner, &phone, &request).await?;
+    // Setting the password revoked every session: nothing to renew from. A
+    // missing password is a plain failure, not a wrong password.
+    assert!(matches!(
+        sign_in(&db, &phone, None).await,
+        Err(IdentityError::AuthFailed)
+    ));
+    assert!(matches!(
+        sign_in(&db, &phone, Some("incorrect fixture password")).await,
+        Err(IdentityError::PasswordRejected)
+    ));
+
+    let first = sign_in(&db, &phone, Some(PASSWORD)).await?;
+    assert!(!first.renewed);
+    let renewed = sign_in(&db, &phone, None).await?;
+    assert!(renewed.renewed);
+    // Renewal rotates the token.
+    assert!(authenticate(&db, &first.token).await.is_err());
+    assert!(authenticate(&db, &renewed.token).await.is_ok());
+    let week = OffsetDateTime::now_utc() + time::Duration::days(7);
+    assert!((renewed.session.expires_at - week).abs() < time::Duration::minutes(1));
+
+    // A renewal challenge is single-use and needs this device's key.
+    let challenge = create_challenge(&db, phone.0.id).await?;
+    let signed = login_proof(&phone.1, phone.0.id, &challenge);
+    assert!(
+        login_with_password(&db, phone.0.id, challenge.id, &signed, None)
+            .await?
+            .renewed
+    );
+    assert!(
+        login_with_password(&db, phone.0.id, challenge.id, &signed, None)
+            .await
+            .is_err()
+    );
+    let challenge = create_challenge(&db, phone.0.id).await?;
+    let stranger = SigningKey::from_bytes(&rand::random());
+    let forged = login_proof(&stranger, phone.0.id, &challenge);
+    assert!(
+        login_with_password(&db, phone.0.id, challenge.id, &forged, None)
+            .await
+            .is_err()
+    );
+
+    // A renewed session never outlives its password login plus 30 days.
+    let current = sign_in(&db, &phone, None).await?;
+    age_anchor(&db, &current, "29d12h").await?;
+    let capped = sign_in(&db, &phone, None).await?;
+    let limit = OffsetDateTime::now_utc() + time::Duration::hours(12);
+    assert!(capped.session.expires_at <= limit);
+    assert!(capped.session.expires_at > limit - time::Duration::minutes(1));
+    age_anchor(&db, &capped, "30d1s").await?;
+    assert!(matches!(
+        sign_in(&db, &phone, None).await,
+        Err(IdentityError::AuthFailed)
+    ));
+
+    // Logout ends renewal, even with an older session of the device.
+    let older = sign_in(&db, &phone, Some(PASSWORD)).await?;
+    let newer = sign_in(&db, &phone, Some(PASSWORD)).await?;
+    revoke_session(&db, older.session.id).await?;
+    assert!(authenticate(&db, &newer.token).await.is_err());
+    assert!(sign_in(&db, &phone, None).await.is_err());
+
+    // A password login that escaped a concurrent password change's revocation
+    // (write skew) carries the old revision and cannot anchor renewal.
+    sign_in(&db, &phone, Some(PASSWORD)).await?;
+    db.query("UPDATE account_passwords SET revision = 'rotated' WHERE user_id = $user")
+        .bind(("user", owner.to_string()))
+        .await?
+        .check()?;
+    assert!(matches!(
+        sign_in(&db, &phone, None).await,
+        Err(IdentityError::AuthFailed)
+    ));
+
+    // A password change ends renewal.
+    let request = password_request(&db, owner, &phone, PASSWORD).await?;
+    approve_signed(&db, owner, &phone, &request).await?;
+    sign_in(&db, &phone, Some(PASSWORD)).await?;
+    sign_in(&db, &phone, None).await?;
+    let request = password_request(&db, owner, &phone, CHANGED).await?;
+    approve_signed(&db, owner, &phone, &request).await?;
+    assert!(sign_in(&db, &phone, None).await.is_err());
+
+    // Revoking the device ends renewal.
+    sign_in(&db, &phone, Some(CHANGED)).await?;
+    sign_in(&db, &phone, None).await?;
+    revoke_device(&db, phone.0.id).await?;
+    assert!(sign_in(&db, &phone, None).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn only_biometric_key_platforms_renew_without_a_password(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = fixture_db("renewal_platform_fixture").await?;
+    let owner = create_user(&db, "fixture owner").await?.id;
+    let phone = device(&db, owner, Platform::Ios).await?;
+    let request = password_request(&db, owner, &phone, PASSWORD).await?;
+    approve_signed(&db, owner, &phone, &request).await?;
+    let android = device(&db, owner, Platform::Android).await?;
+    sign_in(&db, &android, Some(PASSWORD)).await?;
+    assert!(sign_in(&db, &android, None).await?.renewed);
+    // A signed revoke ends renewal.
+    let request = revoke_request(&db, owner, &phone, android.0.id).await?;
+    approve_signed(&db, owner, &phone, &request).await?;
+    assert!(sign_in(&db, &android, None).await.is_err());
+    // Core cannot tell whether a Mac's key is biometry-bound.
+    for platform in [Platform::Macos, Platform::Linux, Platform::Windows] {
+        let desktop = device(&db, owner, platform).await?;
+        let session = sign_in(&db, &desktop, Some(PASSWORD)).await?;
+        assert!(
+            matches!(
+                sign_in(&db, &desktop, None).await,
+                Err(IdentityError::AuthFailed)
+            ),
+            "{}",
+            platform.as_str()
+        );
+        // The refusal leaves the password session alone.
+        assert!(authenticate(&db, &session.token).await.is_ok());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+async fn renewal_racing_a_password_change_never_survives_it(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = fixture_db("renewal_race_fixture").await?;
+    // Repeated so the two transactions overlap in some rounds.
+    for _ in 0..5 {
+        let owner = create_user(&db, "fixture owner").await?.id;
+        let phone = device(&db, owner, Platform::Ios).await?;
+        let request = password_request(&db, owner, &phone, PASSWORD).await?;
+        approve_signed(&db, owner, &phone, &request).await?;
+        sign_in(&db, &phone, Some(PASSWORD)).await?;
+        let change = password_request(&db, owner, &phone, CHANGED).await?;
+        let (renewal, changed) = tokio::join!(
+            sign_in(&db, &phone, None),
+            approve_signed(&db, owner, &phone, &change),
+        );
+        assert!(renewal.is_ok() || changed.is_ok(), "{changed:?}");
+        if changed.is_ok() {
+            if let Ok(renewal) = &renewal {
+                assert!(authenticate(&db, &renewal.token).await.is_err());
+            }
+            assert!(sign_in(&db, &phone, None).await.is_err());
+        }
+    }
     Ok(())
 }

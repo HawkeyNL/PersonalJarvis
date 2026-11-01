@@ -615,8 +615,13 @@ pub(crate) async fn auth_login(
             return Err(unauthorized());
         }
     };
-    note_password_verified(&state, Some(req.device_id));
-    record_security_event(&state, Some(req.device_id), "auth.login", "ok", None).await;
+    // A renewal verified no password, so it leaves the backoff untouched.
+    if result.renewed {
+        record_security_event(&state, Some(req.device_id), "auth.login", "renewed", None).await;
+    } else {
+        note_password_verified(&state, Some(req.device_id));
+        record_security_event(&state, Some(req.device_id), "auth.login", "ok", None).await;
+    }
     Ok(Json(json!({
         "token": result.token,
         "expires_at": result.session.expires_at.unix_timestamp(),

@@ -298,6 +298,7 @@ schema_eleven_sha256=$(head -n 11 "$schema_manifest" | sha256sum | awk '{print $
 schema_twelve_sha256=$(head -n 12 "$schema_manifest" | sha256sum | awk '{print $1}')
 schema_thirteen_sha256=$(head -n 13 "$schema_manifest" | sha256sum | awk '{print $1}')
 schema_fourteen_sha256=$(head -n 14 "$schema_manifest" | sha256sum | awk '{print $1}')
+schema_fifteen_sha256=$(head -n 15 "$schema_manifest" | sha256sum | awk '{print $1}')
 jq -n \
   --arg tag "$release_tag" \
   --arg revision "$release_revision" \
@@ -305,8 +306,8 @@ jq -n \
   --arg core_version "$core_version" \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
-  --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" --arg schema_eight "$schema_eight_sha256" --arg schema_nine "$schema_nine_sha256" --arg schema_ten "$schema_ten_sha256" --arg schema_eleven "$schema_eleven_sha256" --arg schema_twelve "$schema_twelve_sha256" --arg schema_thirteen "$schema_thirteen_sha256" --arg schema_fourteen "$schema_fourteen_sha256" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 15, from_sha256: [$schema_six, $schema_seven, $schema_eight, $schema_nine, $schema_ten, $schema_eleven, $schema_twelve, $schema_thirteen, $schema_fourteen]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1, codex_chat_worker: 1, ibkr_broker: 1, codex_runtime: 1, backup_timer: 1, housekeeping_timer: 1, persona_validate: 1}}' \
+  --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" --arg schema_eight "$schema_eight_sha256" --arg schema_nine "$schema_nine_sha256" --arg schema_ten "$schema_ten_sha256" --arg schema_eleven "$schema_eleven_sha256" --arg schema_twelve "$schema_twelve_sha256" --arg schema_thirteen "$schema_thirteen_sha256" --arg schema_fourteen "$schema_fourteen_sha256" --arg schema_fifteen "$schema_fifteen_sha256" \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 16, from_sha256: [$schema_six, $schema_seven, $schema_eight, $schema_nine, $schema_ten, $schema_eleven, $schema_twelve, $schema_thirteen, $schema_fourteen, $schema_fifteen]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1, codex_chat_worker: 1, ibkr_broker: 1, codex_runtime: 1, backup_timer: 1, housekeeping_timer: 1, persona_validate: 1}}' \
   > "$temporary_release/release.json"
 
 (
