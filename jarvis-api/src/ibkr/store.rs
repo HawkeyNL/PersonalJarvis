@@ -203,10 +203,12 @@ struct PortfolioRow {
     skipped_positions: Vec<Skipped>,
 }
 
-/// At most [`MAX_SKIPPED`] named, never more than counted, and no more
-/// positions in all than one sync may hold.
+/// At most [`MAX_SKIPPED`] named, never more than counted, at least one
+/// named when any is counted (as the app requires), and no more positions in
+/// all than one sync may hold.
 fn skipped_fits(portfolio: &Portfolio) -> bool {
     portfolio.skipped.len() <= MAX_SKIPPED.min(portfolio.skipped_count)
+        && portfolio.skipped.is_empty() == (portfolio.skipped_count == 0)
         && portfolio.positions.len() + portfolio.skipped_count <= MAX_POSITIONS
 }
 
@@ -412,16 +414,22 @@ mod tests {
             })
         );
 
-        // More skipped positions named than counted, or than the limit, are
-        // refused.
+        // More skipped positions named than counted, or than the limit, or
+        // none named while some are counted, are refused.
         let overnamed = Portfolio {
             skipped_count: 1,
             ..first.clone()
         };
-        assert!(matches!(
-            write_snapshot(&db, &overnamed).await,
-            Err(IbkrStoreError::InvalidData)
-        ));
+        let unnamed = Portfolio {
+            skipped: vec![],
+            ..first.clone()
+        };
+        for bad in [&overnamed, &unnamed] {
+            assert!(matches!(
+                write_snapshot(&db, bad).await,
+                Err(IbkrStoreError::InvalidData)
+            ));
+        }
 
         // A later sync replaces every position; one point per day remains,
         // holding the last value of that day.
