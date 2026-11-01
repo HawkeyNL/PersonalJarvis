@@ -75,7 +75,7 @@ ibkr_install_values() (
         shift 2
     done
     for index in "${!names[@]}"; do
-        mv -f -- "${staged[$index]}" "$ibkr_oauth_dir/${names[$index]}" || return 1
+        mv -Tf -- "${staged[$index]}" "$ibkr_oauth_dir/${names[$index]}" || return 1
     done
 )
 
@@ -102,7 +102,7 @@ set_ibkr_oauth() (
         fail "the access token secret must be the base64 text shown by IBKR"
     prepend=$(printf '%s' "$encrypted" | ibkr_decrypt_secret "$ibkr_oauth_dir/private_encryption.pem") &&
         [[ $prepend =~ ^[0-9a-f]+$ ]] ||
-        fail "the access token secret does not decrypt with private_encryption.pem; nothing was changed"
+        fail "the access token secret does not decrypt with private_encryption.pem (wrong key, damaged text, or OpenSSL older than 3.2); nothing was changed"
     ensure_ibkr_identity || fail "could not create the jarvis-ibkr service identity"
     ibkr_install_values consumer_key "$consumer_key" access_token "$access_token" \
         access_token_secret "$prepend" || fail "could not save the IBKR credentials"

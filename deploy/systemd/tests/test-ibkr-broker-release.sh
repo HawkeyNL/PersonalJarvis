@@ -8,7 +8,9 @@ service="$repo/deploy/systemd/jarvis-ibkr-broker.service"
 # Own identity, Core's socket group, credentials only through LoadCredential=
 # under the fixed names the broker reads, and never the encryption key.
 grep -Fxq 'User=jarvis-ibkr' "$service"
-grep -Fxq 'Group=jarvis' "$service"
+grep -Fxq 'Group=jarvis-ibkr' "$service"
+grep -Fxq 'ExecStartPre=+/usr/bin/install -d -o jarvis-ibkr -g jarvis -m 2750 /run/jarvis-ibkr-broker' "$service"
+[[ $(grep '^ReadWritePaths=' "$service") == 'ReadWritePaths=/run/jarvis-ibkr-broker' ]]
 grep -Fxq 'ExecStart=/opt/jarvis/current/jarvis-ibkr-broker' "$service"
 grep -Fxq 'Environment=JARVIS_IBKR_BROKER_ALLOWED_PEERS=jarvis' "$service"
 for credential in consumer_key:consumer_key access_token:access_token \
@@ -24,11 +26,10 @@ for directive in NoNewPrivileges=true CapabilityBoundingSet= LockPersonality=tru
     RestrictRealtime=true RestrictNamespaces=true SystemCallArchitectures=native \
     SystemCallFilter=@system-service MemoryDenyWriteExecute=true \
     'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' 'InaccessiblePaths=/etc/jarvis /var/lib/jarvis' \
-    UMask=0117 RuntimeDirectory=jarvis-ibkr-broker RuntimeDirectoryMode=0750 LimitCORE=0 \
-    Restart=on-failure; do
+    UMask=0117 LimitCORE=0 TasksMax=64 Restart=on-failure StartLimitIntervalSec=300 StartLimitBurst=5; do
     grep -Fxq "$directive" "$service"
 done
-! grep -Eq '^(SupplementaryGroups|EnvironmentFile|ReadWritePaths|StateDirectory|AmbientCapabilities|DynamicUser)=' "$service"
+! grep -Eq '^(SupplementaryGroups|EnvironmentFile|StateDirectory|RuntimeDirectory|AmbientCapabilities|DynamicUser)=' "$service"
 
 fixture=$(mktemp -d /tmp/jarvis-ibkr-release.XXXXXXXX)
 trap 'rm -rf -- "$fixture"' EXIT

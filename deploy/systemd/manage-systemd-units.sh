@@ -432,6 +432,9 @@ validate_release() {
     if [[ $(backup_capability "$release") == 1 ]]; then
         [[ $(stat -c '%u:%g' "$release/jarvis-backup") == 0:0 ]] || fail "backup helper is not root-owned"
     fi
+    if [[ $(ibkr_broker_capability "$release") == 1 ]]; then
+        [[ $(stat -c '%u:%g' "$release/jarvis-ibkr-broker") == 0:0 ]] || fail "IBKR broker is not root-owned"
+    fi
     if [[ $(housekeeping_capability "$release") == 1 ]]; then
         [[ $(stat -c '%u:%g' "$release/jarvis-housekeeping") == 0:0 ]] || fail "housekeeping helper is not root-owned"
     fi

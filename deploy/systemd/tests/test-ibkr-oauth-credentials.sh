@@ -60,7 +60,7 @@ answers "$fx_consumer_key" "$fx_access_token" "$fx_wrong"
 if set_ibkr_oauth >> "$fixture/output" 2>&1; then
     echo 'a secret encrypted for another key was accepted' >&2; exit 1
 fi
-grep -Fq 'does not decrypt with private_encryption.pem; nothing was changed' "$fixture/output"
+grep -Fq 'does not decrypt with private_encryption.pem' "$fixture/output"
 [[ ! -e $ibkr_oauth_dir/consumer_key && ! -e $ibkr_oauth_dir/access_token_secret ]]
 [[ ! -e $fixture/identity && ! -e $fixture/service-calls ]]
 
@@ -98,6 +98,19 @@ chmod 0440 "$ibkr_oauth_dir/access_token"
 ibkr_oauth_status > "$fixture/status"
 grep -Eq '^access_token +empty$' "$fixture/status"
 [[ -z $(grep -Ev '^[a-z_.]+ +(set|empty)$' "$fixture/status") ]]
+
+# Links are never followed: a linked item counts as empty, a linked directory
+# is refused.
+mv "$ibkr_oauth_dir/consumer_key" "$fixture/linked-key"
+ln -s "$fixture/linked-key" "$ibkr_oauth_dir/consumer_key"
+ibkr_oauth_status > "$fixture/status"
+grep -Eq '^consumer_key +empty$' "$fixture/status"
+mv "$ibkr_oauth_dir" "$fixture/real-dir"
+ln -s "$fixture/real-dir" "$ibkr_oauth_dir"
+answers "$fx_consumer_key" "$fx_access_token" "$fx_encrypted"
+if set_ibkr_oauth >> "$fixture/output" 2>&1; then
+    echo 'a linked credential directory was accepted' >&2; exit 1
+fi
 
 # No value, ciphertext or decrypted secret reaches output or service calls.
 for leaked in "$fx_consumer_key" "$fx_access_token" "$fx_encrypted" "$fx_secret" "$fx_secret_hex"; do

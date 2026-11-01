@@ -277,14 +277,14 @@ fi
 # Optional owner-enabled IBKR broker: when it runs, its identity and socket
 # boundary are mandatory.
 if systemctl is-active --quiet jarvis-ibkr-broker.service; then
-    check "IBKR broker uses its own identity with Core's socket group" bash -c \
-        '[[ $(systemctl show -p User --value jarvis-ibkr-broker.service) == jarvis-ibkr && $(systemctl show -p Group --value jarvis-ibkr-broker.service) == jarvis ]]'
+    check "IBKR broker uses its own identity and group" bash -c \
+        '[[ $(systemctl show -p User --value jarvis-ibkr-broker.service) == jarvis-ibkr && $(systemctl show -p Group --value jarvis-ibkr-broker.service) == jarvis-ibkr ]]'
     check "IBKR identity has no extra group access" bash -c \
         '[[ $(id -nG jarvis-ibkr) == jarvis-ibkr ]]'
     check "IBKR broker socket is private to Core's group" bash -c \
-        '[[ -S /run/jarvis-ibkr-broker/broker.sock && ! -L /run/jarvis-ibkr-broker/broker.sock && $(stat -c "%U:%G:%a" /run/jarvis-ibkr-broker/broker.sock) == jarvis-ibkr:jarvis:660 ]]'
+        '[[ -d /run/jarvis-ibkr-broker && ! -L /run/jarvis-ibkr-broker && $(stat -c "%U:%G:%a" /run/jarvis-ibkr-broker) == jarvis-ibkr:jarvis:2750 && -S /run/jarvis-ibkr-broker/broker.sock && ! -L /run/jarvis-ibkr-broker/broker.sock && $(stat -c "%U:%G:%a" /run/jarvis-ibkr-broker/broker.sock) == jarvis-ibkr:jarvis:660 ]]'
     check "IBKR credential directory is root-only" bash -c \
-        '[[ -d /etc/jarvis/secrets/ibkr-oauth && ! -L /etc/jarvis/secrets/ibkr-oauth && $(stat -c "%U:%G:%a" /etc/jarvis/secrets/ibkr-oauth) == root:root:700 ]]'
+        'dir=/etc/jarvis/secrets/ibkr-oauth; [[ -d $dir && ! -L $dir && $(stat -c "%u" "$dir") == 0 ]] && (( (8#$(stat -c "%a" "$dir") & 077) == 0 ))'
     ui_detail "IBKR broker: active (optional; read-only)"
 else
     ui_detail "IBKR broker: inactive (optional)"
