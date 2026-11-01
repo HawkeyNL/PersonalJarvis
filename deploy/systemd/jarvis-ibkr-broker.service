@@ -28,7 +28,9 @@ LoadCredential=dh_param:/etc/jarvis/secrets/ibkr-oauth/dhparam.pem
 # broker itself is not in that group. Not a RuntimeDirectory=: systemd resets
 # those to User:Group before every Exec* command.
 ExecStartPre=+/usr/bin/install -d -o jarvis-ibkr -g jarvis -m 2750 /run/jarvis-ibkr-broker
-ReadWritePaths=/run/jarvis-ibkr-broker
+# Optional (-): the namespace is also built for ExecStartPre, before the
+# directory exists.
+ReadWritePaths=-/run/jarvis-ibkr-broker
 ExecStart=/opt/jarvis/current/jarvis-ibkr-broker
 Restart=on-failure
 RestartSec=5s

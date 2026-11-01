@@ -10,7 +10,7 @@ service="$repo/deploy/systemd/jarvis-ibkr-broker.service"
 grep -Fxq 'User=jarvis-ibkr' "$service"
 grep -Fxq 'Group=jarvis-ibkr' "$service"
 grep -Fxq 'ExecStartPre=+/usr/bin/install -d -o jarvis-ibkr -g jarvis -m 2750 /run/jarvis-ibkr-broker' "$service"
-[[ $(grep '^ReadWritePaths=' "$service") == 'ReadWritePaths=/run/jarvis-ibkr-broker' ]]
+[[ $(grep '^ReadWritePaths=' "$service") == 'ReadWritePaths=-/run/jarvis-ibkr-broker' ]]
 grep -Fxq 'ExecStart=/opt/jarvis/current/jarvis-ibkr-broker' "$service"
 grep -Fxq 'Environment=JARVIS_IBKR_BROKER_ALLOWED_PEERS=jarvis' "$service"
 for credential in consumer_key:consumer_key access_token:access_token \
