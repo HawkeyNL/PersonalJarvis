@@ -67,6 +67,13 @@ pub fn to_snapshot(o: &Observation<'_>) -> Result<TokenSnapshot, MarketDataError
             return Err(MarketDataError::InvalidInput("pair is for another token"));
         }
     }
+    let other_mint = o.mint_account.is_some_and(|m| m.mint() != o.mint)
+        || o.largest_accounts.is_some_and(|h| h.mint() != o.mint);
+    if other_mint {
+        return Err(MarketDataError::InvalidInput(
+            "RPC read is for another token",
+        ));
+    }
     if let Some(quote) = o.sell_quote {
         if quote.input_mint != o.mint || quote.in_amount != o.sell_amount {
             return Err(MarketDataError::InvalidInput(
@@ -115,8 +122,8 @@ pub fn to_snapshot(o: &Observation<'_>) -> Result<TokenSnapshot, MarketDataError
 
 /// The larger of Jupiter's reported impact and the loss implied by its own
 /// USD values (which also counts fees). The unit of `priceImpact` is not
-/// verified live, so the USD cross-check keeps a misread unit from making the
-/// impact look smaller. Overflow saturates to `u32::MAX`.
+/// verified live, so the USD loss is required: without both USD values the
+/// impact is unknown (`None`). Overflow saturates to `u32::MAX`.
 fn sell_impact_bps(quote: &Quote) -> Option<u32> {
     let reported = quote.price_impact_pct.map(|pct| {
         pct.abs()
@@ -135,8 +142,8 @@ fn sell_impact_bps(quote: &Quote) -> Option<u32> {
                 .unwrap_or(u32::MAX),
         ),
         _ => None,
-    };
-    reported.max(from_usd)
+    }?;
+    Some(reported.map_or(from_usd, |r| r.max(from_usd)))
 }
 
 /// Share of supply in the [`TOP_HOLDERS`] largest non-excluded accounts.
@@ -199,8 +206,15 @@ mod tests {
         }
     }
 
+    fn checked<T>(value: T) -> CrossChecked<T> {
+        CrossChecked {
+            mint: MINT.to_owned(),
+            value,
+        }
+    }
+
     fn mint() -> CrossChecked<MintAccount> {
-        CrossChecked(mint_account())
+        checked(mint_account())
     }
 
     fn holders() -> CrossChecked<Vec<TokenAccountBalance>> {
@@ -208,7 +222,7 @@ mod tests {
             "../fixtures/rpc_get_token_largest_accounts.json"
         ))
         .unwrap();
-        CrossChecked(serde_json::from_value(reply["result"]["value"].clone()).unwrap())
+        checked(serde_json::from_value(reply["result"]["value"].clone()).unwrap())
     }
 
     fn quote() -> Quote {
@@ -218,8 +232,8 @@ mod tests {
             in_amount: SELL,
             out_amount: 1_043_211,
             price_impact_pct: Some(d("1.371")),
-            in_usd_value: None,
-            out_usd_value: None,
+            in_usd_value: Some(d("100")),
+            out_usd_value: Some(d("98.7")),
         }
     }
 
@@ -335,7 +349,7 @@ mod tests {
         .unwrap();
         assert_eq!(s.top_holders_share, Decimal::ONE);
 
-        let empty_supply = CrossChecked(MintAccount {
+        let empty_supply = checked(MintAccount {
             supply: 0,
             ..mint_account()
         });
@@ -347,7 +361,7 @@ mod tests {
         assert_eq!(s.top_holders_share, Decimal::ONE);
 
         let no_impact = Quote {
-            price_impact_pct: None,
+            in_usd_value: None,
             ..quote.clone()
         };
         let s = to_snapshot(&Observation {
@@ -357,7 +371,7 @@ mod tests {
         .unwrap();
         assert_eq!(s.sell_impact_bps, None);
 
-        let live = CrossChecked(MintAccount {
+        let live = checked(MintAccount {
             mint_authority: Some([1; 32]),
             ..mint_account()
         });
@@ -395,8 +409,14 @@ mod tests {
         assert_eq!(impact(Some("2.5"), Some(("100", "99"))), Some(250));
         assert_eq!(impact(None, Some(("100", "101"))), Some(0));
         assert_eq!(impact(None, Some(("0", "1"))), None);
-        assert_eq!(impact(Some("-0.5"), None), Some(50));
+        // Without both USD values the impact is unknown, whatever is reported.
+        assert_eq!(impact(Some("-0.5"), None), None);
         assert_eq!(impact(None, None), None);
+        let one_side = Quote {
+            out_usd_value: None,
+            ..quote()
+        };
+        assert_eq!(sell_impact_bps(&one_side), None);
     }
 
     #[test]
@@ -461,6 +481,27 @@ mod tests {
         };
         assert!(to_snapshot(&Observation {
             sell_quote: Some(&small),
+            ..empty()
+        })
+        .is_err());
+
+        let other_mint = "So11111111111111111111111111111111111111112".to_owned();
+        let foreign_mint = CrossChecked {
+            mint: other_mint.clone(),
+            value: mint_account(),
+        };
+        assert!(to_snapshot(&Observation {
+            mint_account: Some(&foreign_mint),
+            ..empty()
+        })
+        .is_err());
+
+        let foreign_holders = CrossChecked {
+            mint: other_mint,
+            value: holders().value,
+        };
+        assert!(to_snapshot(&Observation {
+            largest_accounts: Some(&foreign_holders),
             ..empty()
         })
         .is_err());

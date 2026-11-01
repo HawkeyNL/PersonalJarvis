@@ -53,8 +53,10 @@ impl fmt::Debug for RpcEndpoint {
     }
 }
 
-/// JSON-RPC error codes providers use for rate limits inside an HTTP 200.
-const RATE_LIMIT_CODES: &[i64] = &[-32005, -32429];
+/// JSON-RPC error codes inside an HTTP 200 that block the provider like a
+/// 429: `-32005` is "node unhealthy / behind" (not a rate limit, but backing
+/// off from a lagging node also fails closed), `-32429` is a rate limit.
+const BACKOFF_CODES: &[i64] = &[-32005, -32429];
 
 /// One RPC provider. Crate-private: callers read through [`CrossCheckedRpc`].
 pub(crate) struct RpcClient {
@@ -144,7 +146,7 @@ impl RpcClient {
             return Err(self.invalid("not a JSON-RPC 2.0 reply to this request"));
         }
         match (reply.result, reply.error) {
-            (_, Some(error)) if RATE_LIMIT_CODES.contains(&error.code) => {
+            (_, Some(error)) if BACKOFF_CODES.contains(&error.code) => {
                 Err(self.http.rate_limited(DEFAULT_BACKOFF))
             }
             (_, Some(error)) => Err(MarketDataError::Rpc {
@@ -224,7 +226,7 @@ impl CrossCheckedRpc {
 
     pub async fn mint(&self, mint: &str) -> Result<CrossChecked<MintAccount>, MarketDataError> {
         let (a, b) = tokio::join!(self.primary.mint(mint), self.secondary.mint(mint));
-        agree(a?, b?, "mint account")
+        agree(mint, a?, b?, "mint account")
     }
 
     /// Both lists sorted by amount (largest first) then address, so ties in
@@ -247,24 +249,40 @@ impl CrossCheckedRpc {
             });
             v
         };
-        agree(sort(a?), sort(b?), "largest token accounts")
+        agree(mint, sort(a?), sort(b?), "largest token accounts")
     }
 }
 
-/// A value two independent RPC providers returned identically.
+/// A value two independent RPC providers returned identically for `mint`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CrossChecked<T>(pub(crate) T);
+pub struct CrossChecked<T> {
+    pub(crate) mint: String,
+    pub(crate) value: T,
+}
 
 impl<T> CrossChecked<T> {
+    /// The mint address this value was read for.
+    pub fn mint(&self) -> &str {
+        &self.mint
+    }
+
     pub fn get(&self) -> &T {
-        &self.0
+        &self.value
     }
 }
 
 /// The value both providers returned, or an error naming what differs.
-fn agree<T: PartialEq>(a: T, b: T, what: &'static str) -> Result<CrossChecked<T>, MarketDataError> {
+fn agree<T: PartialEq>(
+    mint: &str,
+    a: T,
+    b: T,
+    what: &'static str,
+) -> Result<CrossChecked<T>, MarketDataError> {
     if a == b {
-        Ok(CrossChecked(a))
+        Ok(CrossChecked {
+            mint: mint.to_owned(),
+            value: a,
+        })
     } else {
         Err(MarketDataError::ProviderDisagreement(what))
     }
@@ -419,6 +437,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(agreed.get().mint_authority, None);
+        assert_eq!(agreed.mint(), mint);
 
         let (a, _) = client(0, &revoked).await;
         let (b, _) = client(1, &active).await;
