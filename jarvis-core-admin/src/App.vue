@@ -61,7 +61,8 @@ let runtimeTimer: number | undefined;
 // A lock or unlock removes the focused element; focus moves to what replaced it.
 watch(() => session.locked, (locked) => {
   if (locked) pendingPairings.value = 0;
-  void nextTick(() => (locked ? unlockButton.value : page.value)?.focus());
+  // The restart dialog is modal; focus stays in it.
+  if (!restartRequired.value) void nextTick(() => (locked ? unlockButton.value : page.value)?.focus());
 });
 function go(view: ViewName) { active.value = navigate(session.locked, active.value, view); }
 // A card that opens another view unmounts itself; focus moves to the new page.
