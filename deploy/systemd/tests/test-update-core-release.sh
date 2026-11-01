@@ -437,7 +437,7 @@ prepare_migration_candidate() {
     install -m 0755 "$repo_dir/deploy/systemd/schema-backup.sh" "$asset/schema-backup"
     install -m 0644 "$repo_dir/jarvis-core-admin/packaging/com.hawkeynl.jarvis.devices.policy" \
         "$asset/com.hawkeynl.jarvis.devices.policy"
-    jq --arg previous "$from" '.tooling.local_devices = 1 | .schema_migration = {version:1,target:15,from_sha256:[$previous]}' \
+    jq --arg previous "$from" '.tooling.local_devices = 1 | .schema_migration = {version:1,target:16,from_sha256:[$previous]}' \
         "$asset/release.json" > "$fixture_dir/migration-manifest"
     install -m 0644 "$fixture_dir/migration-manifest" "$asset/release.json"
     (cd "$asset" && sha256sum schema-backup com.hawkeynl.jarvis.devices.policy >> artifact-binaries.sha256)
