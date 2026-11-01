@@ -9,7 +9,7 @@ async function load() { busy.value = true; error.value = ""; try { data.value = 
 onMounted(load);
 </script>
 <template>
-  <PageHeader title="System / About" description="Non-secret Home Node and build provenance. Hardware identifiers and process environment are intentionally omitted." :busy="busy"><button class="secondary" @click="load">Refresh</button></PageHeader>
+  <PageHeader title="System" description="Non-secret Home Node and build provenance. Hardware identifiers and process environment are intentionally omitted." :busy="busy"><button class="secondary" @click="load">Refresh</button></PageHeader>
   <ErrorPanel v-if="error" :message="error" />
   <section v-if="data" class="system-grid"><JvTile v-for="[key, value] in data.values" :key="key" icon="doc" :label="key" :value="value" /></section>
 </template>

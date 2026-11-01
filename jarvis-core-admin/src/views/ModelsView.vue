@@ -128,7 +128,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 </script>
 
 <template>
-  <PageHeader title="Models" description="Exact owner policy with reviewed per-million-token pricing. Unknown prices are never displayed as free." :busy="busy">
+  <PageHeader title="Models &amp; routing" description="Exact owner policy with reviewed per-million-token pricing. Unknown prices are never displayed as free." :busy="busy">
     <button class="secondary" @click="load">Refresh view</button><button @click="mutate('refresh')">Refresh catalog</button>
   </PageHeader>
   <ErrorPanel v-if="error" :message="error" /><ResultPanel v-if="result" :result="result" />

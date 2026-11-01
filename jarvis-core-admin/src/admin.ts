@@ -2,9 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 export type ViewName =
   | "overview"
-  | "health"
-  | "services"
-  | "update"
+  | "releases"
   | "agents"
   | "models"
   | "usage"

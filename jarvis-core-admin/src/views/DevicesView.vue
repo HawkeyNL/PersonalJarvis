@@ -9,9 +9,10 @@ const busy = ref(false);
 const error = ref("");
 const result = ref("");
 const selection = ref<{ request: DeviceAction; title: string; detail: string } | null>(null);
+const emit = defineEmits<{ pairings: [count: number] }>();
 async function load() {
   busy.value = true; error.value = "";
-  try { data.value = await api.devices(); }
+  try { data.value = await api.devices(); emit("pairings", data.value.requests.length); }
   catch (e) { error.value = errorText(e); }
   finally { busy.value = false; }
 }

@@ -99,7 +99,7 @@ onMounted(load);
 </script>
 
 <template>
-  <PageHeader title="AI Accounts" description="Owner-only subscription connections. Provider credentials stay in dedicated worker storage, never in Core Admin or Jarvis chat." :busy="busy">
+  <PageHeader title="AI accounts" description="Owner-only subscription connections. Provider credentials stay in dedicated worker storage, never in Core Admin or Jarvis chat." :busy="busy">
     <button class="secondary" :disabled="busy" @click="load">Check status</button>
   </PageHeader>
   <ErrorPanel v-if="error" :message="error" />
