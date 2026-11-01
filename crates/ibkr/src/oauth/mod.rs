@@ -102,9 +102,18 @@ impl std::fmt::Debug for OAuthCredentials {
     }
 }
 
+/// No access for others and none for the group, except read access for the
+/// root group. systemd `LoadCredential=` files are root:root and, on a tmpfs
+/// credentials mount, readable by the service user through an ACL whose mask
+/// shows as group read.
+#[cfg(unix)]
+fn private_mode(mode: u32, gid: u32) -> bool {
+    mode & 0o007 == 0 && (mode & 0o070 == 0 || (gid == 0 && mode & 0o070 == 0o040))
+}
+
 /// Read a credential file, failing closed unless it is a regular file (not a
-/// symlink), at most [`MAX_CREDENTIAL_BYTES`], and on unix not accessible by
-/// group or others.
+/// symlink), at most [`MAX_CREDENTIAL_BYTES`], and on unix private (see
+/// [`private_mode`]).
 fn read_secret(path: &Path, what: &'static str) -> Result<Zeroizing<String>, IbkrError> {
     let invalid = IbkrError::Credential(what);
     let link = std::fs::symlink_metadata(path).map_err(|_| IbkrError::Credential(what))?;
@@ -121,7 +130,7 @@ fn read_secret(path: &Path, what: &'static str) -> Result<Zeroizing<String>, Ibk
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         // Same inode as the checked path: nobody swapped in a symlink between
         // the two lookups.
-        if meta.permissions().mode() & 0o077 != 0
+        if !private_mode(meta.permissions().mode(), meta.gid())
             || (meta.dev(), meta.ino()) != (link.dev(), link.ino())
         {
             return Err(invalid);

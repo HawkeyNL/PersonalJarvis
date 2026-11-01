@@ -580,6 +580,25 @@ fn loads_credential_files_and_redacts_debug() {
 }
 
 #[test]
+fn credential_modes_allow_only_root_group_read() {
+    for (mode, gid, ok) in [
+        (0o600, 1000, true),
+        (0o400, 1000, true),
+        // systemd credential on tmpfs: root:root, ACL mask shown as group read.
+        (0o440, 0, true),
+        (0o640, 0, true),
+        (0o440, 1000, false),
+        (0o460, 0, false),
+        (0o450, 0, false),
+        (0o444, 0, false),
+        (0o404, 1000, false),
+        (0o660, 1000, false),
+    ] {
+        assert_eq!(private_mode(mode, gid), ok, "{mode:o} gid {gid}");
+    }
+}
+
+#[test]
 fn refuses_unsafe_credential_files() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
