@@ -2,7 +2,7 @@ BEGIN TRANSACTION;
 -- Read model of the IBKR portfolio: what the read-only broker reported at
 -- Core's last good sync. No row here is an order, a mandate or a limit.
 -- Amounts are decimal strings, never floats; Core parses them with
--- rust_decimal. Cash account, EUR base currency only.
+-- rust_decimal. Cash account, EUR base currency, EUR positions only.
 
 -- The last good sync: only the row `current` is used.
 DEFINE TABLE IF NOT EXISTS ibkr_portfolio SCHEMAFULL PERMISSIONS NONE;
@@ -11,6 +11,13 @@ DEFINE FIELD as_of ON ibkr_portfolio TYPE datetime;
 DEFINE FIELD base_currency ON ibkr_portfolio TYPE string ASSERT $value = 'EUR';
 DEFINE FIELD net_liquidation ON ibkr_portfolio TYPE string ASSERT $value = /^-?[0-9]{1,20}(\.[0-9]{1,28})?$/;
 DEFINE FIELD cash ON ibkr_portfolio TYPE string ASSERT $value = /^-?[0-9]{1,20}(\.[0-9]{1,28})?$/;
+-- Valid positions the sync left out because they are not in EUR: how many,
+-- and at most 50 of them by symbol and currency (absent when IBKR reported
+-- no three-letter code).
+DEFINE FIELD skipped_count ON ibkr_portfolio TYPE int ASSERT $value >= 0 AND $value <= 1000;
+DEFINE FIELD skipped_positions ON ibkr_portfolio TYPE array<object, 50>;
+DEFINE FIELD skipped_positions.*.symbol ON ibkr_portfolio TYPE string ASSERT string::len($value) >= 1 AND string::len($value) <= 32;
+DEFINE FIELD skipped_positions.*.currency ON ibkr_portfolio TYPE option<string> ASSERT $value = NONE OR $value = /^[A-Z]{3}$/;
 
 -- Positions of that sync, replaced as a whole on every good sync. The row id
 -- is the IBKR contract id.

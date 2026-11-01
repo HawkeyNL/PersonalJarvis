@@ -1573,7 +1573,7 @@ async fn fake_ibkr_broker(dir: &std::path::Path) -> jarvis_ibkr::broker::BrokerC
                 let reply = match request["kind"].as_str() {
                     Some("accounts") => r#"{"ok":[{"accountId":"U1234567","currency":"EUR"}]}"#,
                     Some("positions") => {
-                        r#"{"ok":[{"conid":12345,"contractDesc":"VANGUARD FTSE ALL-WORLD","ticker":"VWCE","assetClass":"STK","currency":"EUR","position":"10","mktPrice":"120.5","mktValue":"1205","avgPrice":"101.25"}]}"#
+                        r#"{"ok":[{"conid":12345,"contractDesc":"VANGUARD FTSE ALL-WORLD","ticker":"VWCE","assetClass":"STK","currency":"EUR","position":"10","mktPrice":"120.5","mktValue":"1205","avgPrice":"101.25"},{"conid":265598,"ticker":"AAPL","assetClass":"STK","currency":"USD","position":"1","mktPrice":"200","mktValue":"200","avgPrice":"150"}]}"#
                     }
                     Some("ledger") => {
                         r#"{"ok":{"BASE":{"netliquidationvalue":"2205.5","cashbalance":"1000.5"}}}"#
@@ -1652,6 +1652,15 @@ async fn trading_routes_serve_the_synced_portfolio_read_only(
     assert_eq!(body["positions"][0]["symbol"], "VWCE");
     assert_eq!(body["positions"][0]["market_value"], "1205");
     assert_eq!(body["positions"][0]["weight_pct"], "54.64");
+    // The USD position is left out of the positions and reported instead.
+    assert_eq!(body["positions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["skipped_count"], 1);
+    assert_eq!(
+        body["skipped_positions"],
+        json!([{ "symbol": "AAPL", "currency": "USD" }])
+    );
+    let response = call(&on, "GET", "/v1/trading/instruments/265598/bars?range=1D").await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     let body = json_body(call(&on, "GET", "/v1/trading/portfolio/history?range=ALL").await?).await;
     assert_eq!(body["range"], "ALL");

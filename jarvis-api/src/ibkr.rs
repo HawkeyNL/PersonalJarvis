@@ -19,7 +19,7 @@ use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
 use jarvis_store::Database;
-use store::{Holding, Portfolio, BASE_CURRENCY, MAX_POSITIONS};
+use store::{Holding, Portfolio, Skipped, BASE_CURRENCY, MAX_POSITIONS, MAX_SKIPPED};
 
 /// Between good syncs; below the app's ten-minute staleness mark.
 const SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -120,11 +120,6 @@ fn holding(position: &Position, quantity: Decimal) -> Result<Holding, &'static s
     if !(1..=MAX_CONID).contains(&position.conid) {
         return Err("invalid contract id");
     }
-    // The app reads market values in the base currency; with EUR only, a
-    // position in another currency would be shown with the wrong unit.
-    if position.currency.as_deref() != Some(BASE_CURRENCY) {
-        return Err("position not in EUR");
-    }
     let symbol = text(position.ticker.as_deref(), 32)
         .or_else(|| text(position.description.as_deref(), 32))
         .ok_or("position without a valid symbol")?;
@@ -160,8 +155,11 @@ fn holding(position: &Position, quantity: Decimal) -> Result<Holding, &'static s
 }
 
 /// Validate one broker read into the stored shape. Closed positions
-/// (quantity 0) are left out; anything else that does not validate refuses
-/// the whole sync, so the stored portfolio stays the last consistent one.
+/// (quantity 0) are left out. A valid position in another currency than EUR
+/// is left out too and reported in `skipped`: the app reads market values in
+/// the base currency, so it would show it with the wrong unit. Anything else
+/// that does not validate refuses the whole sync, so the stored portfolio
+/// stays the last consistent one.
 pub fn map_portfolio(
     positions: &[Position],
     ledger: &Ledger,
@@ -177,29 +175,46 @@ pub fn map_portfolio(
         .and_then(amount)
         .ok_or("invalid cash balance")?;
     let mut holdings = Vec::new();
+    let mut skipped = Vec::new();
+    let mut conids = Vec::new();
     for position in positions {
         let quantity = position.position.ok_or("position without quantity")?;
         if quantity.is_zero() {
             continue;
         }
-        if holdings.len() == MAX_POSITIONS {
+        if conids.len() == MAX_POSITIONS {
             return Err("too many positions");
         }
-        holdings.push(holding(position, quantity)?);
+        let holding = holding(position, quantity)?;
+        conids.push(holding.conid);
+        if position.currency.as_deref() == Some(BASE_CURRENCY) {
+            holdings.push(holding);
+        } else {
+            skipped.push(Skipped {
+                symbol: holding.symbol,
+                currency: position
+                    .currency
+                    .as_deref()
+                    .filter(|c| c.len() == 3 && c.bytes().all(|b| b.is_ascii_uppercase()))
+                    .map(str::to_string),
+            });
+        }
     }
-    holdings.sort_by_key(|h| h.conid);
-    if holdings
-        .windows(2)
-        .any(|pair| pair[0].conid == pair[1].conid)
-    {
+    conids.sort_unstable();
+    if conids.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err("duplicate position");
     }
     store::sort_positions(&mut holdings);
+    let skipped_count = skipped.len();
+    skipped.sort();
+    skipped.truncate(MAX_SKIPPED);
     Ok(Portfolio {
         as_of,
         net_liquidation,
         cash,
         positions: holdings,
+        skipped,
+        skipped_count,
     })
 }
 
@@ -228,13 +243,13 @@ async fn sync_once(
     db: &Database,
     client: &BrokerClient,
     socket: &Path,
-) -> Result<usize, SyncError> {
+) -> Result<Portfolio, SyncError> {
     if !tokio::fs::try_exists(socket).await.unwrap_or(false) {
         return Err(SyncError::BrokerNotRunning);
     }
     let portfolio = fetch(client).await?;
     match tokio::time::timeout(DB_TIMEOUT, store::write_snapshot(db, &portfolio)).await {
-        Ok(Ok(())) => Ok(portfolio.positions.len()),
+        Ok(Ok(())) => Ok(portfolio),
         Ok(Err(error)) => {
             tracing::warn!(%error, "IBKR portfolio write failed");
             Err(SyncError::Store)
@@ -260,18 +275,36 @@ pub fn start(db: Database, client: BrokerClient, socket: PathBuf) {
     tokio::spawn(async move {
         let mut failures: u32 = 0;
         let mut last: Option<Result<(), SyncError>> = None;
+        let mut last_skipped: (usize, Vec<Skipped>) = (0, Vec::new());
         loop {
             let outcome = sync_once(&db, &client, &socket).await;
             let summary = outcome.as_ref().map(|_| ()).map_err(Clone::clone);
             if last.as_ref() != Some(&summary) {
                 match &outcome {
-                    Ok(positions) => tracing::info!(positions, "IBKR portfolio synced"),
+                    Ok(portfolio) => tracing::info!(
+                        positions = portfolio.positions.len(),
+                        "IBKR portfolio synced"
+                    ),
                     Err(SyncError::BrokerNotRunning) => {
                         tracing::info!("IBKR broker is not running; portfolio sync waits")
                     }
                     Err(error) => tracing::warn!(%error, "IBKR portfolio sync failed"),
                 }
                 last = Some(summary);
+            }
+            if let Ok(portfolio) = &outcome {
+                if last_skipped.0 != portfolio.skipped_count || last_skipped.1 != portfolio.skipped
+                {
+                    if portfolio.skipped_count > 0 {
+                        tracing::warn!(
+                            skipped = portfolio.skipped_count,
+                            "IBKR positions not in EUR are not shown"
+                        );
+                    } else {
+                        tracing::info!("IBKR positions are all in EUR again");
+                    }
+                    last_skipped = (portfolio.skipped_count, portfolio.skipped.clone());
+                }
             }
             failures = match outcome {
                 Ok(_) | Err(SyncError::BrokerNotRunning) => 0,
@@ -350,8 +383,6 @@ mod tests {
             let json = VWCE.replace(change.0, change.1);
             map_portfolio(&[position(&json)], &ledger(LEDGER), at).unwrap_err()
         };
-        assert_eq!(bad((r#""EUR""#, r#""USD""#)), "position not in EUR");
-        assert_eq!(bad((r#","currency":"EUR""#, "")), "position not in EUR");
         assert_eq!(bad((r#""12345""#, "-1")), "invalid contract id");
         assert_eq!(bad((r#""12345""#, "1000000000000")), "invalid contract id");
         assert_eq!(
@@ -420,6 +451,82 @@ mod tests {
             .unwrap_err(),
             "invalid cash balance"
         );
+    }
+
+    #[test]
+    fn skips_positions_not_in_eur_and_reports_them() {
+        let at = OffsetDateTime::UNIX_EPOCH;
+        let other = |conid: &str, ticker: &str, currency: &str| {
+            position(
+                &VWCE
+                    .replace(r#""12345""#, conid)
+                    .replace(r#""VWCE""#, &format!("\"{ticker}\""))
+                    .replace(r#","currency":"EUR""#, currency),
+            )
+        };
+        let read = [
+            position(VWCE),
+            other("2", "AAPL", r#","currency":"USD""#),
+            other("3", "NOCUR", ""),
+            other("4", "BAD", r#","currency":"us$""#),
+        ];
+        let portfolio = map_portfolio(&read, &ledger(LEDGER), at).unwrap();
+        assert_eq!(portfolio.positions.len(), 1);
+        assert_eq!(portfolio.positions[0].symbol, "VWCE");
+        assert_eq!(portfolio.skipped_count, 3);
+        let skipped = |symbol: &str, currency: Option<&str>| Skipped {
+            symbol: symbol.into(),
+            currency: currency.map(Into::into),
+        };
+        assert_eq!(
+            portfolio.skipped,
+            [
+                skipped("AAPL", Some("USD")),
+                skipped("BAD", None),
+                skipped("NOCUR", None),
+            ]
+        );
+        // A skipped position is still validated, counted against the limit
+        // and checked for duplicates.
+        let unpriced = position(
+            &VWCE
+                .replace(r#""EUR""#, r#""USD""#)
+                .replace(r#""mktPrice":"120.50""#, r#""mktPrice":null"#),
+        );
+        assert_eq!(
+            map_portfolio(&[unpriced], &ledger(LEDGER), at).unwrap_err(),
+            "invalid market price"
+        );
+        let twice = [
+            position(VWCE),
+            other("12345", "VWCE", r#","currency":"USD""#),
+        ];
+        assert_eq!(
+            map_portfolio(&twice, &ledger(LEDGER), at).unwrap_err(),
+            "duplicate position"
+        );
+        let many: Vec<Position> = (1..=MAX_POSITIONS as i64 + 1)
+            .map(|conid| other(&conid.to_string(), "USD1", r#","currency":"USD""#))
+            .collect();
+        assert_eq!(
+            map_portfolio(&many, &ledger(LEDGER), at).unwrap_err(),
+            "too many positions"
+        );
+        // The reported list is capped; the count is not.
+        let all: Vec<Position> = (1..=MAX_POSITIONS as i64)
+            .map(|conid| {
+                other(
+                    &conid.to_string(),
+                    &format!("S{conid:04}"),
+                    r#","currency":"USD""#,
+                )
+            })
+            .collect();
+        let capped = map_portfolio(&all, &ledger(LEDGER), at).unwrap();
+        assert!(capped.positions.is_empty());
+        assert_eq!(capped.skipped_count, MAX_POSITIONS);
+        assert_eq!(capped.skipped.len(), MAX_SKIPPED);
+        assert_eq!(capped.skipped[0].symbol, "S0001");
     }
 
     #[test]
