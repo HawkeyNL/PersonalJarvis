@@ -146,8 +146,9 @@ impl Fake {
                         "0"
                     },
                 );
+            } else {
+                *self.lst.lock().unwrap() = Some(lst.to_vec());
             }
-            *self.lst.lock().unwrap() = Some(lst.to_vec());
             self.mints.fetch_add(1, Ordering::SeqCst);
             let expires = (unix_now() + Duration::from_secs(86_400)).as_millis();
             return (
@@ -491,10 +492,12 @@ fn pacer_spaces_requests_and_blocks_after_429() {
 
 #[test]
 fn loads_credential_files_and_redacts_debug() {
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let write = |name: &str, contents: &str| {
         let path = dir.path().join(name);
         std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         path
     };
     let files = OAuthCredentialFiles {
@@ -562,4 +565,81 @@ fn loads_credential_files_and_redacts_debug() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn refuses_unsafe_credential_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("consumer_key");
+    std::fs::write(&path, "TESTCONS").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        read_secret(&path, "consumer key").unwrap().as_str(),
+        "TESTCONS"
+    );
+
+    for mode in [0o640, 0o604, 0o660] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            matches!(
+                read_secret(&path, "consumer key"),
+                Err(IbkrError::Credential("consumer key"))
+            ),
+            "{mode:o}"
+        );
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(matches!(
+        read_secret(&link, "consumer key"),
+        Err(IbkrError::Credential(_))
+    ));
+    assert!(matches!(
+        read_secret(dir.path(), "consumer key"),
+        Err(IbkrError::Credential(_))
+    ));
+
+    let big = dir.path().join("big");
+    std::fs::write(&big, vec![b'A'; MAX_CREDENTIAL_BYTES as usize + 1]).unwrap();
+    std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(matches!(
+        read_secret(&big, "consumer key"),
+        Err(IbkrError::Credential(_))
+    ));
+}
+
+#[tokio::test]
+async fn failed_refresh_keeps_the_still_valid_lst() {
+    let (client, fake) = fake_client().await;
+    client.ledger("DU1234567").await.unwrap();
+    // Move into the refresh margin, past the mint cooldown.
+    {
+        let mut state = client.session.lock().await;
+        state.current.as_mut().unwrap().expires_at = Instant::now() + Duration::from_secs(60);
+        state.last_mint = None;
+    }
+    *fake.bad_lst_signature.lock().unwrap() = true;
+    client.ledger("DU1234567").await.unwrap();
+    assert_eq!(
+        fake.mints.load(Ordering::SeqCst),
+        2,
+        "refresh was attempted"
+    );
+    // Within the cooldown the old LST keeps serving without another mint.
+    client.ledger("DU1234567").await.unwrap();
+    assert_eq!(fake.mints.load(Ordering::SeqCst), 2);
+    // At its real expiry it is dropped.
+    client
+        .session
+        .lock()
+        .await
+        .current
+        .as_mut()
+        .unwrap()
+        .expires_at = Instant::now();
+    let error = client.ledger("DU1234567").await.unwrap_err();
+    assert!(matches!(error, IbkrError::MintCooldown { .. }), "{error:?}");
 }

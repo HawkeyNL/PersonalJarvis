@@ -14,14 +14,17 @@
 //! (base64). It is decrypted once, at credential setup and outside Core, e.g.
 //! `base64 -d secret.b64 | openssl pkeyutl -decrypt -inkey
 //! private_encryption.pem | xxd -p -c0`, and only that lowercase hex (the
-//! base-string "prepend") is stored in a root-only file. Core never loads the
+//! base-string "prepend") is stored in a file readable only by the service
+//! user that runs the IBKR client. Core never loads the
 //! encryption key and does no RSA decryption at runtime.
 
 mod crypto;
 mod types;
 
 use std::{
-    path::PathBuf,
+    fs::File,
+    io::Read as _,
+    path::{Path, PathBuf},
     sync::Mutex as StdMutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -58,6 +61,8 @@ const SNAPSHOT_PREFLIGHT_DELAY: Duration = Duration::from_secs(1);
 const MAX_SNAPSHOT_CONIDS: usize = 50;
 /// 100 positions per page, so this bounds one call at 5000 positions.
 const MAX_POSITION_PAGES: u32 = 50;
+/// Credential files are a few KiB at most (PEM keys, hex tokens).
+const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
 // ponytail: compete=false never kicks the owner's TWS/mobile session, but the
 // init may then report "not authenticated" while another session is active.
 const SSODH_INIT_BODY: &str = r#"{"publish":true,"compete":false}"#;
@@ -95,10 +100,40 @@ impl std::fmt::Debug for OAuthCredentials {
     }
 }
 
-fn read_secret(path: &PathBuf, what: &'static str) -> Result<Zeroizing<String>, IbkrError> {
-    std::fs::read_to_string(path)
-        .map(Zeroizing::new)
-        .map_err(|_| IbkrError::Credential(what))
+/// Read a credential file, failing closed unless it is a regular file (not a
+/// symlink), at most [`MAX_CREDENTIAL_BYTES`], and on unix not accessible by
+/// group or others.
+fn read_secret(path: &Path, what: &'static str) -> Result<Zeroizing<String>, IbkrError> {
+    let invalid = IbkrError::Credential(what);
+    let link = std::fs::symlink_metadata(path).map_err(|_| IbkrError::Credential(what))?;
+    if !link.file_type().is_file() {
+        return Err(invalid);
+    }
+    let file = File::open(path).map_err(|_| IbkrError::Credential(what))?;
+    let meta = file.metadata().map_err(|_| IbkrError::Credential(what))?;
+    if !meta.is_file() || meta.len() > MAX_CREDENTIAL_BYTES {
+        return Err(invalid);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // Same inode as the checked path: nobody swapped in a symlink between
+        // the two lookups.
+        if meta.permissions().mode() & 0o077 != 0
+            || (meta.dev(), meta.ino()) != (link.dev(), link.ino())
+        {
+            return Err(invalid);
+        }
+    }
+    // Sized up front so reading does not reallocate and leave copies behind.
+    let mut text = Zeroizing::new(String::with_capacity(meta.len() as usize + 1));
+    file.take(MAX_CREDENTIAL_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| IbkrError::Credential(what))?;
+    if text.len() as u64 > MAX_CREDENTIAL_BYTES {
+        return Err(invalid);
+    }
+    Ok(text)
 }
 
 /// PKCS#8 (`BEGIN PRIVATE KEY`, OpenSSL 3) or PKCS#1 (`BEGIN RSA PRIVATE
@@ -226,8 +261,18 @@ impl Pacer {
 
 struct Session {
     lst: Zeroizing<Vec<u8>>,
-    refresh_at: Instant,
+    /// Server-stated expiry (capped); refresh starts [`LST_REFRESH_MARGIN`] earlier.
+    expires_at: Instant,
     generation: u64,
+}
+
+/// LST bytes and the generation they belong to.
+type LstHandle = (Zeroizing<Vec<u8>>, u64);
+
+impl Session {
+    fn handle(&self) -> LstHandle {
+        (self.lst.clone(), self.generation)
+    }
 }
 
 #[derive(Default)]
@@ -487,30 +532,57 @@ impl IbkrOAuthClient {
 
     /// The current LST bytes and generation, minting a new one when absent or
     /// close to expiry. Concurrent callers wait for a single mint.
-    async fn session(&self) -> Result<(Zeroizing<Vec<u8>>, u64), IbkrError> {
+    ///
+    /// The pacer wait happens before the lock is taken, so a queued mint does
+    /// not block callers that only need the cached LST.
+    async fn session(&self) -> Result<LstHandle, IbkrError> {
+        if let Some(found) = Self::usable(&*self.session.lock().await)? {
+            return Ok(found);
+        }
+        self.pace(false).await?;
         let mut state = self.session.lock().await;
-        let now = Instant::now();
-        if let Some(current) = state.current.as_ref().filter(|s| now < s.refresh_at) {
-            return Ok((current.lst.clone(), current.generation));
+        if let Some(found) = Self::usable(&state)? {
+            return Ok(found);
         }
-        if let Some(next) = state.last_mint.map(|at| at + MINT_COOLDOWN) {
-            if now < next {
-                return Err(IbkrError::MintCooldown {
-                    retry_after_secs: (next - now).as_secs().max(1),
-                });
+        state.last_mint = Some(Instant::now());
+        match self.mint().await {
+            Ok((lst, expires_at)) => {
+                state.generation += 1;
+                let generation = state.generation;
+                Ok(state
+                    .current
+                    .insert(Session {
+                        lst,
+                        expires_at,
+                        generation,
+                    })
+                    .handle())
             }
+            // A failed refresh inside the margin keeps the still-valid LST.
+            Err(error) => match state.current.as_ref() {
+                Some(old) if Instant::now() < old.expires_at => Ok(old.handle()),
+                _ => Err(error),
+            },
         }
-        state.last_mint = Some(now);
-        state.current = None;
-        let (lst, refresh_at) = self.mint().await?;
-        state.generation += 1;
-        let generation = state.generation;
-        let current = state.current.insert(Session {
-            lst,
-            refresh_at,
-            generation,
-        });
-        Ok((current.lst.clone(), current.generation))
+    }
+
+    /// `Some` when the cached LST can be used now, `None` when a mint is due,
+    /// or `MintCooldown` when a mint is due but was attempted too recently.
+    fn usable(state: &SessionState) -> Result<Option<LstHandle>, IbkrError> {
+        let now = Instant::now();
+        let valid = state.current.as_ref().filter(|s| now < s.expires_at);
+        if let Some(fresh) = valid.filter(|s| now + LST_REFRESH_MARGIN < s.expires_at) {
+            return Ok(Some(fresh.handle()));
+        }
+        match state.last_mint.map(|at| at + MINT_COOLDOWN) {
+            Some(next) if now < next => match valid {
+                Some(old) => Ok(Some(old.handle())),
+                None => Err(IbkrError::MintCooldown {
+                    retry_after_secs: (next - now).as_secs().max(1),
+                }),
+            },
+            _ => Ok(None),
+        }
     }
 
     async fn mint(&self) -> Result<(Zeroizing<Vec<u8>>, Instant), IbkrError> {
@@ -531,7 +603,7 @@ impl IbkrOAuthClient {
             ("oauth_token", creds.access_token.as_str()),
         ];
         let prepend = Zeroizing::new(hex::encode(&*creds.secret));
-        let base = Zeroizing::new(crypto::base_string(&prepend, "POST", &url, &params));
+        let base = crypto::base_string(&prepend, "POST", &url, &params);
         let signature = crypto::rsa_sha256_signature(&creds.signing_key, &base)?;
         params.push(("oauth_signature", &signature));
         let authorization = crypto::authorization_header(&creds.realm, &params);
@@ -542,8 +614,9 @@ impl IbkrOAuthClient {
             // hyper omits it for an empty body; IBKR then answers 411.
             .header(header::CONTENT_LENGTH, "0")
             .body("");
-        let response: LstResponse = serde_json::from_slice(&self.execute(request, false).await?)
-            .map_err(IbkrError::Decode)?;
+        // Paced by the caller (`session`) before the timestamp was taken.
+        let response: LstResponse =
+            serde_json::from_slice(&self.send(request).await?).map_err(IbkrError::Decode)?;
 
         let lst = crypto::live_session_token(
             &response.diffie_hellman_response,
@@ -563,7 +636,8 @@ impl IbkrOAuthClient {
         let lifetime = u64::try_from(response.live_session_token_expiration)
             .ok()
             .and_then(|ms| Duration::from_millis(ms).checked_sub(unix_now()))
-            .and_then(|left| left.min(MAX_LST_LIFETIME).checked_sub(LST_REFRESH_MARGIN))
+            .map(|left| left.min(MAX_LST_LIFETIME))
+            .filter(|left| *left > LST_REFRESH_MARGIN)
             .ok_or(IbkrError::Handshake("live session token expires too soon"))?;
         Ok((lst, Instant::now() + lifetime))
     }
@@ -579,6 +653,8 @@ impl IbkrOAuthClient {
         accounts: bool,
     ) -> Result<Vec<u8>, IbkrError> {
         let (lst, generation) = self.session().await?;
+        // Wait for the slot first, so the signed timestamp is fresh when sent.
+        self.pace(accounts).await?;
         let creds = &self.credentials;
         let url = format!("{}{path}", self.base);
         let nonce = crypto::random_hex(16);
@@ -619,7 +695,7 @@ impl IbkrOAuthClient {
             None if is_post => request.header(header::CONTENT_LENGTH, "0").body(""),
             None => request,
         };
-        let result = self.execute(request, accounts).await;
+        let result = self.send(request).await;
         if matches!(result, Err(IbkrError::Unauthorized)) {
             // Only the LST this request used: a newer one minted meanwhile
             // stays. The next mint gets a new generation, so the brokerage
@@ -630,19 +706,19 @@ impl IbkrOAuthClient {
                 .as_mut()
                 .filter(|s| s.generation == generation)
             {
-                session.refresh_at = Instant::now();
+                session.expires_at = Instant::now();
             }
         }
         result
     }
 
-    async fn execute(
-        &self,
-        request: reqwest::RequestBuilder,
-        accounts: bool,
-    ) -> Result<Vec<u8>, IbkrError> {
+    /// Wait for a pacer slot; fails while a 429 back-off is active.
+    async fn pace(&self, accounts: bool) -> Result<(), IbkrError> {
         tokio::time::sleep_until(self.pacer.reserve(accounts)?).await;
-        self.pacer.ensure_open()?;
+        self.pacer.ensure_open()
+    }
+
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<Vec<u8>, IbkrError> {
         let response = request.send().await?;
         match response.status() {
             StatusCode::TOO_MANY_REQUESTS => {

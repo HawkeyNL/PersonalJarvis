@@ -24,8 +24,14 @@ const RFC3986: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-pub(crate) fn encode(value: &str) -> String {
-    utf8_percent_encode(value, RFC3986).to_string()
+/// Percent-encodes into a buffer reserved for the worst case (3 bytes per
+/// byte), so no reallocation leaves partial copies of the input behind.
+pub(crate) fn encode(value: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(value.len() * 3));
+    for part in utf8_percent_encode(value, RFC3986) {
+        out.push_str(part);
+    }
+    out
 }
 
 /// `prepend + METHOD & enc(url) & enc(sorted k=v joined by &)`.
@@ -38,15 +44,27 @@ pub(crate) fn base_string(
     method: &str,
     url: &str,
     params: &[(&str, &str)],
-) -> String {
+) -> Zeroizing<String> {
     let mut pairs: Vec<_> = params.to_vec();
     pairs.sort_unstable();
-    let joined = pairs
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    format!("{prepend}{method}&{}&{}", encode(url), encode(&joined))
+    let joined_len: usize = pairs.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+    let mut joined = Zeroizing::new(String::with_capacity(joined_len));
+    for (index, (key, value)) in pairs.iter().enumerate() {
+        if index > 0 {
+            joined.push('&');
+        }
+        joined.push_str(key);
+        joined.push('=');
+        joined.push_str(value);
+    }
+    let (url, joined) = (encode(url), encode(&joined));
+    let mut base = Zeroizing::new(String::with_capacity(
+        prepend.len() + method.len() + url.len() + joined.len() + 2,
+    ));
+    for part in [prepend, method, "&", &url, "&", &joined] {
+        base.push_str(part);
+    }
+    base
 }
 
 /// `OAuth realm="..", k="v", ..` with the pairs sorted by key.
@@ -70,7 +88,7 @@ pub(crate) fn rsa_sha256_signature(key: &RsaKeyPair, base: &str) -> Result<Strin
         &mut signature,
     )
     .map_err(|_| IbkrError::Handshake("signing the LST request failed"))?;
-    Ok(encode(&B64.encode(signature)))
+    Ok(encode(&B64.encode(signature)).to_string())
 }
 
 /// DER body of the first PEM block with exactly this label.
@@ -88,7 +106,7 @@ pub(crate) fn pem_body(pem: &str, label: &str) -> Option<Zeroizing<Vec<u8>>> {
 pub(crate) fn hmac_sha256_signature(lst: &[u8], base: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(lst).expect("HMAC takes any key length");
     mac.update(base.as_bytes());
-    encode(&B64.encode(mac.finalize().into_bytes()))
+    encode(&B64.encode(mac.finalize().into_bytes())).to_string()
 }
 
 /// Random value of `bytes` length as lowercase hex (nonces).
@@ -99,8 +117,9 @@ pub(crate) fn random_hex(bytes: usize) -> String {
 }
 
 /// A fresh 256-bit DH private value `a`.
-// ponytail: num-bigint has no Zeroize, so `a` and K stay in memory until the
-// allocator reuses them; they live for one mint and protect a 24 h token.
+// ponytail: neither num-bigint values (`a`, K) nor ring's `RsaKeyPair` are
+// zeroized: num-bigint has no Zeroize and ring keeps the key internally. `a`
+// and K live for one mint; zeroizing them needs a bigint crate with Zeroize.
 pub(crate) fn dh_private() -> BigUint {
     let mut buf = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(buf.as_mut());
@@ -257,16 +276,16 @@ pub(crate) mod tests {
             ],
         );
         assert_eq!(
-            base,
+            base.as_str(),
             "GET&http%3A%2F%2Flocalhost%3A12345%2Ftradingapi%2Fv1%2Fmarketdata%2Fsnapshot&conid%3D8314%26oauth_consumer_key%3DTESTCONS%26oauth_nonce%3Daecef17086308940e861%26oauth_signature_method%3DHMAC-SHA256%26oauth_timestamp%3D1473795686%26oauth_token%3D6f531f8fd316915af53f"
         );
         let lst = B64.decode(TEST_LST).unwrap();
         assert_eq!(
             hmac_sha256_signature(&lst, &base),
-            encode("+BdIuZDNooYZAbO9RZUCTC5F/3HjFOb04Tu4crpi0v8=")
+            encode("+BdIuZDNooYZAbO9RZUCTC5F/3HjFOb04Tu4crpi0v8=").as_str()
         );
         assert_eq!(
-            encode("+BdI/x="),
+            encode("+BdI/x=").as_str(),
             "%2BBdI%2Fx%3D",
             "signature characters are percent-encoded"
         );
@@ -281,7 +300,7 @@ pub(crate) mod tests {
             &[("oauth_token", "tok"), ("diffie_hellman_challenge", "ff")],
         );
         assert_eq!(
-            base,
+            base.as_str(),
             "a1b2POST&https%3A%2F%2Fapi.ibkr.com%2Fv1%2Fapi%2Foauth%2Flive_session_token&diffie_hellman_challenge%3Dff%26oauth_token%3Dtok"
         );
     }
