@@ -20,7 +20,7 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use time::{Duration, OffsetDateTime};
 
 use crate::filter::{self, FilterRules, Verdict};
-use crate::paper;
+use crate::paper::{self, CostModel};
 use crate::types::{Position, TokenSnapshot};
 
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
@@ -219,17 +219,22 @@ pub fn evaluate_entry(
 /// Only a fresh snapshot (within `max_snapshot_age`) of the position's own
 /// mint may drive a price-based exit. Otherwise, and for data too absurd to
 /// compute with, only the time stop applies.
+///
+/// Exits must never be blocked by a bad parameter set, so instead of
+/// refusing invalid params this clamps the exit slippage and intent lifetime
+/// into their code-fixed bounds.
 pub fn evaluate_exit(
     position: &Position,
     s: &TokenSnapshot,
     params: &StrategyParams,
+    costs: &CostModel,
     max_snapshot_age: Duration,
     now: OffsetDateTime,
 ) -> Option<TradeIntent> {
     let usable =
         s.mint == position.mint && s.observed_at <= now && now - s.observed_at <= max_snapshot_age;
     let reason = usable
-        .then(|| market_exit(position, s, params))
+        .then(|| market_exit(position, s, params, costs))
         .flatten()
         .or_else(|| {
             (now - position.opened_at >= params.max_hold).then_some(ExitReason::TimeStop)
@@ -239,18 +244,25 @@ pub fn evaluate_exit(
         mint: position.mint.clone(),
         kind: IntentKind::Exit(reason),
         amount_in: position.tokens,
-        max_slippage_bps: params.exit_slippage_bps,
+        max_slippage_bps: params
+            .exit_slippage_bps
+            .clamp(bounds::EXIT_SLIPPAGE_BPS.0, bounds::EXIT_SLIPPAGE_BPS.1),
         created_at: now,
-        expires_at: now + params.intent_ttl,
+        expires_at: now
+            + params
+                .intent_ttl
+                .clamp(bounds::INTENT_TTL.0, bounds::INTENT_TTL.1),
     })
 }
 
 /// Liquidity drop, stop loss or take profit; `None` when none fires or the
-/// numbers overflow.
+/// numbers overflow. A fresh price of zero or less is a stop loss: the
+/// position can no longer be valued.
 fn market_exit(
     position: &Position,
     s: &TokenSnapshot,
     params: &StrategyParams,
+    costs: &CostModel,
 ) -> Option<ExitReason> {
     let keep = |bps: u32| BPS - Decimal::from(bps.min(10_000));
     let floor = position
@@ -259,8 +271,11 @@ fn market_exit(
     if s.liquidity_usd.checked_mul(BPS)? <= floor {
         return Some(ExitReason::LiquidityDrop);
     }
-    let value =
-        paper::sell_value(position.tokens, s.price_usd, s.liquidity_usd)?.checked_mul(BPS)?;
+    if s.price_usd <= Decimal::ZERO {
+        return Some(ExitReason::StopLoss);
+    }
+    let value = paper::sell_value(position.tokens, s.price_usd, s.liquidity_usd, costs)?
+        .checked_mul(BPS)?;
     if value <= position.cost_usd.checked_mul(keep(params.stop_loss_bps))? {
         return Some(ExitReason::StopLoss);
     }
@@ -274,7 +289,7 @@ fn market_exit(
 mod tests {
     use super::*;
     use crate::filter::tests::rules;
-    use crate::testutil::{d, good_snapshot, t0, Rng};
+    use crate::testutil::{costs, d, good_snapshot, t0, Rng};
 
     fn params() -> StrategyParams {
         StrategyParams {
@@ -440,13 +455,13 @@ mod tests {
     }
 
     fn exit(p: &Position, s: &TokenSnapshot, now: OffsetDateTime) -> Option<IntentKind> {
-        evaluate_exit(p, s, &params(), Duration::seconds(30), now).map(|i| i.kind)
+        evaluate_exit(p, s, &params(), &costs(), Duration::seconds(30), now).map(|i| i.kind)
     }
 
     #[test]
     fn exits_fire_safety_first() {
         let p = position("40");
-        let s = good_snapshot(); // 40000 tokens at 0.001 ~ 39.98 USD executable
+        let s = good_snapshot(); // 40000 tokens at 0.001 ~ 39.88 USD executable
         assert_eq!(exit(&p, &s, t0()), None);
 
         let mut drained = s.clone();
@@ -476,7 +491,8 @@ mod tests {
             Some(IntentKind::Exit(ExitReason::TimeStop))
         );
 
-        let intent = evaluate_exit(&p, &up, &params(), Duration::seconds(30), t0()).unwrap();
+        let intent =
+            evaluate_exit(&p, &up, &params(), &costs(), Duration::seconds(30), t0()).unwrap();
         assert_eq!(intent.amount_in, d("40000"));
         assert_eq!(intent.max_slippage_bps, 800);
     }
@@ -517,5 +533,46 @@ mod tests {
                 Some(IntentKind::Exit(ExitReason::TimeStop))
             );
         }
+    }
+
+    #[test]
+    fn fresh_zero_price_is_a_stop_loss() {
+        let mut s = good_snapshot();
+        s.price_usd = Decimal::ZERO;
+        assert_eq!(
+            exit(&position("40"), &s, t0()),
+            Some(IntentKind::Exit(ExitReason::StopLoss))
+        );
+    }
+
+    #[test]
+    fn exits_clamp_bad_params_instead_of_blocking() {
+        let p = position("40");
+        let late = t0() + Duration::hours(4);
+        let mut bad = params();
+        bad.exit_slippage_bps = 0;
+        bad.intent_ttl = Duration::days(1);
+        let intent = evaluate_exit(
+            &p,
+            &good_snapshot(),
+            &bad,
+            &costs(),
+            Duration::seconds(30),
+            late,
+        )
+        .unwrap();
+        assert_eq!(intent.max_slippage_bps, bounds::EXIT_SLIPPAGE_BPS.0);
+        assert_eq!(intent.expires_at, late + bounds::INTENT_TTL.1);
+        bad.exit_slippage_bps = u32::MAX;
+        let intent = evaluate_exit(
+            &p,
+            &good_snapshot(),
+            &bad,
+            &costs(),
+            Duration::seconds(30),
+            late,
+        )
+        .unwrap();
+        assert_eq!(intent.max_slippage_bps, bounds::EXIT_SLIPPAGE_BPS.1);
     }
 }

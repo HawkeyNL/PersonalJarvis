@@ -36,12 +36,22 @@ pub mod types;
 
 #[cfg(test)]
 pub(crate) mod testutil {
+    use crate::paper::CostModel;
     use crate::types::{LpStatus, TokenSnapshot};
     use rust_decimal::Decimal;
     use time::{Duration, OffsetDateTime};
 
     pub fn d(s: &str) -> Decimal {
         s.parse().expect("test decimal")
+    }
+
+    pub fn costs() -> CostModel {
+        CostModel {
+            dex_fee_bps: 25,
+            network_fee_usd: d("0.001"),
+            priority_fee_usd: d("0.01"),
+            failure_rate: d("0.1"),
+        }
     }
 
     pub fn t0() -> OffsetDateTime {

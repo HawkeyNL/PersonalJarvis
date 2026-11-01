@@ -1,12 +1,16 @@
 //! Progress toward the owner's goal, such as 2x or 20x the stake.
 //!
-//! The hot wallet never holds more than the stake: everything above it is
-//! swept to the owner's own address. So the wallet balance alone says little.
-//! The multiple counts both: `(wallet value + total swept) / stake`.
+//! The hot wallet is capped at the stake (the mandate's capital cap).
+//! Whatever it earns above the cap is swept to the owner's own address
+//! continuously, so the principal keeps trading and the profit is already
+//! home. That is why the wallet balance alone says little, and why the
+//! multiple counts both: `(wallet value + total swept) / stake`.
 //!
-//! When the goal is reached the owner has chosen in advance what happens
-//! ([`AtGoal`]). This module only calculates the resulting [`GoalAction`]; the
-//! signer is the only component that can actually sweep or stop.
+//! Because profit leaves as it is made, there is no separate "take the
+//! profit" step at the goal. The owner picks in advance between two
+//! [`GoalAction`]s: keep running, or stop (no new entries, exit every
+//! position, sweep the whole wallet). This module only calculates; the signer
+//! is the only component that can actually exit, sweep or stop.
 
 use rust_decimal::Decimal;
 
@@ -50,73 +54,37 @@ pub fn progress(
     })
 }
 
-/// What the owner wants once the goal is reached.
+/// What happens at the goal; also the owner's choice made in advance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AtGoal {
-    /// Only notify; keep trading within the stake.
+pub enum GoalAction {
+    /// Keep trading within the cap; profit keeps being swept home.
     KeepRunning,
-    /// Send the stake home, keep trading with the profit.
-    SweepPrincipal,
-    /// Send everything home and open nothing new until a new mandate.
+    /// Open nothing new, exit every position and sweep the whole wallet.
     Stop,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GoalAction {
-    KeepRunning,
-    /// Sweep this much to the owner's address, then keep running.
-    Sweep {
-        usd: Decimal,
-    },
-    /// Sweep the whole wallet and stop entering positions.
-    SweepAllAndStop {
-        usd: Decimal,
-    },
-}
-
-/// The action for the current state. Before the goal it is always
-/// `KeepRunning`.
-///
-/// `swept_usd` includes the routine profit sweeps above the stake, so it
-/// cannot say how much of the stake itself came home. That is
-/// `principal_returned_usd` (part of `swept_usd`). `SweepPrincipal` sweeps
-/// only the stake not yet returned, so repeating the call never sweeps it
-/// twice.
+/// The action for the current state: always `KeepRunning` before the goal,
+/// the owner's `at_goal` choice once it is reached. `None` for inputs
+/// [`progress`] rejects.
 pub fn action(
     stake_usd: Decimal,
     wallet_usd: Decimal,
     swept_usd: Decimal,
-    principal_returned_usd: Decimal,
     goal: Decimal,
-    at_goal: AtGoal,
+    at_goal: GoalAction,
 ) -> Option<GoalAction> {
-    if principal_returned_usd < Decimal::ZERO || principal_returned_usd > swept_usd {
-        return None;
-    }
-    let p = progress(stake_usd, wallet_usd, swept_usd, goal)?;
-    if !p.reached {
-        return Some(GoalAction::KeepRunning);
-    }
-    Some(match at_goal {
-        AtGoal::KeepRunning => GoalAction::KeepRunning,
-        AtGoal::SweepPrincipal => {
-            let usd = (stake_usd - principal_returned_usd)
-                .max(Decimal::ZERO)
-                .min(wallet_usd);
-            if usd.is_zero() {
-                GoalAction::KeepRunning
-            } else {
-                GoalAction::Sweep { usd }
-            }
-        }
-        AtGoal::Stop => GoalAction::SweepAllAndStop { usd: wallet_usd },
+    let reached = progress(stake_usd, wallet_usd, swept_usd, goal)?.reached;
+    Some(if reached {
+        at_goal
+    } else {
+        GoalAction::KeepRunning
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{d, Rng};
+    use crate::testutil::d;
 
     #[test]
     fn progress_counts_wallet_and_swept() {
@@ -126,7 +94,7 @@ mod tests {
         assert_eq!(p.remaining_usd, d("66"));
         assert!(!p.reached);
 
-        let p = progress(d("100"), d("40"), d("160"), d("2")).unwrap();
+        let p = progress(d("100"), d("100"), d("100"), d("2")).unwrap();
         assert!(p.reached);
         assert_eq!(p.fraction_to_goal, Decimal::ONE);
         assert_eq!(p.remaining_usd, Decimal::ZERO);
@@ -147,15 +115,7 @@ mod tests {
         assert_eq!(progress(d("100"), d("1"), d("-1"), d("2")), None);
         assert_eq!(progress(d("100"), d("1"), d("1"), d("1")), None);
         assert_eq!(
-            action(d("0"), d("1"), d("1"), d("0"), d("2"), AtGoal::Stop),
-            None
-        );
-        assert_eq!(
-            action(d("100"), d("1"), d("1"), d("2"), d("2"), AtGoal::Stop),
-            None
-        );
-        assert_eq!(
-            action(d("100"), d("1"), d("1"), d("-1"), d("2"), AtGoal::Stop),
+            action(d("0"), d("1"), d("1"), d("2"), GoalAction::Stop),
             None
         );
         // A goal a hair above 1x overflows the division: no panic, no answer.
@@ -164,56 +124,22 @@ mod tests {
     }
 
     #[test]
-    fn actions_at_and_before_goal() {
+    fn owner_choice_applies_only_once_reached() {
         use GoalAction::*;
-        let before = |at| action(d("100"), d("100"), d("34"), d("0"), d("2"), at);
-        for at in [AtGoal::KeepRunning, AtGoal::SweepPrincipal, AtGoal::Stop] {
-            assert_eq!(before(at), Some(KeepRunning));
+        for at_goal in [KeepRunning, Stop] {
+            assert_eq!(
+                action(d("100"), d("100"), d("99.99"), d("2"), at_goal),
+                Some(KeepRunning)
+            );
+            assert_eq!(
+                action(d("100"), d("100"), d("100"), d("2"), at_goal),
+                Some(at_goal)
+            );
         }
-        let reached =
-            |returned: &str, at| action(d("100"), d("100"), d("100"), d(returned), d("2"), at);
-        assert_eq!(reached("100", AtGoal::KeepRunning), Some(KeepRunning));
+        // 20x is far away even with a full wallet and some profit home.
         assert_eq!(
-            reached("100", AtGoal::Stop),
-            Some(SweepAllAndStop { usd: d("100") })
+            action(d("100"), d("100"), d("500"), d("20"), Stop),
+            Some(KeepRunning)
         );
-        // 100 of profit was swept above the stake, but none of the stake.
-        assert_eq!(
-            reached("0", AtGoal::SweepPrincipal),
-            Some(Sweep { usd: d("100") })
-        );
-        // 40 of the stake already came home.
-        assert_eq!(
-            action(
-                d("100"),
-                d("160"),
-                d("40"),
-                d("40"),
-                d("2"),
-                AtGoal::SweepPrincipal
-            ),
-            Some(Sweep { usd: d("60") })
-        );
-        // Stake already fully home: nothing left to sweep.
-        assert_eq!(reached("100", AtGoal::SweepPrincipal), Some(KeepRunning));
-    }
-
-    #[test]
-    fn sweep_never_exceeds_wallet_or_outstanding_stake() {
-        let mut rng = Rng::new(21);
-        for _ in 0..2_000 {
-            let stake = rng.decimal(10_000, 2) + d("0.01");
-            let wallet = rng.decimal(20_000, 2);
-            let swept = rng.decimal(200_000, 2);
-            let returned = rng.decimal(20_000, 2).min(swept);
-            let goal = rng.decimal(30, 1) + d("1.1");
-            match action(stake, wallet, swept, returned, goal, AtGoal::SweepPrincipal) {
-                Some(GoalAction::Sweep { usd }) => {
-                    assert!(usd > Decimal::ZERO && usd <= wallet && usd <= stake - returned);
-                }
-                Some(GoalAction::KeepRunning) => {}
-                other => panic!("unexpected {other:?}"),
-            }
-        }
     }
 }
