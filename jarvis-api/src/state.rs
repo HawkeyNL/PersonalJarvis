@@ -231,4 +231,6 @@ pub struct AppState {
     pub app_update_mirror: Option<AppUpdateMirror>,
     /// Generic owner pushes via self-hosted ntfy; disabled unless configured.
     pub notifier: crate::notify::Notifier,
+    /// Memecoin PAPER trader state shared with its task; off by default.
+    pub memecoin: Arc<crate::memecoin::PaperHandle>,
 }

@@ -389,6 +389,28 @@ pub struct AppConfig {
     /// disables bootstrap; public clients are never allowed implicitly.
     #[serde(default)]
     pub bootstrap_allowed_cidrs: String,
+
+    /// Memecoin PAPER trader: a simulation on read-only market data with no
+    /// wallet, signer or execution path. Default **false**.
+    #[serde(default)]
+    pub memecoin_paper_enabled: bool,
+    /// Root-owned paper profile (watchlist, simulation inputs, strategy).
+    #[serde(default = "default_memecoin_paper_profile_path")]
+    pub memecoin_paper_profile_path: String,
+    /// RFC 3339 `paused_at` of the one owner pause to clear at startup.
+    /// Resuming is deliberately not possible over the API.
+    #[serde(default)]
+    pub memecoin_paper_resume_paused_at: String,
+    /// Two independent Solana RPC endpoints (different hosts). The URLs
+    /// usually embed a provider key. Secret — redacted in `Debug`.
+    #[serde(default)]
+    pub market_solana_rpc_a_url: String,
+    #[serde(default)]
+    pub market_solana_rpc_b_url: String,
+    /// Optional Jupiter API key; keyless quotes are paced more slowly.
+    /// Secret — redacted in `Debug`.
+    #[serde(default)]
+    pub market_jupiter_api_key: String,
 }
 
 /// The directory that holds Core's API socket, created by the Core unit.
@@ -585,6 +607,10 @@ fn default_huggingface_route_hard() -> String {
 
 fn default_huggingface_catalog_path() -> String {
     "/etc/jarvis/huggingface-catalog.json".to_string()
+}
+
+fn default_memecoin_paper_profile_path() -> String {
+    "/etc/jarvis/memecoin-paper.json".to_string()
 }
 
 fn default_llm_monthly_budget_eur() -> f64 {
@@ -877,6 +903,27 @@ impl fmt::Debug for AppConfig {
                 &redact(&self.bootstrap_secret_sha256),
             )
             .field("bootstrap_allowed_cidrs", &self.bootstrap_allowed_cidrs)
+            .field("memecoin_paper_enabled", &self.memecoin_paper_enabled)
+            .field(
+                "memecoin_paper_profile_path",
+                &self.memecoin_paper_profile_path,
+            )
+            .field(
+                "memecoin_paper_resume_paused_at",
+                &self.memecoin_paper_resume_paused_at,
+            )
+            .field(
+                "market_solana_rpc_a_url",
+                &redact(&self.market_solana_rpc_a_url),
+            )
+            .field(
+                "market_solana_rpc_b_url",
+                &redact(&self.market_solana_rpc_b_url),
+            )
+            .field(
+                "market_jupiter_api_key",
+                &redact(&self.market_jupiter_api_key),
+            )
             .finish()
     }
 }
@@ -999,6 +1046,12 @@ mod tests {
             api_unix_socket: String::new(),
             bootstrap_secret_sha256: String::new(),
             bootstrap_allowed_cidrs: String::new(),
+            memecoin_paper_enabled: false,
+            memecoin_paper_profile_path: default_memecoin_paper_profile_path(),
+            memecoin_paper_resume_paused_at: String::new(),
+            market_solana_rpc_a_url: "https://rpc-a.example/?api-key=rpc-supersecret".to_string(),
+            market_solana_rpc_b_url: String::new(),
+            market_jupiter_api_key: "jupiter-supersecret".to_string(),
         };
 
         let rendered = format!("{cfg:?}");
@@ -1039,6 +1092,7 @@ mod tests {
             );
             assert_eq!(cfg.llm_huggingface_route, "groq");
             assert_eq!(cfg.environment, "development"); // default
+            assert!(!cfg.memecoin_paper_enabled); // off unless deliberately enabled
             Ok(())
         });
     }
@@ -1138,6 +1192,12 @@ mod tests {
             api_unix_socket: String::new(),
             bootstrap_secret_sha256: "00".repeat(32),
             bootstrap_allowed_cidrs: String::new(),
+            memecoin_paper_enabled: false,
+            memecoin_paper_profile_path: default_memecoin_paper_profile_path(),
+            memecoin_paper_resume_paused_at: String::new(),
+            market_solana_rpc_a_url: "https://rpc-a.example/?api-key=rpc-supersecret".to_string(),
+            market_solana_rpc_b_url: String::new(),
+            market_jupiter_api_key: "jupiter-supersecret".to_string(),
         };
         assert!(cfg.bootstrap_enrollment().is_err());
         cfg.bootstrap_allowed_cidrs = "192.168.10.0/24".to_string();
