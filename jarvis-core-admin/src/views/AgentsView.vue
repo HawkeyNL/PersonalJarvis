@@ -18,7 +18,7 @@ onMounted(load);
 <template>
   <PageHeader title="Agents" description="Safe registry metadata only. Private prompts and agent definition bodies are never loaded by this application." :busy="busy"><button class="secondary" @click="check">Check</button><button class="secondary" @click="load">Refresh</button><button @click="confirmUpdate = true">Update bundle</button></PageHeader>
   <ErrorPanel v-if="error" :message="error" /><ResultPanel v-if="result" :result="result" />
-  <section v-if="data" class="hero-card"><div><span class="card-label">ACTIVE BUNDLE</span><strong>{{ data.bundle.id }}</strong></div><div><span class="card-label">AGENTS</span><strong>{{ data.bundle.agent_count }}</strong></div></section>
+  <section v-if="data" class="hero-card"><div><span class="card-label">Active bundle</span><strong>{{ data.bundle.id }}</strong></div><div><span class="card-label">Agents</span><strong>{{ data.bundle.agent_count }}</strong></div></section>
   <section class="split-view">
     <div class="tree-card">
       <div v-if="!groups.length" class="empty-state">Safe tree metadata is unavailable in this legacy bundle.</div>
@@ -29,7 +29,7 @@ onMounted(load);
         </div>
       </div>
     </div>
-    <aside class="detail-card sticky-detail"><template v-if="selected"><span class="card-label">SAFE AGENT DETAILS</span><h2>{{ selected.name }}</h2><dl><dt>ID</dt><dd>{{ selected.id }}</dd><dt>Group</dt><dd>{{ selected.group }}</dd><dt>State</dt><dd>{{ selected.state }}</dd><dt>Model policy</dt><dd>{{ selected.model_policy ?? "Not declared" }}</dd><dt>Profile length</dt><dd>{{ selected.profile_lines ? `${selected.profile_lines} lines` : "Not recorded" }}</dd><dt>Source updated</dt><dd>{{ updatedLabel(selected.source_updated_at) }}</dd><dt>Bundle</dt><dd>{{ data?.bundle.id }}</dd></dl><p class="security-note">Prompt/body: never loaded</p></template><div v-else class="empty-state">Select an agent to inspect safe metadata.</div></aside>
+    <aside class="detail-card sticky-detail"><template v-if="selected"><span class="card-label">Safe agent details</span><h2>{{ selected.name }}</h2><dl><dt>ID</dt><dd>{{ selected.id }}</dd><dt>Group</dt><dd>{{ selected.group }}</dd><dt>State</dt><dd>{{ selected.state }}</dd><dt>Model policy</dt><dd>{{ selected.model_policy ?? "Not declared" }}</dd><dt>Profile length</dt><dd>{{ selected.profile_lines ? `${selected.profile_lines} lines` : "Not recorded" }}</dd><dt>Source updated</dt><dd>{{ updatedLabel(selected.source_updated_at) }}</dd><dt>Bundle</dt><dd>{{ data?.bundle.id }}</dd></dl><p class="security-note">Prompt/body: never loaded</p></template><div v-else class="empty-state">Select an agent to inspect safe metadata.</div></aside>
   </section>
   <ConfirmDialog v-if="confirmUpdate" title="Update the active agent bundle?" detail="The trusted private-agent helper validates and activates the complete bundle. This GUI receives no private prompt contents." confirm-label="Confirm update" @cancel="confirmUpdate = false" @confirm="update" />
 </template>

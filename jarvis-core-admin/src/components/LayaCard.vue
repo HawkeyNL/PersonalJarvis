@@ -65,7 +65,7 @@ onMounted(load);
 
 <template>
   <article class="metric-card laya-card">
-    <span class="card-label">LOCAL SYSTEM-1 CLASSIFIER · LAYA</span>
+    <span class="card-label">Local System-1 classifier · Laya</span>
     <ErrorPanel v-if="error" :message="error" />
     <ResultPanel v-if="result" :result="result" />
     <template v-if="status">

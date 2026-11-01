@@ -1,0 +1,121 @@
+/* Jarvis Instrument design tokens (light + dark), from the design canvas.
+   Semantic names only; components use these, never raw colours.
+   theme.ts sets <html data-theme="light|dark"> (System resolves to one of them).
+   Every value is inside sRGB, so no gamut fallback is needed. All supported
+   WebViews (WebKitGTK 2.36+, WKWebView/Safari 15.4+, WebView2) render oklch(). */
+
+:root {
+  color-scheme: light;
+  --bg-page: oklch(0.985 0.003 255);
+  --bg-surface: oklch(1 0 0);
+  --bg-raised: oklch(1 0 0);
+  --bg-sunken: oklch(0.965 0.004 255);
+  --bg-hover: oklch(0.95 0.005 255);
+  --bg-selected: oklch(0.94 0.02 258);
+  --bg-scrim: oklch(0.22 0.01 255 / 0.32);
+  --border-subtle: oklch(0.925 0.005 255);
+  --border: oklch(0.88 0.006 255);
+  --border-strong: oklch(0.62 0.01 255);
+  --separator: oklch(0.925 0.005 255);
+  --text-primary: oklch(0.22 0.01 255);
+  --text-secondary: oklch(0.47 0.012 255);
+  --text-disabled: oklch(0.72 0.008 255);
+  --text-inverse: oklch(0.99 0.002 255);
+  --text-on-accent: oklch(1 0 0);
+  --accent-subtle: oklch(0.965 0.016 258);
+  --accent-border: oklch(0.82 0.06 258);
+  --accent-solid: oklch(0.52 0.17 258);
+  --accent-solid-hover: oklch(0.47 0.16 258);
+  --accent-text: oklch(0.48 0.16 258);
+  --focus-ring: oklch(0.6 0.16 258);
+  --positive-subtle: oklch(0.96 0.02 195);
+  --positive-solid: oklch(0.55 0.092 195);
+  --positive-text: oklch(0.48 0.081 195);
+  --negative-subtle: oklch(0.965 0.02 55);
+  --negative-solid: oklch(0.62 0.15 55);
+  --negative-text: oklch(0.52 0.128 55);
+  --danger-subtle: oklch(0.96 0.019 27);
+  --danger-solid: oklch(0.53 0.19 27);
+  --danger-solid-hover: oklch(0.48 0.18 27);
+  --danger-text: oklch(0.5 0.17 27);
+  --chart-accent: oklch(0.52 0.17 258);
+  --chart-ma: oklch(0.5 0.16 300); /* short moving average; distinct from rising/falling candles */
+  --shadow-border: 0 0 0 1px oklch(0 0 0 / 0.06), 0 1px 2px -1px oklch(0 0 0 / 0.06), 0 2px 4px 0 oklch(0 0 0 / 0.04);
+  --shadow-border-hover: 0 0 0 1px oklch(0 0 0 / 0.08), 0 1px 2px -1px oklch(0 0 0 / 0.08), 0 2px 4px 0 oklch(0 0 0 / 0.06);
+  --shadow-pop: 0 0 0 1px oklch(0 0 0 / 0.06), 0 8px 24px -4px oklch(0 0 0 / 0.14), 0 2px 6px 0 oklch(0 0 0 / 0.06);
+
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-xl: 20px;
+  --r-pill: 999px;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-icon: cubic-bezier(0.2, 0, 0, 1);
+  --d-press: 150ms;
+  --d-hover: 150ms;
+  --d-pop: 200ms;
+  --d-modal: 240ms;
+  --d-exit: 150ms;
+  --d-enter: 300ms;
+}
+
+/* Dark is tuned separately, not inverted. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg-page: oklch(0.165 0.008 255);
+  --bg-surface: oklch(0.2 0.009 255);
+  --bg-raised: oklch(0.24 0.01 255);
+  --bg-sunken: oklch(0.145 0.007 255);
+  --bg-hover: oklch(0.265 0.01 255);
+  --bg-selected: oklch(0.28 0.04 258);
+  --bg-scrim: oklch(0.08 0.005 255 / 0.6);
+  --border-subtle: oklch(0.27 0.01 255);
+  --border: oklch(0.33 0.011 255);
+  --border-strong: oklch(0.55 0.012 255);
+  --separator: oklch(0.27 0.01 255);
+  --text-primary: oklch(0.95 0.004 255);
+  --text-secondary: oklch(0.78 0.01 255);
+  --text-disabled: oklch(0.5 0.01 255);
+  --text-inverse: oklch(0.2 0.009 255);
+  --text-on-accent: oklch(1 0 0);
+  --accent-subtle: oklch(0.27 0.05 258);
+  --accent-border: oklch(0.45 0.09 258);
+  --accent-solid: oklch(0.55 0.15 258);
+  --accent-solid-hover: oklch(0.5 0.15 258);
+  --accent-text: oklch(0.79 0.1 258);
+  --focus-ring: oklch(0.72 0.13 258);
+  --positive-subtle: oklch(0.27 0.035 195);
+  --positive-solid: oklch(0.62 0.09 195);
+  --positive-text: oklch(0.8 0.09 195);
+  --negative-subtle: oklch(0.28 0.045 55);
+  --negative-solid: oklch(0.68 0.13 55);
+  --negative-text: oklch(0.8 0.11 55);
+  --danger-subtle: oklch(0.28 0.06 27);
+  --danger-solid: oklch(0.55 0.17 27);
+  --danger-solid-hover: oklch(0.49 0.16 27);
+  --danger-text: oklch(0.76 0.13 27);
+  --chart-accent: oklch(0.72 0.13 258);
+  --chart-ma: oklch(0.74 0.12 300);
+  --shadow-border: 0 0 0 1px oklch(1 0 0 / 0.08);
+  --shadow-border-hover: 0 0 0 1px oklch(1 0 0 / 0.13);
+  --shadow-pop: 0 0 0 1px oklch(1 0 0 / 0.1), 0 12px 32px -6px oklch(0 0 0 / 0.6);
+}
+
+/* Before main.ts sets data-theme only the empty page shows: paint it dark
+   for dark-OS users so there is no white flash. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+    --bg-page: oklch(0.165 0.008 255);
+  }
+}
+
+/* Theme switch: no transition smear (theme.ts adds this for two frames). */
+.no-tx,
+.no-tx *,
+.no-tx *::before,
+.no-tx *::after {
+  transition: none !important;
+}

@@ -37,12 +37,12 @@ onMounted(() => load());
   <template v-if="data">
     <section class="metric-grid persona-metrics">
       <article class="metric-card">
-        <span class="card-label">INSTALLED</span>
+        <span class="card-label">Installed</span>
         <template v-if="data.installed"><strong class="mono">{{ shortHash(data.installed.sha256) }}</strong><span class="persona-meta">{{ data.installed.bytes }} bytes · changed {{ time(data.installed.modified) }}</span><JvStatusDot :tone="data.installed.problem ? 'error' : 'ok'" :label="problemLabel(data.installed.problem)" :size="7" /></template>
         <strong v-else>None</strong>
       </article>
       <article class="metric-card">
-        <span class="card-label">CANDIDATE</span>
+        <span class="card-label">Candidate</span>
         <template v-if="data.candidate"><strong class="mono">{{ data.candidate.sha256 ? shortHash(data.candidate.sha256) : "too large" }}</strong><span class="persona-meta">commit <span class="mono">{{ data.candidate.commit }}</span><template v-if="data.candidate.bytes !== null"> · {{ data.candidate.bytes }} bytes</template></span><JvStatusDot :tone="data.candidate.signature === 'verified' ? 'ok' : 'error'" :label="signatures[data.candidate.signature]" :size="7" /><JvStatusDot :tone="data.candidate.problem ? 'error' : 'ok'" :label="problemLabel(data.candidate.problem)" :size="7" /></template>
         <template v-else><strong>Unavailable</strong><span class="persona-meta wrap-anywhere">{{ sourceProblemLabel(data.candidate_error) }}</span></template>
       </article>

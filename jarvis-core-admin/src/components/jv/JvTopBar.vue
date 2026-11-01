@@ -8,11 +8,8 @@ defineProps<{ title: string; subtitle?: string }>();
   <header class="jv-topbar">
     <div class="left">
       <div class="brand">
-        <span class="ring" aria-hidden="true"></span>
-        <span class="words">
-          <span class="name">JARVIS</span>
-          <span class="tag">CORE ADMINISTRATION</span>
-        </span>
+        <span class="name">Jarvis</span>
+        <span class="tag">Core Administration</span>
       </div>
     </div>
 
@@ -32,47 +29,26 @@ defineProps<{ title: string; subtitle?: string }>();
   position: relative;
   z-index: 5;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 24px;
-  padding: 26px 32px 0 36px;
+  padding: 20px 32px 0 32px;
 }
-.left, .right { display: flex; align-items: center; min-width: 0; }
-.right { justify-content: flex-end; gap: 22px; }
+.left, .right { display: flex; align-items: center; }
+.center { min-width: 0; }
+.right { justify-content: flex-end; gap: 16px; }
 
-.brand { display: flex; align-items: center; gap: 22px; text-decoration: none; color: inherit; }
-.ring {
-  width: 34px; height: 34px; flex: none; box-sizing: border-box; border-radius: 50%;
-  border: 3px solid var(--accent);
-  box-shadow: 0 0 14px rgba(var(--accent-rgb), 0.7), inset 0 0 8px rgba(var(--accent-rgb), 0.45);
-}
-.words { display: flex; flex-direction: column; }
-.name { font-family: var(--font-display); font-weight: 500; font-size: 19px; letter-spacing: 0.5em; line-height: 24px; color: #eaf7f1; }
-.tag { margin-top: 2px; font-size: 11px; letter-spacing: 0.32em; color: var(--text-5); }
+.brand { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.name { font-size: 17px; line-height: 1.3; font-weight: 600; color: var(--text-primary); }
+.tag { font-size: 12px; line-height: 1.4; color: var(--text-secondary); }
 
-.title { text-align: center; position: relative; }
-.title h1 {
-  margin: 0; font-family: var(--font-display); font-weight: 600; font-size: var(--fs-23);
-  letter-spacing: 0.5em; padding-left: 0.5em; line-height: 30px; color: var(--text-0);
-}
-.title p { margin: 10px 0 0; font-size: 11px; letter-spacing: 0.38em; padding-left: 0.38em; color: #9fb8ad; }
-.title::before, .title::after {
-  content: ""; position: absolute; top: 20px; width: 68px; height: 1px;
-}
-.title::before { right: calc(100% + 0px); background: linear-gradient(90deg, transparent, rgba(var(--accent-rgb), 0.6)); }
-.title::after { left: calc(100% + 0px); background: linear-gradient(90deg, rgba(var(--accent-rgb), 0.6), transparent); }
+.title { min-width: 0; text-align: center; }
+.title h1 { margin: 0; font-size: 18px; line-height: 1.3; font-weight: 600; letter-spacing: -0.01em; color: var(--text-primary); }
+.title p { margin: 2px 0 0; font-size: 13px; line-height: 1.45; color: var(--text-secondary); }
 
-/* The session cluster is wider than the desktop app's; drop the title rules
-   before they run into it. */
-@media (max-width: 1399px) {
-  .title::before, .title::after { display: none; }
-}
 @media (max-width: 1099px), (max-height: 759px) {
-  .jv-topbar { padding: 16px 16px 0; gap: 12px; grid-template-columns: auto minmax(0, 1fr) auto; }
+  .jv-topbar { padding: 14px 16px 0; gap: 12px; }
   .tag { display: none; }
-  .ring { width: 28px; height: 28px; }
-  .name { font-size: 18px; letter-spacing: 0.42em; }
-  .title h1 { font-size: 19px; letter-spacing: 0.32em; }
   .title p { display: none; }
 }
 </style>

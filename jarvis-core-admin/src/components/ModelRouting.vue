@@ -89,7 +89,7 @@ onMounted(() => { void load(); });
 <template>
   <section class="detail-card routing-card">
     <div class="card-heading">
-      <div><span class="card-label">MODEL ROUTING</span><h2>Order per tier</h2></div>
+      <div><span class="card-label">Model routing</span><h2>Order per tier</h2></div>
       <div class="paid-switch" :class="paidApi">
         <span>Paid APIs: <strong>{{ paidApi }}</strong></span>
         <button v-if="paidApi === 'allowed'" class="small secondary" :disabled="locked" @click="apply({ action: 'paid_api', state: 'off' })">Turn off</button>

@@ -1,16 +1,22 @@
-Bundled fonts (latin subsets, WOFF2, as served by Google Fonts):
+Bundled fonts (Latin1 subsets, WOFF2), unmodified from the IBM Plex releases
+on npm (https://github.com/IBM/plex):
 
-  exo2-latin-variable.woff2         Exo 2 (variable, upright)
-  exo2-latin-italic-variable.woff2  Exo 2 (variable, italic)
-    Copyright 2013 The Exo 2 Project Authors (https://github.com/NDISCOVER/Exo-2.0)
+  @ibm/plex-sans 1.1.0 (npm sha1 44a45a8e269870221c431eb4e8023dca6ed21ceb)
+    IBMPlexSans-Regular-Latin1.woff2   IBM Plex Sans 400
+    IBMPlexSans-Medium-Latin1.woff2    IBM Plex Sans 500
+    IBMPlexSans-SemiBold-Latin1.woff2  IBM Plex Sans 600
 
-  rajdhani-latin-500.woff2          Rajdhani Medium
-  rajdhani-latin-600.woff2          Rajdhani SemiBold
-    Copyright 2014 Indian Type Foundry (info@indiantypefoundry.com)
+  @ibm/plex-mono 1.1.0 (npm sha1 5406e372e2807b3cc1e78be6b8ea64256135c12d)
+    IBMPlexMono-Regular-Latin1.woff2   IBM Plex Mono 400
+    IBMPlexMono-Medium-Latin1.woff2    IBM Plex Mono 500
 
-Both font families are licensed under the SIL Open Font License, Version 1.1.
-This license is copied below, and is also available with a FAQ at:
-https://openfontlicense.org
+The license text below is the package's LICENSE.txt, unchanged.
+
+Copyright © 2017 IBM Corp. with Reserved Font Name "Plex"
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+
+This license is copied below, and is also available with a FAQ at: http://scripts.sil.org/OFL
 
 
 -----------------------------------------------------------
@@ -26,7 +32,7 @@ with others.
 
 The OFL allows the licensed fonts to be used, studied, modified and
 redistributed freely as long as they are not sold by themselves. The
-fonts, including any derivative works, can be bundled, embedded,
+fonts, including any derivative works, can be bundled, embedded, 
 redistributed and/or sold with any software provided that any reserved
 names are not used by derivative works. The fonts and derivatives,
 however, cannot be released under any other type of license. The
@@ -73,7 +79,7 @@ Name(s) unless explicit written permission is granted by the corresponding
 Copyright Holder. This restriction only applies to the primary font name as
 presented to the users.
 
-4) The name(s) of the Copyright Holder(s) and the Author(s) of the Font
+4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
 Software shall not be used to promote, endorse or advertise any
 Modified Version, except to acknowledge the contribution(s) of the
 Copyright Holder(s) and the Author(s) or with their explicit written

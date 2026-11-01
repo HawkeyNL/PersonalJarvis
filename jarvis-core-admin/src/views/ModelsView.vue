@@ -161,7 +161,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
   <p v-if="rows.length" class="usage-source">USD per million text tokens, not an invoice. Expand a model's pricing details for its source, review date and context/peak-rate conditions. Unknown cache prices are not assumed to be discounted.</p>
   <div v-if="selectedHf" class="dialog-backdrop" @click.self="closeRoutes">
     <section class="dialog routes-dialog" role="dialog" aria-modal="true" aria-labelledby="routes-title">
-      <div class="card-heading"><div><span class="card-label">HUGGING FACE INFERENCE PROVIDERS</span><h2 id="routes-title" class="mono wrap-anywhere">{{ selectedHf.model }}</h2></div><button class="small secondary" :disabled="routeSaving" @click="closeRoutes">Close</button></div>
+      <div class="card-heading"><div><span class="card-label">Hugging Face inference providers</span><h2 id="routes-title" class="mono wrap-anywhere">{{ selectedHf.model }}</h2></div><button class="small secondary" :disabled="routeSaving" @click="closeRoutes">Close</button></div>
       <ErrorPanel v-if="routeError" :message="routeError" /><ResultPanel v-if="routeResult" :result="routeResult" />
       <div v-if="routeLoading && !hfDetails" class="modal-loading"><span class="spinner" />Loading available routes…</div>
       <template v-if="hfDetails">
