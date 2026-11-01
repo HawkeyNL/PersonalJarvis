@@ -26,7 +26,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 13);
+    assert_eq!(version.unwrap().version, 14);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
@@ -47,7 +47,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_eleven.unwrap().version, 13);
+    assert_eq!(from_eleven.unwrap().version, 14);
     db.use_db("from_twelve").await?;
     apply_through_twelve(&db).await?;
     // A v12 pairing row has none of the new optional fields and stays valid.
@@ -59,7 +59,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_twelve_version: Option<SchemaVersion> = from_twelve.take(0)?;
-    assert_eq!(from_twelve_version.unwrap().version, 13);
+    assert_eq!(from_twelve_version.unwrap().version, 14);
     let legacy_has_no_ip: Vec<bool> = from_twelve.take(1)?;
     assert_eq!(legacy_has_no_ip, [true]);
     // The database bounds the new fields even if Core validation regressed.
@@ -88,7 +88,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
-    assert_eq!(migrated_version.unwrap().version, 13);
+    assert_eq!(migrated_version.unwrap().version, 14);
     let legacy: Vec<String> = migrated.take(1)?;
     assert_eq!(legacy, ["password-set"]);
     db.query("CREATE account_actions SET id = 'reset', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
@@ -124,6 +124,59 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         assert!(db.query(&bad).await?.check().is_err(), "{bad}");
     }
     db.query(create("e", "apns", &other, "production"))
+        .await?
+        .check()?;
+    db.use_db("from_thirteen").await?;
+    apply_through_thirteen(&db).await?;
+    apply_baseline_schema(&db).await?;
+    let from_thirteen: Option<SchemaVersion> = db
+        .query("SELECT version FROM schema_version:baseline")
+        .await?
+        .check()?
+        .take(0)?;
+    assert_eq!(from_thirteen.unwrap().version, 14);
+    // The paper tables enforce their shape even if Core validation regressed.
+    let (mint, other) = (
+        "So11111111111111111111111111111111111111112",
+        "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    );
+    let trip = |id: &str, mint: &str, extra: &str| {
+        format!("CREATE memecoin_paper_trips SET id = '{id}', slot = '{mint}', mint = '{mint}', strategy_version = 1, status = 'open', tokens = '10.5', cost_usd = '25.01', entry_liquidity_usd = '50000', exit_failures = 0, opened_at = time::now(){extra};")
+    };
+    db.query(trip("a", mint, "")).await?.check()?;
+    // Each case breaks exactly one rule.
+    for bad in [
+        // A second open trip for the same mint.
+        trip("b", mint, ""),
+        // Closed fields on an open trip.
+        trip("c", other, ", usd_out = '1'"),
+        // A float instead of a decimal string.
+        trip("d", other, "").replace("tokens = '10.5'", "tokens = '1e5'"),
+        // Not a base58 mint.
+        trip("e", "not-a-mint-0OIl-not-a-mint-0OIl-x", ""),
+        // A stuck trip with exit fields, and a negative failure count.
+        trip("g", other, ", exit_reason = 'stop_loss'").replace("status = 'open'", "status = 'stuck'"),
+        trip("h", other, "").replace("exit_failures = 0", "exit_failures = -1"),
+        // A closed trip without its exit fields.
+        trip("f", other, "").replace("status = 'open'", "status = 'closed'").replace(&format!("slot = '{other}'"), "slot = 'f'"),
+        "CREATE memecoin_candidates SET id = 'y', mint = 'So11111111111111111111111111111111111111112', observed_at = time::now(), strategy_version = 1, reason = 'because';".to_string(),
+        // A pause without its time.
+        "CREATE memecoin_paper_control SET id = 'paper', paused = true, paused_by = 'd';".to_string(),
+        "CREATE memecoin_paper_costs SET id = 'z', kind = 'refund', usd = '1', at = time::now(), strategy_version = 1;".to_string(),
+    ] {
+        assert!(db.query(&bad).await?.check().is_err(), "{bad}");
+    }
+    // A stuck position still holds its mint.
+    db.query(trip("s", other, "").replace("status = 'open'", "status = 'stuck'"))
+        .await?
+        .check()?;
+    assert!(db.query(trip("s2", other, "")).await?.check().is_err());
+    db.query("UPDATE memecoin_paper_trips:a SET status = 'closed', slot = 'a', closed_at = time::now(), usd_out = '30', exit_fees_usd = '0.02', net_pnl_usd = '-0.03', exit_reason = 'take_profit';")
+        .await?
+        .check()?;
+    // Closed, so the mint is free for a new position.
+    db.query(trip("b", mint, "")).await?.check()?;
+    db.query("CREATE memecoin_candidates SET id = 'r', mint = 'So11111111111111111111111111111111111111112', observed_at = time::now(), strategy_version = 1, reason = 'lp_not_secured', price_usd = '0.0001', liquidity_usd = NONE;")
         .await?
         .check()?;
     db.query("UPDATE schema_version:baseline SET version = 99;")

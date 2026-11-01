@@ -34,6 +34,7 @@ pub mod intent;
 #[cfg(unix)]
 pub mod local_devices;
 mod mcp;
+pub mod memecoin;
 mod metering;
 pub mod model_control;
 pub mod notify;
