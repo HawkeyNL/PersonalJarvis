@@ -1,13 +1,15 @@
 # Home Node backup and restore
 
 `jarvis-backup` writes one encrypted archive per run for disaster recovery.
-The owner runs it as root, by hand or with the opt-in daily timer, and copies
-archives off the machine by hand. Nothing is uploaded.
+The owner runs it as root, by hand or with the opt-in daily timer. Nothing is
+uploaded. For a backup that stays on the Home Node, see
+[Local-only backup](#local-only-backup).
 
-> **Only one archive stays on the host.** Each successful run replaces the
-> previous archive. A disk failure, a compromised host or a backup of already
-> damaged data leaves you with nothing older. Copy archives off the machine
-> regularly (see [Copying off the machine](#copying-off-the-machine)).
+> **Archives stay on the same disk as the live data.** Each run keeps the
+> newest 7 archives and the newest archive of each of the last 4 ISO weeks
+> (3 to 4 weeks of history). A disk failure or a compromised host still
+> leaves you with nothing. Copy archives off the machine when you can (see
+> [Copying off the machine](#copying-off-the-machine)).
 
 ## What is in an archive
 
@@ -37,9 +39,14 @@ Not included, by design:
    and each restored count must lie between the two live counts. The live
    database is never written.
 3. It encrypts, writes the archive atomically, verifies the checksum and
-   member layout, and only then removes the previous archive. The archive it
-   just published is never removed, even when another archive carries a later
-   date (clock skew or a manual copy).
+   member layout, and only then prunes older archives (7 daily, 4 weekly).
+   The archive it just published is never removed. While any archive carries
+   a later date (clock skew or a manual copy), nothing is pruned and the run
+   logs a warning.
+
+Before it starts, the run refuses to continue unless the destination has
+room for twice the newest archive plus 1 GiB, and `/run` has 2 GiB for the
+plaintext export.
 
 If any step fails before publishing, nothing is published, the previous
 archive is untouched, and the temporary files are removed. A second run on the same day
@@ -50,7 +57,175 @@ the run. tmpfs can be swapped to disk.
 The run holds the Core updater lock and waits up to 10 minutes for a running
 update.
 
-## One-time setup
+## Local-only backup
+
+Archives stay in `/var/backups/jarvis-dr` on the Home Node, encrypted to a key
+that is generated on the host once and then kept only by the owner.
+
+**Protects against:** a bad migration or Core bug that damages data, database
+corruption, and operator error (deleted records, a broken `/etc/jarvis`), up
+to 3 to 4 weeks back.
+
+**Does not protect against:** loss or failure of the SSD, theft of the
+machine, fire, or a compromised host (root can delete the archives, and an
+attacker already has the live data). For those you need a copy off the
+machine.
+
+**Key trade-off.** `init-local` creates the key pair in a throwaway keyring
+on tmpfs, prints the private key once, and keeps only the public key. The
+private key therefore exists on this host for a few seconds and in your
+terminal scrollback, and it has no passphrase: whoever holds the printed
+block can read every archive, including the secrets from `/etc/jarvis`. If
+you lose it, every archive is unreadable. The [Mac setup](#one-time-setup-with-owner-keys-on-a-mac)
+below never puts a private key on the host and remains the stronger option.
+
+Archives are encrypted, not signed. Anyone with the public key, such as root
+on this host, can build an archive that passes `verify --decrypt`. A
+compromised host is out of scope for a local-only backup anyway.
+
+### Set up, once
+
+Needs a Core release that ships this version of `jarvis-backup`.
+
+```bash
+# Only if the command is missing (Home Nodes prepared before it shipped):
+sudo ln -sfn /opt/jarvis/current/jarvis-backup /usr/local/sbin/jarvis-backup
+sudo jarvis-backup init-local
+```
+
+`init-local` creates `/var/backups/jarvis-dr` (root, 0700), writes
+`/etc/jarvis-backup/backup.conf` and `recipients.asc`, and prints the private
+key. Copy the whole block, including the `BEGIN` and `END` lines, into your
+password manager (a paper copy as well is wise), then run `clear`. It refuses
+to run when either file already exists.
+
+The private key goes to stdout. Do not redirect or pipe it into a file (for
+example `> key.asc` or `| tee`): a plaintext key on the host's disk defeats
+the point of keeping only the public key here, and `rm` does not reliably
+erase it from an SSD.
+
+### First run and decrypt check
+
+```bash
+sudo systemctl start jarvis-backup.service
+journalctl -u jarvis-backup --since today
+sudo jarvis-backup verify --decrypt
+```
+
+Paste the private key and press Ctrl-D. The command decrypts every member of
+the newest archive on tmpfs, checks it against the manifest, and removes the
+plaintext and the key again. The pasted key shows on screen, so run `clear`
+afterwards. Do not leave the prompt open: it holds the backup lock, and a
+scheduled run meanwhile exits with code 75. Do this now, to prove the saved key works, and
+repeat it every month. `verify --decrypt` and `restore` take a key without a
+passphrase, such as the `init-local` key; for Mac keys use the
+[decrypt drill on the Mac](#quarterly-decrypt-drill-on-the-mac).
+
+### Daily timer
+
+```bash
+sudo systemctl enable --now jarvis-backup.timer
+systemctl list-timers jarvis-backup.timer
+```
+
+Core keeps running: the database is read with SurrealDB's online export (one
+read transaction), the row counts are compared with the live database, and
+the export is test-imported into a disposable container before it is
+encrypted. See [Daily schedule](#daily-schedule) for retries.
+
+### Restore into a scratch directory
+
+```bash
+sudo jarvis-backup restore /var/backups/jarvis-dr/jarvis-backup-YYYY-MM-DD.tar /run/jarvis-restore
+```
+
+Paste the private key and press Ctrl-D. This creates `/run/jarvis-restore`
+(0700, in RAM) with `export.surql`, `etc-jarvis.tar` and `manifest.json`,
+after the same checks as `verify --decrypt`. Live data is not touched. The
+target must not exist yet. Its parent must be root-owned, not writable by
+others and on the same filesystem as `/run`, so the plaintext is only renamed,
+never copied to disk. Inspect it:
+
+```bash
+sudo jq '.created_at, .tables' /run/jarvis-restore/manifest.json
+sudo tar -tvf /run/jarvis-restore/etc-jarvis.tar
+```
+
+It holds plaintext secrets: run `sudo rm -r /run/jarvis-restore` when done.
+
+### Roll the database back to an archive
+
+Core is down while you do this.
+
+1. Restore into `/run/jarvis-restore` as above. Then check that the archive
+   was made with the SurrealDB image that runs now: the two digests must be
+   equal, because an export from another major version does not import.
+   ```bash
+   sudo jq -r .surrealdb_image /run/jarvis-restore/manifest.json
+   sudo grep '^SURREALDB_IMAGE=' /etc/jarvis/surrealdb.env
+   ```
+   The export also holds the Core database user. If the Core database
+   password was rotated after the archive was made, restore `/etc/jarvis`
+   from the same archive as well (step 3 of disaster recovery), or Core
+   cannot log in.
+2. Stop scheduled backups, Core and the database, and keep the current tree:
+   ```bash
+   sudo systemctl stop jarvis-backup.timer jarvis-backup.service jarvis-core.service jarvis-surrealdb.service
+   sudo docker compose --env-file /etc/jarvis/surrealdb.env -f /opt/jarvis/surrealdb/docker-compose.yml ps --status running -q
+   sudo mv /var/lib/jarvis/surrealdb /var/lib/jarvis/surrealdb.before-restore
+   ```
+   The `ps` command must print nothing.
+3. Follow steps 4 to 6 of [Disaster recovery](#disaster-recovery-onto-a-fresh-home-node).
+   Read `/run/jarvis-restore` for `/root/restore` throughout: for
+   `export.surql`, for `etc-jarvis.tar` and in the final "Delete" step. In
+   step 4, use `sudo systemctl start jarvis-surrealdb.service` instead of the
+   start helper. It starts SurrealDB on a new, empty data directory.
+   Restore `/etc/jarvis` (step 3, before step 4) only when it is damaged or
+   the password changed, and then from the same archive. Keep the current tree first, and
+   replace it rather than extract over it: a merge keeps files that are not
+   in the archive.
+   ```bash
+   (umask 077 && sudo tar -C / -cpf /root/etc-jarvis.before-restore.tar etc/jarvis) \
+     && sudo tar -tf /root/etc-jarvis.before-restore.tar >/dev/null \
+     && sudo rm -r /etc/jarvis
+   ```
+   Then run the checked extraction of step 3.
+4. `sudo systemctl start jarvis-backup.timer`, and delete `/run/jarvis-restore`.
+
+To undo the rollback:
+
+```bash
+sudo systemctl stop jarvis-core.service jarvis-surrealdb.service
+sudo rm -r /var/lib/jarvis/surrealdb
+sudo mv /var/lib/jarvis/surrealdb.before-restore /var/lib/jarvis/surrealdb
+# Only if you restored /etc/jarvis:
+sudo rm -r /etc/jarvis && sudo tar -C / -xpf /root/etc-jarvis.before-restore.tar
+sudo systemctl start jarvis-surrealdb.service jarvis-core.service
+```
+
+Delete `/var/lib/jarvis/surrealdb.before-restore` and
+`/root/etc-jarvis.before-restore.tar` (it holds plaintext secrets) once Core
+works.
+
+### Turning it off
+
+```bash
+sudo systemctl disable --now jarvis-backup.timer
+```
+
+Archives and configuration stay. To remove them as well (this deletes every
+archive):
+
+```bash
+sudo rm /etc/jarvis-backup/backup.conf /etc/jarvis-backup/recipients.asc
+sudo rm -r /var/backups/jarvis-dr
+```
+
+Releases older than this version keep only one archive: after a Core
+rollback, the first run deletes all older archives. Disable the timer before
+rolling back if you need that history.
+
+## One-time setup with owner keys on a Mac
 
 ### 1. Owner keys, on the Mac
 
@@ -94,8 +269,12 @@ sudo ln -sfn /opt/jarvis/current/jarvis-backup /usr/local/sbin/jarvis-backup
 
 ```bash
 sudo jarvis-backup create
-sudo jarvis-backup verify /var/backups/jarvis-dr/jarvis-backup-YYYY-MM-DD.tar
+sudo jarvis-backup verify      # newest archive; or pass an archive path
 ```
+
+`verify` checks the checksum and the member layout and needs no key.
+`verify --decrypt` and `restore` also decrypt, see
+[Local-only backup](#local-only-backup).
 
 After a rollback to a release older than the one that introduced it, the
 command is absent until the next update; existing archives are unaffected.

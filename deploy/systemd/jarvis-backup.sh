@@ -5,11 +5,16 @@
 #   etc-jarvis.tar.zst.gpg   protected configuration including secrets
 #   manifest.json.gpg        versions, table counts and member hashes
 # Members are encrypted to owner public keys only: this host cannot decrypt
-# its own backups. Before encryption the export is imported into a disposable,
-# networkless SurrealDB container and its table counts are compared with the
-# live database. Nothing is uploaded; the owner copies archives off-machine.
+# its own backups (`init-local` generates that key here once and prints the
+# private half for the owner to store elsewhere). Before encryption the export
+# is imported into a disposable, networkless SurrealDB container and its table
+# counts are compared with the live database. Nothing is uploaded. Archives
+# are kept 7 daily plus 4 weekly.
 #
-# The only plaintext file is the export, on tmpfs below /run, removed on exit.
+# The only plaintext file of `create` is the export, on tmpfs below /run,
+# removed on exit. `verify --decrypt` and `restore` read the owner private key
+# from stdin into a throwaway keyring there and decrypt there as well; only
+# `restore` moves the plaintext to the directory the owner names.
 # No secret is read into this process or placed on a command line: SurrealDB
 # root credentials stay in the production container environment.
 set -euo pipefail
@@ -18,9 +23,10 @@ umask 077
 
 readonly archive_pattern='jarvis-backup-[0-9]{4}-[0-9]{2}-[0-9]{2}\.tar'
 readonly members=(etc-jarvis.tar.zst.gpg manifest.json.gpg surrealdb.surql.zst.gpg)
-readonly keep=1
+readonly keep_daily=7 keep_weekly=4
 # The disposable restore container has 1 GiB; a larger export cannot be tested.
 readonly max_export_kib=$((1024 * 1024))
+readonly max_manifest_kib=1024
 
 fail() { echo "jarvis backup: $*" >&2; exit 1; }
 log() { echo "jarvis backup: $*" >&2; }
@@ -143,13 +149,20 @@ build_members() {
         | encrypt_to > "$staging/manifest.json.gpg"
 }
 
-# The tar must hold exactly the expected members, each a non-empty regular file.
+# The tar must hold exactly the expected members, each a non-empty regular file
+# owned by 0/0 without owner names, as publish writes them. The listing is
+# untrusted: owner names could shift fields, so the split listing is numeric,
+# and the size is matched, never evaluated arithmetically.
 check_members() {
-    local archive=$1 listing mode size name
-    listing=$(tar -tvf "$archive" 2>/dev/null) || fail 'archive is not a readable tar'
+    local archive=$1 listing mode owner size name
+    listing=$(tar --numeric-owner -tvf "$archive" 2>/dev/null) || fail 'archive is not a readable tar'
     [[ $(tar -tf "$archive" | LC_ALL=C sort) == "$(printf '%s\n' "${members[@]}")" ]] || fail 'unexpected archive members'
-    while read -r mode _ size _ _ name; do
-        [[ $mode == -* && $size -gt 0 ]] || fail "member $name is not a non-empty regular file"
+    # Owner names (even "0" or ones holding a newline) make the named listing
+    # differ from the numeric one.
+    [[ $(tar -tvf "$archive" 2>/dev/null) == "$listing" ]] || fail 'unexpected member owner'
+    while read -r mode owner size _ _ name; do
+        [[ $owner == 0/0 ]] || fail 'unexpected member owner'
+        [[ $mode == -* && $size =~ ^[1-9][0-9]*$ ]] || fail "member $name is not a non-empty regular file"
     done <<< "$listing"
 }
 
@@ -172,19 +185,43 @@ publish() {
     printf '%s\n' "$dest/$name"
 }
 
-# Keep the just-published archive $2 plus the newest $keep-1 others. The
-# current archive is never a deletion candidate, so a future-dated name (clock
-# skew, manual copy) cannot evict it. Only regular files with the exact archive
-# name are considered; symlinks and other files are never touched.
+# Keep the just-published archive $2, the newest $keep_daily archives and the
+# newest archive of each of the newest $keep_weekly ISO weeks (names carry one
+# date, so one archive per day). The current archive is never a deletion
+# candidate, and nothing is pruned while a future-dated name (clock skew,
+# manual copy) exists, so a wrong clock cannot evict history. Only regular
+# files with the exact archive name and a valid date are considered; symlinks
+# and other files are never touched.
 prune() {
-    local dest=$1 current=$2 old
+    local dest=$1 current=$2 name week last_week='' days=0 weeks=0 new_week
     [[ $current =~ ^$archive_pattern$ ]] || fail 'prune needs the current archive name'
     find "$dest" -mindepth 1 -maxdepth 1 -type d -name '.jarvis-backup.*' -exec rm -rf -- {} +
-    while IFS= read -r old; do
-        rm -f -- "$dest/$old" "$dest/$old.sha256"
+    while IFS= read -r name; do
+        week=$(date -u -d "${name:14:10}" +%G-%V 2>/dev/null) || continue
+        # Names sort newest first, so this returns before anything is deleted.
+        if [[ $name > $current ]]; then
+            log 'an archive is dated after the current one; not pruning (check the clock)'
+            return 0
+        fi
+        new_week=false
+        if [[ $week != "$last_week" ]]; then weeks=$((weeks + 1)) last_week=$week new_week=true; fi
+        days=$((days + 1))
+        [[ $name == "$current" ]] || (( days <= keep_daily )) || { $new_week && (( weeks <= keep_weekly )); } \
+            || rm -f -- "$dest/$name" "$dest/$name.sha256"
     done < <(find "$dest" -mindepth 1 -maxdepth 1 -type f -regextype posix-extended \
-        -regex ".*/$archive_pattern" -printf '%f\n' | awk -v current="$current" '$0 != current' \
-        | LC_ALL=C sort -r | tail -n +"$keep")
+        -regex ".*/$archive_pattern" -printf '%f\n' | LC_ALL=C sort -r)
+}
+
+# Refuse to start unless the destination keeps room for two archives of the
+# newest size plus 1 GiB, and $2 (tmpfs) has 2 GiB for the plaintext export.
+check_space() {
+    local dest=$1 run=$2 newest need
+    newest=$(find "$dest" -mindepth 1 -maxdepth 1 -type f -regextype posix-extended \
+        -regex ".*/$archive_pattern" -printf '%s\n' | sort -n | tail -1)
+    need=$(( ${newest:-0} * 2 + 1024 * 1024 * 1024 ))
+    (( $(df --output=avail -B1 "$dest" | tail -1) >= need )) || fail 'not enough free space at the destination'
+    (( $(df --output=avail -B1 "$run" | tail -1) >= 2 * 1024 * 1024 * 1024 )) \
+        || fail 'not enough free space below /run for the export'
 }
 
 # Integrity and shape check; needs no key.
@@ -200,6 +237,128 @@ verify() {
     [[ $actual == "$expected" ]] || fail 'checksum mismatch'
     check_members "$archive"
     log "verified ${archive##*/}"
+}
+
+decrypt_member() {
+    gpg --batch --quiet --homedir "$gnupg_home" --no-auto-key-retrieve --decrypt -- "$run_dir/members/$1" 2>/dev/null
+}
+
+# Decrypt a verified archive with the owner private key read from stdin into
+# the throwaway keyring, check every member against the manifest, and leave
+# manifest.json, export.surql and etc-jarvis.tar in $run_dir/out (tmpfs below
+# /run, removed on exit). Each plaintext output is capped like the export.
+decrypt_archive() {
+    local archive=$1 out="$run_dir/out" copy name want size
+    [[ ${archive##*/} =~ ^$archive_pattern$ && -f $archive && ! -L $archive ]] || fail 'not a jarvis backup archive'
+    [[ -f $archive.sha256 && ! -L $archive.sha256 ]] || fail 'checksum file missing'
+    size=$(stat -c %s -- "$archive")
+    # A private copy, the ciphertext members and up to 1 GiB per plaintext
+    # output share /run.
+    (( $(df --output=avail -B1 "$lock_dir" | tail -1) >= 2 * size + 2 * 1024 * 1024 * 1024 )) \
+        || fail 'not enough free space below /run to decrypt'
+    # Verify and extract the same private copy: the archive directory may be
+    # writable by others, who could swap the file between the two steps. The
+    # copy is capped at the size checked above.
+    copy="$run_dir/${archive##*/}"
+    ( ulimit -f $(( size / 1024 + 1 )) \
+        && cp -P -- "$archive" "$copy" && cp -P -- "$archive.sha256" "$copy.sha256" ) \
+        || fail 'cannot copy the archive'
+    verify "$copy"
+    install -d -m 0700 "$gnupg_home" "$run_dir/members" "$out"
+    [[ ! -t 0 ]] || log 'paste the backup private key, then press Ctrl-D'
+    gpg --batch --quiet --homedir "$gnupg_home" --import 2>/dev/null || fail 'cannot import the private key from stdin'
+    gpg --batch --homedir "$gnupg_home" --list-secret-keys --with-colons 2>/dev/null \
+        | awk -F: '$1 == "sec" { found = 1 } END { exit !found }' || fail 'stdin holds no private key'
+    tar -C "$run_dir/members" --no-same-owner -xf "$copy" "${members[@]}"
+    rm -f -- "$copy" "$copy.sha256"
+    ( ulimit -f "$max_manifest_kib" && decrypt_member manifest.json.gpg > "$out/manifest.json" ) \
+        || fail 'cannot decrypt the manifest (wrong key or over 1 MiB?)'
+    jq -e '.format_version == 1' "$out/manifest.json" >/dev/null 2>&1 || fail 'unsupported manifest'
+    for name in etc-jarvis.tar.zst.gpg surrealdb.surql.zst.gpg; do
+        want=$(jq -r --arg n "$name" '.members[$n].sha256 // ""' "$out/manifest.json")
+        [[ $(sha256sum < "$run_dir/members/$name" | cut -d' ' -f1) == "$want" ]] || fail "member $name does not match the manifest"
+    done
+    # Chained with &&: errexit does not apply inside a || list.
+    ( ulimit -f "$max_export_kib" \
+        && decrypt_member surrealdb.surql.zst.gpg | zstd -dq > "$out/export.surql" \
+        && decrypt_member etc-jarvis.tar.zst.gpg | zstd -dq > "$out/etc-jarvis.tar" ) \
+        || fail 'cannot decrypt the data members'
+    [[ $(sha256sum < "$out/export.surql" | cut -d' ' -f1) == "$(jq -r '.export_sha256' "$out/manifest.json")" ]] \
+        || fail 'export does not match the manifest'
+    # The disaster-recovery rule: only regular files and directories below etc/jarvis/.
+    tar -tvf "$out/etc-jarvis.tar" | awk '$1 !~ /^[-d]/ { bad = 1 } END { exit bad }' \
+        || fail 'configuration tar has an unexpected entry type'
+    tar -tf "$out/etc-jarvis.tar" | awk '$0 !~ /^etc\/jarvis(\/|$)/ || /(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }' \
+        || fail 'configuration tar has an entry outside etc/jarvis'
+}
+
+take_backup_lock() {
+    exec 8> "$lock_dir/jarvis-backup.lock"
+    flock -n 8 || { log 'another backup is running'; exit 75; }
+}
+
+# A private tmpfs run directory. Leftovers of killed runs (plaintext, a
+# private key) go first.
+begin_private_run() {
+    take_backup_lock
+    remove_stale_run_dirs
+    trap cleanup EXIT
+    run_dir=$(mktemp -d "$lock_dir/jarvis-backup.XXXXXXXX")
+    gnupg_home="$run_dir/gnupg"
+}
+
+verify_decrypt() {
+    begin_private_run
+    decrypt_archive "$1"
+    log "decrypted ${1##*/}: every member matches the manifest"
+}
+
+# Decrypt into the new private directory $2. Live data is never touched.
+restore_to() {
+    local archive=$1 target=$2
+    [[ $target =~ ^/[A-Za-z0-9._/-]+$ && $target != *'/..'* && ! -e $target && ! -L $target ]] \
+        || fail 'restore target must be a new absolute path'
+    safe_dir "$(dirname -- "$target")"
+    # Same filesystem as the run directory: the final move is a rename, so
+    # plaintext never lands half-copied on disk.
+    [[ $(stat -c %d -- "$(dirname -- "$target")") == "$(stat -c %d -- "$lock_dir")" ]] \
+        || fail "restore target must be on the same filesystem as $lock_dir"
+    begin_private_run
+    decrypt_archive "$archive"
+    mv -T -- "$run_dir/out" "$target"
+    log "restored ${archive##*/} into $target; it holds plaintext secrets, delete it when done"
+}
+
+# One-time local-only setup: generate a key pair in a throwaway tmpfs keyring,
+# print the private key once on stdout for the owner to store off this
+# machine, and keep only the public key here. Never overwrites a config.
+init_local() {
+    local dest=$1 fpr name
+    for name in backup.conf recipients.asc; do
+        [[ ! -e $config_dir/$name && ! -L $config_dir/$name ]] || fail "already configured: $config_dir/$name exists"
+    done
+    begin_private_run
+    install -d -m 0700 "$gnupg_home"
+    gpg --batch --quiet --homedir "$gnupg_home" --passphrase '' \
+        --quick-gen-key "Jarvis local backup $(date -u +%F)" default default never 2>/dev/null \
+        || fail 'cannot generate the backup key'
+    fpr=$(gpg --batch --homedir "$gnupg_home" --with-colons --list-keys 2>/dev/null \
+        | awk -F: '$1 == "fpr" && !f { print $10; f = 1 }')
+    printf 'destination=%s\nrecipients=%s\n' "$dest" "$fpr" > "$run_dir/backup.conf"
+    read_config "$run_dir/backup.conf"
+    gpg --batch --homedir "$gnupg_home" --armor --export "$fpr" > "$run_dir/recipients.asc"
+    prepare_keyring "$run_dir/check" "$run_dir/recipients.asc"
+    gpgconf --homedir "$run_dir/check" --kill all >/dev/null 2>&1 || true
+    install -d -m 0700 "$config_dir" "$dest"
+    safe_dir "$config_dir"
+    safe_dir "$dest"
+    log 'Store the private key below in your password manager now, then clear the terminal.'
+    log 'Without it no archive can be decrypted; this host keeps only the public key.'
+    gpg --batch --homedir "$gnupg_home" --armor --pinentry-mode loopback --passphrase '' \
+        --export-secret-keys "$fpr" || fail 'cannot print the private key'
+    install -m 0600 "$run_dir/recipients.asc" "$config_dir/recipients.asc"
+    install -m 0600 "$run_dir/backup.conf" "$config_dir/backup.conf"
+    log "configured $dest for key $fpr"
 }
 
 # --- Production database access -------------------------------------------
@@ -294,16 +453,16 @@ remove_stale_runs() {
         mapfile -t containers <<< "$ids"
         docker rm -f "${containers[@]}" >/dev/null || fail 'cannot remove stale restore containers'
     fi
+    remove_stale_run_dirs
+}
+
+remove_stale_run_dirs() {
     find "$lock_dir" -mindepth 1 -maxdepth 1 -type d -name 'jarvis-backup.????????' -exec rm -rf -- {} +
 }
 
-create() {
-    local tool newest need avail day parent
-    [[ $EUID == 0 ]] || fail 'root required'
-    day=$(date -u +%F)
-    for tool in docker gpg gpgconf zstd jq tar sha256sum flock find stat df; do
-        command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
-    done
+# Check and read the owner configuration; sets $destination and $recipients.
+load_config() {
+    local parent
     [[ -e $config_dir/backup.conf || -L $config_dir/backup.conf ]] \
         || fail "not configured: $config_dir/backup.conf is missing (see docs/BACKUP_AND_RESTORE.md)"
     safe_dir "$config_dir"
@@ -319,6 +478,24 @@ create() {
         parent=$destination
         while [[ $parent != / ]]; do parent=$(dirname -- "$parent"); safe_dir "$parent"; done
     fi
+}
+
+latest_archive() {
+    local name
+    name=$(find "$destination" -mindepth 1 -maxdepth 1 -type f -regextype posix-extended \
+        -regex ".*/$archive_pattern" -printf '%f\n' | LC_ALL=C sort | tail -n 1)
+    [[ -n $name ]] || fail "no archive in $destination yet"
+    printf '%s\n' "$destination/$name"
+}
+
+create() {
+    local tool day
+    [[ $EUID == 0 ]] || fail 'root required'
+    day=$(date -u +%F)
+    for tool in docker gpg gpgconf zstd jq tar sha256sum flock find stat df; do
+        command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
+    done
+    load_config
     private_root_file "$env_file" 'surrealdb.env'
     private_root_file "$marker" 'the Core provisioning marker'
     namespace=$(single_value "$marker" namespace '[A-Za-z][A-Za-z0-9_]{0,63}') \
@@ -329,8 +506,7 @@ create() {
     image=$(single_value "$env_file" SURREALDB_IMAGE 'surrealdb/surrealdb@sha256:[0-9a-f]{64}') \
         || fail 'SURREALDB_IMAGE must be exactly one digest-pinned official image'
 
-    exec 8> "$lock_dir/jarvis-backup.lock"
-    flock -n 8 || { log 'another backup is running'; exit 75; }
+    take_backup_lock
     remove_stale_runs
     exec 9> "$lock_dir/jarvis-updater.lock"
     flock -w 600 9 || { log 'a Core update is running'; exit 75; }
@@ -340,13 +516,7 @@ create() {
     exec 6> "$lock_dir/jarvis-private-agent-update.lock"
     flock -w 60 6 || { log 'a private agent update is running'; exit 75; }
 
-    newest=$(find "$destination" -mindepth 1 -maxdepth 1 -type f -regextype posix-extended \
-        -regex ".*/$archive_pattern" -printf '%s\n' | sort -n | tail -1)
-    need=$(( ${newest:-0} * 2 + 1024 * 1024 * 1024 ))
-    avail=$(df --output=avail -B1 "$destination" | tail -1)
-    (( avail >= need )) || fail 'not enough free space at the destination'
-    avail=$(df --output=avail -B1 "$lock_dir" | tail -1)
-    (( avail >= 2 * 1024 * 1024 * 1024 )) || fail 'not enough free space below /run for the export'
+    check_space "$destination" "$lock_dir"
 
     trap cleanup EXIT
     run_dir=$(mktemp -d "$lock_dir/jarvis-backup.XXXXXXXX")
@@ -392,10 +562,29 @@ main() {
         marker="$fixture_root/etc/jarvis/surrealdb-core-provisioned"
         compose_file="$fixture_root/docker-compose.yml"
     fi
+    local usage='usage: jarvis-backup create | verify [--decrypt] [ARCHIVE] | restore ARCHIVE DIR | init-local'
+    local decrypt=false archive
     case ${1:-} in
-        create) [[ $# == 1 ]] || fail 'usage: jarvis-backup create'; create ;;
-        verify) [[ $# == 2 ]] || fail 'usage: jarvis-backup verify ARCHIVE'; verify "$2" ;;
-        *) fail 'usage: jarvis-backup create | verify ARCHIVE' ;;
+        create) [[ $# == 1 ]] || fail "$usage"; create ;;
+        verify)
+            shift
+            if [[ ${1:-} == --decrypt ]]; then decrypt=true; shift; fi
+            (( $# <= 1 )) || fail "$usage"
+            if (( $# == 0 )) || $decrypt; then [[ $EUID == 0 ]] || fail 'root required'; fi
+            if (( $# == 0 )); then load_config; archive=$(latest_archive); else archive=$1; fi
+            if $decrypt; then verify_decrypt "$archive"; else verify "$archive"; fi
+            ;;
+        restore)
+            [[ $# == 3 ]] || fail "$usage"
+            [[ $EUID == 0 ]] || fail 'root required'
+            restore_to "$2" "$3"
+            ;;
+        init-local)
+            [[ $# == 1 ]] || fail "$usage"
+            [[ $EUID == 0 ]] || fail 'root required'
+            init_local /var/backups/jarvis-dr
+            ;;
+        *) fail "$usage" ;;
     esac
 }
 
