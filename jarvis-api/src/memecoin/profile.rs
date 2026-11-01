@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use jarvis_onchain::filter::FilterRules;
@@ -175,7 +175,8 @@ impl PaperProfile {
                 "max_open_positions must be 1 to {MAX_OPEN_POSITIONS}"
             ));
         }
-        // ponytail: no cash ledger; the simulation can never commit more than the stake.
+        // ponytail: no cash ledger; open positions stay within the stake, entry
+        // and failed-attempt fees aside. Track cash if fees ever matter here.
         let committed = v
             .max_position_usd
             .checked_mul(Decimal::from(v.max_open_positions));
@@ -263,8 +264,12 @@ impl PaperProfile {
     /// with mode 0640 and its directory's group, like the Hugging Face
     /// catalog, so Core can read but never change it.
     pub fn load(path: &Path, enforce_production_boundary: bool) -> Result<Self, String> {
-        let file =
-            fs::File::open(path).map_err(|error| format!("paper profile unavailable: {error}"))?;
+        // O_NOFOLLOW and fstat: the file checked is the file read.
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| format!("paper profile unavailable: {error}"))?;
         let metadata = file
             .metadata()
             .map_err(|error| format!("paper profile unavailable: {error}"))?;
@@ -273,10 +278,7 @@ impl PaperProfile {
                 .parent()
                 .and_then(|parent| fs::metadata(parent).ok())
                 .ok_or("paper profile has no trusted parent")?;
-            let link = fs::symlink_metadata(path)
-                .map_err(|error| format!("paper profile unavailable: {error}"))?;
-            if link.file_type().is_symlink()
-                || metadata.uid() != 0
+            if metadata.uid() != 0
                 || metadata.gid() != parent.gid()
                 || metadata.permissions().mode() & 0o777 != 0o640
             {
@@ -328,7 +330,7 @@ pub(crate) mod tests {
             },
             "costs": {
                 "dex_fee_bps": 25, "network_fee_usd": "0.001",
-                "priority_fee_usd": "0.01", "failure_rate": "0"
+                "priority_fee_usd": "0.01", "failure_rate": "0.1"
             }
         })
     }
@@ -355,6 +357,22 @@ pub(crate) mod tests {
                 .versioned_params,
             profile.versioned_params
         );
+    }
+
+    #[test]
+    fn load_refuses_symlinks_and_unprotected_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("profile.json");
+        fs::write(&file, fixture_json().to_string()).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(PaperProfile::load(&file, false).is_ok());
+        // Not root-owned, so production refuses it.
+        assert!(PaperProfile::load(&file, true).is_err());
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(PaperProfile::load(&link, false).is_err());
+        fs::write(&file, " ".repeat(65 * 1024)).unwrap();
+        assert!(PaperProfile::load(&file, false).is_err());
     }
 
     #[test]

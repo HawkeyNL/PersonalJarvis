@@ -54,7 +54,8 @@ no values on purpose.
 
 Everything except `watchlist` and `goal_multiple` is recorded with the strategy
 version. Changing any of it without raising `strategy.version` keeps the
-trader off. Reports and the paper gate cover the current version only; open
+trader off; that includes rewriting `"25"` as `"25.0"`, since decimals keep
+their scale. Reports and the paper gate cover the current version only; open
 positions of an older version are still exited.
 
 ## What a tick does
@@ -64,7 +65,12 @@ exactly; value open positions and simulate exits (also while paused); unless
 paused, observe up to 5 watchlist mints (each at most every 15 minutes,
 through the per-provider pacing of `jarvis-market-data`), run the filter and
 the strategy, and simulate entries. A write failure stops the tick before
-anything is simulated on it. A candidate row is written only when a mint's
+anything is simulated on it. If the stored ledger no longer replays exactly
+(or is over 100 000 rows, or is dated more than five minutes ahead of the
+clock), every tick stops, exits included, until the owner investigates; the
+overview shows the reason as `last_error` and the log reports it once. If the
+pause state cannot be read, that tick makes no entries. A candidate row is
+written only when a mint's
 verdict changes. Candidate rows and the hourly gate snapshots are pruned after
 30 days; trips and costs are kept for the paper gate.
 
@@ -81,7 +87,8 @@ decisions.
 - `GET /v1/trading/meme/candidates?limit=1..100` (default 50).
 - `GET /v1/trading/meme/trades?limit=1..100`: closed paper trades.
 - `POST /v1/trading/meme/pause`: stops entries at once and persists the pause
-  (security audit `memecoin.paper.pause`). Exits continue.
+  (security audit `memecoin.paper.pause`). Exits continue. A `503` means the
+  pause holds only until the next restart; retry until it answers `200`.
 
 ## Resuming
 

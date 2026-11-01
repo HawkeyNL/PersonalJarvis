@@ -73,6 +73,7 @@ pub(crate) async fn overview(_authed: Authed, State(state): State<AppState>) -> 
         "running": handle.running(),
         "paused": control.paused || handle.paused(),
         "paused_at": control.paused_at.map(ts),
+        "last_error": handle.last_error(),
         "resume": "configuration only (JARVIS_MEMECOIN_PAPER_RESUME_PAUSED_AT)",
     });
     if let Some(view) = handle.view() {

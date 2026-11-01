@@ -48,6 +48,10 @@ pub const MAX_ENTRY_CANDIDATES_PER_TICK: usize = 5;
 /// A mint is observed again for an entry at most this often.
 const OBSERVE_COOLDOWN: Duration = Duration::minutes(15);
 const GATE_SNAPSHOT_EVERY: Duration = Duration::hours(1);
+/// A ledger dated further ahead than this means the clock jumped back or
+/// was ahead before: stop instead of stamping events into the future, which
+/// would stretch the paper gate's duration.
+const CLOCK_TOLERANCE: Duration = Duration::minutes(5);
 /// Sell quotes are taken into USDC.
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -60,6 +64,8 @@ pub struct PaperHandle {
     /// Only a restart with the resume setting can clear a pause.
     paused: AtomicBool,
     view: RwLock<Option<PaperView>>,
+    /// Why the last tick stopped, if it did. Cleared by a good tick.
+    last_error: RwLock<Option<String>>,
 }
 
 impl PaperHandle {
@@ -88,6 +94,30 @@ impl PaperHandle {
 
     pub fn view(&self) -> Option<PaperView> {
         self.view.read().ok().and_then(|view| view.clone())
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.read().ok().and_then(|error| error.clone())
+    }
+
+    /// Record a tick outcome; `true` when it differs from the previous one,
+    /// so a persistent failure is logged once, not every minute.
+    fn note_outcome(&self, error: Option<String>) -> bool {
+        let Ok(mut slot) = self.last_error.write() else {
+            return true;
+        };
+        let changed = *slot != error;
+        *slot = error;
+        changed
+    }
+}
+
+/// Clears `running` when the task ends, panics included.
+struct RunningGuard(Arc<PaperHandle>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::SeqCst);
     }
 }
 
@@ -401,17 +431,29 @@ impl PaperTask {
             .flatten()
             .chain(costs.iter().map(|c| c.at))
             .max();
+        if last.is_some_and(|last| last > OffsetDateTime::now_utc() + CLOCK_TOLERANCE) {
+            return Err("paper ledger is dated ahead of the clock".into());
+        }
         let mut stamp = move || {
             let at = OffsetDateTime::now_utc()
                 .max(last.map_or(OffsetDateTime::UNIX_EPOCH, |l| l + Duration::nanoseconds(1)));
             last = Some(at);
             at
         };
-        // A failed read counts as paused; a pause is never cleared here.
-        match bounded(store::control(db)).await {
-            Ok(control) if !control.paused => {}
-            _ => self.handle.pause_now(),
-        }
+        // A stored pause latches; a failed read pauses this tick only.
+        let read_failed = match bounded(store::control(db)).await {
+            Ok(control) => {
+                if control.paused {
+                    self.handle.pause_now();
+                }
+                false
+            }
+            Err(error) => {
+                tracing::warn!(%error, "memecoin paper: pause state unreadable; no entries this tick");
+                true
+            }
+        };
+        let paused = || read_failed || self.handle.paused();
 
         let p = &self.profile;
         let version = p.strategy.version;
@@ -539,7 +581,7 @@ impl PaperTask {
         due.truncate(MAX_ENTRY_CANDIDATES_PER_TICK);
         let deny_list = BTreeSet::new();
         for mint in due {
-            if self.handle.paused() || open >= p.max_open_positions {
+            if paused() || open >= p.max_open_positions {
                 break;
             }
             stats.observed += 1;
@@ -595,7 +637,7 @@ impl PaperTask {
             };
             // No research step runs yet; it could only veto or shrink.
             let size = apply_research(intent.amount_in, ResearchAdjustment::Keep);
-            if self.handle.paused() {
+            if paused() {
                 break;
             }
             match paper::buy(
@@ -759,17 +801,26 @@ pub async fn start(
     let version = profile.strategy.version;
     let mut task = PaperTask::new(profile, handle.clone());
     handle.running.store(true, Ordering::SeqCst);
+    let guard = RunningGuard(handle.clone());
     tokio::spawn(async move {
+        let _guard = guard;
         let mut interval =
             tokio::time::interval_at(tokio::time::Instant::now() + TICK_INTERVAL, TICK_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             let mut dice = roll;
-            match tokio::time::timeout(TICK_TIMEOUT, task.tick(&db, market.as_ref(), &mut dice))
-                .await
-            {
-                Ok(Ok(stats)) => tracing::info!(
+            let outcome =
+                tokio::time::timeout(TICK_TIMEOUT, task.tick(&db, market.as_ref(), &mut dice))
+                    .await;
+            let error = match &outcome {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(error.clone()),
+                Err(_) => Some("tick timed out".to_string()),
+            };
+            let changed = handle.note_outcome(error.clone());
+            match (outcome, error) {
+                (Ok(Ok(stats)), _) => tracing::info!(
                     observed = stats.observed,
                     accepted = stats.accepted,
                     entries = stats.entries,
@@ -779,8 +830,10 @@ pub async fn start(
                     provider_errors = stats.provider_errors,
                     "memecoin paper tick"
                 ),
-                Ok(Err(error)) => tracing::error!(%error, "memecoin paper tick stopped"),
-                Err(_) => tracing::warn!("memecoin paper tick timed out"),
+                (_, Some(error)) if changed => {
+                    tracing::error!(%error, "memecoin paper tick stopped")
+                }
+                _ => {}
             }
         }
     });
@@ -947,6 +1000,7 @@ mod tests {
         let market = FixtureMarket {
             price_a: Mutex::new(d("0.001")),
         };
+        // Rolls at or above the 10% failure rate fill; a roll of 0 fails.
         let mut no_failure = || Decimal::new(999_999, 6);
 
         // Tick 1: A is accepted and bought, B is rejected for its pool.
