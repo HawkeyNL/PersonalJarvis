@@ -240,6 +240,12 @@ for worker in jarvis-claude jarvis-codex; do
     fi
 done
 
+# The optional IBKR broker identity: no home, no login, no extra groups. Its
+# unit stays disabled until the owner sets the credentials and enables it.
+if ! getent passwd jarvis-ibkr >/dev/null; then
+    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin jarvis-ibkr
+fi
+
 [[ -f /etc/jarvis/surrealdb.env && ! -L /etc/jarvis/surrealdb.env ]] || {
     echo "missing root-only /etc/jarvis/surrealdb.env" >&2
     exit 1

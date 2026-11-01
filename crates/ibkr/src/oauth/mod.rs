@@ -102,9 +102,27 @@ impl std::fmt::Debug for OAuthCredentials {
     }
 }
 
+/// No group or other access. One exception: a systemd `LoadCredential=` file
+/// directly in `$CREDENTIALS_DIRECTORY` may be root:root 0440, which is how a
+/// tmpfs credentials mount grants the service user read access (an ACL whose
+/// mask shows as group read).
+#[cfg(unix)]
+fn private_mode(mode: u32, uid: u32, gid: u32, systemd_credential: bool) -> bool {
+    let mode = mode & 0o7777;
+    mode & 0o077 == 0 || (systemd_credential && uid == 0 && gid == 0 && mode == 0o440)
+}
+
+/// `path` sits directly in the systemd credentials directory of this process.
+#[cfg(unix)]
+fn is_systemd_credential(path: &Path) -> bool {
+    std::env::var_os("CREDENTIALS_DIRECTORY")
+        .map(PathBuf::from)
+        .is_some_and(|dir| dir.is_absolute() && path.parent() == Some(dir.as_path()))
+}
+
 /// Read a credential file, failing closed unless it is a regular file (not a
-/// symlink), at most [`MAX_CREDENTIAL_BYTES`], and on unix not accessible by
-/// group or others.
+/// symlink), at most [`MAX_CREDENTIAL_BYTES`], and on unix private (see
+/// [`private_mode`]).
 fn read_secret(path: &Path, what: &'static str) -> Result<Zeroizing<String>, IbkrError> {
     let invalid = IbkrError::Credential(what);
     let link = std::fs::symlink_metadata(path).map_err(|_| IbkrError::Credential(what))?;
@@ -121,8 +139,13 @@ fn read_secret(path: &Path, what: &'static str) -> Result<Zeroizing<String>, Ibk
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         // Same inode as the checked path: nobody swapped in a symlink between
         // the two lookups.
-        if meta.permissions().mode() & 0o077 != 0
-            || (meta.dev(), meta.ino()) != (link.dev(), link.ino())
+        let systemd_credential = is_systemd_credential(path);
+        if !private_mode(
+            meta.permissions().mode(),
+            meta.uid(),
+            meta.gid(),
+            systemd_credential,
+        ) || (meta.dev(), meta.ino()) != (link.dev(), link.ino())
         {
             return Err(invalid);
         }

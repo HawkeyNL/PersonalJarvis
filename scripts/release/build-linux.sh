@@ -68,6 +68,11 @@ verify_systemd_unit_candidate() {
     echo "release candidate does not declare Codex chat worker capability 1" >&2
     exit 1
   }
+  jq -e '.tooling.ibkr_broker == 1 and (.tooling.ibkr_broker | type) == "number"' \
+    "$release/release.json" >/dev/null || {
+    echo "release candidate does not declare IBKR broker capability 1" >&2
+    exit 1
+  }
   jq -e '.tooling.model_policy_directory == 1 and (.tooling.model_policy_directory | type) == "number"' \
     "$release/release.json" >/dev/null || {
     echo "release candidate does not declare model-policy directory capability 1" >&2
@@ -199,6 +204,7 @@ cargo build --locked --release \
   -p jarvis-api --bins \
   -p jarvis-codex --bin jarvis-codex-runtime \
   -p jarvis-core --bin jarvis-agent-bundle \
+  -p jarvis-ibkr --bin jarvis-ibkr-broker \
   -p jarvis-admin --bin jarvis
 
 # The Linux graphical administrator is a separate Tauri workspace. Its Vue
@@ -224,6 +230,7 @@ install -m 0755 "$release_target_dir/release/jarvis-codex-runtime" "$temporary_r
 install -m 0755 "$release_target_dir/release/jarvis-claude-worker" "$temporary_release/jarvis-claude-worker"
 install -m 0755 "$release_target_dir/release/jarvis-codex-chat-worker" "$temporary_release/jarvis-codex-chat-worker"
 install -m 0755 "$release_target_dir/release/jarvis-agent-bundle" "$temporary_release/jarvis-agent-bundle"
+install -m 0755 "$release_target_dir/release/jarvis-ibkr-broker" "$temporary_release/jarvis-ibkr-broker"
 install -m 0755 "$release_target_dir/release/jarvis" "$temporary_release/jarvis"
 install -m 0755 "$release_target_dir/release/jarvis-core-admin" "$temporary_release/jarvis-core-admin"
 # A production Core Admin App must serve its embedded Vue assets through
@@ -268,7 +275,8 @@ for unit in \
   jarvis-claude.service jarvis-claude.socket \
   jarvis-codex-chat.service jarvis-codex-chat.socket \
   jarvis-backup.service jarvis-backup.timer \
-  jarvis-housekeeping.service jarvis-housekeeping.timer; do
+  jarvis-housekeeping.service jarvis-housekeeping.timer \
+  jarvis-ibkr-broker.service; do
   install -m 0644 "deploy/systemd/$unit" "$temporary_release/systemd-$unit"
 done
 install -m 0644 deploy/systemd/pricing-registry.json "$temporary_release/pricing-registry.json"
@@ -297,12 +305,12 @@ jq -n \
   --arg cli_version "$cli_version" \
   --arg core_admin_version "$core_admin_version" \
   --arg schema_six "$schema_six_sha256" --arg schema_seven "$schema_seven_sha256" --arg schema_eight "$schema_eight_sha256" --arg schema_nine "$schema_nine_sha256" --arg schema_ten "$schema_ten_sha256" --arg schema_eleven "$schema_eleven_sha256" --arg schema_twelve "$schema_twelve_sha256" --arg schema_thirteen "$schema_thirteen_sha256" \
-  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 14, from_sha256: [$schema_six, $schema_seven, $schema_eight, $schema_nine, $schema_ten, $schema_eleven, $schema_twelve, $schema_thirteen]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1, codex_chat_worker: 1, codex_runtime: 1, backup_timer: 1, housekeeping_timer: 1, persona_validate: 1}}' \
+  '{tag: $tag, revision: $revision, schema_sha256: $schema_sha256, schema_migration: {version: 1, target: 14, from_sha256: [$schema_six, $schema_seven, $schema_eight, $schema_nine, $schema_ten, $schema_eleven, $schema_twelve, $schema_thirteen]}, components: {core: $core_version, cli: $cli_version, core_admin: $core_admin_version}, tooling: {private_agents: 1, admin_helpers: 1, systemd_units: 1, local_devices: 1, model_policy_directory: 1, model_catalog: 1, laya_runtime: 1, subscription_workers: 1, codex_chat_worker: 1, ibkr_broker: 1, codex_runtime: 1, backup_timer: 1, housekeeping_timer: 1, persona_validate: 1}}' \
   > "$temporary_release/release.json"
 
 (
   cd "$temporary_release"
-  sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-codex-runtime jarvis-claude-worker jarvis-codex-chat-worker jarvis-agent-bundle \
+  sha256sum jarvis-api jarvis-config-broker jarvis-codex-broker jarvis-codex-runtime jarvis-claude-worker jarvis-codex-chat-worker jarvis-agent-bundle jarvis-ibkr-broker \
     jarvis jarvis-core-admin jarvis-core-admin.desktop jarvis-core-admin.png \
     jarvis-core-admin.version update-core-release jarvis-models jarvis-credentials jarvis-backup jarvis-housekeeping \
     com.hawkeynl.jarvis.devices.policy \

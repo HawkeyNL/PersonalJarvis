@@ -1,0 +1,79 @@
+[Unit]
+Description=Jarvis read-only IBKR broker
+After=network-online.target
+Wants=network-online.target
+# Set up by `sudo jarvis-credentials set ibkr-oauth`; never enabled by an
+# install or update. The owner enables it with `systemctl enable --now`.
+ConditionPathExists=/etc/jarvis/secrets/ibkr-oauth/access_token_secret
+# A broken credential stops after a few attempts instead of looping forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+# The only process holding the IBKR credentials. Its own group, so it cannot
+# reach Core's other group-only sockets; the broker also checks the kernel
+# peer uid of every caller.
+User=jarvis-ibkr
+Group=jarvis-ibkr
+Environment=JARVIS_IBKR_BROKER_ALLOWED_PEERS=jarvis
+# Read by the service manager (as root) and exposed read-only to this service
+# only, under fixed names. The RSA encryption key is never loaded.
+LoadCredential=consumer_key:/etc/jarvis/secrets/ibkr-oauth/consumer_key
+LoadCredential=access_token:/etc/jarvis/secrets/ibkr-oauth/access_token
+LoadCredential=access_token_secret:/etc/jarvis/secrets/ibkr-oauth/access_token_secret
+LoadCredential=signature_key:/etc/jarvis/secrets/ibkr-oauth/private_signature.pem
+LoadCredential=dh_param:/etc/jarvis/secrets/ibkr-oauth/dhparam.pem
+# Setgid to Core's group, so the 0660 socket is Core-connectable while the
+# broker itself is not in that group. Not a RuntimeDirectory=: systemd resets
+# those to User:Group before every Exec* command.
+ExecStartPre=+/usr/bin/install -d -o jarvis-ibkr -g jarvis -m 2750 /run/jarvis-ibkr-broker
+# Optional (-): the namespace is also built for ExecStartPre, before the
+# directory exists.
+ReadWritePaths=-/run/jarvis-ibkr-broker
+ExecStart=/opt/jarvis/current/jarvis-ibkr-broker
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=20s
+TimeoutStopSec=30s
+UMask=0117
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+PrivatePIDs=true
+RemoveIPC=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+MemoryDenyWriteExecute=true
+# Nothing executes except the release binary and the shared libraries it
+# loads (only the multiarch directory: /usr/lib itself holds shells).
+NoExecPaths=/
+ExecPaths=/opt/jarvis/releases /usr/lib/x86_64-linux-gnu -/usr/lib64
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Internet only (IBKR's API): no loopback services, LAN, link-local,
+# CGNAT/Tailscale or ULA ranges. 127.0.0.53 is the systemd-resolved stub.
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.0.0.53
+InaccessiblePaths=/etc/jarvis /var/lib/jarvis
+LimitCORE=0
+TasksMax=64
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
