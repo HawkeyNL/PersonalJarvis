@@ -544,16 +544,23 @@ async fn main() -> anyhow::Result<()> {
         budget_cents,
     );
 
+    // Off by default. A configuration problem leaves the trading routes
+    // answering "not configured"; Core keeps running.
+    let ibkr_broker = if config.ibkr_portfolio_sync_enabled {
+        jarvis_api::ibkr::client(&config.ibkr_broker_socket)
+            .map_err(|reason| tracing::error!(reason, "IBKR portfolio sync disabled"))
+            .ok()
+            .map(Arc::new)
+    } else {
+        None
+    };
     let state = AppState {
         realtime: Default::default(),
         db,
         environment: config.environment.clone(),
         require_https: config.environment.eq_ignore_ascii_case("production"),
         dev_enrollment: config.dev_enrollment,
-        ibkr: jarvis_ibkr::IbkrClient::new(&config.ibkr_gateway_url)
-            .map_err(|error| tracing::warn!(%error, "IBKR gateway client disabled"))
-            .ok()
-            .map(Arc::new),
+        ibkr: ibkr_broker.clone(),
         llm,
         fast_intent_router: {
             use jarvis_api::intent::{
@@ -664,6 +671,13 @@ async fn main() -> anyhow::Result<()> {
             jarvis_api::run_audit_maintenance(&audit_state).await;
         }
     });
+    if let Some(client) = &ibkr_broker {
+        jarvis_api::ibkr::start(
+            state.db.clone(),
+            client.as_ref().clone(),
+            config.ibkr_broker_socket.clone().into(),
+        );
+    }
     if config.memecoin_paper_enabled {
         if let Err(reason) = start_memecoin_paper(&config, &state).await {
             tracing::error!(%reason, "memecoin paper trader disabled");

@@ -30,6 +30,7 @@ pub mod broker_replay;
 pub mod budget_gate;
 mod error;
 mod extract;
+pub mod ibkr;
 pub mod intent;
 #[cfg(unix)]
 pub mod local_devices;
@@ -69,7 +70,6 @@ use routes::auth::{
     push_target_delete, push_target_set, unlock_approve, unlock_deny, unlock_pending,
     unlock_request, unlock_status,
 };
-use routes::broker::{ibkr_positions, ibkr_status};
 use routes::chat::{
     assistant_chat, assistant_orchestrate, conversation_brain_set, delete_conversation,
     get_conversation, list_conversations,
@@ -179,8 +179,15 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/holdings", get(get_holdings).post(add_holding))
         .route("/v1/holdings/{id}", delete(remove_holding))
-        .route("/v1/broker/ibkr/status", get(ibkr_status))
-        .route("/v1/broker/ibkr/positions", get(ibkr_positions))
+        .route("/v1/trading/portfolio", get(routes::trading::portfolio))
+        .route(
+            "/v1/trading/portfolio/history",
+            get(routes::trading::history),
+        )
+        .route(
+            "/v1/trading/instruments/{conid}/bars",
+            get(routes::trading::bars),
+        )
         .route("/v1/trading/meme/overview", get(routes::meme::overview))
         .route("/v1/trading/meme/candidates", get(routes::meme::candidates))
         .route("/v1/trading/meme/trades", get(routes::meme::trades))

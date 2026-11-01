@@ -91,6 +91,7 @@ jobs:
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-api --test surreal_api -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-api --lib notify::apns -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-api --lib memecoin -- --ignored
+          JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-api --lib ibkr::store -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-api --bin jarvis-codex-broker -- --ignored
       - name: IBKR broker under real systemd
         run: |

@@ -26,7 +26,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 14);
+    assert_eq!(version.unwrap().version, 15);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
@@ -47,7 +47,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_eleven.unwrap().version, 14);
+    assert_eq!(from_eleven.unwrap().version, 15);
     db.use_db("from_twelve").await?;
     apply_through_twelve(&db).await?;
     // A v12 pairing row has none of the new optional fields and stays valid.
@@ -59,7 +59,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_twelve_version: Option<SchemaVersion> = from_twelve.take(0)?;
-    assert_eq!(from_twelve_version.unwrap().version, 14);
+    assert_eq!(from_twelve_version.unwrap().version, 15);
     let legacy_has_no_ip: Vec<bool> = from_twelve.take(1)?;
     assert_eq!(legacy_has_no_ip, [true]);
     // The database bounds the new fields even if Core validation regressed.
@@ -88,7 +88,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
-    assert_eq!(migrated_version.unwrap().version, 14);
+    assert_eq!(migrated_version.unwrap().version, 15);
     let legacy: Vec<String> = migrated.take(1)?;
     assert_eq!(legacy, ["password-set"]);
     db.query("CREATE account_actions SET id = 'reset', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
@@ -134,7 +134,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_thirteen.unwrap().version, 14);
+    assert_eq!(from_thirteen.unwrap().version, 15);
     // The paper tables enforce their shape even if Core validation regressed.
     let (mint, other) = (
         "So11111111111111111111111111111111111111112",
@@ -179,6 +179,42 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     db.query("CREATE memecoin_candidates SET id = 'r', mint = 'So11111111111111111111111111111111111111112', observed_at = time::now(), strategy_version = 1, reason = 'lp_not_secured', price_usd = '0.0001', liquidity_usd = NONE;")
         .await?
         .check()?;
+    db.use_db("from_fourteen").await?;
+    apply_through_fourteen(&db).await?;
+    apply_baseline_schema(&db).await?;
+    let from_fourteen: Option<SchemaVersion> = db
+        .query("SELECT version FROM schema_version:baseline")
+        .await?
+        .check()?
+        .take(0)?;
+    assert_eq!(from_fourteen.unwrap().version, 15);
+    // The IBKR read model enforces its shape even if Core validation regressed.
+    let position = |id: &str, extra: &str| {
+        format!("CREATE ibkr_positions SET id = '{id}', conid = {id}, symbol = 'VWCE', asset_class = 'STK', currency = 'EUR', quantity = '12.5', avg_cost = '101.25', last_price = '120', market_value = '1500', unrealized_pnl = '-3.5'{extra};")
+    };
+    db.query(position("1", "")).await?.check()?;
+    db.query("UPSERT ibkr_portfolio:current SET id = 'current', as_of = time::now(), base_currency = 'EUR', net_liquidation = '2500.5', cash = '-1000';")
+        .await?
+        .check()?;
+    db.query("UPSERT ibkr_portfolio_history:⟨2026-11-01⟩ SET id = '2026-11-01', t = time::now(), value = '2500.5';")
+        .await?
+        .check()?;
+    // Each case breaks exactly one rule.
+    for bad in [
+        // The same contract twice.
+        position("1", "").replace("id = '1'", "id = '9'"),
+        position("2", ", name = ''"),
+        position("3", "").replace("asset_class = 'STK'", "asset_class = 'stk'"),
+        position("4", "").replace("currency = 'EUR'", "currency = 'EURO'"),
+        // A float instead of a decimal string.
+        position("5", "").replace("quantity = '12.5'", "quantity = '1e5'"),
+        position("6", "").replace("conid = 6", "conid = 0"),
+        "UPSERT ibkr_portfolio:current SET base_currency = 'USD';".to_string(),
+        "UPSERT ibkr_portfolio:current SET cash = '1,5';".to_string(),
+        "CREATE ibkr_portfolio_history SET id = 'x', t = time::now(), value = 'NaN';".to_string(),
+    ] {
+        assert!(db.query(&bad).await?.check().is_err(), "{bad}");
+    }
     db.query("UPDATE schema_version:baseline SET version = 99;")
         .await?
         .check()?;

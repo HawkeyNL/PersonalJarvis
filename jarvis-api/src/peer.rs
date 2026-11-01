@@ -122,7 +122,7 @@ pub struct ProxyIdentity {
 }
 
 /// `(uid, primary gid)` of a local account, or `None` if it does not exist.
-fn lookup_user(name: &CStr) -> Option<(u32, u32)> {
+pub(crate) fn lookup_user(name: &CStr) -> Option<(u32, u32)> {
     // SAFETY: zeroed passwd is a valid out-parameter; getpwnam_r only writes
     // into it and `buf`, both of which outlive the call.
     let mut entry: libc::passwd = unsafe { std::mem::zeroed() };

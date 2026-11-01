@@ -98,10 +98,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub public_hostname: String,
 
-    /// Base URL of the IBKR Client Portal Gateway (read-only proxy target).
-    #[serde(default = "default_ibkr_gateway_url")]
-    pub ibkr_gateway_url: String,
-
     /// LLM provider for the brain: `anthropic` (default) or `ollama`.
     #[serde(default = "default_llm_provider")]
     pub llm_provider: String,
@@ -411,6 +407,14 @@ pub struct AppConfig {
     /// Secret — redacted in `Debug`.
     #[serde(default)]
     pub market_jupiter_api_key: String,
+
+    /// Read-only IBKR portfolio sync through the local IBKR broker. Default
+    /// **false**. It never places orders and holds no IBKR credentials.
+    #[serde(default)]
+    pub ibkr_portfolio_sync_enabled: bool,
+    /// The broker's Unix socket (absolute path).
+    #[serde(default = "default_ibkr_broker_socket")]
+    pub ibkr_broker_socket: String,
 }
 
 /// The directory that holds Core's API socket, created by the Core unit.
@@ -432,10 +436,6 @@ fn default_surreal_database() -> String {
 
 fn default_environment() -> String {
     "development".to_string()
-}
-
-fn default_ibkr_gateway_url() -> String {
-    "https://localhost:5000/v1/api".to_string()
 }
 
 fn default_llm_provider() -> String {
@@ -607,6 +607,10 @@ fn default_huggingface_route_hard() -> String {
 
 fn default_huggingface_catalog_path() -> String {
     "/etc/jarvis/huggingface-catalog.json".to_string()
+}
+
+fn default_ibkr_broker_socket() -> String {
+    "/run/jarvis-ibkr-broker/broker.sock".to_string()
 }
 
 fn default_memecoin_paper_profile_path() -> String {
@@ -812,7 +816,6 @@ impl fmt::Debug for AppConfig {
             .field("environment", &self.environment)
             .field("dev_enrollment", &self.dev_enrollment)
             .field("public_hostname", &self.public_hostname)
-            .field("ibkr_gateway_url", &self.ibkr_gateway_url)
             .field("llm_provider", &self.llm_provider)
             .field("llm_jev_api_key", &redact(&self.llm_jev_api_key))
             .field("llm_jev_model", &self.llm_jev_model)
@@ -924,6 +927,11 @@ impl fmt::Debug for AppConfig {
                 "market_jupiter_api_key",
                 &redact(&self.market_jupiter_api_key),
             )
+            .field(
+                "ibkr_portfolio_sync_enabled",
+                &self.ibkr_portfolio_sync_enabled,
+            )
+            .field("ibkr_broker_socket", &self.ibkr_broker_socket)
             .finish()
     }
 }
@@ -964,7 +972,6 @@ mod tests {
             environment: "test".to_string(),
             dev_enrollment: false,
             public_hostname: String::new(),
-            ibkr_gateway_url: "https://localhost:5000/v1/api".to_string(),
             llm_provider: "anthropic".to_string(),
             llm_api_key: "sk-ant-supersecretkey".to_string(),
             llm_jev_api_key: "jev-supersecret".to_string(),
@@ -1052,6 +1059,8 @@ mod tests {
             market_solana_rpc_a_url: "https://rpc-a.example/?api-key=rpc-supersecret".to_string(),
             market_solana_rpc_b_url: String::new(),
             market_jupiter_api_key: "jupiter-supersecret".to_string(),
+            ibkr_portfolio_sync_enabled: false,
+            ibkr_broker_socket: default_ibkr_broker_socket(),
         };
 
         let rendered = format!("{cfg:?}");
@@ -1093,6 +1102,11 @@ mod tests {
             assert_eq!(cfg.llm_huggingface_route, "groq");
             assert_eq!(cfg.environment, "development"); // default
             assert!(!cfg.memecoin_paper_enabled); // off unless deliberately enabled
+            assert!(!cfg.ibkr_portfolio_sync_enabled);
+            assert_eq!(
+                cfg.ibkr_broker_socket,
+                "/run/jarvis-ibkr-broker/broker.sock"
+            );
             Ok(())
         });
     }
@@ -1110,7 +1124,6 @@ mod tests {
             environment: "production".to_string(),
             dev_enrollment: false,
             public_hostname: String::new(),
-            ibkr_gateway_url: String::new(),
             llm_provider: String::new(),
             llm_api_key: String::new(),
             llm_jev_api_key: String::new(),
@@ -1198,6 +1211,8 @@ mod tests {
             market_solana_rpc_a_url: "https://rpc-a.example/?api-key=rpc-supersecret".to_string(),
             market_solana_rpc_b_url: String::new(),
             market_jupiter_api_key: "jupiter-supersecret".to_string(),
+            ibkr_portfolio_sync_enabled: false,
+            ibkr_broker_socket: default_ibkr_broker_socket(),
         };
         assert!(cfg.bootstrap_enrollment().is_err());
         cfg.bootstrap_allowed_cidrs = "192.168.10.0/24".to_string();

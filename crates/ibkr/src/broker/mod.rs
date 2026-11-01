@@ -133,10 +133,7 @@ impl From<&IbkrError> for BrokerError {
             | IbkrError::NotAuthenticated
             | IbkrError::Credential(_)
             | IbkrError::Handshake(_) => Self::UpstreamAuth,
-            IbkrError::Http(_)
-            | IbkrError::Decode(_)
-            | IbkrError::NoAccount
-            | IbkrError::InvalidBaseUrl => Self::Upstream,
+            IbkrError::Http(_) | IbkrError::Decode(_) => Self::Upstream,
         }
     }
 }
