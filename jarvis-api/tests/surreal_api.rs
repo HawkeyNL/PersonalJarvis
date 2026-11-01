@@ -40,9 +40,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         environment: "test".to_string(),
         require_https: false,
         dev_enrollment: true,
-        ibkr: jarvis_ibkr::IbkrClient::new("https://localhost:5000/v1/api")
-            .ok()
-            .map(Arc::new),
+        ibkr: None,
         llm: jarvis_llm::stub(),
         fast_intent_router: None,
         llm_max_tokens: 256,
@@ -1531,5 +1529,185 @@ async fn memecoin_paper_routes_are_read_only_except_pause() -> Result<(), Box<dy
         .take(0)?;
     assert_eq!(audited.len(), 2);
     assert!(audited.iter().all(Option::is_some));
+    Ok(())
+}
+
+const TRADING_ROUTES: [&str; 3] = [
+    "/v1/trading/portfolio",
+    "/v1/trading/portfolio/history?range=1M",
+    "/v1/trading/instruments/12345/bars?range=1D",
+];
+
+#[tokio::test]
+async fn trading_routes_refuse_missing_or_invalid_sessions() {
+    let app = build_router(state(jarvis_store::Database::init(), None).await);
+    for path in TRADING_ROUTES {
+        for authorization in [None, Some("Bearer not-a-session")] {
+            let mut request = Request::builder().uri(path);
+            if let Some(value) = authorization {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+    }
+}
+
+/// A fake IBKR broker on a temporary socket: one canned reply per request
+/// kind, like `jarvis-ibkr-broker` (JSON line in, JSON line out).
+async fn fake_ibkr_broker(dir: &std::path::Path) -> jarvis_ibkr::broker::BrokerClient {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let socket = dir.join("broker.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (read, mut write) = stream.into_split();
+                let mut line = String::new();
+                let _ = BufReader::new(read).read_line(&mut line).await;
+                let request: Value = serde_json::from_str(&line).unwrap_or_default();
+                let reply = match request["kind"].as_str() {
+                    Some("accounts") => r#"{"ok":[{"accountId":"U1234567","currency":"EUR"}]}"#,
+                    Some("positions") => {
+                        r#"{"ok":[{"conid":12345,"contractDesc":"VANGUARD FTSE ALL-WORLD","ticker":"VWCE","assetClass":"STK","currency":"EUR","position":"10","mktPrice":"120.5","mktValue":"1205","avgPrice":"101.25"}]}"#
+                    }
+                    Some("ledger") => {
+                        r#"{"ok":{"BASE":{"netliquidationvalue":"2205.5","cashbalance":"1000.5"}}}"#
+                    }
+                    Some("history") if request["period"] == "1d" && request["bar"] == "5min" => {
+                        r#"{"ok":{"data":[{"t":1730419200000,"o":"120","h":"121.5","l":"119","c":"121","v":"1500"}]}}"#
+                    }
+                    _ => r#"{"error":{"code":"invalid_request"}}"#,
+                };
+                let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
+            });
+        }
+    });
+    // SAFETY: geteuid has no preconditions.
+    jarvis_ibkr::broker::BrokerClient::new(socket, unsafe { libc::geteuid() })
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn trading_routes_serve_the_synced_portfolio_read_only(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let dir = tempfile::tempdir()?;
+    let client = fake_ibkr_broker(dir.path()).await;
+
+    // Off by default: every route answers "not configured".
+    let off = build_router(state(db.clone(), None).await);
+    let (token, _) = enroll_login(&off, &SigningKey::from_bytes(&rand::random())).await;
+    let call = |app: &axum::Router, method: &str, path: &str| {
+        app.clone().oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+    for path in TRADING_ROUTES {
+        let response = call(&off, "GET", path).await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(
+            json_body(response).await["error"],
+            "IBKR portfolio sync is not configured"
+        );
+    }
+
+    let mut on_state = state(db.clone(), None).await;
+    on_state.ibkr = Some(Arc::new(client.clone()));
+    let on = build_router(on_state);
+    // Enabled, before the first sync: no data yet, still "not connected".
+    for path in &TRADING_ROUTES[..2] {
+        let response = call(&on, "GET", path).await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+    }
+
+    let portfolio = jarvis_api::ibkr::fetch(&client).await?;
+    jarvis_api::ibkr::store::write_snapshot(&db, &portfolio).await?;
+
+    let body = json_body(call(&on, "GET", "/v1/trading/portfolio").await?).await;
+    assert_eq!(body["source"], "IBKR");
+    assert!(body["as_of"].is_string() && body.get("delay_minutes").is_none());
+    assert_eq!(body["base_currency"], "EUR");
+    assert_eq!(body["net_liquidation"], "2205.5");
+    assert_eq!(body["cash"], "1000.5");
+    assert_eq!(body["positions"][0]["conid"], 12345);
+    assert_eq!(body["positions"][0]["symbol"], "VWCE");
+    assert_eq!(body["positions"][0]["market_value"], "1205");
+    assert_eq!(body["positions"][0]["weight_pct"], "54.64");
+
+    let body = json_body(call(&on, "GET", "/v1/trading/portfolio/history?range=ALL").await?).await;
+    assert_eq!(body["range"], "ALL");
+    assert_eq!(body["points"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["points"][0]["value"], "2205.5");
+
+    let body = json_body(call(&on, "GET", TRADING_ROUTES[2]).await?).await;
+    assert_eq!(body["conid"], 12345);
+    assert_eq!(body["symbol"], "VWCE");
+    assert_eq!(body["currency"], "EUR");
+    assert_eq!(body["range"], "1D");
+    assert_eq!(body["bars"][0]["c"], "121");
+
+    for (path, status) in [
+        ("/v1/trading/portfolio/history", StatusCode::BAD_REQUEST),
+        (
+            "/v1/trading/portfolio/history?range=2Y",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/trading/instruments/0/bars?range=1D",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/trading/instruments/12345/bars?range=10Y",
+            StatusCode::BAD_REQUEST,
+        ),
+        // Only held instruments: Core is no general market data proxy.
+        (
+            "/v1/trading/instruments/999/bars?range=1D",
+            StatusCode::NOT_FOUND,
+        ),
+        // The fake broker refuses this period: the upstream error is a 503.
+        (
+            "/v1/trading/instruments/12345/bars?range=1W",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        assert_eq!(call(&on, "GET", path).await?.status(), status, "{path}");
+    }
+    // Read-only: no write method on any trading route, and the legacy
+    // gateway routes are gone.
+    for path in TRADING_ROUTES {
+        for method in ["POST", "PUT", "DELETE"] {
+            assert_eq!(
+                call(&on, method, path).await?.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path}"
+            );
+        }
+    }
+    for path in ["/v1/broker/ibkr/status", "/v1/broker/ibkr/positions"] {
+        assert_eq!(
+            call(&on, "GET", path).await?.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
     Ok(())
 }
