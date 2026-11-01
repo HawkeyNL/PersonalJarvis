@@ -99,6 +99,8 @@ pub(crate) async fn overview(_authed: Authed, State(state): State<AppState>) -> 
                     "cost_usd": money(p.cost_usd),
                     "value_usd": p.value_usd.map(money),
                     "opened_at": ts(p.opened_at),
+                    "exit_failures": p.exit_failures,
+                    "stuck": p.stuck,
                 })
             })
             .collect::<Vec<_>>()

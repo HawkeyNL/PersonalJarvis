@@ -667,6 +667,7 @@ async fn main() -> anyhow::Result<()> {
     if config.memecoin_paper_enabled {
         if let Err(reason) = start_memecoin_paper(&config, &state).await {
             tracing::error!(%reason, "memecoin paper trader disabled");
+            state.memecoin.note_start_failure();
         }
     }
     let _local_device_admin = if state.environment == "production" {

@@ -15,7 +15,9 @@ running.
 1. Write the paper profile (below) to `/etc/jarvis/memecoin-paper.json`,
    owned by root, with the group of `/etc/jarvis` and mode `0640`. Production
    refuses any other owner, mode or a symlink. No API writes this file.
-2. Put the market-data settings in `/etc/jarvis/core.env` (root:jarvis 0640):
+2. Put the market-data secrets in `/etc/jarvis/secrets/market-data.env`, with
+   the same owner and mode as the other provider files there. The Core unit
+   loads it as an optional `EnvironmentFile`, like the LLM provider keys:
    - `JARVIS_MARKET_SOLANA_RPC_A_URL` and `JARVIS_MARKET_SOLANA_RPC_B_URL`:
      two HTTPS Solana RPC endpoints on **different** hosts from the
      market-data allowlist (`api.mainnet-beta.solana.com`,
@@ -24,13 +26,13 @@ running.
      Core redacts them in its logs.
    - `JARVIS_MARKET_JUPITER_API_KEY` (optional): without it, quotes are
      paced to one per 2.1 s.
-   - `JARVIS_MEMECOIN_PAPER_ENABLED=true`.
-3. Restart Core. The log shows `memecoin PAPER trader running` or the reason
-   it stayed off.
+3. Set `JARVIS_MEMECOIN_PAPER_ENABLED=true` in `/etc/jarvis/core.env` and
+   restart Core. The log shows `memecoin PAPER trader running` or the reason
+   it stayed off; the overview then reports `running` or a `last_error`.
 
-`jarvis-credentials` does not manage these three secrets yet; adding them as
-providers (`solana-rpc-a`, `solana-rpc-b`, `jupiter`, read from the TTY with a
-read-only probe and their own `EnvironmentFile`) is a follow-up.
+`jarvis-credentials` does not manage `market-data.env` yet; a provider that
+reads these values from the TTY and probes them read-only is a follow-up.
+Until then the owner writes the file by hand.
 
 ## Paper profile
 
@@ -50,7 +52,7 @@ no values on purpose.
 - `strategy`: `version` and the `StrategyParams` fields of `jarvis-onchain`
   (`*_secs` for durations); validated against the code-fixed bounds.
 - `costs`: `dex_fee_bps`, `network_fee_usd`, `priority_fee_usd`,
-  `failure_rate` (fraction).
+  `failure_rate` (fraction, below 1).
 
 Everything except `watchlist` and `goal_multiple` is recorded with the strategy
 version. Changing any of it without raising `strategy.version` keeps the
@@ -60,19 +62,28 @@ positions of an older version are still exited.
 
 ## What a tick does
 
-Every 60 s: reload the paper ledger from the database and check it replays
-exactly; value open positions and simulate exits (also while paused); unless
-paused, observe up to 5 watchlist mints (each at most every 15 minutes,
-through the per-provider pacing of `jarvis-market-data`), run the filter and
-the strategy, and simulate entries. A write failure stops the tick before
-anything is simulated on it. If the stored ledger no longer replays exactly
-(or is over 100 000 rows, or is dated more than five minutes ahead of the
-clock), every tick stops, exits included, until the owner investigates; the
-overview shows the reason as `last_error` and the log reports it once. If the
-pause state cannot be read, that tick makes no entries. A candidate row is
-written only when a mint's
-verdict changes. Candidate rows and the hourly gate snapshots are pruned after
-30 days; trips and costs are kept for the paper gate.
+Every 60 s: value held positions and simulate exits (also while paused);
+then, if the stored ledger replays exactly and the trader is not paused,
+observe up to 5 watchlist mints (each at most every 15 minutes, through the
+per-provider pacing of `jarvis-market-data`), run the filter and the
+strategy, and simulate entries; finally report from the stored ledger. A
+write failure stops the tick before anything is simulated on it.
+
+- An exit that fails or cannot be priced is retried on later ticks; after 10
+  such attempts the position is marked `stuck` (shown in the overview), is
+  no longer retried and keeps its slot. Failed-attempt fees are summed per
+  day, so they cannot grow the ledger without bound.
+- If the stored ledger no longer replays exactly or exceeds 100 000 rows,
+  entries and the report stop until the owner investigates; exits continue.
+  The overview shows a fixed reason as `last_error` (details are in the
+  log, reported once).
+- A ledger dated more than five minutes ahead of the clock stops the whole
+  tick, so events are never stamped into the future.
+- If the pause state cannot be read, that tick makes no entries.
+
+A candidate row is written only when a mint's verdict changes. Candidate rows
+and the hourly gate snapshots are pruned after 30 days; trips and costs are
+kept for the paper gate.
 
 **Known limit:** market data cannot yet tell whether a pool's LP is burned or
 locked, so every live candidate is rejected with `lp_not_secured` until LP

@@ -48,6 +48,8 @@ pub const MAX_ENTRY_CANDIDATES_PER_TICK: usize = 5;
 /// A mint is observed again for an entry at most this often.
 const OBSERVE_COOLDOWN: Duration = Duration::minutes(15);
 const GATE_SNAPSHOT_EVERY: Duration = Duration::hours(1);
+/// Failed or unpriceable exits before a position is marked stuck.
+pub const EXIT_FAILURE_CAP: u32 = 10;
 /// A ledger dated further ahead than this means the clock jumped back or
 /// was ahead before: stop instead of stamping events into the future, which
 /// would stretch the paper gate's duration.
@@ -65,7 +67,7 @@ pub struct PaperHandle {
     paused: AtomicBool,
     view: RwLock<Option<PaperView>>,
     /// Why the last tick stopped, if it did. Cleared by a good tick.
-    last_error: RwLock<Option<String>>,
+    last_error: RwLock<Option<&'static str>>,
 }
 
 impl PaperHandle {
@@ -96,13 +98,19 @@ impl PaperHandle {
         self.view.read().ok().and_then(|view| view.clone())
     }
 
-    pub fn last_error(&self) -> Option<String> {
-        self.last_error.read().ok().and_then(|error| error.clone())
+    /// A fixed message, never error detail (that goes to the log).
+    pub fn last_error(&self) -> Option<&'static str> {
+        self.last_error.read().ok().and_then(|error| *error)
+    }
+
+    /// Shown in the overview when the trader is enabled but did not start.
+    pub fn note_start_failure(&self) {
+        self.note_outcome(Some("paper trader did not start; see the Core log"));
     }
 
     /// Record a tick outcome; `true` when it differs from the previous one,
     /// so a persistent failure is logged once, not every minute.
-    fn note_outcome(&self, error: Option<String>) -> bool {
+    fn note_outcome(&self, error: Option<&'static str>) -> bool {
         let Ok(mut slot) = self.last_error.write() else {
             return true;
         };
@@ -144,6 +152,9 @@ pub struct OpenView {
     /// Executable value along the pool curve; `None` without a fresh mark.
     pub value_usd: Option<Decimal>,
     pub opened_at: OffsetDateTime,
+    pub exit_failures: u32,
+    /// Exits stopped after [`EXIT_FAILURE_CAP`] failed attempts.
+    pub stuck: bool,
 }
 
 /// Read-only market data. The live source wraps the market-data clients;
@@ -365,14 +376,22 @@ fn roll() -> Decimal {
     Decimal::new(rand::thread_rng().gen_range(0..1_000_000), 6)
 }
 
-/// One call with a timeout; a timeout is an error.
+/// One call with a timeout. The store error is logged here; callers and the
+/// overview only ever see a fixed message.
 async fn bounded<T>(
+    what: &'static str,
     future: impl std::future::Future<Output = Result<T, store::MemecoinStoreError>>,
-) -> Result<T, String> {
+) -> Result<T, &'static str> {
     match tokio::time::timeout(DB_TIMEOUT, future).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(_) => Err("database call timed out".into()),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, what, "memecoin paper database call failed");
+            Err("database call failed")
+        }
+        Err(_) => {
+            tracing::warn!(what, "memecoin paper database call timed out");
+            Err("database call timed out")
+        }
     }
 }
 
@@ -385,6 +404,7 @@ pub struct TickStats {
     pub exits: usize,
     pub failed_attempts: usize,
     pub unpriced_exits: usize,
+    pub stuck: usize,
     pub provider_errors: usize,
 }
 
@@ -398,6 +418,30 @@ pub struct PaperTask {
     last_gate_at: Option<OffsetDateTime>,
 }
 
+/// The whole stored ledger for the current strategy version.
+async fn load_history(db: &Database, version: u32) -> Result<Ledger, &'static str> {
+    let trips = bounded("trips", store::load_trips(db)).await?;
+    let costs = bounded("costs", store::load_costs(db)).await?;
+    // Every stored result must recompute, whatever its version.
+    replay(
+        &trips.iter().collect::<Vec<_>>(),
+        &costs.iter().collect::<Vec<_>>(),
+    )
+    .map_err(|error| {
+        tracing::error!(?error, "memecoin paper ledger does not replay");
+        "paper ledger does not replay"
+    })?;
+    let ours: Vec<&Trip> = trips
+        .iter()
+        .filter(|t| t.strategy_version == version)
+        .collect();
+    let our_costs: Vec<&Cost> = costs
+        .iter()
+        .filter(|c| c.strategy_version == version)
+        .collect();
+    replay(&ours, &our_costs).map_err(|_| "paper ledger does not replay")
+}
+
 impl PaperTask {
     pub fn new(profile: PaperProfile, handle: Arc<PaperHandle>) -> Self {
         Self {
@@ -409,30 +453,32 @@ impl PaperTask {
     }
 
     /// One tick. `Err` stops the tick; nothing is simulated without its
-    /// write having succeeded first.
+    /// write having succeeded first. Exits need only the held positions, so
+    /// a problem with the stored history stops entries and the report, never
+    /// exits.
     pub async fn tick(
         &mut self,
         db: &Database,
         source: &dyn MarketSource,
         roll: &mut (dyn FnMut() -> Decimal + Send),
-    ) -> Result<TickStats, String> {
+    ) -> Result<TickStats, &'static str> {
         let mut stats = TickStats::default();
-        let mut trips = bounded(store::load_trips(db)).await?;
-        let mut costs = bounded(store::load_costs(db)).await?;
-        replay(
-            &trips.iter().collect::<Vec<_>>(),
-            &costs.iter().collect::<Vec<_>>(),
-        )
-        .map_err(|error| format!("paper ledger does not replay: {error:?}"))?;
+        let mut held = bounded("held trips", store::load_held_trips(db)).await?;
+        let latest_close = bounded("latest trip", store::recent_closed_trips(db, 1)).await?;
+        let costs = bounded("costs", store::load_costs(db)).await?;
         // Events are strictly ordered by our own clock, even if it steps back.
-        let mut last = trips
+        let mut last = held
             .iter()
-            .flat_map(|t| [Some(t.opened_at), t.close.as_ref().map(|c| c.closed_at)])
-            .flatten()
+            .map(|t| t.opened_at)
+            .chain(
+                latest_close
+                    .iter()
+                    .filter_map(|t| t.close.as_ref().map(|c| c.closed_at)),
+            )
             .chain(costs.iter().map(|c| c.at))
             .max();
         if last.is_some_and(|last| last > OffsetDateTime::now_utc() + CLOCK_TOLERANCE) {
-            return Err("paper ledger is dated ahead of the clock".into());
+            return Err("paper ledger is dated ahead of the clock");
         }
         let mut stamp = move || {
             let at = OffsetDateTime::now_utc()
@@ -440,34 +486,28 @@ impl PaperTask {
             last = Some(at);
             at
         };
+        let p = &self.profile;
+        let version = p.strategy.version;
+        let history = load_history(db, version).await;
         // A stored pause latches; a failed read pauses this tick only.
-        let read_failed = match bounded(store::control(db)).await {
+        let read_failed = match bounded("pause state", store::control(db)).await {
             Ok(control) => {
                 if control.paused {
                     self.handle.pause_now();
                 }
                 false
             }
-            Err(error) => {
-                tracing::warn!(%error, "memecoin paper: pause state unreadable; no entries this tick");
-                true
-            }
+            Err(_) => true,
         };
         let paused = || read_failed || self.handle.paused();
 
-        let p = &self.profile;
-        let version = p.strategy.version;
-        let held: BTreeSet<String> = trips
-            .iter()
-            .filter(|t| t.close.is_none())
-            .map(|t| t.mint.clone())
-            .collect();
-        let mut mints: Vec<&str> = held.iter().map(String::as_str).collect();
+        let held_mints: BTreeSet<String> = held.iter().map(|t| t.mint.clone()).collect();
+        let mut mints: Vec<&str> = held_mints.iter().map(String::as_str).collect();
         mints.extend(
             p.watchlist
                 .iter()
                 .map(String::as_str)
-                .filter(|m| !held.contains(*m)),
+                .filter(|m| !held_mints.contains(*m)),
         );
         let pairs = match source.pairs(&mints).await {
             Ok(pairs) => pairs,
@@ -493,11 +533,9 @@ impl PaperTask {
             }
         }
 
-        // Exits first, for every open trip and also while paused.
-        for trip in trips.iter_mut() {
-            if trip.close.is_some() {
-                continue;
-            }
+        // Exits first, for every held position and also while paused. A
+        // position whose exit failed EXIT_FAILURE_CAP times is stuck.
+        for trip in held.iter_mut().filter(|t| !t.stuck) {
             let Some(snapshot) =
                 main_pair(&pairs, &trip.mint).and_then(|pair| pair_snapshot(pair, now))
             else {
@@ -538,39 +576,48 @@ impl PaperTask {
                         net_pnl_usd,
                         exit_reason: exit_reason(reason),
                     };
-                    if !bounded(store::close_trip(db, &trip.id, &close)).await? {
-                        return Err("paper trip was not open".into());
+                    if !bounded("close trip", store::close_trip(db, &trip.id, &close)).await? {
+                        return Err("paper trip was not open");
                     }
                     trip.close = Some(close);
                     stats.exits += 1;
                 }
-                Some(Fill::Failed { fees_usd }) => {
-                    let cost = Cost {
-                        id: uuid::Uuid::now_v7().to_string(),
-                        kind: CostKind::FailedTx,
-                        usd: fees_usd,
-                        at: stamp(),
-                        mint: Some(trip.mint.clone()),
-                        strategy_version: version,
-                    };
-                    bounded(store::insert_cost(db, &cost)).await?;
-                    costs.push(cost);
-                    stats.failed_attempts += 1;
-                }
-                None => {
-                    stats.unpriced_exits += 1;
-                    tracing::warn!(mint = %trip.mint, "memecoin paper exit could not be priced");
+                failed => {
+                    // The cost first: a lost counter only means one more try.
+                    if let Some(Fill::Failed { fees_usd }) = failed {
+                        let cost = store::add_cost(
+                            db,
+                            CostKind::FailedTx,
+                            trip.strategy_version,
+                            fees_usd,
+                            stamp(),
+                        );
+                        bounded("add cost", cost).await?;
+                        stats.failed_attempts += 1;
+                    } else {
+                        stats.unpriced_exits += 1;
+                    }
+                    let failure = store::record_exit_failure(db, &trip.id, EXIT_FAILURE_CAP);
+                    let stuck = bounded("exit failure", failure)
+                        .await?
+                        .ok_or("paper trip was not open")?;
+                    trip.exit_failures += 1;
+                    if stuck {
+                        trip.stuck = true;
+                        stats.stuck += 1;
+                        tracing::warn!(mint = %trip.mint, "memecoin paper position stuck; exits stopped");
+                    }
                 }
             }
         }
 
-        // Entries: a few watchlist mints not held at the start of the tick,
-        // least recently observed first.
-        let mut open = trips.iter().filter(|t| t.close.is_none()).count();
+        // Entries need an intact history: a few watchlist mints not held at
+        // the start of the tick, least recently observed first.
+        let mut open = held.iter().filter(|t| t.close.is_none()).count();
         let mut due: Vec<&String> = p
             .watchlist
             .iter()
-            .filter(|m| !held.contains(*m))
+            .filter(|m| !held_mints.contains(*m))
             .filter(|m| {
                 self.seen
                     .get(*m)
@@ -579,6 +626,9 @@ impl PaperTask {
             .collect();
         due.sort_by_key(|m| self.seen.get(*m).map(|(_, at)| *at));
         due.truncate(MAX_ENTRY_CANDIDATES_PER_TICK);
+        if history.is_err() {
+            due.clear();
+        }
         let deny_list = BTreeSet::new();
         for mint in due {
             if paused() || open >= p.max_open_positions {
@@ -617,9 +667,7 @@ impl PaperTask {
                     liquidity_usd: observed.as_ref().map(|s| s.liquidity_usd),
                 };
                 // Best effort: a lost decision row must not stop trading.
-                if let Err(error) = bounded(store::insert_candidate(db, &candidate)).await {
-                    tracing::warn!(%error, "memecoin paper candidate not recorded");
-                }
+                let _ = bounded("candidate", store::insert_candidate(db, &candidate)).await;
             }
             let Some(snapshot) = observed.filter(|_| reason.is_none()) else {
                 continue;
@@ -659,56 +707,43 @@ impl PaperTask {
                         cost_usd: size.checked_add(fees_usd).ok_or("paper entry overflow")?,
                         entry_liquidity_usd: snapshot.liquidity_usd,
                         opened_at: stamp(),
+                        exit_failures: 0,
+                        stuck: false,
                         close: None,
                     };
-                    bounded(store::open_trip(db, &trip)).await?;
-                    trips.push(trip);
+                    bounded("open trip", store::open_trip(db, &trip)).await?;
+                    held.push(trip);
                     open += 1;
                     stats.entries += 1;
                 }
                 Some(Fill::Failed { fees_usd }) => {
-                    let cost = Cost {
-                        id: uuid::Uuid::now_v7().to_string(),
-                        kind: CostKind::FailedTx,
-                        usd: fees_usd,
-                        at: stamp(),
-                        mint: Some(mint.clone()),
-                        strategy_version: version,
-                    };
-                    bounded(store::insert_cost(db, &cost)).await?;
-                    costs.push(cost);
+                    let cost = store::add_cost(db, CostKind::FailedTx, version, fees_usd, stamp());
+                    bounded("add cost", cost).await?;
                     stats.failed_attempts += 1;
                 }
                 None => {}
             }
         }
 
-        // Report on the current strategy version only.
-        let ours: Vec<&Trip> = trips
-            .iter()
-            .filter(|t| t.strategy_version == version)
-            .collect();
-        let our_costs: Vec<&Cost> = costs
-            .iter()
-            .filter(|c| c.strategy_version == version)
-            .collect();
-        let ledger =
-            replay(&ours, &our_costs).map_err(|error| format!("paper report failed: {error:?}"))?;
+        // Report on the current strategy version, from the stored ledger.
+        history?;
+        // ponytail: reloads the whole ledger every tick; keep it in memory if it grows large.
+        let ledger = load_history(db, version).await?;
         let rules = GateRules {
             min_closed_trades: gate::MIN_CLOSED_TRADES,
             min_duration: gate::MIN_DURATION,
             min_trading_days: gate::MIN_TRADING_DAYS,
         };
         let report = gate::evaluate(&ledger, &marks, &p.costs, &rules)
-            .map_err(|error| format!("paper gate failed: {error}"))?;
+            .map_err(|_| "paper gate cannot be computed")?;
         let pnl = ledger
             .pnl(&marks, &p.costs)
-            .map_err(|error| format!("paper pnl failed: {error}"))?;
+            .map_err(|_| "paper result cannot be computed")?;
         let equity_usd = p
             .stake_usd
             .checked_add(pnl.net_usd)
             .ok_or("paper equity overflow")?;
-        let open_view = trips
+        let open_view = held
             .iter()
             .filter(|t| t.close.is_none())
             .map(|t| OpenView {
@@ -720,6 +755,8 @@ impl PaperTask {
                     paper::sell_value(t.tokens, m.price_usd, m.liquidity_usd, &p.costs)
                 }),
                 opened_at: t.opened_at,
+                exit_failures: t.exit_failures,
+                stuck: t.stuck,
             })
             .collect();
         let view = PaperView {
@@ -755,9 +792,11 @@ impl PaperTask {
                 net_result_usd: report.net_result_usd,
                 net_expectancy_usd: report.net_expectancy_usd,
             };
-            match bounded(store::insert_gate_snapshot(db, &snapshot)).await {
-                Ok(()) => self.last_gate_at = Some(now),
-                Err(error) => tracing::warn!(%error, "memecoin paper gate snapshot not recorded"),
+            if bounded("gate snapshot", store::insert_gate_snapshot(db, &snapshot))
+                .await
+                .is_ok()
+            {
+                self.last_gate_at = Some(now);
             }
         }
         Ok(stats)
@@ -784,18 +823,19 @@ pub async fn start(
         market,
         resume_paused_at,
     } = config;
-    bounded(store::register_strategy_version(
-        &db,
-        profile.strategy.version,
-        &profile.versioned_params,
-    ))
-    .await
-    .map_err(|error| format!("strategy version {}: {error}", profile.strategy.version))?;
+    let register =
+        store::register_strategy_version(&db, profile.strategy.version, &profile.versioned_params);
+    bounded("strategy version", register).await.map_err(|error| {
+        format!(
+            "strategy version {} cannot be recorded ({error}); a changed profile needs a new version",
+            profile.strategy.version
+        )
+    })?;
     if let Some(paused_at) = resume_paused_at {
-        match bounded(store::resume(&db, paused_at)).await {
+        match bounded("resume", store::resume(&db, paused_at)).await {
             Ok(true) => tracing::warn!(%paused_at, "memecoin paper pause cleared by configuration"),
             Ok(false) => tracing::info!("memecoin paper resume setting matches no current pause"),
-            Err(error) => tracing::warn!(%error, "memecoin paper resume failed"),
+            Err(_) => tracing::warn!("memecoin paper resume failed"),
         }
     }
     let version = profile.strategy.version;
@@ -815,10 +855,10 @@ pub async fn start(
                     .await;
             let error = match &outcome {
                 Ok(Ok(_)) => None,
-                Ok(Err(error)) => Some(error.clone()),
-                Err(_) => Some("tick timed out".to_string()),
+                Ok(Err(error)) => Some(*error),
+                Err(_) => Some("tick timed out"),
             };
-            let changed = handle.note_outcome(error.clone());
+            let changed = handle.note_outcome(error);
             match (outcome, error) {
                 (Ok(Ok(stats)), _) => tracing::info!(
                     observed = stats.observed,
@@ -827,6 +867,7 @@ pub async fn start(
                     exits = stats.exits,
                     failed_attempts = stats.failed_attempts,
                     unpriced_exits = stats.unpriced_exits,
+                    stuck = stats.stuck,
                     provider_errors = stats.provider_errors,
                     "memecoin paper tick"
                 ),
@@ -879,6 +920,8 @@ mod tests {
             cost_usd: d("25"),
             entry_liquidity_usd: d("100000"),
             opened_at: t0 + Duration::seconds(opened),
+            exit_failures: 0,
+            stuck: false,
             close: close.map(|(at, usd_out, net)| TripClose {
                 closed_at: t0 + Duration::seconds(at),
                 usd_out: d(usd_out),
@@ -900,11 +943,9 @@ mod tests {
         assert_eq!(ledger.closed_trades()[0].net_pnl_usd, d("5"));
         assert_eq!(ledger.lots().len(), 1);
         let cost = Cost {
-            id: "c".into(),
             kind: CostKind::FailedTx,
             usd: d("0.5"),
             at: first.opened_at,
-            mint: None,
             strategy_version: 3,
         };
         let ledger = replay(&[&first], &[&cost]).unwrap();
@@ -948,6 +989,8 @@ mod tests {
     /// unsecured pool (as every live snapshot has today).
     struct FixtureMarket {
         price_a: Mutex<Decimal>,
+        /// Paused by the owner while the first candidate is observed.
+        pause_on_observe: Option<Arc<PaperHandle>>,
     }
 
     #[async_trait]
@@ -966,6 +1009,9 @@ mod tests {
             _sell_usd: Decimal,
             now: OffsetDateTime,
         ) -> Result<TokenSnapshot, MarketDataError> {
+            if let Some(handle) = &self.pause_on_observe {
+                handle.pause_now();
+            }
             let mut s = pair_snapshot(pair, now).ok_or(MarketDataError::NotFound("pair"))?;
             s.mint_authority_revoked = true;
             s.freeze_authority_revoked = true;
@@ -999,6 +1045,7 @@ mod tests {
         let mut task = PaperTask::new(fixture(), handle.clone());
         let market = FixtureMarket {
             price_a: Mutex::new(d("0.001")),
+            pause_on_observe: None,
         };
         // Rolls at or above the 10% failure rate fill; a roll of 0 fails.
         let mut no_failure = || Decimal::new(999_999, 6);
@@ -1050,6 +1097,35 @@ mod tests {
         assert!(handle.paused());
         assert_eq!((stats.observed, stats.entries), (0, 0));
         assert_eq!(store::load_trips(&db).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn a_pause_during_a_tick_stops_the_next_buy() -> Result<(), Box<dyn std::error::Error>> {
+        use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
+        let db = Surreal::new::<Ws>(std::env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+        db.signin(Root {
+            username: &std::env::var("JARVIS_SURREAL_TEST_USER")?,
+            password: &std::env::var("JARVIS_SURREAL_TEST_PASS")?,
+        })
+        .await?;
+        db.use_ns(format!("memecoin_pause_{}", uuid::Uuid::now_v7().simple()))
+            .use_db("core")
+            .await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+        let handle = Arc::new(PaperHandle::new(true));
+        let mut task = PaperTask::new(fixture(), handle.clone());
+        // The owner pauses while A, which would be bought, is observed.
+        let market = FixtureMarket {
+            price_a: Mutex::new(d("0.001")),
+            pause_on_observe: Some(handle.clone()),
+        };
+        let stats = task
+            .tick(&db, &market, &mut || Decimal::new(999_999, 6))
+            .await?;
+        assert_eq!((stats.observed, stats.accepted, stats.entries), (1, 1, 0));
+        assert!(store::load_trips(&db).await?.is_empty());
         Ok(())
     }
 }

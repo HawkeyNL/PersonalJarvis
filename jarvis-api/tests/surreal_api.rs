@@ -1478,6 +1478,7 @@ async fn memecoin_paper_routes_are_read_only_except_pause() -> Result<(), Box<dy
         .use_db("core")
         .await?;
     jarvis_store::apply_baseline_schema(&db).await?;
+    let audit_db = db.clone();
     let app = build_router(state(db, None).await);
     let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
     let call = |method: &'static str, path: &'static str| {
@@ -1522,5 +1523,13 @@ async fn memecoin_paper_routes_are_read_only_except_pause() -> Result<(), Box<dy
     let overview = json_body(call("GET", "/v1/trading/meme/overview").await?).await;
     assert_eq!(overview["paused"], true);
     assert!(overview["paused_at"].is_string());
+    // Each pause is in the security audit, with the device that made it.
+    let audited: Vec<Option<String>> = audit_db
+        .query("SELECT VALUE device_id FROM security_audit WHERE event = 'memecoin.paper.pause' AND outcome = 'paused'")
+        .await?
+        .check()?
+        .take(0)?;
+    assert_eq!(audited.len(), 2);
+    assert!(audited.iter().all(Option::is_some));
     Ok(())
 }

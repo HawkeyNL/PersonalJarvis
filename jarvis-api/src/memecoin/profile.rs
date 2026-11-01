@@ -235,7 +235,8 @@ impl PaperProfile {
             priority_fee_usd: v.costs.priority_fee_usd,
             failure_rate: v.costs.failure_rate,
         };
-        if !costs.is_valid() {
+        // A certain failure would make every exit fail until it is stuck.
+        if !costs.is_valid() || costs.failure_rate >= Decimal::ONE {
             return Err("cost model is out of range".into());
         }
         let versioned_params = serde_json::to_string(&Versioned {
@@ -390,7 +391,7 @@ pub(crate) mod tests {
             ("/max_position_usd", serde_json::json!("100")),
             ("/goal_multiple", serde_json::json!("1")),
             ("/strategy/stop_loss_bps", serde_json::json!(1)),
-            ("/costs/failure_rate", serde_json::json!("1.5")),
+            ("/costs/failure_rate", serde_json::json!("1")),
         ];
         for (pointer, value) in cases {
             let mut json = fixture_json();
