@@ -58,6 +58,16 @@ pub enum ProtocolError {
     InvalidAgentApproval,
     #[error("invalid challenge nonce")]
     InvalidChallenge,
+    #[error("pairing fingerprint does not match the candidate key")]
+    PairingFingerprintMismatch,
+}
+
+/// The pairing fingerprint of a raw 32-byte Ed25519 public key: lowercase hex
+/// SHA-256, as `jarvis devices` prints it. A candidate shows it for its own
+/// key; an approver shows [`PairingRequestItem::verified_fingerprint`].
+pub fn key_fingerprint(public_key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(public_key))
 }
 
 /// Canonical v1 bytes a device signs to log in with one challenge. The domain
@@ -227,11 +237,49 @@ pub struct PairingRequestItem {
     pub id: Uuid,
     pub device_name: String,
     pub platform: String,
+    /// Legacy 16-hex prefix of `fingerprint_full`.
     pub fingerprint: String,
     pub nonce: String,
     pub candidate_public_key: String,
     pub created_at: i64,
     pub expires_at: i64,
+    /// Lowercase hex SHA-256 of the candidate key; absent from older Cores.
+    /// Display [`Self::verified_fingerprint`], never this field.
+    #[serde(default)]
+    pub fingerprint_full: Option<String>,
+    // Unauthenticated hints from the candidate; null when unknown.
+    #[serde(default)]
+    pub ip: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub app_version: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl PairingRequestItem {
+    /// The fingerprint an approver must display: computed locally from
+    /// `candidate_public_key`, the key [`pairing_approval_message`] binds, so
+    /// the owner compares exactly what the signature approves. Apps must never
+    /// show the server's `fingerprint` or `fingerprint_full` instead; either
+    /// one disagreeing with the key is an error, not a display choice.
+    pub fn verified_fingerprint(&self) -> Result<String, ProtocolError> {
+        let key = hex::decode(&self.candidate_public_key)
+            .ok()
+            .filter(|key| key.len() == 32)
+            .ok_or(ProtocolError::InvalidPairingApproval)?;
+        let fingerprint = key_fingerprint(&key);
+        if fingerprint.get(..16) != Some(self.fingerprint.as_str())
+            || self
+                .fingerprint_full
+                .as_deref()
+                .is_some_and(|full| full != fingerprint)
+        {
+            return Err(ProtocolError::PairingFingerprintMismatch);
+        }
+        Ok(fingerprint)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +442,54 @@ mod tests {
             unlock_code(first, &nonce[..31]),
             Err(ProtocolError::InvalidChallenge)
         );
+    }
+
+    #[test]
+    fn approver_fingerprint_is_computed_from_the_signed_key() {
+        let key = [7_u8; 32];
+        let full = key_fingerprint(&key);
+        assert!(is_hex_of_len(&full, 64) && full == full.to_lowercase());
+        let item = |fingerprint: &str, full: Option<&str>, key: &str| PairingRequestItem {
+            id: Uuid::nil(),
+            device_name: "candidate".into(),
+            platform: "ios".into(),
+            fingerprint: fingerprint.into(),
+            nonce: "00".repeat(32),
+            candidate_public_key: key.into(),
+            created_at: 0,
+            expires_at: 0,
+            fingerprint_full: full.map(str::to_owned),
+            ip: None,
+            user_agent: None,
+            app_version: None,
+            model: None,
+        };
+        let key_hex = hex::encode(key);
+        assert_eq!(
+            item(&full[..16], Some(&full), &key_hex).verified_fingerprint(),
+            Ok(full.clone())
+        );
+        // An older Core sends no full fingerprint; the prefix still must match.
+        assert_eq!(
+            item(&full[..16], None, &key_hex).verified_fingerprint(),
+            Ok(full.clone())
+        );
+        let other = key_fingerprint(&[8; 32]);
+        for (prefix, server_full) in [
+            (&other[..16], Some(full.as_str())),
+            (&full[..16], Some(other.as_str())),
+        ] {
+            assert_eq!(
+                item(prefix, server_full, &key_hex).verified_fingerprint(),
+                Err(ProtocolError::PairingFingerprintMismatch)
+            );
+        }
+        for bad_key in ["", "zz", &"07".repeat(31)] {
+            assert_eq!(
+                item(&full[..16], Some(&full), bad_key).verified_fingerprint(),
+                Err(ProtocolError::InvalidPairingApproval)
+            );
+        }
     }
 
     #[test]

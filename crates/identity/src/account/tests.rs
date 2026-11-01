@@ -597,6 +597,7 @@ async fn password_recovery_needs_signature_and_root_confirmation(
         "candidate",
         Platform::Android,
         &candidate.verifying_key().to_bytes(),
+        &crate::PairingDetails::default(),
     )
     .await?;
     let (unlock, _) = create_unlock_request(&db, owner.id, desktop.id).await?;

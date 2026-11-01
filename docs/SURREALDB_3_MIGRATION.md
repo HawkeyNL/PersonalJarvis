@@ -432,7 +432,8 @@ tagged otherwise.
      `INFO FOR TABLE`.
    - Compare names and kinds after normalising the output; the format
      differs between majors [unverified].
-   - `schema_version:baseline.version` must equal 10.
+   - `schema_version:baseline.version` must equal the current version
+     (13 since `0013_pairing_request_details.surql`).
 3. **Content checksums per table:**
    - Run `SELECT * FROM <t> ORDER BY id` on both sides with `--json`.
    - Normalise with jq: sort keys, canonical datetimes in UTC RFC 3339,

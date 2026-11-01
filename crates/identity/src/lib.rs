@@ -177,6 +177,18 @@ pub struct PairingRequest {
     pub status: String,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
+    pub details: PairingDetails,
+}
+
+/// What the candidate's connection and client reported when it asked to pair.
+/// Unauthenticated hints for the approving owner; never part of the signed
+/// approval. The API validates and bounds each value before it is stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PairingDetails {
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub app_version: Option<String>,
+    pub model: Option<String>,
 }
 
 /// Canonical, domain-separated bytes that an approving device signs. This is

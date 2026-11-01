@@ -26,7 +26,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 12);
+    assert_eq!(version.unwrap().version, 13);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
@@ -47,7 +47,31 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_eleven.unwrap().version, 12);
+    assert_eq!(from_eleven.unwrap().version, 13);
+    db.use_db("from_twelve").await?;
+    apply_through_twelve(&db).await?;
+    // A v12 pairing row has none of the new optional fields and stays valid.
+    db.query("CREATE device_pairing_requests SET id = 'legacy', user_id = 'fixture', candidate_name = 'old', candidate_platform = 'ios', candidate_public_key = <bytes>'k', candidate_fingerprint = 'f', nonce = <bytes>'n', status = 'pending', created_at = time::now(), expires_at = time::now() + 5m;")
+        .await?.check()?;
+    apply_baseline_schema(&db).await?;
+    let mut from_twelve = db
+        .query("SELECT version FROM schema_version:baseline; SELECT VALUE candidate_ip = NONE FROM device_pairing_requests:legacy;")
+        .await?
+        .check()?;
+    let from_twelve_version: Option<SchemaVersion> = from_twelve.take(0)?;
+    assert_eq!(from_twelve_version.unwrap().version, 13);
+    let legacy_has_no_ip: Vec<bool> = from_twelve.take(1)?;
+    assert_eq!(legacy_has_no_ip, [true]);
+    // The database bounds the new fields even if Core validation regressed.
+    let too_long = db
+        .query("UPDATE device_pairing_requests:legacy SET candidate_ip = $ip;")
+        .bind(("ip", "1".repeat(46)))
+        .await?
+        .check();
+    assert!(too_long.is_err());
+    db.query("UPDATE device_pairing_requests:legacy SET candidate_ip = '192.0.2.1', candidate_user_agent = 'ua', candidate_app_version = '0.1.14', candidate_model = 'Pixel 9';")
+        .await?
+        .check()?;
     db.use_db("from_ten").await?;
     apply_through_ten(&db).await?;
     // A pending v10 account action stays valid across the migration.
@@ -64,7 +88,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
-    assert_eq!(migrated_version.unwrap().version, 12);
+    assert_eq!(migrated_version.unwrap().version, 13);
     let legacy: Vec<String> = migrated.take(1)?;
     assert_eq!(legacy, ["password-set"]);
     db.query("CREATE account_actions SET id = 'reset', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")

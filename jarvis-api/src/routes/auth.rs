@@ -205,9 +205,7 @@ fn validate_enrollment(req: &EnrollReq) -> Result<(), (StatusCode, Json<Value>)>
     Ok(())
 }
 
-/// An untrusted candidate can request pairing but cannot select an owner: the
-/// single existing Jarvis owner is resolved server-side. No bearer token is
-/// accepted or needed for this non-authoritative waiting record.
+/// First-owner bootstrap body.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PasswordEnrollmentReq {
@@ -217,11 +215,61 @@ pub(crate) struct PasswordEnrollmentReq {
     password: Option<identity::password::AccountPassword>,
 }
 
+/// An untrusted candidate can request pairing but cannot select an owner: the
+/// single existing Jarvis owner is resolved server-side. No bearer token is
+/// accepted or needed for this non-authoritative waiting record.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PairingCreateReq {
+    name: String,
+    platform: String,
+    public_key: String,
+    password: Option<identity::password::AccountPassword>,
+    app_version: Option<String>,
+    model: Option<String>,
+}
+
 pub(crate) async fn pairing_create(
     State(state): State<AppState>,
-    Json(req): Json<PasswordEnrollmentReq>,
+    headers: HeaderMap,
+    extensions: Extensions,
+    Json(req): Json<PairingCreateReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let password = req.password;
+    if req
+        .app_version
+        .as_deref()
+        .is_some_and(|version| !validation::app_version(version))
+    {
+        return Err(bad_request("invalid app_version"));
+    }
+    if req
+        .model
+        .as_deref()
+        .is_some_and(|model| !validation::printable_ascii(model, validation::MAX_DEVICE_MODEL_LEN))
+    {
+        return Err(bad_request("invalid model"));
+    }
+    // The approver sees the name next to the fingerprint. Bootstrap keeps its
+    // existing rules: its device is the owner's own, not a remote candidate.
+    if !validation::no_hidden_chars(&req.name) {
+        return Err(bad_request("invalid device name"));
+    }
+    // Shown to the owner as hints only: a client fully controls its
+    // User-Agent, so anything but bounded printable ASCII is dropped.
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| validation::printable_ascii(value, validation::MAX_USER_AGENT_LEN))
+        .map(str::to_owned);
+    let details = identity::PairingDetails {
+        ip: crate::peer::client_ip(&extensions, &headers, &state)
+            .map(|ip| ip.to_canonical().to_string()),
+        user_agent,
+        app_version: req.app_version,
+        model: req.model,
+    };
     let req = EnrollReq {
         name: req.name,
         platform: req.platform,
@@ -253,13 +301,11 @@ pub(crate) async fn pairing_create(
             Json(json!({ "error": "first device bootstrap required" })),
         ));
     }
-    // With no active device, only an activated owner (bootstrap consumed and
-    // a password stored) reaches this point, so the request needs the
-    // password and explicit root-peer local approval. With an active device,
-    // an owner who has a stored password must supply it; an owner without
-    // one (legacy setup) gets a pending request with no password check at
-    // all. A request never grants device authority: an existing
-    // device or the local root operator must still approve it.
+    // A pairing request needs the owner's stored account password. An owner
+    // without one (a legacy, dev-enrolled setup) must set it from an approver
+    // device first; see below for an owner who has none. A request never
+    // grants device authority: an existing device or the local root operator
+    // must still approve it.
     // Every attempt spends this global budget, which caps the Argon2 runs
     // across all sources so address rotation buys neither online guesses nor
     // memory pressure. Validation failures above do not spend it, and neither
@@ -290,7 +336,29 @@ pub(crate) async fn pairing_create(
             note_password_verified(&state, None);
             true
         }
-        Ok(None) => false,
+        // A legacy owner without a stored password sets one from an approver
+        // device first. With no approver device that is impossible, so the
+        // request stays possible without a password check, as before; only
+        // the local root operator can approve it then.
+        Ok(None) => {
+            let has_approver = identity::list_active_devices(&state.db, user.id)
+                .await
+                .map_err(internal)?
+                .iter()
+                .any(|device| {
+                    identity::surreal::APPROVER_PLATFORMS.contains(&device.platform.as_str())
+                });
+            if has_approver {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "account password required",
+                        "code": "pairing_password_not_set",
+                    })),
+                ));
+            }
+            false
+        }
         Err(identity::IdentityError::Busy) => return Err(busy()),
         Err(identity::IdentityError::PasswordRejected) => {
             note_password_failure(&state, None);
@@ -310,14 +378,15 @@ pub(crate) async fn pairing_create(
         identity::Platform::parse(&req.platform).map_err(|_| bad_request("unknown platform"))?;
     let key =
         hex::decode(&req.public_key).map_err(|_| bad_request("invalid public_key encoding"))?;
-    let pairing = identity::create_pairing_request(&state.db, user.id, &req.name, platform, &key)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::CONFLICT,
-                Json(json!({ "error": "pairing request unavailable" })),
-            )
-        })?;
+    let pairing =
+        identity::create_pairing_request(&state.db, user.id, &req.name, platform, &key, &details)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": "pairing request unavailable" })),
+                )
+            })?;
     // Only a password-verified request may reach the owner's phone; an
     // unauthenticated caller must not be able to trigger pushes.
     if password_verified {
@@ -359,10 +428,16 @@ pub(crate) async fn pairing_pending(
     let requests = identity::pending_pairing_requests(&state.db, authed.user.id)
         .await
         .map_err(internal)?;
+    // `fingerprint` is the legacy 16-hex prefix; `fingerprint_full` is the
+    // lowercase hex SHA-256 of the raw key, as `jarvis devices` shows it and a
+    // candidate can compute from its own key. The candidate details are
+    // unauthenticated hints (null if unknown).
     let items: Vec<Value> = requests.iter().map(|r| json!({
         "id": r.id, "device_name": r.candidate_name, "platform": r.candidate_platform,
-        "fingerprint": &r.candidate_fingerprint[..16], "nonce": hex::encode(&r.nonce),
+        "fingerprint": &r.candidate_fingerprint[..16], "fingerprint_full": r.candidate_fingerprint,
+        "nonce": hex::encode(&r.nonce),
         "candidate_public_key": hex::encode(&r.candidate_public_key), "created_at": r.created_at.unix_timestamp(), "expires_at": r.expires_at.unix_timestamp(),
+        "ip": r.details.ip, "user_agent": r.details.user_agent, "app_version": r.details.app_version, "model": r.details.model,
     })).collect();
     Ok(Json(json!({ "requests": items })))
 }
