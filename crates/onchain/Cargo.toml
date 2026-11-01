@@ -1,0 +1,11 @@
+[package]
+name = "jarvis-onchain"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rust_decimal.workspace = true
+thiserror.workspace = true
+time.workspace = true

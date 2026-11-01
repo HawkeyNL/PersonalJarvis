@@ -24,6 +24,7 @@ members = [
     "crates/sandbox",
     "crates/privileged",
     "crates/admin",
+    "crates/onchain",
 ]
 # The Tauri client crate builds via its own tooling (npm run tauri ...) and is
 # intentionally excluded so backend CI (clippy -D warnings) stays fast and the

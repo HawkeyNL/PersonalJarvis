@@ -2539,6 +2539,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-onchain"
+version = "0.1.0"
+dependencies = [
+ "rust_decimal",
+ "thiserror 1.0.69",
+ "time",
+]
+
+[[package]]
 name = "jarvis-orchestrator"
 version = "0.1.0"
 dependencies = [
