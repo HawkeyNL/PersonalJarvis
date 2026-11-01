@@ -211,9 +211,9 @@ pub struct Pnl {
 /// sum is checked: absurd values give [`LedgerError::Overflow`], not a panic.
 ///
 /// Buys and sells must arrive in time order: an event dated before the
-/// previous one is refused. That keeps the record's own timestamps honest,
-/// so the gate can measure duration from them without trusting a caller's
-/// clock, and a back-dated buy cannot stretch the record.
+/// previous one is refused, so the record cannot be back-dated and a
+/// back-dated buy cannot stretch it. Forward-dated events are not detected
+/// here; whoever feeds the ledger must stamp events with its own clock.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Ledger {
     lots: Vec<Position>,
