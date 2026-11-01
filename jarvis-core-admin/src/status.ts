@@ -8,7 +8,7 @@ const OK = ["active", "enabled", "passed", "healthy", "configured", "known", "lo
 // Intended or not-yet-relevant states: a mostly disabled catalog is normal, and
 // a manual updater is the owner's choice, not a fault.
 const NEUTRAL = ["disabled", "manual", "off", "not run this session", "logged_out"];
-const ERROR = ["failed", "error", "inactive", "unavailable"];
+const ERROR = ["failed", "error", "inactive", "unavailable", "unhealthy"];
 
 export function toneOf(state: string): Tone {
   const value = state.toLowerCase();

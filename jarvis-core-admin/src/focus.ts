@@ -37,9 +37,15 @@ export function dialogFocus(dialog: HTMLElement, onEscape?: () => void) {
         trapTab(event, dialog);
       }
     },
-    /** Back to the element that opened the dialog, if it is still on the page. */
+    /**
+     * Back to the element that opened the dialog, if it is still on the page.
+     * An opener disabled by the work the dialog started (a busy page header)
+     * cannot take focus; its page container (tabindex -1) does instead.
+     */
     restore() {
-      if (opener?.isConnected) opener.focus();
+      if (!opener?.isConnected) return;
+      if (opener.matches(":disabled")) opener.closest<HTMLElement>("[tabindex='-1']")?.focus();
+      else opener.focus();
     },
   };
 }

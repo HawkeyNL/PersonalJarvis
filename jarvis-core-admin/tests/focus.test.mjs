@@ -6,13 +6,14 @@ import { dialogFocus, trapTab } from "../src/focus.ts";
 // that lists its focusable children, and one document tracking activeElement.
 function fakeDom(names) {
   const doc = { activeElement: null };
-  const element = (name) => ({ name, isConnected: true, ownerDocument: doc, focus() { doc.activeElement = this; } });
-  const opener = element("opener");
+  const element = (name) => ({ name, isConnected: true, disabled: false, ownerDocument: doc, focus() { if (!this.disabled) doc.activeElement = this; }, matches: function () { return this.disabled; } });
+  const page = element("page");
+  const opener = { ...element("opener"), closest: () => page };
   const items = names.map(element);
   const dialog = { ...element("dialog"), querySelectorAll: () => items, contains: (node) => node === dialog || items.includes(node) };
   dialog.focus = () => { doc.activeElement = dialog; };
   opener.focus();
-  return { doc, opener, items, dialog };
+  return { doc, opener, page, items, dialog };
 }
 const key = (name, shiftKey = false) => ({ key: name, shiftKey, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
 
@@ -90,4 +91,13 @@ test("closing gives focus back to the opener, unless it left the page", () => {
   opener.isConnected = false;
   focus.restore();
   assert.equal(doc.activeElement, cancel);
+});
+
+test("an opener disabled by the work it started hands focus to its page", () => {
+  const { doc, opener, page, items: [confirm], dialog } = fakeDom(["confirm"]);
+  const focus = dialogFocus(dialog, () => {});
+  confirm.focus();
+  opener.disabled = true;
+  focus.restore();
+  assert.equal(doc.activeElement, page);
 });

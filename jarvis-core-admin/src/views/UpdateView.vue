@@ -19,8 +19,10 @@ const dialog = computed(() => {
     const previous = known(status.value.previous);
     return { title: previous ? `Roll back Core to ${previous}?` : "Roll back Core?", detail: DETAIL, confirmLabel: previous ? `Roll back to ${previous}` : "Roll back Core", tone: "danger" as const, requireText: undefined };
   }
-  const target = pending.value === "version" ? version.value : known(status.value.latest);
-  return { title: target ? `Install Core ${target}?` : "Update Core to the latest release?", detail: DETAIL, confirmLabel: target ? `Install ${target}` : "Update to latest", tone: "primary" as const, requireText: undefined };
+  if (pending.value === "version") return { title: `Install Core ${version.value}?`, detail: DETAIL, confirmLabel: `Install ${version.value}`, tone: "primary" as const, requireText: undefined };
+  // The updater resolves the newest verified release when it runs, so the last known one is only a hint.
+  const latest = known(status.value.latest);
+  return { title: "Update Core to the latest release?", detail: `${latest ? `Latest known release: ${latest}. ` : ""}${DETAIL}`, confirmLabel: latest ? `Update to latest (${latest})` : "Update to latest", tone: "primary" as const, requireText: undefined };
 });
 async function load(check = false) { busy.value = true; error.value = ""; try { status.value = await api.updateStatus(check); } catch (e) { error.value = errorText(e); errorTitle.value = "Could not load release status"; } finally { busy.value = false; } }
 async function execute() { const action = pending.value; pending.value = null; if (!action) return; busy.value = true; error.value = ""; result.value = null; try { const request: Record<string, string> = { action: action === "version" ? "install_version" : action }; if (action === "version") request.version = version.value; if (action === "migrate") request.version = migrateTarget.value; result.value = await api.updateMutation(request); if (result.value.success) emit("restartRequired"); } catch (e) { error.value = errorText(e); errorTitle.value = undefined; } finally { busy.value = false; } }

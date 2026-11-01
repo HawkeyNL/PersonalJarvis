@@ -6,6 +6,6 @@ defineProps<{ result: OperationResult }>();
 <template>
   <section class="result-panel" role="status">
     <p class="result-summary"><StatusBadge :tone="result.success ? 'ok' : 'error'" :label="result.success ? 'Done' : 'Failed'" />{{ result.summary }}</p>
-    <details><summary>Technical output</summary><pre>{{ result.detail }}</pre></details>
+    <details :open="!result.success"><summary>Technical output</summary><pre>{{ result.detail }}</pre></details>
   </section>
 </template>

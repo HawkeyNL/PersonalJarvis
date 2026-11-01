@@ -9,7 +9,7 @@ test("intended and not-yet-run states are neutral, not red or amber", () => {
 
 test("healthy states are ok and failures stay red", () => {
   for (const state of ["active", "enabled", "passed", "connected", "automatic", "up to date", "available"]) assert.equal(toneOf(state), "ok", state);
-  for (const state of ["failed", "inactive", "unavailable", "error"]) assert.equal(toneOf(state), "error", state);
+  for (const state of ["failed", "inactive", "unavailable", "error", "unhealthy"]) assert.equal(toneOf(state), "error", state);
   assert.equal(toneOf("update available"), "warn");
   assert.equal(toneOf("incompatible_runtime"), "warn");
 });

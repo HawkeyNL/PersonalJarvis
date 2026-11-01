@@ -70,14 +70,17 @@ watch(() => session.locked, (locked) => {
   // The restart dialog is modal; focus stays in it.
   if (!restartRequired.value) void nextTick(() => (locked ? unlockButton.value : page.value)?.focus());
 });
-// The restart gate has no Escape and no restore: it never closes.
+// The restart gate has no Escape and no restore: it never closes. The rest of
+// the shell is inert behind it, so Tab can only reach it. Focus moves in only
+// when an update the owner just ran raised it: a focus from the runtime timer
+// would fire focusin and count as activity for the idle lock.
 watch(restartRequired, (required) => {
-  if (!required) return;
-  void nextTick(() => {
-    restartFocus = dialogFocus(restartDialog.value!);
-    restartDialog.value!.querySelector("button")?.focus();
-  });
+  if (required) void nextTick(() => { restartFocus = dialogFocus(restartDialog.value!); });
 });
+function raiseRestart() {
+  restartRequired.value = true;
+  void nextTick(() => restartDialog.value?.querySelector("button")?.focus());
+}
 function go(view: ViewName) { active.value = navigate(session.locked, active.value, view); }
 // A card that opens another view unmounts itself; focus moves to the new page.
 function open(view: ViewName) {
@@ -117,7 +120,7 @@ onBeforeUnmount(() => {
 </script>
 <template>
   <div class="app-shell" @pointermove="recordActivity" @pointerdown="recordActivity" @mouseenter="recordActivity" @wheel="recordActivity" @touchstart="recordActivity" @keydown="recordActivity" @focusin="recordActivity">
-    <nav class="sidebar" aria-label="Core Admin">
+    <nav class="sidebar" aria-label="Core Admin" :inert="restartRequired">
       <template v-for="(section, s) in sections" :key="s">
         <p v-if="section.label" :id="`nav-section-${s}`" class="nav-section">{{ section.label }}</p>
         <ul :aria-labelledby="section.label ? `nav-section-${s}` : undefined">
@@ -131,7 +134,7 @@ onBeforeUnmount(() => {
         </ul>
       </template>
     </nav>
-    <div class="main-shell">
+    <div class="main-shell" :inert="restartRequired">
       <JvTopBar :title="session.locked ? 'Locked' : undefined">
         <div class="session-cluster">
           <StatusBadge v-if="session.locked" tone="warn" label="Locked" />
@@ -144,7 +147,7 @@ onBeforeUnmount(() => {
         <JvSegmented v-model="activeTab" variant="tabs" :items="tabs" :label="`${item.label} views`" controls="page-view" />
       </div>
       <main id="page-view" ref="page" tabindex="-1" :role="tabs ? 'tabpanel' : undefined" :class="['page', { 'with-tabs': tabs, 'logs-active': active === 'logs', 'locked-page': session.locked }]">
-        <component :is="current" v-if="current" @restart-required="restartRequired = true" @open="open" @pairings="(count: number) => (pendingPairings = count)" />
+        <component :is="current" v-if="current" @restart-required="raiseRestart" @open="open" @pairings="(count: number) => (pendingPairings = count)" />
         <section v-else class="lock-screen">
           <JvPanel icon="shield" title="Jarvis Core is locked" tone="warn" status="Locked" description="Authenticate once through the GNOME system dialog. Your password is never handled by this application.">
             <p v-if="lockNote" class="lock-note" role="status">{{ session.authError }}</p>
