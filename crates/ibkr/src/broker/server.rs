@@ -2,11 +2,10 @@
 //! request dispatch and one audit line per connection.
 
 use std::{
-    ffi::CString,
     fs,
     future::Future,
     io::Write as _,
-    os::unix::fs::{FileTypeExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -41,7 +40,7 @@ pub fn resolve_peers(spec: &str) -> Result<Vec<u32>, String> {
                 .parse()
                 .map_err(|_| format!("invalid peer uid {entry}"))?
         } else {
-            lookup_uid(entry).ok_or_else(|| format!("unknown peer user {entry}"))?
+            super::lookup_uid(entry).ok_or_else(|| format!("unknown peer user {entry}"))?
         };
         uids.push(uid);
     }
@@ -51,19 +50,14 @@ pub fn resolve_peers(spec: &str) -> Result<Vec<u32>, String> {
     Ok(uids)
 }
 
-fn lookup_uid(name: &str) -> Option<u32> {
-    let name = CString::new(name).ok()?;
-    // Called once at startup, before any request handling.
-    let entry = unsafe { libc::getpwnam(name.as_ptr()) };
-    (!entry.is_null()).then(|| unsafe { (*entry).pw_uid })
-}
-
 /// Bind the socket (0660; the parent directory comes from systemd), replacing
-/// only a stale socket, never another file type.
+/// only a stale socket of this uid, never another file type or owner.
 pub fn bind(socket: &Path) -> std::io::Result<UnixListener> {
     if let Ok(meta) = fs::symlink_metadata(socket) {
-        if !meta.file_type().is_socket() {
-            return Err(std::io::Error::other("refusing non-socket broker path"));
+        if !meta.file_type().is_socket() || meta.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::other(
+                "refusing unsafe existing broker path",
+            ));
         }
         fs::remove_file(socket)?;
     }

@@ -168,6 +168,10 @@ impl Fake {
             return (401, String::new());
         }
         let path = request.path.trim_start_matches("/v1/api");
+        if path == "/portfolio/DU7777777/positions/0" {
+            let one = r#"{"conid":1,"position":1}"#;
+            return (200, format!("[{}]", vec![one; MAX_POSITIONS + 1].join(",")));
+        }
         let body = match (request.method.as_str(), path) {
             ("GET", "/portfolio/accounts") => r#"[{"accountId":"DU1234567"}]"#,
             ("GET", "/portfolio/DU1234567/positions/0") => {
@@ -299,6 +303,14 @@ async fn mints_once_then_signs_paged_reads() {
     let ledger = client.ledger("DU1234567").await.unwrap();
     assert_eq!(ledger["BASE"].cashbalance, Some("12.5".parse().unwrap()));
     assert_eq!(fake.mints.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn positions_stop_at_the_cap_before_the_next_page() {
+    let (client, fake) = fake_client().await;
+    let error = client.positions("DU7777777").await.unwrap_err();
+    assert!(matches!(error, IbkrError::TooLarge), "{error:?}");
+    assert_eq!(fake.count("/DU7777777/positions/1"), 0);
 }
 
 #[tokio::test]

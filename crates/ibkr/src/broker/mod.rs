@@ -10,7 +10,7 @@
 //!
 //! [`BrokerClient`] is the typed client Core uses; [`server`] is the broker.
 
-use std::{path::PathBuf, time::Duration};
+use std::{ffi::CString, path::PathBuf, time::Duration};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::{
@@ -141,16 +141,27 @@ impl From<&IbkrError> for BrokerError {
     }
 }
 
+/// uid of a user name. Call once at startup: `getpwnam` is not reentrant.
+pub fn lookup_uid(name: &str) -> Option<u32> {
+    let name = CString::new(name).ok()?;
+    let entry = unsafe { libc::getpwnam(name.as_ptr()) };
+    (!entry.is_null()).then(|| unsafe { (*entry).pw_uid })
+}
+
 /// Typed client for the broker socket. Holds no credentials.
 #[derive(Debug, Clone)]
 pub struct BrokerClient {
     socket: PathBuf,
+    broker_uid: u32,
 }
 
 impl BrokerClient {
-    pub fn new(socket: impl Into<PathBuf>) -> Self {
+    /// `broker_uid` is the broker's service uid (see [`lookup_uid`]): a
+    /// socket served by any other process is refused before sending.
+    pub fn new(socket: impl Into<PathBuf>, broker_uid: u32) -> Self {
         Self {
             socket: socket.into(),
+            broker_uid,
         }
     }
 
@@ -208,6 +219,9 @@ impl BrokerClient {
         }
         let reply = tokio::time::timeout(CLIENT_DEADLINE, async {
             let mut stream = UnixStream::connect(&self.socket).await.ok()?;
+            if stream.peer_cred().ok()?.uid() != self.broker_uid {
+                return None;
+            }
             // A busy broker may answer and close before reading the request.
             let _ = stream.write_all(&line).await;
             let mut reply = Vec::new();

@@ -73,7 +73,7 @@ fn error_of(reply: &[u8]) -> BrokerError {
 #[tokio::test]
 async fn typed_round_trip_for_every_read() {
     let broker = start(&[own_uid()]).await;
-    let client = BrokerClient::new(&broker.socket);
+    let client = BrokerClient::new(&broker.socket, own_uid());
     assert_eq!(client.accounts().await.unwrap()[0].account_id, "DU1234567");
     let positions = client.positions("DU1234567").await.unwrap();
     assert_eq!(positions[1].position, Some("2.5".parse().unwrap()));
@@ -132,7 +132,7 @@ async fn refuses_a_peer_uid_that_is_not_allowlisted() {
     let reply = raw(&broker.socket, b"{\"kind\":\"accounts\"}\n").await;
     assert!(reply.is_empty(), "no reply to an unknown peer");
     assert_eq!(
-        BrokerClient::new(&broker.socket)
+        BrokerClient::new(&broker.socket, own_uid())
             .accounts()
             .await
             .unwrap_err(),
@@ -199,7 +199,7 @@ async fn refuses_connections_beyond_the_concurrency_bound() {
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
-        BrokerClient::new(&broker.socket)
+        BrokerClient::new(&broker.socket, own_uid())
             .accounts()
             .await
             .unwrap_err(),
@@ -229,6 +229,17 @@ async fn keep_alive_tickles_only_an_open_brokerage_session() {
     client.keep_alive().await.unwrap_err();
     client.keep_alive().await.unwrap();
     assert_eq!(fake.count("/tickle"), 2);
+}
+
+#[tokio::test]
+async fn client_refuses_a_socket_served_by_another_uid() {
+    let broker = start(&[own_uid()]).await;
+    let client = BrokerClient::new(&broker.socket, own_uid().wrapping_add(1));
+    assert_eq!(
+        client.accounts().await.unwrap_err(),
+        BrokerError::Unavailable
+    );
+    assert!(broker.fake.requests.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -267,7 +278,7 @@ async fn audit_lines_and_errors_carry_no_secrets_urls_or_account_ids() {
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let broker = start(&[own_uid()]).await;
-    let client = BrokerClient::new(&broker.socket);
+    let client = BrokerClient::new(&broker.socket, own_uid());
     client.positions("DU1234567").await.unwrap();
     broker.fake.fail.lock().unwrap().insert("/ledger", 500);
     let ledger = client.ledger("DU1234567").await.unwrap_err();
@@ -308,7 +319,7 @@ async fn audit_lines_and_errors_carry_no_secrets_urls_or_account_ids() {
 #[tokio::test]
 async fn graceful_shutdown_stops_accepting_and_finishes() {
     let broker = start(&[own_uid()]).await;
-    let client = BrokerClient::new(&broker.socket);
+    let client = BrokerClient::new(&broker.socket, own_uid());
     client.accounts().await.unwrap();
     broker.stop.send(()).unwrap();
     broker.task.await.unwrap().unwrap();

@@ -61,6 +61,8 @@ const SNAPSHOT_PREFLIGHT_DELAY: Duration = Duration::from_secs(1);
 const MAX_SNAPSHOT_CONIDS: usize = 50;
 /// 100 positions per page, so this bounds one call at 5000 positions.
 const MAX_POSITION_PAGES: u32 = 50;
+/// Hard cap on collected positions, whatever the upstream page size.
+const MAX_POSITIONS: usize = 5000;
 /// Credential files are a few KiB at most (PEM keys, hex tokens).
 const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
 // ponytail: compete=false never kicks the owner's TWS/mobile session, but the
@@ -383,6 +385,9 @@ impl IbkrOAuthClient {
         let account_id = valid_account(account_id)?;
         let mut all = Vec::new();
         for page in 0..MAX_POSITION_PAGES {
+            if all.len() > MAX_POSITIONS {
+                return Err(IbkrError::TooLarge);
+            }
             let batch: Vec<Position> = self
                 .get_json(
                     &format!("/portfolio/{account_id}/positions/{page}"),
@@ -479,19 +484,30 @@ impl IbkrOAuthClient {
     /// idle client never mints a session just to keep it alive. A failed
     /// tickle stops the keep-alive until the next `/iserver` read re-opens it.
     pub async fn keep_alive(&self) -> Result<(), IbkrError> {
-        if *self.brokerage.lock().await == 0 {
+        let opened_for = *self.brokerage.lock().await;
+        if opened_for == 0 {
             return Ok(());
         }
         let result = self.tickle().await.map(|_| ());
         if result.is_err() {
-            *self.brokerage.lock().await = 0;
+            self.close_brokerage(opened_for).await;
         }
         result
+    }
+
+    /// Forget the brokerage session opened for `generation`; one opened
+    /// meanwhile for a newer LST stays.
+    async fn close_brokerage(&self, generation: u64) {
+        let mut opened_for = self.brokerage.lock().await;
+        if *opened_for == generation {
+            *opened_for = 0;
+        }
     }
 
     /// Keep the brokerage session alive; call about once a minute. When the
     /// session is gone the next `/iserver` call re-opens it.
     pub async fn tickle(&self) -> Result<AuthStatus, IbkrError> {
+        let opened_for = *self.brokerage.lock().await;
         let tickle: Tickle = serde_json::from_slice(
             &self
                 .signed(Method::POST, "/tickle", &[], None, false)
@@ -500,7 +516,7 @@ impl IbkrOAuthClient {
         .map_err(IbkrError::Decode)?;
         let status = tickle.iserver.map(|i| i.auth_status).unwrap_or_default();
         if !status.authenticated {
-            *self.brokerage.lock().await = 0;
+            self.close_brokerage(opened_for).await;
         }
         Ok(status)
     }
