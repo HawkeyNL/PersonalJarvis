@@ -535,12 +535,10 @@ pub async fn control(db: &Database) -> Result<Control> {
 pub async fn pause(db: &Database, device_id: &str) -> Result<()> {
     run(
         db,
-        "UPSERT $record SET id = 'paper', paused_by = IF paused = true THEN paused_by ELSE $device END, \
+        "UPSERT memecoin_paper_control:paper SET id = 'paper', \
+         paused_by = IF paused = true THEN paused_by ELSE $device END, \
          paused_at = IF paused = true THEN paused_at ELSE time::now() END, paused = true RETURN NONE",
-        json!({
-            "record": surrealdb::RecordId::from_table_key("memecoin_paper_control", "paper"),
-            "device": device_id,
-        }),
+        json!({"device": device_id}),
     )
     .await?;
     Ok(())
