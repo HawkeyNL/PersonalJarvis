@@ -13,6 +13,21 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
+tokio = { workspace = true }
+rust_decimal.workspace = true
+rand.workspace = true
+sha2.workspace = true
+hex.workspace = true
+zeroize = "1"
+# OAuth 1.0a: ring signs the LST request (RSA-SHA256), num-bigint does the
+# DH arithmetic, der parses the DH parameters, HMAC-SHA1/SHA256 for the LST.
+ring = "0.17"
+num-bigint = "0.4"
+der = { version = "0.7", features = ["alloc"] }
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+percent-encoding = "2"
 
 [dev-dependencies]
-tokio.workspace = true
+tempfile = "3"
