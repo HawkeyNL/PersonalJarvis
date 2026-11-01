@@ -53,7 +53,7 @@ button span { overflow: hidden; text-overflow: ellipsis; }
 
 @media (max-width: 1099px), (max-height: 759px) {
   .jv-seg { overflow-x: auto; scrollbar-width: none; }
-  button { flex: 1 0 auto; padding: 0 12px; }
+  .jv-seg button { flex: 1 0 auto; padding: 0 12px; }
   .tabs button { font-size: 13px; }
 }
 </style>

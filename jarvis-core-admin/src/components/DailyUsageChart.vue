@@ -27,7 +27,9 @@ function token(name: string): string {
   const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   if (!probe || !value) return value;
   probe.clearRect(0, 0, 1, 1);
+  probe.fillStyle = "#010203";
   probe.fillStyle = value;
+  if (probe.fillStyle === "#010203") return value; // colour not parsed here; let Chart.js try it
   probe.fillRect(0, 0, 1, 1);
   const [r, g, b, a] = probe.getImageData(0, 0, 1, 1).data;
   return `rgba(${r}, ${g}, ${b}, ${(a / 255).toFixed(3)})`;
@@ -42,15 +44,17 @@ function renderChart() {
   const rows = props.rows;
   const muted = token("--text-secondary");
   const text = token("--text-primary");
+  // A surface-coloured edge between stacked segments, so they do not rely on hue alone.
+  const edge = { borderColor: token("--bg-surface"), borderWidth: 1 };
   chart = new Chart(canvas.value, {
     type: "bar",
     data: {
       labels: rows.map((row) => row.day.slice(8)),
       datasets: [
-        { label: "Input", data: rows.map((row) => row.input_tokens), backgroundColor: token("--chart-accent") },
-        { label: "Output", data: rows.map((row) => row.output_tokens), backgroundColor: token("--chart-ma") },
-        { label: "Cache read", data: rows.map((row) => row.cache_read_tokens), backgroundColor: token("--positive-solid") },
-        { label: "Cache write", data: rows.map((row) => row.cache_write_tokens), backgroundColor: token("--negative-solid") },
+        { label: "Input", data: rows.map((row) => row.input_tokens), backgroundColor: token("--chart-accent"), ...edge },
+        { label: "Output", data: rows.map((row) => row.output_tokens), backgroundColor: token("--chart-ma"), ...edge },
+        { label: "Cache read", data: rows.map((row) => row.cache_read_tokens), backgroundColor: token("--positive-solid"), ...edge },
+        { label: "Cache write", data: rows.map((row) => row.cache_write_tokens), backgroundColor: token("--negative-solid"), ...edge },
       ],
     },
     options: {
@@ -120,6 +124,7 @@ function renderChart() {
 const themeWatch = new MutationObserver(renderChart);
 onMounted(() => {
   renderChart();
+  void document.fonts.ready.then(renderChart); // redraw once IBM Plex has loaded
   themeWatch.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 });
 watch(() => props.rows, renderChart, { deep: true });
