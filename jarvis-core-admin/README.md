@@ -136,12 +136,13 @@ assets) with one flat sidebar: Overview, Devices and Releases, an AI section
 (Models & routing, Accounts & keys with AI accounts and Credentials as
 sub-tabs, Usage & costs, Agents, Persona) and a Diagnostics section (Logs,
 System). Devices shows the number of pending pairings as a badge, taken from
-data the Overview and Devices views already load. The top bar shows the root
-session and the time it locks, with **Lock now**. Overview is a read-only
-dashboard of service health, release and update state, monthly spend, latency
-and reliability, models and routing, agents, devices, AI accounts and
-credentials, followed by the Health and Services sections; each card opens its
-detail view. The Models view
+data the Overview and Devices views already load; it clears on lock and
+returns when one of those views loads again. The top bar shows the root
+session and the time it locks, with **Lock now**. Overview is a dashboard
+of service health, release and update state, monthly spend, latency and
+reliability, models and routing, agents, devices, AI accounts and credentials,
+followed by the Health (with the full deployment verifier) and Services
+sections; each card opens its detail view. The Models view
 can filter and sort exact reviewed per-million-token prices, shows at most 25
 rows per page and presents Hugging Face route selection in a focused modal;
 unknown remote prices remain visibly unknown. Usage & costs shows bounded

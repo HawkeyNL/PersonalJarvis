@@ -51,13 +51,18 @@ const restartRequired = ref(false);
 const restartBusy = ref(false);
 const restartError = ref("");
 const page = ref<HTMLElement | null>(null);
+const unlockButton = ref<HTMLButtonElement | null>(null);
 const current = computed(() => visibleView(session.locked, views[active.value]));
 const item = computed(() => sections.flatMap((section) => section.items).find((entry) => entry.id === active.value || entry.tabs?.some((tab) => tab.id === active.value))!);
 const tabs = computed(() => (session.locked ? undefined : item.value.tabs));
 const activeTab = computed({ get: () => active.value, set: (id: string) => go(id as ViewName) });
 const locksAt = computed(() => lockTime(session.lastActivity));
 let runtimeTimer: number | undefined;
-watch(() => session.locked, (locked) => { if (locked) pendingPairings.value = 0; });
+// A lock or unlock removes the focused element; focus moves to what replaced it.
+watch(() => session.locked, (locked) => {
+  if (locked) pendingPairings.value = 0;
+  void nextTick(() => (locked ? unlockButton.value : page.value)?.focus());
+});
 function go(view: ViewName) { active.value = navigate(session.locked, active.value, view); }
 // A card that opens another view unmounts itself; focus moves to the new page.
 function open(view: ViewName) {
@@ -112,7 +117,7 @@ onBeforeUnmount(() => {
       </template>
     </nav>
     <div class="main-shell">
-      <JvTopBar>
+      <JvTopBar :title="session.locked ? 'Locked' : undefined">
         <div class="session-cluster">
           <JvStatusDot v-if="session.locked" tone="warn" label="Locked" />
           <JvStatusDot v-else tone="warn" :label="`Root session · locks ${locksAt}`" />
@@ -125,11 +130,11 @@ onBeforeUnmount(() => {
       </div>
       <main id="page-view" ref="page" tabindex="-1" :role="tabs ? 'tabpanel' : undefined" :class="['page', { 'with-tabs': tabs, 'logs-active': active === 'logs', 'locked-page': session.locked }]">
         <component :is="current" v-if="current" @restart-required="restartRequired = true" @open="open" @pairings="(count: number) => (pendingPairings = count)" />
-        <section v-else class="lock-screen" aria-live="polite">
+        <section v-else class="lock-screen">
           <JvPanel icon="shield" title="Jarvis Core is locked" tone="warn" status="Locked" description="Authenticate once through the GNOME system dialog. Your password is never handled by this application.">
-            <div v-if="session.authError" class="lock-error">{{ session.authError }}</div>
+            <div v-if="session.authError" class="lock-error" role="alert">{{ session.authError }}</div>
             <div class="lock-actions">
-              <button class="primary" :disabled="session.authBusy" @click="unlock">{{ session.authBusy ? "Waiting for system authorization…" : "Unlock administration" }}</button>
+              <button ref="unlockButton" class="primary" :disabled="session.authBusy" @click="unlock">{{ session.authBusy ? "Waiting for system authorization…" : "Unlock administration" }}</button>
               <small>The session locks after five minutes without pointer or keyboard activity.</small>
             </div>
           </JvPanel>

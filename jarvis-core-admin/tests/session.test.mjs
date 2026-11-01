@@ -95,13 +95,19 @@ test("a locked session ignores activity and the idle check", async (t) => {
   const { state, calls, session } = await unlockedSession(t);
   session.lock("Locked by owner.");
   assert.equal(state.authError, "Locked by owner.");
+  const last = state.lastActivity;
+  t.mock.timers.tick(5000);
   session.recordActivity();
+  assert.equal(state.lastActivity, last, "activity does not renew a locked session");
   t.mock.timers.tick(IDLE_TIMEOUT_MS);
   assert.equal(calls.lock, 1);
   assert.equal(calls.touch, 0);
   assert.equal(state.locked, true);
 });
 
+// The helper contract App.vue relies on (`navigate` for every entry and tab,
+// `<component v-if="current">` with `visibleView`). The rendered result, with
+// disabled entries and no mounted view, was checked in headless Chrome.
 test("locked state disables navigation and unmounts the view", () => {
   assert.equal(navigate(true, "overview", "devices"), "overview");
   assert.equal(navigate(false, "overview", "devices"), "devices");
