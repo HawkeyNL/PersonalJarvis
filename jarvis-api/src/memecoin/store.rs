@@ -316,9 +316,10 @@ pub async fn close_trip(db: &Database, id: &str, close: &TripClose) -> Result<bo
     }
     let closed: Vec<String> = rows(
         db,
-        "UPDATE memecoin_paper_trips SET status = 'closed', slot = $id, closed_at = <datetime>$closed_at, \
-         usd_out = $usd_out, exit_fees_usd = $exit_fees_usd, net_pnl_usd = $net_pnl_usd, \
-         exit_reason = $exit_reason WHERE record::id(id) = $id AND status = 'open' RETURN VALUE record::id(id)",
+        "UPDATE type::thing('memecoin_paper_trips', $id) SET status = 'closed', slot = $id, \
+         closed_at = <datetime>$closed_at, usd_out = $usd_out, exit_fees_usd = $exit_fees_usd, \
+         net_pnl_usd = $net_pnl_usd, exit_reason = $exit_reason WHERE status = 'open' \
+         RETURN VALUE record::id(id)",
         json!({
             "id": id,
             "closed_at": rfc3339(close.closed_at)?,
