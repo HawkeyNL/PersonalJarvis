@@ -129,11 +129,12 @@ pub(crate) fn portfolio_body(portfolio: &store::Portfolio) -> Value {
             }
             // A calculation, not a broker value: share of net liquidation.
             if net > Decimal::ZERO {
-                if let Some(weight) = h.market_value.checked_div(net) {
-                    row["weight_pct"] = (weight * Decimal::ONE_HUNDRED)
-                        .round_dp(2)
-                        .to_string()
-                        .into();
+                if let Some(pct) = h
+                    .market_value
+                    .checked_div(net)
+                    .and_then(|weight| weight.checked_mul(Decimal::ONE_HUNDRED))
+                {
+                    row["weight_pct"] = pct.round_dp(2).to_string().into();
                 }
             }
             row

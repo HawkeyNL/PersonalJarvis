@@ -71,8 +71,8 @@ pub fn client(socket: &str) -> Result<BrokerClient, &'static str> {
     let (uid, _) = crate::peer::lookup_user(BROKER_USER)
         .ok_or("IBKR broker account jarvis-ibkr is missing")?;
     // SAFETY: geteuid has no preconditions.
-    if uid == unsafe { libc::geteuid() } {
-        return Err("IBKR broker account must not be Core's own user");
+    if uid == 0 || uid == unsafe { libc::geteuid() } {
+        return Err("IBKR broker account must not be root or Core's own user");
     }
     Ok(BrokerClient::new(socket, uid))
 }
@@ -113,8 +113,11 @@ fn text(value: Option<&str>, max: usize) -> Option<String> {
         .then(|| value.to_string())
 }
 
+const MAX_CONID: i64 = 999_999_999_999;
+
 fn holding(position: &Position, quantity: Decimal) -> Result<Holding, &'static str> {
-    if position.conid <= 0 {
+    // Same bound as the bars route and the app: 1 to 12 digits.
+    if !(1..=MAX_CONID).contains(&position.conid) {
         return Err("invalid contract id");
     }
     // The app reads market values in the base currency; with EUR only, a
@@ -350,6 +353,7 @@ mod tests {
         assert_eq!(bad((r#""EUR""#, r#""USD""#)), "position not in EUR");
         assert_eq!(bad((r#","currency":"EUR""#, "")), "position not in EUR");
         assert_eq!(bad((r#""12345""#, "-1")), "invalid contract id");
+        assert_eq!(bad((r#""12345""#, "1000000000000")), "invalid contract id");
         assert_eq!(
             bad((r#""STK""#, r#""stk""#)),
             "position without a valid asset class"
