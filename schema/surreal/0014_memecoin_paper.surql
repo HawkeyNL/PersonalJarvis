@@ -28,17 +28,19 @@ DEFINE INDEX IF NOT EXISTS memecoin_strategy_versions_version ON memecoin_strate
 
 -- One row is one lot, the position it forms and its round trip: paper opens
 -- at most one lot per mint and always sells it whole. `slot` is the mint
--- while open and the row id once closed, so the UNIQUE index allows one open
--- position per mint. Never pruned: the paper gate needs the whole history.
+-- while held and the row id once closed, so the UNIQUE index allows one held
+-- position per mint. A position whose exit failed too often is `stuck`: still
+-- held, no longer retried. Never pruned: the paper gate needs the history.
 DEFINE TABLE IF NOT EXISTS memecoin_paper_trips SCHEMAFULL PERMISSIONS NONE;
 DEFINE FIELD id ON memecoin_paper_trips TYPE string;
 DEFINE FIELD slot ON memecoin_paper_trips TYPE string ASSERT string::len($value) >= 1 AND string::len($value) <= 64;
 DEFINE FIELD mint ON memecoin_paper_trips TYPE string ASSERT $value = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 DEFINE FIELD strategy_version ON memecoin_paper_trips TYPE int ASSERT $value >= 1;
-DEFINE FIELD status ON memecoin_paper_trips TYPE string ASSERT ($value = 'open' AND slot = mint AND closed_at = NONE AND usd_out = NONE AND exit_fees_usd = NONE AND net_pnl_usd = NONE AND exit_reason = NONE) OR ($value = 'closed' AND slot != mint AND closed_at != NONE AND usd_out != NONE AND exit_fees_usd != NONE AND net_pnl_usd != NONE AND exit_reason != NONE);
+DEFINE FIELD status ON memecoin_paper_trips TYPE string ASSERT ($value IN ['open', 'stuck'] AND slot = mint AND closed_at = NONE AND usd_out = NONE AND exit_fees_usd = NONE AND net_pnl_usd = NONE AND exit_reason = NONE) OR ($value = 'closed' AND slot != mint AND closed_at != NONE AND usd_out != NONE AND exit_fees_usd != NONE AND net_pnl_usd != NONE AND exit_reason != NONE);
 DEFINE FIELD tokens ON memecoin_paper_trips TYPE string ASSERT $value = /^[0-9]{1,28}(\.[0-9]{1,28})?$/;
 DEFINE FIELD cost_usd ON memecoin_paper_trips TYPE string ASSERT $value = /^[0-9]{1,20}(\.[0-9]{1,28})?$/;
 DEFINE FIELD entry_liquidity_usd ON memecoin_paper_trips TYPE string ASSERT $value = /^[0-9]{1,20}(\.[0-9]{1,28})?$/;
+DEFINE FIELD exit_failures ON memecoin_paper_trips TYPE int ASSERT $value >= 0 AND $value <= 1000;
 DEFINE FIELD opened_at ON memecoin_paper_trips TYPE datetime;
 DEFINE FIELD closed_at ON memecoin_paper_trips TYPE option<datetime>;
 DEFINE FIELD usd_out ON memecoin_paper_trips TYPE option<string> ASSERT $value = NONE OR $value = /^[0-9]{1,20}(\.[0-9]{1,28})?$/;
@@ -49,14 +51,14 @@ DEFINE INDEX IF NOT EXISTS memecoin_paper_trips_id ON memecoin_paper_trips FIELD
 DEFINE INDEX IF NOT EXISTS memecoin_paper_trips_slot ON memecoin_paper_trips FIELDS slot UNIQUE;
 DEFINE INDEX IF NOT EXISTS memecoin_paper_trips_closed ON memecoin_paper_trips FIELDS closed_at;
 
--- Costs without a fill: fees of failed attempts and attributed AI spend.
+-- Costs without a fill (fees of failed attempts, attributed AI spend),
+-- summed per strategy version, kind and UTC day so the table stays small.
 -- Never pruned: they are part of the net result.
 DEFINE TABLE IF NOT EXISTS memecoin_paper_costs SCHEMAFULL PERMISSIONS NONE;
 DEFINE FIELD id ON memecoin_paper_costs TYPE string;
 DEFINE FIELD kind ON memecoin_paper_costs TYPE string ASSERT $value IN ['failed_tx', 'ai_cost'];
 DEFINE FIELD usd ON memecoin_paper_costs TYPE string ASSERT $value = /^[0-9]{1,20}(\.[0-9]{1,28})?$/;
 DEFINE FIELD at ON memecoin_paper_costs TYPE datetime;
-DEFINE FIELD mint ON memecoin_paper_costs TYPE option<string> ASSERT $value = NONE OR $value = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 DEFINE FIELD strategy_version ON memecoin_paper_costs TYPE int ASSERT $value >= 1;
 DEFINE INDEX IF NOT EXISTS memecoin_paper_costs_id ON memecoin_paper_costs FIELDS id UNIQUE;
 

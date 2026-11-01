@@ -136,22 +136,29 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .take(0)?;
     assert_eq!(from_thirteen.unwrap().version, 14);
     // The paper tables enforce their shape even if Core validation regressed.
-    let mint = "So11111111111111111111111111111111111111112";
-    let trip = |id: &str, extra: &str| {
-        format!("CREATE memecoin_paper_trips SET id = '{id}', slot = '{mint}', mint = '{mint}', strategy_version = 1, status = 'open', tokens = '10.5', cost_usd = '25.01', entry_liquidity_usd = '50000', opened_at = time::now(){extra};")
+    let (mint, other) = (
+        "So11111111111111111111111111111111111111112",
+        "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    );
+    let trip = |id: &str, mint: &str, extra: &str| {
+        format!("CREATE memecoin_paper_trips SET id = '{id}', slot = '{mint}', mint = '{mint}', strategy_version = 1, status = 'open', tokens = '10.5', cost_usd = '25.01', entry_liquidity_usd = '50000', exit_failures = 0, opened_at = time::now(){extra};")
     };
-    db.query(trip("a", "")).await?.check()?;
+    db.query(trip("a", mint, "")).await?.check()?;
+    // Each case breaks exactly one rule.
     for bad in [
         // A second open trip for the same mint.
-        trip("b", ""),
+        trip("b", mint, ""),
         // Closed fields on an open trip.
-        trip("c", ", usd_out = '1'").replace(&format!("slot = '{mint}'"), "slot = 'cccccccccccccccccccccccccccccccc'"),
+        trip("c", other, ", usd_out = '1'"),
         // A float instead of a decimal string.
-        trip("d", "").replace("tokens = '10.5'", "tokens = '1e5'").replace(&format!("slot = '{mint}'"), "slot = 'dddddddddddddddddddddddddddddddd'"),
+        trip("d", other, "").replace("tokens = '10.5'", "tokens = '1e5'"),
         // Not a base58 mint.
-        trip("e", "").replace(&format!("slot = '{mint}', mint = '{mint}'"), "slot = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', mint = 'not-a-mint-0OIl-not-a-mint-0OIl-x'"),
+        trip("e", "not-a-mint-0OIl-not-a-mint-0OIl-x", ""),
+        // A stuck trip with exit fields, and a negative failure count.
+        trip("g", other, ", exit_reason = 'stop_loss'").replace("status = 'open'", "status = 'stuck'"),
+        trip("h", other, "").replace("exit_failures = 0", "exit_failures = -1"),
         // A closed trip without its exit fields.
-        "CREATE memecoin_paper_trips SET id = 'f', slot = 'f', mint = 'So11111111111111111111111111111111111111112', strategy_version = 1, status = 'closed', tokens = '1', cost_usd = '1', entry_liquidity_usd = '1', opened_at = time::now();".to_string(),
+        trip("f", other, "").replace("status = 'open'", "status = 'closed'").replace(&format!("slot = '{other}'"), "slot = 'f'"),
         "CREATE memecoin_candidates SET id = 'y', mint = 'So11111111111111111111111111111111111111112', observed_at = time::now(), strategy_version = 1, reason = 'because';".to_string(),
         // A pause without its time.
         "CREATE memecoin_paper_control SET id = 'paper', paused = true, paused_by = 'd';".to_string(),
@@ -159,11 +166,16 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     ] {
         assert!(db.query(&bad).await?.check().is_err(), "{bad}");
     }
+    // A stuck position still holds its mint.
+    db.query(trip("s", other, "").replace("status = 'open'", "status = 'stuck'"))
+        .await?
+        .check()?;
+    assert!(db.query(trip("s2", other, "")).await?.check().is_err());
     db.query("UPDATE memecoin_paper_trips:a SET status = 'closed', slot = 'a', closed_at = time::now(), usd_out = '30', exit_fees_usd = '0.02', net_pnl_usd = '-0.03', exit_reason = 'take_profit';")
         .await?
         .check()?;
     // Closed, so the mint is free for a new position.
-    db.query(trip("b", "")).await?.check()?;
+    db.query(trip("b", mint, "")).await?.check()?;
     db.query("CREATE memecoin_candidates SET id = 'r', mint = 'So11111111111111111111111111111111111111112', observed_at = time::now(), strategy_version = 1, reason = 'lp_not_secured', price_usd = '0.0001', liquidity_usd = NONE;")
         .await?
         .check()?;

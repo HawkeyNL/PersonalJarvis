@@ -94,6 +94,10 @@ pub struct Trip {
     pub cost_usd: Decimal,
     pub entry_liquidity_usd: Decimal,
     pub opened_at: OffsetDateTime,
+    /// Failed or unpriceable exit attempts so far.
+    pub exit_failures: u32,
+    /// Held, but exits stopped after [`Trip::exit_failures`] reached the cap.
+    pub stuck: bool,
     pub close: Option<TripClose>,
 }
 
@@ -121,14 +125,13 @@ impl CostKind {
     }
 }
 
-/// A cost without a fill: fees of a failed attempt or attributed AI spend.
+/// Costs without a fill (fees of failed attempts or attributed AI spend),
+/// summed per strategy version, kind and UTC day. `at` is the latest one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cost {
-    pub id: String,
     pub kind: CostKind,
     pub usd: Decimal,
     pub at: OffsetDateTime,
-    pub mint: Option<String>,
     pub strategy_version: u32,
 }
 
@@ -198,6 +201,25 @@ async fn run(db: &Database, query: &str, bindings: Value) -> Result<surrealdb::R
 
 async fn rows<T: DeserializeOwned>(db: &Database, query: &str, bindings: Value) -> Result<Vec<T>> {
     Ok(run(db, query, bindings).await?.take(0)?)
+}
+
+/// A query on one record. The record id is bound on its own: inside a JSON
+/// binding it would arrive as a plain object (and `type::thing` is gone in
+/// SurrealDB 3).
+async fn record_rows<T: DeserializeOwned>(
+    db: &Database,
+    query: &str,
+    table: &str,
+    key: &str,
+    bindings: Value,
+) -> Result<Vec<T>> {
+    Ok(db
+        .query(query)
+        .bind(bindings)
+        .bind(("rid", surrealdb::RecordId::from_table_key(table, key)))
+        .await?
+        .check()?
+        .take(0)?)
 }
 
 pub async fn insert_candidate(db: &Database, candidate: &Candidate) -> Result<()> {
@@ -286,14 +308,14 @@ pub async fn register_strategy_version(db: &Database, version: u32, params: &str
 }
 
 pub async fn open_trip(db: &Database, trip: &Trip) -> Result<()> {
-    if trip.close.is_some() {
+    if trip.close.is_some() || trip.stuck || trip.exit_failures != 0 {
         return Err(MemecoinStoreError::InvalidData);
     }
     run(
         db,
         "CREATE memecoin_paper_trips SET id = $id, slot = $mint, mint = $mint, strategy_version = $strategy_version, \
          status = 'open', tokens = $tokens, cost_usd = $cost_usd, entry_liquidity_usd = $entry_liquidity_usd, \
-         opened_at = <datetime>$opened_at, closed_at = NONE, usd_out = NONE, exit_fees_usd = NONE, \
+         exit_failures = 0, opened_at = <datetime>$opened_at, closed_at = NONE, usd_out = NONE, exit_fees_usd = NONE, \
          net_pnl_usd = NONE, exit_reason = NONE RETURN NONE",
         json!({
             "id": trip.id,
@@ -314,12 +336,13 @@ pub async fn close_trip(db: &Database, id: &str, close: &TripClose) -> Result<bo
     if !EXIT_REASONS.contains(&close.exit_reason) {
         return Err(MemecoinStoreError::InvalidData);
     }
-    let closed: Vec<String> = rows(
+    let closed: Vec<String> = record_rows(
         db,
-        "UPDATE type::thing('memecoin_paper_trips', $id) SET status = 'closed', slot = $id, \
-         closed_at = <datetime>$closed_at, usd_out = $usd_out, exit_fees_usd = $exit_fees_usd, \
-         net_pnl_usd = $net_pnl_usd, exit_reason = $exit_reason WHERE status = 'open' \
-         RETURN VALUE record::id(id)",
+        "UPDATE $rid SET status = 'closed', slot = $id, closed_at = <datetime>$closed_at, \
+         usd_out = $usd_out, exit_fees_usd = $exit_fees_usd, net_pnl_usd = $net_pnl_usd, \
+         exit_reason = $exit_reason WHERE status = 'open' RETURN VALUE record::id(id)",
+        "memecoin_paper_trips",
+        id,
         json!({
             "id": id,
             "closed_at": rfc3339(close.closed_at)?,
@@ -333,6 +356,23 @@ pub async fn close_trip(db: &Database, id: &str, close: &TripClose) -> Result<bo
     Ok(closed.len() == 1)
 }
 
+/// Count a failed or unpriceable exit of an open trip. At `cap` failures the
+/// trip becomes stuck and is no longer retried. Returns whether it is now
+/// stuck, or `None` when no open trip has this id.
+pub async fn record_exit_failure(db: &Database, id: &str, cap: u32) -> Result<Option<bool>> {
+    let status: Vec<String> = record_rows(
+        db,
+        "UPDATE $rid SET exit_failures += 1, \
+         status = IF exit_failures >= $cap THEN 'stuck' ELSE 'open' END \
+         WHERE status = 'open' RETURN VALUE status",
+        "memecoin_paper_trips",
+        id,
+        json!({"cap": cap}),
+    )
+    .await?;
+    Ok(status.first().map(|status| status == "stuck"))
+}
+
 #[derive(Deserialize)]
 struct TripRow {
     id: String,
@@ -341,6 +381,8 @@ struct TripRow {
     tokens: String,
     cost_usd: String,
     entry_liquidity_usd: String,
+    status: String,
+    exit_failures: u32,
     #[serde(with = "time::serde::rfc3339")]
     opened_at: OffsetDateTime,
     #[serde(default, with = "time::serde::rfc3339::option")]
@@ -382,13 +424,19 @@ impl TryFrom<TripRow> for Trip {
             cost_usd: decimal(&row.cost_usd)?,
             entry_liquidity_usd: decimal(&row.entry_liquidity_usd)?,
             opened_at: row.opened_at,
+            exit_failures: row.exit_failures,
+            stuck: match (row.status.as_str(), &close) {
+                ("stuck", None) => true,
+                ("open", None) | ("closed", Some(_)) => false,
+                _ => return Err(MemecoinStoreError::InvalidData),
+            },
             close,
         })
     }
 }
 
 const TRIP_FIELDS: &str = "record::id(id) AS id, mint, strategy_version, tokens, cost_usd, \
-    entry_liquidity_usd, opened_at, closed_at, usd_out, exit_fees_usd, net_pnl_usd, exit_reason";
+    entry_liquidity_usd, status, exit_failures, opened_at, closed_at, usd_out, exit_fees_usd, net_pnl_usd, exit_reason";
 
 fn bounded<T>(rows: Vec<T>) -> Result<Vec<T>> {
     if rows.len() > MAX_LEDGER_ROWS {
@@ -425,33 +473,58 @@ pub async fn recent_closed_trips(db: &Database, limit: usize) -> Result<Vec<Trip
     rows.into_iter().map(Trip::try_from).collect()
 }
 
-pub async fn insert_cost(db: &Database, cost: &Cost) -> Result<()> {
-    run(
-        db,
-        "CREATE memecoin_paper_costs SET id = $id, kind = $kind, usd = $usd, at = <datetime>$at, \
-         mint = $mint, strategy_version = $strategy_version RETURN NONE",
-        json!({
-            "id": cost.id,
-            "kind": cost.kind.as_str(),
-            "usd": cost.usd.to_string(),
-            "at": rfc3339(cost.at)?,
-            "mint": cost.mint,
-            "strategy_version": cost.strategy_version,
-        }),
-    )
-    .await?;
-    Ok(())
-}
-
 #[derive(Deserialize)]
 struct CostRow {
-    id: String,
     kind: String,
     usd: String,
     #[serde(with = "time::serde::rfc3339")]
     at: OffsetDateTime,
-    mint: Option<String>,
     strategy_version: u32,
+}
+
+/// Add `usd` to the day's cost row of `kind`. Only the paper task writes
+/// costs, so the read-modify-write cannot race.
+pub async fn add_cost(
+    db: &Database,
+    kind: CostKind,
+    strategy_version: u32,
+    usd: Decimal,
+    at: OffsetDateTime,
+) -> Result<()> {
+    if usd < Decimal::ZERO {
+        return Err(MemecoinStoreError::InvalidData);
+    }
+    let key = format!("{strategy_version}-{}-{}", kind.as_str(), at.date());
+    let stored: Vec<String> = record_rows(
+        db,
+        "SELECT VALUE usd FROM $rid",
+        "memecoin_paper_costs",
+        &key,
+        json!({}),
+    )
+    .await?;
+    let total = match stored.first() {
+        Some(existing) => decimal(existing)?
+            .checked_add(usd)
+            .ok_or(MemecoinStoreError::InvalidData)?,
+        None => usd,
+    };
+    record_rows::<serde::de::IgnoredAny>(
+        db,
+        "UPSERT $rid SET id = $id, kind = $kind, usd = $usd, at = <datetime>$at, \
+         strategy_version = $strategy_version RETURN NONE",
+        "memecoin_paper_costs",
+        &key,
+        json!({
+            "id": key,
+            "kind": kind.as_str(),
+            "usd": total.to_string(),
+            "at": rfc3339(at)?,
+            "strategy_version": strategy_version,
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Every cost row, oldest first, for rebuilding the ledger.
@@ -459,8 +532,7 @@ pub async fn load_costs(db: &Database) -> Result<Vec<Cost>> {
     let rows: Vec<CostRow> = rows(
         db,
         &format!(
-            "SELECT record::id(id) AS id, kind, usd, at, mint, strategy_version \
-             FROM memecoin_paper_costs ORDER BY at LIMIT {}",
+            "SELECT kind, usd, at, strategy_version FROM memecoin_paper_costs ORDER BY at LIMIT {}",
             MAX_LEDGER_ROWS + 1
         ),
         json!({}),
@@ -470,7 +542,6 @@ pub async fn load_costs(db: &Database) -> Result<Vec<Cost>> {
         .into_iter()
         .map(|row| {
             Ok(Cost {
-                id: row.id,
                 kind: match row.kind.as_str() {
                     "failed_tx" => CostKind::FailedTx,
                     "ai_cost" => CostKind::AiCost,
@@ -478,7 +549,6 @@ pub async fn load_costs(db: &Database) -> Result<Vec<Cost>> {
                 },
                 usd: decimal(&row.usd)?,
                 at: row.at,
-                mint: row.mint,
                 strategy_version: row.strategy_version,
             })
         })
@@ -518,7 +588,7 @@ struct ControlRow {
 pub async fn control(db: &Database) -> Result<Control> {
     let rows: Vec<ControlRow> = rows(
         db,
-        "SELECT paused, paused_at, paused_by FROM memecoin_paper_control WHERE record::id(id) = 'paper'",
+        "SELECT paused, paused_at, paused_by FROM memecoin_paper_control:paper",
         json!({}),
     )
     .await?;
@@ -550,9 +620,8 @@ pub async fn pause(db: &Database, device_id: &str) -> Result<()> {
 pub async fn resume(db: &Database, paused_at: OffsetDateTime) -> Result<bool> {
     let cleared: Vec<String> = rows(
         db,
-        "UPDATE memecoin_paper_control SET paused = false, paused_at = NONE, paused_by = NONE \
-         WHERE record::id(id) = 'paper' AND paused = true AND paused_at = <datetime>$paused_at \
-         RETURN VALUE record::id(id)",
+        "UPDATE memecoin_paper_control:paper SET paused = false, paused_at = NONE, paused_by = NONE \
+         WHERE paused = true AND paused_at = <datetime>$paused_at RETURN VALUE record::id(id)",
         json!({"paused_at": rfc3339(paused_at)?}),
     )
     .await?;
@@ -655,6 +724,8 @@ mod tests {
             cost_usd: d("25.011"),
             entry_liquidity_usd: d("80000"),
             opened_at: now - Duration::hours(2),
+            exit_failures: 0,
+            stuck: false,
             close: None,
         };
         open_trip(&db, &trip).await?;
@@ -687,26 +758,30 @@ mod tests {
         .await?;
         let trips = load_trips(&db).await?;
         assert_eq!(trips.len(), 2);
-        assert_eq!(trips[0].close, Some(close));
+        assert_eq!(trips[0].close, Some(close.clone()));
         assert_eq!(trips[0].tokens, trip.tokens);
         assert_eq!(trips[1].close, None);
         assert_eq!(recent_closed_trips(&db, 10).await?.len(), 1);
 
-        insert_cost(
-            &db,
-            &Cost {
-                id: "c1".into(),
-                kind: CostKind::FailedTx,
-                usd: d("0.011"),
-                at: now,
-                mint: Some(MINT.into()),
-                strategy_version: 3,
-            },
-        )
-        .await?;
+        // Exit failures count up to the cap, then the trip is stuck: still
+        // held, never closed or counted again.
+        assert_eq!(record_exit_failure(&db, "t2", 2).await?, Some(false));
+        assert_eq!(record_exit_failure(&db, "t2", 2).await?, Some(true));
+        assert_eq!(record_exit_failure(&db, "t2", 2).await?, None);
+        assert!(!close_trip(&db, "t2", &close).await?);
+        let stuck = &load_trips(&db).await?[1];
+        assert!(stuck.stuck && stuck.exit_failures == 2 && stuck.close.is_none());
+        assert_eq!(record_exit_failure(&db, "missing", 2).await?, None);
+
+        // Costs add up in one row per version, kind and day.
+        for usd in ["0.011", "0.004"] {
+            add_cost(&db, CostKind::FailedTx, 3, d(usd), now).await?;
+        }
+        add_cost(&db, CostKind::FailedTx, 3, d("1"), now - Duration::days(2)).await?;
         let costs = load_costs(&db).await?;
-        assert_eq!(costs.len(), 1);
-        assert_eq!(costs[0].kind, CostKind::FailedTx);
+        assert_eq!(costs.len(), 2);
+        assert_eq!(costs[1].usd, d("0.015"));
+        assert_eq!(costs[1].kind, CostKind::FailedTx);
 
         for (id, at) in [("g-old", now - Duration::days(40)), ("g-new", now)] {
             insert_gate_snapshot(
