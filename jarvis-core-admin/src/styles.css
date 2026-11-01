@@ -164,6 +164,13 @@ button.small, .btn-sm { min-height: 32px; padding: 0 12px; font-size: 13px; bord
 button:disabled, button.danger.ghost:disabled, .btn:disabled, .btn[aria-disabled="true"] {
   background: var(--bg-sunken); color: var(--text-disabled); box-shadow: none; border-color: transparent; cursor: not-allowed;
 }
+/* Busy: the spinner replaces the label in place, so nothing shifts. */
+button[aria-busy="true"] { position: relative; color: transparent; }
+button[aria-busy="true"]::after {
+  content: ""; position: absolute; inset: 0; width: 16px; height: 16px; margin: auto;
+  border: 2px solid var(--text-secondary); border-right-color: transparent; border-radius: var(--r-pill);
+}
+@media (prefers-reduced-motion: no-preference) { button[aria-busy="true"]::after { animation: spin 0.6s linear infinite; } }
 @media (prefers-reduced-motion: no-preference) {
   button:not(:disabled):active, .btn:not(:disabled):not([aria-disabled="true"]):active { transform: scale(0.96); }
 }
@@ -195,6 +202,11 @@ button:disabled, button.danger.ghost:disabled, .btn:disabled, .btn[aria-disabled
 .badge.pos { background: var(--positive-subtle); color: var(--positive-text); }
 .badge.neg { background: var(--negative-subtle); color: var(--negative-text); }
 .badge.dng { background: var(--danger-subtle); color: var(--danger-text); }
+/* A bare status dot (StatusBadge without a label) for compact cards. */
+.status-dot { display: inline-block; width: 6px; height: 6px; border-radius: var(--r-pill); background: var(--border-strong); }
+.status-dot.pos { background: var(--positive-solid); }
+.status-dot.neg { background: var(--negative-solid); }
+.status-dot.dng { background: var(--danger-solid); }
 
 /* Page header inside a node: title, description and the action row. */
 .page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
@@ -203,6 +215,7 @@ button:disabled, button.danger.ghost:disabled, .btn:disabled, .btn[aria-disabled
 .dash-section:focus { outline: none; }
 .page-header p:not(.eyebrow) { max-width: 720px; margin: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
 .page-actions, .action-row { display: flex; flex-wrap: wrap; gap: 8px; }
+fieldset.page-actions { min-width: 0; margin: 0; padding: 0; border: 0; }
 .busy { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 13px; white-space: nowrap; }
 .spinner { width: 16px; height: 16px; flex-shrink: 0; display: inline-block; border: 2px solid currentColor; border-right-color: transparent; border-radius: var(--r-pill); }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -223,7 +236,6 @@ button:disabled, button.danger.ghost:disabled, .btn:disabled, .btn[aria-disabled
 .metric-card strong { font-size: 22px; line-height: 1.2; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .metric-card > .card-label::first-letter { text-transform: uppercase; } /* data keys such as "release" */
 .metric-card small, .metric-card p { margin: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
-.status-badge { white-space: nowrap; }
 .card-list { display: grid; gap: 8px; }
 .card-list h2 { margin: 14px 0 4px; font-size: 15px; }
 .card-list > p { margin: 0; color: var(--text-secondary); font-size: 13px; }
@@ -234,14 +246,13 @@ button:disabled, button.danger.ghost:disabled, .btn:disabled, .btn[aria-disabled
 .detail-card dl { display: grid; grid-template-columns: minmax(90px, 0.4fr) 1fr; gap: 8px 12px; margin: 14px 0 0; font-size: 13px; }
 .security-note { color: var(--text-secondary); font-size: 13px; }
 .error-panel, .result-panel { margin: 0 0 16px; padding: 14px 18px; border-radius: var(--r-lg); overflow: hidden; }
+.result-panel { background: var(--bg-surface); box-shadow: var(--shadow-border); }
+.result-summary { display: flex; align-items: center; gap: 10px; margin: 0; line-height: 1.5; overflow-wrap: anywhere; }
+.result-panel summary { width: fit-content; margin-top: 8px; color: var(--text-secondary); font-size: 13px; cursor: pointer; }
 .error-panel { background: var(--danger-subtle); color: var(--text-primary); }
 .error-panel strong { color: var(--danger-text); }
 .error-panel p, .dialog p { margin: 6px 0 0; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
-.result-panel.success { background: var(--positive-subtle); }
-.result-panel.success strong { color: var(--positive-text); }
-.result-panel.failure { background: var(--danger-subtle); }
-.result-panel.failure strong { color: var(--danger-text); }
-.result-panel pre { max-width: 100%; margin: 10px 0 0; color: var(--text-primary); font: 12px/1.55 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.result-panel pre { max-width: 100%; margin: 8px 0 0; color: var(--text-primary); font: 12px/1.55 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
 .empty-state { display: grid; place-items: center; min-height: 120px; padding: 16px; color: var(--text-secondary); font-size: 13px; text-align: center; }
 
 /* Tables */
@@ -288,7 +299,7 @@ input[type="checkbox"] { width: 18px; height: 18px; min-height: 0; margin: 0; pa
 .tree-agent { justify-content: space-between; padding-left: 14px; font-weight: 400; }
 .tree-agent small { color: var(--text-secondary); }
 .tree-agent.selected { background: var(--bg-selected); color: var(--accent-text); }
-.tree-agent .status-badge { margin-left: auto; }
+.tree-agent .badge { margin-left: auto; }
 @media (hover: hover) and (pointer: fine) {
   .tree-group-button:not(:disabled):hover, .tree-agent:not(.selected):not(:disabled):hover { background: var(--bg-hover); box-shadow: none; }
   .tree-agent.selected:hover { background: var(--bg-selected); box-shadow: none; }
@@ -342,6 +353,7 @@ input[type="checkbox"] { width: 18px; height: 18px; min-height: 0; margin: 0; pa
 .dialog p { color: var(--text-secondary); font-size: 14px; }
 .dialog label { display: flex; flex-direction: column; gap: 6px; margin-top: 16px; font-size: 13px; font-weight: 500; }
 .dialog-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+.dialog .dialog-actions button { max-width: 100%; padding-block: 8px; white-space: normal; overflow-wrap: anywhere; line-height: 1.3; }
 .routes-dialog { width: min(1120px, 100%); }
 .card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
 .modal-loading { display: flex; align-items: center; gap: 10px; min-height: 130px; color: var(--text-secondary); font-size: 13px; }
@@ -437,6 +449,7 @@ input[type="checkbox"] { width: 18px; height: 18px; min-height: 0; margin: 0; pa
 .lock-screen .jv-panel { width: 100%; }
 .lock-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; }
 .lock-actions small { color: var(--text-secondary); font-size: 13px; }
+.lock-note { margin: 0; padding: 12px 14px; border-radius: var(--r-md); background: var(--bg-sunken); color: var(--text-secondary); font-size: 13px; }
 .lock-error { padding: 12px 14px; border-radius: var(--r-md); background: var(--danger-subtle); color: var(--danger-text); font-size: 13px; overflow-wrap: anywhere; }
 
 @media (max-width: 1099px), (max-height: 759px) {

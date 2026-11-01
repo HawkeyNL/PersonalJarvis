@@ -18,6 +18,7 @@ const maxOutput = ref("");
 const sort = ref("provider");
 const busy = ref(false);
 const error = ref("");
+const errorTitle = ref<string>();
 const result = ref<OperationResult | null>(null);
 const disableTarget = ref<ModelRecord | null>(null);
 const selectedHf = ref<ModelRecord | null>(null);
@@ -27,6 +28,7 @@ const routeLoading = ref(false);
 const routeSaving = ref(false);
 const routeBusy = computed(() => routeLoading.value || routeSaving.value);
 const routeError = ref("");
+const routeErrorTitle = ref<string>();
 const routeResult = ref<OperationResult | null>(null);
 const currentPage = ref(1);
 const PAGE_SIZE = 25;
@@ -67,7 +69,7 @@ function price(value: number | null): string {
 async function load() {
   busy.value = true; error.value = "";
   try { rows.value = await api.models(); }
-  catch (reason) { error.value = errorText(reason); }
+  catch (reason) { error.value = errorText(reason); errorTitle.value = "Could not load models"; }
   finally { busy.value = false; }
 }
 async function mutate(action: "refresh" | "enable" | "disable", row?: ModelRecord) {
@@ -77,7 +79,7 @@ async function mutate(action: "refresh" | "enable" | "disable", row?: ModelRecor
     if (action === "refresh" && provider.value !== "all") request.provider = provider.value;
     if (row) { request.provider = row.provider; request.model = row.model; }
     result.value = await api.modelMutation(request); await load();
-  } catch (reason) { error.value = errorText(reason); }
+  } catch (reason) { error.value = errorText(reason); errorTitle.value = undefined; }
   finally { busy.value = false; }
 }
 const registerProvider = ref("codex-cli");
@@ -88,7 +90,7 @@ async function registerSubscription() {
   try {
     result.value = await api.modelMutation({ action: "register", provider: registerProvider.value, model: registerModel.value.trim() });
     registerModel.value = ""; await load();
-  } catch (reason) { error.value = errorText(reason); }
+  } catch (reason) { error.value = errorText(reason); errorTitle.value = undefined; }
   finally { busy.value = false; }
 }
 async function inspectHf(row: ModelRecord) {
@@ -98,7 +100,7 @@ async function inspectHf(row: ModelRecord) {
   try {
     const details = await api.modelProviders(row.model);
     if (request === routeRequest) { hfDetails.value = details; selectedRoute.value = row.route ?? "auto"; }
-  } catch (reason) { if (request === routeRequest) routeError.value = errorText(reason); }
+  } catch (reason) { if (request === routeRequest) { routeError.value = errorText(reason); routeErrorTitle.value = "Could not load routes"; } }
   finally { if (request === routeRequest) routeLoading.value = false; }
 }
 async function saveRoute() {
@@ -112,7 +114,7 @@ async function saveRoute() {
     hfDetails.value = await api.modelProviders(row.model);
     selectedRoute.value = selectedHf.value.route ?? "auto";
     routeResult.value = operation;
-  } catch (reason) { routeError.value = errorText(reason); }
+  } catch (reason) { routeError.value = errorText(reason); routeErrorTitle.value = undefined; }
   finally { routeSaving.value = false; }
 }
 function closeRoutes() {
@@ -131,7 +133,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
   <PageHeader title="Models &amp; routing" description="Exact owner policy with reviewed per-million-token pricing. Unknown prices are never displayed as free." :busy="busy">
     <button class="secondary" @click="load">Refresh view</button><button @click="mutate('refresh')">Refresh catalog</button>
   </PageHeader>
-  <ErrorPanel v-if="error" :message="error" /><ResultPanel v-if="result" :result="result" />
+  <ErrorPanel v-if="error" :message="error" :title="errorTitle" /><ResultPanel v-if="result" :result="result" />
   <ModelRouting :models="rows" />
   <LayaCard />
   <form class="model-toolbar register-form" @submit.prevent="registerSubscription">
@@ -162,7 +164,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
   <div v-if="selectedHf" class="dialog-backdrop" @click.self="closeRoutes">
     <section class="dialog routes-dialog" role="dialog" aria-modal="true" aria-labelledby="routes-title">
       <div class="card-heading"><div><span class="card-label">Hugging Face inference providers</span><h2 id="routes-title" class="mono wrap-anywhere">{{ selectedHf.model }}</h2></div><button class="small secondary" :disabled="routeSaving" @click="closeRoutes">Close</button></div>
-      <ErrorPanel v-if="routeError" :message="routeError" /><ResultPanel v-if="routeResult" :result="routeResult" />
+      <ErrorPanel v-if="routeError" :message="routeError" :title="routeErrorTitle" /><ResultPanel v-if="routeResult" :result="routeResult" />
       <div v-if="routeLoading && !hfDetails" class="modal-loading"><span class="spinner" />Loading available routes…</div>
       <template v-if="hfDetails">
         <div class="route-controls"><select v-model="selectedRoute" :disabled="routeBusy" aria-label="Hugging Face route"><option v-for="route in hfDetails.routes" :key="route" :value="route">{{ route }}</option></select><button :disabled="routeBusy" @click="saveRoute">{{ routeSaving ? 'Saving…' : 'Save route' }}</button></div>
@@ -173,5 +175,5 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
       </template>
     </section>
   </div>
-  <ConfirmDialog v-if="disableTarget" title="Disable this model?" :detail="`${disableTarget.provider}/${disableTarget.model} will no longer be eligible for routing.`" confirm-label="Disable model" @cancel="disableTarget = null" @confirm="mutate('disable', disableTarget ?? undefined)" />
+  <ConfirmDialog v-if="disableTarget" title="Disable this model?" :detail="`${disableTarget.provider}/${disableTarget.model} will no longer be eligible for routing.`" :confirm-label="`Disable ${disableTarget.model}`" tone="danger" @cancel="disableTarget = null" @confirm="mutate('disable', disableTarget ?? undefined)" />
 </template>

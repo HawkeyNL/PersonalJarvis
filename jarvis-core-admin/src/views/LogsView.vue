@@ -19,7 +19,7 @@ watch(service, () => load()); watch(follow, syncFollow); onMounted(load); onBefo
 <template>
   <div class="logs-page">
     <PageHeader title="Logs" description="Bounded, sanitized and parsed output from the fixed Jarvis journal allowlist." :busy="busy"><button class="secondary" @click="() => load()">Refresh</button><button :class="follow ? 'active-button' : 'secondary'" @click="follow = !follow">{{ follow ? "Following" : "Follow" }}</button></PageHeader>
-    <ErrorPanel v-if="error" :message="error" />
+    <ErrorPanel v-if="error" title="Could not load logs" :message="error" />
     <section class="log-toolbar">
       <label>Service<select v-model="service"><option v-for="item in services" :key="item.value" :value="item.value">{{ item.label }}</option></select></label>
       <label>Level<select v-model="level"><option v-for="item in ['ALL','ERROR','WARN','INFO','DEBUG','SYSTEM']" :key="item">{{ item }}</option></select></label>

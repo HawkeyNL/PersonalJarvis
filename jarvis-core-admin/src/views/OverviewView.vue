@@ -3,13 +3,14 @@ import { computed, onMounted, provide, ref } from "vue";
 import {
   aiAccountLabels, api, credentialLabels, errorText,
   type AiAccountRecord, type CredentialRecord, type DeviceOverview, type ModelRecord,
-  type OverviewResponse, type RouteTier, type RoutingReport, type Tone, type UsageReport, type ViewName,
+  type OverviewResponse, type RouteTier, type RoutingReport, type UsageReport, type ViewName,
 } from "../admin";
+import { keyedState, stateLabel, toneOf, type Tone } from "../status";
 import DailyUsageChart from "../components/DailyUsageChart.vue";
 import HealthView from "./HealthView.vue";
 import ServicesView from "./ServicesView.vue";
 import JvModuleCard from "../components/jv/JvModuleCard.vue";
-import JvStatusDot from "../components/jv/JvStatusDot.vue";
+import StatusBadge from "../components/StatusBadge.vue";
 import { NOT_MEASURED, budgetPercent, compact, eur, integer, measured, ms, serviceSummary } from "../stats";
 
 // Stats-first dashboard. Every number comes from the same trusted broker
@@ -72,19 +73,18 @@ const serviceCard = computed(() => {
   const down = Object.entries(data.status.services).filter(([, state]) => state.toLowerCase() !== "active").map(([name]) => name);
   return {
     value: `${services.value.up} / ${services.value.total} up`,
-    lines: [down.length ? `Not active: ${down.join(", ")}` : "Every Jarvis service is active", `Updater ${data.status.updater_enabled}`],
+    lines: [down.length ? `Not active: ${down.join(", ")}` : "Every Jarvis service is active", `Updates: ${stateLabel(keyedState("updater", data.status.updater_enabled))}`],
     tone: services.value.tone,
   };
 });
 const releaseCard = computed(() => {
   const data = overview.value.data;
   if (!data) return overview.value.error ? unavailable(overview.value.error) : pending;
-  const state = data.update?.update ?? "not checked";
-  const lower = state.toLowerCase();
+  const state = data.update?.update ? keyedState("update", data.update.update) : "";
   return {
     value: data.status.release ?? "Unavailable",
-    lines: [`Update: ${state}`, data.update?.latest ? `Latest release ${data.update.latest}` : "Check for updates in Releases"],
-    tone: (lower.includes("available") || lower.includes("required") ? "warn" : lower.includes("up to date") ? "ok" : "idle") as Tone,
+    lines: [`Update: ${state ? stateLabel(state) : "Not checked"}`, data.update?.latest ? `Latest release ${data.update.latest}` : "Check for updates in Releases"],
+    tone: state ? toneOf(state) : "idle",
   };
 });
 const agentCard = computed(() => {
@@ -149,7 +149,7 @@ const accountCard = computed(() => {
   const troubled = rows.some((row) => !["connected", "logged_out"].includes(row.state));
   return {
     value: `${connected} / ${rows.length} connected`,
-    lines: rows.map((row) => `${aiAccountLabels[row.provider]}: ${row.state.replace(/_/g, " ")}`),
+    lines: rows.map((row) => `${aiAccountLabels[row.provider]}: ${stateLabel(row.state)}`),
     tone: (troubled ? "warn" : connected ? "ok" : "idle") as Tone,
   };
 });
@@ -168,7 +168,7 @@ const credentialCard = computed(() => {
         <p class="eyebrow">Home Node health</p>
         <h1>{{ headline }}</h1>
         <div class="hero-pill" role="status">
-          <JvStatusDot :tone="healthTone" :label="healthTone === 'ok' ? 'Healthy' : healthTone === 'warn' ? 'Degraded' : healthTone === 'error' ? 'Attention' : 'Unknown'" />
+          <StatusBadge :tone="healthTone" :label="healthTone === 'ok' ? 'Healthy' : healthTone === 'warn' ? 'Degraded' : healthTone === 'error' ? 'Attention' : 'Unknown'" />
           <span class="pill-sep" aria-hidden="true"></span>
           <span>{{ overview.data?.status.release ?? "Release unknown" }}</span>
         </div>

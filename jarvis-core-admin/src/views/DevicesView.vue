@@ -7,13 +7,14 @@ import ConfirmDialog from "../components/ConfirmDialog.vue";
 const data = ref<DeviceOverview | null>(null);
 const busy = ref(false);
 const error = ref("");
+const errorTitle = ref<string>();
 const result = ref("");
-const selection = ref<{ request: DeviceAction; title: string; detail: string } | null>(null);
+const selection = ref<{ request: DeviceAction; title: string; detail: string; label: string; tone: "primary" | "neutral" | "danger" } | null>(null);
 const emit = defineEmits<{ pairings: [count: number] }>();
 async function load() {
   busy.value = true; error.value = "";
   try { data.value = await api.devices(); emit("pairings", data.value.requests.length); }
-  catch (e) { error.value = errorText(e); }
+  catch (e) { error.value = errorText(e); errorTitle.value = "Could not load devices"; }
   finally { busy.value = false; }
 }
 async function apply() {
@@ -24,7 +25,7 @@ async function apply() {
     await api.deviceAction(selected.request);
     result.value = "Device access updated through local system authorization.";
     await load();
-  } catch (e) { error.value = errorText(e); }
+  } catch (e) { error.value = errorText(e); errorTitle.value = undefined; }
   finally { busy.value = false; }
 }
 onMounted(load);
@@ -33,7 +34,7 @@ onMounted(load);
   <PageHeader title="Devices" description="Home Node owner control. Every change requests the computer administrator password through the system dialog." :busy="busy">
     <button class="secondary" :disabled="busy" @click="load">Refresh</button>
   </PageHeader>
-  <ErrorPanel v-if="error" :message="error" />
+  <ErrorPanel v-if="error" :message="error" :title="errorTitle" />
   <p v-if="result" role="status">{{ result }}</p>
   <section v-if="data" class="card-list">
     <h2>Waiting for approval</h2>
@@ -45,18 +46,18 @@ onMounted(load);
         <p>Expires: {{ new Date(request.expires_at * 1000).toLocaleString() }}</p>
       </div>
       <div class="action-row">
-      <button :disabled="busy" @click="selection = { request: {action: 'approve', request_id: request.id, fingerprint: request.fingerprint}, title: `Allow ${request.name}?`, detail: `Confirm that this is your device. Fingerprint: ${request.fingerprint}` }">Allow…</button>
-      <button class="secondary" :disabled="busy" @click="selection = { request: {action: 'deny', request_id: request.id}, title: `Deny ${request.name}?`, detail: 'This pending request will be rejected.' }">Deny…</button>
+      <button :disabled="busy" @click="selection = { request: {action: 'approve', request_id: request.id, fingerprint: request.fingerprint}, title: `Allow ${request.name}?`, detail: `Confirm that this is your device. Fingerprint: ${request.fingerprint}. The system asks for the administrator password next.`, label: `Allow ${request.name}`, tone: 'primary' }">Allow…</button>
+      <button class="secondary" :disabled="busy" @click="selection = { request: {action: 'deny', request_id: request.id}, title: `Deny ${request.name}?`, detail: 'This pending request will be rejected. The system asks for the administrator password next.', label: `Deny ${request.name}`, tone: 'neutral' }">Deny…</button>
       </div>
     </article>
     <h2>Trusted devices</h2>
     <p v-if="!data.devices.length">No active devices. First-device activation uses the local one-time code.</p>
     <article v-for="device in data.devices" :key="device.id" class="row-card">
       <strong>{{ device.name }} · {{ device.platform }}</strong>
-      <button class="danger" :disabled="busy" @click="selection = { request: {action: 'revoke', device_id: device.id}, title: `Revoke ${device.name}?`, detail: 'This ends its sessions and live connections. Revoking every device does not reopen first-device activation.' }">Revoke…</button>
+      <button class="danger" :disabled="busy" @click="selection = { request: {action: 'revoke', device_id: device.id}, title: `Revoke ${device.name}?`, detail: 'This ends its sessions and live connections. Revoking every device does not reopen first-device activation. The system asks for the administrator password next.', label: `Revoke ${device.name}`, tone: 'danger' }">Revoke…</button>
     </article>
   </section>
-  <ConfirmDialog v-if="selection" :title="selection.title" :detail="selection.detail" confirm-label="Continue to system authorization" @cancel="selection = null" @confirm="apply" />
+  <ConfirmDialog v-if="selection" :title="selection.title" :detail="selection.detail" :confirm-label="selection.label" :tone="selection.tone" @cancel="selection = null" @confirm="apply" />
 </template>
 <style scoped>
 .device-request { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
