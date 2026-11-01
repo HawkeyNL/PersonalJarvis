@@ -40,7 +40,7 @@ onMounted(load);
 </script>
 
 <template>
-  <PageHeader title="Usage & Costs" description="Bounded monthly token, cost, latency and reliability aggregates. Prompts, replies, credentials and request identifiers never enter this view." :busy="busy">
+  <PageHeader title="Usage &amp; costs" description="Bounded monthly token, cost, latency and reliability aggregates. Prompts, replies, credentials and request identifiers never enter this view." :busy="busy">
     <button class="secondary" @click="load">Refresh</button>
   </PageHeader>
   <ErrorPanel v-if="error && !initializing" :message="error" />

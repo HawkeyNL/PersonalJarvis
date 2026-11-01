@@ -1,18 +1,22 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, provide, ref } from "vue";
 import {
   aiAccountLabels, api, credentialLabels, errorText,
   type AiAccountRecord, type CredentialRecord, type DeviceOverview, type ModelRecord,
   type OverviewResponse, type RouteTier, type RoutingReport, type Tone, type UsageReport, type ViewName,
 } from "../admin";
 import DailyUsageChart from "../components/DailyUsageChart.vue";
+import HealthView from "./HealthView.vue";
+import ServicesView from "./ServicesView.vue";
 import JvModuleCard from "../components/jv/JvModuleCard.vue";
 import JvStatusDot from "../components/jv/JvStatusDot.vue";
 import { NOT_MEASURED, budgetPercent, compact, eur, integer, measured, ms, serviceSummary } from "../stats";
 
 // Stats-first dashboard. Every number comes from the same trusted broker
 // commands as the detail views; a source that fails only blanks its own card.
-const emit = defineEmits<{ open: [view: ViewName] }>();
+const emit = defineEmits<{ open: [view: ViewName]; pairings: [count: number] }>();
+// Health and Services are sections of this page, so their headers are h2.
+provide("pageHeadingLevel", 2);
 type Source<T> = { data: T | null; error: string };
 const empty = <T,>(): Source<T> => ({ data: null, error: "" });
 const overview = ref<Source<OverviewResponse>>(empty());
@@ -36,10 +40,16 @@ async function load() {
     settle(routes, api.modelRoutes()), settle(devices, api.devices()), settle(accounts, api.aiAccounts()),
     settle(credentials, api.credentials()),
   ]);
+  if (devices.value.data) emit("pairings", devices.value.data.requests.length);
   updatedAt.value = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
   busy.value = false;
 }
 onMounted(load);
+const servicesSection = ref<HTMLElement | null>(null);
+function showServices() {
+  servicesSection.value?.scrollIntoView({ block: "start" });
+  servicesSection.value?.focus({ preventScroll: true });
+}
 
 const services = computed(() => serviceSummary(overview.value.data?.status.services));
 const healthTone = computed<Tone>(() => (overview.value.error && !overview.value.data ? "error" : services.value.tone));
@@ -73,7 +83,7 @@ const releaseCard = computed(() => {
   const lower = state.toLowerCase();
   return {
     value: data.status.release ?? "Unavailable",
-    lines: [`Update: ${state}`, data.update?.latest ? `Latest release ${data.update.latest}` : "Check for updates in Update"],
+    lines: [`Update: ${state}`, data.update?.latest ? `Latest release ${data.update.latest}` : "Check for updates in Releases"],
     tone: (lower.includes("available") || lower.includes("required") ? "warn" : lower.includes("up to date") ? "ok" : "idle") as Tone,
   };
 });
@@ -171,8 +181,8 @@ const credentialCard = computed(() => {
     </header>
 
     <div class="dash-grid">
-      <JvModuleCard icon="layers" title="Services" v-bind="serviceCard" @open="emit('open', 'services')" />
-      <JvModuleCard icon="download" title="Release" v-bind="releaseCard" @open="emit('open', 'update')" />
+      <JvModuleCard icon="layers" title="Services" v-bind="serviceCard" @open="showServices" />
+      <JvModuleCard icon="download" title="Releases" v-bind="releaseCard" @open="emit('open', 'releases')" />
       <JvModuleCard icon="agents" title="Agents" v-bind="agentCard" @open="emit('open', 'agents')" />
 
       <JvModuleCard class="wide" icon="chart" title="Spend this month" :value="spendCard.value" :lines="spendCard.lines" :tone="spendCard.tone" @open="emit('open', 'usage')">
@@ -205,6 +215,11 @@ const credentialCard = computed(() => {
         </span>
       </JvModuleCard>
     </div>
+
+    <section ref="servicesSection" class="dash-section" tabindex="-1" aria-label="Health and services">
+      <HealthView />
+      <ServicesView />
+    </section>
   </div>
 </template>
 

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-// Core Admin top bar: brand on the left, the current node title in the
-// centre, and the session cluster (right slot) supplied by the shell.
-defineProps<{ title: string; subtitle?: string }>();
+// Core Admin top bar: brand on the left, an optional title in the centre,
+// and the session cluster (right slot) supplied by the shell.
+defineProps<{ title?: string; subtitle?: string }>();
 </script>
 
 <template>
@@ -14,7 +14,7 @@ defineProps<{ title: string; subtitle?: string }>();
     </div>
 
     <div class="center">
-      <div class="title">
+      <div v-if="title" class="title">
         <h1>{{ title }}</h1>
         <p v-if="subtitle">{{ subtitle }}</p>
       </div>

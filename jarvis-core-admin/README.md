@@ -131,16 +131,20 @@ an update when Core, CLI, the graphical app, or multiple components changed.
 
 ## Scope
 
-The app uses the Jarvis redesign's visual language (bundled OFL fonts, no
-remote assets) and groups its views into four nodes: Overview, Operations
-(Health, Services, Logs), Intelligence (Agents, Models, Usage & Costs) and
-Administration (Devices, AI Accounts, Credentials, Persona, Update, System). Overview
-is a read-only dashboard of service health, release and update state, monthly
-spend, latency and reliability, models and routing, agents, devices, AI
-accounts and credentials; each card opens its detail view. The Models view
+The app uses the Jarvis Instrument design (bundled OFL fonts, no remote
+assets) with one flat sidebar: Overview, Devices and Releases, an AI section
+(Models & routing, Accounts & keys with AI accounts and Credentials as
+sub-tabs, Usage & costs, Agents, Persona) and a Diagnostics section (Logs,
+System). Devices shows the number of pending pairings as a badge, taken from
+data the Overview and Devices views already load. The top bar shows the root
+session and the time it locks, with **Lock now**. Overview is a read-only
+dashboard of service health, release and update state, monthly spend, latency
+and reliability, models and routing, agents, devices, AI accounts and
+credentials, followed by the Health and Services sections; each card opens its
+detail view. The Models view
 can filter and sort exact reviewed per-million-token prices, shows at most 25
 rows per page and presents Hugging Face route selection in a focused modal;
-unknown remote prices remain visibly unknown. Usage & Costs shows bounded
+unknown remote prices remain visibly unknown. Usage & costs shows bounded
 current-month request, token and estimated-cost aggregates by day, provider,
 model and agent, with latency p50/p95, failures and fallbacks. A dimension
 that an older Core omits or does not instrument yet reads "Not measured yet",
@@ -153,7 +157,7 @@ structured where possible, searchable/filterable, selectable, wrapped and
 optionally followed through bounded polling of the allowlisted direct CLI
 operation.
 
-Core writes the bounded Usage & Costs aggregate at startup, after metered
+Core writes the bounded Usage & costs aggregate at startup, after metered
 model calls and on a periodic recovery interval. A not-yet-created snapshot is
 shown as an initializing empty state instead of a generic failed-operation
 panel.
@@ -165,7 +169,7 @@ or Markdown prompt bodies. **Check** compares the configured, allowlisted
 uses the existing trusted validator and transactional Core-readiness rollback
 path before the refreshed safe tree is displayed.
 
-The Persona page (Administration) shows only the installed, candidate and
+The Persona page (AI section) shows only the installed, candidate and
 history SHA-256 hashes, sizes, times, the candidate's signature state and
 fixed validation and source problem codes; persona text and host paths never
 reach the GUI. **Install

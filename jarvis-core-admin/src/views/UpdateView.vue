@@ -19,7 +19,7 @@ async function execute() { const action = pending.value; pending.value = null; i
 onMounted(() => load(false));
 </script>
 <template>
-  <PageHeader title="Update Center" description="Release verification, staging, activation and rollback remain owned by the trusted Core updater." :busy="busy"><button class="secondary" @click="load(false)">Refresh</button><button class="secondary" @click="load(true)">Check for updates</button></PageHeader>
+  <PageHeader title="Releases" description="Release verification, staging, activation and rollback remain owned by the trusted Core updater." :busy="busy"><button class="secondary" @click="load(false)">Refresh</button><button class="secondary" @click="load(true)">Check for updates</button></PageHeader>
   <ErrorPanel v-if="error" :message="error" /><ResultPanel v-if="result" :result="result" />
   <section class="metric-grid update-metrics"><article v-for="(value, key) in status" :key="key" class="metric-card"><span class="card-label">{{ key }}</span><StatusBadge v-if="key === 'update' || key === 'updater'" :state="value" /><strong v-else>{{ value }}</strong></article></section>
   <section class="action-card"><div><h2>Install a verified release</h2><p>GNOME will request administrator authorization. No password enters this application.</p></div><div class="action-row"><button @click="pending = 'latest'">Update to latest</button><input v-model="version" placeholder="v0.0.17" aria-label="Specific version" /><button class="secondary" :disabled="!version" @click="pending = 'version'">Install version</button><button class="danger ghost" @click="pending = 'rollback'">Rollback</button></div></section>
