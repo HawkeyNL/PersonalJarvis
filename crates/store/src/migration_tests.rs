@@ -193,7 +193,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         format!("CREATE ibkr_positions SET id = '{id}', conid = {id}, symbol = 'VWCE', asset_class = 'STK', currency = 'EUR', quantity = '12.5', avg_cost = '101.25', last_price = '120', market_value = '1500', unrealized_pnl = '-3.5'{extra};")
     };
     db.query(position("1", "")).await?.check()?;
-    db.query("UPSERT ibkr_portfolio:current SET id = 'current', as_of = time::now(), base_currency = 'EUR', net_liquidation = '2500.5', cash = '-1000';")
+    db.query("UPSERT ibkr_portfolio:current SET id = 'current', as_of = time::now(), base_currency = 'EUR', net_liquidation = '2500.5', cash = '-1000', skipped_count = 2, skipped_positions = [{ symbol: 'AAPL', currency: 'USD' }, { symbol: 'NOCUR' }];")
         .await?
         .check()?;
     db.query("UPSERT ibkr_portfolio_history:⟨2026-11-01⟩ SET id = '2026-11-01', t = time::now(), value = '2500.5';")
@@ -211,6 +211,10 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         position("6", "").replace("conid = 6", "conid = 0"),
         "UPSERT ibkr_portfolio:current SET base_currency = 'USD';".to_string(),
         "UPSERT ibkr_portfolio:current SET cash = '1,5';".to_string(),
+        "UPSERT ibkr_portfolio:current SET skipped_count = -1;".to_string(),
+        "UPSERT ibkr_portfolio:current SET skipped_positions = [{ symbol: 'AAPL', currency: 'usd' }];".to_string(),
+        "UPSERT ibkr_portfolio:current SET skipped_positions = [{ symbol: '' }];".to_string(),
+        format!("UPSERT ibkr_portfolio:current SET skipped_positions = [{}];", ["{ symbol: 'X' }"; 51].join(", ")),
         "CREATE ibkr_portfolio_history SET id = 'x', t = time::now(), value = 'NaN';".to_string(),
     ] {
         assert!(db.query(&bad).await?.check().is_err(), "{bad}");

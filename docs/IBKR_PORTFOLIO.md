@@ -13,9 +13,12 @@ it is off, or the broker account does not exist, the trading routes answer
 `503` ("not configured") and Core makes no broker call.
 
 Scope: one IBKR **cash account** with base currency **EUR**, and positions
-in EUR. Anything else (a second account, another base currency, a position
-in another currency, a value Core cannot parse) refuses the sync: the last
-good data stays and shows as stale in the app, and the Core log says why.
+in EUR. A position in another currency (or without one) is not shown: the
+sync leaves it out, the API reports it in `skipped_positions` and the Core log
+warns once whenever that set changes. Anything else (a second account,
+another base currency, a value Core cannot parse, also in a skipped position)
+refuses the sync: the last good data stays and shows as stale in the app, and
+the Core log says why.
 
 ## Enabling it (owner)
 
@@ -54,7 +57,12 @@ report the price delay; the app shows it as "delay unknown".
 
 - `GET /v1/trading/portfolio`: `base_currency`, `net_liquidation`, `cash`
   and `positions` (largest market value first, with `weight_pct` as a share
-  of net liquidation).
+  of net liquidation). When positions were left out for their currency, also
+  `skipped_count` and `skipped_positions` (at most 50, sorted by symbol:
+  `symbol` and, if IBKR reported a three-letter code, `currency`); both are
+  absent otherwise. `net_liquidation` stays as IBKR reports it and includes
+  the skipped positions, so the shown weights then add up to less than the
+  non-cash share of the account.
 - `GET /v1/trading/portfolio/history?range=1M|3M|1Y|ALL`: daily points,
   oldest first.
 - `GET /v1/trading/instruments/{conid}/bars?range=1D|1W|1M|3M|1Y|5Y`: bars

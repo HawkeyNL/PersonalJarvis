@@ -7,7 +7,7 @@
 use std::str::FromStr;
 
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -18,6 +18,8 @@ use jarvis_store::Database;
 pub const BASE_CURRENCY: &str = "EUR";
 /// The most positions one sync may store (the app's limit as well).
 pub const MAX_POSITIONS: usize = 1000;
+/// The most skipped positions one sync reports by name.
+pub const MAX_SKIPPED: usize = 50;
 /// Daily history points are kept this long.
 pub const HISTORY_DAYS: u32 = 3650;
 /// The most history points one read returns.
@@ -65,14 +67,27 @@ pub struct Holding {
     pub unrealized_pnl: Option<Decimal>,
 }
 
+/// A valid position the sync left out because it is not in
+/// [`BASE_CURRENCY`]. `currency` is absent when the broker reported none or
+/// no three-letter code.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Skipped {
+    pub symbol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+}
+
 /// The account at one good sync. Positions are sorted by market value,
-/// largest first.
+/// largest first. `skipped` holds at most [`MAX_SKIPPED`] of the
+/// `skipped_count` positions left out, sorted by symbol.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Portfolio {
     pub as_of: OffsetDateTime,
     pub net_liquidation: Decimal,
     pub cash: Decimal,
     pub positions: Vec<Holding>,
+    pub skipped: Vec<Skipped>,
+    pub skipped_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,7 +141,7 @@ fn position_row(holding: &Holding) -> Value {
 /// liquidation as the point of its UTC day, in one transaction. History
 /// older than [`HISTORY_DAYS`] is pruned on the way.
 pub async fn write_snapshot(db: &Database, portfolio: &Portfolio) -> Result<()> {
-    if portfolio.positions.len() > MAX_POSITIONS {
+    if portfolio.positions.len() > MAX_POSITIONS || !skipped_fits(portfolio) {
         return Err(IbkrStoreError::InvalidData);
     }
     let day = portfolio.as_of.date().to_string();
@@ -135,7 +150,8 @@ pub async fn write_snapshot(db: &Database, portfolio: &Portfolio) -> Result<()> 
          DELETE ibkr_positions RETURN NONE; \
          FOR $p IN $positions {{ CREATE ibkr_positions CONTENT $p RETURN NONE; }}; \
          UPSERT ibkr_portfolio:current SET id = 'current', as_of = <datetime>$as_of, \
-         base_currency = $base, net_liquidation = $net_liquidation, cash = $cash RETURN NONE; \
+         base_currency = $base, net_liquidation = $net_liquidation, cash = $cash, \
+         skipped_count = $skipped_count, skipped_positions = $skipped RETURN NONE; \
          UPSERT $day SET id = $day_key, t = <datetime>$as_of, value = $net_liquidation RETURN NONE; \
          DELETE ibkr_portfolio_history WHERE t < time::now() - {HISTORY_DAYS}d RETURN NONE; \
          COMMIT TRANSACTION;"
@@ -146,6 +162,8 @@ pub async fn write_snapshot(db: &Database, portfolio: &Portfolio) -> Result<()> 
         "base": BASE_CURRENCY,
         "net_liquidation": portfolio.net_liquidation.to_string(),
         "cash": portfolio.cash.to_string(),
+        "skipped_count": portfolio.skipped_count,
+        "skipped": portfolio.skipped,
         "day_key": day,
     }))
     .bind((
@@ -181,6 +199,17 @@ struct PortfolioRow {
     net_liquidation: String,
     cash: String,
     positions: Vec<PositionRow>,
+    skipped_count: usize,
+    skipped_positions: Vec<Skipped>,
+}
+
+/// At most [`MAX_SKIPPED`] named, never more than counted, at least one
+/// named when any is counted (as the app requires), and no more positions in
+/// all than one sync may hold.
+fn skipped_fits(portfolio: &Portfolio) -> bool {
+    portfolio.skipped.len() <= MAX_SKIPPED.min(portfolio.skipped_count)
+        && portfolio.skipped.is_empty() == (portfolio.skipped_count == 0)
+        && portfolio.positions.len() + portfolio.skipped_count <= MAX_POSITIONS
 }
 
 /// The last good sync, or `None` before the first one. One statement, so
@@ -188,7 +217,7 @@ struct PortfolioRow {
 pub async fn load_portfolio(db: &Database) -> Result<Option<Portfolio>> {
     let rows: Vec<PortfolioRow> = db
         .query(format!(
-            "SELECT as_of, base_currency, net_liquidation, cash, \
+            "SELECT as_of, base_currency, net_liquidation, cash, skipped_count, skipped_positions, \
              (SELECT conid, symbol, name, asset_class, currency, quantity, avg_cost, \
              last_price, market_value, unrealized_pnl FROM ibkr_positions LIMIT {}) AS positions \
              FROM ibkr_portfolio:current",
@@ -222,12 +251,18 @@ pub async fn load_portfolio(db: &Database) -> Result<Option<Portfolio>> {
         })
         .collect::<Result<Vec<_>>>()?;
     sort_positions(&mut positions);
-    Ok(Some(Portfolio {
+    let portfolio = Portfolio {
         as_of: row.as_of,
         net_liquidation: decimal(&row.net_liquidation)?,
         cash: decimal(&row.cash)?,
         positions,
-    }))
+        skipped: row.skipped_positions,
+        skipped_count: row.skipped_count,
+    };
+    if !skipped_fits(&portfolio) {
+        return Err(IbkrStoreError::InvalidData);
+    }
+    Ok(Some(portfolio))
 }
 
 /// Largest market value first, then by contract id for a stable order.
@@ -355,6 +390,17 @@ mod tests {
                 },
                 holding(1, "1500.75"),
             ],
+            skipped: vec![
+                Skipped {
+                    symbol: "AAPL".into(),
+                    currency: Some("USD".into()),
+                },
+                Skipped {
+                    symbol: "NOCUR".into(),
+                    currency: None,
+                },
+            ],
+            skipped_count: 3,
         };
         write_snapshot(&db, &first).await?;
         sort_positions(&mut first.positions);
@@ -368,6 +414,23 @@ mod tests {
             })
         );
 
+        // More skipped positions named than counted, or than the limit, or
+        // none named while some are counted, are refused.
+        let overnamed = Portfolio {
+            skipped_count: 1,
+            ..first.clone()
+        };
+        let unnamed = Portfolio {
+            skipped: vec![],
+            ..first.clone()
+        };
+        for bad in [&overnamed, &unnamed] {
+            assert!(matches!(
+                write_snapshot(&db, bad).await,
+                Err(IbkrStoreError::InvalidData)
+            ));
+        }
+
         // A later sync replaces every position; one point per day remains,
         // holding the last value of that day.
         let second = Portfolio {
@@ -375,6 +438,8 @@ mod tests {
             net_liquidation: d("2600"),
             cash: d("0"),
             positions: vec![holding(3, "50")],
+            skipped: vec![],
+            skipped_count: 0,
         };
         write_snapshot(&db, &second).await?;
         let same_day = Portfolio {

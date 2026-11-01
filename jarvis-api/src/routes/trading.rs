@@ -145,6 +145,11 @@ pub(crate) fn portfolio_body(portfolio: &store::Portfolio) -> Value {
     body.insert("net_liquidation".into(), net.to_string().into());
     body.insert("cash".into(), portfolio.cash.to_string().into());
     body.insert("positions".into(), positions.into());
+    // Positions not in EUR the sync left out; absent when there are none.
+    if portfolio.skipped_count > 0 {
+        body.insert("skipped_count".into(), portfolio.skipped_count.into());
+        body.insert("skipped_positions".into(), json!(portfolio.skipped));
+    }
     Value::Object(body)
 }
 
@@ -357,6 +362,8 @@ mod tests {
                 },
                 holding(7, "0.01"),
             ],
+            skipped: vec![],
+            skipped_count: 0,
         };
         let body = portfolio_body(&portfolio);
         assert_fresh(&body);
@@ -382,6 +389,31 @@ mod tests {
         assert_eq!(second["weight_pct"], "0.00");
         // Optional fields are absent, never null.
         assert!(second.get("name").is_none() && second.get("unrealized_pnl").is_none());
+
+        assert!(body.get("skipped_count").is_none() && body.get("skipped_positions").is_none());
+
+        // Positions left out are reported by count and by symbol; an
+        // unknown currency is absent.
+        let with_skipped = store::Portfolio {
+            skipped: vec![
+                store::Skipped {
+                    symbol: "AAPL".into(),
+                    currency: Some("USD".into()),
+                },
+                store::Skipped {
+                    symbol: "NOCUR".into(),
+                    currency: None,
+                },
+            ],
+            skipped_count: 60,
+            ..portfolio.clone()
+        };
+        let body = portfolio_body(&with_skipped);
+        assert_eq!(body["skipped_count"], 60);
+        assert_eq!(
+            body["skipped_positions"],
+            json!([{ "symbol": "AAPL", "currency": "USD" }, { "symbol": "NOCUR" }])
+        );
 
         // No weight against a zero or negative net liquidation.
         let empty = store::Portfolio {
