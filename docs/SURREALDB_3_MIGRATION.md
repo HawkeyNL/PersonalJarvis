@@ -201,7 +201,7 @@ The statements were extracted from all Rust string literals.
   - It imports the export into a disposable container (`--network none`,
     `start --unauthenticated memory`, 1 GiB) started from **the live image
     digest** (`:243-254`), then compares counts.
-  - It encrypts to the owner's keys and keeps **one** archive (`keep=1`).
+  - It encrypts to the owner's keys and keeps 7 daily plus 4 weekly archives.
   - The manifest records the image digest.
 - **`schema-backup`** (`deploy/systemd/schema-backup.sh`):
   - It makes a cold `cp -a` copy of `/var/lib/jarvis/surrealdb` with Core
@@ -541,7 +541,7 @@ Likelihood (L) and impact (I) are rated 1–3. The score is L×I.
 | 2 | **Silent `NULL` vs `NONE` change** in `json!` bindings (B7) breaks writes or changes `= NONE` predicates | 3 | 2 | 6 | Typed `SurrealValue` binding structs; full database test suite on 3.3 | CI on 3.3; write errors in Core logs during smoke tests |
 | 3 | **Version skew or partial upgrade**: new Core on the old engine (or the reverse), env digest switched without the directory swap, half-renamed directories | 2 | 3 | 6 | One helper owns the swap; ordered, rename-only steps with a receipt per step; restart resumes from the receipt or rolls back; WS mismatch fails closed at connect | `readyz` fails; helper status command; the drill includes kill-at-each-step |
 | 4 | **Authentication or permission change**: `EDITOR` cannot `DEFINE`/`INFO`, imported passhash rejected, root not created from the environment | 2 | 3 | 6 | Run 3.3 migration tests as a database `EDITOR`; drill with real provisioning | Core fails to start; automatic rollback |
-| 5 | **Backup format incompatibility**: old archives cannot be restored into 3.x; `keep=1` overwrites the only 2.x archive on the next run | 3 | 2 | 6 | Owner keeps the pre-upgrade archive off host; two-step DR documented; `docker save` of 2.6.5 | `jarvis-backup verify` shows the engine version |
+| 5 | **Backup format incompatibility**: old archives cannot be restored into 3.x; retention prunes the last 2.x archive about four weeks after the upgrade | 3 | 2 | 6 | Owner keeps the pre-upgrade archive off host; two-step DR documented; `docker save` of 2.6.5 | `jarvis-backup verify` shows the engine version |
 | 6 | **Compare-and-swap semantics drift** (WHERE-before-data, transaction isolation) weakens one-use challenges, approvals or budget reservations | 1 | 3 | 3 | Existing replay and compare-and-swap tests must pass on 3.3; opus review of the PR2 diff | CI |
 | 7 | **Fresh-install breakage** (B3, B4) leaves new Home Nodes unable to bootstrap | 3 | 1 | 3 | Fixes in PR1 and the engine-switch release; migration test from an empty database on 3.3 | CI |
 | 8 | **Memory or disk exhaustion** during import (cache sizing, 2 GiB limit, `/run` tmpfs) | 2 | 2 | 4 | Space checks before stopping services; limits on disposable containers; measure in the drill | Helper aborts before the swap; OOM kill shows up as an import failure |

@@ -7,13 +7,15 @@ shopt -s inherit_errexit
 # shellcheck disable=SC2034  # globals below are consumed by the sourced script
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 fixture=$(mktemp -d)
+# Not named cleanup: the sourced script defines its own.
 # shellcheck disable=SC2317  # invoked through the EXIT trap
-cleanup() {
-    for home in "$fixture"/keys-*; do gpgconf --homedir "$home" --kill all >/dev/null 2>&1 || true; done
-    gpgconf --homedir "$fixture/run/gnupg" --kill all >/dev/null 2>&1 || true
+cleanup_fixture() {
+    for home in "$fixture"/keys-* "$fixture"/pin-* "$fixture/run/gnupg" "$fixture/local/pub"; do
+        gpgconf --homedir "$home" --kill all >/dev/null 2>&1 || true
+    done
     rm -rf -- "$fixture"
 }
-trap cleanup EXIT
+trap cleanup_fixture EXIT
 # shellcheck source=deploy/systemd/jarvis-backup.sh
 source "$repo/deploy/systemd/jarvis-backup.sh"
 expect_fail() {
@@ -148,29 +150,57 @@ expect_fail count_matches 5 5 4
 expect_fail count_matches 5 7 8
 
 # --- Rotation -------------------------------------------------------------------
-for day in 01 02 03 04 05 06 07 08 09; do
-    printf 'archive' > "$fixture/dest/jarvis-backup-2026-09-$day.tar"
-    printf 'sum' > "$fixture/dest/jarvis-backup-2026-09-$day.tar.sha256"
+for offset in $(seq 1 63); do
+    day=$(date -u -d "2026-10-03 -$offset days" +%F)
+    printf 'archive' > "$fixture/dest/jarvis-backup-$day.tar"
+    printf 'sum' > "$fixture/dest/jarvis-backup-$day.tar.sha256"
 done
 printf 'keep' > "$fixture/dest/notes.txt"
+printf 'invalid date' > "$fixture/dest/jarvis-backup-2026-13-45.tar"
 printf 'target' > "$fixture/outside"
 ln -s "$fixture/outside" "$fixture/dest/jarvis-backup-2026-01-01.tar"
-# A future-dated archive (clock skew, manual copy) sorts first by name but must
-# never evict the archive that was just published.
-printf 'future' > "$fixture/dest/jarvis-backup-2099-01-01.tar"
 mkdir "$fixture/dest/.jarvis-backup.stale"
 expect_fail prune "$fixture/dest" ''
 expect_fail prune "$fixture/dest" notes.txt
 prune "$fixture/dest" jarvis-backup-2026-10-03.tar
-remaining=$(find "$fixture/dest" -maxdepth 1 -name 'jarvis-backup-*.tar' -type f -printf '%f\n' | sort | tr '\n' ' ')
-# Only the current archive is kept.
-[[ $remaining == 'jarvis-backup-2026-10-03.tar ' ]]
-[[ ! -e $fixture/dest/jarvis-backup-2099-01-01.tar && ! -e $fixture/dest/jarvis-backup-2026-09-09.tar.sha256 ]]
+kept() { find "$fixture/dest" -maxdepth 1 -name 'jarvis-backup-*.tar' -type f -printf '%f\n' | sed 's/^jarvis-backup-//; s/\.tar$//' | sort | tr '\n' ' '; }
+# 7 daily, then the newest archive of ISO weeks 38 and 37 (weeks 40 and 39
+# already have a daily). An unparsable date is never touched.
+[[ $(kept) == '2026-09-13 2026-09-20 2026-09-27 2026-09-28 2026-09-29 2026-09-30 2026-10-01 2026-10-02 2026-10-03 2026-13-45 ' ]]
+[[ ! -e $fixture/dest/jarvis-backup-2026-09-26.tar.sha256 && -e $fixture/dest/jarvis-backup-2026-09-13.tar.sha256 ]]
 [[ -e $fixture/dest/jarvis-backup-2026-10-03.tar.sha256 ]]
 verify "$archive" 2>/dev/null
-[[ -e $fixture/dest/jarvis-backup-2026-10-03.tar && -e $fixture/dest/notes.txt ]]
+[[ -e $fixture/dest/notes.txt ]]
 [[ -L $fixture/dest/jarvis-backup-2026-01-01.tar && $(cat "$fixture/outside") == target ]]
 [[ ! -e $fixture/dest/.jarvis-backup.stale ]]
+# Mid-week: the 7th daily is not the newest of its week.
+mkdir -m 0700 "$fixture/midweek"
+for offset in $(seq 0 30); do
+    printf 'a' > "$fixture/midweek/jarvis-backup-$(date -u -d "2026-10-07 -$offset days" +%F).tar"
+done
+prune "$fixture/midweek" jarvis-backup-2026-10-07.tar
+[[ $(find "$fixture/midweek" -type f -printf '%f\n' | sed 's/^jarvis-backup-//; s/\.tar$//' | sort | tr '\n' ' ') \
+    == '2026-09-20 2026-09-27 2026-10-01 2026-10-02 2026-10-03 2026-10-04 2026-10-05 2026-10-06 2026-10-07 ' ]]
+# A future-dated archive (clock skew, manual copy) stops pruning altogether,
+# so a wrong clock can neither evict the current archive nor the history.
+printf 'old' > "$fixture/dest/jarvis-backup-2026-09-01.tar"
+printf 'future' > "$fixture/dest/jarvis-backup-2099-01-01.tar"
+prune "$fixture/dest" jarvis-backup-2026-10-03.tar 2>/dev/null
+[[ $(kept) == '2026-09-01 2026-09-13 2026-09-20 2026-09-27 2026-09-28 2026-09-29 2026-09-30 2026-10-01 2026-10-02 2026-10-03 2026-13-45 2099-01-01 ' ]]
+rm "$fixture/dest/jarvis-backup-2099-01-01.tar" "$fixture/dest/jarvis-backup-2026-13-45.tar" \
+    "$fixture/dest/jarvis-backup-2026-09-01.tar"
+
+# --- Space guard ------------------------------------------------------------------
+gib=$((1024 * 1024 * 1024))
+# shellcheck disable=SC2317  # invoked through check_space
+df() { printf 'Avail\n%s\n' "$fake_avail"; }
+fake_avail=$((2 * gib)); check_space "$fixture/dest" "$fixture/run"
+fake_avail=$((gib - 1)); expect_fail check_space "$fixture/dest" "$fixture/run"
+mkdir "$fixture/big"
+truncate -s "$gib" "$fixture/big/jarvis-backup-2026-10-01.tar"
+fake_avail=$((3 * gib - 1)); expect_fail check_space "$fixture/big" "$fixture/run"
+fake_avail=$((3 * gib)); check_space "$fixture/big" "$fixture/run"
+unset -f df
 
 # --- Leftovers of a SIGKILLed run ---------------------------------------------------
 # Only exact run directories go; the lock file, symlinks (and their targets)
@@ -194,9 +224,90 @@ docker() { [[ $1 != ps ]] || return 1; }
 expect_fail remove_stale_runs
 unset -f docker
 
+# --- Local-only setup, decrypting verify and restore round trip -------------------
+# Rootless: production directories are root-owned, fixture ones are not.
+# shellcheck disable=SC2317  # invoked through init_local and restore_to
+safe_dir() { [[ -d $1 && ! -L $1 ]] || fail 'required directory is missing or symlinked'; }
+# Independent of the free space of the test host's /tmp.
+df() { printf 'Avail\n%s\n' "$fake_avail"; }
+fake_avail=$((3 * gib))
+local_root="$fixture/local"
+config_dir="$local_root/etc-jarvis-backup" lock_dir="$local_root/run"
+mkdir -p "$lock_dir"
+# Stale run directories of a killed decrypt (plaintext, private key) go first.
+mkdir "$lock_dir/jarvis-backup.Kil1ed00"
+( init_local "$local_root/dest" ) > "$local_root/key.asc" 2> "$local_root/init.log"
+grep -q 'BEGIN PGP PRIVATE KEY BLOCK' "$local_root/key.asc"
+[[ $(stat -c '%a' "$config_dir/backup.conf") == 600 && $(stat -c '%a' "$config_dir/recipients.asc") == 600 ]]
+[[ $(stat -c '%a' "$local_root/dest") == 700 ]]
+expect_fail init_local "$local_root/dest"
+read_config "$config_dir/backup.conf"
+[[ $destination == "$local_root/dest" && ${#recipients[@]} == 1 ]]
+# The host keeps only the public key: prepare_keyring refuses private keys.
+gnupg_home="$local_root/pub"
+prepare_keyring "$gnupg_home" "$config_dir/recipients.asc"
+[[ -z $(find "$lock_dir" -mindepth 1 -maxdepth 1 -name 'jarvis-backup.*' -type d) ]]
+
+mkdir "$local_root/stage"
+local_archive=$( { build_members "$local_root/stage" "$fixture/run" "$fixture/root"
+                   publish "$local_root/stage" "$local_root/dest" 2026-10-04; } 2>/dev/null )
+( verify_decrypt "$local_archive" ) < "$local_root/key.asc" 2>/dev/null
+( restore_to "$local_archive" "$local_root/restored" ) < "$local_root/key.asc" 2>/dev/null
+[[ $(stat -c '%a' "$local_root/restored") == 700 ]]
+cmp "$local_root/restored/export.surql" "$fixture/run/export.surql"
+[[ $(tar -xOf "$local_root/restored/etc-jarvis.tar" etc/jarvis/secrets/provider.env) == "PROVIDER_KEY=$canary" ]]
+jq -e '.format_version == 1' "$local_root/restored/manifest.json" >/dev/null
+[[ -z $(find "$lock_dir" -mindepth 1 -maxdepth 1 -name 'jarvis-backup.*' -type d) ]]
+# Refused: an existing or relative target, a wrong key, no key.
+expect_fail restore_to "$local_archive" "$local_root/restored" < "$local_root/key.asc"
+expect_fail restore_to "$local_archive" restored-here < "$local_root/key.asc"
+if [[ $(stat -c %d /dev) != "$(stat -c %d "$lock_dir")" ]]; then
+    expect_fail restore_to "$local_archive" /dev/jarvis-restore-test < "$local_root/key.asc"
+fi
+fake_avail=$((2 * gib)); expect_fail verify_decrypt "$local_archive" < "$local_root/key.asc"
+fake_avail=$((3 * gib))
+gpg --batch --homedir "$fixture/keys-other" --armor --export-secret-keys --pinentry-mode loopback \
+    --passphrase '' > "$local_root/other-secret.asc" 2>/dev/null
+expect_fail verify_decrypt "$local_archive" < "$local_root/other-secret.asc"
+message=$( (verify_decrypt "$local_archive") < "$config_dir/recipients.asc" 2>&1 ) && exit 1
+[[ $message == *'no private key'* ]]
+# Swapped members with valid ciphertext pass the key-free check but not the
+# manifest: a different configuration tar, then a different export under a
+# manifest whose member hashes were updated to match.
+mkdir -p "$local_root/open" "$local_root/swap/etc/jarvis"
+tar -C "$local_root/open" -xf "$local_archive"
+# Rebuild the archive from open/ and expect decrypting verification to fail with $1.
+repack() {
+    tar -C "$local_root/open" --owner=0 --group=0 --numeric-owner -cf "$local_archive" "${members[@]}"
+    (cd "$local_root/dest" && sha256sum -- "${local_archive##*/}") > "$local_archive.sha256"
+    verify "$local_archive" 2>/dev/null
+    message=$( (verify_decrypt "$local_archive") < "$local_root/key.asc" 2>&1 ) && exit 1
+    [[ $message == *"$1"* ]]
+}
+cp -a "$local_root/open" "$local_root/open.good"
+tar -C "$local_root/swap" -cf - etc/jarvis | zstd -q -c | encrypt_to > "$local_root/open/etc-jarvis.tar.zst.gpg"
+repack 'member etc-jarvis.tar.zst.gpg does not match the manifest'
+rm -r "$local_root/open"
+cp -a "$local_root/open.good" "$local_root/open"
+printf 'DEFINE TABLE other;\n' | zstd -q -c | encrypt_to > "$local_root/open/surrealdb.surql.zst.gpg"
+jq -c --arg h "$(sha256sum < "$local_root/open/surrealdb.surql.zst.gpg" | cut -d' ' -f1)" \
+    '.members["surrealdb.surql.zst.gpg"].sha256 = $h' "$local_root/restored/manifest.json" \
+    | encrypt_to > "$local_root/open/manifest.json.gpg"
+repack 'export does not match the manifest'
+# A configuration tar with a symlink is refused, like in disaster recovery.
+mkdir -p "$local_root/linked/etc/jarvis" "$local_root/stage2"
+ln -s /etc/shadow "$local_root/linked/etc/jarvis/link"
+{ build_members "$local_root/stage2" "$fixture/run" "$local_root/linked"
+  publish "$local_root/stage2" "$local_root/dest" 2026-10-05; } >/dev/null 2>&1
+expect_fail verify_decrypt "$local_root/dest/jarvis-backup-2026-10-05.tar" < "$local_root/key.asc"
+[[ -z $(find "$lock_dir" -mindepth 1 -maxdepth 1 -name 'jarvis-backup.*' -type d) ]]
+
 # --- Entry point refusals ---------------------------------------------------------
 if [[ $EUID != 0 ]]; then
-    expect_fail bash "$repo/deploy/systemd/jarvis-backup.sh" create
+    for args in create init-local 'verify --decrypt' "verify --decrypt $archive" "restore $archive /tmp/x"; do
+        # shellcheck disable=SC2086  # word splitting builds the argument list
+        expect_fail bash "$repo/deploy/systemd/jarvis-backup.sh" $args
+    done
 fi
 expect_fail env JARVIS_BACKUP_FIXTURE_ROOT=/tmp/x bash "$repo/deploy/systemd/jarvis-backup.sh" verify "$archive"
 usage=$(bash "$repo/deploy/systemd/jarvis-backup.sh" bogus 2>&1) && exit 1
