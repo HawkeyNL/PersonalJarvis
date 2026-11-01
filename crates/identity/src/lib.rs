@@ -145,6 +145,8 @@ pub struct Challenge {
 pub struct LoginResult {
     pub token: String,
     pub session: Session,
+    /// True when a biometric device renewed without the account password.
+    pub renewed: bool,
 }
 
 pub struct Authenticated {
