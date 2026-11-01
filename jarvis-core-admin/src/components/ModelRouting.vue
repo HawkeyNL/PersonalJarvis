@@ -27,6 +27,7 @@ const report = ref<RoutingReport | null>(null);
 const drafts = reactive<Record<RouteTier, Draft>>({ cheap: blank(), default: blank(), hard: blank() });
 const busy = ref(false);
 const error = ref("");
+const errorTitle = ref<string>();
 const result = ref<OperationResult | null>(null);
 const confirmPaid = ref(false);
 const confirmResearch = ref(false);
@@ -73,13 +74,13 @@ async function load() {
       const saved = stored(tier);
       drafts[tier] = { chain: saved ? saved.chain.map((entry) => ({ ...entry })) : [], metered: saved?.metered_after_subscription ?? false, pick: "" };
     }
-  } catch (reason) { error.value = errorText(reason); }
+  } catch (reason) { error.value = errorText(reason); errorTitle.value = "Could not load model routing"; }
   finally { busy.value = false; }
 }
 async function apply(request: RouteMutation) {
   busy.value = true; error.value = ""; result.value = null; confirmPaid.value = false; confirmResearch.value = false;
   try { result.value = await api.modelRouteMutation(request); }
-  catch (reason) { error.value = errorText(reason); }
+  catch (reason) { error.value = errorText(reason); errorTitle.value = undefined; }
   finally { busy.value = false; }
   await load();
 }
@@ -103,8 +104,8 @@ onMounted(() => { void load(); });
     </div>
     <p class="usage-source">Research web search lets an explicit Research request search the web through an enabled subscription in the Hard tier (claude-cli, codex-cli), never a paid API. Only the question leaves the Home Node, to that provider and its search partners.</p>
     <p class="usage-source">Paid APIs off keeps only subscriptions (claude-cli, codex-cli) and local Ollama in every tier. Routing only orders models: a model still has to be enabled, and disabled models are skipped. Every change restarts Jarvis Core.</p>
-    <ErrorPanel v-if="unavailable" :message="`${REASONS[unavailable] ?? 'Routing is unavailable.'} Jarvis uses the built-in order without paid APIs until it is fixed as root (${unavailable}).`" />
-    <ErrorPanel v-if="error" :message="error" /><ResultPanel v-if="result" :result="result" />
+    <ErrorPanel v-if="unavailable" title="Routing file needs repair" :message="`${REASONS[unavailable] ?? 'Routing is unavailable.'} Jarvis uses the built-in order without paid APIs until it is fixed as root (${unavailable}).`" />
+    <ErrorPanel v-if="error" :message="error" :title="errorTitle" /><ResultPanel v-if="result" :result="result" />
     <div v-if="report" class="routing-grid">
       <div v-for="item in TIERS" :key="item.tier" class="routing-tier">
         <span class="card-label">{{ item.label }} · {{ stored(item.tier) ? "owner order" : "built-in order" }}</span>
@@ -137,6 +138,6 @@ onMounted(() => { void load(); });
       </div>
     </div>
   </section>
-  <ConfirmDialog v-if="confirmResearch" title="Turn on research web search?" detail="Explicit Research requests send only the question, with a fixed instruction, to your Claude or ChatGPT subscription, which searches the web with its provider-hosted search. No memory, history or device data is sent. Web results are untrusted; answers list their sources." confirm-label="Turn on" @cancel="confirmResearch = false" @confirm="apply({ action: 'research_web_search', state: 'on' })" />
-  <ConfirmDialog v-if="confirmPaid" title="Allow paid APIs?" detail="Metered provider APIs become eligible again in every tier, within the monthly budget. Providers bill each call." confirm-label="Allow paid APIs" @cancel="confirmPaid = false" @confirm="apply({ action: 'paid_api', state: 'allowed' })" />
+  <ConfirmDialog v-if="confirmResearch" title="Turn on research web search?" detail="Explicit Research requests send only the question, with a fixed instruction, to your Claude or ChatGPT subscription, which searches the web with its provider-hosted search. No memory, history or device data is sent. Web results are untrusted; answers list their sources." confirm-label="Turn on web search" tone="primary" @cancel="confirmResearch = false" @confirm="apply({ action: 'research_web_search', state: 'on' })" />
+  <ConfirmDialog v-if="confirmPaid" title="Allow paid APIs?" detail="Metered provider APIs become eligible again in every tier, within the monthly budget. Providers bill each call." confirm-label="Allow paid APIs" tone="primary" @cancel="confirmPaid = false" @confirm="apply({ action: 'paid_api', state: 'allowed' })" />
 </template>

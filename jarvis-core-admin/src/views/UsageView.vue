@@ -43,7 +43,7 @@ onMounted(load);
   <PageHeader title="Usage &amp; costs" description="Bounded monthly token, cost, latency and reliability aggregates. Prompts, replies, credentials and request identifiers never enter this view." :busy="busy">
     <button class="secondary" @click="load">Refresh</button>
   </PageHeader>
-  <ErrorPanel v-if="error && !initializing" :message="error" />
+  <ErrorPanel v-if="error && !initializing" title="Could not load usage" :message="error" />
   <section v-if="initializing" class="detail-card empty-state">
     Usage statistics are initializing. Core retries the safe aggregate automatically; refresh this view in a moment.
   </section>

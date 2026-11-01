@@ -4,6 +4,7 @@ import { api, errorText, type HealthResponse } from "../admin";
 import ErrorPanel from "../components/ErrorPanel.vue";
 import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
+import { keyedState } from "../status";
 const data = ref<HealthResponse | null>(null); const busy = ref(false); const error = ref("");
 async function load(verify = false) { busy.value = true; error.value = ""; try { data.value = await api.health(verify); } catch (e) { error.value = errorText(e); } finally { busy.value = false; } }
 onMounted(() => load(false));
@@ -12,9 +13,9 @@ onMounted(() => load(false));
   <PageHeader title="Health" description="Local service checks and the trusted full deployment verifier." :busy="busy">
     <button class="secondary" @click="load(false)">Refresh</button><button @click="load(true)">Run full verification</button>
   </PageHeader>
-  <ErrorPanel v-if="error" :message="error" />
+  <ErrorPanel v-if="error" title="Could not load health checks" :message="error" />
   <section v-if="data" class="card-list">
-    <article v-for="(state, name) in data.checks" :key="name" class="row-card"><strong>{{ name }}</strong><StatusBadge :state="state" /></article>
+    <article v-for="(state, name) in data.checks" :key="name" class="row-card"><strong>{{ name }}</strong><StatusBadge :state="keyedState(name, state)" /></article>
     <article class="row-card"><strong>Deployment verifier</strong><StatusBadge :state="data.verification ?? 'not run this session'" /></article>
   </section>
 </template>

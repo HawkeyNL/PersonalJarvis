@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import NavIcon, { type IconName } from "../NavIcon.vue";
-import type { Tone } from "../../admin";
+import StatusBadge from "../StatusBadge.vue";
+import type { Tone } from "../../status";
 
 // A dashboard card: a button with icon, name, an optional headline value,
 // lines of live summary and an optional body (a meter or chart) below.
@@ -22,7 +23,7 @@ const accessibleName = computed(() => [props.title, props.value, ...props.lines]
       </span>
     </span>
     <span v-if="$slots.default" class="body"><slot /></span>
-    <span class="dot" :class="tone" aria-hidden="true"></span>
+    <StatusBadge class="card-dot" :tone="tone" />
   </button>
 </template>
 
@@ -56,8 +57,5 @@ const accessibleName = computed(() => [props.title, props.value, ...props.lines]
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .value + .line { margin-top: 2px; }
-.dot { position: absolute; top: 16px; right: 16px; width: 6px; height: 6px; border-radius: 50%; background: var(--border-strong); }
-.dot.ok { background: var(--positive-solid); }
-.dot.warn { background: var(--negative-solid); }
-.dot.error { background: var(--danger-solid); }
+.card-dot { position: absolute; top: 16px; right: 16px; }
 </style>

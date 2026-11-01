@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { api, errorText, type ViewName } from "./admin";
-import { createSession, initialSession, lockTime, navigate, visibleView } from "./session";
+import { dialogFocus } from "./focus";
+import { IDLE_REASON, createSession, initialSession, lockTime, navigate, visibleView } from "./session";
 import NavIcon, { type IconName } from "./components/NavIcon.vue";
+import StatusBadge from "./components/StatusBadge.vue";
 import ThemeSelect from "./components/ThemeSelect.vue";
 import JvPanel from "./components/jv/JvPanel.vue";
 import JvSegmented from "./components/jv/JvSegmented.vue";
-import JvStatusDot from "./components/jv/JvStatusDot.vue";
 import JvTopBar from "./components/jv/JvTopBar.vue";
 import AgentsView from "./views/AgentsView.vue";
 import CredentialsView from "./views/CredentialsView.vue";
@@ -52,6 +53,11 @@ const restartBusy = ref(false);
 const restartError = ref("");
 const page = ref<HTMLElement | null>(null);
 const unlockButton = ref<HTMLButtonElement | null>(null);
+const restartDialog = ref<HTMLElement | null>(null);
+let restartFocus: ReturnType<typeof dialogFocus> | undefined;
+const OWNER_REASON = "Locked by owner.";
+// An idle or owner lock is expected; only real failures are alerts.
+const lockNote = computed(() => [IDLE_REASON, OWNER_REASON].includes(session.authError));
 const current = computed(() => visibleView(session.locked, views[active.value]));
 const item = computed(() => sections.flatMap((section) => section.items).find((entry) => entry.id === active.value || entry.tabs?.some((tab) => tab.id === active.value))!);
 const tabs = computed(() => (session.locked ? undefined : item.value.tabs));
@@ -63,6 +69,14 @@ watch(() => session.locked, (locked) => {
   if (locked) pendingPairings.value = 0;
   // The restart dialog is modal; focus stays in it.
   if (!restartRequired.value) void nextTick(() => (locked ? unlockButton.value : page.value)?.focus());
+});
+// The restart gate has no Escape and no restore: it never closes.
+watch(restartRequired, (required) => {
+  if (!required) return;
+  void nextTick(() => {
+    restartFocus = dialogFocus(restartDialog.value!);
+    restartDialog.value!.querySelector("button")?.focus();
+  });
 });
 function go(view: ViewName) { active.value = navigate(session.locked, active.value, view); }
 // A card that opens another view unmounts itself; focus moves to the new page.
@@ -120,10 +134,10 @@ onBeforeUnmount(() => {
     <div class="main-shell">
       <JvTopBar :title="session.locked ? 'Locked' : undefined">
         <div class="session-cluster">
-          <JvStatusDot v-if="session.locked" tone="warn" label="Locked" />
-          <JvStatusDot v-else tone="warn" :label="`Root session · locks ${locksAt}`" />
+          <StatusBadge v-if="session.locked" tone="warn" label="Locked" />
+          <StatusBadge v-else tone="warn" :label="`Root session · locks ${locksAt}`" />
           <ThemeSelect />
-          <button v-if="!session.locked" class="small" @click="lock('Locked by owner.')">Lock now</button>
+          <button v-if="!session.locked" class="small" @click="lock(OWNER_REASON)">Lock now</button>
         </div>
       </JvTopBar>
       <div v-if="tabs" class="node-tabs">
@@ -133,7 +147,8 @@ onBeforeUnmount(() => {
         <component :is="current" v-if="current" @restart-required="restartRequired = true" @open="open" @pairings="(count: number) => (pendingPairings = count)" />
         <section v-else class="lock-screen">
           <JvPanel icon="shield" title="Jarvis Core is locked" tone="warn" status="Locked" description="Authenticate once through the GNOME system dialog. Your password is never handled by this application.">
-            <div v-if="session.authError" class="lock-error" role="alert">{{ session.authError }}</div>
+            <p v-if="lockNote" class="lock-note" role="status">{{ session.authError }}</p>
+            <div v-else-if="session.authError" class="lock-error" role="alert">{{ session.authError }}</div>
             <div class="lock-actions">
               <button ref="unlockButton" class="primary" :disabled="session.authBusy" @click="unlock">{{ session.authBusy ? "Waiting for system authorization…" : "Unlock administration" }}</button>
               <small>The session locks after five minutes without pointer or keyboard activity.</small>
@@ -143,10 +158,10 @@ onBeforeUnmount(() => {
       </main>
     </div>
     <div v-if="restartRequired" class="dialog-backdrop restart-backdrop">
-      <section class="dialog restart-dialog" role="alertdialog" aria-modal="true" aria-labelledby="restart-title">
+      <section ref="restartDialog" class="dialog restart-dialog" role="alertdialog" aria-modal="true" tabindex="-1" aria-labelledby="restart-title" aria-describedby="restart-detail" @keydown="restartFocus?.keydown($event)">
         <span class="eyebrow">Update installed</span>
         <h2 id="restart-title">Restart Jarvis Core Administration</h2>
-        <p>The trusted update completed and replaced administration components. This older application process cannot continue safely.</p>
+        <p id="restart-detail">The trusted update completed and replaced administration components. This older application process cannot continue safely.</p>
         <p v-if="restartError" class="restart-error">{{ restartError }}</p>
         <div class="dialog-actions"><button class="primary" :disabled="restartBusy" @click="restartNow">{{ restartBusy ? "Restarting…" : "Restart now" }}</button></div>
       </section>

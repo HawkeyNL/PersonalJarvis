@@ -10,6 +10,6 @@ onMounted(load);
 </script>
 <template>
   <PageHeader title="Services" description="Visibility for the fixed Jarvis-owned service allowlist. Arbitrary units are never accepted." :busy="busy"><button class="secondary" @click="load">Refresh</button></PageHeader>
-  <ErrorPanel v-if="error" :message="error" />
+  <ErrorPanel v-if="error" title="Could not load services" :message="error" />
   <section class="table-card"><table><thead><tr><th>Jarvis service</th><th>State</th></tr></thead><tbody><tr v-for="row in rows" :key="row.name"><td>{{ row.name }}</td><td><StatusBadge :state="row.state" /></td></tr></tbody></table></section>
 </template>

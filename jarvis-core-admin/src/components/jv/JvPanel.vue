@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import NavIcon, { type IconName } from "../NavIcon.vue";
-import JvStatusDot from "./JvStatusDot.vue";
-import type { Tone } from "../../admin";
+import StatusBadge from "../StatusBadge.vue";
+import type { Tone } from "../../status";
 
 // Detail panel of a node page: header (icon, title, status, description,
 // italic detail line, optional action) and the body slot below it.
@@ -15,7 +15,7 @@ defineProps<{ icon: IconName; title: string; tone: Tone; status: string; descrip
       <div class="meta">
         <div class="line1">
           <h2>{{ title }}</h2>
-          <JvStatusDot :tone="tone" :label="status" />
+          <StatusBadge :tone="tone" :label="status" />
         </div>
         <p v-if="description" class="desc">{{ description }}</p>
         <p v-if="quote" class="quote">{{ quote }}</p>

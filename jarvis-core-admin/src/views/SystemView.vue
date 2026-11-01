@@ -10,6 +10,6 @@ onMounted(load);
 </script>
 <template>
   <PageHeader title="System" description="Non-secret Home Node and build provenance. Hardware identifiers and process environment are intentionally omitted." :busy="busy"><button class="secondary" @click="load">Refresh</button></PageHeader>
-  <ErrorPanel v-if="error" :message="error" />
+  <ErrorPanel v-if="error" title="Could not load system information" :message="error" />
   <section v-if="data" class="system-grid"><JvTile v-for="[key, value] in data.values" :key="key" icon="doc" :label="key" :value="value" /></section>
 </template>
