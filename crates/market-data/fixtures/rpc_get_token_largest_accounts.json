@@ -1,0 +1,30 @@
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "context": { "apiVersion": "2.2.16", "slot": 341197053 },
+    "value": [
+      {
+        "address": "8xKqnB5Y5WkYpM3cW2qN6h9a4zH7tVjRrL2sE1dFgPbQ",
+        "amount": "400000000000000",
+        "decimals": 6,
+        "uiAmount": 400000000.0,
+        "uiAmountString": "400000000"
+      },
+      {
+        "address": "3vT9yK2pQm8dLwR6nHc1xZ5bJ4fG7sUaE9iMoNqYtWkD",
+        "amount": "50000000000000",
+        "decimals": 6,
+        "uiAmount": 50000000.0,
+        "uiAmountString": "50000000"
+      },
+      {
+        "address": "9pLm3Kq7Rt2Wx5Yz8Ab4Cd6Ef1Gh3Jk5Mn7Pq9Rs2Tu",
+        "amount": "30000000000000",
+        "decimals": 6,
+        "uiAmount": 30000000.0,
+        "uiAmountString": "30000000"
+      }
+    ]
+  },
+  "id": 1
+}
