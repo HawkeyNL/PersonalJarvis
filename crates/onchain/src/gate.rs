@@ -8,14 +8,18 @@
 //! This only produces a report. It never enables execution: going live stays
 //! an owner action with a signed mandate.
 //!
-//! The minimum trade count and duration have floors fixed in code
-//! ([`MIN_CLOSED_TRADES`], [`MIN_DURATION`]). Configuration may raise them,
-//! never lower them.
+//! The minimum trade count, duration and number of trading days have floors
+//! fixed in code ([`MIN_CLOSED_TRADES`], [`MIN_DURATION`],
+//! [`MIN_TRADING_DAYS`]). Configuration may raise them, never lower them.
+//! Trading days are distinct UTC dates on which a round trip closed, so one
+//! long hold plus a burst of quick trades cannot stand in for weeks of
+//! trading. The ledger refuses out-of-order events, so these timestamps
+//! cannot be back-dated.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rust_decimal::Decimal;
-use time::Duration;
+use time::{Duration, UtcOffset};
 
 use crate::paper::{checked_sum, CostModel, Ledger, LedgerError, Mark};
 
@@ -23,6 +27,8 @@ use crate::paper::{checked_sum, CostModel, Ledger, LedgerError, Mark};
 pub const MIN_CLOSED_TRADES: usize = 100;
 /// Code-fixed floor for [`GateRules::min_duration`].
 pub const MIN_DURATION: Duration = Duration::days(28);
+/// Code-fixed floor for [`GateRules::min_trading_days`].
+pub const MIN_TRADING_DAYS: usize = 7;
 
 /// Gate thresholds from configuration. They can only be stricter than the
 /// floors; [`evaluate`] applies the floors even if `validate` was skipped.
@@ -30,6 +36,7 @@ pub const MIN_DURATION: Duration = Duration::days(28);
 pub struct GateRules {
     pub min_closed_trades: usize,
     pub min_duration: Duration,
+    pub min_trading_days: usize,
 }
 
 /// A configured gate threshold below its code-fixed floor.
@@ -51,6 +58,11 @@ impl GateRules {
                 field: "min_duration",
             });
         }
+        if self.min_trading_days < MIN_TRADING_DAYS {
+            return Err(BelowFloor {
+                field: "min_trading_days",
+            });
+        }
         Ok(())
     }
 }
@@ -68,6 +80,9 @@ pub struct GateReport {
     pub net_expectancy_usd: Decimal,
     pub enough_trades: bool,
     pub enough_time: bool,
+    /// Distinct UTC dates on which a round trip closed.
+    pub trading_days: usize,
+    pub enough_days: bool,
     pub positive_expectancy: bool,
     pub passed: bool,
 }
@@ -91,6 +106,11 @@ pub fn evaluate(
         (Some(first), Some(last)) => (last - first).max(Duration::ZERO),
         _ => Duration::ZERO,
     };
+    let trading_days = trades
+        .iter()
+        .map(|t| t.closed_at.to_offset(UtcOffset::UTC).date())
+        .collect::<BTreeSet<_>>()
+        .len();
     let realised = checked_sum(trades.iter().map(|t| t.net_pnl_usd))?;
     let net_result_usd = checked_sum(
         [
@@ -108,16 +128,19 @@ pub fn evaluate(
     };
     let enough_trades = closed_trades >= rules.min_closed_trades.max(MIN_CLOSED_TRADES);
     let enough_time = duration >= rules.min_duration.max(MIN_DURATION);
+    let enough_days = trading_days >= rules.min_trading_days.max(MIN_TRADING_DAYS);
     let positive_expectancy = net_expectancy_usd > Decimal::ZERO;
     Ok(GateReport {
         closed_trades,
         duration,
+        trading_days,
+        enough_days,
         net_result_usd,
         net_expectancy_usd,
         enough_trades,
         enough_time,
         positive_expectancy,
-        passed: enough_trades && enough_time && positive_expectancy,
+        passed: enough_trades && enough_time && enough_days && positive_expectancy,
     })
 }
 
@@ -126,30 +149,38 @@ mod tests {
     use super::*;
     use crate::testutil::{costs, d, t0};
     use crate::types::Position;
+    use time::OffsetDateTime;
 
     const FLOORS: GateRules = GateRules {
         min_closed_trades: MIN_CLOSED_TRADES,
         min_duration: MIN_DURATION,
+        min_trading_days: MIN_TRADING_DAYS,
     };
 
-    fn lot(mint: &str) -> Position {
+    fn lot(mint: &str, at: OffsetDateTime) -> Position {
         Position {
             mint: mint.to_owned(),
             tokens: d("100"),
             cost_usd: d("10"),
-            opened_at: t0(),
+            opened_at: at,
             entry_liquidity_usd: d("100000"),
         }
     }
 
-    /// `n` round trips opened at `t0`, the last closing after `span`, each
-    /// netting `pnl`.
+    /// `n` back-to-back round trips spread evenly from `t0` to `t0 + span`,
+    /// each netting `pnl`.
     fn ledger(n: usize, pnl: &str, span: Duration) -> Ledger {
         let mut ledger = Ledger::default();
-        for _ in 0..n {
-            ledger.open(lot("A")).unwrap();
+        let step = span / n as u32;
+        for i in 0..n as u32 {
+            ledger.open(lot("A", t0() + step * i)).unwrap();
+            let close_at = if i + 1 == n as u32 {
+                t0() + span
+            } else {
+                t0() + step * (i + 1)
+            };
             ledger
-                .close("A", d("100"), d("10") + d(pnl), d("0"), t0() + span)
+                .close("A", d("100"), d("10") + d(pnl), d("0"), close_at)
                 .unwrap();
         }
         ledger
@@ -180,6 +211,7 @@ mod tests {
         let raised = GateRules {
             min_closed_trades: MIN_CLOSED_TRADES + 50,
             min_duration: MIN_DURATION + Duration::days(7),
+            min_trading_days: MIN_TRADING_DAYS + 3,
         };
         assert_eq!(raised.validate(), Ok(()));
         let fewer = GateRules {
@@ -190,6 +222,16 @@ mod tests {
             fewer.validate(),
             Err(BelowFloor {
                 field: "min_closed_trades"
+            })
+        );
+        let fewer_days = GateRules {
+            min_trading_days: MIN_TRADING_DAYS - 1,
+            ..FLOORS
+        };
+        assert_eq!(
+            fewer_days.validate(),
+            Err(BelowFloor {
+                field: "min_trading_days"
             })
         );
         let shorter = GateRules {
@@ -206,6 +248,7 @@ mod tests {
         let lax = GateRules {
             min_closed_trades: 1,
             min_duration: Duration::ZERO,
+            min_trading_days: 1,
         };
         let report = evaluate(
             &ledger(10, "1", Duration::days(1)),
@@ -237,8 +280,9 @@ mod tests {
     #[test]
     fn open_losers_count_and_open_winners_do_not_offset_them() {
         let mut l = ledger(MIN_CLOSED_TRADES, "0.5", MIN_DURATION); // +50
-        l.open(lot("UP")).unwrap();
-        l.open(lot("RUG")).unwrap();
+        let later = t0() + MIN_DURATION;
+        l.open(lot("UP", later)).unwrap();
+        l.open(lot("RUG", later)).unwrap();
         // UP is worth far more than RUG lost, but must not cancel it out.
         let marks = BTreeMap::from([(
             "UP".to_owned(),
@@ -251,9 +295,9 @@ mod tests {
         // RUG has no usable mark: its full cost of 10 counts as lost.
         assert_eq!(report.net_result_usd, d("40"));
 
-        l.open(lot("RUG2")).unwrap();
+        l.open(lot("RUG2", later)).unwrap();
         for _ in 0..4 {
-            l.open(lot("RUG3")).unwrap();
+            l.open(lot("RUG3", later)).unwrap();
         }
         let report = evaluate(&l, &marks, &costs(), &FLOORS).unwrap();
         assert_eq!(report.net_result_usd, d("-10"));
@@ -266,5 +310,24 @@ mod tests {
         assert_eq!(empty.duration, Duration::ZERO);
         assert_eq!(empty.net_expectancy_usd, Decimal::ZERO);
         assert!(!empty.passed);
+    }
+
+    #[test]
+    fn one_long_hold_plus_a_burst_does_not_pass() {
+        // A single hold spans the whole period; every other trade happens in
+        // one burst on its last day.
+        let mut l = Ledger::default();
+        l.open(lot("HOLD", t0())).unwrap();
+        for i in 0..MIN_CLOSED_TRADES as i64 - 1 {
+            let at = t0() + Duration::days(27) + Duration::minutes(i);
+            l.open(lot("A", at)).unwrap();
+            l.close("A", d("100"), d("11"), d("0"), at).unwrap();
+        }
+        l.close("HOLD", d("100"), d("11"), d("0"), t0() + MIN_DURATION)
+            .unwrap();
+        let report = eval(&l);
+        assert!(report.enough_trades && report.enough_time && report.positive_expectancy);
+        assert_eq!(report.trading_days, 2);
+        assert!(!report.enough_days && !report.passed);
     }
 }

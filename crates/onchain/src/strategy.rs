@@ -256,8 +256,8 @@ pub fn evaluate_exit(
 }
 
 /// Liquidity drop, stop loss or take profit; `None` when none fires or the
-/// numbers overflow. A fresh price of zero or less is a stop loss: the
-/// position can no longer be valued.
+/// numbers overflow. A fresh price of zero or less, or an invalid cost
+/// model, is a stop loss: the position can no longer be valued.
 fn market_exit(
     position: &Position,
     s: &TokenSnapshot,
@@ -271,7 +271,9 @@ fn market_exit(
     if s.liquidity_usd.checked_mul(BPS)? <= floor {
         return Some(ExitReason::LiquidityDrop);
     }
-    if s.price_usd <= Decimal::ZERO {
+    // A position that cannot be valued (dead price, or a broken cost model
+    // that would otherwise silently block every price exit) is cut.
+    if s.price_usd <= Decimal::ZERO || !costs.is_valid() {
         return Some(ExitReason::StopLoss);
     }
     let value = paper::sell_value(position.tokens, s.price_usd, s.liquidity_usd, costs)?
@@ -574,5 +576,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(intent.max_slippage_bps, bounds::EXIT_SLIPPAGE_BPS.1);
+    }
+
+    #[test]
+    fn collapsed_price_or_broken_costs_stop_out() {
+        let p = position("40");
+        let mut s = good_snapshot();
+        s.price_usd = d("0.00000000000000000001");
+        assert_eq!(
+            exit(&p, &s, t0()),
+            Some(IntentKind::Exit(ExitReason::StopLoss))
+        );
+
+        let broken = CostModel {
+            dex_fee_bps: 10_000,
+            ..costs()
+        };
+        let intent = evaluate_exit(
+            &p,
+            &good_snapshot(),
+            &params(),
+            &broken,
+            Duration::seconds(30),
+            t0(),
+        );
+        assert_eq!(
+            intent.map(|i| i.kind),
+            Some(IntentKind::Exit(ExitReason::StopLoss))
+        );
     }
 }

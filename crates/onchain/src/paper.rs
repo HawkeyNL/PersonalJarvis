@@ -40,6 +40,16 @@ pub struct CostModel {
     pub failure_rate: Decimal,
 }
 
+impl CostModel {
+    /// Pool fee below 100%, fees non-negative, failure rate within `0..=1`.
+    pub fn is_valid(&self) -> bool {
+        self.dex_fee_bps < 10_000
+            && self.network_fee_usd >= Decimal::ZERO
+            && self.priority_fee_usd >= Decimal::ZERO
+            && (Decimal::ZERO..=Decimal::ONE).contains(&self.failure_rate)
+    }
+}
+
 /// Outcome of one simulated attempt. Pool fee and price impact are already
 /// inside `amount_out`; `fees_usd` is what the attempt cost on top.
 #[derive(Debug, Clone, PartialEq)]
@@ -85,12 +95,17 @@ pub fn sell(
 
 /// What selling `tokens` would return after the pool fee and price impact,
 /// before transaction fees. Used to value positions at an executable price.
+/// A collapsed price can value a position at exactly zero. `None` for an
+/// invalid cost model or inputs that cannot be priced.
 pub fn sell_value(
     tokens: Decimal,
     price_usd: Decimal,
     liquidity_usd: Decimal,
     costs: &CostModel,
 ) -> Option<Decimal> {
+    if !costs.is_valid() {
+        return None;
+    }
     let (quote_reserve, token_reserve) = reserves(price_usd, liquidity_usd)?;
     swap_out(tokens, token_reserve, quote_reserve, costs)
 }
@@ -110,16 +125,12 @@ fn attempt(
     roll: Decimal,
     fill: impl FnOnce() -> Option<Decimal>,
 ) -> Option<Fill> {
-    let valid = costs.dex_fee_bps < 10_000
-        && costs.network_fee_usd >= Decimal::ZERO
-        && costs.priority_fee_usd >= Decimal::ZERO
-        && (Decimal::ZERO..=Decimal::ONE).contains(&costs.failure_rate)
-        && (Decimal::ZERO..Decimal::ONE).contains(&roll);
-    if !valid {
+    if !costs.is_valid() || !(Decimal::ZERO..Decimal::ONE).contains(&roll) {
         return None;
     }
     let fees_usd = costs.network_fee_usd.checked_add(costs.priority_fee_usd)?;
-    let amount_out = fill()?;
+    // An order too small to receive anything does not fill.
+    let amount_out = fill().filter(|out| *out > Decimal::ZERO)?;
     if roll < costs.failure_rate {
         return Some(Fill::Failed { fees_usd });
     }
@@ -148,7 +159,7 @@ fn curve_out(amount_in: Decimal, reserve_in: Decimal, reserve_out: Decimal) -> O
         .checked_mul(amount_in)?
         .checked_div(reserve_in.checked_add(amount_in)?)?
         .round_dp_with_strategy(12, RoundingStrategy::ToZero);
-    (out > Decimal::ZERO).then_some(out)
+    Some(out)
 }
 
 /// Current price and liquidity used to value open lots.
@@ -177,8 +188,9 @@ pub enum LedgerError {
     InvalidAmount,
     #[error("sell exceeds the tokens held in open lots")]
     InsufficientTokens,
-    #[error("sell is dated before a lot it would close")]
-    CloseBeforeOpen,
+    /// Events must be recorded in time order (see [`Ledger`]).
+    #[error("event is dated before the previous ledger event")]
+    OutOfOrder,
     #[error("amounts too large to account for")]
     Overflow,
 }
@@ -197,6 +209,11 @@ pub struct Pnl {
 
 /// The ledger is fed from simulated fills on untrusted market data, so every
 /// sum is checked: absurd values give [`LedgerError::Overflow`], not a panic.
+///
+/// Buys and sells must arrive in time order: an event dated before the
+/// previous one is refused. That keeps the record's own timestamps honest,
+/// so the gate can measure duration from them without trusting a caller's
+/// clock, and a back-dated buy cannot stretch the record.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Ledger {
     lots: Vec<Position>,
@@ -206,6 +223,7 @@ pub struct Ledger {
     open_trips: BTreeMap<String, (Decimal, OffsetDateTime)>,
     failed_tx_fees_usd: Decimal,
     ai_cost_usd: Decimal,
+    last_event_at: Option<OffsetDateTime>,
 }
 
 impl Ledger {
@@ -231,8 +249,17 @@ impl Ledger {
         if lot.tokens <= Decimal::ZERO || lot.cost_usd < Decimal::ZERO {
             return Err(LedgerError::InvalidAmount);
         }
+        self.check_order(lot.opened_at)?;
+        self.last_event_at = Some(lot.opened_at);
         self.lots.push(lot);
         Ok(())
+    }
+
+    fn check_order(&self, at: OffsetDateTime) -> Result<(), LedgerError> {
+        match self.last_event_at {
+            Some(last) if at < last => Err(LedgerError::OutOfOrder),
+            _ => Ok(()),
+        }
     }
 
     /// Record a filled sell of `tokens` of `mint`, consuming lots oldest
@@ -250,6 +277,7 @@ impl Ledger {
         if tokens <= Decimal::ZERO || usd_out < Decimal::ZERO || fees_usd < Decimal::ZERO {
             return Err(LedgerError::InvalidAmount);
         }
+        self.check_order(at)?;
         let held = checked_sum(
             self.lots
                 .iter()
@@ -267,9 +295,6 @@ impl Ledger {
         for lot in lots.iter_mut().filter(|l| l.mint == mint) {
             if left.is_zero() {
                 break;
-            }
-            if lot.opened_at > at {
-                return Err(LedgerError::CloseBeforeOpen);
             }
             oldest.get_or_insert(lot.opened_at);
             let take = left.min(lot.tokens);
@@ -306,6 +331,7 @@ impl Ledger {
         lots.retain(|l| !l.tokens.is_zero());
         let still_held = lots.iter().any(|l| l.mint == mint);
         self.lots = lots;
+        self.last_event_at = Some(at);
         if still_held {
             self.open_trips
                 .insert(mint.to_owned(), (trip_pnl, trip_opened));
@@ -639,7 +665,8 @@ mod tests {
             ledger.open_losses(&marks, &costs()),
             Ok(lose_value - d("10"))
         );
-        // A partial sell at a loss still counts while the rest is open.
+        // WIN's partial sell lost 4, but the rest is up by more: the trip is
+        // a net winner overall, so it adds nothing and LOSE stays the total.
         ledger.close("WIN", d("50"), d("1"), d("0"), t0()).unwrap();
         let win_rest = sell_value(d("50"), d("1"), d("1000000000"), &costs()).unwrap();
         assert!(
@@ -678,7 +705,7 @@ mod tests {
         );
         assert_eq!(
             ledger.close("A", d("1"), d("1"), d("0"), t0() - Duration::seconds(1)),
-            Err(LedgerError::CloseBeforeOpen)
+            Err(LedgerError::OutOfOrder)
         );
         assert_eq!(
             ledger.close("A", d("1"), Decimal::MAX, Decimal::ZERO, t0()),
@@ -730,5 +757,70 @@ mod tests {
             assert_eq!(paid_back, d("10"));
             assert_eq!(ledger.closed_trades().len(), 1);
         }
+    }
+
+    #[test]
+    fn curve_output_rounds_down() {
+        // 2 * 1 / (2 + 1) = 0.6666...; rounding to nearest would end in 7.
+        assert_eq!(curve_out(d("1"), d("2"), d("2")), Some(d("0.666666666666")));
+        // Below the 12th decimal the output is zero: valued, but not filled.
+        assert_eq!(
+            curve_out(d("1"), d("1000000000000000"), d("1")),
+            Some(Decimal::ZERO)
+        );
+        assert_eq!(
+            sell(
+                d("1"),
+                d("0.000000000000000000001"),
+                d("100000"),
+                &costs(),
+                d("0.5")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn collapsed_price_values_at_zero_and_bad_costs_value_nothing() {
+        let tiny = d("0.00000000000000000001");
+        assert_eq!(
+            sell_value(d("40000"), tiny, d("200000"), &costs()),
+            Some(Decimal::ZERO)
+        );
+        for bad in [
+            CostModel {
+                dex_fee_bps: 10_000,
+                ..costs()
+            },
+            CostModel {
+                network_fee_usd: d("-1"),
+                ..costs()
+            },
+            CostModel {
+                failure_rate: d("2"),
+                ..costs()
+            },
+        ] {
+            assert!(!bad.is_valid());
+            assert_eq!(sell_value(d("1"), d("1"), d("100000"), &bad), None);
+        }
+    }
+
+    #[test]
+    fn back_dated_events_are_refused() {
+        let mut ledger = Ledger::default();
+        ledger.open(lot("A", "10", "1", 5)).unwrap();
+        assert_eq!(
+            ledger.open(lot("B", "10", "1", 4)),
+            Err(LedgerError::OutOfOrder)
+        );
+        ledger.open(lot("B", "10", "1", 5)).unwrap();
+        ledger
+            .close("A", d("10"), d("1"), d("0"), t0() + Duration::hours(6))
+            .unwrap();
+        assert_eq!(
+            ledger.open(lot("C", "10", "1", 5)),
+            Err(LedgerError::OutOfOrder)
+        );
     }
 }
