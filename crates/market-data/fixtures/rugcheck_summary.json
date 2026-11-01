@@ -1,0 +1,23 @@
+{
+  "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "tokenType": "",
+  "risks": [
+    {
+      "name": "Top 10 holders high ownership",
+      "value": "",
+      "description": "The top 10 users hold more than 70% token supply",
+      "score": 5191,
+      "level": "danger"
+    },
+    {
+      "name": "Low Liquidity",
+      "value": "$184532.17",
+      "description": "Low amount of liquidity in the token pool",
+      "score": 1000,
+      "level": "warn"
+    }
+  ],
+  "score": 6192,
+  "score_normalised": 41,
+  "lpLockedPct": 99.87
+}

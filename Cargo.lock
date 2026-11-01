@@ -2548,6 +2548,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-market-data"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "jarvis-onchain",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "jarvis-observability"
 version = "0.1.0"
 dependencies = [
