@@ -40,6 +40,22 @@ fx_encrypted=$(printf '%s' "$fx_secret" |
     openssl pkeyutl -encrypt -pubin -inkey "$fixture/public.pem" -pkeyopt rsa_padding_mode:pkcs1 | base64 -w0)
 answers() { printf '%s\n' "$@" > "$fixture/answers"; }
 
+# An OpenSSL without rsa_pkcs1_implicit_rejection is refused before any prompt.
+openssl() {
+    if [[ ${1:-} == version ]]; then echo 'OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.0.13 30 Jan 2024)'; else command openssl "$@"; fi
+}
+answers "$fx_consumer_key" "$fx_access_token" "$fx_encrypted"
+if set_ibkr_oauth > "$fixture/old-openssl" 2>&1; then
+    echo 'an OpenSSL older than 3.2 was accepted' >&2; exit 1
+fi
+grep -Fq 'OpenSSL 3.2 or newer is required' "$fixture/old-openssl"
+[[ $(wc -l < "$fixture/answers") == 3 && ! -e $ibkr_oauth_dir/consumer_key ]]
+unset -f openssl
+if ! ibkr_openssl_ok; then
+    echo "IBKR OAuth credential helper: refusal checked; decrypt tests skipped because $(openssl version) lacks rsa_pkcs1_implicit_rejection (needs 3.2+)"
+    exit 0
+fi
+
 # Nothing is set yet.
 ibkr_oauth_status > "$fixture/status"
 grep -Eq '^consumer_key +empty$' "$fixture/status"
@@ -92,6 +108,17 @@ grep -Fq -- '--system --user-group --no-create-home --home-dir /nonexistent --sh
 grep -Fxq 'try-restart jarvis-ibkr-broker.service' "$fixture/service-calls"
 ibkr_oauth_status > "$fixture/status"
 [[ $(grep -c ' set$' "$fixture/status") == 5 ]]
+
+# A rename failing after the first one reports a partial save.
+mv() { [[ ${*: -1} != */access_token ]] && command mv "$@"; }
+answers "$fx_consumer_key" "$fx_access_token" "$fx_encrypted"
+if set_ibkr_oauth > "$fixture/partial" 2>&1; then
+    echo 'a failed rename was reported as saved' >&2; exit 1
+fi
+grep -Fq 'only partially saved; rerun set' "$fixture/partial"
+cat "$fixture/partial" >> "$fixture/output"
+unset -f mv
+[[ -z $(find "$ibkr_oauth_dir" -name '.*' -print -quit) ]]
 
 # Status reports only set/empty; an unsafe file counts as empty.
 chmod 0440 "$ibkr_oauth_dir/access_token"

@@ -51,12 +51,23 @@ ProtectClock=true
 ProtectHostname=true
 ProtectProc=invisible
 ProcSubset=pid
+PrivatePIDs=true
+RemoveIPC=true
 RestrictRealtime=true
 RestrictNamespaces=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
 MemoryDenyWriteExecute=true
+# Nothing executes except the release binary and the shared libraries it
+# loads (only the multiarch directory: /usr/lib itself holds shells).
+NoExecPaths=/
+ExecPaths=/opt/jarvis/releases /usr/lib/x86_64-linux-gnu -/usr/lib64
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Internet only (IBKR's API): no loopback services, LAN, link-local,
+# CGNAT/Tailscale or ULA ranges. 127.0.0.53 is the systemd-resolved stub.
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.0.0.53
 InaccessiblePaths=/etc/jarvis /var/lib/jarvis
 LimitCORE=0
 TasksMax=64

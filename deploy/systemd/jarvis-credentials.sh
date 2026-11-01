@@ -57,12 +57,21 @@ ibkr_decrypt_secret() {
         od -An -v -tx1 | tr -d ' \n'
 }
 
+# The option above exists from OpenSSL 3.2. Never decrypt without it.
+ibkr_openssl_ok() {
+    local version
+    version=$(openssl version 2>/dev/null) || return 1
+    [[ $version =~ ^OpenSSL\ ([0-9]+)\.([0-9]+)\. ]] || return 1
+    (( BASH_REMATCH[1] > 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] >= 2) ))
+}
+
 ensure_ibkr_identity() {
     getent passwd jarvis-ibkr >/dev/null ||
         useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin jarvis-ibkr
 }
 
 # NAME VALUE ...: stage every file root-only 0400, then rename all in place.
+# Exit 2 means some files were already replaced.
 ibkr_install_values() (
     local -a names=() staged=()
     local tmp index
@@ -75,7 +84,7 @@ ibkr_install_values() (
         shift 2
     done
     for index in "${!names[@]}"; do
-        mv -Tf -- "${staged[$index]}" "$ibkr_oauth_dir/${names[$index]}" || return 1
+        mv -Tf -- "${staged[$index]}" "$ibkr_oauth_dir/${names[$index]}" || return $((index > 0 ? 2 : 1))
     done
 )
 
@@ -84,6 +93,7 @@ set_ibkr_oauth() (
     require_tty
     command -v openssl >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 ||
         fail "openssl and base64 are required"
+    ibkr_openssl_ok || fail "OpenSSL 3.2 or newer is required: older versions turn a wrong key into random bytes instead of an error"
     [[ -d $ibkr_oauth_dir ]] && ibkr_private_ok "$ibkr_oauth_dir" ||
         fail "$ibkr_oauth_dir must be a root-only directory holding the generated keys"
     for key in private_encryption.pem private_signature.pem dhparam.pem; do
@@ -102,10 +112,13 @@ set_ibkr_oauth() (
         fail "the access token secret must be the base64 text shown by IBKR"
     prepend=$(printf '%s' "$encrypted" | ibkr_decrypt_secret "$ibkr_oauth_dir/private_encryption.pem") &&
         [[ $prepend =~ ^[0-9a-f]+$ ]] ||
-        fail "the access token secret does not decrypt with private_encryption.pem (wrong key, damaged text, or OpenSSL older than 3.2); nothing was changed"
+        fail "the access token secret does not decrypt with private_encryption.pem (wrong key or damaged text); nothing was changed"
     ensure_ibkr_identity || fail "could not create the jarvis-ibkr service identity"
+    local saved=0
     ibkr_install_values consumer_key "$consumer_key" access_token "$access_token" \
-        access_token_secret "$prepend" || fail "could not save the IBKR credentials"
+        access_token_secret "$prepend" || saved=$?
+    ((saved != 2)) || fail "IBKR credentials only partially saved; rerun set"
+    ((saved == 0)) || fail "could not save the IBKR credentials; nothing was changed"
     # A running broker loads the new values; a stopped one stays stopped.
     systemctl try-restart jarvis-ibkr-broker.service >/dev/null 2>&1 || true
     echo "jarvis-credentials: IBKR OAuth credentials saved. Enable the broker with: sudo systemctl enable --now jarvis-ibkr-broker.service"

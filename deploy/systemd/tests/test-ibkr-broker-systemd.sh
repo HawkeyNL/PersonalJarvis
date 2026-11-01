@@ -67,8 +67,10 @@ install -d -m 0700 "$creds"
 install -m 0755 "$binary" "$fixture/jarvis-ibkr-broker"
 sed -e "s#^ExecStart=/opt/jarvis/current/jarvis-ibkr-broker\$#ExecStart=$fixture/jarvis-ibkr-broker#" \
     -e "s#/etc/jarvis/secrets/ibkr-oauth/#$creds/#g" \
+    -e "s#^ExecPaths=/opt/jarvis/releases #ExecPaths=$fixture #" \
     "$repo_dir/deploy/systemd/$unit" > "/run/systemd/system/$unit"
 grep -Fxq "ExecStart=$fixture/jarvis-ibkr-broker" "/run/systemd/system/$unit"
+grep -Fxq "ExecPaths=$fixture /usr/lib/x86_64-linux-gnu -/usr/lib64" "/run/systemd/system/$unit"
 [[ $(grep -c "^LoadCredential=[a-z_]*:$creds/" "/run/systemd/system/$unit") == 5 ]]
 systemctl daemon-reload
 systemctl start "$unit"

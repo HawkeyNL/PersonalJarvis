@@ -580,22 +580,34 @@ fn loads_credential_files_and_redacts_debug() {
 }
 
 #[test]
-fn credential_modes_allow_only_root_group_read() {
-    for (mode, gid, ok) in [
-        (0o600, 1000, true),
-        (0o400, 1000, true),
-        // systemd credential on tmpfs: root:root, ACL mask shown as group read.
-        (0o440, 0, true),
-        (0o640, 0, true),
-        (0o440, 1000, false),
-        (0o460, 0, false),
-        (0o450, 0, false),
-        (0o444, 0, false),
-        (0o404, 1000, false),
-        (0o660, 1000, false),
+fn credential_modes_relax_only_for_root_systemd_credentials() {
+    for (mode, uid, gid, systemd, ok) in [
+        (0o100600, 1000, 1000, false, true),
+        (0o400, 1000, 1000, false, true),
+        (0o400, 1000, 1000, true, true),
+        // systemd credential on tmpfs: root:root 0440 through an ACL mask.
+        (0o100440, 0, 0, true, true),
+        (0o440, 0, 0, false, false),
+        (0o440, 1000, 0, true, false),
+        (0o440, 0, 1000, true, false),
+        (0o640, 0, 0, true, false),
+        (0o460, 0, 0, true, false),
+        (0o444, 0, 0, true, false),
+        (0o4440, 0, 0, true, false),
+        (0o404, 1000, 1000, false, false),
+        (0o660, 1000, 1000, false, false),
     ] {
-        assert_eq!(private_mode(mode, gid), ok, "{mode:o} gid {gid}");
+        assert_eq!(
+            private_mode(mode, uid, gid, systemd),
+            ok,
+            "{mode:o} {uid}:{gid} systemd={systemd}"
+        );
     }
+    // Without CREDENTIALS_DIRECTORY no path counts as a systemd credential.
+    assert!(
+        std::env::var_os("CREDENTIALS_DIRECTORY").is_some()
+            || !is_systemd_credential(Path::new("/run/credentials/x.service/consumer_key"))
+    );
 }
 
 #[test]

@@ -26,7 +26,11 @@ for directive in NoNewPrivileges=true CapabilityBoundingSet= LockPersonality=tru
     RestrictRealtime=true RestrictNamespaces=true SystemCallArchitectures=native \
     SystemCallFilter=@system-service MemoryDenyWriteExecute=true \
     'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' 'InaccessiblePaths=/etc/jarvis /var/lib/jarvis' \
-    UMask=0117 LimitCORE=0 TasksMax=64 Restart=on-failure StartLimitIntervalSec=300 StartLimitBurst=5; do
+    UMask=0117 LimitCORE=0 TasksMax=64 Restart=on-failure StartLimitIntervalSec=300 StartLimitBurst=5 \
+    PrivatePIDs=true RemoveIPC=true 'SystemCallFilter=~@privileged @resources' NoExecPaths=/ \
+    'ExecPaths=/opt/jarvis/releases /usr/lib/x86_64-linux-gnu -/usr/lib64' \
+    'IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7' \
+    IPAddressAllow=127.0.0.53; do
     grep -Fxq "$directive" "$service"
 done
 ! grep -Eq '^(SupplementaryGroups|EnvironmentFile|StateDirectory|RuntimeDirectory|AmbientCapabilities|DynamicUser)=' "$service"
