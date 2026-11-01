@@ -628,6 +628,9 @@ async fn main() -> anyhow::Result<()> {
         bootstrap_enrollment,
         app_update_mirror,
         notifier,
+        memecoin: Arc::new(jarvis_api::memecoin::PaperHandle::new(
+            config.memecoin_paper_enabled,
+        )),
     };
 
     jarvis_api::refresh_usage_snapshot(&state).await;
@@ -661,6 +664,12 @@ async fn main() -> anyhow::Result<()> {
             jarvis_api::run_audit_maintenance(&audit_state).await;
         }
     });
+    if config.memecoin_paper_enabled {
+        if let Err(reason) = start_memecoin_paper(&config, &state).await {
+            tracing::error!(%reason, "memecoin paper trader disabled");
+            state.memecoin.note_start_failure();
+        }
+    }
     let _local_device_admin = if state.environment == "production" {
         Some(jarvis_api::local_devices::start(state.clone())?)
     } else {
@@ -689,6 +698,42 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The paper trader is optional: any configuration problem leaves it off and
+/// Core running. It never receives a wallet, signer or execution path.
+async fn start_memecoin_paper(
+    config: &AppConfig,
+    state: &jarvis_api::AppState,
+) -> Result<(), String> {
+    use jarvis_api::memecoin;
+    let profile = memecoin::PaperProfile::load(
+        Path::new(&config.memecoin_paper_profile_path),
+        config.environment.eq_ignore_ascii_case("production"),
+    )?;
+    let market = memecoin::LiveMarket::new(
+        &config.market_solana_rpc_a_url,
+        &config.market_solana_rpc_b_url,
+        &config.market_jupiter_api_key,
+    )
+    .map_err(|error| format!("market data: {error}"))?;
+    let resume = config.memecoin_paper_resume_paused_at.trim();
+    let resume_paused_at = (!resume.is_empty())
+        .then(|| {
+            time::OffsetDateTime::parse(resume, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| "JARVIS_MEMECOIN_PAPER_RESUME_PAUSED_AT is not RFC 3339".to_string())
+        })
+        .transpose()?;
+    memecoin::start(
+        state.db.clone(),
+        state.memecoin.clone(),
+        memecoin::StartConfig {
+            profile,
+            market: Box::new(market),
+            resume_paused_at,
+        },
+    )
+    .await
 }
 
 /// `systemctl reload jarvis-core` sends SIGHUP: re-read the staged agent

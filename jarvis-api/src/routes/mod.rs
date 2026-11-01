@@ -12,6 +12,7 @@ pub(crate) mod broker;
 pub(crate) mod chat;
 mod chat_context;
 pub(crate) mod coding;
+pub(crate) mod meme;
 pub(crate) mod portfolio;
 pub(crate) mod runs;
 pub(crate) mod services;

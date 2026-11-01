@@ -459,6 +459,21 @@ pub async fn load_trips(db: &Database) -> Result<Vec<Trip>> {
     bounded(rows)?.into_iter().map(Trip::try_from).collect()
 }
 
+/// Positions still held (open or stuck), oldest first. Paper holds at most
+/// one per mint and opens at most 10, so 64 bounds even a lowered limit.
+pub async fn load_held_trips(db: &Database) -> Result<Vec<Trip>> {
+    let rows: Vec<TripRow> = rows(
+        db,
+        &format!(
+            "SELECT {TRIP_FIELDS} FROM memecoin_paper_trips WHERE status != 'closed' \
+             ORDER BY opened_at LIMIT 64"
+        ),
+        json!({}),
+    )
+    .await?;
+    rows.into_iter().map(Trip::try_from).collect()
+}
+
 /// Newest closed trips first, at most [`MAX_LIST`].
 pub async fn recent_closed_trips(db: &Database, limit: usize) -> Result<Vec<Trip>> {
     let rows: Vec<TripRow> = rows(

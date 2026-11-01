@@ -96,6 +96,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         bootstrap_enrollment: None,
         app_update_mirror: None,
         notifier: Default::default(),
+        memecoin: Default::default(),
     }
 }
 
@@ -1422,5 +1423,113 @@ async fn month_statistics_break_down_agents_latency_failures_and_fallbacks(
     assert_eq!(stats.failures_by_category.len(), 1);
     assert_eq!(stats.failures_by_category[0].category, "timeout");
     assert_eq!(stats.failures_by_category[0].requests, 1);
+    Ok(())
+}
+
+const MEME_ROUTES: [(&str, &str); 4] = [
+    ("GET", "/v1/trading/meme/overview"),
+    ("GET", "/v1/trading/meme/candidates?limit=5"),
+    ("GET", "/v1/trading/meme/trades"),
+    ("POST", "/v1/trading/meme/pause"),
+];
+
+#[tokio::test]
+async fn memecoin_paper_routes_refuse_missing_or_invalid_sessions() {
+    // An unconnected database cannot authenticate any token.
+    let fixture = state(jarvis_store::Database::init(), None).await;
+    let handle = fixture.memecoin.clone();
+    let app = build_router(fixture);
+    for (method, path) in MEME_ROUTES {
+        for authorization in [None, Some("Bearer not-a-session")] {
+            let mut request = Request::builder().method(method).uri(path);
+            if let Some(value) = authorization {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+    }
+    // Disabled by default, and an unauthenticated pause changes nothing.
+    assert!(!handle.enabled() && !handle.running() && !handle.paused());
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn memecoin_paper_routes_are_read_only_except_pause() -> Result<(), Box<dyn std::error::Error>>
+{
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let audit_db = db.clone();
+    let app = build_router(state(db, None).await);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let call = |method: &'static str, path: &'static str| {
+        app.clone().oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+
+    let overview = json_body(call("GET", "/v1/trading/meme/overview").await?).await;
+    assert_eq!(overview["mode"], "paper");
+    assert_eq!(overview["enabled"], false);
+    assert_eq!(overview["paused"], false);
+    assert!(overview.get("equity_usd").is_none());
+    let candidates = json_body(call("GET", "/v1/trading/meme/candidates").await?).await;
+    assert_eq!(candidates["candidates"], json!([]));
+    let trades = json_body(call("GET", "/v1/trading/meme/trades?limit=100").await?).await;
+    assert_eq!(trades["trades"], json!([]));
+    for bad in [
+        "/v1/trading/meme/trades?limit=0",
+        "/v1/trading/meme/candidates?limit=101",
+        "/v1/trading/meme/candidates?limit=x",
+    ] {
+        assert_eq!(
+            call("GET", bad).await?.status(),
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    // There is no way to resume over HTTP.
+    for path in ["/v1/trading/meme/resume", "/v1/trading/meme/unpause"] {
+        assert_eq!(call("POST", path).await?.status(), StatusCode::NOT_FOUND);
+    }
+    for _ in 0..2 {
+        let paused = call("POST", "/v1/trading/meme/pause").await?;
+        assert_eq!(paused.status(), StatusCode::OK);
+    }
+    let overview = json_body(call("GET", "/v1/trading/meme/overview").await?).await;
+    assert_eq!(overview["paused"], true);
+    assert!(overview["paused_at"].is_string());
+    // Each pause is in the security audit, with the device that made it.
+    let audited: Vec<Option<String>> = audit_db
+        .query("SELECT VALUE device_id FROM security_audit WHERE event = 'memecoin.paper.pause' AND outcome = 'paused'")
+        .await?
+        .check()?
+        .take(0)?;
+    assert_eq!(audited.len(), 2);
+    assert!(audited.iter().all(Option::is_some));
     Ok(())
 }

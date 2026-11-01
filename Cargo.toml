@@ -111,3 +111,4 @@ jarvis-sandbox = { path = "crates/sandbox" }
 jarvis-privileged = { path = "crates/privileged" }
 jarvis-core = { path = "jarvis-core" }
 jarvis-onchain = { path = "crates/onchain" }
+jarvis-market-data = { path = "crates/market-data" }

@@ -20,6 +20,9 @@ EnvironmentFile=-/etc/jarvis/secrets/zai.env
 EnvironmentFile=-/etc/jarvis/secrets/ollama-cloud.env
 EnvironmentFile=-/etc/jarvis/secrets/huggingface.env
 EnvironmentFile=-/etc/jarvis/secrets/jev.env
+# Optional read-only market-data endpoints and keys for the paper trader
+# (docs/MEMECOIN_PAPER.md).
+EnvironmentFile=-/etc/jarvis/secrets/market-data.env
 # Optional owner-notification publisher token (docs/NOTIFICATIONS.md).
 EnvironmentFile=-/etc/jarvis/secrets/ntfy.env
 # Optional APNs signing key for approval pushes to the iOS app.
