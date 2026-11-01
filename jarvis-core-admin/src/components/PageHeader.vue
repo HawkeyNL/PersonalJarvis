@@ -5,7 +5,7 @@ defineProps<{ title: string; description: string; busy?: boolean }>();
 <template>
   <header class="page-header">
     <div>
-      <p class="eyebrow">HOME NODE</p>
+      <p class="eyebrow">Home Node</p>
       <h1>{{ title }}</h1>
       <p>{{ description }}</p>
     </div>

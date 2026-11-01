@@ -11,7 +11,7 @@ test("unmeasured values are never shown as zero", () => {
   assert.equal(measured(5100, ms), "5.1 s");
 });
 
-test("service summary counts active units and picks the orb tone", () => {
+test("service summary counts active units and picks the health tone", () => {
   assert.deepEqual(serviceSummary(null), { up: 0, total: 0, tone: "idle" });
   assert.deepEqual(serviceSummary({ core: "active", db: "active" }), { up: 2, total: 2, tone: "ok" });
   assert.deepEqual(serviceSummary({ core: "active", db: "inactive" }), { up: 1, total: 2, tone: "warn" });

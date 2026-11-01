@@ -49,30 +49,30 @@ onMounted(load);
   </section>
   <template v-if="data">
     <section class="usage-metrics">
-      <article class="metric-card"><span class="card-label">TOTAL TOKENS</span><strong>{{ integer(data.total_tokens) }}</strong><small>{{ integer(data.requests) }} model calls</small></article>
-      <article class="metric-card"><span class="card-label">INPUT</span><strong>{{ integer(data.input_tokens) }}</strong><small>{{ integer(data.cache_read_tokens) }} cached</small></article>
-      <article class="metric-card"><span class="card-label">OUTPUT</span><strong>{{ integer(data.output_tokens) }}</strong><small>{{ integer(data.cache_write_tokens) }} cache writes</small></article>
-      <article class="metric-card"><span class="card-label">MONTH SPEND</span><strong>{{ eur(data.spent_eur) }}</strong><small>{{ eur(data.remaining_eur) }} remaining</small></article>
-      <article class="metric-card"><span class="card-label">LATENCY P50</span><strong :class="{ unmeasured: data.latency_p50_ms === null }">{{ measured(data.latency_p50_ms, ms) }}</strong><small>Calls with a measured latency</small></article>
-      <article class="metric-card"><span class="card-label">LATENCY P95</span><strong :class="{ unmeasured: data.latency_p95_ms === null }">{{ measured(data.latency_p95_ms, ms) }}</strong><small>Slowest 5% start above this</small></article>
-      <article class="metric-card"><span class="card-label">FAILURES</span><strong :class="{ unmeasured: data.failures === null }">{{ measured(data.failures) }}</strong><small>Failed model calls this month</small></article>
-      <article class="metric-card"><span class="card-label">FALLBACKS</span><strong :class="{ unmeasured: data.fallbacks === null }">{{ measured(data.fallbacks) }}</strong><small>Router moves to a next model</small></article>
+      <article class="metric-card"><span class="card-label">Total tokens</span><strong>{{ integer(data.total_tokens) }}</strong><small>{{ integer(data.requests) }} model calls</small></article>
+      <article class="metric-card"><span class="card-label">Input</span><strong>{{ integer(data.input_tokens) }}</strong><small>{{ integer(data.cache_read_tokens) }} cached</small></article>
+      <article class="metric-card"><span class="card-label">Output</span><strong>{{ integer(data.output_tokens) }}</strong><small>{{ integer(data.cache_write_tokens) }} cache writes</small></article>
+      <article class="metric-card"><span class="card-label">Month spend</span><strong>{{ eur(data.spent_eur) }}</strong><small>{{ eur(data.remaining_eur) }} remaining</small></article>
+      <article class="metric-card"><span class="card-label">Latency p50</span><strong :class="{ unmeasured: data.latency_p50_ms === null }">{{ measured(data.latency_p50_ms, ms) }}</strong><small>Calls with a measured latency</small></article>
+      <article class="metric-card"><span class="card-label">Latency p95</span><strong :class="{ unmeasured: data.latency_p95_ms === null }">{{ measured(data.latency_p95_ms, ms) }}</strong><small>Slowest 5% start above this</small></article>
+      <article class="metric-card"><span class="card-label">Failures</span><strong :class="{ unmeasured: data.failures === null }">{{ measured(data.failures) }}</strong><small>Failed model calls this month</small></article>
+      <article class="metric-card"><span class="card-label">Fallbacks</span><strong :class="{ unmeasured: data.fallbacks === null }">{{ measured(data.fallbacks) }}</strong><small>Router moves to a next model</small></article>
     </section>
 
     <section class="detail-card budget-card">
-      <div class="budget-heading"><div><span class="card-label">MONTHLY HARD BUDGET</span><h2>{{ eur(data.spent_eur) }} / {{ eur(data.budget_eur) }}</h2></div><strong :class="{ 'usage-danger': data.over_budget }">{{ budgetPercent.toFixed(0) }}%</strong></div>
+      <div class="budget-heading"><div><span class="card-label">Monthly hard budget</span><h2>{{ eur(data.spent_eur) }} / {{ eur(data.budget_eur) }}</h2></div><strong :class="{ 'usage-danger': data.over_budget }">{{ budgetPercent.toFixed(0) }}%</strong></div>
       <div class="usage-progress"><i :class="{ danger: data.over_budget }" :style="{ width: `${budgetPercent}%` }" /></div>
       <small>{{ eur(data.reserved_eur) }} reserved · {{ eur(data.remaining_hard_eur) }} hard capacity remaining</small>
     </section>
 
     <section class="usage-grid">
       <article class="detail-card">
-        <span class="card-label">TOKENS BY DAY</span>
+        <span class="card-label">Tokens by day</span>
         <DailyUsageChart v-if="data.daily.length" :rows="data.daily" />
         <div v-else class="empty-state">No recorded model calls this month.</div>
       </article>
       <article class="detail-card">
-        <span class="card-label">BY PROVIDER</span>
+        <span class="card-label">By provider</span>
         <div v-if="data.by_backend.length" class="provider-usage">
           <div v-for="row in data.by_backend" :key="row.backend">
             <div><strong>{{ row.backend }}</strong><span>{{ integer(row.total_tokens) }} · {{ eur(row.spent_eur) }}</span></div>
@@ -129,7 +129,7 @@ onMounted(load);
 
 <style scoped>
 .breakdown-tabs { margin: 4px 0 12px; }
-.metric-card strong.unmeasured { font-family: var(--font-body); font-size: var(--fs-15); font-style: italic; font-weight: 300; color: var(--idle); }
+.metric-card strong.unmeasured { font-size: 15px; font-weight: 400; color: var(--text-secondary); }
 .breakdown-unavailable { margin: 14px; }
 .failure-usage { margin: 0; padding: 16px; }
 </style>

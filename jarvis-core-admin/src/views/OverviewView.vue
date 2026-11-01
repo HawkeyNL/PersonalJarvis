@@ -7,7 +7,6 @@ import {
 } from "../admin";
 import DailyUsageChart from "../components/DailyUsageChart.vue";
 import JvModuleCard from "../components/jv/JvModuleCard.vue";
-import JvOrb from "../components/jv/JvOrb.vue";
 import JvStatusDot from "../components/jv/JvStatusDot.vue";
 import { NOT_MEASURED, budgetPercent, compact, eur, integer, measured, ms, serviceSummary } from "../stats";
 
@@ -43,7 +42,7 @@ async function load() {
 onMounted(load);
 
 const services = computed(() => serviceSummary(overview.value.data?.status.services));
-const orbTone = computed<Tone>(() => (overview.value.error && !overview.value.data ? "error" : services.value.tone));
+const healthTone = computed<Tone>(() => (overview.value.error && !overview.value.data ? "error" : services.value.tone));
 const headline = computed(() => {
   if (!overview.value.data) return overview.value.error ? "Home Node state unavailable" : "Reading Home Node state…";
   const { up, total } = services.value;
@@ -155,12 +154,11 @@ const credentialCard = computed(() => {
 <template>
   <div class="dash">
     <header class="dash-hero">
-      <JvOrb class="dash-orb" :size="196" :tone="orbTone" still />
       <div class="hero-text">
-        <p class="eyebrow">HOME NODE HEALTH</p>
+        <p class="eyebrow">Home Node health</p>
         <h1>{{ headline }}</h1>
         <div class="hero-pill" role="status">
-          <JvStatusDot :tone="orbTone" :label="orbTone === 'ok' ? 'Healthy' : orbTone === 'warn' ? 'Degraded' : orbTone === 'error' ? 'Attention' : 'Unknown'" />
+          <JvStatusDot :tone="healthTone" :label="healthTone === 'ok' ? 'Healthy' : healthTone === 'warn' ? 'Degraded' : healthTone === 'error' ? 'Attention' : 'Unknown'" />
           <span class="pill-sep" aria-hidden="true"></span>
           <span>{{ overview.data?.status.release ?? "Release unknown" }}</span>
         </div>
@@ -173,18 +171,18 @@ const credentialCard = computed(() => {
     </header>
 
     <div class="dash-grid">
-      <JvModuleCard icon="layers" title="SERVICES" v-bind="serviceCard" @open="emit('open', 'services')" />
-      <JvModuleCard icon="download" title="RELEASE" v-bind="releaseCard" @open="emit('open', 'update')" />
-      <JvModuleCard icon="agents" title="AGENTS" v-bind="agentCard" @open="emit('open', 'agents')" />
+      <JvModuleCard icon="layers" title="Services" v-bind="serviceCard" @open="emit('open', 'services')" />
+      <JvModuleCard icon="download" title="Release" v-bind="releaseCard" @open="emit('open', 'update')" />
+      <JvModuleCard icon="agents" title="Agents" v-bind="agentCard" @open="emit('open', 'agents')" />
 
-      <JvModuleCard class="wide" icon="chart" title="SPEND THIS MONTH" :value="spendCard.value" :lines="spendCard.lines" :tone="spendCard.tone" @open="emit('open', 'usage')">
+      <JvModuleCard class="wide" icon="chart" title="Spend this month" :value="spendCard.value" :lines="spendCard.lines" :tone="spendCard.tone" @open="emit('open', 'usage')">
         <template v-if="usage.data">
           <span class="meter" aria-hidden="true"><i :class="{ danger: usage.data.over_budget }" :style="{ width: `${budgetPercent(usage.data.spent_eur, usage.data.budget_eur)}%` }" /></span>
           <DailyUsageChart v-if="usage.data.daily.length" class="dash-chart" :rows="usage.data.daily" />
           <span v-else class="note">No recorded model calls this month.</span>
         </template>
       </JvModuleCard>
-      <JvModuleCard icon="pulse" title="LATENCY &amp; RELIABILITY" v-bind="latencyCard" @open="emit('open', 'usage')">
+      <JvModuleCard icon="pulse" title="Latency &amp; reliability" v-bind="latencyCard" @open="emit('open', 'usage')">
         <span v-if="usage.data?.by_backend.length" class="backend-latency">
           <span v-for="row in usage.data.by_backend.slice(0, 4)" :key="row.backend">
             <span>{{ row.backend }}</span><span>{{ row.latency_p50_ms === null ? NOT_MEASURED : `${ms(row.latency_p50_ms)} · p95 ${measured(row.latency_p95_ms, ms)}` }}</span>
@@ -192,16 +190,16 @@ const credentialCard = computed(() => {
         </span>
       </JvModuleCard>
 
-      <JvModuleCard class="wide" icon="chip" title="MODELS &amp; ROUTING" v-bind="modelCard" @open="emit('open', 'models')">
+      <JvModuleCard class="wide" icon="chip" title="Models &amp; routing" v-bind="modelCard" @open="emit('open', 'models')">
         <span v-if="routes.data" class="chips">
           <span v-for="item in tiers" :key="item.tier" class="chip" :class="{ owner: item.owner }">{{ item.label }} · {{ item.detail }}</span>
         </span>
         <span v-else-if="routes.error" class="note">Routing unavailable: {{ routes.error }}</span>
       </JvModuleCard>
-      <JvModuleCard icon="monitor" title="DEVICES" v-bind="deviceCard" @open="emit('open', 'devices')" />
+      <JvModuleCard icon="monitor" title="Devices" v-bind="deviceCard" @open="emit('open', 'devices')" />
 
-      <JvModuleCard icon="link-2" title="AI ACCOUNTS" v-bind="accountCard" @open="emit('open', 'ai-accounts')" />
-      <JvModuleCard class="wide" icon="key" title="CREDENTIALS" v-bind="credentialCard" @open="emit('open', 'credentials')">
+      <JvModuleCard icon="link-2" title="AI accounts" v-bind="accountCard" @open="emit('open', 'ai-accounts')" />
+      <JvModuleCard class="wide" icon="key" title="Credentials" v-bind="credentialCard" @open="emit('open', 'credentials')">
         <span v-if="credentials.data" class="chips">
           <span v-for="row in credentials.data" :key="row.provider" class="chip" :class="{ owner: row.configured }">{{ credentialLabels[row.provider] }} · {{ row.configured ? "configured" : "not set" }}</span>
         </span>
@@ -212,33 +210,29 @@ const credentialCard = computed(() => {
 
 <style scoped>
 .dash { max-width: 1180px; margin: 0 auto; }
-.dash-hero { display: flex; align-items: center; justify-content: center; gap: 48px; margin: 4px 0 30px; }
-.dash-orb { flex: none; }
+.dash-hero { margin: 0 0 24px; }
 .hero-text { min-width: 0; }
-.hero-text h1 { margin: 10px 0 14px; font-family: var(--font-display); font-size: 30px; font-weight: 600; letter-spacing: 0.08em; color: var(--text-0); }
+.hero-text h1 { margin: 4px 0 12px; font-size: 28px; }
 .hero-pill {
-  display: inline-flex; align-items: center; gap: 14px; height: 40px; padding: 0 20px;
-  border: 1px solid var(--line-a30); border-radius: 999px; background: rgba(4, 30, 24, 0.75); font-size: var(--fs-13); color: var(--text-2);
+  display: inline-flex; align-items: center; gap: 12px; height: 36px; padding: 0 6px;
+  border-radius: var(--r-pill); background: var(--bg-sunken); font-size: 13px; color: var(--text-primary);
 }
-.pill-sep { width: 1px; height: 18px; background: var(--line-a30); }
-.hero-meta { display: flex; align-items: center; gap: 14px; margin: 14px 0 0; color: var(--text-5); font-size: var(--fs-12); }
-.dash-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px 16px; }
+.hero-pill > span:last-child { padding-right: 10px; }
+.pill-sep { width: 1px; height: 16px; background: var(--border); }
+.hero-meta { display: flex; align-items: center; gap: 12px; margin: 12px 0 0; color: var(--text-secondary); font-size: 13px; }
+.dash-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
 .dash-grid > .wide { grid-column: span 2; }
-.meter { display: block; height: 6px; overflow: hidden; border-radius: 999px; background: rgba(var(--accent-rgb), 0.12); }
-.meter i { display: block; height: 100%; min-width: 2px; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
-.meter i.danger { background: var(--danger); }
 .dash-chart { height: 150px; margin-top: 10px; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
-.chip { padding: 4px 10px; border: 1px solid var(--line-a18); border-radius: 999px; color: var(--text-5); font-size: var(--fs-11); letter-spacing: 0.04em; }
-.chip.owner { border-color: var(--line-a45); color: var(--text-2); }
-.note { color: var(--text-5); font-size: var(--fs-12); }
-.backend-latency { display: grid; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line-a18); font-size: var(--fs-11); color: var(--text-4); }
+.chip { display: inline-flex; align-items: center; height: 24px; padding: 0 9px; border-radius: var(--r-pill); background: var(--bg-sunken); color: var(--text-secondary); font-size: 12px; font-weight: 500; }
+.chip.owner { background: var(--accent-subtle); color: var(--accent-text); }
+.note { color: var(--text-secondary); font-size: 13px; }
+.backend-latency { display: grid; gap: 6px; padding-top: 10px; border-top: 1px solid var(--separator); font-size: 13px; color: var(--text-secondary); }
 .backend-latency > span { display: flex; justify-content: space-between; gap: 10px; }
-.backend-latency > span > span:last-child { color: var(--text-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.backend-latency > span > span:last-child { color: var(--text-primary); font-variant-numeric: tabular-nums; white-space: nowrap; }
 @media (max-width: 1099px), (max-height: 759px) {
-  .dash-hero { gap: 24px; margin-bottom: 20px; }
-  .dash-orb { display: none; }
-  .hero-text h1 { font-size: 24px; }
+  .dash-hero { margin-bottom: 18px; }
+  .hero-text h1 { font-size: 22px; }
   .dash-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 </style>

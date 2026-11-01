@@ -20,7 +20,7 @@ export function measured(value: number | null | undefined, format: (value: numbe
 
 export type ServiceTone = "ok" | "warn" | "error" | "idle";
 
-/** Services up out of total, and the tone the dashboard orb takes from them. */
+/** Services up out of total, and the tone the dashboard health badge takes from them. */
 export function serviceSummary(services: Record<string, string> | null | undefined): { up: number; total: number; tone: ServiceTone } {
   const states = Object.values(services ?? {}).map((state) => state.toLowerCase());
   const up = states.filter((state) => state === "active").length;

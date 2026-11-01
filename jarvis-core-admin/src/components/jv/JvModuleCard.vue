@@ -29,31 +29,35 @@ const accessibleName = computed(() => [props.title, props.value, ...props.lines]
 <style scoped>
 .jv-card {
   position: relative; display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 14px;
-  box-sizing: border-box; min-width: 0; min-height: 87px; padding: 14px 30px 14px 20px;
-  border-radius: var(--r-22); border: 1px solid var(--line); background: var(--card-bg);
-  color: inherit; font: inherit; font-weight: 400; text-align: left; cursor: pointer;
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  min-width: 0; min-height: 88px; padding: 16px 28px 16px 18px;
+  border-radius: var(--r-lg); background: var(--bg-surface); box-shadow: var(--shadow-border);
+  color: inherit; font: inherit; font-weight: 400; line-height: 1.5; text-align: left; white-space: normal;
 }
-.row { display: flex; align-items: center; gap: 22px; min-width: 0; }
+.row { display: flex; align-items: center; gap: 14px; min-width: 0; }
 .body { display: block; min-width: 0; }
-.jv-card:hover { border-color: var(--line-a45); box-shadow: 0 0 22px rgba(var(--accent-rgb), 0.12); }
-.icon {
-  width: 58px; height: 58px; flex: none; box-sizing: border-box; display: grid; place-items: center;
-  border-radius: 50%; border: 1.5px solid var(--line-a55); color: var(--accent);
+@media (hover: hover) and (pointer: fine) {
+  .jv-card:hover { background: var(--bg-surface); box-shadow: var(--shadow-border-hover); }
 }
-.icon :deep(svg) { width: 26px; height: 26px; stroke-width: 1.5; }
+@media (prefers-reduced-motion: no-preference) {
+  .jv-card:active { transform: scale(0.99); }
+}
+.icon {
+  width: 36px; height: 36px; flex: none; display: grid; place-items: center;
+  border-radius: 10px; background: var(--bg-sunken); color: var(--text-secondary);
+}
+.icon :deep(svg) { width: 20px; height: 20px; stroke-width: 1.6; }
 .text { display: flex; flex-direction: column; min-width: 0; }
-.title { font-size: var(--fs-12); font-weight: 600; letter-spacing: 0.1em; color: var(--text-0); }
-.line { font-size: var(--fs-11); letter-spacing: 0.06em; color: var(--text-5); line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.title + .line { margin-top: 5px; }
+.title { font-size: 13px; font-weight: 500; color: var(--text-secondary); }
+.line { font-size: 13px; color: var(--text-secondary); line-height: 1.45; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.title + .line { margin-top: 4px; }
 .value {
-  margin-top: 4px; font-family: var(--font-display); font-size: 26px; font-weight: 600; line-height: 1.1;
-  letter-spacing: 0.04em; color: var(--text-0); font-variant-numeric: tabular-nums;
+  margin-top: 2px; font-size: 22px; font-weight: 600; line-height: 1.2; letter-spacing: -0.01em;
+  color: var(--text-primary); font-variant-numeric: tabular-nums;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .value + .line { margin-top: 2px; }
-.dot { position: absolute; top: 16px; right: 18px; width: 5px; height: 5px; border-radius: 50%; background: var(--idle); }
-.dot.ok { background: var(--accent); box-shadow: var(--glow-sm); }
-.dot.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
-.dot.error { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
+.dot { position: absolute; top: 16px; right: 16px; width: 6px; height: 6px; border-radius: 50%; background: var(--border-strong); }
+.dot.ok { background: var(--positive-solid); }
+.dot.warn { background: var(--negative-solid); }
+.dot.error { background: var(--danger-solid); }
 </style>
