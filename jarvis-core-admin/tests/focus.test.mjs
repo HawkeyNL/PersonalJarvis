@@ -70,9 +70,11 @@ test("Escape cancels; other keys do not", () => {
   assert.ok(escape.defaultPrevented);
 });
 
-test("a dialog without onEscape (the restart gate) ignores Escape but still traps Tab", () => {
-  const { doc, items: [restart], dialog } = fakeDom(["restart"]);
+test("a dialog without onEscape (the restart gate) moves no focus, ignores Escape and traps Tab", () => {
+  const { doc, opener, items: [restart], dialog } = fakeDom(["restart"]);
   const focus = dialogFocus(dialog);
+  // No programmatic focus: a focusin would count as activity for the idle lock.
+  assert.equal(doc.activeElement, opener);
   restart.focus();
   const escape = key("Escape");
   focus.keydown(escape);

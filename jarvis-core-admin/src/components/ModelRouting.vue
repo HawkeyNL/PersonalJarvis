@@ -139,5 +139,5 @@ onMounted(() => { void load(); });
     </div>
   </section>
   <ConfirmDialog v-if="confirmResearch" title="Turn on research web search?" detail="Explicit Research requests send only the question, with a fixed instruction, to your Claude or ChatGPT subscription, which searches the web with its provider-hosted search. No memory, history or device data is sent. Web results are untrusted; answers list their sources." confirm-label="Turn on web search" tone="primary" @cancel="confirmResearch = false" @confirm="apply({ action: 'research_web_search', state: 'on' })" />
-  <ConfirmDialog v-if="confirmPaid" title="Allow paid APIs?" detail="Metered provider APIs become eligible again in every tier, within the monthly budget. Providers bill each call." confirm-label="Allow paid APIs" tone="primary" @cancel="confirmPaid = false" @confirm="apply({ action: 'paid_api', state: 'allowed' })" />
+  <ConfirmDialog v-if="confirmPaid" title="Allow paid APIs?" detail="Metered provider APIs become eligible again in every tier, within the monthly budget. Providers bill each call." confirm-label="Allow paid APIs" tone="danger" @cancel="confirmPaid = false" @confirm="apply({ action: 'paid_api', state: 'allowed' })" />
 </template>

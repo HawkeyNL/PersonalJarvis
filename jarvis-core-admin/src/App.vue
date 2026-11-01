@@ -71,16 +71,12 @@ watch(() => session.locked, (locked) => {
   if (!restartRequired.value) void nextTick(() => (locked ? unlockButton.value : page.value)?.focus());
 });
 // The restart gate has no Escape and no restore: it never closes. The rest of
-// the shell is inert behind it, so Tab can only reach it. Focus moves in only
-// when an update the owner just ran raised it: a focus from the runtime timer
-// would fire focusin and count as activity for the idle lock.
+// the shell is inert behind it, so the first Tab lands on it. Focus is never
+// moved in programmatically: that would fire focusin and count as activity for
+// the idle lock.
 watch(restartRequired, (required) => {
   if (required) void nextTick(() => { restartFocus = dialogFocus(restartDialog.value!); });
 });
-function raiseRestart() {
-  restartRequired.value = true;
-  void nextTick(() => restartDialog.value?.querySelector("button")?.focus());
-}
 function go(view: ViewName) { active.value = navigate(session.locked, active.value, view); }
 // A card that opens another view unmounts itself; focus moves to the new page.
 function open(view: ViewName) {
@@ -147,7 +143,7 @@ onBeforeUnmount(() => {
         <JvSegmented v-model="activeTab" variant="tabs" :items="tabs" :label="`${item.label} views`" controls="page-view" />
       </div>
       <main id="page-view" ref="page" tabindex="-1" :role="tabs ? 'tabpanel' : undefined" :class="['page', { 'with-tabs': tabs, 'logs-active': active === 'logs', 'locked-page': session.locked }]">
-        <component :is="current" v-if="current" @restart-required="raiseRestart" @open="open" @pairings="(count: number) => (pendingPairings = count)" />
+        <component :is="current" v-if="current" @restart-required="restartRequired = true" @open="open" @pairings="(count: number) => (pendingPairings = count)" />
         <section v-else class="lock-screen">
           <JvPanel icon="shield" title="Jarvis Core is locked" tone="warn" status="Locked" description="Authenticate once through the GNOME system dialog. Your password is never handled by this application.">
             <p v-if="lockNote" class="lock-note" role="status">{{ session.authError }}</p>
