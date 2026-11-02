@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { api, errorText, type ClaudeRuntimeMutation, type ClaudeRuntimeStatus, type CodexRuntimeMutation, type CodexRuntimeStatus, type OperationResult, type RuntimeChannel, strictRuntimeVersion } from "../../admin";
 import ConfirmDialog from "../ConfirmDialog.vue";
 import StatusBadge from "../StatusBadge.vue";
@@ -43,7 +43,8 @@ async function runtimeAction<T>(mutate: (request: T) => Promise<OperationResult>
   confirmRuntime.value = null;
   confirmCodexRuntime.value = null;
   await track(operations, { doing: dialog.doing, done: dialog.label, note: NOTE }, () => mutate(request), errorText);
-  await loadRuntime();
+  // After a lock or a page change the next mount reads the status itself.
+  if (mounted) await loadRuntime();
 }
 
 type Dialog = { title: string; detail: string; label: string; doing: string; tone: "neutral" | "primary" };
@@ -77,7 +78,9 @@ function codexRuntimeDialog(request: CodexRuntimeMutation): Dialog {
 
 const claudeDialog = computed(() => confirmRuntime.value && runtimeDialog(confirmRuntime.value));
 const codexDialog = computed(() => confirmCodexRuntime.value && codexRuntimeDialog(confirmCodexRuntime.value));
-onMounted(loadRuntime);
+let mounted = false;
+onMounted(() => { mounted = true; void loadRuntime(); });
+onBeforeUnmount(() => { mounted = false; });
 </script>
 
 <template>

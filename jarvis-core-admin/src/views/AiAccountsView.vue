@@ -52,7 +52,7 @@ onMounted(load);
       <p>Worker: {{ row.worker }}<br>Billing: {{ stateLabel(row.billing) }}<br>Runtime: {{ stateLabel(row.runtime) }}</p>
       <p v-if="row.state === 'incompatible_runtime'">The installed Claude CLI is outside the reviewed version contract. Recheck after an owner-reviewed CLI update before enabling the worker socket.</p>
       <p v-if="row.state === 'host_unsupported'">A host system tool the worker runs through (systemd-run or env) failed the root-ownership check. Connect reports which one.</p>
-      <p>Runtime install, update and rollback: <button class="small ghost" @click="emit('open', 'releases')">Releases</button></p>
+      <p>Runtime install, update and rollback: <button class="small ghost" @click="emit('open', 'releases')">Open Releases</button></p>
       <p v-if="row.legacy_identity">The retired <code>jarvis-codex-chat</code> identity or <code>/var/lib/jarvis-codex-chat</code> still exists. It is no longer used and can be removed (see <code>docs/SUBSCRIPTION_WORKERS.md</code>).</p>
       <p v-if="row.provider === 'claude' && row.state === 'connected'">Claude login is linked. Verify extra usage is disabled or capped at zero in your provider account before explicitly enabling the worker socket.</p>
       <div class="dialog-actions">

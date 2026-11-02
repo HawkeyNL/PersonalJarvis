@@ -17,6 +17,8 @@ export interface ReleaseOffer {
   install: string;
   /** The release that needs an explicit schema migration, or "". */
   migrate: string;
+  /** The active release when its managed systemd units need a repair, or "". */
+  repair: string;
 }
 
 /**
@@ -28,13 +30,17 @@ export function releaseOffer(status: Record<string, string>): ReleaseOffer {
   const latest = releaseTag(status.latest);
   const migrate = status.schema === "migration required" ? latest : "";
   const newer = status.update !== undefined ? status.update === "available" : !current ? !!latest : newerRelease(latest, current);
-  return { current, previous: releaseTag(status.previous), install: newer && !migrate ? latest : "", migrate };
+  const install = newer && !migrate ? latest : "";
+  // `--version` with the active tag reinstalls its units (update-core-release.sh, repair_active_managed_units).
+  const broken = status.update === "repair required" || status.systemd_units === "repair-required";
+  return { current, previous: releaseTag(status.previous), install, migrate, repair: broken && !install && !migrate ? current : "" };
 }
 
 /** The Core card headline. */
 export function releaseHeadline(offer: ReleaseOffer): string {
   if (offer.migrate) return `${offer.migrate} needs a schema migration`;
   if (offer.install) return `${offer.install} is ready to install`;
+  if (offer.repair) return `${offer.repair} needs a unit repair`;
   return offer.current ? `${offer.current} is active` : "Release status";
 }
 
@@ -45,18 +51,17 @@ export function runtimeBadge(installed: boolean, healthy: boolean, update: boole
   return update ? { tone: "warn", label: "Update available" } : { tone: "ok", label: "Installed" };
 }
 
-export type CoreAction = "latest" | "version" | "rollback" | "migrate";
-
-/** The terminal command that does the same as the in-app action. */
-export function cliCommand(action: CoreAction, version = ""): string {
-  if (action === "rollback") return "sudo jarvis update --rollback";
-  if (action === "migrate") return `sudo jarvis update --migrate ${version}`;
-  return version ? `sudo jarvis update --version ${version}` : "sudo jarvis update --latest";
+/** The terminal command for the card's offer: migrate, install or repair; "" when there is none. */
+export function cliCommand(offer: ReleaseOffer): string {
+  if (offer.migrate) return `sudo jarvis update --migrate ${offer.migrate}`;
+  const version = offer.install || offer.repair;
+  return version ? `sudo jarvis update --version ${version}` : "";
 }
 
 // What a Core install, rollback and migration do to running clients, from
-// deploy/systemd/update-core-release.sh: readiness is retried for about a minute.
-export const DOWNTIME = "Core restarts and connected clients disconnect until it is ready again, usually well under a minute.";
+// deploy/systemd/update-core-release.sh: readiness is retried for about a minute,
+// after Laya reloads its models if it was running.
+export const DOWNTIME = "Core restarts and connected clients disconnect until it is ready again, usually about a minute; longer if Laya reloads its models or the updater restores the previous release.";
 
 /** One long operation. It lives outside the view, so a lock or a page change cannot lose its outcome. */
 export interface TrackedOperation {

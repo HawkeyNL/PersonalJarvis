@@ -12,7 +12,7 @@ test("only vMAJOR.MINOR.PATCH counts as a release tag", () => {
 });
 
 test("status offers a newer latest; a check's update key wins", () => {
-  assert.deepEqual(releaseOffer(STATUS), { current: "v0.0.67", previous: "v0.0.66", install: "v0.0.68", migrate: "" });
+  assert.deepEqual(releaseOffer(STATUS), { current: "v0.0.67", previous: "v0.0.66", install: "v0.0.68", migrate: "", repair: "" });
   assert.equal(releaseOffer({ ...STATUS, latest: "v0.0.67" }).install, "");
   assert.equal(releaseOffer({ ...STATUS, latest: "v0.0.9" , current: "v0.0.10" }).install, "", "numeric, not string, compare");
   assert.equal(releaseOffer({ ...STATUS, update: "not available" }).install, "");
@@ -35,10 +35,21 @@ test("headline and CLI equivalent name the version", () => {
   assert.equal(releaseHeadline(releaseOffer({ ...STATUS, latest: "v0.0.67" })), "v0.0.67 is active");
   assert.equal(releaseHeadline(releaseOffer({ ...STATUS, schema: "migration required" })), "v0.0.68 needs a schema migration");
   assert.equal(releaseHeadline(releaseOffer({})), "Release status");
-  assert.equal(cliCommand("version", "v0.0.68"), "sudo jarvis update --version v0.0.68");
-  assert.equal(cliCommand("migrate", "v0.0.68"), "sudo jarvis update --migrate v0.0.68");
-  assert.equal(cliCommand("rollback"), "sudo jarvis update --rollback");
-  assert.equal(cliCommand("latest"), "sudo jarvis update --latest");
+  assert.equal(cliCommand(releaseOffer(STATUS)), "sudo jarvis update --version v0.0.68");
+  assert.equal(cliCommand(releaseOffer({ ...STATUS, schema: "migration required" })), "sudo jarvis update --migrate v0.0.68");
+  assert.equal(cliCommand(releaseOffer({ ...STATUS, latest: "v0.0.67" })), "");
+});
+
+test("broken units offer a repair of the active release unless an install or migration covers it", () => {
+  const repair = releaseOffer({ ...STATUS, update: "repair required" });
+  assert.equal(repair.repair, "v0.0.67");
+  assert.equal(repair.install, "");
+  assert.equal(releaseHeadline(repair), "v0.0.67 needs a unit repair");
+  assert.equal(cliCommand(repair), "sudo jarvis update --version v0.0.67");
+  assert.equal(releaseOffer({ ...STATUS, latest: "v0.0.67", systemd_units: "repair-required" }).repair, "v0.0.67");
+  assert.equal(releaseOffer({ ...STATUS, systemd_units: "repair-required" }).repair, "", "installing v0.0.68 installs its units");
+  assert.equal(releaseOffer({ ...STATUS, schema: "migration required", systemd_units: "repair-required" }).repair, "");
+  assert.equal(releaseOffer({ systemd_units: "repair-required", current: "unavailable" }).repair, "");
 });
 
 test("runtime badge: a failed check outranks an update", () => {

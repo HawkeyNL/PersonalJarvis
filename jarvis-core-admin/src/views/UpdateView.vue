@@ -12,14 +12,14 @@ import { DOWNTIME, cliCommand, isRunning, operationView, releaseHeadline, releas
 import { updaterLabel } from "../components/overview/needs";
 import { fieldLabel, keyedState, stateLabel } from "../status";
 const emit = defineEmits<{ restartRequired: [] }>();
-const status = ref<Record<string, string>>({}); const busy = ref(false); const error = ref(""); const errorTitle = ref<string>(); const version = ref(""); const pending = ref<"version" | "rollback" | "migrate" | null>(null);
+const status = ref<Record<string, string>>({}); const busy = ref(false); const error = ref(""); const errorTitle = ref<string>(); const version = ref(""); const pending = ref<"version" | "repair" | "rollback" | "migrate" | null>(null);
 // The version a confirmed install sends: the offered release or the one typed below.
 const target = ref("");
 const offer = computed(() => releaseOffer(status.value));
 const running = computed(() => isRunning(operations));
 const op = computed(() => operations.current && { ...operationView(operations.current), result: operations.current.result, error: operations.current.error });
 const typedVersion = computed(() => releaseTag(version.value.trim()));
-const hint = computed(() => (offer.value.migrate ? cliCommand("migrate", offer.value.migrate) : offer.value.install ? cliCommand("version", offer.value.install) : ""));
+const hint = computed(() => cliCommand(offer.value));
 const current = computed(() => offer.value.current || "the release that is active now");
 // A broker request holds the session until it ends, so unlocking waits for it.
 const LOCK_NOTE = "This can take up to 30 minutes. If the session locks meanwhile, the operation keeps running, unlocking waits until it has finished, and the outcome shows on this page.";
@@ -28,22 +28,25 @@ const dialog = computed(() => {
   if (pending.value === "migrate") return { title: `Migrate Core to ${migrate}?`, detail: `Core and SurrealDB stop and clients disconnect. A cold snapshot goes to /var/backups/jarvis-migrations before the database is migrated; on failure the snapshot is restored and the previous release restarted. Afterwards a binary-only rollback across this schema change is refused. GNOME asks for the administrator password again for this step. If the session locks meanwhile, the migration keeps running and the outcome shows on this page.`, confirmLabel: `Migrate to ${migrate}`, tone: "danger" as const, requireText: migrate };
   if (pending.value === "rollback") {
     const previous = offer.value.previous;
-    return { title: previous ? `Roll back Core to ${previous}?` : "Roll back Core?", detail: `${DOWNTIME} The trusted updater activates ${previous || "the newest verified earlier release"} in place of ${current.value}. If it fails its readiness check, the updater restores ${current.value} and restarts it. The database is not changed; a rollback across a schema migration is refused. ${LOCK_NOTE}`, confirmLabel: previous ? `Roll back to ${previous}` : "Roll back Core", tone: "danger" as const, requireText: undefined };
+    return { title: previous ? `Roll back Core to ${previous}?` : "Roll back Core?", detail: `${DOWNTIME} The trusted updater activates ${previous || "the newest other verified release with the same schema"} in place of ${current.value}. If it fails its readiness check, the updater restores ${current.value} and restarts it. The database is not changed; a rollback across a schema migration is refused. ${LOCK_NOTE}`, confirmLabel: previous ? `Roll back to ${previous}` : "Roll back Core", tone: "danger" as const, requireText: undefined };
   }
+  if (pending.value === "repair") return { title: `Repair Core ${target.value}?`, detail: `The trusted updater reinstalls the managed systemd units of ${target.value} and restarts the services. ${DOWNTIME} If the repair fails, the updater restores the previous unit policy. ${LOCK_NOTE}`, confirmLabel: `Repair ${target.value}`, tone: "primary" as const, requireText: undefined };
   return { title: `Install Core ${target.value}?`, detail: `${DOWNTIME} The trusted updater checks ${target.value} against its published SHA-256, stages it next to ${current.value} and activates it. If ${target.value} fails its readiness check, the updater switches back to ${current.value} and restarts it. A release that changes the database schema is refused here and needs Migrate. ${LOCK_NOTE}`, confirmLabel: `Install ${target.value}`, tone: "primary" as const, requireText: undefined };
 });
-async function load(check = false) { busy.value = true; error.value = ""; try { status.value = await api.updateStatus(check); } catch (e) { error.value = errorText(e); errorTitle.value = "Could not load release status"; } finally { busy.value = false; } }
-function install(tag: string) { target.value = tag; pending.value = "version"; }
+async function load(check = false) { busy.value = true; error.value = ""; try { const values = await api.updateStatus(check); status.value = check ? { ...status.value, ...values } : values; } catch (e) { error.value = errorText(e); errorTitle.value = "Could not load release status"; } finally { busy.value = false; } }
+function install(tag: string, action: "version" | "repair" = "version") { target.value = tag; pending.value = action; }
 const LABELS = {
   version: () => ({ doing: `Installing Core ${target.value}`, done: `Install Core ${target.value}` }),
+  repair: () => ({ doing: `Repairing Core ${target.value}`, done: `Repair Core ${target.value}` }),
   rollback: () => ({ doing: offer.value.previous ? `Rolling back Core to ${offer.value.previous}` : "Rolling back Core", done: offer.value.previous ? `Roll back Core to ${offer.value.previous}` : "Roll back Core" }),
   migrate: () => ({ doing: `Migrating Core to ${offer.value.migrate}`, done: `Migrate Core to ${offer.value.migrate}` }),
 };
 async function execute() {
   const action = pending.value; pending.value = null; if (!action) return;
   error.value = "";
-  const request: Record<string, string> = { action: action === "version" ? "install_version" : action };
-  if (action === "version") request.version = target.value;
+  // A repair is `install_version` with the active tag, as `sudo jarvis update --version` is.
+  const request: Record<string, string> = { action: action === "version" || action === "repair" ? "install_version" : action };
+  if (action === "version" || action === "repair") request.version = target.value;
   if (action === "migrate") request.version = offer.value.migrate;
   const result = await track(operations, { ...LABELS[action](), note: "The trusted updater owns the transaction and finishes it even if this session locks." }, () => api.updateMutation(request), errorText);
   // Unmounted by a lock or a page change: the emit is dropped and the shell's
@@ -67,7 +70,9 @@ onBeforeUnmount(() => { mounted = false; clearTimeout(copyTimer); });
 <template>
   <PageHeader title="Releases" description="Release verification, staging, activation and rollback remain owned by the trusted Core updater." :busy="busy || running"><button class="secondary" @click="load(false)">Refresh</button><button class="secondary" @click="load(true)">Check for updates</button></PageHeader>
   <ErrorPanel v-if="error" :message="error" :title="errorTitle" />
-  <section v-if="op" class="card op-card" role="status" :aria-busy="op.phase === 'running'">
+  <!-- Always rendered, so the start is announced; the outcome is announced by the result or error panel. -->
+  <p class="sr-only" role="status">{{ op?.phase === "running" ? `${op.headline}. ${op.detail}` : "" }}</p>
+  <section v-if="op" class="card op-card">
     <p class="op-head"><span v-if="op.phase === 'running'" class="spinner" aria-hidden="true"></span><StatusBadge :tone="op.phase === 'running' ? 'idle' : op.phase === 'done' ? 'ok' : 'error'" :label="op.badge" /><strong>{{ op.headline }}</strong></p>
     <p class="op-detail">{{ op.detail }}</p>
   </section>
@@ -78,6 +83,7 @@ onBeforeUnmount(() => { mounted = false; clearTimeout(copyTimer); });
     <p class="release-sub">Installed {{ offer.current || "unknown" }} · previous {{ offer.previous || "none" }}<template v-if="offer.migrate"> · routine updates refuse this release; migrate explicitly with a fresh administrator authorization.</template></p>
     <div class="action-row">
       <button v-if="offer.install" class="primary" :disabled="busy || running" @click="install(offer.install)">Install {{ offer.install }}</button>
+      <button v-if="offer.repair" class="primary" :disabled="busy || running" @click="install(offer.repair, 'repair')">Repair {{ offer.repair }}</button>
       <button v-if="offer.migrate" class="danger" :disabled="busy || running" @click="pending = 'migrate'">Migrate to {{ offer.migrate }}</button>
       <button class="danger ghost" :disabled="busy || running" @click="pending = 'rollback'">{{ offer.previous ? `Roll back to ${offer.previous}` : "Roll back" }}</button>
     </div>
