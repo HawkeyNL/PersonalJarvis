@@ -45,7 +45,7 @@ test("versions and identifiers pass through unchanged", () => {
 test("an unset key is neutral; account billing and runtime lines read as words", () => {
   assert.equal(toneOf("not configured"), "idle");
   assert.equal(stateLabel("not configured"), "Not set");
-  assert.equal(stateLabel(keyedState("billing", "subscription")), "Subscription only");
+  assert.equal(stateLabel(keyedState("billing", "subscription")), "Subscription login");
   assert.equal(stateLabel(keyedState("billing", "overage_unverified")), "Extra usage setting not verified");
   assert.equal(stateLabel(keyedState("runtime", "inactive")), "Worker socket off");
   assert.equal(stateLabel(keyedState("runtime", "active")), "Worker running");

@@ -27,7 +27,7 @@ const KEYED: Record<string, Record<string, string>> = {
   updater: { enabled: "automatic", disabled: "manual" },
   update: { available: "update available", "not available": "up to date" },
   // AI account billing and worker runtime lines.
-  billing: { subscription: "subscription only" },
+  billing: { subscription: "subscription login" },
   runtime: { inactive: "worker socket off", active: "worker running" },
 };
 export const keyedState = (key: string, value: string): string => KEYED[key.toLowerCase()]?.[value] ?? value;

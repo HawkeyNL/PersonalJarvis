@@ -15,7 +15,7 @@ export function accountConfirm(provider: AiAccountProvider, label: string, actio
   if (action === "reconnect") {
     return {
       title: `Reconnect ${label}?`,
-      detail: `${TERMINAL} The official ${label} client signs in again there and replaces the current login. Use it when the login expired or should change account.`,
+      detail: `${TERMINAL} The official ${label} client signs in again there. If that sign-in completes, it replaces the current login. Use it to switch accounts or to refresh a login that stopped working.`,
       confirmLabel: `Reconnect ${label}`,
       tone: "primary",
     };
@@ -23,7 +23,7 @@ export function accountConfirm(provider: AiAccountProvider, label: string, actio
   if (action === "disconnect") {
     return {
       title: `Disconnect ${label}?`,
-      detail: `${provider === "codex" ? "Also disables the Codex chat worker socket, which uses this login. " : ""}Active runs may fail. Reconnecting opens a trusted terminal and requires system administrator authorization again.`,
+      detail: `${TERMINAL} ${provider === "codex" ? "It disables the Codex chat worker, broker and coding service, which use this login," : "It disables the Claude worker socket and stops active Claude runs,"} then signs out; the terminal asks you to type YES first. Connecting again needs a new sign-in.`,
       confirmLabel: `Disconnect ${label}`,
       tone: "danger",
     };

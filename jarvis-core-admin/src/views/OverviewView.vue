@@ -193,7 +193,7 @@ const credentialCard = computed(() => {
       </JvModuleCard>
       <JvModuleCard icon="monitor" title="Devices" v-bind="deviceCard" @open="emit('open', 'devices')" />
 
-      <JvModuleCard class="full" icon="key" title="Credentials" v-bind="credentialCard" @open="emit('open', 'ai-accounts')">
+      <JvModuleCard class="full" icon="key" title="API keys" v-bind="credentialCard" @open="emit('open', 'ai-accounts')">
         <span v-if="credentials.data" class="chips">
           <span v-for="row in credentials.data" :key="row.provider" class="chip" :class="{ owner: row.configured }">{{ credentialLabels[row.provider] }} · {{ row.configured ? "configured" : "not set" }}</span>
         </span>

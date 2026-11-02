@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { nextTick, onMounted, ref } from "vue";
 import {
   aiAccountLabels as labels, api, credentialLabels, errorText,
   type AiAccountAction, type AiAccountProvider, type AiAccountRecord, type CredentialProvider, type CredentialRecord, type ModelRecord, type OperationResult, type RoutingReport, type ViewName,
@@ -21,8 +21,9 @@ const errors = ref({ accounts: "", keys: "", usage: "" });
 const busy = ref(false);
 const actionError = ref("");
 const result = ref<OperationResult | null>(null);
-// The button whose trusted terminal is open, e.g. "key:openai".
+// The button whose trusted terminal is open, e.g. "key:openai", and what it is for.
 const running = ref("");
+const runningFor = ref("");
 const confirm = ref<{ spec: ConfirmSpec; run: () => void } | null>(null);
 const emit = defineEmits<{ open: [view: ViewName] }>();
 
@@ -44,15 +45,31 @@ const loadUsage = async () => { usage.value = await settle(async () => {
 }, "usage"); };
 async function load() {
   busy.value = true;
+  actionError.value = "";
+  result.value = null;
   await Promise.all([loadAccounts(), loadKeys(), loadUsage()]);
   busy.value = false;
 }
 
+// The clicked button is disabled while its terminal is open, which drops focus
+// (a confirm dialog gives it to the page). Afterwards the button gets it back,
+// or the page when the button is gone (Connect becomes Test). Only when focus
+// was lost: the owner may have moved on.
+async function returnFocus(opener: Element | null) {
+  const page = opener?.closest<HTMLElement>("[tabindex='-1']");
+  await nextTick();
+  const active = document.activeElement;
+  if (active && active !== document.body && active !== page) return;
+  if (opener instanceof HTMLElement && opener.isConnected && !opener.matches(":disabled")) opener.focus();
+  else page?.focus();
+}
+
 // Every action runs in a trusted terminal; the broker call returns when it closes.
-async function run(id: string, operation: () => Promise<OperationResult>, reload: () => Promise<void>) {
+async function run(id: string, name: string, operation: () => Promise<OperationResult>, reload: () => Promise<void>, opener: Element | null) {
   confirm.value = null;
   busy.value = true;
   running.value = id;
+  runningFor.value = name;
   actionError.value = "";
   result.value = null;
   try { result.value = await operation(); }
@@ -62,16 +79,20 @@ async function run(id: string, operation: () => Promise<OperationResult>, reload
     await reload();
     busy.value = false;
     running.value = "";
+    runningFor.value = "";
+    void returnFocus(opener);
   }
 }
 function account(provider: AiAccountProvider, action: AiAccountAction) {
-  const go = () => run(`${action}:${provider}`, () => api.aiAccountAction(provider, action), loadAccounts);
+  const opener = document.activeElement;
+  const go = () => run(`${action}:${provider}`, labels[provider], () => api.aiAccountAction(provider, action), loadAccounts, opener);
   const spec = accountConfirm(provider, labels[provider], action);
   if (spec) confirm.value = { spec, run: go };
   else void go();
 }
 function setKey(row: CredentialRecord) {
-  const go = () => run(`key:${row.provider}`, () => api.credentialSet(row.provider), loadKeys);
+  const opener = document.activeElement;
+  const go = () => run(`key:${row.provider}`, `the ${credentialLabels[row.provider]} key`, () => api.credentialSet(row.provider), loadKeys, opener);
   const spec = keyConfirm(credentialLabels[row.provider], row.configured);
   if (spec) confirm.value = { spec, run: go };
   else void go();
@@ -87,6 +108,7 @@ onMounted(load);
   <PageHeader title="Accounts &amp; keys" description="Subscription logins and API keys for model providers. This app shows their status only; logins and keys are entered in a trusted terminal, never here." :busy="busy">
     <button class="secondary" @click="load">Refresh</button>
   </PageHeader>
+  <p class="sr-only" role="status">{{ runningFor ? `A trusted terminal window is open for ${runningFor}. Finish there; this page updates when it closes.` : "" }}</p>
   <ErrorPanel v-if="actionError" :message="actionError" />
   <ResultPanel v-if="result" :result="result" />
 
@@ -118,7 +140,7 @@ onMounted(load);
 
   <section class="accounts-section" aria-labelledby="keys-title">
     <h2 id="keys-title">API keys</h2>
-    <p id="keys-hint" class="section-hint">Set and Replace open a trusted terminal window and ask for system administrator authorization. You type the key there, hidden; it goes straight to protected storage and never enters this app, Tauri IPC, logs or process arguments. The key is checked before it replaces a stored one, and that provider's models are refreshed; they stay disabled until you enable them. “Configured” means stored, not that the provider accepts it right now.</p>
+    <p id="keys-hint" class="section-hint">Set and Replace open a trusted terminal window and ask for system administrator authorization. You type the key there, hidden; it goes straight to protected storage and never enters this app, Tauri IPC, logs or process arguments. The key is checked before it replaces a stored one, and that provider's model list is refreshed; new models start disabled. “Configured” means stored, not that the provider accepts it right now.</p>
     <ErrorPanel v-if="errors.keys" title="Could not load API keys" :message="errors.keys" />
     <ErrorPanel v-if="errors.usage" title="Could not read which models use each key" :message="errors.usage" />
     <div class="credential-grid">

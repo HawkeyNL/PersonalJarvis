@@ -40,7 +40,7 @@ test("reconnect and replace confirm with the provider name in primary tone; disc
   const disconnect = accountConfirm("codex", "Codex", "disconnect");
   assert.equal(disconnect.tone, "danger");
   assert.equal(disconnect.confirmLabel, "Disconnect Codex");
-  assert.match(disconnect.detail, /Codex chat worker socket/);
+  assert.match(disconnect.detail, /Codex chat worker, broker and coding service/);
   assert.doesNotMatch(accountConfirm("claude", "Claude Code", "disconnect").detail, /Codex/);
   const replace = keyConfirm("OpenAI", true);
   assert.equal(replace.tone, "primary");
@@ -68,7 +68,10 @@ test("no .vue file contains a password or secret-like input", () => {
   const SECRET = /password|passwd|secret|\btoken\b|access[-_ ]?key|api[-_ ]?key|credential|bearer|cookie/i;
   for (const file of files) {
     const source = readFileSync(file, "utf8");
-    assert.doesNotMatch(source, /type\s*=\s*["']password["']|:type\s*=|-webkit-text-security|contenteditable/i, file);
-    for (const [tag] of source.matchAll(/<(input|textarea)\b[^>]*>/gis)) assert.doesNotMatch(tag, SECRET, `${file}: ${tag}`);
+    assert.doesNotMatch(source, /type\s*=\s*["']password["']|(?:v-bind)?:type\s*=|-webkit-text-security|contenteditable/i, file);
+    for (const [tag] of source.matchAll(/<(input|textarea)\b[^>]*>/gis)) {
+      assert.doesNotMatch(tag, SECRET, `${file}: ${tag}`);
+      assert.doesNotMatch(tag, /v-bind\s*=/, `${file}: spread attributes hide the input type: ${tag}`);
+    }
   }
 });
