@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, provide, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import {
   aiAccountLabels, api, credentialLabels, errorText,
   type AiAccountRecord, type CredentialRecord, type DeviceOverview, type ModelRecord,
@@ -7,18 +7,18 @@ import {
 } from "../admin";
 import { keyedState, stateLabel, toneOf, type Tone } from "../status";
 import DailyUsageChart from "../components/DailyUsageChart.vue";
-import HealthView from "./HealthView.vue";
-import ServicesView from "./ServicesView.vue";
 import JvModuleCard from "../components/jv/JvModuleCard.vue";
-import StatusBadge from "../components/StatusBadge.vue";
-import { NOT_MEASURED, budgetPercent, compact, eur, integer, measured, ms, serviceSummary } from "../stats";
+import PageHeader from "../components/PageHeader.vue";
+import HealthSection from "../components/overview/HealthSection.vue";
+import NeedsList from "../components/overview/NeedsList.vue";
+import { needsYou, usageInitializing, type NeedItem, type Source } from "../components/overview/needs";
+import { NOT_MEASURED, budgetPercent, compact, eur, integer, measured, ms } from "../stats";
 
-// Stats-first dashboard. Every number comes from the same trusted broker
-// commands as the detail views; a source that fails only blanks its own card.
+// "Needs you" first, then health, then stats cards. Every number comes from the
+// same trusted broker commands as the detail views; a source that fails only
+// blanks its own section. The broker serializes requests anyway, so they run
+// one after another in priority order and each section fills as its data lands.
 const emit = defineEmits<{ open: [view: ViewName]; pairings: [count: number] }>();
-// Health and Services are sections of this page, so their headers are h2.
-provide("pageHeadingLevel", 2);
-type Source<T> = { data: T | null; error: string };
 const empty = <T,>(): Source<T> => ({ data: null, error: "" });
 const overview = ref<Source<OverviewResponse>>(empty());
 const usage = ref<Source<UsageReport>>(empty());
@@ -29,54 +29,50 @@ const accounts = ref<Source<AiAccountRecord[]>>(empty());
 const credentials = ref<Source<CredentialRecord[]>>(empty());
 const busy = ref(false);
 const updatedAt = ref("");
+// A lock unmounts this view; requests still queued must not run after it.
+let mounted = true;
+onBeforeUnmount(() => { mounted = false; });
 
-async function settle<T>(target: { value: Source<T> }, request: Promise<T>) {
-  try { target.value = { data: await request, error: "" }; }
+async function settle<T>(target: { value: Source<T> }, request: () => Promise<T>) {
+  if (!mounted) return;
+  try { target.value = { data: await request(), error: "" }; }
   catch (e) { target.value = { data: target.value.data, error: errorText(e) }; }
 }
 async function load() {
+  if (busy.value) return;
   busy.value = true;
-  await Promise.all([
-    settle(overview, api.overview()), settle(usage, api.usage()), settle(models, api.models()),
-    settle(routes, api.modelRoutes()), settle(devices, api.devices()), settle(accounts, api.aiAccounts()),
-    settle(credentials, api.credentials()),
-  ]);
+  await settle(overview, api.overview);
+  await settle(devices, api.devices);
   if (devices.value.data) emit("pairings", devices.value.data.requests.length);
+  await settle(routes, api.modelRoutes);
+  await settle(usage, api.usage);
+  await settle(credentials, api.credentials);
+  await settle(models, api.models);
+  await settle(accounts, api.aiAccounts);
   updatedAt.value = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
   busy.value = false;
 }
 onMounted(load);
-const servicesSection = ref<HTMLElement | null>(null);
-function showServices() {
-  servicesSection.value?.scrollIntoView({ block: "start" });
-  servicesSection.value?.focus({ preventScroll: true });
-}
 
-const services = computed(() => serviceSummary(overview.value.data?.status.services));
-const healthTone = computed<Tone>(() => (overview.value.error && !overview.value.data ? "error" : services.value.tone));
-const headline = computed(() => {
-  if (!overview.value.data) return overview.value.error ? "Home Node state unavailable" : "Reading Home Node state…";
-  const { up, total } = services.value;
-  if (!total) return "No Jarvis services reported";
-  return up === total ? "All services running" : `${total - up} of ${total} services need attention`;
+const needs = computed(() => needsYou({
+  overview: overview.value, usage: usage.value, models: models.value, routes: routes.value, devices: devices.value, credentials: credentials.value,
+}, credentialLabels));
+function act(target: NeedItem["target"]) {
+  if (target === "refresh") void load();
+  else emit("open", target);
+}
+const description = computed(() => {
+  const release = overview.value.data?.status.release;
+  const checked = busy.value ? "Reading Home Node state…" : updatedAt.value ? `Checked ${updatedAt.value}` : "";
+  return [release ? `Release ${release}` : "", checked].filter(Boolean).join(" · ");
 });
+
 const unavailable = (error: string) => ({ value: "Unavailable", lines: [error], tone: "error" as Tone });
 const pending = { value: "…", lines: ["Loading"], tone: "idle" as Tone };
-// Core retries the usage aggregate while it starts; that is not a failure.
-const usageMissing = () => usage.value.error.includes("usage statistics are unavailable")
+const usageMissing = () => usageInitializing(usage.value.error)
   ? { value: "Initializing", lines: ["Core is preparing usage statistics"], tone: "idle" as Tone }
   : usage.value.error ? unavailable(usage.value.error) : pending;
 
-const serviceCard = computed(() => {
-  const data = overview.value.data;
-  if (!data) return overview.value.error ? unavailable(overview.value.error) : pending;
-  const down = Object.entries(data.status.services).filter(([, state]) => state.toLowerCase() !== "active").map(([name]) => name);
-  return {
-    value: `${services.value.up} / ${services.value.total} up`,
-    lines: [down.length ? `Not active: ${down.join(", ")}` : "Every Jarvis service is active", `Updates: ${stateLabel(keyedState("updater", data.status.updater_enabled))}`],
-    tone: services.value.tone,
-  };
-});
 const releaseCard = computed(() => {
   const data = overview.value.data;
   if (!data) return overview.value.error ? unavailable(overview.value.error) : pending;
@@ -163,27 +159,16 @@ const credentialCard = computed(() => {
 
 <template>
   <div class="dash">
-    <header class="dash-hero">
-      <div class="hero-text">
-        <p class="eyebrow">Home Node health</p>
-        <h1>{{ headline }}</h1>
-        <div class="hero-pill" role="status">
-          <StatusBadge :tone="healthTone" :label="healthTone === 'ok' ? 'Healthy' : healthTone === 'warn' ? 'Degraded' : healthTone === 'error' ? 'Attention' : 'Unknown'" />
-          <span class="pill-sep" aria-hidden="true"></span>
-          <span>{{ overview.data?.status.release ?? "Release unknown" }}</span>
-        </div>
-        <p class="hero-meta">
-          <span v-if="busy" class="busy"><span class="spinner" /> Reading Home Node state</span>
-          <span v-else-if="updatedAt">Updated {{ updatedAt }}</span>
-          <button class="small" :disabled="busy" @click="load">Refresh</button>
-        </p>
-      </div>
-    </header>
+    <PageHeader title="Overview" :description="description" :busy="busy"><button class="secondary" @click="load">Refresh</button></PageHeader>
 
+    <NeedsList :items="needs.items" :loading="needs.loading" :busy="busy" @act="act" />
+    <HealthSection :services="overview.data?.status.services ?? null" :updater="overview.data?.status.updater_enabled ?? null" :error="overview.error" @logs="emit('open', 'logs')" />
+
+    <h2 class="glance-title">At a glance</h2>
     <div class="dash-grid">
-      <JvModuleCard icon="layers" title="Services" v-bind="serviceCard" @open="showServices" />
       <JvModuleCard icon="download" title="Releases" v-bind="releaseCard" @open="emit('open', 'releases')" />
       <JvModuleCard icon="agents" title="Agents" v-bind="agentCard" @open="emit('open', 'agents')" />
+      <JvModuleCard icon="link-2" title="AI accounts" v-bind="accountCard" @open="emit('open', 'ai-accounts')" />
 
       <JvModuleCard class="wide" icon="chart" title="Spend this month" :value="spendCard.value" :lines="spendCard.lines" :tone="spendCard.tone" @open="emit('open', 'usage')">
         <template v-if="usage.data">
@@ -208,35 +193,21 @@ const credentialCard = computed(() => {
       </JvModuleCard>
       <JvModuleCard icon="monitor" title="Devices" v-bind="deviceCard" @open="emit('open', 'devices')" />
 
-      <JvModuleCard icon="link-2" title="AI accounts" v-bind="accountCard" @open="emit('open', 'ai-accounts')" />
-      <JvModuleCard class="wide" icon="key" title="Credentials" v-bind="credentialCard" @open="emit('open', 'credentials')">
+      <JvModuleCard class="full" icon="key" title="Credentials" v-bind="credentialCard" @open="emit('open', 'credentials')">
         <span v-if="credentials.data" class="chips">
           <span v-for="row in credentials.data" :key="row.provider" class="chip" :class="{ owner: row.configured }">{{ credentialLabels[row.provider] }} · {{ row.configured ? "configured" : "not set" }}</span>
         </span>
       </JvModuleCard>
     </div>
-
-    <section ref="servicesSection" class="dash-section" tabindex="-1" aria-label="Health and services">
-      <HealthView />
-      <ServicesView />
-    </section>
   </div>
 </template>
 
 <style scoped>
 .dash { max-width: 1180px; margin: 0 auto; }
-.dash-hero { margin: 0 0 24px; }
-.hero-text { min-width: 0; }
-.hero-text h1 { margin: 4px 0 12px; font-size: 28px; }
-.hero-pill {
-  display: inline-flex; align-items: center; gap: 12px; height: 36px; padding: 0 6px;
-  border-radius: var(--r-pill); background: var(--bg-sunken); font-size: 13px; color: var(--text-primary);
-}
-.hero-pill > span:last-child { padding-right: 10px; }
-.pill-sep { width: 1px; height: 16px; background: var(--border); }
-.hero-meta { display: flex; align-items: center; gap: 12px; margin: 12px 0 0; color: var(--text-secondary); font-size: 13px; }
+.glance-title { margin: 0 0 12px; font-size: 15px; }
 .dash-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
 .dash-grid > .wide { grid-column: span 2; }
+.dash-grid > .full { grid-column: 1 / -1; }
 .dash-chart { height: 150px; margin-top: 10px; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .chip { display: inline-flex; align-items: center; height: 24px; padding: 0 9px; border-radius: var(--r-pill); background: var(--bg-sunken); color: var(--text-secondary); font-size: 12px; font-weight: 500; }
@@ -246,8 +217,6 @@ const credentialCard = computed(() => {
 .backend-latency > span { display: flex; justify-content: space-between; gap: 10px; }
 .backend-latency > span > span:last-child { color: var(--text-primary); font-variant-numeric: tabular-nums; white-space: nowrap; }
 @media (max-width: 1099px), (max-height: 759px) {
-  .dash-hero { margin-bottom: 18px; }
-  .hero-text h1 { font-size: 22px; }
   .dash-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 </style>
