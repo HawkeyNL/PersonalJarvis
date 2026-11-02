@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { api, errorText, type HfProvidersResponse, type ModelRecord, type OperationResult } from "../admin";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { api, errorText, type ModelRecord, type OperationResult } from "../admin";
 import ConfirmDialog from "../components/ConfirmDialog.vue";
 import ErrorPanel from "../components/ErrorPanel.vue";
 import LayaCard from "../components/LayaCard.vue";
@@ -8,6 +8,30 @@ import ModelRouting from "../components/ModelRouting.vue";
 import PageHeader from "../components/PageHeader.vue";
 import ResultPanel from "../components/ResultPanel.vue";
 import StatusBadge from "../components/StatusBadge.vue";
+import JvSegmented from "../components/jv/JvSegmented.vue";
+import HfRoutesDialog from "../components/models/HfRoutesDialog.vue";
+import { modelConfirm } from "../components/models/routing";
+
+const TABS = [{ id: "routing", label: "Routing" }, { id: "catalog", label: "Catalog" }, { id: "laya", label: "Local classifier (Laya)" }];
+const tab = ref("routing");
+const unsaved = ref(0);
+const applying = ref(false);
+const leaveTo = ref<string | null>(null);
+const tabLabel = computed(() => TABS.find((item) => item.id === tab.value)!.label);
+// Leaving Routing unmounts it and drops its staged changes, so ask first.
+// While an Apply runs the tab stays put: leaving would stop it half-way.
+function chooseTab(id: string) {
+  if (id === tab.value) return;
+  if (applying.value) return stay();
+  if (tab.value === "routing" && unsaved.value) leaveTo.value = id;
+  else tab.value = id;
+}
+function leave() { tab.value = leaveTo.value!; leaveTo.value = null; unsaved.value = 0; applying.value = false; }
+function stay() {
+  leaveTo.value = null;
+  // Arrow keys moved focus to the tab that was refused; give it back to Routing.
+  void nextTick(() => document.querySelector<HTMLElement>(".models-tabs [aria-selected='true']")?.focus());
+}
 
 const rows = ref<ModelRecord[]>([]);
 const query = ref("");
@@ -20,19 +44,10 @@ const busy = ref(false);
 const error = ref("");
 const errorTitle = ref<string>();
 const result = ref<OperationResult | null>(null);
-const disableTarget = ref<ModelRecord | null>(null);
+const toggleTarget = ref<{ action: "enable" | "disable"; row: ModelRecord } | null>(null);
 const selectedHf = ref<ModelRecord | null>(null);
-const hfDetails = ref<HfProvidersResponse | null>(null);
-const selectedRoute = ref("fastest");
-const routeLoading = ref(false);
-const routeSaving = ref(false);
-const routeBusy = computed(() => routeLoading.value || routeSaving.value);
-const routeError = ref("");
-const routeErrorTitle = ref<string>();
-const routeResult = ref<OperationResult | null>(null);
 const currentPage = ref(1);
 const PAGE_SIZE = 25;
-let routeRequest = 0;
 const providers = computed(() => [...new Set(rows.value.map((row) => row.provider))].sort());
 const filtered = computed(() => {
   const q = query.value.toLowerCase().trim();
@@ -63,6 +78,8 @@ const firstVisible = computed(() => filtered.value.length ? (currentPage.value -
 const lastVisible = computed(() => Math.min(currentPage.value * PAGE_SIZE, filtered.value.length));
 watch([query, provider, state, priceStatus, maxOutput, sort], () => { currentPage.value = 1; });
 watch(totalPages, (pages) => { currentPage.value = Math.min(currentPage.value, pages); });
+// aria-disabled, not disabled: Previous/Next keep focus at the first and last page.
+function goPage(page: number) { if (page >= 1 && page <= totalPages.value) currentPage.value = page; }
 function price(value: number | null): string {
   return value === null ? "—" : `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`;
 }
@@ -73,7 +90,7 @@ async function load() {
   finally { busy.value = false; }
 }
 async function mutate(action: "refresh" | "enable" | "disable", row?: ModelRecord) {
-  busy.value = true; error.value = ""; disableTarget.value = null;
+  busy.value = true; error.value = ""; toggleTarget.value = null;
   try {
     const request: Record<string, string> = { action };
     if (action === "refresh" && provider.value !== "all") request.provider = provider.value;
@@ -82,6 +99,7 @@ async function mutate(action: "refresh" | "enable" | "disable", row?: ModelRecor
   } catch (reason) { error.value = errorText(reason); errorTitle.value = undefined; }
   finally { busy.value = false; }
 }
+const toggleSpec = computed(() => toggleTarget.value && modelConfirm(toggleTarget.value.action, toggleTarget.value.row));
 const registerProvider = ref("codex-cli");
 const registerModel = ref("");
 // Subscriptions have no model catalog: record one exact pair, disabled.
@@ -93,40 +111,7 @@ async function registerSubscription() {
   } catch (reason) { error.value = errorText(reason); errorTitle.value = undefined; }
   finally { busy.value = false; }
 }
-async function inspectHf(row: ModelRecord) {
-  if (row.provider !== "huggingface") return;
-  const request = ++routeRequest;
-  routeLoading.value = true; routeError.value = ""; routeResult.value = null; selectedHf.value = row; hfDetails.value = null;
-  try {
-    const details = await api.modelProviders(row.model);
-    if (request === routeRequest) { hfDetails.value = details; selectedRoute.value = row.route ?? "auto"; }
-  } catch (reason) { if (request === routeRequest) { routeError.value = errorText(reason); routeErrorTitle.value = "Could not load routes"; } }
-  finally { if (request === routeRequest) routeLoading.value = false; }
-}
-async function saveRoute() {
-  const row = selectedHf.value;
-  if (!row) return;
-  routeSaving.value = true; routeError.value = ""; routeResult.value = null;
-  try {
-    const operation = await api.modelMutation({ action: "set_route", provider: row.provider, model: row.model, route: selectedRoute.value });
-    rows.value = await api.models();
-    selectedHf.value = rows.value.find((item) => item.provider === row.provider && item.model === row.model) ?? row;
-    hfDetails.value = await api.modelProviders(row.model);
-    selectedRoute.value = selectedHf.value.route ?? "auto";
-    routeResult.value = operation;
-  } catch (reason) { routeError.value = errorText(reason); routeErrorTitle.value = undefined; }
-  finally { routeSaving.value = false; }
-}
-function closeRoutes() {
-  if (routeSaving.value) return;
-  routeRequest++; routeLoading.value = false;
-  selectedHf.value = null; hfDetails.value = null; routeError.value = ""; routeResult.value = null;
-}
-function onKeydown(event: KeyboardEvent) {
-  if (event.key === "Escape" && selectedHf.value) closeRoutes();
-}
-onMounted(() => { void load(); window.addEventListener("keydown", onKeydown); });
-onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
+onMounted(() => { void load(); });
 </script>
 
 <template>
@@ -134,46 +119,46 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
     <button class="secondary" @click="load">Refresh view</button><button @click="mutate('refresh')">Refresh catalog</button>
   </PageHeader>
   <ErrorPanel v-if="error" :message="error" :title="errorTitle" /><ResultPanel v-if="result" :result="result" />
-  <ModelRouting :models="rows" />
-  <LayaCard />
-  <form class="model-toolbar register-form" @submit.prevent="registerSubscription">
-    <select v-model="registerProvider" aria-label="Subscription provider"><option value="claude-cli">claude-cli</option><option value="codex-cli">codex-cli</option></select>
-    <input v-model="registerModel" class="search" maxlength="80" required placeholder="Subscription model, e.g. gpt-6-luna" aria-label="Subscription model" />
-    <button class="secondary" :disabled="busy">Register subscription model</button>
-  </form>
-  <p class="usage-source">Registering records the exact pair as disabled; enable it below before routing uses it.</p>
-  <div class="model-toolbar">
-    <input v-model="query" class="search" placeholder="Search provider, model or source…" />
-    <select v-model="provider" aria-label="Provider"><option value="all">All providers</option><option v-for="item in providers" :key="item" :value="item">{{ item }}</option></select>
-    <select v-model="state" aria-label="State"><option value="all">Any state</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select>
-    <select v-model="priceStatus" aria-label="Pricing"><option value="all">Any pricing</option><option value="known">Known price</option><option value="estimated">Estimated</option><option value="conservative">Conservative</option><option value="unknown">Unknown price</option><option value="local">Local / included</option></select>
-    <input v-model="maxOutput" type="number" min="0" step="0.01" placeholder="Max output $/1M" aria-label="Maximum output price per million tokens" />
-    <select v-model="sort" aria-label="Sort"><option value="provider">Sort by model</option><option value="input">Cheapest input</option><option value="output">Cheapest output</option></select>
+  <JvSegmented class="models-tabs" :items="TABS" :model-value="tab" label="Models and routing sections" controls="models-panel" @update:model-value="chooseTab" />
+  <div id="models-panel" class="models-panel" role="tabpanel" :aria-label="tabLabel">
+    <ModelRouting v-if="tab === 'routing'" :models="rows" @changes="(count: number) => (unsaved = count)" @applying="(active: boolean) => (applying = active)" />
+    <LayaCard v-else-if="tab === 'laya'" />
+    <template v-else>
+      <form class="model-toolbar register-form" @submit.prevent="registerSubscription">
+        <select v-model="registerProvider" aria-label="Subscription provider"><option value="claude-cli">claude-cli</option><option value="codex-cli">codex-cli</option></select>
+        <input v-model="registerModel" class="search" maxlength="80" required placeholder="Subscription model, e.g. gpt-6-luna" aria-label="Subscription model" />
+        <button class="secondary" :disabled="busy">Register subscription model</button>
+      </form>
+      <p class="usage-source">Registering records the exact pair as disabled; enable it below before routing uses it.</p>
+      <div class="model-toolbar" role="search" aria-label="Filter models">
+        <label class="sr-only" for="model-search">Search models</label>
+        <input id="model-search" v-model="query" class="search" placeholder="Search provider, model or source…" />
+        <select v-model="provider" aria-label="Provider"><option value="all">All providers</option><option v-for="item in providers" :key="item" :value="item">{{ item }}</option></select>
+        <select v-model="state" aria-label="State"><option value="all">Any state</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select>
+        <select v-model="priceStatus" aria-label="Pricing"><option value="all">Any pricing</option><option value="known">Known price</option><option value="estimated">Estimated</option><option value="conservative">Conservative</option><option value="unknown">Unknown price</option><option value="local">Local / included</option></select>
+        <input v-model="maxOutput" type="number" min="0" step="0.01" placeholder="Max output $/1M" aria-label="Maximum output price per million tokens" />
+        <select v-model="sort" aria-label="Sort"><option value="provider">Sort by model</option><option value="input">Cheapest input</option><option value="output">Cheapest output</option></select>
+      </div>
+      <div class="filter-summary" role="status">{{ filtered.length }} of {{ rows.length }} models · showing {{ firstVisible }}–{{ lastVisible }} · prices in USD per 1M tokens</div>
+      <section class="table-card" aria-label="Model catalog"><table><thead><tr><th>Provider</th><th>Model</th><th>State</th><th>HF route</th><th>Input</th><th>Cached</th><th>Output</th><th>Price</th><th>Actions</th></tr></thead>
+        <tbody><tr v-for="row in pageRows" :key="`${row.provider}/${row.model}`"><td>{{ row.provider }}</td><td class="mono wrap-anywhere">{{ row.model }}<details v-if="row.pricing_source"><summary>Pricing details</summary><p class="usage-source wrap-anywhere">{{ row.pricing_source }} · {{ row.pricing_updated_at }}</p><p class="usage-source wrap-anywhere">{{ row.pricing_notes || "Owner-configured rates. Check applicable context and service tier." }}</p></details></td><td><StatusBadge :state="row.enabled ? 'enabled' : 'disabled'" /></td><td class="mono">{{ row.provider === 'huggingface' ? (row.route ?? 'tier default') : '—' }}</td><td class="mono">{{ price(row.input_per_million_usd) }}</td><td class="mono">{{ price(row.cache_read_per_million_usd) }}</td><td class="mono">{{ price(row.output_per_million_usd) }}</td><td><StatusBadge :state="row.price_status" /></td><td class="table-actions"><button v-if="row.provider === 'huggingface'" class="small secondary" :aria-label="`Routes for ${row.model}`" @click="selectedHf = row">Routes</button><button v-if="!row.enabled" class="small secondary" :disabled="busy" :aria-label="`Enable ${row.provider}/${row.model}`" @click="toggleTarget = { action: 'enable', row }">Enable…</button><button v-else class="small danger ghost" :disabled="busy" :aria-label="`Disable ${row.provider}/${row.model}`" @click="toggleTarget = { action: 'disable', row }">Disable…</button></td></tr></tbody>
+      </table><div v-if="!filtered.length && !busy" class="empty-state">No models match these filters.</div></section>
+      <nav v-if="filtered.length > PAGE_SIZE" class="pagination" aria-label="Model pages">
+        <button class="btn small secondary" :aria-disabled="currentPage === 1" @click="goPage(currentPage - 1)">Previous</button>
+        <button v-for="page in visiblePages" :key="page" class="small secondary page-number" :class="{ active: currentPage === page }" :aria-label="`Page ${page}`" :aria-current="currentPage === page ? 'page' : undefined" @click="goPage(page)">{{ page }}</button>
+        <button class="btn small secondary" :aria-disabled="currentPage === totalPages" @click="goPage(currentPage + 1)">Next</button>
+        <span>Page {{ currentPage }} of {{ totalPages }}</span>
+      </nav>
+      <p v-if="rows.length" class="usage-source">USD per million text tokens, not an invoice. Expand a model's pricing details for its source, review date and context/peak-rate conditions. Unknown cache prices are not assumed to be discounted.</p>
+    </template>
   </div>
-  <div class="filter-summary">{{ filtered.length }} of {{ rows.length }} models · showing {{ firstVisible }}–{{ lastVisible }} · prices in USD per 1M tokens</div>
-  <section class="table-card"><table><thead><tr><th>Provider</th><th>Model</th><th>State</th><th>HF route</th><th>Input</th><th>Cached</th><th>Output</th><th>Price</th><th></th></tr></thead>
-    <tbody><tr v-for="row in pageRows" :key="`${row.provider}/${row.model}`"><td>{{ row.provider }}</td><td class="mono wrap-anywhere">{{ row.model }}<details v-if="row.pricing_source"><summary>Pricing details</summary><p class="usage-source wrap-anywhere">{{ row.pricing_source }} · {{ row.pricing_updated_at }}</p><p class="usage-source wrap-anywhere">{{ row.pricing_notes || "Owner-configured rates. Check applicable context and service tier." }}</p></details></td><td><StatusBadge :state="row.enabled ? 'enabled' : 'disabled'" /></td><td class="mono">{{ row.provider === 'huggingface' ? (row.route ?? 'tier default') : '—' }}</td><td class="mono">{{ price(row.input_per_million_usd) }}</td><td class="mono">{{ price(row.cache_read_per_million_usd) }}</td><td class="mono">{{ price(row.output_per_million_usd) }}</td><td><StatusBadge :state="row.price_status" /></td><td class="table-actions"><button v-if="row.provider === 'huggingface'" class="small secondary" @click="inspectHf(row)">Routes</button><button v-if="!row.enabled" class="small secondary" @click="mutate('enable', row)">Enable</button><button v-else class="small danger ghost" @click="disableTarget = row">Disable</button></td></tr></tbody>
-  </table><div v-if="!filtered.length && !busy" class="empty-state">No models match these filters.</div></section>
-  <nav v-if="filtered.length > PAGE_SIZE" class="pagination" aria-label="Model pages">
-    <button class="small secondary" :disabled="currentPage === 1" @click="currentPage--">Previous</button>
-    <button v-for="page in visiblePages" :key="page" class="small secondary page-number" :class="{ active: currentPage === page }" :aria-current="currentPage === page ? 'page' : undefined" @click="currentPage = page">{{ page }}</button>
-    <button class="small secondary" :disabled="currentPage === totalPages" @click="currentPage++">Next</button>
-    <span>Page {{ currentPage }} of {{ totalPages }}</span>
-  </nav>
-  <p v-if="rows.length" class="usage-source">USD per million text tokens, not an invoice. Expand a model's pricing details for its source, review date and context/peak-rate conditions. Unknown cache prices are not assumed to be discounted.</p>
-  <div v-if="selectedHf" class="dialog-backdrop" @click.self="closeRoutes">
-    <section class="dialog routes-dialog" role="dialog" aria-modal="true" aria-labelledby="routes-title">
-      <div class="card-heading"><div><span class="card-label">Hugging Face inference providers</span><h2 id="routes-title" class="mono wrap-anywhere">{{ selectedHf.model }}</h2></div><button class="small secondary" :disabled="routeSaving" @click="closeRoutes">Close</button></div>
-      <ErrorPanel v-if="routeError" :message="routeError" :title="routeErrorTitle" /><ResultPanel v-if="routeResult" :result="routeResult" />
-      <div v-if="routeLoading && !hfDetails" class="modal-loading"><span class="spinner" />Loading available routes…</div>
-      <template v-if="hfDetails">
-        <div class="route-controls"><select v-model="selectedRoute" :disabled="routeBusy" aria-label="Hugging Face route"><option v-for="route in hfDetails.routes" :key="route" :value="route">{{ route }}</option></select><button :disabled="routeBusy" @click="saveRoute">{{ routeSaving ? 'Saving…' : 'Save route' }}</button></div>
-        <p class="usage-source">Route selection does not enable this model. Dynamic routes use conservative budget estimates when the execution provider is not known.</p>
-        <div class="table-card"><table><thead><tr><th>Route</th><th>Status</th><th>Context</th><th>Input/M</th><th>Output/M</th><th>TTFT</th><th>Tok/s</th><th>Tools</th><th>Structured</th></tr></thead><tbody>
-          <tr v-for="item in hfDetails.providers" :key="item.provider"><td class="mono">{{ item.provider }}</td><td><StatusBadge :state="item.status" /></td><td class="mono">{{ item.context_length ?? '—' }}</td><td class="mono">{{ price(item.input_per_million_usd) }}</td><td class="mono">{{ price(item.output_per_million_usd) }}</td><td class="mono">{{ item.first_token_latency_ms === null ? '—' : `${item.first_token_latency_ms} ms` }}</td><td class="mono">{{ item.throughput ?? '—' }}</td><td>{{ item.supports_tools === null ? '—' : (item.supports_tools ? 'yes' : 'no') }}</td><td>{{ item.supports_structured_output === null ? '—' : (item.supports_structured_output ? 'yes' : 'no') }}</td></tr>
-        </tbody></table></div>
-      </template>
-    </section>
-  </div>
-  <ConfirmDialog v-if="disableTarget" title="Disable this model?" :detail="`${disableTarget.provider}/${disableTarget.model} will no longer be eligible for routing.`" :confirm-label="`Disable ${disableTarget.model}`" tone="danger" @cancel="disableTarget = null" @confirm="mutate('disable', disableTarget ?? undefined)" />
+  <HfRoutesDialog v-if="selectedHf" :key="`${selectedHf.provider}/${selectedHf.model}`" :row="selectedHf" @close="selectedHf = null" @rows="(next: ModelRecord[]) => (rows = next)" />
+  <ConfirmDialog v-if="toggleTarget && toggleSpec" :title="toggleSpec.title" :detail="toggleSpec.detail" :confirm-label="toggleSpec.label" :tone="toggleSpec.tone" @cancel="toggleTarget = null" @confirm="mutate(toggleTarget.action, toggleTarget.row)" />
+  <ConfirmDialog v-if="leaveTo" title="Discard unsaved routing changes?" :detail="`Routing has ${unsaved} unsaved ${unsaved === 1 ? 'change' : 'changes'}. Leaving this tab drops what you have not applied; nothing was sent to Core.`" confirm-label="Discard changes" tone="danger" @cancel="stay" @confirm="leave" />
 </template>
+
+<style scoped>
+.models-tabs { margin-bottom: 16px; }
+/* The global hover and press rules only exclude :disabled. */
+.btn[aria-disabled="true"]:hover, .btn[aria-disabled="true"]:active { background: var(--bg-sunken); transform: none; }
+</style>
