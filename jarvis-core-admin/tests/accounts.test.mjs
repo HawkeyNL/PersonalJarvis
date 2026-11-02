@@ -68,7 +68,7 @@ test("no .vue file contains a password or secret-like input", () => {
   const SECRET = /password|passwd|secret|\btoken\b|access[-_ ]?key|api[-_ ]?key|credential|bearer|cookie/i;
   for (const file of files) {
     const source = readFileSync(file, "utf8");
-    assert.doesNotMatch(source, /type\s*=\s*["']password["']|(?:v-bind)?:type\s*=|-webkit-text-security|contenteditable/i, file);
+    assert.doesNotMatch(source, /type\s*=\s*["']password["']|:type\s*=|-webkit-text-security|contenteditable/i, file);
     for (const [tag] of source.matchAll(/<(input|textarea)\b[^>]*>/gis)) {
       assert.doesNotMatch(tag, SECRET, `${file}: ${tag}`);
       assert.doesNotMatch(tag, /v-bind\s*=/, `${file}: spread attributes hide the input type: ${tag}`);

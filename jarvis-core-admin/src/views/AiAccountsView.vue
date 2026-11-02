@@ -54,18 +54,23 @@ async function load() {
 // The clicked button is disabled while its terminal is open, which drops focus
 // (a confirm dialog gives it to the page). Afterwards the button gets it back,
 // or the page when the button is gone (Connect becomes Test). Only when focus
-// was lost: the owner may have moved on.
-async function returnFocus(opener: Element | null) {
-  const page = opener?.closest<HTMLElement>("[tabindex='-1']");
+// was lost: the owner may have moved on. The page is looked up at click time,
+// because a swapped button is detached by then.
+type Opener = { button: HTMLElement; page: HTMLElement | null };
+const openerOf = (event: Event): Opener => {
+  const button = event.currentTarget as HTMLElement;
+  return { button, page: button.closest<HTMLElement>("[tabindex='-1']") };
+};
+async function returnFocus({ button, page }: Opener) {
   await nextTick();
   const active = document.activeElement;
   if (active && active !== document.body && active !== page) return;
-  if (opener instanceof HTMLElement && opener.isConnected && !opener.matches(":disabled")) opener.focus();
+  if (button.isConnected && !button.matches(":disabled")) button.focus();
   else page?.focus();
 }
 
 // Every action runs in a trusted terminal; the broker call returns when it closes.
-async function run(id: string, name: string, operation: () => Promise<OperationResult>, reload: () => Promise<void>, opener: Element | null) {
+async function run(id: string, name: string, operation: () => Promise<OperationResult>, reload: () => Promise<void>, opener: Opener) {
   confirm.value = null;
   busy.value = true;
   running.value = id;
@@ -83,15 +88,15 @@ async function run(id: string, name: string, operation: () => Promise<OperationR
     void returnFocus(opener);
   }
 }
-function account(provider: AiAccountProvider, action: AiAccountAction) {
-  const opener = document.activeElement;
+function account(provider: AiAccountProvider, action: AiAccountAction, event: Event) {
+  const opener = openerOf(event);
   const go = () => run(`${action}:${provider}`, labels[provider], () => api.aiAccountAction(provider, action), loadAccounts, opener);
   const spec = accountConfirm(provider, labels[provider], action);
   if (spec) confirm.value = { spec, run: go };
   else void go();
 }
-function setKey(row: CredentialRecord) {
-  const opener = document.activeElement;
+function setKey(row: CredentialRecord, event: Event) {
+  const opener = openerOf(event);
   const go = () => run(`key:${row.provider}`, `the ${credentialLabels[row.provider]} key`, () => api.credentialSet(row.provider), loadKeys, opener);
   const spec = keyConfirm(credentialLabels[row.provider], row.configured);
   if (spec) confirm.value = { spec, run: go };
@@ -127,11 +132,11 @@ onMounted(load);
         <p v-if="row.provider === 'claude' && row.state === 'connected'">Claude login is linked. Verify extra usage is disabled or capped at zero in your provider account before explicitly enabling the worker socket.</p>
         <p>Runtime install, update and rollback: <button class="small ghost" @click="emit('open', 'releases')">Open Releases</button></p>
         <div class="dialog-actions">
-          <button v-if="row.state !== 'connected'" class="small secondary" :disabled="busy" aria-describedby="subscriptions-hint" @click="account(row.provider, 'connect')">{{ label(`connect:${row.provider}`, "Connect") }}</button>
+          <button v-if="row.state !== 'connected'" class="small secondary" :disabled="busy" aria-describedby="subscriptions-hint" @click="account(row.provider, 'connect', $event)">{{ label(`connect:${row.provider}`, "Connect") }}</button>
           <template v-else>
-            <button class="small secondary" :disabled="busy" aria-describedby="subscriptions-hint" @click="account(row.provider, 'test')">{{ label(`test:${row.provider}`, "Test") }}</button>
-            <button class="small secondary" :disabled="busy" @click="account(row.provider, 'reconnect')">{{ label(`reconnect:${row.provider}`, "Reconnect…") }}</button>
-            <button class="small danger" :disabled="busy" @click="account(row.provider, 'disconnect')">{{ label(`disconnect:${row.provider}`, "Disconnect…") }}</button>
+            <button class="small secondary" :disabled="busy" aria-describedby="subscriptions-hint" @click="account(row.provider, 'test', $event)">{{ label(`test:${row.provider}`, "Test") }}</button>
+            <button class="small secondary" :disabled="busy" @click="account(row.provider, 'reconnect', $event)">{{ label(`reconnect:${row.provider}`, "Reconnect…") }}</button>
+            <button class="small danger" :disabled="busy" @click="account(row.provider, 'disconnect', $event)">{{ label(`disconnect:${row.provider}`, "Disconnect…") }}</button>
           </template>
         </div>
       </article>
@@ -148,8 +153,8 @@ onMounted(load);
         <h3 :id="`key-${row.provider}`" class="card-label">{{ credentialLabels[row.provider] }}</h3>
         <StatusBadge :state="row.configured ? 'configured' : 'not configured'" :tone="needed(row) ? 'warn' : undefined" />
         <p>{{ keyUseLabel(useOf(row.provider)) }}<template v-if="needed(row)">; those calls fail without a key</template></p>
-        <button v-if="row.configured" class="small secondary" :disabled="busy" @click="setKey(row)">{{ label(`key:${row.provider}`, "Replace…") }}</button>
-        <button v-else class="small secondary" :disabled="busy" aria-describedby="keys-hint" @click="setKey(row)">{{ label(`key:${row.provider}`, "Set key") }}</button>
+        <button v-if="row.configured" class="small secondary" :disabled="busy" @click="setKey(row, $event)">{{ label(`key:${row.provider}`, "Replace…") }}</button>
+        <button v-else class="small secondary" :disabled="busy" aria-describedby="keys-hint" @click="setKey(row, $event)">{{ label(`key:${row.provider}`, "Set key") }}</button>
       </article>
     </div>
   </section>
