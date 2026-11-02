@@ -40,5 +40,7 @@ onBeforeUnmount(() => focus?.restore());
 </template>
 <style scoped>
 .well { margin-top: 16px; }
+/* The global hover and press rules only exclude :disabled. */
+.btn[aria-disabled="true"]:hover, .btn[aria-disabled="true"]:active { background: var(--bg-sunken); transform: none; }
 .fingerprint { margin: 6px 0 0; color: var(--text-primary); font: 15px/1.6 var(--font-mono); letter-spacing: 0.02em; word-spacing: 0.2em; }
 </style>

@@ -32,9 +32,9 @@ const LOAD_FAILED = "Could not load devices";
 // Background refresh on activity (see pairing.ts): silent, keeps the current
 // list on failure and never replaces an action's error.
 const refresher = createActivityRefresh(async () => {
-  const own = !error.value || errorTitle.value === LOAD_FAILED;
-  try { await fetchDevices(); if (own) error.value = ""; }
-  catch (e) { if (own) { error.value = errorText(e); errorTitle.value = LOAD_FAILED; } }
+  const own = () => !error.value || errorTitle.value === LOAD_FAILED;
+  try { await fetchDevices(); if (own()) error.value = ""; }
+  catch (e) { if (own()) { error.value = errorText(e); errorTitle.value = LOAD_FAILED; } }
 }, () => !busy.value && !review.value && !revoking.value);
 async function load() {
   busy.value = true; error.value = "";
@@ -147,6 +147,8 @@ onBeforeUnmount(() => {
 </template>
 <style scoped>
 .device-section { margin-top: 20px; }
+/* The global hover and press rules only exclude :disabled. */
+.btn[aria-disabled="true"]:hover, .btn[aria-disabled="true"]:active { background: var(--bg-sunken); transform: none; }
 .device-section h2 { margin: 0 0 4px; font-size: 15px; }
 .section-hint { margin: 0 0 12px; color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
 .device-result { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; }
