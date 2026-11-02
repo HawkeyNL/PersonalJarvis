@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from "vue";
-import { api, errorText, type ModelRecord, type OperationResult } from "../admin";
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { api, errorText, type ModelRecord, type OperationResult, type ViewName } from "../admin";
+import { NAV_GUARD, leaveRouting, type NavGuard } from "../navguard";
 import ConfirmDialog from "../components/ConfirmDialog.vue";
 import ErrorPanel from "../components/ErrorPanel.vue";
 import LayaCard from "../components/LayaCard.vue";
@@ -16,21 +17,41 @@ const TABS = [{ id: "routing", label: "Routing" }, { id: "catalog", label: "Cata
 const tab = ref("routing");
 const unsaved = ref(0);
 const applying = ref(false);
-const leaveTo = ref<string | null>(null);
+const leaveTo = ref<{ tab: string } | { view: ViewName } | null>(null);
+// Set when the sidebar was refused during an Apply; cleared when it ends.
+const navBlocked = ref(false);
+const emit = defineEmits<{ open: [view: ViewName] }>();
 const tabLabel = computed(() => TABS.find((item) => item.id === tab.value)!.label);
 // Leaving Routing unmounts it and drops its staged changes, so ask first.
 // While an Apply runs the tab stays put: leaving would stop it half-way.
 function chooseTab(id: string) {
   if (id === tab.value) return;
   if (applying.value) return stay();
-  if (tab.value === "routing" && unsaved.value) leaveTo.value = id;
+  if (tab.value === "routing" && unsaved.value) leaveTo.value = { tab: id };
   else tab.value = id;
 }
-function leave() { tab.value = leaveTo.value!; leaveTo.value = null; unsaved.value = 0; applying.value = false; }
+// The same rules for the sidebar. A lock never asks (navguard.ts): it
+// unmounts this view, which drops the staged changes and stops an Apply.
+const removeGuard = inject<NavGuard | null>(NAV_GUARD, null)?.set((next) => {
+  const decision = leaveRouting(applying.value, unsaved.value);
+  if (decision === "block") navBlocked.value = true;
+  if (decision === "ask") leaveTo.value = { view: next };
+  return decision === "go";
+});
+onBeforeUnmount(() => removeGuard?.());
+watch(applying, (active) => { if (!active) navBlocked.value = false; });
+function leave() {
+  const target = leaveTo.value!;
+  leaveTo.value = null; unsaved.value = 0; applying.value = false;
+  if ("view" in target) emit("open", target.view);
+  else tab.value = target.tab;
+}
 function stay() {
+  const sidebar = leaveTo.value && "view" in leaveTo.value;
   leaveTo.value = null;
-  // Arrow keys moved focus to the tab that was refused; give it back to Routing.
-  void nextTick(() => document.querySelector<HTMLElement>(".models-tabs [aria-selected='true']")?.focus());
+  // Arrow keys moved focus to the tab that was refused; give it back to
+  // Routing. From the sidebar, the dialog gives focus back to its opener.
+  if (!sidebar) void nextTick(() => document.querySelector<HTMLElement>(".models-tabs [aria-selected='true']")?.focus());
 }
 
 const rows = ref<ModelRecord[]>([]);
@@ -120,6 +141,7 @@ onMounted(() => { void load(); });
   </PageHeader>
   <ErrorPanel v-if="error" :message="error" :title="errorTitle" /><ResultPanel v-if="result" :result="result" />
   <JvSegmented class="models-tabs" :items="TABS" :model-value="tab" label="Models and routing sections" controls="models-panel" @update:model-value="chooseTab" />
+  <p class="nav-blocked" role="status">{{ navBlocked ? "Apply is still running. Models & routing stays open until it finishes." : "" }}</p>
   <div id="models-panel" class="models-panel" role="tabpanel" :aria-label="tabLabel">
     <ModelRouting v-if="tab === 'routing'" :models="rows" @changes="(count: number) => (unsaved = count)" @applying="(active: boolean) => (applying = active)" />
     <!-- Stays mounted, as before the tabs: a long Laya install keeps its state and result. -->
@@ -155,11 +177,14 @@ onMounted(() => { void load(); });
   </div>
   <HfRoutesDialog v-if="selectedHf" :key="`${selectedHf.provider}/${selectedHf.model}`" :row="selectedHf" @close="selectedHf = null" @rows="(next: ModelRecord[]) => (rows = next)" />
   <ConfirmDialog v-if="toggleTarget && toggleSpec" :title="toggleSpec.title" :detail="toggleSpec.detail" :confirm-label="toggleSpec.label" :tone="toggleSpec.tone" @cancel="toggleTarget = null" @confirm="mutate(toggleTarget.action, toggleTarget.row)" />
-  <ConfirmDialog v-if="leaveTo" title="Discard unsaved routing changes?" :detail="`Routing has ${unsaved} unsaved ${unsaved === 1 ? 'change' : 'changes'}. Leaving this tab drops what you have not applied; nothing was sent to Core.`" confirm-label="Discard changes" tone="danger" @cancel="stay" @confirm="leave" />
+  <ConfirmDialog v-if="leaveTo" title="Discard unsaved routing changes?" :detail="`Routing has ${unsaved} unsaved ${unsaved === 1 ? 'change' : 'changes'}. Leaving ${'view' in leaveTo ? 'Models & routing' : 'this tab'} drops what you have not applied; nothing was sent to Core.`" confirm-label="Discard changes" cancel-label="Stay" tone="danger" @cancel="stay" @confirm="leave" />
 </template>
 
 <style scoped>
 .models-tabs { margin-bottom: 16px; }
+/* Stays in the tree while empty, so the live region announces its first message. */
+.nav-blocked { margin: -4px 2px 12px; color: var(--negative-text); font-size: 13px; }
+.nav-blocked:empty { margin: 0; }
 /* The global hover and press rules only exclude :disabled. */
 .btn[aria-disabled="true"]:hover, .btn[aria-disabled="true"]:active { background: var(--bg-sunken); transform: none; }
 </style>

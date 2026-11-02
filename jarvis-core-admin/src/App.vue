@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { api, errorText, type ViewName } from "./admin";
+import { computed, nextTick, onBeforeUnmount, onMounted, provide, reactive, ref, watch } from "vue";
+import { api, errorText, type LogService, type ViewName } from "./admin";
 import { dialogFocus } from "./focus";
+import { NAV_GUARD, createNavGuard } from "./navguard";
 import { IDLE_REASON, createSession, initialSession, lockTime, navigate, visibleView } from "./session";
 import NavIcon, { type IconName } from "./components/NavIcon.vue";
 import StatusBadge from "./components/StatusBadge.vue";
@@ -46,6 +47,13 @@ const views = { overview: OverviewView, devices: DevicesView, releases: UpdateVi
 const session = reactive(initialSession());
 const { lock, unlock: authenticate, recordActivity, start, stop } = createSession(session, api, errorText);
 const active = ref<ViewName>("overview");
+// Models holds a sidebar move while routing changes are staged or applying.
+const navGuard = createNavGuard();
+provide(NAV_GUARD, navGuard);
+// Logs Follow stops on a lock even before the lock unmounts the view.
+provide("sessionLocked", () => session.locked);
+// The service an "Open logs" action preselects; LogsView checks the allowlist.
+const logService = ref<LogService>();
 // Reported by the Overview and Devices views from data they already load.
 const pendingPairings = ref(0);
 const restartRequired = ref(false);
@@ -77,10 +85,15 @@ watch(() => session.locked, (locked) => {
 watch(restartRequired, (required) => {
   if (required) void nextTick(() => { restartFocus = dialogFocus(restartDialog.value!); });
 });
-function go(view: ViewName) { active.value = navigate(session.locked, active.value, view); }
+function go(view: ViewName) {
+  if (!navGuard.allows(session.locked, active.value, view)) return;
+  active.value = navigate(session.locked, active.value, view);
+  logService.value = undefined;
+}
 // A card that opens another view unmounts itself; focus moves to the new page.
-function open(view: ViewName) {
+function open(view: ViewName, service?: LogService) {
   go(view);
+  if (active.value === view) logService.value = service;
   void nextTick(() => page.value?.focus());
 }
 function unlock() { return authenticate(checkRuntime); }
@@ -143,7 +156,7 @@ onBeforeUnmount(() => {
         <JvSegmented v-model="activeTab" variant="tabs" :items="tabs" :label="`${item.label} views`" controls="page-view" />
       </div>
       <main id="page-view" ref="page" tabindex="-1" :role="tabs ? 'tabpanel' : undefined" :class="['page', { 'with-tabs': tabs, 'logs-active': active === 'logs', 'locked-page': session.locked }]">
-        <component :is="current" v-if="current" @restart-required="restartRequired = true" @open="open" @pairings="(count: number) => (pendingPairings = count)" />
+        <component :is="current" v-if="current" v-bind="active === 'logs' ? { service: logService } : {}" @restart-required="restartRequired = true" @open="open" @pairings="(count: number) => (pendingPairings = count)" />
         <section v-else class="lock-screen">
           <JvPanel icon="shield" title="Jarvis Core is locked" tone="warn" status="Locked" description="Authenticate once through the GNOME system dialog. Your password is never handled by this application.">
             <p v-if="lockNote" class="lock-note" role="status">{{ session.authError }}</p>

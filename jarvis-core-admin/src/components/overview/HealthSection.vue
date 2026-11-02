@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { api, errorText } from "../../admin";
+import { api, errorText, type LogService } from "../../admin";
 import { serviceSummary } from "../../stats";
 import { stateLabel, toneOf, type Tone } from "../../status";
 import StatusBadge from "../StatusBadge.vue";
@@ -10,7 +10,7 @@ import { logServiceFor, updaterLabel } from "./needs";
 // all from the status Overview already read. The last full-check result lives
 // only in this component: a lock unmounts the view and drops it.
 const props = defineProps<{ services: Record<string, string> | null; updater: string | null; error: string }>();
-const emit = defineEmits<{ logs: [] }>();
+const emit = defineEmits<{ logs: [service: LogService] }>();
 
 const summary = computed(() => serviceSummary(props.services));
 const rows = computed(() => Object.entries(props.services ?? {}));
@@ -59,7 +59,7 @@ async function fullCheck() {
           <tr v-for="[name, state] in rows" :key="name">
             <td>{{ name }}</td>
             <td><StatusBadge :state="state" /></td>
-            <td class="num"><button v-if="state.toLowerCase() !== 'active' && logServiceFor(name)" type="button" class="small secondary" :aria-label="`Open logs, then choose ${name}`" @click="emit('logs')">Open logs</button></td>
+            <td class="num"><button v-if="state.toLowerCase() !== 'active' && logServiceFor(name)" type="button" class="small secondary" :aria-label="`Open ${name} logs`" @click="emit('logs', logServiceFor(name)!)">Open logs</button></td>
           </tr>
           <tr><td>Updater</td><td><StatusBadge :tone="updater.tone" :label="updater.label" /></td><td></td></tr>
         </tbody>

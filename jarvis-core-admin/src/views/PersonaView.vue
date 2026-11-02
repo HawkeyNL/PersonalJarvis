@@ -49,12 +49,13 @@ onMounted(() => load());
     </section>
     <section class="action-card">
       <div><h2>Install candidate</h2><p>{{ blocker ?? `Install ${shortHash(data.candidate?.sha256 ?? "")} from the signed private checkout. The trusted admin CLI installs exactly this hash, restarts Core and checks readiness.` }}</p></div>
-      <div class="action-row"><button :disabled="busy || !!blocker" @click="askInstall">Install candidate…</button></div>
+      <div class="action-row"><button :disabled="busy || !!blocker" @click="askInstall">{{ blocker ? "Install candidate…" : `Install ${shortHash(data.candidate?.sha256 ?? "")}…` }}</button></div>
     </section>
-    <section class="table-card">
-      <table><thead><tr><th>History version</th><th class="num">Size</th><th>Last used</th><th>State</th><th></th></tr></thead>
-        <tbody><tr v-for="entry in data.history" :key="entry.sha256"><td class="mono">{{ shortHash(entry.sha256) }}</td><td class="num">{{ entry.bytes }} bytes</td><td>{{ time(entry.modified) }}</td><td><StatusBadge :tone="entry.problem ? 'error' : entry.installed ? 'ok' : 'idle'" :label="entry.problem ? problemLabel(entry.problem) : entry.installed ? 'Installed' : 'Available'" /></td><td class="table-actions"><button class="small danger ghost" :disabled="busy || entry.installed || entry.problem !== null" @click="askRollback(entry.sha256)">Roll back…</button></td></tr></tbody>
-      </table>
+    <section class="card tight persona-history" aria-labelledby="persona-history-title">
+      <div class="card-title"><h2 id="persona-history-title">History</h2><span class="t-xs t-2">Hashes and sizes only</span></div>
+      <div class="table-scroll"><table class="tbl"><thead><tr><th>Version</th><th class="num">Size</th><th>Last used</th><th>State</th><th class="table-actions"><span class="sr-only">Actions</span></th></tr></thead>
+        <tbody><tr v-for="entry in data.history" :key="entry.sha256"><td class="mono">{{ shortHash(entry.sha256) }}</td><td class="num">{{ entry.bytes }} bytes</td><td>{{ time(entry.modified) }}</td><td><StatusBadge :tone="entry.problem ? 'error' : entry.installed ? 'ok' : 'idle'" :label="entry.problem ? problemLabel(entry.problem) : entry.installed ? 'Installed' : 'Available'" /></td><td class="table-actions"><button class="small danger ghost" :disabled="busy || entry.installed || entry.problem !== null" :aria-label="`Roll back to ${shortHash(entry.sha256)}`" @click="askRollback(entry.sha256)">Roll back…</button></td></tr></tbody>
+      </table></div>
       <div v-if="!data.history.length" class="empty-state">No persona history yet.</div>
     </section>
     <p class="security-note">Edit the persona through signed commits in the private repository; this application has no editor.</p>
@@ -62,6 +63,7 @@ onMounted(() => load());
   <ConfirmDialog v-if="pending" :title="pending.title" :detail="pending.detail" :confirm-label="pending.label" :tone="pending.tone" @cancel="pending = null" @confirm="execute" />
 </template>
 <style scoped>
-.persona-metrics { margin-bottom: 14px; }
+.persona-metrics { margin-bottom: 16px; }
+.persona-history { margin-bottom: 12px; }
 .persona-meta { color: var(--text-4); font-size: var(--fs-13); }
 </style>
