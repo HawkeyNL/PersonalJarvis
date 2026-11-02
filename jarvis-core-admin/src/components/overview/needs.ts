@@ -17,8 +17,8 @@ export interface NeedsSources {
   devices: Source<DeviceOverview>;
   credentials: Source<CredentialRecord[]>;
 }
-/** A row with one action: open a view, or "refresh" to read everything again. */
-export interface NeedItem { key: string; tone: "warn" | "error"; title: string; detail: string; action: string; target: ViewName | "refresh" }
+/** A row with one action: open a view, or "refresh" to read everything again. `service` preselects Logs. */
+export interface NeedItem { key: string; tone: "warn" | "error"; title: string; detail: string; action: string; target: ViewName | "refresh"; service?: LogService }
 export interface Needs { items: NeedItem[]; loading: boolean }
 
 const SOURCE_NAMES: Record<keyof NeedsSources, string> = {
@@ -70,9 +70,8 @@ export function needsYou(sources: NeedsSources, credentialLabels: Record<string,
     items.push({
       key: `service:${name}`, tone: toneOf(state) === "error" ? "error" : "warn",
       title: `${name} is not active`,
-      // ponytail: Logs opens on Core; preselecting the unit needs a LogsView prop.
-      detail: `State: ${stateLabel(state)}.${logs && logs !== "core" ? ` In Logs, choose ${name}.` : ""}`,
-      action: logs ? "Open logs" : "Refresh", target: logs ? "logs" : "refresh",
+      detail: `State: ${stateLabel(state)}.`,
+      action: logs ? "Open logs" : "Refresh", target: logs ? "logs" : "refresh", service: logs ?? undefined,
     });
   }
   if (usage.data?.over_budget) {

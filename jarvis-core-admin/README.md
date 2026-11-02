@@ -150,13 +150,16 @@ current-month request, token and estimated-cost aggregates by day, provider,
 model and agent, with latency p50/p95, failures and fallbacks. A dimension
 that an older Core omits or does not instrument yet reads "Not measured yet",
 never 0. Its responsive stacked daily token chart uses a narrowly registered
-Chart.js build; budget and provider progress indicators remain native
-application UI. No prompt, reply, credential or request identifier enters
+Chart.js build; the budget and token-share meters remain native application
+UI. No prompt, reply, credential or request identifier enters
 either view. Credential values are never shown or stored by the GUI. Logs are
 bounded, control-sequence sanitized,
 structured where possible, searchable/filterable, selectable, wrapped and
 optionally followed through bounded polling of the allowlisted direct CLI
-operation.
+operation. Follow polls every 2.5 seconds, one request at a time, and pauses
+after 60 seconds without pointer or keyboard activity; it never counts as
+activity for the idle lock and stops on a lock. **Open logs** on Overview
+preselects the service, limited to the fixed allowlist.
 
 Core writes the bounded Usage & costs aggregate at startup, after metered
 model calls and on a periodic recovery interval. A not-yet-created snapshot is
@@ -165,8 +168,8 @@ panel.
 
 The Agents page obtains its tree through the canonical protected admin CLI's
 bounded safe projection. It never reads the private checkout, agent JSON files,
-or Markdown prompt bodies. **Check** compares the configured, allowlisted
-`HawkeyNL/PersonalJarvisAgents` checkout with `origin/main`; **Update bundle**
+or Markdown prompt bodies. **Check for bundle update** compares the configured, allowlisted
+`HawkeyNL/PersonalJarvisAgents` checkout with `origin/main`; **Update agent bundle**
 uses the existing trusted validator and transactional Core-readiness rollback
 path before the refreshed safe tree is displayed.
 

@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import {
   aiAccountLabels, api, credentialLabels, errorText,
   type AiAccountRecord, type CredentialRecord, type DeviceOverview, type ModelRecord,
-  type OverviewResponse, type RouteTier, type RoutingReport, type UsageReport, type ViewName,
+  type LogService, type OverviewResponse, type RouteTier, type RoutingReport, type UsageReport, type ViewName,
 } from "../admin";
 import { keyedState, stateLabel, toneOf, type Tone } from "../status";
 import DailyUsageChart from "../components/DailyUsageChart.vue";
@@ -18,7 +18,7 @@ import { NOT_MEASURED, budgetPercent, compact, eur, integer, measured, ms } from
 // same trusted broker commands as the detail views; a source that fails only
 // blanks its own section. The broker serializes requests anyway, so they run
 // one after another in priority order and each section fills as its data lands.
-const emit = defineEmits<{ open: [view: ViewName]; pairings: [count: number] }>();
+const emit = defineEmits<{ open: [view: ViewName, service?: LogService]; pairings: [count: number] }>();
 const empty = <T,>(): Source<T> => ({ data: null, error: "" });
 const overview = ref<Source<OverviewResponse>>(empty());
 const usage = ref<Source<UsageReport>>(empty());
@@ -57,9 +57,9 @@ onMounted(load);
 const needs = computed(() => needsYou({
   overview: overview.value, usage: usage.value, models: models.value, routes: routes.value, devices: devices.value, credentials: credentials.value,
 }, credentialLabels));
-function act(target: NeedItem["target"]) {
+function act(target: NeedItem["target"], service?: LogService) {
   if (target === "refresh") void load();
-  else emit("open", target);
+  else emit("open", target, service);
 }
 const description = computed(() => {
   const release = overview.value.data?.status.release;
@@ -162,7 +162,7 @@ const credentialCard = computed(() => {
     <PageHeader title="Overview" :description="description" :busy="busy"><button class="secondary" @click="load">Refresh</button></PageHeader>
 
     <NeedsList :items="needs.items" :loading="needs.loading" :busy="busy" @act="act" />
-    <HealthSection :services="overview.data?.status.services ?? null" :updater="overview.data?.status.updater_enabled ?? null" :error="overview.error" @logs="emit('open', 'logs')" />
+    <HealthSection :services="overview.data?.status.services ?? null" :updater="overview.data?.status.updater_enabled ?? null" :error="overview.error" @logs="(service: LogService) => emit('open', 'logs', service)" />
 
     <h2 class="glance-title">At a glance</h2>
     <div class="dash-grid">

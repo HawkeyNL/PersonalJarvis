@@ -52,10 +52,11 @@ test("services not active get a row; failed is an error and logs map to the allo
   const sources = calm();
   sources.overview.data.status.services = { ...SERVICES, SurrealDB: "failed", OpenSandbox: "activating", Mystery: "inactive" };
   const items = needsYou(sources, LABELS).items;
-  assert.deepEqual(items.map((item) => [item.key, item.tone, item.target]), [
-    ["service:SurrealDB", "error", "logs"], ["service:OpenSandbox", "warn", "logs"], ["service:Mystery", "error", "refresh"],
+  assert.deepEqual(items.map((item) => [item.key, item.tone, item.target, item.service]), [
+    ["service:SurrealDB", "error", "logs", "surrealdb"], ["service:OpenSandbox", "warn", "logs", "opensandbox"], ["service:Mystery", "error", "refresh", undefined],
   ]);
-  assert.match(items[0].detail, /State: Failed\. In Logs, choose SurrealDB\./);
+  // "Open logs" preselects the unit, so the row no longer says to choose it.
+  assert.equal(items[0].detail, "State: Failed.");
   assert.equal(logServiceFor("Config broker"), "config-broker");
   assert.equal(logServiceFor("Core"), "core");
   assert.equal(logServiceFor("Caddy"), null);

@@ -2,7 +2,7 @@
 import { onBeforeUnmount, onMounted, ref, useId } from "vue";
 import { dialogFocus } from "../focus";
 // `tone` styles the confirm button: danger only for destructive actions.
-const props = defineProps<{ title: string; detail: string; confirmLabel: string; tone: "neutral" | "primary" | "danger"; requireText?: string }>();
+const props = defineProps<{ title: string; detail: string; confirmLabel: string; tone: "neutral" | "primary" | "danger"; requireText?: string; cancelLabel?: string }>();
 const emit = defineEmits<{ cancel: []; confirm: [] }>();
 const typed = ref("");
 const id = useId();
@@ -25,7 +25,7 @@ onBeforeUnmount(() => focus?.restore());
         <input v-model="typed" autocomplete="off" spellcheck="false" :aria-label="`Type ${requireText} to confirm`" />
       </label>
       <div class="dialog-actions">
-        <button class="secondary" @click="$emit('cancel')">Cancel</button>
+        <button class="secondary" @click="$emit('cancel')">{{ cancelLabel ?? "Cancel" }}</button>
         <button :class="tone === 'neutral' ? 'secondary' : tone" :disabled="!!requireText && typed !== requireText" @click="$emit('confirm')">{{ confirmLabel }}</button>
       </div>
     </section>

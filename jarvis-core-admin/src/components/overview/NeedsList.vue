@@ -6,7 +6,7 @@ import type { NeedItem } from "./needs";
 // while any source is still loading; "All good" only once every source read.
 // One persistent live region announces the outcome once loading ends.
 defineProps<{ items: NeedItem[]; loading: boolean; busy: boolean }>();
-defineEmits<{ act: [target: NeedItem["target"]] }>();
+defineEmits<{ act: [target: NeedItem["target"], service?: NeedItem["service"]] }>();
 </script>
 
 <template>
@@ -17,7 +17,7 @@ defineEmits<{ act: [target: NeedItem["target"]] }>();
       <li v-for="item in items" :key="item.key" class="needs-row">
         <StatusBadge :tone="item.tone" :label="item.tone === 'error' ? 'Problem' : 'Action'" />
         <span class="needs-text"><strong>{{ item.title }}</strong><span>{{ item.detail }}</span></span>
-        <button type="button" class="small secondary" :aria-label="`${item.action}: ${item.title}`" :disabled="busy && item.target === 'refresh'" @click="$emit('act', item.target)">{{ item.action }}</button>
+        <button type="button" class="small secondary" :aria-label="`${item.action}: ${item.title}`" :disabled="busy && item.target === 'refresh'" @click="$emit('act', item.target, item.service)">{{ item.action }}</button>
       </li>
       <li v-if="loading" class="needs-row skeleton" aria-busy="true"><span class="sr-only">Checking the Home Node…</span><i aria-hidden="true" /><i aria-hidden="true" /></li>
     </ul>
