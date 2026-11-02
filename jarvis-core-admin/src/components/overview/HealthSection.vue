@@ -4,7 +4,7 @@ import { api, errorText } from "../../admin";
 import { serviceSummary } from "../../stats";
 import { stateLabel, toneOf, type Tone } from "../../status";
 import StatusBadge from "../StatusBadge.vue";
-import { logServiceFor } from "./needs";
+import { logServiceFor, updaterLabel } from "./needs";
 
 // Health verdict, the service allowlist and the trusted full deployment check,
 // all from the status Overview already read. The last full-check result lives
@@ -15,16 +15,17 @@ const emit = defineEmits<{ logs: [] }>();
 const summary = computed(() => serviceSummary(props.services));
 const rows = computed(() => Object.entries(props.services ?? {}));
 const verdict = computed<{ tone: Tone; label: string; text: string }>(() => {
-  const { up, total, tone } = summary.value;
+  const { up, total } = summary.value;
   if (!total) return { tone: "idle", label: "Unknown", text: "No Jarvis services reported." };
-  if (up === total) return { tone, label: "Healthy", text: `All ${total} Jarvis services are active.` };
+  if (up === total) return { tone: "ok", label: "Healthy", text: `All ${total} Jarvis services are active.` };
+  // Same tone as the worst row, so a red row never sits under an amber verdict.
+  const tone: Tone = rows.value.some(([, state]) => toneOf(state) === "error") ? "error" : "warn";
   return { tone, label: "Degraded", text: `${total - up} of ${total} Jarvis services are not active.` };
 });
-// The timer off is the owner's choice for manual installs, so it stays neutral.
-const UPDATER: Record<string, string> = { disabled: "Manual · timer off", enabled: "Automatic · timer on" };
 const updater = computed(() => {
   const value = props.updater ?? "";
-  return UPDATER[value] ? { label: UPDATER[value], tone: "idle" as Tone } : { label: stateLabel(value), tone: toneOf(value) };
+  const label = updaterLabel(value);
+  return label ? { label, tone: "idle" as Tone } : { label: stateLabel(value), tone: toneOf(value) };
 });
 
 const checking = ref(false);

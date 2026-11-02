@@ -33,6 +33,30 @@ const LOGS: Record<string, LogService> = {
 /** The log allowlist entry for a service label; null when it has no logs here. */
 export const logServiceFor = (label: string): LogService | null => LOGS[label] ?? null;
 
+// Credential ids name model providers differently (credential_setup.rs).
+const MODEL_PROVIDER: Record<string, string> = {
+  anthropic: "anthropic-api", openai: "openai-api", deepseek: "deepseek-api", xai: "xai-api", zai: "zai-api",
+  "ollama-cloud": "ollama-cloud", huggingface: "huggingface",
+};
+
+// Core retries the usage aggregate while it starts; that is not a failure.
+export const usageInitializing = (error: string) => error.includes("usage statistics are unavailable");
+
+// `systemctl is-enabled` exits non-zero for a disabled timer and the CLI then
+// reports "inactive". A timer off is the owner's choice, so it stays neutral.
+const UPDATER: Record<string, string> = { disabled: "Manual · timer off", inactive: "Manual · timer off", enabled: "Automatic · timer on" };
+/** Label for the updater timer state; null when it is not a known state. */
+export const updaterLabel = (state: string): string | null => UPDATER[state] ?? null;
+
+const tag = (value = "") => /^v?(\d+)\.(\d+)\.(\d+)$/.exec(value)?.slice(1).map(Number) ?? null;
+/** True when release tag `latest` is newer than `current`. Malformed tags never are. */
+export function newerRelease(latest?: string, current?: string): boolean {
+  const a = tag(latest), b = tag(current);
+  if (!a || !b) return false;
+  const i = a.findIndex((part, n) => part !== b[n]);
+  return i >= 0 && a[i] > b[i];
+}
+
 /** Services whose state is anything but active. */
 const inactiveServices = (services: Record<string, string>): [string, string][] =>
   Object.entries(services).filter(([, state]) => state.toLowerCase() !== "active");
@@ -82,7 +106,8 @@ export function needsYou(sources: NeedsSources, credentialLabels: Record<string,
       detail: "This release changes the database schema and installs only through the explicit migration.",
       action: "Open releases", target: "releases",
     });
-  } else if (update?.update === "available") {
+  // Overview reads the status without a check, so the tags decide.
+  } else if (update?.update === "available" || newerRelease(update?.latest, update?.current)) {
     items.push({
       key: "update", tone: "warn", title: `Update available${latest ? `:${latest}` : ""}`,
       detail: "A newer release is ready to install. Updates are manual.",
@@ -96,7 +121,7 @@ export function needsYou(sources: NeedsSources, credentialLabels: Record<string,
     ...Object.values(routes.data?.routing?.tiers ?? {}).flatMap((tier) => tier?.chain.map((entry) => entry.provider) ?? []),
   ]);
   for (const row of credentials.data ?? []) {
-    if (row.configured || !used.has(row.provider)) continue;
+    if (row.configured || !used.has(MODEL_PROVIDER[row.provider])) continue;
     const label = credentialLabels[row.provider] ?? row.provider;
     items.push({
       key: `key:${row.provider}`, tone: "warn", title: `${label} key is not set`,
@@ -108,7 +133,7 @@ export function needsYou(sources: NeedsSources, credentialLabels: Record<string,
   // Without every source, "All good" would be a guess: name what is missing.
   // A failed refresh counts too, since the data it kept may be stale.
   const entries = Object.entries(sources) as [keyof NeedsSources, Source<unknown>][];
-  const failed = entries.filter(([, source]) => source.error).map(([name]) => SOURCE_NAMES[name]);
+  const failed = entries.filter(([name, source]) => source.error && !(name === "usage" && usageInitializing(source.error))).map(([name]) => SOURCE_NAMES[name]);
   if (failed.length) {
     items.push({
       key: "unread", tone: "warn", title: "Some checks could not run",

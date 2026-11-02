@@ -4,22 +4,24 @@ import type { NeedItem } from "./needs";
 
 // Rows that need the owner, each with one action. A skeleton row stands in
 // while any source is still loading; "All good" only once every source read.
-defineProps<{ items: NeedItem[]; loading: boolean }>();
+// One persistent live region announces the outcome once loading ends.
+defineProps<{ items: NeedItem[]; loading: boolean; busy: boolean }>();
 defineEmits<{ act: [target: NeedItem["target"]] }>();
 </script>
 
 <template>
   <section class="needs" aria-labelledby="needs-title">
     <h2 id="needs-title">Needs you</h2>
+    <p class="sr-only" role="status">{{ loading ? "" : items.length ? `${items.length} item${items.length === 1 ? "" : "s"} need you.` : "All good." }}</p>
     <ul v-if="items.length || loading" class="needs-list">
       <li v-for="item in items" :key="item.key" class="needs-row">
         <StatusBadge :tone="item.tone" :label="item.tone === 'error' ? 'Problem' : 'Action'" />
         <span class="needs-text"><strong>{{ item.title }}</strong><span>{{ item.detail }}</span></span>
-        <button type="button" class="small secondary" :aria-label="`${item.action}: ${item.title}`" @click="$emit('act', item.target)">{{ item.action }}</button>
+        <button type="button" class="small secondary" :aria-label="`${item.action}: ${item.title}`" :disabled="busy && item.target === 'refresh'" @click="$emit('act', item.target)">{{ item.action }}</button>
       </li>
       <li v-if="loading" class="needs-row skeleton" aria-busy="true"><span class="sr-only">Checking the Home Node…</span><i aria-hidden="true" /><i aria-hidden="true" /></li>
     </ul>
-    <p v-else class="needs-calm" role="status"><StatusBadge tone="ok" label="All good" />Nothing needs you right now.</p>
+    <p v-else class="needs-calm"><StatusBadge tone="ok" label="All good" />Nothing needs you right now.</p>
   </section>
 </template>
 

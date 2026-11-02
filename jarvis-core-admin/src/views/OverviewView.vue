@@ -11,7 +11,7 @@ import JvModuleCard from "../components/jv/JvModuleCard.vue";
 import PageHeader from "../components/PageHeader.vue";
 import HealthSection from "../components/overview/HealthSection.vue";
 import NeedsList from "../components/overview/NeedsList.vue";
-import { needsYou, type NeedItem, type Source } from "../components/overview/needs";
+import { needsYou, usageInitializing, type NeedItem, type Source } from "../components/overview/needs";
 import { NOT_MEASURED, budgetPercent, compact, eur, integer, measured, ms } from "../stats";
 
 // "Needs you" first, then health, then stats cards. Every number comes from the
@@ -69,8 +69,7 @@ const description = computed(() => {
 
 const unavailable = (error: string) => ({ value: "Unavailable", lines: [error], tone: "error" as Tone });
 const pending = { value: "…", lines: ["Loading"], tone: "idle" as Tone };
-// Core retries the usage aggregate while it starts; that is not a failure.
-const usageMissing = () => usage.value.error.includes("usage statistics are unavailable")
+const usageMissing = () => usageInitializing(usage.value.error)
   ? { value: "Initializing", lines: ["Core is preparing usage statistics"], tone: "idle" as Tone }
   : usage.value.error ? unavailable(usage.value.error) : pending;
 
@@ -162,7 +161,7 @@ const credentialCard = computed(() => {
   <div class="dash">
     <PageHeader title="Overview" :description="description" :busy="busy"><button class="secondary" @click="load">Refresh</button></PageHeader>
 
-    <NeedsList :items="needs.items" :loading="needs.loading" @act="act" />
+    <NeedsList :items="needs.items" :loading="needs.loading" :busy="busy" @act="act" />
     <HealthSection :services="overview.data?.status.services ?? null" :updater="overview.data?.status.updater_enabled ?? null" :error="overview.error" @logs="emit('open', 'logs')" />
 
     <h2 class="glance-title">At a glance</h2>
