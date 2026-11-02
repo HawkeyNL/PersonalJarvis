@@ -50,8 +50,9 @@ const active = ref<ViewName>("overview");
 // Models holds a sidebar move while routing changes are staged or applying.
 const navGuard = createNavGuard();
 provide(NAV_GUARD, navGuard);
-// Logs Follow stops on a lock even before the lock unmounts the view.
-provide("sessionLocked", () => session.locked);
+// Logs Follow stops on a lock even before the lock unmounts the view, and
+// behind the restart gate, which leaves the view mounted.
+provide("pollingBlocked", () => session.locked || restartRequired.value);
 // The service an "Open logs" action preselects; LogsView checks the allowlist.
 const logService = ref<LogService>();
 // Reported by the Overview and Devices views from data they already load.
@@ -74,7 +75,7 @@ const locksAt = computed(() => lockTime(session.lastActivity));
 let runtimeTimer: number | undefined;
 // A lock or unlock removes the focused element; focus moves to what replaced it.
 watch(() => session.locked, (locked) => {
-  if (locked) pendingPairings.value = 0;
+  if (locked) { pendingPairings.value = 0; logService.value = undefined; }
   // The restart dialog is modal; focus stays in it.
   if (!restartRequired.value) void nextTick(() => (locked ? unlockButton.value : page.value)?.focus());
 });

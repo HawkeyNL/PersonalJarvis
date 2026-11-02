@@ -34,7 +34,8 @@ function chooseTab(id: string) {
 // unmounts this view, which drops the staged changes and stops an Apply.
 const removeGuard = inject<NavGuard | null>(NAV_GUARD, null)?.set((next) => {
   const decision = leaveRouting(applying.value, unsaved.value);
-  if (decision === "block") navBlocked.value = true;
+  // Cleared first, so a second refused click is announced again.
+  if (decision === "block") { navBlocked.value = false; void nextTick(() => { navBlocked.value = applying.value; }); }
   if (decision === "ask") leaveTo.value = { view: next };
   return decision === "go";
 });

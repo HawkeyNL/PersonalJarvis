@@ -33,18 +33,20 @@ function setup(t) {
   return { calls, state, follower, shell, finish: async () => { state.resolve(); await flush(); } };
 }
 
-test("polls every 2.5 s while followed, one request at a time", async (t) => {
+test("polls at once, then every 2.5 s while followed, one request at a time", async (t) => {
   const { calls, follower, finish } = setup(t);
   assert.equal(FOLLOW_INTERVAL_MS, 2500);
   follower.start();
   assert.equal(follower.following, true);
-  t.mock.timers.tick(FOLLOW_INTERVAL_MS);
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 1, "Follow reads the log right away");
   t.mock.timers.tick(FOLLOW_INTERVAL_MS);
   assert.equal(calls.length, 1, "the first poll has not answered yet");
   await finish();
   t.mock.timers.tick(FOLLOW_INTERVAL_MS);
   assert.equal(calls.length, 2);
+  await finish();
+  t.mock.timers.tick(FOLLOW_INTERVAL_MS);
+  assert.equal(calls.length, 3);
 });
 
 test("a hanging poll is dropped after the timeout", async (t) => {
@@ -119,9 +121,10 @@ test("dispose (unmount) cancels the timer and removes the activity listeners", (
   const remove = shell.removeEventListener.bind(shell);
   shell.removeEventListener = (name, ...rest) => { removed.push(name); return remove(name, ...rest); };
   follower.start();
+  assert.equal(calls.length, 1);
   follower.dispose();
   t.mock.timers.tick(10 * FOLLOW_INTERVAL_MS);
-  assert.equal(calls.length, 0);
+  assert.equal(calls.length, 1, "nothing after unmount");
   assert.deepEqual(removed.sort(), ["focusin", "keydown", "mouseenter", "pointerdown", "pointermove", "touchstart", "wheel"]);
 });
 
@@ -140,4 +143,10 @@ test("the log list is not a live region; a separate status line is", () => {
   assert.ok(!/aria-live|role="(status|log|alert)"/.test(list), list);
   assert.match(view, /<p class="log-status" role="status">/);
   assert.match(view, /:aria-pressed="follow"/);
+});
+
+test("the shell blocks Follow while locked and behind the restart gate", () => {
+  const app = source("../src/App.vue");
+  assert.match(app, /provide\("pollingBlocked", \(\) => session\.locked \|\| restartRequired\.value\);/);
+  assert.match(source("../src/views/LogsView.vue"), /createFollow\(\(\) => load\(true\), \(\) => mounted && !pollingBlocked\(\),/);
 });

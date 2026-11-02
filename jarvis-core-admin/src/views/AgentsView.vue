@@ -39,7 +39,7 @@ onMounted(load);
           <strong>{{ group }}</strong><small>{{ agents.length }}<span class="sr-only"> {{ agents.length === 1 ? "agent" : "agents" }}</span></small>
         </button>
         <div v-show="expanded.has(group)" :id="`${id}-group-${index}`" class="tree-children">
-          <button v-for="agent in agents" :key="agent.id" class="tree-agent" :class="{ selected: selected?.id === agent.id }" :aria-pressed="selected?.id === agent.id" @click="selected = agent"><span>{{ agent.name }}</span><small v-if="agent.profile_lines">{{ agent.profile_lines }} lines</small><StatusBadge :state="agent.state" /></button>
+          <button v-for="agent in agents" :key="agent.id" class="tree-agent" :class="{ selected: selected?.id === agent.id }" :aria-current="selected?.id === agent.id ? 'true' : undefined" @click="selected = agent"><span>{{ agent.name }}</span><small v-if="agent.profile_lines">{{ agent.profile_lines }} lines</small><StatusBadge :state="agent.state" /></button>
         </div>
       </div>
     </div>

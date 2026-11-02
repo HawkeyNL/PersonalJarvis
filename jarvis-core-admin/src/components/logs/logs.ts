@@ -29,6 +29,7 @@ export const FOLLOW_IDLE_MS = 60_000;
  * - a tick while `allowed()` is false (locked, unmounted) stops it without
  *   polling;
  * - `stop` cancels the timer; a request already sent is not repeated.
+ * `start` polls once right away, through the same gate.
  */
 export function createFollow(poll: () => Promise<unknown>, allowed: () => boolean, onIdle: () => void) {
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -59,6 +60,7 @@ export function createFollow(poll: () => Promise<unknown>, allowed: () => boolea
       if (!allowed()) return;
       activity();
       timer = setInterval(tick, FOLLOW_INTERVAL_MS);
+      tick();
     },
     stop,
     get following() { return timer !== undefined; },

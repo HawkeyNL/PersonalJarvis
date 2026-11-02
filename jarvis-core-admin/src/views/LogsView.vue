@@ -14,7 +14,7 @@ const pausedBy = ref<"" | "idle" | "error">("");
 const viewport = ref<HTMLElement | null>(null);
 // True while the newest line is in view: new lines then keep it in view.
 const atLatest = ref(true);
-const locked = inject("sessionLocked", () => false);
+const pollingBlocked = inject("pollingBlocked", () => false);
 let mounted = false;
 const filtered = computed(() => { const needle = search.value.toLowerCase(); return records.value.filter((record) => (level.value === "ALL" || record.level === level.value) && (!needle || `${record.timestamp ?? ""} ${record.level} ${record.target ?? ""} ${record.source_ip ?? ""} ${record.message} ${record.details.flat().join(" ")}`.toLowerCase().includes(needle))); });
 // The quiet status line changes only with the Follow state, never per poll.
@@ -51,20 +51,17 @@ async function load(quiet = false) {
     records.value = response.records; unit.value = response.unit;
     if (stick) await nextTick(toLatest);
   } catch (e) {
+    if (service !== selected.value) return;
     error.value = errorText(e);
     if (follow.value) { follow.value = false; pausedBy.value = "error"; }
-  } finally { busy.value = false; }
+  } finally { if (service === selected.value) busy.value = false; }
 }
-const follower = createFollow(() => load(true), () => mounted && !locked(), () => { follow.value = false; pausedBy.value = "idle"; });
+const follower = createFollow(() => load(true), () => mounted && !pollingBlocked(), () => { follow.value = false; pausedBy.value = "idle"; });
 function toggleFollow() {
   follow.value = !follow.value;
   pausedBy.value = "";
 }
-watch(follow, (on) => {
-  if (!on) return follower.stop();
-  follower.start();
-  void load(true);
-});
+watch(follow, (on) => (on ? follower.start() : follower.stop()));
 watch(selected, () => { atLatest.value = true; void load(); });
 onMounted(() => {
   mounted = true;

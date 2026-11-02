@@ -59,7 +59,7 @@ async function fullCheck() {
           <tr v-for="[name, state] in rows" :key="name">
             <td>{{ name }}</td>
             <td><StatusBadge :state="state" /></td>
-            <td class="num"><button v-if="state.toLowerCase() !== 'active' && logServiceFor(name)" type="button" class="small secondary" :aria-label="`Open ${name} logs`" @click="emit('logs', logServiceFor(name)!)">Open logs</button></td>
+            <td class="num"><button v-if="state.toLowerCase() !== 'active' && logServiceFor(name)" type="button" class="small secondary" :aria-label="`Open logs: ${name}`" @click="emit('logs', logServiceFor(name)!)">Open logs</button></td>
           </tr>
           <tr><td>Updater</td><td><StatusBadge :tone="updater.tone" :label="updater.label" /></td><td></td></tr>
         </tbody>
