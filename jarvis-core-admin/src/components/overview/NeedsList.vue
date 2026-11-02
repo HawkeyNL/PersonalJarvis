@@ -12,7 +12,7 @@ defineEmits<{ act: [target: NeedItem["target"]] }>();
 <template>
   <section class="needs" aria-labelledby="needs-title">
     <h2 id="needs-title">Needs you</h2>
-    <p class="sr-only" role="status">{{ loading ? "" : items.length ? `${items.length} item${items.length === 1 ? "" : "s"} need you.` : "All good." }}</p>
+    <p class="sr-only" role="status">{{ loading ? "" : items.length ? `${items.length} item${items.length === 1 ? " needs" : "s need"} you.` : "All good." }}</p>
     <ul v-if="items.length || loading" class="needs-list">
       <li v-for="item in items" :key="item.key" class="needs-row">
         <StatusBadge :tone="item.tone" :label="item.tone === 'error' ? 'Problem' : 'Action'" />
