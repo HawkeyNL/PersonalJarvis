@@ -10,7 +10,6 @@ import JvPanel from "./components/jv/JvPanel.vue";
 import JvSegmented from "./components/jv/JvSegmented.vue";
 import JvTopBar from "./components/jv/JvTopBar.vue";
 import AgentsView from "./views/AgentsView.vue";
-import CredentialsView from "./views/CredentialsView.vue";
 import AiAccountsView from "./views/AiAccountsView.vue";
 import DevicesView from "./views/DevicesView.vue";
 import LogsView from "./views/LogsView.vue";
@@ -31,8 +30,7 @@ const sections: { label?: string; items: NavItem[] }[] = [
   ] },
   { label: "AI", items: [
     { id: "models", label: "Models & routing", icon: "chip" },
-    // ponytail: two sub-tabs until AI accounts and credentials merge into one view.
-    { id: "ai-accounts", label: "Accounts & keys", icon: "key", tabs: [{ id: "ai-accounts", label: "AI accounts" }, { id: "credentials", label: "Credentials" }] },
+    { id: "ai-accounts", label: "Accounts & keys", icon: "key" },
     { id: "usage", label: "Usage & costs", icon: "chart" },
     { id: "agents", label: "Agents", icon: "agents" },
     { id: "persona", label: "Persona", icon: "user" },
@@ -42,7 +40,7 @@ const sections: { label?: string; items: NavItem[] }[] = [
     { id: "system", label: "System", icon: "gear" },
   ] },
 ];
-const views = { overview: OverviewView, devices: DevicesView, releases: UpdateView, models: ModelsView, "ai-accounts": AiAccountsView, credentials: CredentialsView, usage: UsageView, agents: AgentsView, persona: PersonaView, logs: LogsView, system: SystemView };
+const views = { overview: OverviewView, devices: DevicesView, releases: UpdateView, models: ModelsView, "ai-accounts": AiAccountsView, usage: UsageView, agents: AgentsView, persona: PersonaView, logs: LogsView, system: SystemView };
 const session = reactive(initialSession());
 const { lock, unlock: authenticate, recordActivity, start, stop } = createSession(session, api, errorText);
 const active = ref<ViewName>("overview");

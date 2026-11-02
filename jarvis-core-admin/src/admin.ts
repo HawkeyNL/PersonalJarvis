@@ -6,7 +6,6 @@ export type ViewName =
   | "agents"
   | "models"
   | "usage"
-  | "credentials"
   | "ai-accounts"
   | "devices"
   | "persona"

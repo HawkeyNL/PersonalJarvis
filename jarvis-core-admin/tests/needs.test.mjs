@@ -94,7 +94,7 @@ test("a key is missing only when an enabled model or a routing tier uses it", ()
   assert.deepEqual(keys(sources), ["key:anthropic"]);
   sources.routes.data.routing.tiers = { hard: { chain: [{ provider: "openai-api", model: "gpt" }], metered_after_subscription: false } };
   const items = needsYou(sources, LABELS).items;
-  assert.deepEqual(items.map((item) => [item.key, item.target]), [["key:anthropic", "credentials"], ["key:openai", "credentials"]]);
+  assert.deepEqual(items.map((item) => [item.key, item.target]), [["key:anthropic", "ai-accounts"], ["key:openai", "ai-accounts"]]);
   assert.equal(items[1].title, "OpenAI key is not set");
 });
 
