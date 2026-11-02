@@ -98,6 +98,21 @@ test("Apply sends one change at a time, in order, and stops at the first failure
   assert.deepEqual(changes(after, next).map((change) => change.request.action), ["reset", "set"]);
 });
 
+test("restage keeps a failed tier order as edited, and an emptied saved tier stays blocked", () => {
+  const saved = report();
+  const staged = baseline(saved);
+  staged.tiers.cheap = { chain: [sub, paid], metered_after_subscription: true };
+  staged.tiers.default = { chain: [], metered_after_subscription: false };
+  const kept = restage(saved, staged, ["cheap", "default"]);
+  assert.deepEqual(kept.tiers.cheap, { chain: [sub, paid], metered_after_subscription: true });
+  assert.notEqual(kept.tiers.cheap, staged.tiers.cheap, "a copy, not the old draft");
+  assert.deepEqual(changes(saved, kept).map((change) => change.request.action), ["set"]);
+  const emptied = baseline(saved);
+  emptied.tiers.cheap.chain = [];
+  const [blocked] = changes(saved, restage(saved, emptied, ["cheap"]));
+  assert.match(blocked.problem, /add a model or use the built-in order/);
+});
+
 test("Apply stops when the page is locked or left mid-way", async () => {
   const saved = report();
   const staged = baseline(saved);

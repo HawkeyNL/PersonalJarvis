@@ -122,8 +122,9 @@ onMounted(() => { void load(); });
   <JvSegmented class="models-tabs" :items="TABS" :model-value="tab" label="Models and routing sections" controls="models-panel" @update:model-value="chooseTab" />
   <div id="models-panel" class="models-panel" role="tabpanel" :aria-label="tabLabel">
     <ModelRouting v-if="tab === 'routing'" :models="rows" @changes="(count: number) => (unsaved = count)" @applying="(active: boolean) => (applying = active)" />
-    <LayaCard v-else-if="tab === 'laya'" />
-    <template v-else>
+    <!-- Stays mounted, as before the tabs: a long Laya install keeps its state and result. -->
+    <div v-show="tab === 'laya'"><LayaCard /></div>
+    <template v-if="tab === 'catalog'">
       <form class="model-toolbar register-form" @submit.prevent="registerSubscription">
         <select v-model="registerProvider" aria-label="Subscription provider"><option value="claude-cli">claude-cli</option><option value="codex-cli">codex-cli</option></select>
         <input v-model="registerModel" class="search" maxlength="80" required placeholder="Subscription model, e.g. gpt-6-luna" aria-label="Subscription model" />

@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
 import { api, errorText, type ModelRecord, type OperationResult, type RouteTier, type RoutingReport } from "../admin";
 import ConfirmDialog from "./ConfirmDialog.vue";
 import ErrorPanel from "./ErrorPanel.vue";
 import ResultPanel from "./ResultPanel.vue";
-import { MAX_CHAIN, ROUTE_PROVIDERS, TIERS, applyConfirm, applyInOrder, baseline, changes, entryKey as key, kind, paidAfterSubscription, restage, stageConfirm, type ConfirmSpec, type Staged } from "./models/routing";
+import { MAX_CHAIN, ROUTE_PROVIDERS, TIERS, applyConfirm, applyInOrder, baseline, changes, entryKey as key, kind, paidAfterSubscription, restage, stageConfirm, type Change, type ConfirmSpec, type Staged } from "./models/routing";
 
 const props = defineProps<{ models: ModelRecord[] }>();
 const emit = defineEmits<{ changes: [count: number]; applying: [active: boolean] }>();
@@ -25,8 +25,10 @@ const progress = ref("");
 const error = ref("");
 const errorTitle = ref<string>();
 const results = ref<OperationResult[]>([]);
-type Pending = { kind: "allow_paid" | "research_on" | "reset" | "apply"; tier?: RouteTier; spec: ConfirmSpec };
-const pending = ref<Pending | null>(null);
+// `list`: for Apply, exactly the changes the confirm showed; those are sent.
+type Pending = { kind: "allow_paid" | "research_on" | "reset" | "apply"; tier?: RouteTier; spec: ConfirmSpec; list?: Change[] };
+// Shallow: the confirmed list goes to the broker as plain objects, not proxies.
+const pending = shallowRef<Pending | null>(null);
 let alive = true;
 
 const candidates = computed(() => props.models.filter((row) => ROUTE_PROVIDERS.includes(row.provider)));
@@ -59,16 +61,20 @@ function move(tier: RouteTier, index: number, delta: number) {
   [chain[index], chain[index + delta]] = [chain[index + delta], chain[index]];
 }
 function confirm(kind: Pending["kind"], tier?: RouteTier) {
-  pending.value = { kind, tier, spec: kind === "apply" ? applyConfirm(list.value) : stageConfirm(kind, tier ? label(tier) : "") };
+  pending.value = kind === "apply" ? { kind, spec: applyConfirm(list.value), list: list.value } : { kind, tier, spec: stageConfirm(kind, tier ? label(tier) : "") };
 }
 function confirmed() {
   const action = pending.value!;
   pending.value = null;
-  if (action.kind === "apply") return void apply();
+  if (action.kind === "apply") return void apply(action.list!);
   const draft = staged.value!;
   if (action.kind === "allow_paid") draft.paid_api = "allowed";
   else if (action.kind === "research_on") draft.research_web_search = "on";
-  else draft.tiers[action.tier!] = null;
+  else {
+    draft.tiers[action.tier!] = null;
+    // The reset button that opened the confirm is gone now; focus the tier's model picker.
+    void nextTick(() => document.querySelector<HTMLElement>(`[data-tier="${action.tier}"] select`)?.focus());
+  }
 }
 // Turning on asks first, unless it only undoes a staged "off". One button, so
 // focus comes back to it after the confirm.
@@ -94,9 +100,8 @@ async function load() {
   finally { busy.value = false; }
 }
 // One broker call per change, in page order, as the separate buttons did.
-async function apply() {
-  const todo = list.value;
-  if (busy.value || !todo.length || problems.value.length) return;
+async function apply(todo: Change[]) {
+  if (busy.value || !todo.length || todo.some((change) => change.problem)) return;
   const draft = staged.value!;
   busy.value = true; error.value = ""; results.value = [];
   progress.value = `Applying 1 of ${todo.length}…`;
@@ -140,7 +145,7 @@ onBeforeUnmount(() => { alive = false; });
     <button v-if="!report && !busy" class="small secondary" @click="load">Load routing again</button>
     <ResultPanel v-for="(item, index) in results" :key="index" :result="item" />
     <div v-if="report && staged" class="routing-grid">
-      <div v-for="item in TIERS" :key="item.tier" class="routing-tier">
+      <div v-for="item in TIERS" :key="item.tier" class="routing-tier" :data-tier="item.tier">
         <span class="card-label">{{ item.label }} · {{ stored(item.tier) ? "owner order" : "built-in order" }}<template v-if="changedKeys.has(item.tier)"> · changed</template></span>
         <ol v-if="staged.tiers[item.tier]?.chain.length" class="route-chain">
           <li v-for="(entry, index) in staged.tiers[item.tier]!.chain" :key="key(entry)">

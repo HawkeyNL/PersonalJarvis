@@ -36,15 +36,15 @@ async function save() {
   const row = current.value;
   saving.value = true; error.value = ""; result.value = null;
   try {
-    const operation = await api.modelMutation({ action: "set_route", provider: row.provider, model: row.model, route: selected.value });
+    // Saved (and Core restarted) even if a reload below fails: show it first.
+    result.value = await api.modelMutation({ action: "set_route", provider: row.provider, model: row.model, route: selected.value });
     const rows = await api.models();
     if (!alive) return;
     emit("rows", rows);
     current.value = rows.find((item) => item.provider === row.provider && item.model === row.model) ?? row;
     details.value = await api.modelProviders(row.model);
     selected.value = current.value.route ?? "auto";
-    result.value = operation;
-  } catch (reason) { error.value = errorText(reason); errorTitle.value = undefined; }
+  } catch (reason) { error.value = errorText(reason); errorTitle.value = result.value ? "Route saved; could not reload routes" : undefined; }
   finally { saving.value = false; }
 }
 // Stays inside .app-shell (no Teleport), so the idle lock keeps seeing activity.
