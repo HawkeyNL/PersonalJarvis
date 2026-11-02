@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   ACTIVITY_EVENTS, PAIRING_LIFETIME_S, REFRESH_INTERVAL_MS, REFRESH_TIMEOUT_MS,
-  countdown, createActivityRefresh, groupFingerprint, isExpired, requestedAt, secondsLeft, withTimeout,
+  approveAction, countdown, createActivityRefresh, groupFingerprint, isExpired, requestedAt, secondsLeft, withTimeout,
 } from "../src/components/devices/pairing.ts";
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -16,6 +16,12 @@ test("fingerprint shows all 64 characters in 16 groups of four, like the apps", 
   assert.equal(grouped.replaceAll(" ", ""), FINGERPRINT);
   assert.equal(groupFingerprint("abcdef"), "abcd ef");
   assert.equal(groupFingerprint(""), "");
+});
+
+test("approve sends Core's raw fingerprint, never the grouped display form", () => {
+  const request = { id: "33333333-3333-4333-8333-333333333333", name: "Pixel", platform: "android", fingerprint: FINGERPRINT, expires_at: 1 };
+  assert.deepEqual(approveAction(request), { action: "approve", request_id: request.id, fingerprint: FINGERPRINT });
+  assert.match(approveAction(request).fingerprint, /^[0-9a-f]{64}$/);
 });
 
 test("countdown runs down to Expired at the expiry second", () => {
@@ -37,7 +43,7 @@ test("requested time is the Core lifetime before expiry", () => {
   assert.equal(requestedAt(1_000_300).getTime(), 1_000_000_000);
 });
 
-test("withTimeout rejects a hanging request and clears its timer otherwise", async (t) => {
+test("withTimeout rejects a hanging request and passes a fast answer through", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const hanging = withTimeout(new Promise(() => {}), 50);
   t.mock.timers.tick(50);
@@ -106,11 +112,14 @@ test("never records activity or touches the session itself", () => {
   }
 });
 
-test("stop (lock or unmount) cancels a scheduled refresh and removes the listeners", (t) => {
+test("stop (lock or unmount) cancels a scheduled refresh and removes the listeners", async (t) => {
   const { calls, refresher, shell } = setup(t);
   t.mock.timers.tick(REFRESH_INTERVAL_MS);
   activity(shell);
-  refresher.stop(); // the lock that this same event caused unmounts the view first
+  // A lock caused by this same event unmounts the view in Vue's microtask
+  // flush, which runs before the deferred (macrotask) refresh.
+  queueMicrotask(() => refresher.stop());
+  await flush();
   t.mock.timers.tick(0);
   assert.equal(calls.length, 0);
   t.mock.timers.tick(REFRESH_INTERVAL_MS);

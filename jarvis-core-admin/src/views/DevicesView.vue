@@ -6,7 +6,7 @@ import ErrorPanel from "../components/ErrorPanel.vue";
 import ConfirmDialog from "../components/ConfirmDialog.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import PairingReviewDialog from "../components/devices/PairingReviewDialog.vue";
-import { REFRESH_TIMEOUT_MS, countdown, createActivityRefresh, isExpired, requestedAt, withTimeout } from "../components/devices/pairing";
+import { REFRESH_TIMEOUT_MS, approveAction, countdown, createActivityRefresh, isExpired, requestedAt, withTimeout } from "../components/devices/pairing";
 const ACTIVATION_COMMAND = "sudo jarvis account activation-code --allow-cidr <private-device-ip>/32";
 const data = ref<DeviceOverview | null>(null);
 const busy = ref(false);
@@ -30,10 +30,11 @@ async function fetchDevices() {
 }
 const LOAD_FAILED = "Could not load devices";
 // Background refresh on activity (see pairing.ts): silent, keeps the current
-// list on failure.
+// list on failure and never replaces an action's error.
 const refresher = createActivityRefresh(async () => {
-  try { await fetchDevices(); if (errorTitle.value === LOAD_FAILED) error.value = ""; }
-  catch (e) { error.value = errorText(e); errorTitle.value = LOAD_FAILED; }
+  const own = !error.value || errorTitle.value === LOAD_FAILED;
+  try { await fetchDevices(); if (own) error.value = ""; }
+  catch (e) { if (own) { error.value = errorText(e); errorTitle.value = LOAD_FAILED; } }
 }, () => !busy.value && !review.value && !revoking.value);
 async function load() {
   busy.value = true; error.value = "";
@@ -59,7 +60,7 @@ async function apply(request: DeviceAction, done: string, failed: string) {
   finally { busy.value = false; }
 }
 function approve(request: PendingDevice) {
-  return apply({ action: "approve", request_id: request.id, fingerprint: request.fingerprint }, `${request.name} is approved and now a trusted device.`, `Could not approve ${request.name}`);
+  return apply(approveAction(request), `${request.name} is approved and now a trusted device.`, `Could not approve ${request.name}`);
 }
 function deny(request: PendingDevice) {
   return apply({ action: "deny", request_id: request.id }, `The request from ${request.name} is denied.`, `Could not deny ${request.name}`);
@@ -72,7 +73,9 @@ onMounted(() => {
   void load();
   // Local clock for the countdowns only; it never calls the broker.
   clock = window.setInterval(() => (now.value = Date.now()), 1000);
-  refresher.start(document.querySelector(".app-shell") ?? document);
+  // Only the shell's events: they are the ones that count as activity.
+  const shell = document.querySelector(".app-shell");
+  if (shell) refresher.start(shell);
 });
 onBeforeUnmount(() => {
   clearInterval(clock);
@@ -102,7 +105,8 @@ onBeforeUnmount(() => {
           </div>
           <StatusBadge v-if="isExpired(request.expires_at, now)" tone="idle" label="Expired" />
           <span v-else class="countdown">Expires in {{ countdown(request.expires_at, now) }}</span>
-          <button class="primary" :disabled="busy || isExpired(request.expires_at, now)" :aria-label="`Review ${request.name}`" @click="review = request">Review…</button>
+          <!-- aria-disabled on expiry: a focused button that expires keeps focus. -->
+          <button class="btn primary" :disabled="busy" :aria-disabled="isExpired(request.expires_at, now)" :aria-label="`Review ${request.name}`" @click="isExpired(request.expires_at, now) || (review = request)">Review…</button>
         </li>
       </ul>
     </section>

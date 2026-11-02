@@ -1,6 +1,10 @@
 // Pairing helpers for the Devices view: fingerprint display, expiry countdown
 // and the activity-driven refresh of the pending list. No Vue or Tauri
 // imports, so `npm run test:unit` loads this file directly.
+import type { DeviceAction, PendingDevice } from "../../admin";
+
+/** Approve sends Core's raw fingerprint; the grouped form is display only. */
+export const approveAction = (request: PendingDevice): DeviceAction => ({ action: "approve", request_id: request.id, fingerprint: request.fingerprint });
 
 /** The full key fingerprint in groups of four, exactly as the Jarvis apps show it. */
 export const groupFingerprint = (fingerprint: string): string => fingerprint.match(/.{1,4}/g)?.join(" ") ?? "";
@@ -38,12 +42,14 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, message = "The H
  * Refreshes the pending list on the shell's own activity events, at most once
  * per REFRESH_INTERVAL_MS, never on a timer. Every broker request resets the
  * backend session window, so a timed poll would keep the root broker alive
- * after the user left. Here each refresh starts in the same moment as an event
- * the shell already records as activity (it never calls recordActivity
- * itself), so it cannot move the backend window past the frontend idle lock.
- * No activity means no refresh. The view only exists while unlocked; a lock
- * unmounts it and `stop` cancels a refresh that has not started yet.
- * `ready` lets the view skip a refresh while it is busy or a dialog is open.
+ * after the user left. Here each refresh starts with an event the shell
+ * already records as activity (it never calls recordActivity itself); like
+ * any request, the backend restarts its window when the request finishes.
+ * No activity means no refresh, and the frontend idle lock stays
+ * authoritative: the view only exists while unlocked, a lock unmounts it, and
+ * `stop` cancels a refresh that has not started yet. The timeout only stops
+ * waiting in the frontend. `ready` lets the view skip a refresh while it is
+ * busy or a dialog is open.
  */
 export function createActivityRefresh(refresh: () => Promise<unknown>, ready: () => boolean = () => true) {
   let last = Date.now(); // the view loads on mount
