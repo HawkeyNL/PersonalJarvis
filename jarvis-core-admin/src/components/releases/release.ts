@@ -32,7 +32,8 @@ export function releaseOffer(status: Record<string, string>): ReleaseOffer {
   const newer = status.update !== undefined ? status.update === "available" : !current ? !!latest : newerRelease(latest, current);
   const install = newer && !migrate ? latest : "";
   // `--version` with the active tag reinstalls its units (update-core-release.sh, repair_active_managed_units).
-  const broken = status.update === "repair required" || status.systemd_units === "repair-required";
+  // A check (the `update` key) is newer than the status it was merged into.
+  const broken = status.update !== undefined ? status.update === "repair required" : status.systemd_units === "repair-required";
   return { current, previous: releaseTag(status.previous), install, migrate, repair: broken && !install && !migrate ? current : "" };
 }
 

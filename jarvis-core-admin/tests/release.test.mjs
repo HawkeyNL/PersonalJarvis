@@ -50,6 +50,7 @@ test("broken units offer a repair of the active release unless an install or mig
   assert.equal(releaseOffer({ ...STATUS, systemd_units: "repair-required" }).repair, "", "installing v0.0.68 installs its units");
   assert.equal(releaseOffer({ ...STATUS, schema: "migration required", systemd_units: "repair-required" }).repair, "");
   assert.equal(releaseOffer({ systemd_units: "repair-required", current: "unavailable" }).repair, "");
+  assert.equal(releaseOffer({ ...STATUS, latest: "v0.0.67", systemd_units: "repair-required", update: "not available" }).repair, "", "a fresh check wins over merged status");
 });
 
 test("runtime badge: a failed check outranks an update", () => {
