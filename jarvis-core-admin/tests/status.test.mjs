@@ -41,3 +41,13 @@ test("versions and identifiers pass through unchanged", () => {
   assert.equal(stateLabel("0.1.38"), "0.1.38");
   assert.equal(stateLabel("main@8a99157"), "main@8a99157");
 });
+
+test("an unset key is neutral; account billing and runtime lines read as words", () => {
+  assert.equal(toneOf("not configured"), "idle");
+  assert.equal(stateLabel("not configured"), "Not set");
+  assert.equal(stateLabel(keyedState("billing", "subscription")), "Subscription login");
+  assert.equal(stateLabel(keyedState("billing", "overage_unverified")), "Extra usage setting not verified");
+  assert.equal(stateLabel(keyedState("runtime", "inactive")), "Worker socket off");
+  assert.equal(stateLabel(keyedState("runtime", "active")), "Worker running");
+  assert.equal(stateLabel(keyedState("runtime", "socket_ready")), "Ready, starts on demand");
+});

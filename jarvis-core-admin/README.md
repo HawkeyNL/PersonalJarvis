@@ -133,8 +133,8 @@ an update when Core, CLI, the graphical app, or multiple components changed.
 
 The app uses the Jarvis Instrument design (bundled OFL fonts, no remote
 assets) with one flat sidebar: Overview, Devices and Releases, an AI section
-(Models & routing, Accounts & keys with AI accounts and Credentials as
-sub-tabs, Usage & costs, Agents, Persona) and a Diagnostics section (Logs,
+(Models & routing, Accounts & keys with subscription logins and API keys on
+one page, Usage & costs, Agents, Persona) and a Diagnostics section (Logs,
 System). Devices shows the number of pending pairings as a badge, taken from
 data the Overview and Devices views already load; it clears on lock and
 returns when one of those views loads again. The top bar shows the root

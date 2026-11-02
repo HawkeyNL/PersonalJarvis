@@ -39,6 +39,23 @@ const MODEL_PROVIDER: Record<string, string> = {
   "ollama-cloud": "ollama-cloud", huggingface: "huggingface",
 };
 
+/** What uses a credential: enabled models and routing tiers. */
+export interface KeyUse { models: number; routing: boolean }
+/**
+ * How many enabled models use this credential's provider, and whether a routing
+ * tier does. Null for a credential that no model provider uses (Jev, the task
+ * classifier).
+ */
+export function keyUse(credential: string, models: ModelRecord[], routes: RoutingReport | null): KeyUse | null {
+  const provider = MODEL_PROVIDER[credential];
+  if (!provider) return null;
+  return {
+    models: models.filter((row) => row.enabled && row.provider === provider).length,
+    routing: Object.values(routes?.routing?.tiers ?? {}).some((tier) => tier?.chain.some((entry) => entry.provider === provider)),
+  };
+}
+export const keyInUse = (use: KeyUse | null): boolean => !!use && (use.models > 0 || use.routing);
+
 // Core retries the usage aggregate while it starts; that is not a failure.
 export const usageInitializing = (error: string) => error.includes("usage statistics are unavailable");
 
@@ -115,17 +132,13 @@ export function needsYou(sources: NeedsSources, credentialLabels: Record<string,
   }
   // A key is missing only when something uses its provider: an enabled model
   // or a routing tier. Unused providers stay quiet.
-  const used = new Set([
-    ...(models.data ?? []).filter((row) => row.enabled).map((row) => row.provider),
-    ...Object.values(routes.data?.routing?.tiers ?? {}).flatMap((tier) => tier?.chain.map((entry) => entry.provider) ?? []),
-  ]);
   for (const row of credentials.data ?? []) {
-    if (row.configured || !used.has(MODEL_PROVIDER[row.provider])) continue;
+    if (row.configured || !keyInUse(keyUse(row.provider, models.data ?? [], routes.data))) continue;
     const label = credentialLabels[row.provider] ?? row.provider;
     items.push({
       key: `key:${row.provider}`, tone: "warn", title: `${label} key is not set`,
       detail: `Enabled models or routing use ${label}; those calls fail without a key.`,
-      action: "Set key", target: "credentials",
+      action: "Set key", target: "ai-accounts",
     });
   }
 

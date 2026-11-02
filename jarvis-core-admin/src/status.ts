@@ -7,7 +7,9 @@ export type Tone = "ok" | "idle" | "warn" | "error";
 const OK = ["active", "enabled", "passed", "healthy", "configured", "known", "local", "yes", "available", "connected", "automatic", "up to date"];
 // Intended or not-yet-relevant states: a mostly disabled catalog is normal, and
 // a manual updater is the owner's choice, not a fault.
-const NEUTRAL = ["disabled", "manual", "off", "not run this session", "logged_out"];
+// A key nobody uses yet is not a problem either; Accounts & keys warns when an
+// enabled model needs it.
+const NEUTRAL = ["disabled", "manual", "off", "not run this session", "logged_out", "not configured"];
 const ERROR = ["failed", "error", "inactive", "unavailable", "unhealthy"];
 
 export function toneOf(state: string): Tone {
@@ -24,6 +26,9 @@ export function toneOf(state: string): Tone {
 const KEYED: Record<string, Record<string, string>> = {
   updater: { enabled: "automatic", disabled: "manual" },
   update: { available: "update available", "not available": "up to date" },
+  // AI account billing and worker runtime lines.
+  billing: { subscription: "subscription login" },
+  runtime: { inactive: "worker socket off", active: "worker running" },
 };
 export const keyedState = (key: string, value: string): string => KEYED[key.toLowerCase()]?.[value] ?? value;
 
@@ -54,6 +59,7 @@ const STATES: Record<string, string> = {
   socket_ready: "Ready, starts on demand",
   overage_unverified: "Extra usage setting not verified",
   unverified: "Not verified",
+  "not configured": "Not set",
   "not run this session": "Not run yet",
   "release-matched": "Matches release",
   "repair-required": "Repair required",
