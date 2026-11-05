@@ -18,7 +18,8 @@ surface is the explicitly registered command list in
 - a fixed read of the root-controlled active agent manifest;
 - explicitly typed Core update, agent update, model-policy and persona
   install/rollback mutations;
-- a typed credential-provider action that opens a separate trusted terminal.
+- a typed credential-provider action that opens a separate trusted terminal;
+- a typed Claude worker-socket enable/disable action (see below).
 
 Privileged calls use `/usr/bin/pkexec` and the system's GNOME polkit agent. A
 password is never accepted by Vue, Tauri IPC, command arguments or stdin.
@@ -40,6 +41,15 @@ invokes only `pkexec /usr/local/sbin/jarvis credentials set <typed-provider>`;
 the active verified credential helper reads hidden input directly from the
 controlling terminal. Only the allowlisted provider name enters argv. The
 secret never enters Vue state, Tauri IPC, captured output or a command line.
+
+The Claude **Enable worker…** and **Disable worker…** buttons on Accounts &
+keys do not use the broker. Like device actions and schema migration, each runs
+`pkexec /usr/local/sbin/jarvis accounts worker <enable|disable> claude` with a
+fixed argv under the `com.hawkeynl.jarvis.accounts` PolicyKit action
+(`auth_admin`, never `_keep`), so the OS password is asked again even while the
+session is unlocked. The CLI checks the release, login and runtime before it
+touches the socket; it cannot verify that extra usage is turned off on
+claude.ai, so the confirmation dialog asks the owner to do that first.
 
 At startup the installed application opens one narrow root broker through the
 system authorization dialog. All later requests in that unlocked GUI session

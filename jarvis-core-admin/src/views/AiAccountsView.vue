@@ -2,14 +2,14 @@
 import { nextTick, onMounted, ref } from "vue";
 import {
   aiAccountLabels as labels, api, credentialLabels, errorText,
-  type AiAccountAction, type AiAccountProvider, type AiAccountRecord, type CredentialProvider, type CredentialRecord, type ModelRecord, type OperationResult, type RoutingReport, type ViewName,
+  type AiAccountAction, type AiAccountProvider, type AiAccountRecord, type AiWorkerAction, type CredentialProvider, type CredentialRecord, type ModelRecord, type OperationResult, type RoutingReport, type ViewName,
 } from "../admin";
 import ConfirmDialog from "../components/ConfirmDialog.vue";
 import ErrorPanel from "../components/ErrorPanel.vue";
 import PageHeader from "../components/PageHeader.vue";
 import ResultPanel from "../components/ResultPanel.vue";
 import StatusBadge from "../components/StatusBadge.vue";
-import { accountConfirm, keyConfirm, keyUseLabel, type ConfirmSpec } from "../components/accounts/accounts";
+import { accountConfirm, keyConfirm, keyUseLabel, workerAction, workerConfirm, type ConfirmSpec } from "../components/accounts/accounts";
 import { keyInUse, keyUse } from "../components/overview/needs";
 import { keyedState, stateLabel } from "../status";
 
@@ -69,7 +69,8 @@ async function returnFocus({ button, page }: Opener) {
   else page?.focus();
 }
 
-// Every action runs in a trusted terminal; the broker call returns when it closes.
+// Every action but the worker switch runs in a trusted terminal; the call
+// returns when it closes. The worker switch only shows the system prompt.
 async function run(id: string, name: string, operation: () => Promise<OperationResult>, reload: () => Promise<void>, opener: Opener) {
   confirm.value = null;
   busy.value = true;
@@ -95,6 +96,10 @@ function account(provider: AiAccountProvider, action: AiAccountAction, event: Ev
   if (spec) confirm.value = { spec, run: go };
   else void go();
 }
+function worker(action: AiWorkerAction, event: Event) {
+  const opener = openerOf(event);
+  confirm.value = { spec: workerConfirm(action), run: () => run(`worker:${action}`, "the Claude worker", () => api.aiWorkerAction("claude", action), loadAccounts, opener) };
+}
 function setKey(row: CredentialRecord, event: Event) {
   const opener = openerOf(event);
   const go = () => run(`key:${row.provider}`, `the ${credentialLabels[row.provider]} key`, () => api.credentialSet(row.provider), loadKeys, opener);
@@ -104,7 +109,7 @@ function setKey(row: CredentialRecord, event: Event) {
 }
 const useOf = (provider: CredentialProvider) => (usage.value ? keyUse(provider, usage.value.models, usage.value.routes) : undefined);
 const needed = (row: CredentialRecord) => !row.configured && keyInUse(useOf(row.provider) ?? null);
-const label = (id: string, idle: string) => (running.value === id ? "Terminal open…" : idle);
+const label = (id: string, idle: string) => (running.value === id ? (id.startsWith("worker:") ? "Authorizing…" : "Terminal open…") : idle);
 
 onMounted(load);
 </script>
@@ -113,7 +118,7 @@ onMounted(load);
   <PageHeader title="Accounts &amp; keys" description="Subscription logins and API keys for model providers. This app shows their status only; logins and keys are entered in a trusted terminal, never here." :busy="busy">
     <button class="secondary" @click="load">Refresh</button>
   </PageHeader>
-  <p class="sr-only" role="status">{{ runningFor ? `A trusted terminal window is open for ${runningFor}. Finish there; this page updates when it closes.` : "" }}</p>
+  <p class="sr-only" role="status">{{ !runningFor ? "" : running.startsWith("worker:") ? `Waiting for administrator authorization for ${runningFor}.` : `A trusted terminal window is open for ${runningFor}. Finish there; this page updates when it closes.` }}</p>
   <ErrorPanel v-if="actionError" :message="actionError" />
   <ResultPanel v-if="result" :result="result" />
 
@@ -130,6 +135,7 @@ onMounted(load);
         <p v-if="row.state === 'host_unsupported'">A host system tool the worker runs through (systemd-run or env) failed the root-ownership check. Connect reports which one.</p>
         <p v-if="row.legacy_identity">The retired <code>jarvis-codex-chat</code> identity or <code>/var/lib/jarvis-codex-chat</code> still exists. It is no longer used and can be removed (see <code>docs/SUBSCRIPTION_WORKERS.md</code>).</p>
         <p v-if="row.provider === 'claude' && row.state === 'connected'">Claude login is linked. Verify extra usage is disabled or capped at zero in your provider account before explicitly enabling the worker socket.</p>
+        <p v-if="workerAction(row)">Worker socket: <button class="small" :class="workerAction(row) === 'enable' ? 'secondary' : 'danger'" :disabled="busy" @click="worker(workerAction(row)!, $event)">{{ workerAction(row) === "enable" ? label("worker:enable", "Enable worker…") : label("worker:disable", "Disable worker…") }}</button></p>
         <p>Runtime install, update and rollback: <button class="small ghost" @click="emit('open', 'releases')">Open Releases</button></p>
         <div class="dialog-actions">
           <button v-if="row.state !== 'connected'" class="small secondary" :disabled="busy" aria-describedby="subscriptions-hint" @click="account(row.provider, 'connect', $event)">{{ label(`connect:${row.provider}`, "Connect") }}</button>

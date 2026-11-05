@@ -95,6 +95,19 @@ pub(super) fn trusted_health_verifier_command() -> Result<ProcessCommand> {
     Ok(trusted_command(verifier))
 }
 
+/// Whether the active managed release ships the subscription worker units.
+/// An unreadable or unsafe release counts as not shipping them.
+pub(super) fn active_release_ships_subscription_workers() -> bool {
+    active_release_manifest(Path::new(CURRENT_RELEASE), Path::new(RELEASES_ROOT), 0, 0).is_ok_and(
+        |(_, manifest)| {
+            manifest
+                .pointer("/tooling/subscription_workers")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+        },
+    )
+}
+
 pub(super) fn resolve_health_verifier(
     current: &Path,
     releases: &Path,
@@ -102,6 +115,55 @@ pub(super) fn resolve_health_verifier(
     expected_uid: u32,
     expected_gid: u32,
 ) -> Result<PathBuf> {
+    let (active, manifest) =
+        active_release_manifest(current, releases, expected_uid, expected_gid)?;
+    let versioned = match manifest.pointer("/tooling/systemd_units") {
+        None => false,
+        Some(value) if value.as_u64() == Some(1) => true,
+        Some(_) => bail!("active release declares an unsupported managed-systemd capability"),
+    };
+    let verifier = if versioned {
+        active.join("verify-home-node")
+    } else {
+        legacy_verifier.to_path_buf()
+    };
+    validate_owned_path(&verifier, expected_uid, expected_gid, true)
+        .context("trusted Home Node verifier is unsafe")?;
+    if versioned {
+        let canonical =
+            fs::canonicalize(&verifier).context("resolve versioned Home Node verifier")?;
+        if canonical.parent() != Some(active.as_path())
+            || canonical.file_name() != Some(OsStr::new("verify-home-node"))
+        {
+            bail!("versioned Home Node verifier escapes the active release");
+        }
+    } else {
+        let parent = legacy_verifier
+            .parent()
+            .context("legacy Home Node verifier has no parent")?;
+        validate_owned_path(parent, expected_uid, expected_gid, false)
+            .context("legacy Home Node verifier directory is unsafe")?;
+        let canonical_parent =
+            fs::canonicalize(parent).context("resolve legacy Home Node verifier directory")?;
+        let canonical = fs::canonicalize(&verifier).context("resolve legacy Home Node verifier")?;
+        if canonical_parent != parent
+            || canonical.parent() != Some(canonical_parent.as_path())
+            || canonical.file_name() != Some(OsStr::new("verify-home-node"))
+        {
+            bail!("legacy Home Node verifier escapes its fixed directory");
+        }
+    }
+    Ok(verifier)
+}
+
+/// The active managed release directory and its manifest, after checking the
+/// release root, the `current` link, the directory and the manifest itself.
+pub(super) fn active_release_manifest(
+    current: &Path,
+    releases: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<(PathBuf, serde_json::Value)> {
     validate_owned_path(releases, expected_uid, expected_gid, false)
         .context("managed release root is unsafe")?;
     let canonical_releases = fs::canonicalize(releases).context("resolve managed release root")?;
@@ -144,43 +206,7 @@ pub(super) fn resolve_health_verifier(
     if manifest.get("tag").and_then(serde_json::Value::as_str) != Some(tag) {
         bail!("active release manifest tag does not match its managed directory");
     }
-    let versioned = match manifest.pointer("/tooling/systemd_units") {
-        None => false,
-        Some(value) if value.as_u64() == Some(1) => true,
-        Some(_) => bail!("active release declares an unsupported managed-systemd capability"),
-    };
-    let verifier = if versioned {
-        active.join("verify-home-node")
-    } else {
-        legacy_verifier.to_path_buf()
-    };
-    validate_owned_path(&verifier, expected_uid, expected_gid, true)
-        .context("trusted Home Node verifier is unsafe")?;
-    if versioned {
-        let canonical =
-            fs::canonicalize(&verifier).context("resolve versioned Home Node verifier")?;
-        if canonical.parent() != Some(active.as_path())
-            || canonical.file_name() != Some(OsStr::new("verify-home-node"))
-        {
-            bail!("versioned Home Node verifier escapes the active release");
-        }
-    } else {
-        let parent = legacy_verifier
-            .parent()
-            .context("legacy Home Node verifier has no parent")?;
-        validate_owned_path(parent, expected_uid, expected_gid, false)
-            .context("legacy Home Node verifier directory is unsafe")?;
-        let canonical_parent =
-            fs::canonicalize(parent).context("resolve legacy Home Node verifier directory")?;
-        let canonical = fs::canonicalize(&verifier).context("resolve legacy Home Node verifier")?;
-        if canonical_parent != parent
-            || canonical.parent() != Some(canonical_parent.as_path())
-            || canonical.file_name() != Some(OsStr::new("verify-home-node"))
-        {
-            bail!("legacy Home Node verifier escapes its fixed directory");
-        }
-    }
-    Ok(verifier)
+    Ok((active, manifest))
 }
 
 pub(super) fn resolve_admin_helper(

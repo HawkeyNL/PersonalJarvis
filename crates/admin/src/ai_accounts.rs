@@ -120,7 +120,27 @@ pub(super) enum AccountsCommand {
         #[command(subcommand)]
         command: runtime::RuntimeCommand,
     },
+    /// Enable or disable the provider's subscription worker socket.
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
 }
+
+#[derive(Debug, Subcommand)]
+pub(super) enum WorkerCommand {
+    /// Enable the worker socket once the login and runtime check out. The
+    /// owner must have turned off extra usage on the provider account first.
+    Enable { provider: AccountProvider },
+    /// Disable the worker socket and stop any active run.
+    Disable { provider: AccountProvider },
+}
+
+const CODEX_WORKER_REFUSAL: &str =
+    "only the Claude worker is managed here; see docs/SUBSCRIPTION_WORKERS.md for the Codex chat worker";
+
+/// Starts the Claude worker socket; the service is socket-activated.
+const CLAUDE_WORKER_ENABLE: [&str; 3] = ["enable", "--now", "jarvis-claude.socket"];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct AccountStatus {
@@ -170,6 +190,12 @@ pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
         AccountsCommand::Reconnect { provider } => Some((*provider, "reconnect")),
         AccountsCommand::Disconnect { provider } => Some((*provider, "disconnect")),
         AccountsCommand::Test { provider } => Some((*provider, "test")),
+        AccountsCommand::Worker {
+            command: WorkerCommand::Enable { provider },
+        } => Some((*provider, "worker_enable")),
+        AccountsCommand::Worker {
+            command: WorkerCommand::Disable { provider },
+        } => Some((*provider, "worker_disable")),
         // Runtime commands record their own version-bearing audit events.
         AccountsCommand::List
         | AccountsCommand::Status { .. }
@@ -244,6 +270,35 @@ pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
                 Ok(())
             }
             AccountsCommand::Runtime { command } => runtime::run(command, json),
+            AccountsCommand::Worker {
+                command: WorkerCommand::Enable { provider },
+            } => {
+                if let Some(reason) = worker_enable_refusal(
+                    provider,
+                    crate::admin_helpers::active_release_ships_subscription_workers,
+                    || status(AccountProvider::Claude).state,
+                    || ensure_claude_runtime_compatible().is_ok(),
+                ) {
+                    bail!(reason);
+                }
+                run_systemctl(&CLAUDE_WORKER_ENABLE)
+                    .context("Claude worker socket could not be enabled")?;
+                if runtime_state(provider) == "inactive" {
+                    bail!("Claude worker socket is still inactive after enabling it");
+                }
+                println!("claude worker socket enabled");
+                Ok(())
+            }
+            AccountsCommand::Worker {
+                command: WorkerCommand::Disable { provider },
+            } => {
+                if provider != AccountProvider::Claude {
+                    bail!(CODEX_WORKER_REFUSAL);
+                }
+                stop_subscription_runtime(provider)?;
+                println!("{} worker disabled", provider.name());
+                Ok(())
+            }
             AccountsCommand::Disconnect { provider } => {
                 if json {
                     bail!("account disconnection requires a trusted interactive terminal");
@@ -345,22 +400,50 @@ fn require_tty() -> Result<()> {
     Ok(())
 }
 
-fn stop_subscription_runtime(provider: AccountProvider) -> Result<()> {
+/// Why `worker enable` must not proceed, checked in this order; `None` when
+/// it may. Each check runs only when every earlier one passed.
+fn worker_enable_refusal(
+    provider: AccountProvider,
+    release_ships_workers: impl FnOnce() -> bool,
+    login_state: impl FnOnce() -> &'static str,
+    runtime_compatible: impl FnOnce() -> bool,
+) -> Option<&'static str> {
+    if provider != AccountProvider::Claude {
+        return Some(CODEX_WORKER_REFUSAL);
+    }
+    if !release_ships_workers() {
+        return Some("the active Core release does not ship the subscription worker units");
+    }
+    if login_state() != "connected" {
+        return Some(
+            "the Claude subscription is not connected; run `jarvis accounts connect claude` first",
+        );
+    }
+    if !runtime_compatible() {
+        return Some("the Claude runtime version is incompatible with the reviewed worker flags");
+    }
+    None
+}
+
+fn run_systemctl(args: &[&str]) -> Result<()> {
     validate_system_executable("/usr/bin/systemctl")?;
+    let result = Command::new("/usr/bin/systemctl")
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !result.success() {
+        bail!("systemctl {} failed", args.join(" "));
+    }
+    Ok(())
+}
+
+fn stop_subscription_runtime(provider: AccountProvider) -> Result<()> {
     for args in runtime_stop_commands(provider) {
-        let result = Command::new("/usr/bin/systemctl")
-            .args(*args)
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !result.success() {
-            bail!(
-                "{} runtime could not be stopped before logout",
-                provider.name()
-            );
-        }
+        run_systemctl(args)
+            .with_context(|| format!("{} runtime could not be stopped", provider.name()))?;
     }
     Ok(())
 }
@@ -939,6 +1022,73 @@ mod tests {
                 &["disable", "--now", "jarvis-codex.service"],
             ]
         );
+    }
+
+    #[test]
+    fn worker_enable_refuses_in_order_and_only_then_starts_the_socket() {
+        use AccountProvider::{Claude, Codex};
+        let never = || -> bool { panic!("checked after an earlier refusal") };
+        let never_state = || -> &'static str { panic!("checked after an earlier refusal") };
+        assert_eq!(
+            worker_enable_refusal(Codex, never, never_state, never),
+            Some(CODEX_WORKER_REFUSAL)
+        );
+        assert!(worker_enable_refusal(Claude, || false, never_state, never)
+            .unwrap()
+            .contains("does not ship"));
+        for state in [
+            "logged_out",
+            "wrong_auth_mode",
+            "incompatible_runtime",
+            "unhealthy",
+        ] {
+            assert!(worker_enable_refusal(Claude, || true, || state, never)
+                .unwrap()
+                .contains("not connected"));
+        }
+        assert!(
+            worker_enable_refusal(Claude, || true, || "connected", || false)
+                .unwrap()
+                .contains("incompatible")
+        );
+        assert_eq!(
+            worker_enable_refusal(Claude, || true, || "connected", || true),
+            None
+        );
+        assert_eq!(
+            CLAUDE_WORKER_ENABLE,
+            ["enable", "--now", "jarvis-claude.socket"]
+        );
+    }
+
+    #[test]
+    fn worker_commands_parse_for_both_providers() {
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            crate::Cli::try_parse_from(["jarvis", "accounts", "worker"].iter().chain(args)).map(
+                |cli| match cli.command {
+                    Some(crate::Commands::Accounts {
+                        command: AccountsCommand::Worker { command },
+                    }) => command,
+                    _ => panic!("not an accounts worker command"),
+                },
+            )
+        };
+        assert!(matches!(
+            parse(&["enable", "claude"]).unwrap(),
+            WorkerCommand::Enable {
+                provider: AccountProvider::Claude
+            }
+        ));
+        assert!(matches!(
+            parse(&["disable", "codex"]).unwrap(),
+            WorkerCommand::Disable {
+                provider: AccountProvider::Codex
+            }
+        ));
+        assert!(parse(&["enable"]).is_err());
+        assert!(parse(&["start", "claude"]).is_err());
+        assert!(parse(&["enable", "claude", "--yes"]).is_err());
     }
 
     #[test]

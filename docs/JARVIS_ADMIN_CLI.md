@@ -587,6 +587,23 @@ binary rollback. Power loss/SIGKILL recovery is likewise a local operator task;
 the controlled rollback tests cover reported activation failures, not arbitrary
 host/storage failure. Keep a separately verified owner backup before maintenance.
 
+### Subscription worker socket
+
+```bash
+sudo jarvis accounts worker enable claude
+sudo jarvis accounts worker disable claude
+```
+
+`enable` refuses unless the active release declares
+`tooling.subscription_workers = 1`, the Claude login is `connected` and the
+Claude runtime is inside the reviewed version contract; then it runs
+`systemctl enable --now jarvis-claude.socket`. Turn off extra usage on
+claude.ai (or set its limit to 0) first: Jarvis cannot verify that setting.
+`disable` disables the socket and stops active Claude runs; the login stays.
+Codex is refused. Core Admin's Accounts & keys page runs the same commands
+through `pkexec` under the `com.hawkeynl.jarvis.accounts` PolicyKit action
+(`auth_admin`, never `_keep`). See `docs/SUBSCRIPTION_WORKERS.md`.
+
 ### Local device administration
 
 Core Admin's Devices page uses local operating-system administrator authority,

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
-import { accountConfirm, keyConfirm, keyUseLabel } from "../src/components/accounts/accounts.ts";
+import { accountConfirm, keyConfirm, keyUseLabel, workerAction, workerConfirm } from "../src/components/accounts/accounts.ts";
 import { keyInUse, keyUse } from "../src/components/overview/needs.ts";
 
 const MODELS = [
@@ -53,6 +53,34 @@ test("connect, test and setting a missing key need no confirmation", () => {
   assert.equal(accountConfirm("claude", "Claude Code", "connect"), null);
   assert.equal(accountConfirm("codex", "Codex", "test"), null);
   assert.equal(keyConfirm("OpenAI", false), null);
+});
+
+test("the worker switch: enable only a connected Claude login whose socket is off", () => {
+  const row = (state, runtime, provider = "claude") => ({ provider, state, runtime });
+  assert.equal(workerAction(row("connected", "inactive")), "enable");
+  assert.equal(workerAction(row("connected", "socket_ready")), "disable");
+  assert.equal(workerAction(row("connected", "active")), "disable");
+  // A socket left up after a logout can still be switched off.
+  assert.equal(workerAction(row("logged_out", "socket_ready")), "disable");
+  assert.equal(workerAction(row("logged_out", "inactive")), null);
+  assert.equal(workerAction(row("incompatible_runtime", "inactive")), null);
+  assert.equal(workerAction(row("connected", "unavailable")), null);
+  assert.equal(workerAction(row("connected", "inactive", "codex")), null);
+  assert.equal(workerAction(row("connected", "active", "codex")), null);
+});
+
+test("enabling the worker warns about extra usage and names the CLI equivalent", () => {
+  const enable = workerConfirm("enable");
+  assert.equal(enable.tone, "danger");
+  assert.match(enable.detail, /extra usage on claude\.ai/);
+  assert.match(enable.detail, /limit to 0/);
+  assert.match(enable.detail, /cannot verify/);
+  assert.match(enable.detail, /sudo jarvis accounts worker enable claude/);
+  const disable = workerConfirm("disable");
+  assert.equal(disable.tone, "danger");
+  assert.equal(disable.confirmLabel, "Disable worker");
+  assert.match(disable.detail, /sudo jarvis accounts worker disable claude/);
+  assert.doesNotMatch(disable.detail, /terminal/);
 });
 
 // Secrets and logins go only through the trusted terminal. No .vue file may

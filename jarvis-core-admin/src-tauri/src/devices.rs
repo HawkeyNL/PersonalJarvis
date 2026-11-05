@@ -168,11 +168,24 @@ mod tests {
             policy
                 .matches("<allow_active>auth_admin</allow_active>")
                 .count(),
-            2
+            3
         );
         assert!(policy.contains(r#"<action id="com.hawkeynl.jarvis.core.migrate">"#));
+        let accounts = policy
+            .split(r#"<action id="com.hawkeynl.jarvis.accounts">"#)
+            .nth(1)
+            .and_then(|rest| rest.split("</action>").next())
+            .unwrap();
+        assert!(accounts.contains("<allow_active>auth_admin</allow_active>"));
+        assert!(accounts.contains("<allow_inactive>no</allow_inactive>"));
+        assert!(accounts.contains(
+            r#"<annotate key="org.freedesktop.policykit.exec.path">/usr/local/sbin/jarvis</annotate>"#
+        ));
+        assert!(accounts.contains(
+            r#"<annotate key="org.freedesktop.policykit.exec.argv1">accounts</annotate>"#
+        ));
         // pkexec expands this, so the dialog names the real command.
-        assert_eq!(policy.matches("$(command_line)</message>").count(), 2);
+        assert_eq!(policy.matches("$(command_line)</message>").count(), 3);
         assert!(!policy.contains("auth_admin_keep"));
     }
 }
