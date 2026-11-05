@@ -335,9 +335,9 @@ pub(super) async fn execute_chat(
     // model-selection prompt is substituted for the owner's request.
     let requirements = llm::classify_task(mode, &new_msg);
     let mut chat = llm::ChatRequest {
-        // Always the server persona plus live runtime facts; clients cannot
-        // replace it.
-        system: Some(super::runtime_facts::system_prompt(&state).await),
+        // Set below for every non-research turn: always the server persona
+        // plus live runtime facts; clients cannot replace it.
+        system: None,
         tier: requirements.tier,
         mode,
         messages,
@@ -365,6 +365,11 @@ pub(super) async fn execute_chat(
                 chat.provider = Some(provider);
             }
         }
+    }
+
+    // Built only on the paths that send it, after the early refusals.
+    if requested_mode != llm::RoutingMode::Research {
+        chat.system = Some(super::runtime_facts::system_prompt(&state).await);
     }
 
     let llm_started = Instant::now();

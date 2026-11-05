@@ -197,7 +197,8 @@ or a metered API) and contains exactly:
 - the names of the loaded private agents (never their instructions).
 
 It never contains tokens, account emails or ids, paths, socket names,
-hostnames or other secrets. A source that cannot be read (for example a
+hostnames or other secrets. Model ids and agent names are reduced to ASCII
+letters, digits and ` ._:/+-` (anything else becomes `?`). A source that cannot be read (for example a
 portfolio read that fails or takes longer than 2 seconds) is left out and the
 chat continues. The block is at most 2 KiB, one line per fact, and is cut
 deterministically at a whole line. Persona plus block stay at least 1 KiB

@@ -114,6 +114,10 @@ fn compose(persona: &str, facts: &Facts) -> String {
         .saturating_sub(persona.len() + 2);
     let block = render(facts, room.min(MAX_BYTES));
     if block.is_empty() {
+        tracing::debug!(
+            persona_bytes = persona.len(),
+            "runtime facts omitted: persona leaves no room"
+        );
         persona.to_string()
     } else {
         format!("{persona}\n\n{block}")
@@ -165,7 +169,7 @@ fn lines(facts: &Facts) -> Vec<String> {
                         (facts.allows)(&entry.provider, &entry.model)
                             && !routing.refuses_provider(&entry.provider)
                     })
-                    .map(|entry| format!("{}:{}", entry.provider, entry.model))
+                    .map(|entry| format!("{}:{}", safe(&entry.provider), safe(&entry.model)))
                     .collect();
                 if models.is_empty() {
                     "no allowed model".to_string()
@@ -209,16 +213,38 @@ fn lines(facts: &Facts) -> Vec<String> {
     lines.push(match &facts.agents {
         None => "Loaded agents: none (no agent bundle loaded).".into(),
         Some(names) if names.is_empty() => "Loaded agents: none.".into(),
-        Some(names) => format!("Loaded agents ({}): {}.", names.len(), names.join(", ")),
+        Some(names) => format!(
+            "Loaded agents ({}): {}.",
+            names.len(),
+            names
+                .iter()
+                .map(|name| safe(name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     });
     lines
 }
 
-/// One line, no control characters, at most [`MAX_LINE_BYTES`].
+/// An owner-configured value (model id, agent name) as plain ASCII: no
+/// control, bidi, zero-width or tag characters can reach the model.
+fn safe(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || " ._:/+-".contains(ch) {
+                ch
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// One line of at most [`MAX_LINE_BYTES`].
 fn clip(line: &str) -> String {
     let mut out = String::new();
     for ch in line.chars() {
-        let ch = if ch.is_control() { ' ' } else { ch };
         if out.len() + ch.len_utf8() > MAX_LINE_BYTES - '…'.len_utf8() {
             out.push('…');
             break;
@@ -344,6 +370,17 @@ mod tests {
     }
 
     #[test]
+    fn owner_values_are_reduced_to_plain_ascii() {
+        let routing = routing(PaidApi::Allowed);
+        let mut facts = facts(&routing, Ibkr::NotLinked);
+        facts.agents = Some(vec!["Re\u{202E}search\u{200B}x\u{E0041}é".into()]);
+        let block = render(&facts, MAX_BYTES);
+        assert!(block.contains("Loaded agents (1): Re?search?x??."));
+        assert!(!block.contains(['\u{202E}', '\u{200B}', '\u{E0041}']));
+        assert_eq!(safe("org/model-1.5:fast+x y_z"), "org/model-1.5:fast+x y_z");
+    }
+
+    #[test]
     fn truncation_is_deterministic_and_capped() {
         let routing = routing(PaidApi::Allowed);
         let mut many = facts(&routing, synced());
@@ -351,7 +388,7 @@ mod tests {
         let full = render(&many, MAX_BYTES);
         assert!(full.len() <= MAX_BYTES);
         let agents = full.lines().last().unwrap();
-        assert!(agents.starts_with("Loaded agents (200): Agent 000"));
+        assert!(agents.starts_with("Loaded agents (200): Agent?000"));
         assert!(agents.ends_with('…') && agents.len() <= MAX_LINE_BYTES);
         // A smaller cap keeps a prefix of the same lines, never a partial line.
         let small = render(&many, PREFACE.len() + 60);
