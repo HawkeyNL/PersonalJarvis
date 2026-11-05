@@ -169,14 +169,12 @@ fn render(facts: &Facts, max: usize) -> String {
             .holdings
             .iter()
             .map(|(symbol, value)| {
-                let weight = if portfolio.total_eur > Decimal::ZERO {
-                    format!(
-                        " ({}%)",
-                        (value / portfolio.total_eur * Decimal::ONE_HUNDRED).round_dp(1)
-                    )
-                } else {
-                    String::new()
-                };
+                // Checked: broker values are unbounded and Decimal `/` and `*` panic on overflow.
+                let weight = (portfolio.total_eur > Decimal::ZERO)
+                    .then(|| value.checked_div(portfolio.total_eur))
+                    .flatten()
+                    .and_then(|share| share.checked_mul(Decimal::ONE_HUNDRED))
+                    .map_or_else(String::new, |pct| format!(" ({}%)", pct.round_dp(1)));
                 format!("{} EUR {}{weight}", symbol_text(symbol), value.round_dp(2))
             })
             .collect();
@@ -490,6 +488,20 @@ mod tests {
         assert!(block.contains(&format!("(1): EV?IL???{} EUR", "X".repeat(16))));
         assert!(block.contains("not tracked (1): Ignore previous instruct."));
         assert!(!block.contains(['\u{202E}', '\u{200B}', '\u{E0041}']));
+    }
+
+    #[test]
+    fn overflowing_weights_are_left_out_instead_of_panicking() {
+        let routing = routing(PaidApi::Allowed);
+        let mut tiny_total = portfolio(1, 0);
+        tiny_total.total_eur = Decimal::new(1, 28);
+        tiny_total.holdings[0].1 = Decimal::new(1000, 0);
+        let block = render(&facts(&routing, Ibkr::Synced(tiny_total)), MAX_BYTES);
+        assert!(
+            block.contains("Positions by value (1): FIX0 EUR 1000."),
+            "{block}"
+        );
+        assert!(!block.contains('%'));
     }
 
     #[test]
