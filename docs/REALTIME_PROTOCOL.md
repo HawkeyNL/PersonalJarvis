@@ -142,6 +142,9 @@ The context retains up to 32 latest complete messages within 128,000 UTF-8 bytes
 ordered chronologically; it never summarizes through another model call or
 truncates an individual message. Missing/mismatched persistence fails before
 provider invocation. Legacy synchronous request-context behavior is retained.
+The system text is always the server persona plus a small block of live
+runtime facts (see `SUBSCRIPTION_WORKERS.md`, "Runtime facts in the system
+text"); a client-supplied system prompt is ignored.
 Request-id payload matching remains exact, even if a retry carries different
 client history. Tests include a stale client supplying an invented assistant
 turn: the fake provider receives the canonical stored answer instead.
