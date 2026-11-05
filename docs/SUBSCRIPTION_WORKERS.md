@@ -140,10 +140,29 @@ Neither worker owns a TCP listener.
 
 After a reviewed release is installed, the official CLI is verified and the
 owner has disabled extra usage or set its limit to zero in the Anthropic
-account, the owner can deliberately enable the local worker with
-`sudo systemctl enable --now jarvis-claude.socket`. The socket is never
-enabled by `accounts connect` or by a Core update. `sudo jarvis accounts
-status claude` reports login status, not a verified billing ceiling.
+account, the owner can deliberately enable the local worker. In Core Admin →
+Accounts & keys, the Claude card shows **Enable worker…** for a connected login
+whose socket is off and **Disable worker…** while the socket or a run is up.
+Both ask for confirmation, then for fresh administrator authorization
+(PolicyKit action `com.hawkeynl.jarvis.accounts`, `auth_admin`, never
+`_keep`). The CLI equivalents are:
+
+```sh
+sudo jarvis accounts worker enable claude
+sudo jarvis accounts worker disable claude
+```
+
+`worker enable` refuses, in this order, when the active release lacks
+`tooling.subscription_workers = 1`, the Claude login is not `connected`, or
+the Claude runtime is outside the reviewed version contract; then it runs
+`systemctl enable --now jarvis-claude.socket` and fails if the socket is still
+inactive. It cannot check the extra-usage setting: that stays the owner's
+responsibility. `worker disable` disables the socket and stops active Claude
+runs, like Disconnect, but keeps the login. Both are audited as
+`worker_enable`/`worker_disable`. Codex is refused; its chat worker is enabled
+as described below. The socket is never enabled by `accounts connect` or by a
+Core update. `sudo jarvis accounts status claude` reports login status, not a
+verified billing ceiling.
 Core uses a `claude-cli` model only when that exact pair is enabled in
 `policy.json`. `sudo jarvis models refresh claude-cli` records the configured
 Claude tier models (disabled); `sudo jarvis models register claude-cli <model>`

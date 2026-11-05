@@ -1,6 +1,6 @@
 // Accounts & keys: which actions ask first, and what a key's usage line says.
 // No Vue or Tauri imports, so `npm run test:unit` loads this file directly.
-import type { AiAccountAction, AiAccountProvider } from "../../admin";
+import type { AiAccountAction, AiAccountProvider, AiAccountRecord, AiWorkerAction } from "../../admin";
 import type { KeyUse } from "../overview/needs.ts";
 
 export interface ConfirmSpec { title: string; detail: string; confirmLabel: string; tone: "primary" | "danger" }
@@ -29,6 +29,37 @@ export function accountConfirm(provider: AiAccountProvider, label: string, actio
     };
   }
   return null;
+}
+
+/**
+ * The worker-socket action a subscription card offers: enable for a connected
+ * Claude login whose socket is off, disable while the socket or a run is up.
+ */
+export function workerAction(row: Pick<AiAccountRecord, "provider" | "state" | "runtime">): AiWorkerAction | null {
+  if (row.provider !== "claude") return null;
+  if (row.runtime === "socket_ready" || row.runtime === "active") return "disable";
+  if (row.state === "connected" && row.runtime === "inactive") return "enable";
+  return null;
+}
+
+const AUTHORIZE = "Your system asks for administrator authorization.";
+
+/** Both worker actions ask first; enabling is the one that can cost money. */
+export function workerConfirm(action: AiWorkerAction): ConfirmSpec {
+  if (action === "enable") {
+    return {
+      title: "Enable the Claude worker?",
+      detail: `Only continue if you turned off extra usage on claude.ai (or set its limit to 0). Jarvis cannot verify that setting; without it, Jarvis runs can be billed beyond your subscription. ${AUTHORIZE} The login and runtime are checked again before the worker socket starts. CLI equivalent: sudo jarvis accounts worker enable claude`,
+      confirmLabel: "Enable worker",
+      tone: "danger",
+    };
+  }
+  return {
+    title: "Disable the Claude worker?",
+    detail: `This disables the Claude worker socket and stops active Claude runs. The login stays connected. ${AUTHORIZE} CLI equivalent: sudo jarvis accounts worker disable claude`,
+    confirmLabel: "Disable worker",
+    tone: "danger",
+  };
 }
 
 /** Replacing a stored key asks first; setting a missing one does not. */

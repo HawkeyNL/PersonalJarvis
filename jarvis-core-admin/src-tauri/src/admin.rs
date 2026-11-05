@@ -585,6 +585,40 @@ impl AiAccountAction {
     }
 }
 
+/// Only the Claude worker socket is managed from the app.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AiWorkerProvider {
+    Claude,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AiWorkerAction {
+    Enable,
+    Disable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiWorkerRequest {
+    pub provider: AiWorkerProvider,
+    pub action: AiWorkerAction,
+}
+
+impl AiWorkerRequest {
+    fn arguments(self) -> Vec<&'static str> {
+        let action = match self.action {
+            AiWorkerAction::Enable => "enable",
+            AiWorkerAction::Disable => "disable",
+        };
+        let provider = match self.provider {
+            AiWorkerProvider::Claude => "claude",
+        };
+        vec![ADMIN, "accounts", "worker", action, provider]
+    }
+}
+
 /// Sanitized official Claude Code runtime state; versions are strict
 /// `MAJOR.MINOR.PATCH` and nothing else from the release service is kept.
 #[derive(Debug, Deserialize, Serialize)]
@@ -1573,6 +1607,27 @@ pub fn ai_account_entry(action: &OsStr, provider: &OsStr) -> AdminResult<()> {
     } else {
         Err("AI account operation did not complete".to_owned())
     }
+}
+
+/// Like `migrate`, never uses the retained broker grant: every change starts a
+/// fresh PolicyKit authentication (`auth_admin`, never `_keep`). The CLI runs
+/// the login, release and runtime checks before it touches the socket.
+pub fn ai_worker_action(
+    session: &SessionManager,
+    request: AiWorkerRequest,
+) -> AdminResult<OperationResult> {
+    root_guard()?;
+    session.require_active()?;
+    let args = request.arguments();
+    verify_root_executable(ADMIN)?;
+    devices::verify_installed_policy()?;
+    operation(
+        run_checked_command(PKEXEC, &args, Duration::from_secs(120))?,
+        match request.action {
+            AiWorkerAction::Enable => "Claude worker socket enabled",
+            AiWorkerAction::Disable => "Claude worker socket disabled",
+        },
+    )
 }
 
 pub fn credential_set(
@@ -2980,6 +3035,27 @@ mod tests {
             "\"access_token\":\"canary-secret\",\"runtime\"",
         );
         assert!(serde_json::from_str::<AiAccountRecord>(&with_token).is_err());
+    }
+
+    #[test]
+    fn ai_worker_action_runs_a_fixed_command_and_rejects_extra_fields() {
+        let request = |json: &str| serde_json::from_str::<AiWorkerRequest>(json);
+        assert_eq!(
+            request(r#"{"provider":"claude","action":"enable"}"#)
+                .unwrap()
+                .arguments(),
+            [ADMIN, "accounts", "worker", "enable", "claude"]
+        );
+        assert_eq!(
+            request(r#"{"provider":"claude","action":"disable"}"#)
+                .unwrap()
+                .arguments(),
+            [ADMIN, "accounts", "worker", "disable", "claude"]
+        );
+        assert!(request(r#"{"provider":"claude","action":"enable","password":"x"}"#).is_err());
+        assert!(request(r#"{"provider":"codex","action":"enable"}"#).is_err());
+        assert!(request(r#"{"provider":"claude","action":"restart"}"#).is_err());
+        assert!(request(r#"{"provider":"claude"}"#).is_err());
     }
 
     #[test]

@@ -179,6 +179,7 @@ export interface CredentialRecord { provider: CredentialProvider; configured: bo
 export const credentialLabels: Record<CredentialProvider, string> = { anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", xai: "xAI", zai: "Z.ai", "ollama-cloud": "Ollama Cloud", huggingface: "Hugging Face", jev: "TypeSafe Jev" };
 export type AiAccountProvider = "claude" | "codex";
 export type AiAccountAction = "connect" | "test" | "reconnect" | "disconnect";
+export type AiWorkerAction = "enable" | "disable";
 export const aiAccountLabels: Record<AiAccountProvider, string> = { claude: "Claude Code", codex: "Codex" };
 export interface AiAccountRecord {
   provider: AiAccountProvider;
@@ -309,6 +310,8 @@ export const api = {
   aiAccounts: () => invoke<AiAccountRecord[]>("ai_accounts"),
   aiAccountAction: (provider: AiAccountProvider, action: AiAccountAction) =>
     invoke<OperationResult>("ai_account_action", { provider, action }),
+  aiWorkerAction: (provider: "claude", action: AiWorkerAction) =>
+    invoke<OperationResult>("ai_worker_action", { request: { provider, action } }),
   claudeRuntime: () => invoke<ClaudeRuntimeStatus>("claude_runtime"),
   claudeRuntimeMutation: (request: ClaudeRuntimeMutation) =>
     invoke<OperationResult>("claude_runtime_mutation", { request }),

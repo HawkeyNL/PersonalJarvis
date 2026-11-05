@@ -309,6 +309,18 @@ async fn ai_account_action(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+async fn ai_worker_action(
+    session: tauri::State<'_, Arc<session::SessionManager>>,
+    request: admin::AiWorkerRequest,
+) -> Result<admin::OperationResult, String> {
+    with_session(session, move |session| {
+        admin::ai_worker_action(&session, request)
+    })
+    .await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 async fn credential_set(
     session: tauri::State<'_, Arc<session::SessionManager>>,
     provider: admin::CredentialProvider,
@@ -387,6 +399,7 @@ pub fn run() {
             credentials,
             ai_accounts,
             ai_account_action,
+            ai_worker_action,
             claude_runtime,
             claude_runtime_mutation,
             laya,
