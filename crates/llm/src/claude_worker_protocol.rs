@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 pub const SOCKET: &str = "/run/jarvis-claude.sock";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_REPLY_BYTES: usize = 256 * 1024;
+/// Longest system text a worker accepts. Core keeps persona plus runtime
+/// facts within it, so the whole request stays under [`MAX_REQUEST_BYTES`].
+pub const MAX_SYSTEM_BYTES: usize = 12 * 1024;
 /// Longest research prompt a worker accepts (the bounded question in UTF-8).
 pub const MAX_RESEARCH_PROMPT_BYTES: usize = 4 * crate::types::MAX_RESEARCH_QUESTION_CHARS;
 
@@ -77,7 +80,7 @@ impl ClaudeWorkerRequest {
             && self
                 .system
                 .as_deref()
-                .is_none_or(|value| value.len() <= 12 * 1024)
+                .is_none_or(|value| value.len() <= MAX_SYSTEM_BYTES)
             && valid_worker_model(&self.model)
     }
 }

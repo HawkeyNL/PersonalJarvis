@@ -70,7 +70,13 @@ impl LlmProvider for Fake {
         "fixture"
     }
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
-        assert_eq!(req.system.as_deref(), Some(JARVIS_SYSTEM_FALLBACK));
+        // The server persona plus live runtime facts; a client's own system
+        // prompt is dropped.
+        let system = req.system.as_deref().unwrap();
+        assert!(system.starts_with(JARVIS_SYSTEM_FALLBACK));
+        assert!(system.contains("\n\nRuntime facts: live facts about your own Jarvis setup"));
+        assert!(system.contains("Jarvis Core version: "));
+        assert!(!system.contains("CLIENT-SYSTEM-OVERRIDE"));
         self.1
             .lock()
             .unwrap()
@@ -513,7 +519,7 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
         "/v1/assistant/chat",
         json!({
             "messages":[{"role":"user","content":"Legacy client question"}],
-            "system":"X"
+            "system":"CLIENT-SYSTEM-OVERRIDE"
         }),
     )
     .await;

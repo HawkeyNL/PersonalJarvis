@@ -175,6 +175,37 @@ OpenSandbox workload, task-scoped proxy, repository snapshot authority and run
 lifecycle before that path can be activated. This missing execution layer does
 not block merging the fail-closed foundation.
 
+## Runtime facts in the system text
+
+On ordinary chat turns and orchestration calls, Core appends a short
+plain-text block of runtime facts to the persona, so the model can say
+truthfully which models and integrations it uses. The research path is
+unchanged: it still sends only the question and the fixed research prompt.
+The block goes to whichever provider answers the turn (a subscription worker
+or a metered API) and contains exactly:
+
+- the Core version;
+- whether paid APIs are on or off;
+- per tier (cheap, default, hard) the owner's routed `provider:model` chain in
+  order, limited to pairs `policy.json` enables (metered entries are left out
+  while paid APIs are off), or `built-in order` when the tier is not routed;
+- whether the `claude-cli` and `codex-cli` worker sockets exist (enabled or
+  not). Core cannot see account login status and says so;
+- whether IBKR portfolio sync is linked and, after a good sync, its time, the
+  number of positions, the number of non-EUR positions left out and the total
+  value in EUR. Never symbols, contract ids or per-position amounts;
+- the names of the loaded private agents (never their instructions).
+
+It never contains tokens, account emails or ids, paths, socket names,
+hostnames or other secrets. Model ids and agent names are reduced to ASCII
+letters, digits and ` ._:/+-` (anything else becomes `?`). A source that cannot be read (for example a
+portfolio read that fails or takes longer than 2 seconds) is left out and the
+chat continues. The block is at most 2 KiB, one line per fact, and is cut
+deterministically at a whole line. Persona plus block stay at least 1 KiB
+below the worker's 12 KiB system cap, leaving room for the orchestrator's role
+text; a persona too large for that gets no block. The whole worker request
+therefore stays within its 64 KiB limit.
+
 ## Installing the Claude Code runtime
 
 Core Admin → AI Accounts shows the installed Claude Code version, whether it

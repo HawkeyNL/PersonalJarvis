@@ -335,8 +335,9 @@ pub(super) async fn execute_chat(
     // model-selection prompt is substituted for the owner's request.
     let requirements = llm::classify_task(mode, &new_msg);
     let mut chat = llm::ChatRequest {
-        // Always the server persona; clients cannot replace it.
-        system: Some(state.jarvis_system.to_string()),
+        // Set below for every non-research turn: always the server persona
+        // plus live runtime facts; clients cannot replace it.
+        system: None,
         tier: requirements.tier,
         mode,
         messages,
@@ -364,6 +365,11 @@ pub(super) async fn execute_chat(
                 chat.provider = Some(provider);
             }
         }
+    }
+
+    // Built only on the paths that send it, after the early refusals.
+    if requested_mode != llm::RoutingMode::Research {
+        chat.system = Some(super::runtime_facts::system_prompt(&state).await);
     }
 
     let llm_started = Instant::now();
@@ -883,7 +889,8 @@ pub(crate) async fn assistant_orchestrate(
     if task.len() > validation::MAX_TASK_LEN {
         return Err(bad_request("task too long"));
     }
-    let result = orchestrator::plan_and_execute(&state.llm, task, &state.jarvis_system).await;
+    let system = super::runtime_facts::system_prompt(&state).await;
+    let result = orchestrator::plan_and_execute(&state.llm, task, &system).await;
     if let Err(error) = &result {
         record_failure(&state, None, error, Default::default()).await;
     }
