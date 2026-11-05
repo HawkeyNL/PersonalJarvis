@@ -192,16 +192,24 @@ or a metered API) and contains exactly:
 - whether the `claude-cli` and `codex-cli` worker sockets exist (enabled or
   not). Core cannot see account login status and says so;
 - whether IBKR portfolio sync is linked and, after a good sync, its time, the
-  number of positions, the number of non-EUR positions left out and the total
-  value in EUR. Never symbols, contract ids or per-position amounts;
-- the names of the loaded private agents (never their instructions).
+  number of EUR positions and the total value in EUR;
+- the names of the loaded private agents (never their instructions);
+- after a good IBKR sync, the EUR positions largest first, each as symbol,
+  market value in EUR and weight as a percentage of the total value, then the
+  symbols of the non-EUR positions the sync left out (names only; they have no
+  EUR value). Each list shows as many entries as fit and ends with "and K
+  more". Never contract ids (conids), account ids, quantities, prices, costs,
+  profit and loss or currencies.
 
 It never contains tokens, account emails or ids, paths, socket names,
-hostnames or other secrets. Model ids and agent names are reduced to ASCII
-letters, digits and ` ._:/+-` (anything else becomes `?`). A source that cannot be read (for example a
+hostnames or other secrets. Model ids, agent names and symbols are reduced to
+ASCII letters, digits and ` ._:/+-` (anything else becomes `?`); a symbol is
+cut to 24 characters. A source that cannot be read (for example a
 portfolio read that fails or takes longer than 2 seconds) is left out and the
 chat continues. The block is at most 2 KiB, one line per fact, and is cut
-deterministically at a whole line. Persona plus block stay at least 1 KiB
+deterministically at a whole line. The two position lists come last and only
+use the room the other lines leave (the EUR list at most 900 bytes), so they
+never push another fact out. Persona plus block stay at least 1 KiB
 below the worker's 12 KiB system cap, leaving room for the orchestrator's role
 text; a persona too large for that gets no block. The whole worker request
 therefore stays within its 64 KiB limit.
