@@ -123,7 +123,7 @@ expect_fail verify "$archive"
 cp -a "$fixture/good.tar" "$archive"
 # Always change the byte: it can already hold any value, so a fixed one flakes.
 byte=$(od -An -tu1 -j700 -N1 "$archive")
-printf "\\$(printf '%03o' $(( (byte + 1) % 256 )))" | dd of="$archive" bs=1 seek=700 conv=notrunc status=none
+printf '%b' "\\0$(printf '%03o' $(( (byte + 1) % 256 )))" | dd of="$archive" bs=1 seek=700 conv=notrunc status=none
 expect_fail verify "$archive"
 reshape() {
     cp -a "$fixture/good.tar" "$archive"
