@@ -59,7 +59,8 @@ provider secrets. It never passes `--bare`: bare mode reads only
 `ANTHROPIC_API_KEY` or an `apiKeyHelper` and never the subscription OAuth
 login. Instead `--restricted` ignores user, project and local settings files
 (so their hooks and plugins), `--strict-mcp-config` ignores every MCP
-configuration, `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` and
+configuration, `--disable-slash-commands` keeps a prompt that starts with `/`
+from running a skill or command, `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` and
 `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` turn off CLAUDE.md loading and
 auto-memory, and the CLI runs in the private `/run/jarvis-claude` directory.
 A failed run logs only its worker state and a fixed stage name (for example
@@ -445,7 +446,7 @@ invocation:
 ```text
 claude -p --output-format json --model <model> --restricted --strict-mcp-config
   --no-session-persistence --tools WebSearch --disallowedTools mcp__*
-  --allowedTools WebSearch --max-turns 8 [--system-prompt-file <private file>]
+  --disable-slash-commands --allowedTools WebSearch --max-turns 8 [--system-prompt-file <private file>]
 ```
 
 `--tools WebSearch` makes `WebSearch` the only built-in tool (the CLI
@@ -455,8 +456,8 @@ cannot show). `WebSearch` runs on Anthropic's web search backend and returns
 titles and URLs; it does not fetch pages (Claude Code tools reference,
 "WebSearch tool behavior"). `WebFetch`, which would fetch URLs from this host,
 stays unavailable: `--restricted` removes it unless `--tools` names it, and
-`--tools` does not. MCP stays denied and `--restricted`, `--strict-mcp-config`
-and `--no-session-persistence` stay. The CLI reference names no newer version
+`--tools` does not. MCP stays denied and `--restricted`, `--strict-mcp-config`,
+`--disable-slash-commands` and `--no-session-persistence` stay. The CLI reference names no newer version
 requirement for these flags, so the 2.1.248 gate is unchanged; a real research
 run has not been accepted on the Home Node yet.
 

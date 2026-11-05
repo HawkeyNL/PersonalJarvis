@@ -263,6 +263,7 @@ fn cli_args(model: &str, research: bool, system_prompt: Option<&Path>) -> Vec<Os
         tools,
         "--disallowedTools",
         "mcp__*",
+        "--disable-slash-commands",
     ]
     .map(OsString::from)
     .to_vec();
@@ -405,14 +406,14 @@ mod tests {
             argv(false, Some(prompt)),
             "-p --output-format json --model claude-opus-5 --restricted --strict-mcp-config \
              --no-session-persistence --tools  --disallowedTools mcp__* \
-             --system-prompt-file /run/jarvis-claude/.tmpX"
+             --disable-slash-commands --system-prompt-file /run/jarvis-claude/.tmpX"
         );
         assert_eq!(cli_args("m", false, None)[9], OsString::from(""));
         assert_eq!(
             argv(true, Some(prompt)),
             "-p --output-format json --model claude-opus-5 --restricted --strict-mcp-config \
              --no-session-persistence --tools WebSearch --disallowedTools mcp__* \
-             --allowedTools WebSearch --max-turns 8 \
+             --disable-slash-commands --allowedTools WebSearch --max-turns 8 \
              --system-prompt-file /run/jarvis-claude/.tmpX"
         );
         // Never the host-side fetch, never an MCP or command tool.
