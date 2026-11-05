@@ -281,9 +281,16 @@ pub(super) fn run(command: AccountsCommand, json: bool) -> Result<()> {
                 ) {
                     bail!(reason);
                 }
-                run_systemctl(&CLAUDE_WORKER_ENABLE)
-                    .context("Claude worker socket could not be enabled")?;
-                if runtime_state(provider) == "inactive" {
+                eprintln!(
+                    "Extra usage on the Claude account can be billed beyond the subscription; \
+                     Jarvis cannot verify that it is off."
+                );
+                let enabled = run_systemctl(&CLAUDE_WORKER_ENABLE)
+                    .context("Claude worker socket could not be enabled");
+                if enabled.is_err() || runtime_state(provider) == "inactive" {
+                    // Never leave a half-enabled socket that would start at the next boot.
+                    let _ = stop_subscription_runtime(provider);
+                    enabled?;
                     bail!("Claude worker socket is still inactive after enabling it");
                 }
                 println!("claude worker socket enabled");
