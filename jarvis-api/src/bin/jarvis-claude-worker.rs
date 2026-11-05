@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             let _ = send(
                 &mut stream,
-                ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure),
+                failed(ClaudeWorkerState::RuntimeFailure, "all run slots busy"),
             )
             .await;
             continue;
@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
         let research_permits = research_permits.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let failure = || ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure);
+            let failure = |stage| failed(ClaudeWorkerState::RuntimeFailure, stage);
             let reply =
                 match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request(&mut stream)).await {
                     Ok(Ok(request)) => match research_slot(request.research, &research_permits) {
@@ -88,13 +88,14 @@ async fn main() -> Result<()> {
                             let deadline = reply_deadline(request.research);
                             match tokio::time::timeout(deadline, handle(request)).await {
                                 Ok(Ok(reply)) => reply,
-                                _ => failure(),
+                                Ok(Err(_)) => failure("run I/O error"),
+                                Err(_) => failure("reply deadline"),
                             }
                         }
                         // The one research slot is busy: refuse, never queue.
-                        None => failure(),
+                        None => failure("research slot busy"),
                     },
-                    _ => failure(),
+                    _ => failure("invalid request"),
                 };
             let _ = send(&mut stream, reply).await;
         });
@@ -103,13 +104,15 @@ async fn main() -> Result<()> {
 
 async fn handle(request: ClaudeWorkerRequest) -> Result<ClaudeWorkerReply> {
     if !supported_runtime().await {
-        return Ok(ClaudeWorkerReply::failure(
+        return Ok(failed(
             ClaudeWorkerState::IncompatibleRuntime,
+            "version gate",
         ));
     }
     if !subscription_auth().await {
-        return Ok(ClaudeWorkerReply::failure(
+        return Ok(failed(
             ClaudeWorkerState::SubscriptionUnavailable,
+            "subscription auth check",
         ));
     }
     run_official_client(request).await
@@ -201,33 +204,50 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let mut child = command.spawn()?;
+    let Ok(mut child) = command.spawn() else {
+        return Ok(failed(ClaudeWorkerState::RuntimeFailure, "spawn"));
+    };
     let mut stdin = child.stdin.take().context("Claude stdin unavailable")?;
-    stdin.write_all(request.prompt.as_bytes()).await?;
+    if stdin.write_all(request.prompt.as_bytes()).await.is_err() {
+        return Ok(failed(ClaudeWorkerState::RuntimeFailure, "stdin write"));
+    }
     drop(stdin);
     let stdout = child.stdout.take().context("Claude stdout unavailable")?;
     let mut bytes = Vec::new();
-    let output = tokio::time::timeout(run_timeout(request.research), async {
+    let Ok(output) = tokio::time::timeout(run_timeout(request.research), async {
         stdout
             .take((MAX_REPLY_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .await?;
         child.wait().await
     })
-    .await??;
-    if bytes.len() > MAX_REPLY_BYTES || !output.success() {
-        return Ok(ClaudeWorkerReply::failure(
+    .await
+    else {
+        return Ok(failed(ClaudeWorkerState::RuntimeFailure, "run timeout"));
+    };
+    if bytes.len() > MAX_REPLY_BYTES {
+        return Ok(failed(
             ClaudeWorkerState::RuntimeFailure,
+            "oversized output",
         ));
+    }
+    if !output?.success() {
+        return Ok(failed(ClaudeWorkerState::RuntimeFailure, "non-zero exit"));
     }
     Ok(parse_cli_reply(&bytes))
 }
 
-/// The reviewed `claude -p` invocation: restricted, bare, no session, no MCP
-/// and no built-in tool. Only an owner-enabled research run gets exactly one
-/// tool: `WebSearch`, which runs on Anthropic's side and returns titles and
-/// URLs. `WebFetch` (a host-side fetch) stays unavailable: `--restricted`
-/// removes it unless `--tools` names it, and `--tools` names only WebSearch.
+/// The reviewed `claude -p` invocation: restricted, no session, no MCP and no
+/// built-in tool. Never `--bare`: it reads only `ANTHROPIC_API_KEY` or an
+/// `apiKeyHelper`, never the subscription OAuth login this worker exists for.
+/// What `--bare` skipped is covered by `--restricted` (user, project and local
+/// settings files, so their hooks and plugins), `--strict-mcp-config`, the
+/// environment of `clean_command` and the private working directory.
+///
+/// Only an owner-enabled research run gets exactly one tool: `WebSearch`,
+/// which runs on Anthropic's side and returns titles and URLs. `WebFetch` (a
+/// host-side fetch) stays unavailable: `--restricted` removes it unless
+/// `--tools` names it, and `--tools` names only WebSearch.
 fn cli_args(model: &str, research: bool, system_prompt: Option<&Path>) -> Vec<OsString> {
     let tools = if research { "WebSearch" } else { "" };
     let mut args: Vec<OsString> = [
@@ -237,7 +257,7 @@ fn cli_args(model: &str, research: bool, system_prompt: Option<&Path>) -> Vec<Os
         "--model",
         model,
         "--restricted",
-        "--bare",
+        "--strict-mcp-config",
         "--no-session-persistence",
         "--tools",
         tools,
@@ -266,20 +286,23 @@ fn cli_args(model: &str, research: bool, system_prompt: Option<&Path>) -> Vec<Os
 
 fn parse_cli_reply(bytes: &[u8]) -> ClaudeWorkerReply {
     let Ok(parsed) = serde_json::from_slice::<CliResult>(bytes) else {
-        return ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure);
+        return failed(ClaudeWorkerState::RuntimeFailure, "unparseable output");
     };
     if parsed.is_error {
         let category = format!("{} {}", parsed.subtype, parsed.result).to_ascii_lowercase();
-        return ClaudeWorkerReply::failure(
-            if category.contains("limit") || category.contains("rate") {
-                ClaudeWorkerState::PlanLimit
-            } else {
-                ClaudeWorkerState::RuntimeFailure
-            },
-        );
+        let state = if category.contains("limit") || category.contains("rate") {
+            ClaudeWorkerState::PlanLimit
+        } else {
+            ClaudeWorkerState::RuntimeFailure
+        };
+        // Only a short machine subtype; never the result text.
+        let subtype = Some(parsed.subtype.as_str())
+            .filter(|s| s.len() <= 40 && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+            .unwrap_or("other");
+        return failed(state, &format!("is_error subtype {subtype}"));
     }
     if parsed.result.trim().is_empty() {
-        return ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure);
+        return failed(ClaudeWorkerState::RuntimeFailure, "empty result");
     }
     ClaudeWorkerReply {
         protocol: 1,
@@ -290,6 +313,13 @@ fn parse_cli_reply(bytes: &[u8]) -> ClaudeWorkerReply {
         cache_read_tokens: parsed.usage.as_ref().map(|u| u.cache_read_input_tokens),
         cache_write_tokens: parsed.usage.as_ref().map(|u| u.cache_creation_input_tokens),
     }
+}
+
+/// A failure reply, logged to the journal by state and fixed stage only:
+/// never prompt, system prompt, reply text, account data or CLI stderr.
+fn failed(state: ClaudeWorkerState, stage: &str) -> ClaudeWorkerReply {
+    eprintln!("Claude run failed: {state:?} at {stage}");
+    ClaudeWorkerReply::failure(state)
 }
 
 fn clean_command() -> Command {
@@ -305,7 +335,13 @@ fn clean_command() -> Command {
         // Only the root-installed runtime may run; never self-update into HOME.
         .env("DISABLE_UPDATES", "1")
         .env("DISABLE_AUTOUPDATER", "1")
-        .current_dir(HOME);
+        // What `--bare` used to skip: no CLAUDE.md (user or project) and no
+        // auto-memory. Not CLAUDE_CODE_SIMPLE: that is `--bare` itself.
+        .env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1")
+        .env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
+        // The private runtime directory holds no CLAUDE.md or `.claude/`,
+        // nor do its root-owned parents; HOME is the CLI's own config home.
+        .current_dir(RUNTIME);
     command
 }
 
@@ -340,7 +376,18 @@ mod tests {
             .collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(environment.get("DISABLE_UPDATES"), Some(&Some("1")));
         assert_eq!(environment.get("DISABLE_AUTOUPDATER"), Some(&Some("1")));
+        assert_eq!(
+            environment.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS"),
+            Some(&Some("1"))
+        );
+        assert_eq!(
+            environment.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY"),
+            Some(&Some("1"))
+        );
         assert!(!environment.contains_key("ANTHROPIC_API_KEY"));
+        // CLAUDE_CODE_SIMPLE is `--bare`, which never reads the OAuth login.
+        assert!(!environment.contains_key("CLAUDE_CODE_SIMPLE"));
+        assert_eq!(command.as_std().get_current_dir(), Some(Path::new(RUNTIME)));
     }
 
     fn argv(research: bool, system_prompt: Option<&Path>) -> String {
@@ -356,14 +403,14 @@ mod tests {
         let prompt = Path::new("/run/jarvis-claude/.tmpX");
         assert_eq!(
             argv(false, Some(prompt)),
-            "-p --output-format json --model claude-opus-5 --restricted --bare \
+            "-p --output-format json --model claude-opus-5 --restricted --strict-mcp-config \
              --no-session-persistence --tools  --disallowedTools mcp__* \
              --system-prompt-file /run/jarvis-claude/.tmpX"
         );
         assert_eq!(cli_args("m", false, None)[9], OsString::from(""));
         assert_eq!(
             argv(true, Some(prompt)),
-            "-p --output-format json --model claude-opus-5 --restricted --bare \
+            "-p --output-format json --model claude-opus-5 --restricted --strict-mcp-config \
              --no-session-persistence --tools WebSearch --disallowedTools mcp__* \
              --allowedTools WebSearch --max-turns 8 \
              --system-prompt-file /run/jarvis-claude/.tmpX"
@@ -372,6 +419,7 @@ mod tests {
         for research in [false, true] {
             let args = argv(research, None);
             for forbidden in [
+                "--bare",
                 "WebFetch",
                 "Bash",
                 "default",

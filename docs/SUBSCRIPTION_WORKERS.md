@@ -55,8 +55,17 @@ over `/run/jarvis-claude.sock`. The root-owned socket grants access only to the
 `jarvis` group, and the worker checks the peer UID. The worker executes the
 official CLI as `jarvis-claude` with a clean environment, no inherited
 `ANTHROPIC_API_KEY`, restricted mode, built-in and MCP tools denied, no session persistence and no access to Core's
-provider secrets. A system prompt is placed in a private temporary file, not
-in process arguments. The worker returns only a typed answer, token counts or
+provider secrets. It never passes `--bare`: bare mode reads only
+`ANTHROPIC_API_KEY` or an `apiKeyHelper` and never the subscription OAuth
+login. Instead `--restricted` ignores user, project and local settings files
+(so their hooks and plugins), `--strict-mcp-config` ignores every MCP
+configuration, `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` and
+`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` turn off CLAUDE.md loading and
+auto-memory, and the CLI runs in the private `/run/jarvis-claude` directory.
+A failed run logs only its worker state and a fixed stage name (for example
+`version gate` or `non-zero exit`) to the journal, never prompt, reply,
+account data or CLI output. A system prompt is placed in a private temporary
+file, not in process arguments. The worker returns only a typed answer, token counts or
 a safe unavailable/plan-limit state. Claude runs are classified as
 `subscription`, not metered API calls; explicit `claude-cli` selection cannot
 silently fall back to paid Anthropic API credit. The normal Auto router may
@@ -434,7 +443,7 @@ workers run exactly as described above, with every tool off.
 invocation:
 
 ```text
-claude -p --output-format json --model <model> --restricted --bare
+claude -p --output-format json --model <model> --restricted --strict-mcp-config
   --no-session-persistence --tools WebSearch --disallowedTools mcp__*
   --allowedTools WebSearch --max-turns 8 [--system-prompt-file <private file>]
 ```
@@ -446,8 +455,8 @@ cannot show). `WebSearch` runs on Anthropic's web search backend and returns
 titles and URLs; it does not fetch pages (Claude Code tools reference,
 "WebSearch tool behavior"). `WebFetch`, which would fetch URLs from this host,
 stays unavailable: `--restricted` removes it unless `--tools` names it, and
-`--tools` does not. MCP stays denied and `--bare`, `--restricted` and
-`--no-session-persistence` stay. The CLI reference names no newer version
+`--tools` does not. MCP stays denied and `--restricted`, `--strict-mcp-config`
+and `--no-session-persistence` stay. The CLI reference names no newer version
 requirement for these flags, so the 2.1.248 gate is unchanged; a real research
 run has not been accepted on the Home Node yet.
 
