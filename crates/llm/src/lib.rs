@@ -60,6 +60,11 @@ pub trait LlmProvider: Send + Sync {
     fn can_serve_tier(&self, _tier: Tier) -> bool {
         true
     }
+    /// Read-only hint: would [`LlmProvider::research`] have a backend to try
+    /// right now? Only the router knows the owner's switch, so default no.
+    fn can_research(&self) -> bool {
+        false
+    }
     /// Generate a reply for the conversation at the requested tier.
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError>;
     /// Only user-visible assistant text may reach this callback. Providers

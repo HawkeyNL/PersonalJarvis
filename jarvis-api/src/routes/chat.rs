@@ -467,11 +467,17 @@ pub(super) async fn execute_chat(
             .await
             .map_err(|_| internal_error())?;
             if let Some(run) = &realtime_run {
+                let research_offer = crate::intent::research_offer(
+                    intent_kind,
+                    || state.llm.can_research(),
+                    &new_msg,
+                );
                 state.realtime.publish(
                     authed.user.id,
                     Event::AssistantCompleted {
                         run: run.clone(),
                         message,
+                        research_offer,
                     },
                 );
                 state.realtime.publish(
@@ -508,6 +514,7 @@ pub(super) async fn execute_chat(
                     Event::AssistantCompleted {
                         run: run.clone(),
                         message,
+                        research_offer: None,
                     },
                 );
             }

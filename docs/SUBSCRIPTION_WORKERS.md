@@ -186,6 +186,8 @@ or a metered API) and contains exactly:
 
 - the Core version;
 - whether paid APIs are on or off;
+- whether web search is available (only through an owner-started Research
+  run) and that the chat itself has no tools, MCP servers or web access;
 - per tier (cheap, default, hard) the owner's routed `provider:model` chain in
   order, limited to pairs `policy.json` enables (metered entries are left out
   while paid APIs are off), or `built-in order` when the tier is not routed;

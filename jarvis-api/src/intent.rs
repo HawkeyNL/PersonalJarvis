@@ -4,6 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use jarvis_client_core::realtime::ResearchOffer;
 use reqwest::{redirect::Policy, Client, Url};
 use serde::Deserialize;
 use serde_json::json;
@@ -74,6 +75,23 @@ pub(crate) fn route_mode(
         Some(WorkKind::Coding | WorkKind::ActionRequest) => RoutingMode::Deep,
         Some(WorkKind::Conversation) | None => RoutingMode::Auto,
     }
+}
+
+/// Research advice never searches by itself: it only lets the app offer the
+/// owner a click that sends this question as a new explicit Research run.
+/// No offer when that run could not start (switch off, no subscription, or a
+/// question Research would refuse).
+pub(crate) fn research_offer(
+    kind: Option<WorkKind>,
+    can_research: impl FnOnce() -> bool,
+    question: &str,
+) -> Option<ResearchOffer> {
+    (kind == Some(WorkKind::Research) && can_research())
+        .then(|| jarvis_llm::ResearchRequest::new(question))
+        .flatten()
+        .map(|request| ResearchOffer {
+            question: request.question().to_owned(),
+        })
 }
 
 /// A pinned owner brain is an explicit choice, not an Auto-routing hint.
@@ -1117,6 +1135,18 @@ mod tests {
             ),
             RoutingMode::Deep,
         );
+    }
+
+    #[test]
+    fn only_research_advice_with_a_usable_research_path_offers_a_search() {
+        let offer = research_offer(Some(WorkKind::Research), || true, "  weer morgen?  ");
+        assert_eq!(offer.unwrap().question, "weer morgen?");
+        assert!(research_offer(Some(WorkKind::Research), || false, "weer?").is_none());
+        assert!(research_offer(Some(WorkKind::Coding), || true, "weer?").is_none());
+        assert!(research_offer(None, || unreachable!(), "weer?").is_none());
+        let too_long = "x".repeat(jarvis_llm::MAX_RESEARCH_QUESTION_CHARS + 1);
+        assert!(research_offer(Some(WorkKind::Research), || true, &too_long).is_none());
+        assert!(research_offer(Some(WorkKind::Research), || true, "   ").is_none());
     }
 
     #[test]

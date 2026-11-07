@@ -458,6 +458,20 @@ impl LlmProvider for RouterProvider {
             })
     }
 
+    /// Mirrors the checks in [`Self::research`] without starting a run.
+    fn can_research(&self) -> bool {
+        self.routing.snapshot().research_web_search_on()
+            && self
+                .plan(Tier::Hard, true, None)
+                .iter()
+                .any(|(candidate, pinned)| {
+                    crate::routing::is_subscription_backend(&candidate.id)
+                        && self
+                            .choose_model(&candidate.id, pinned.as_deref(), None, Tier::Hard)
+                            .is_some()
+                })
+    }
+
     async fn chat_stream(
         &self,
         req: &ChatRequest,
@@ -1615,6 +1629,7 @@ mod tests {
             r#"{"version":1,"research_web_search":"off"}"#,
         ] {
             let f = research_fleet(raw, &[]);
+            assert!(!f.router.can_research(), "{raw}");
             let error = f.router.research(&question()).await.unwrap_err();
             assert!(matches!(error, LlmError::NotConfigured(_)), "{raw}");
             assert_eq!(research_calls(&f), [0, 0, 0, 0]);
@@ -1627,6 +1642,7 @@ mod tests {
             always_available(),
             &[],
         );
+        assert!(!f.router.can_research());
         assert!(f.router.research(&question()).await.is_err());
         assert_eq!(research_calls(&f), [0, 0, 0, 0]);
     }
@@ -1642,6 +1658,7 @@ mod tests {
                 {"provider":"claude-cli","model":"claude-opus-5"}]}}}"#,
             &[],
         );
+        assert!(f.router.can_research());
         let reply = f.router.research(&question()).await.unwrap();
         assert_eq!(
             (reply.text.as_str(), reply.model.as_str()),
@@ -1666,6 +1683,7 @@ mod tests {
                 {"provider":"anthropic-api","model":"claude-opus-5"}]}}}"#,
             &[],
         );
+        assert!(!f.router.can_research());
         assert!(matches!(
             f.router.research(&question()).await,
             Err(LlmError::NotConfigured(_))
@@ -1691,6 +1709,7 @@ mod tests {
             always_available(),
             &[],
         );
+        assert!(!f.router.can_research());
         assert!(f.router.research(&question()).await.is_err());
         assert_eq!(research_calls(&f), [0, 0, 0, 0]);
     }

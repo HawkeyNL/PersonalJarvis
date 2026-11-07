@@ -255,7 +255,12 @@ change it restarts Core.
 
 When it is on, only a request with the explicit mode `research` searches. A
 classifier that guesses "research" for an Auto request does not: that request
-stays an ordinary hard-tier answer without tools. A research request:
+stays an ordinary hard-tier answer without tools. Its `assistant.completed`
+event then carries a `research_offer` with the owner's question (only when a
+research run could start now, see
+[REALTIME_PROTOCOL.md](REALTIME_PROTOCOL.md)); the app shows a button, and
+only the owner's click sends that question as a new `research` request. A
+research request:
 
 - sends **only the latest user question** (trimmed, at most 2000 characters;
   a longer question is refused, never cut) with a fixed research instruction
