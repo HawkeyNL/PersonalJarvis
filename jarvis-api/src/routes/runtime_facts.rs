@@ -242,7 +242,7 @@ fn lines(facts: &Facts) -> Vec<String> {
             "Web search: {}. This chat has no tools, MCP servers or web access: \
              never claim to look something up or guess current facts.",
             if facts.research {
-                "available only when the owner picks Research or clicks the search offer under a reply"
+                "available only through an owner-started Research run, such as a search offer the app shows under a reply"
             } else {
                 "not available"
             }
@@ -437,7 +437,7 @@ mod tests {
         for expected in [
             "Jarvis Core version: 9.8.7.",
             "Paid APIs: on.",
-            "Web search: available only when the owner picks Research",
+            "Web search: available only through an owner-started Research run",
             "This chat has no tools, MCP servers or web access",
             "Model chain for tier cheap: built-in order.",
             "Model chain for tier default: claude-cli:claude-sonnet-fixture > codex-cli:gpt-fixture.",
