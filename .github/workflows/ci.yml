@@ -130,8 +130,19 @@ jobs:
         # (via surrealdb's tokio-tungstenite) that re-exports webpki-roots 1.x.
         # The guard allows only that shim and patched 1.x; it also fails when
         # webpki-roots leaves the lockfile, so the exception gets removed.
+        # RUSTSEC-2026-0453/0454 (surrealdb 2.x local engine, reblessive) expire
+        # early; see security/DEPENDENCY_EXCEPTIONS.md for the conditions.
         run: |
           test "$(date -u +%F)" \< "2026-12-31"
+          test "$(date -u +%F)" \< "2026-12-07"
+          if grep -q '^name = "affinitypool"$' Cargo.lock; then
+            echo "affinitypool is locked: the RUSTSEC-2026-0453 exception no longer holds" >&2
+            exit 1
+          fi
+          if ! grep -qxF 'surrealdb = { version = "2.6.5", default-features = false, features = ["protocol-ws", "rustls"] }' Cargo.toml; then
+            echo "surrealdb changed: re-review RUSTSEC-2026-0453/0454" >&2
+            exit 1
+          fi
           versions=$(grep -A1 '^name = "webpki-roots"$' Cargo.lock | grep '^version')
           if grep -Evq '^version = "(0\.26\.11|1\.0\.[1-9][0-9]+|1\.[1-9][0-9]*\.[0-9]+)"$' <<< "$versions"; then
             echo "webpki-roots outside the RUSTSEC-2026-0381 exception" >&2
