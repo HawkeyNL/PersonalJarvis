@@ -69,6 +69,9 @@ impl LlmProvider for Fake {
     fn label(&self) -> &str {
         "fixture"
     }
+    fn can_research(&self) -> bool {
+        true
+    }
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
         // The server persona plus live runtime facts; a client's own system
         // prompt is dropped.
@@ -359,8 +362,15 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
             assert!(started, "delta must follow assistant.started");
             streamed.push_str(text);
         }
-        if let Event::AssistantCompleted { message, .. } = first.event {
+        if let Event::AssistantCompleted {
+            message,
+            research_offer,
+            ..
+        } = first.event
+        {
             assert!(started, "completion must follow assistant.started");
+            // FakeJev advises research: offered, never searched (one inference).
+            assert_eq!(research_offer.unwrap().question, "One question");
             break message;
         }
     };

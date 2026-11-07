@@ -63,7 +63,7 @@ impl VoiceGate {
                     .map(SpeechAction::Speak)
                     .collect()
             }
-            Event::AssistantCompleted { run, message }
+            Event::AssistantCompleted { run, message, .. }
                 if self.enabled
                     && self.owner == Some(self.device)
                     && self.owner_run == Some(run.run_id) =>
@@ -246,6 +246,7 @@ mod tests {
                 model: None,
                 created_at: time::OffsetDateTime::UNIX_EPOCH,
             },
+            research_offer: None,
         }
     }
     fn enabled_gate(run: &RunIdentity) -> VoiceGate {

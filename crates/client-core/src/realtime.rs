@@ -62,6 +62,12 @@ pub struct RunIdentity {
     pub conversation_id: Uuid,
 }
 
+/// The owner's own latest question, as the app would send it to Research.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchOffer {
+    pub question: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum Event {
@@ -86,6 +92,10 @@ pub enum Event {
     AssistantCompleted {
         run: RunIdentity,
         message: CanonicalMessage,
+        /// Advisory only: the app may offer a web search, and only the owner's
+        /// click sends a new explicit Research run. Absent for older Cores.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        research_offer: Option<ResearchOffer>,
     },
     #[serde(rename = "assistant.failed")]
     AssistantFailed {
@@ -226,5 +236,42 @@ mod tests {
         assert!(!cursor.accept(&event));
         event.protocol = 99;
         assert!(!cursor.accept(&event));
+    }
+
+    #[test]
+    fn research_offer_is_optional_on_the_wire() {
+        let id = Uuid::nil();
+        let mut completed = Event::AssistantCompleted {
+            run: RunIdentity {
+                run_id: id,
+                request_id: id,
+                conversation_id: id,
+            },
+            message: CanonicalMessage {
+                id,
+                conversation_id: id,
+                role: MessageRole::Assistant,
+                content: "hi".into(),
+                model: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            research_offer: None,
+        };
+        // Without an offer the payload keeps the old shape, so old payloads decode.
+        let old = serde_json::to_value(&completed).unwrap();
+        assert!(old["payload"].get("research_offer").is_none());
+        assert_eq!(serde_json::from_value::<Event>(old).unwrap(), completed);
+
+        if let Event::AssistantCompleted { research_offer, .. } = &mut completed {
+            *research_offer = Some(ResearchOffer {
+                question: "weather in Utrecht?".into(),
+            });
+        }
+        let new = serde_json::to_value(&completed).unwrap();
+        assert_eq!(
+            new["payload"]["research_offer"]["question"],
+            "weather in Utrecht?"
+        );
+        assert_eq!(serde_json::from_value::<Event>(new).unwrap(), completed);
     }
 }

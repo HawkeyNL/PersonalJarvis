@@ -58,6 +58,8 @@ pub(super) struct Facts<'a> {
     pub allows: &'a dyn Fn(&str, &str) -> bool,
     pub claude_worker: bool,
     pub codex_worker: bool,
+    /// Whether an owner-started Research run could search the web now.
+    pub research: bool,
     /// `None` when no agent bundle is loaded.
     pub agents: Option<Vec<String>>,
     pub ibkr: Ibkr,
@@ -76,6 +78,7 @@ pub(super) async fn system_prompt(state: &AppState) -> String {
         allows: &allows,
         claude_worker,
         codex_worker,
+        research: state.llm.can_research(),
         agents: state.agent_registry.as_deref().map(|loader| {
             let snapshot = loader.snapshot();
             snapshot
@@ -235,6 +238,15 @@ fn lines(facts: &Facts) -> Vec<String> {
             "Paid APIs: {}.",
             if routing.paid_api_off() { "off" } else { "on" }
         ),
+        format!(
+            "Web search: {}. This chat has no tools, MCP servers or web access: \
+             never claim to look something up or guess current facts.",
+            if facts.research {
+                "available only through an owner-started Research run, such as a search offer the app shows under a reply"
+            } else {
+                "not available"
+            }
+        ),
     ];
     for (name, tier) in [
         ("cheap", Tier::Cheap),
@@ -387,6 +399,7 @@ mod tests {
             allows: &allows,
             claude_worker: true,
             codex_worker: false,
+            research: true,
             agents: Some(vec!["Research".into(), "Trading".into()]),
             ibkr,
         }
@@ -424,6 +437,8 @@ mod tests {
         for expected in [
             "Jarvis Core version: 9.8.7.",
             "Paid APIs: on.",
+            "Web search: available only through an owner-started Research run",
+            "This chat has no tools, MCP servers or web access",
             "Model chain for tier cheap: built-in order.",
             "Model chain for tier default: claude-cli:claude-sonnet-fixture > codex-cli:gpt-fixture.",
             "Model chain for tier hard: anthropic-api:claude-opus-fixture > claude-cli:claude-opus-fixture.",
@@ -444,8 +459,15 @@ mod tests {
     #[test]
     fn paid_api_off_drops_metered_entries_and_failed_reads_are_omitted() {
         let routing = routing(PaidApi::Off);
-        let block = render(&facts(&routing, Ibkr::Linked), MAX_BYTES);
+        let block = render(
+            &Facts {
+                research: false,
+                ..facts(&routing, Ibkr::Linked)
+            },
+            MAX_BYTES,
+        );
         assert!(block.contains("Paid APIs: off."));
+        assert!(block.contains("Web search: not available. This chat has no tools"));
         assert!(block.contains("Model chain for tier hard: claude-cli:claude-opus-fixture."));
         assert!(block.contains("IBKR: linked.\n"));
         assert!(!block.contains("portfolio"));

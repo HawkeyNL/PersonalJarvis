@@ -48,7 +48,12 @@ Public events:
 - `message.created` with canonical message and originating request ID
 - `assistant.started` with run/request/conversation IDs
 - `assistant.delta` with run identity and public assistant text only
-- `assistant.completed` with the canonical persisted assistant message
+- `assistant.completed` with the canonical persisted assistant message and,
+  only when the intent classifier advised research and an owner-started
+  research run could start now, `research_offer: {"question": "..."}`: the
+  owner's own latest question, trimmed. It is advisory and not stored. Core
+  never searches on it; an app may show a button whose click sends exactly
+  that question as a new run with `"mode": "research"`. Older apps ignore it.
 - `assistant.failed` with a fixed safe reason code
 - `voice.owner_changed`, `voice.started`, `voice.stopped`, `voice.failed`
 
