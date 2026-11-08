@@ -547,6 +547,8 @@ const RESEARCH_OFF: &str = "Research is off. The owner can turn on web search wi
 `sudo jarvis models route research-web-search on` or in Core Admin (Model routing).";
 const RESEARCH_UNAVAILABLE: &str = "Research is unavailable right now: no enabled \
 subscription (claude-cli or codex-cli) could run the question. No paid API was used.";
+const RESEARCH_EMPTY: &str = "The web search returned no usable answer. \
+Ask again or rephrase the question.";
 /// Longest research answer, in characters, that is stored.
 const MAX_RESEARCH_ANSWER_CHARS: usize = 12_000;
 
@@ -659,10 +661,19 @@ async fn research_reply(
         ));
     };
     match brain.research(&request).await {
-        Ok(reply) => llm::ChatReply {
-            text: clean_research_text(&reply.text),
-            ..reply
-        },
+        // The run happened: its model and usage stay for metering, only an
+        // answer that the cleanup emptied becomes a fixed text.
+        Ok(reply) => {
+            let text = clean_research_text(&reply.text);
+            llm::ChatReply {
+                text: if text.trim().is_empty() {
+                    RESEARCH_EMPTY.into()
+                } else {
+                    text
+                },
+                ..reply
+            }
+        }
         Err(error) => {
             tracing::warn!(failure = ?error.failure_category(), "research unavailable");
             notice(RESEARCH_UNAVAILABLE.into())
@@ -1032,6 +1043,7 @@ mod tests {
     struct Recorder {
         seen: Mutex<Vec<String>>,
         fail: bool,
+        answer: Option<&'static str>,
     }
 
     #[async_trait::async_trait]
@@ -1051,7 +1063,10 @@ mod tests {
                 return Err(llm::LlmError::NotConfigured("no subscription".into()));
             }
             Ok(llm::ChatReply {
-                text: "Answer\nSources:\nhttps://example.org/a".into(),
+                text: self
+                    .answer
+                    .unwrap_or("Answer\nSources:\nhttps://example.org/a")
+                    .into(),
                 model: "claude-opus-5".into(),
                 backend: Some("claude-cli".into()),
                 requested_route: None,
@@ -1130,6 +1145,18 @@ mod tests {
         );
         let off = research_reply(&llm::RoutingSnapshot::default(), &Recorder::default(), "x").await;
         assert_eq!(stored_model(research, &off), "research");
+    }
+
+    #[tokio::test]
+    async fn research_answer_emptied_by_cleanup_is_a_fixed_text() {
+        let brain = Recorder {
+            answer: Some(" ![](https://x.example/t.gif) \n"),
+            ..Default::default()
+        };
+        let on = routing(r#"{"version":1,"research_web_search":"on"}"#);
+        let reply = research_reply(&on, &brain, "nieuws?").await;
+        assert_eq!(reply.text, RESEARCH_EMPTY);
+        assert_eq!(reply.model, "claude-opus-5");
     }
 
     #[test]
