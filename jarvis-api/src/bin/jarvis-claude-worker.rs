@@ -340,6 +340,9 @@ fn clean_command() -> Command {
         // auto-memory. Not CLAUDE_CODE_SIMPLE: that is `--bare` itself.
         .env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1")
         .env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
+        // Belt and braces: WebFetch is never in `--tools` either. A research
+        // run searches; it never fetches a page a result points at.
+        .env("CLAUDE_CODE_DISABLE_WEB_FETCH", "1")
         // The private runtime directory holds no CLAUDE.md or `.claude/`,
         // nor do its root-owned parents; HOME is the CLI's own config home.
         .current_dir(RUNTIME);
@@ -383,6 +386,10 @@ mod tests {
         );
         assert_eq!(
             environment.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY"),
+            Some(&Some("1"))
+        );
+        assert_eq!(
+            environment.get("CLAUDE_CODE_DISABLE_WEB_FETCH"),
             Some(&Some("1"))
         );
         assert!(!environment.contains_key("ANTHROPIC_API_KEY"));

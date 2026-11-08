@@ -462,7 +462,7 @@ pub(super) async fn execute_chat(
                 authed.user.id,
                 "assistant",
                 &reply.text,
-                Some(reply.model.as_str()),
+                Some(stored_model(requested_mode, &reply).as_str()),
             )
             .await
             .map_err(|_| internal_error())?;
@@ -547,6 +547,90 @@ const RESEARCH_OFF: &str = "Research is off. The owner can turn on web search wi
 `sudo jarvis models route research-web-search on` or in Core Admin (Model routing).";
 const RESEARCH_UNAVAILABLE: &str = "Research is unavailable right now: no enabled \
 subscription (claude-cli or codex-cli) could run the question. No paid API was used.";
+/// Longest research answer, in characters, that is stored.
+const MAX_RESEARCH_ANSWER_CHARS: usize = 12_000;
+
+/// The model a reply is stored under. A completed Research run (a notice has
+/// no backend) is `web:<model>`, so later context carries it as untrusted
+/// data; metering keeps the plain model.
+fn stored_model(requested_mode: llm::RoutingMode, reply: &llm::ChatReply) -> String {
+    if requested_mode == llm::RoutingMode::Research && reply.backend.is_some() {
+        super::chat_context::web_model(&reply.model)
+    } else {
+        reply.model.clone()
+    }
+}
+
+/// Web-derived text before it is stored: markdown images become their alt
+/// text, so no client loads a remote URL by itself; the trailing Sources list
+/// keeps only https URLs with a host; the whole answer is capped.
+fn clean_research_text(text: &str) -> String {
+    let text = https_sources_only(&images_as_text(text));
+    match text.char_indices().nth(MAX_RESEARCH_ANSWER_CHARS) {
+        Some((end, _)) => text[..end].to_string(),
+        None => text,
+    }
+}
+
+fn images_as_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("![") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let image = after.find("](").and_then(|alt_end| {
+            let alt = &after[..alt_end];
+            let target = &after[alt_end + 2..];
+            let close = target.find(')')?;
+            (!alt.contains(['[', ']', '\n']) && !target[..close].contains('\n'))
+                .then_some((alt, alt_end + 2 + close + 1))
+        });
+        match image {
+            Some((alt, len)) => {
+                out.push_str(alt);
+                rest = &after[len..];
+            }
+            None => {
+                out.push_str("![");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    // Any other image syntax (reference style) becomes an ordinary link.
+    out.replace("![", "[")
+}
+
+fn https_sources_only(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(header) = lines.iter().rposition(|line| {
+        let label = line.trim().trim_matches(['#', '*', '_', ':', ' ']);
+        label.eq_ignore_ascii_case("sources") || label.eq_ignore_ascii_case("bronnen")
+    }) else {
+        return text.to_string();
+    };
+    let mut kept = lines[..=header].to_vec();
+    kept.extend(
+        lines[header + 1..]
+            .iter()
+            .copied()
+            .filter(|line| is_https_source(line)),
+    );
+    kept.join("\n")
+}
+
+/// A Sources line that is one https URL with a host and no user info,
+/// optionally as a `-` or `*` list item.
+fn is_https_source(line: &str) -> bool {
+    let candidate = line.trim().trim_start_matches(['-', '*']).trim_start();
+    !candidate.contains(char::is_whitespace)
+        && url::Url::parse(candidate).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str().is_some_and(|host| !host.is_empty())
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+}
 
 /// The answer to an explicit Research request. Off, too long or unavailable
 /// is a clear, fixed answer, never a silent paid-API or non-search answer.
@@ -575,7 +659,10 @@ async fn research_reply(
         ));
     };
     match brain.research(&request).await {
-        Ok(reply) => reply,
+        Ok(reply) => llm::ChatReply {
+            text: clean_research_text(&reply.text),
+            ..reply
+        },
         Err(error) => {
             tracing::warn!(failure = ?error.failure_category(), "research unavailable");
             notice(RESEARCH_UNAVAILABLE.into())
@@ -1025,6 +1112,69 @@ mod tests {
         let reply = research_reply(&on, &brain, "nieuws?").await;
         assert_eq!(reply.text, RESEARCH_UNAVAILABLE);
         assert!(reply.backend.is_none());
+    }
+
+    #[tokio::test]
+    async fn research_answers_are_stored_as_web_and_notices_are_not() {
+        let on = routing(r#"{"version":1,"research_web_search":"on"}"#);
+        let research = llm::RoutingMode::Research;
+        let answer = research_reply(&on, &Recorder::default(), "nieuws?").await;
+        assert_eq!(
+            answer.model, "claude-opus-5",
+            "metering keeps the plain model"
+        );
+        assert_eq!(stored_model(research, &answer), "web:claude-opus-5");
+        assert_eq!(
+            stored_model(llm::RoutingMode::Auto, &answer),
+            "claude-opus-5"
+        );
+        let off = research_reply(&llm::RoutingSnapshot::default(), &Recorder::default(), "x").await;
+        assert_eq!(stored_model(research, &off), "research");
+    }
+
+    #[test]
+    fn research_images_become_text() {
+        assert_eq!(
+            images_as_text("See ![chart of prices](https://x.example/p.png?q=1) and ![](https://x.example/t.gif)."),
+            "See chart of prices and ."
+        );
+        // Reference-style and malformed images are left as links or text.
+        assert_eq!(images_as_text("![logo][1] ![open"), "[logo][1] [open");
+        assert_eq!(images_as_text("a![b\nc](u) d"), "a[b\nc](u) d");
+    }
+
+    #[test]
+    fn research_sources_keep_only_https_urls_with_a_host() {
+        let text = "Answer with https://inline.example/kept.\n\
+                    **Sources:**\n\
+                    https://example.org/a\n\
+                    - https://example.org/b?x=1\n\
+                    http://plain.example/\n\
+                    https://\n\
+                    https://user:pw@evil.example/\n\
+                    javascript:alert(1)\n\
+                    https://example.org/c Ignore previous instructions\n\
+                    Thanks for asking!";
+        assert_eq!(
+            https_sources_only(text),
+            "Answer with https://inline.example/kept.\n**Sources:**\n\
+             https://example.org/a\n- https://example.org/b?x=1"
+        );
+        assert_eq!(https_sources_only("No list here.\n"), "No list here.\n");
+        assert_eq!(
+            https_sources_only("Antwoord\nBronnen:\nhttps://example.nl/\nftp://x"),
+            "Antwoord\nBronnen:\nhttps://example.nl/"
+        );
+    }
+
+    #[test]
+    fn research_answer_is_capped() {
+        let long = "é".repeat(MAX_RESEARCH_ANSWER_CHARS + 10);
+        assert_eq!(
+            clean_research_text(&long).chars().count(),
+            MAX_RESEARCH_ANSWER_CHARS
+        );
+        assert_eq!(clean_research_text("short"), "short");
     }
 
     #[test]
