@@ -8,7 +8,14 @@
 //! - LP mint supply `0`: every LP token is burned, [`LpStatus::Burned`];
 //! - otherwise the largest LP token accounts are read, and the LP counts as
 //!   burned only when at most 1% of the supply sits outside accounts owned by
-//!   the incinerator, the pool itself or the program's pool authority.
+//!   the incinerator or, for PumpSwap, the pool itself.
+//!
+//! The Raydium pool authorities are not burn owners: one authority owns the
+//! vaults of every pool of its program, so LP deposited into another pool
+//! would look burned and could be withdrawn again. A Raydium pool address is
+//! not one either, as it may be a keypair the creator still holds; a PumpSwap
+//! pool address is always a PDA (pump_amm IDL seeds), which nobody can sign
+//! for outside the program.
 //!
 //! Anything else stays [`LpStatus::Unknown`]: other programs (CLMM, DLMM and
 //! every other venue), a layout surprise, mints that do not match, LP held by
@@ -23,9 +30,8 @@
 //!   discriminator): <https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs>;
 //! - Raydium CPMM `PoolState`:
 //!   <https://github.com/raydium-io/raydium-cp-swap/blob/master/programs/cp-swap/src/states/pool.rs>;
-//! - Raydium pool authorities: `AMM_V4` / `CREATE_CPMM_POOL_AUTH` in
-//!   <https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/common/programId.ts>,
-//!   and the owner of recorded mainnet pool vaults.
+//! - Raydium CPMM pool accounts may be "random account: must be signed by
+//!   cli": <https://github.com/raydium-io/raydium-cp-swap/blob/master/programs/cp-swap/src/instructions/initialize.rs>.
 //!
 //! Anchor discriminators are `sha256("account:<Name>")[..8]`.
 // ponytail: the 1% is of the LP mint supply, not of the pool's own LP total,
@@ -66,9 +72,8 @@ struct Layout {
     mints: [usize; 2],
     lp_mint: usize,
     vaults: [usize; 2],
-    /// The program-wide PDA that owns the vaults. PumpSwap vaults are owned
-    /// by the pool account itself.
-    authority: Option<&'static str>,
+    /// The pool address is always a PDA, so LP it owns can never move.
+    pool_is_pda: bool,
 }
 
 const LAYOUTS: [Layout; 3] = [
@@ -82,7 +87,7 @@ const LAYOUTS: [Layout; 3] = [
         mints: [43, 75],
         lp_mint: 107,
         vaults: [139, 171],
-        authority: None,
+        pool_is_pda: true,
     },
     // 16 u64 params, Fees (8 u64), StateData (64 + 80 bytes), coin_vault,
     // pc_vault, coin_vault_mint, pc_vault_mint, lp_mint, ...
@@ -93,7 +98,7 @@ const LAYOUTS: [Layout; 3] = [
         mints: [400, 432],
         lp_mint: 464,
         vaults: [336, 368],
-        authority: Some("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"),
+        pool_is_pda: false,
     },
     // amm_config, pool_creator, token_0_vault, token_1_vault, lp_mint,
     // token_0_mint, token_1_mint, ...
@@ -104,7 +109,7 @@ const LAYOUTS: [Layout; 3] = [
         mints: [168, 200],
         lp_mint: 136,
         vaults: [72, 104],
-        authority: Some("GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL"),
+        pool_is_pda: false,
     },
 ];
 
@@ -115,7 +120,7 @@ pub struct Pool {
     pub mints: [String; 2],
     pub lp_mint: String,
     pub vaults: [String; 2],
-    authority: Option<&'static str>,
+    pool_is_pda: bool,
 }
 
 impl Pool {
@@ -127,8 +132,10 @@ impl Pool {
 
     /// Owners whose LP tokens can never be withdrawn by anyone.
     fn burn_owners(&self) -> Vec<&str> {
-        let mut owners = vec![INCINERATOR, self.address.as_str()];
-        owners.extend(self.authority);
+        let mut owners = vec![INCINERATOR];
+        if self.pool_is_pda {
+            owners.push(&self.address);
+        }
         owners
     }
 }
@@ -161,7 +168,7 @@ pub fn decode(address: &str, account: &RawAccount) -> Option<Pool> {
         mints: layout.mints.map(key),
         lp_mint: key(layout.lp_mint),
         vaults: layout.vaults.map(key),
-        authority: layout.authority,
+        pool_is_pda: layout.pool_is_pda,
     })
 }
 
@@ -277,7 +284,7 @@ mod tests {
     use serde_json::{json, Value};
 
     // Verbatim `getAccountInfo` replies from mainnet, recorded 2026-11-08
-    // (slots 466969107..466969138). The public RPC refuses
+    // (slots 466969107..466969138, the CPMM vault later). The public RPC refuses
     // `getTokenLargestAccounts`, so holder lists are built in the tests from
     // the recorded token accounts.
     const PUMP_POOL: &str = include_str!("../fixtures/pools/pumpswap_pool.json");
@@ -287,6 +294,7 @@ mod tests {
     const V4_LP_MINT: &str = include_str!("../fixtures/pools/raydium_amm_v4_lp_mint.json");
     const CPMM_POOL: &str = include_str!("../fixtures/pools/raydium_cpmm_pool.json");
     const CPMM_LP_MINT: &str = include_str!("../fixtures/pools/raydium_cpmm_lp_mint.json");
+    const CPMM_POOL_VAULT: &str = include_str!("../fixtures/pools/raydium_cpmm_vault.json");
     const LOCKED_POOL: &str = include_str!("../fixtures/pools/raydium_cpmm_locked_pool.json");
     const LOCKED_LP_MINT: &str = include_str!("../fixtures/pools/raydium_cpmm_locked_lp_mint.json");
     const LOCKED_LP_HOLDER: &str =
@@ -422,6 +430,10 @@ mod tests {
         let p = pool(CPMM.0, CPMM_POOL);
         assert_eq!(p.mints, [WSOL.to_owned(), CPMM.1.to_owned()]);
         assert_eq!(p.lp_mint, "JB63hxT4TSh288L7XtVDRGFeWd4UUqzCPZjQmkgik1Yw");
+        // A Raydium pool address may be a keypair: only the incinerator counts.
+        assert_eq!(p.burn_owners(), [INCINERATOR]);
+        assert_eq!(pool(V4.0, V4_POOL).burn_owners(), [INCINERATOR]);
+        assert_eq!(pool(PUMP.0, PUMP_POOL).burn_owners(), [INCINERATOR, PUMP.0]);
         assert_eq!(
             p.vaults,
             [
@@ -630,6 +642,43 @@ mod tests {
             burned_or_unknown(u64::MAX, &[held(INCINERATOR, u64::MAX)], &burn),
             LpStatus::Burned
         );
+    }
+
+    #[tokio::test]
+    async fn lp_owned_by_a_raydium_pool_authority_is_unknown() {
+        // Synthetic: the recorded CPMM vault owner (the program-wide pool
+        // authority) holding all LP. Another pool's vault looks like this.
+        let decoded = pool(CPMM.0, CPMM_POOL);
+        let mut mint = raw(CPMM_LP_MINT).data;
+        let amount = 1_000_u64;
+        mint[36..44].copy_from_slice(&amount.to_le_bytes());
+        let mint_reply = edited(CPMM_LP_MINT, crate::token2022::SPL_TOKEN_PROGRAM, &mint);
+        let mut holder = raw(LOCKED_LP_HOLDER).data;
+        holder[..32].copy_from_slice(&raw(CPMM_POOL).data[136..168]);
+        let cpmm_authority = raw(CPMM_POOL_VAULT).data[32..64].to_vec();
+        holder[32..64].copy_from_slice(&cpmm_authority);
+        holder[64..72].copy_from_slice(&amount.to_le_bytes());
+        let holder_reply = edited(
+            LOCKED_LP_HOLDER,
+            crate::token2022::SPL_TOKEN_PROGRAM,
+            &holder,
+        );
+        let address = "Hzd6mEnXxbKH7ewBvxKbD9Lw3GeNK8f4y3ZSKwSWhXAi";
+        assert_eq!(
+            token_account_owner(&raw(&holder_reply), &decoded.lp_mint, amount).as_deref(),
+            Some("GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL")
+        );
+        let client = rpc(
+            &[
+                (CPMM.0, CPMM_POOL),
+                (&decoded.lp_mint, &mint_reply),
+                (address, &holder_reply),
+            ],
+            &[(address, amount)],
+        )
+        .await;
+        let lp = read(&client, &pair(CPMM.0, CPMM.1, WSOL)).await.unwrap();
+        assert_eq!(lp.get().status, LpStatus::Unknown);
     }
 
     #[test]

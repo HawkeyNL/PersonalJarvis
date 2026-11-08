@@ -3,7 +3,8 @@
 //! Only `getAccountInfo` and `getTokenLargestAccounts` are called, at
 //! `confirmed` commitment. [`CrossCheckedRpc`] asks both providers and fails
 //! with [`MarketDataError::ProviderDisagreement`] unless they agree exactly;
-//! only it can produce the [`CrossChecked`] values the snapshot mapping takes.
+//! only values built from its reads (here and in [`crate::pools::read`]) are
+//! wrapped in the [`CrossChecked`] type the snapshot mapping takes.
 // ponytail: response slots are not compared, so two providers that lag the
 // same way agree on stale state; pass `minContextSlot` if that shows up.
 
