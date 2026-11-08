@@ -15,7 +15,7 @@
 use jarvis_onchain::types::{Extension, ExtensionKind};
 
 pub const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAjS5EQ8i3MBVZ1zRSThdFEsd";
+pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 const MINT_LEN: usize = 82;
 const ACCOUNT_TYPE_OFFSET: usize = 165;

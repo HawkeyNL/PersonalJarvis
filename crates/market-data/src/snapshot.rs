@@ -10,13 +10,14 @@
 //! | mint / freeze authority revoked | `false` | `MintAuthorityActive` |
 //! | top-holder share | `1` (100%) | `HolderConcentrationTooHigh` |
 //! | sell price impact | `None` | `NoSellRoute` |
-//! | LP status | always `Unknown` (see below) | `LpNotSecured` |
+//! | LP status | `Unknown` (see below) | `LpNotSecured` |
 //! | 5 min buys / sells | `0` / `0` | no entry (no trades) |
 //! | 5 min price change | `i32::MIN` | outside any momentum band |
 //!
-//! LP status: DexScreener has none, and RugCheck's `lpLockedPct` says neither
-//! whether the LP is burned or time-locked nor until when, so this crate never
-//! claims `Burned` or `Locked`. Reading the LP mint on chain is a follow-up.
+//! LP status comes only from the on-chain pool read in [`crate::pools`], which
+//! can claim `Burned` but never `Locked`. DexScreener has no LP status, and
+//! RugCheck's `lpLockedPct` says neither whether the LP is burned or
+//! time-locked nor until when, so neither is used.
 //!
 //! Boosts are copied as reported (they are audited, never a positive signal);
 //! trending rank is not fetched and stays `None`.
@@ -28,6 +29,7 @@ use time::OffsetDateTime;
 
 use crate::dexscreener::Pair;
 use crate::jupiter::Quote;
+use crate::pools::PoolLp;
 use crate::rpc::{CrossChecked, TokenAccountBalance};
 use crate::token2022::MintAccount;
 use crate::MarketDataError;
@@ -52,6 +54,9 @@ pub struct Observation<'a> {
     /// burn token accounts, verified on chain; never addresses taken from
     /// DexScreener or another API. Every entry lowers the share.
     pub excluded_accounts: &'a [&'a str],
+    /// The main pool's LP status, read on chain. The pool's verified vaults
+    /// are left out of the holder share as well.
+    pub lp: Option<&'a CrossChecked<PoolLp>>,
     /// Raw units of `mint` the position would sell; `sell_quote` must be for
     /// exactly this amount.
     pub sell_amount: u64,
@@ -68,7 +73,8 @@ pub fn to_snapshot(o: &Observation<'_>) -> Result<TokenSnapshot, MarketDataError
         }
     }
     let other_mint = o.mint_account.is_some_and(|m| m.mint() != o.mint)
-        || o.largest_accounts.is_some_and(|h| h.mint() != o.mint);
+        || o.largest_accounts.is_some_and(|h| h.mint() != o.mint)
+        || o.lp.is_some_and(|lp| lp.mint() != o.mint);
     if other_mint {
         return Err(MarketDataError::InvalidInput(
             "RPC read is for another token",
@@ -104,7 +110,7 @@ pub fn to_snapshot(o: &Observation<'_>) -> Result<TokenSnapshot, MarketDataError
         // Without the mint account both authorities above are `false`, so the
         // filter rejects before it looks at extensions.
         extensions: mint.map(|m| m.extensions.clone()).unwrap_or_default(),
-        lp: LpStatus::Unknown,
+        lp: o.lp.map_or(LpStatus::Unknown, |lp| lp.get().status),
         top_holders_share: holder_share(o).unwrap_or(Decimal::ONE),
         sell_impact_bps: o.sell_quote.and_then(sell_impact_bps),
         buys_5m: m5.map_or(0, |t| t.buys),
@@ -146,17 +152,20 @@ fn sell_impact_bps(quote: &Quote) -> Option<u32> {
     Some(reported.map_or(from_usd, |r| r.max(from_usd)))
 }
 
-/// Share of supply in the [`TOP_HOLDERS`] largest non-excluded accounts.
+/// Share of supply in the [`TOP_HOLDERS`] largest accounts that are neither
+/// excluded nor a vault of the pool.
 fn holder_share(o: &Observation<'_>) -> Option<Decimal> {
     let supply = o.mint_account?.get().supply;
     if supply == 0 {
         return None;
     }
+    let vaults = o.lp.map_or(&[][..], |lp| lp.get().vaults.as_slice());
     let mut amounts: Vec<u64> = o
         .largest_accounts?
         .get()
         .iter()
         .filter(|a| !o.excluded_accounts.contains(&a.address.as_str()))
+        .filter(|a| !vaults.contains(&a.address))
         .map(|a| a.amount)
         .collect();
     amounts.sort_unstable_by(|a, b| b.cmp(a));
@@ -245,6 +254,7 @@ mod tests {
             mint_account: None,
             largest_accounts: None,
             excluded_accounts: &[],
+            lp: None,
             sell_amount: SELL,
             sell_quote: None,
         }
@@ -428,6 +438,35 @@ mod tests {
             ..empty()
         };
         assert_eq!(to_snapshot(&base).unwrap().top_holders_share, d("0.48"));
+    }
+
+    #[test]
+    fn lp_status_and_vaults_come_from_a_pool_read_for_this_token() {
+        let (mint, holders) = (mint(), holders());
+        let burned = checked(PoolLp {
+            status: LpStatus::Burned,
+            vaults: vec![VAULT.to_owned()],
+        });
+        let s = to_snapshot(&Observation {
+            mint_account: Some(&mint),
+            largest_accounts: Some(&holders),
+            lp: Some(&burned),
+            ..empty()
+        })
+        .unwrap();
+        assert_eq!(s.lp, LpStatus::Burned);
+        // The pool vault is left out, as in `maps_full_observation`.
+        assert_eq!(s.top_holders_share, d("0.08"));
+
+        let foreign = CrossChecked {
+            mint: "So11111111111111111111111111111111111111112".to_owned(),
+            value: burned.value.clone(),
+        };
+        assert!(to_snapshot(&Observation {
+            lp: Some(&foreign),
+            ..empty()
+        })
+        .is_err());
     }
 
     #[test]

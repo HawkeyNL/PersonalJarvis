@@ -1,6 +1,6 @@
 //! Read-only Solana JSON-RPC reads against two independent providers.
 //!
-//! Only `getAccountInfo` (mint) and `getTokenLargestAccounts` are called, at
+//! Only `getAccountInfo` and `getTokenLargestAccounts` are called, at
 //! `confirmed` commitment. [`CrossCheckedRpc`] asks both providers and fails
 //! with [`MarketDataError::ProviderDisagreement`] unless they agree exactly;
 //! only it can produce the [`CrossChecked`] values the snapshot mapping takes.
@@ -98,6 +98,13 @@ struct AccountValue {
     owner: String,
 }
 
+/// An account's owner program and raw data, as read with `getAccountInfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawAccount {
+    pub owner: String,
+    pub data: Vec<u8>,
+}
+
 /// One token account from `getTokenLargestAccounts`, amount in raw units.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TokenAccountBalance {
@@ -158,28 +165,39 @@ impl RpcClient {
         }
     }
 
-    /// Read and parse a mint account (SPL Token or Token-2022).
-    pub async fn mint(&self, mint: &str) -> Result<MintAccount, MarketDataError> {
-        validate_address(mint)?;
+    /// Read any account; `what` names it in the not-found error.
+    pub async fn account(
+        &self,
+        address: &str,
+        what: &'static str,
+    ) -> Result<RawAccount, MarketDataError> {
+        validate_address(address)?;
         let reply: WithContext<Option<AccountValue>> = self
             .call(
                 "getAccountInfo",
-                json!([mint, { "encoding": "base64", "commitment": "confirmed" }]),
+                json!([address, { "encoding": "base64", "commitment": "confirmed" }]),
             )
             .await?;
-        let account = reply
-            .value
-            .ok_or(MarketDataError::NotFound("mint account"))?;
-        let program = TokenProgram::from_owner(&account.owner)
-            .ok_or_else(|| self.invalid("account is not owned by a token program"))?;
+        let account = reply.value.ok_or(MarketDataError::NotFound(what))?;
         let (data, encoding) = account.data;
         if encoding != "base64" {
             return Err(self.invalid("account data is not base64"));
         }
-        let bytes = STANDARD
+        let data = STANDARD
             .decode(data)
             .map_err(|_| self.invalid("account data is not valid base64"))?;
-        parse_mint(program, &bytes).map_err(|e| self.invalid(e.0))
+        Ok(RawAccount {
+            owner: account.owner,
+            data,
+        })
+    }
+
+    /// Read and parse a mint account (SPL Token or Token-2022).
+    pub async fn mint(&self, mint: &str) -> Result<MintAccount, MarketDataError> {
+        let account = self.account(mint, "mint account").await?;
+        let program = TokenProgram::from_owner(&account.owner)
+            .ok_or_else(|| self.invalid("account is not owned by a token program"))?;
+        parse_mint(program, &account.data).map_err(|e| self.invalid(e.0))
     }
 
     /// The largest token accounts of `mint` (at most 20, per the RPC spec).
@@ -220,13 +238,26 @@ impl CrossCheckedRpc {
     }
 
     #[cfg(test)]
-    fn from_clients(primary: RpcClient, secondary: RpcClient) -> Self {
+    pub(crate) fn from_clients(primary: RpcClient, secondary: RpcClient) -> Self {
         Self { primary, secondary }
     }
 
     pub async fn mint(&self, mint: &str) -> Result<CrossChecked<MintAccount>, MarketDataError> {
         let (a, b) = tokio::join!(self.primary.mint(mint), self.secondary.mint(mint));
         agree(mint, a?, b?, "mint account")
+    }
+
+    /// Any account, read identically by both providers.
+    pub(crate) async fn account(
+        &self,
+        address: &str,
+        what: &'static str,
+    ) -> Result<RawAccount, MarketDataError> {
+        let (a, b) = tokio::join!(
+            self.primary.account(address, what),
+            self.secondary.account(address, what)
+        );
+        agree(address, a?, b?, what).map(|agreed| agreed.value)
     }
 
     /// Both lists sorted by amount (largest first) then address, so ties in
