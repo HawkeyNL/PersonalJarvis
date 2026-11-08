@@ -16,6 +16,7 @@ use jarvis_onchain::paper::CostModel;
 use jarvis_onchain::strategy::StrategyParams;
 use jarvis_onchain::types::ExtensionKind;
 
+use super::agent::AgentSettings;
 use super::STRATEGY_VERSION_FLOOR;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,23 @@ struct ProfileFile {
     #[serde(default)]
     strategy: Option<StrategyFile>,
     costs: CostFile,
+    /// Claude decides the paper entries and exits and reviews the strategies
+    /// daily. Absent: off, and each strategy enters on its own signal.
+    #[serde(default)]
+    agent: Option<AgentFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentFile {
+    /// Lower than the code caps only.
+    #[serde(default)]
+    max_calls_per_hour: Option<u32>,
+    #[serde(default)]
+    max_calls_per_day: Option<u32>,
+    /// Strategies Claude creates start enabled (on unless set false).
+    #[serde(default = "on")]
+    new_strategies_enabled: bool,
 }
 
 fn on() -> bool {
@@ -156,6 +174,8 @@ pub struct PaperProfile {
     /// Canonical JSON of everything that decided the legacy strategy's
     /// results, recorded with its version; `None` without one.
     pub versioned_params: Option<String>,
+    /// `None`: Claude takes no part.
+    pub agent: Option<AgentSettings>,
 }
 
 fn seconds(value: u64, field: &str) -> Result<Duration, String> {
@@ -295,6 +315,16 @@ impl PaperProfile {
             strategy,
             costs,
             versioned_params,
+            agent: file
+                .agent
+                .map(|a| {
+                    AgentSettings::new(
+                        a.max_calls_per_hour,
+                        a.max_calls_per_day,
+                        a.new_strategies_enabled,
+                    )
+                })
+                .transpose()?,
         })
     }
 
@@ -458,5 +488,35 @@ pub(crate) mod tests {
         let mut json = fixture_json();
         json["filter"]["allowed_extensions"] = serde_json::json!(["unknown"]);
         assert!(PaperProfile::parse(&json.to_string()).is_err());
+    }
+
+    #[test]
+    fn the_agent_is_off_unless_configured_and_config_only_lowers_its_caps() {
+        assert!(fixture().agent.is_none());
+        let mut json = fixture_json();
+        json["agent"] = serde_json::json!({});
+        let agent = PaperProfile::parse(&json.to_string())
+            .unwrap()
+            .agent
+            .unwrap();
+        assert_eq!((agent.max_calls_per_hour, agent.max_calls_per_day), (4, 48));
+        assert!(agent.new_strategies_enabled);
+        json["agent"] = serde_json::json!({"max_calls_per_hour": 2, "max_calls_per_day": 10,
+            "new_strategies_enabled": false});
+        let agent = PaperProfile::parse(&json.to_string())
+            .unwrap()
+            .agent
+            .unwrap();
+        assert_eq!((agent.max_calls_per_hour, agent.max_calls_per_day), (2, 10));
+        assert!(!agent.new_strategies_enabled);
+        for agent in [
+            serde_json::json!({"max_calls_per_hour": 5}),
+            serde_json::json!({"max_calls_per_day": 49}),
+            serde_json::json!({"max_calls_per_hour": 0}),
+            serde_json::json!({"model": "x"}),
+        ] {
+            json["agent"] = agent.clone();
+            assert!(PaperProfile::parse(&json.to_string()).is_err(), "{agent}");
+        }
     }
 }

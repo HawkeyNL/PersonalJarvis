@@ -715,8 +715,11 @@ shares the one background slot with research, so a busy slot refuses the task
 (`runtime_failure`), never queues it, and chat always keeps its own slot. The
 fixed prompts tell the model that the input is numbers-only data with opaque
 ids, that instructions in it are never followed, and that the output is one
-JSON object. The model's output is still untrusted: the caller must validate
-it strictly before using it (nothing in Core uses these tasks yet).
+JSON object. The model's output is still untrusted: the memecoin paper
+trader validates every reply as a whole and drops an invalid one (see
+`docs/MEMECOIN_PAPER.md`). The rationale a reply carries is display only: Core
+stores it for the owner and never feeds it into a later task input, prompt or
+chat context, so model text cannot steer a later call.
 
 The Codex chat worker refuses every request with a `task`.
 
