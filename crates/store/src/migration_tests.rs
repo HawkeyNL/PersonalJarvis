@@ -316,6 +316,11 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         version(11, &lineage.replace("'a'", "'d'")),
         // Lineage without a strategy, and a strategy without an author.
         version(12, ", family = 'a'"),
+        version(18, ", parent_version = 1"),
+        version(19, ", author = 'seed'"),
+        version(20, ", rationale = 'r'"),
+        version(21, ", backtest = '{}'"),
+        version(22, &format!("{lineage}, backtest = '1'")),
         version(13, &lineage.replace(", author = 'claude'", "")),
         version(14, &format!("{lineage}, parent_version = 14")),
         version(15, &lineage.replace("'claude'", "'owner'")),

@@ -405,6 +405,14 @@ const MAX_BACKTEST_BYTES: usize = 4096;
 const MAX_PARAMS: usize = 8192;
 const MAX_CHANGED_BY: usize = 64;
 
+/// A base58 Solana address, as the schema checks it.
+fn valid_address(address: &str) -> bool {
+    (32..=44).contains(&address.len())
+        && address
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() && !b"0OIl".contains(&b))
+}
+
 fn valid_strategy_id(id: &str) -> bool {
     (1..=32).contains(&id.len())
         && id
@@ -558,7 +566,8 @@ async fn version_strategy(db: &Database, version: u32) -> Result<Option<String>>
 }
 
 /// Create a strategy that trades `active_version`, a version of its own.
-/// `false` when the strategy already exists. Only the paper task writes
+/// `false` when the strategy already exists. At most [`MAX_LIST`] exist, so
+/// [`list_strategies`] always returns all of them. Only the paper task writes
 /// strategies, so the check and the write cannot race.
 pub async fn insert_strategy(
     db: &Database,
@@ -583,6 +592,9 @@ pub async fn insert_strategy(
     .await?;
     if !existing.is_empty() {
         return Ok(false);
+    }
+    if list_strategies(db).await?.len() >= MAX_LIST {
+        return Err(MemecoinStoreError::InvalidData);
     }
     run(
         db,
@@ -611,7 +623,7 @@ struct StrategyRow {
     changed_by: String,
 }
 
-/// Every strategy by id, at most [`MAX_LIST`].
+/// Every strategy by id.
 pub async fn list_strategies(db: &Database) -> Result<Vec<Strategy>> {
     let rows: Vec<StrategyRow> = rows(
         db,
@@ -659,8 +671,8 @@ pub async fn set_active_version(
 }
 
 /// Enable or disable a strategy. `owner` is true only when the caller has
-/// verified the owner: an owner's disable can only be lifted by the owner,
-/// so any other enable of such a strategy changes nothing. `false` when
+/// verified the owner: a strategy the owner disabled is only changed by the
+/// owner, so it keeps the owner's disable and its attribution. `false` when
 /// nothing changed or there is no such strategy.
 pub async fn set_strategy_enabled(
     db: &Database,
@@ -677,7 +689,7 @@ pub async fn set_strategy_enabled(
         "UPDATE $rid SET enabled = $enabled, \
          disabled_by_owner = IF $owner THEN !$enabled ELSE disabled_by_owner END, \
          changed_at = time::now(), changed_by = $changed_by \
-         WHERE $owner OR !$enabled OR disabled_by_owner = false RETURN VALUE record::id(id)",
+         WHERE $owner OR disabled_by_owner = false RETURN VALUE record::id(id)",
         "memecoin_strategies",
         id,
         json!({"enabled": enabled, "owner": owner, "changed_by": changed_by}),
@@ -1085,6 +1097,7 @@ fn valid_decision(decision: &Decision) -> bool {
             .is_none_or(|bps| (1..=10_000).contains(&bps))
         && (!matches!(decision.kind, DecisionKind::Enter | DecisionKind::Exit)
             || decision.mint.is_some())
+        && decision.mint.as_deref().is_none_or(valid_address)
         && decision.reason_code.as_deref().is_none_or(|code| {
             (1..=32).contains(&code.len())
                 && code.starts_with(|c: char| c.is_ascii_lowercase())
@@ -1151,7 +1164,10 @@ fn daily_key(mint: &str, at: OffsetDateTime) -> String {
 /// daily one that outlives [`OBSERVATION_FULL_HOURS`]. Only the paper task
 /// writes observations, so the check and the write cannot race.
 pub async fn record_observation(db: &Database, observation: &Observation) -> Result<()> {
-    if observation.price_usd < Decimal::ZERO || observation.liquidity_usd < Decimal::ZERO {
+    if !valid_address(&observation.mint)
+        || observation.price_usd < Decimal::ZERO
+        || observation.liquidity_usd < Decimal::ZERO
+    {
         return Err(MemecoinStoreError::InvalidData);
     }
     let day = daily_key(&observation.mint, observation.at);
@@ -1198,6 +1214,12 @@ pub struct UniverseEntry {
 
 /// Record or replace the universe entry of a mint.
 pub async fn upsert_universe(db: &Database, entry: &UniverseEntry) -> Result<()> {
+    if ![&entry.mint, &entry.pool, &entry.program]
+        .iter()
+        .all(|address| valid_address(address))
+    {
+        return Err(MemecoinStoreError::InvalidData);
+    }
     record_rows::<serde::de::IgnoredAny>(
         db,
         "UPSERT $rid SET id = $mint, mint = $mint, pool = $pool, program = $program, \
@@ -1239,10 +1261,11 @@ pub async fn prune(db: &Database) -> Result<usize> {
         ),
         (
             "memecoin_observations",
-            format!(
-                "at < time::now() - {OBSERVATION_RETENTION_DAYS}d \
-                 OR (daily = false AND at < time::now() - {OBSERVATION_FULL_HOURS}h)"
-            ),
+            format!("at < time::now() - {OBSERVATION_RETENTION_DAYS}d"),
+        ),
+        (
+            "memecoin_observations",
+            format!("daily = false AND at < time::now() - {OBSERVATION_FULL_HOURS}h"),
         ),
         (
             "memecoin_universe",
@@ -1577,6 +1600,10 @@ mod tests {
                 input_tokens: Some(MAX_TOKENS + 1),
                 ..hold.clone()
             },
+            Decision {
+                mint: Some("So1111111111111111111111111111111111111111O".into()),
+                ..enter(now)
+            },
         ] {
             assert!(!valid_decision(&bad), "{bad:?}");
         }
@@ -1665,7 +1692,7 @@ mod tests {
         // Only the owner lifts an owner's disable.
         assert!(set_strategy_enabled(&db, "momentum-a", false, true, "device-1").await?);
         assert!(!set_strategy_enabled(&db, "momentum-a", true, false, "claude").await?);
-        assert!(set_strategy_enabled(&db, "momentum-a", false, false, "claude").await?);
+        assert!(!set_strategy_enabled(&db, "momentum-a", false, false, "claude").await?);
         let strategies = list_strategies(&db).await?;
         assert_eq!(strategies.len(), 2);
         let momentum = &strategies[1];
@@ -1677,7 +1704,7 @@ mod tests {
                 momentum.disabled_by_owner,
                 momentum.changed_by.as_str()
             ),
-            ("momentum-a", 3, false, true, "claude")
+            ("momentum-a", 3, false, true, "device-1")
         );
         assert!(set_strategy_enabled(&db, "momentum-a", true, true, "device-1").await?);
         let momentum = &list_strategies(&db).await?[1];
