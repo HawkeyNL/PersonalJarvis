@@ -862,8 +862,20 @@ mod tests {
         assert!(list_proposals(&db, &id).await?.is_empty());
 
         // An owner change makes an open proposal stale; nothing is applied.
-        let stale = create_proposal(&db, &id, 3, &[ready(&a)], None).await?;
-        let rejected = create_proposal(&db, &id, 3, &[ready(&a)], None).await?;
+        let live = [ProposalOp::UpdateItem {
+            item_id: a.clone(),
+            patch: ItemPatch {
+                status: Some(Status::Live),
+                ..ItemPatch::default()
+            },
+        }];
+        // Already applied: nothing to propose.
+        assert!(matches!(
+            create_proposal(&db, &id, 3, &[ready(&a)], None).await,
+            Err(RoadmapError::Invalid(_))
+        ));
+        let stale = create_proposal(&db, &id, 3, &live, None).await?;
+        let rejected = create_proposal(&db, &id, 3, &live, None).await?;
         let renamed = RoadmapPatch {
             title: Some("Renamed".into()),
             ..RoadmapPatch::default()
