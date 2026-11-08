@@ -238,6 +238,22 @@ impl Discovery {
     pub fn knows(&self, mint: &str) -> bool {
         self.mints.contains_key(mint)
     }
+
+    /// Every kept migration, in no particular order.
+    pub fn migrations(&self) -> impl Iterator<Item = &Migration> {
+        self.mints.values()
+    }
+
+    /// Keep a migration seen before, e.g. one stored before a restart, with
+    /// the same checks as a polled one. `false` when it is refused or
+    /// already known.
+    pub fn remember(&mut self, migration: Migration, now: OffsetDateTime) -> bool {
+        let valid = validate_address(&migration.mint).is_ok()
+            && validate_address(&migration.pool).is_ok()
+            && migration.migrated_at <= now + MAX_CLOCK_SKEW
+            && now - migration.migrated_at <= MAX_AGE;
+        valid && self.insert(migration)
+    }
 }
 
 /// Worth retrying on a later poll rather than skipping the signature.
@@ -463,6 +479,22 @@ mod tests {
         assert!(full.insert(migration("new", now)));
         assert_eq!(full.mints.len(), MAX_MINTS);
         assert!(full.knows("new") && !full.knows(&oldest));
+
+        // Stored migrations come back with the same checks.
+        let mint = "So11111111111111111111111111111111111111112";
+        let pool = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+        let stored = |mint: &str, age| Migration {
+            mint: mint.to_owned(),
+            pool: pool.to_owned(),
+            migrated_at: now - age,
+        };
+        let mut restored = Discovery::new();
+        assert!(!restored.remember(stored("not base58 0OIl", Duration::hours(1)), now));
+        assert!(!restored.remember(stored(mint, Duration::hours(73)), now));
+        assert!(!restored.remember(stored(mint, -Duration::hours(1)), now));
+        assert!(restored.remember(stored(mint, Duration::hours(1)), now));
+        assert!(!restored.remember(stored(mint, Duration::hours(2)), now));
+        assert_eq!(restored.migrations().count(), 1);
 
         // Block times in the future or beyond the window are refused.
         let mut discovery = Discovery::new();

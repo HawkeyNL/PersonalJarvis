@@ -26,7 +26,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 16);
+    assert_eq!(version.unwrap().version, 17);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
@@ -47,7 +47,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_eleven.unwrap().version, 16);
+    assert_eq!(from_eleven.unwrap().version, 17);
     db.use_db("from_twelve").await?;
     apply_through_twelve(&db).await?;
     // A v12 pairing row has none of the new optional fields and stays valid.
@@ -59,7 +59,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_twelve_version: Option<SchemaVersion> = from_twelve.take(0)?;
-    assert_eq!(from_twelve_version.unwrap().version, 16);
+    assert_eq!(from_twelve_version.unwrap().version, 17);
     let legacy_has_no_ip: Vec<bool> = from_twelve.take(1)?;
     assert_eq!(legacy_has_no_ip, [true]);
     // The database bounds the new fields even if Core validation regressed.
@@ -88,7 +88,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
-    assert_eq!(migrated_version.unwrap().version, 16);
+    assert_eq!(migrated_version.unwrap().version, 17);
     let legacy: Vec<String> = migrated.take(1)?;
     assert_eq!(legacy, ["password-set"]);
     db.query("CREATE account_actions SET id = 'reset', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
@@ -134,7 +134,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_thirteen.unwrap().version, 16);
+    assert_eq!(from_thirteen.unwrap().version, 17);
     // The paper tables enforce their shape even if Core validation regressed.
     let (mint, other) = (
         "So11111111111111111111111111111111111111112",
@@ -187,7 +187,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_fourteen.unwrap().version, 16);
+    assert_eq!(from_fourteen.unwrap().version, 17);
     // The IBKR read model enforces its shape even if Core validation regressed.
     let position = |id: &str, extra: &str| {
         format!("CREATE ibkr_positions SET id = '{id}', conid = {id}, symbol = 'VWCE', asset_class = 'STK', currency = 'EUR', quantity = '12.5', avg_cost = '101.25', last_price = '120', market_value = '1500', unrealized_pnl = '-3.5'{extra};")
@@ -232,7 +232,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_fifteen_version: Option<SchemaVersion> = from_fifteen.take(0)?;
-    assert_eq!(from_fifteen_version.unwrap().version, 16);
+    assert_eq!(from_fifteen_version.unwrap().version, 17);
     let legacy_has_no_anchor: Vec<bool> = from_fifteen.take(1)?;
     assert_eq!(legacy_has_no_anchor, [true]);
     db.query(session(
@@ -248,6 +248,115 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
             "bad_revision",
             &format!(", password_revision = '{}'", "r".repeat(65)),
         ),
+    ] {
+        assert!(db.query(&bad).await?.check().is_err(), "{bad}");
+    }
+    db.use_db("from_sixteen").await?;
+    apply_through_sixteen(&db).await?;
+    // A v16 strategy version and trips have none of the new fields.
+    let version = |n: u32, extra: &str| {
+        format!("CREATE memecoin_strategy_versions SET id = 'v{n}', version = {n}, params = '{{}}', created_at = time::now(){extra};")
+    };
+    db.query(version(1, "")).await?.check()?;
+    db.query(trip("old", mint, "")).await?.check()?;
+    db.query("UPDATE memecoin_paper_trips:old SET status = 'closed', slot = 'old', closed_at = time::now(), usd_out = '20', exit_fees_usd = '0.02', net_pnl_usd = '-5.03', exit_reason = 'time_stop';")
+        .await?
+        .check()?;
+    db.query(trip("held", mint, "")).await?.check()?;
+    apply_baseline_schema(&db).await?;
+    let mut from_sixteen = db
+        .query("SELECT version FROM schema_version:baseline; SELECT VALUE strategy_id = NONE AND family = NONE FROM memecoin_strategy_versions:v1;")
+        .await?
+        .check()?;
+    let from_sixteen_version: Option<SchemaVersion> = from_sixteen.take(0)?;
+    assert_eq!(from_sixteen_version.unwrap().version, 17);
+    let legacy_has_no_lineage: Vec<bool> = from_sixteen.take(1)?;
+    assert_eq!(legacy_has_no_lineage, [true]);
+    // Legacy rows still pass every rule when they are written again.
+    db.query("UPDATE memecoin_strategy_versions:v1 SET created_at = time::now(); UPDATE memecoin_paper_trips:old SET exit_failures = 0;")
+        .await?
+        .check()?;
+    let lineage = ", strategy_id = 'momentum-a', family = 'a', author = 'claude'";
+    db.query(version(
+        2,
+        &format!(
+            "{lineage}, parent_version = 1, rationale = 'Tighter stop.', backtest = '{}'",
+            r#"{"trades":3}"#
+        ),
+    ))
+    .await?
+    .check()?;
+    let strategy = |id: &str, extra: &str| {
+        format!("CREATE memecoin_strategies SET id = '{id}', active_version = 2, enabled = true, disabled_by_owner = false, changed_at = time::now(), changed_by = 'seed'{extra};")
+    };
+    db.query(strategy("momentum-a", "")).await?.check()?;
+    let decision = |id: &str, extra: &str| {
+        format!("CREATE memecoin_decisions SET id = '{id}', at = time::now(), call_id = 'call-1'{extra};")
+    };
+    db.query(decision("enter", &format!(", kind = 'enter', strategy_version = 2, mint = '{mint}', size_bps = 2500, reason_code = 'volume_spike', rationale = 'Volume rose.', model = 'claude-sonnet-4-5', input_tokens = 900, output_tokens = 120")))
+        .await?
+        .check()?;
+    db.query(decision("down", ", kind = 'worker_unavailable'"))
+        .await?
+        .check()?;
+    let observation = |id: &str, extra: &str| {
+        format!("CREATE memecoin_observations SET id = '{id}', mint = '{mint}', at = time::now(), price_usd = '0.0001', liquidity_usd = '50000', daily = true{extra};")
+    };
+    db.query(observation("o1", "")).await?.check()?;
+    let universe = |mint: &str, extra: &str| {
+        format!("CREATE memecoin_universe SET id = '{mint}', mint = '{mint}', pool = '{other}', program = '{other}', migrated_at = time::now(){extra};")
+    };
+    db.query(universe(mint, "")).await?.check()?;
+    db.query("UPDATE memecoin_paper_trips:held SET status = 'closed', slot = 'held', closed_at = time::now(), usd_out = '30', exit_fees_usd = '0.02', net_pnl_usd = '4.97', exit_reason = 'trailing_stop', peak_value_usd = '31.5';")
+        .await?
+        .check()?;
+    // Each case breaks exactly one rule.
+    for bad in [
+        version(10, &lineage.replace("momentum-a", "Momentum_A")),
+        version(11, &lineage.replace("'a'", "'d'")),
+        // Lineage without a strategy, and a strategy without an author.
+        version(12, ", family = 'a'"),
+        version(18, ", parent_version = 1"),
+        version(19, ", author = 'seed'"),
+        version(20, ", rationale = 'r'"),
+        version(21, ", backtest = '{}'"),
+        version(22, &format!("{lineage}, backtest = '1'")),
+        version(13, &lineage.replace(", author = 'claude'", "")),
+        version(14, &format!("{lineage}, parent_version = 14")),
+        version(15, &lineage.replace("'claude'", "'owner'")),
+        version(16, &format!("{lineage}, rationale = '{}'", "r".repeat(601))),
+        // 2050 characters, but 4098 bytes.
+        version(
+            17,
+            &format!("{lineage}, backtest = '\"{}\"'", "é".repeat(2048)),
+        ),
+        // An owner's disable while enabled.
+        strategy("b", "").replace("disabled_by_owner = false", "disabled_by_owner = true"),
+        strategy("c", "").replace("'seed'", "''"),
+        strategy("d", "").replace("active_version = 2", "active_version = 0"),
+        strategy("Bad_Id", ""),
+        decision("x1", ", kind = 'buy'"),
+        decision("x2", &format!(", kind = 'enter', mint = '{mint}'")),
+        decision("x3", ", kind = 'skip', size_bps = 100"),
+        decision("x4", ", kind = 'exit'"),
+        decision(
+            "x5",
+            &format!(", kind = 'enter', mint = '{mint}', size_bps = 10001"),
+        ),
+        decision("x6", ", kind = 'skip', reason_code = 'Not-Snake'"),
+        decision(
+            "x7",
+            &format!(", kind = 'skip', rationale = '{}'", "r".repeat(301)),
+        ),
+        decision("x8", ", kind = 'hold'").replace("call-1", "call 1"),
+        decision("x9", ", kind = 'hold', output_tokens = -1"),
+        observation("o2", "").replace("'0.0001'", "'1e-4'"),
+        observation("o3", "").replace(", daily = true", ""),
+        // A second row for the same mint.
+        universe(mint, "").replace(&format!("id = '{mint}'"), "id = 'u2'"),
+        universe(other, "").replace(&format!("pool = '{other}'"), "pool = 'not-base58-0OIl'"),
+        "UPDATE memecoin_paper_trips:old SET exit_reason = 'panic';".to_string(),
+        "UPDATE memecoin_paper_trips:old SET peak_value_usd = '-1';".to_string(),
     ] {
         assert!(db.query(&bad).await?.check().is_err(), "{bad}");
     }

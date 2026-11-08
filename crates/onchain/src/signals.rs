@@ -69,6 +69,27 @@ pub enum SignalId {
 }
 
 impl SignalId {
+    pub const ALL: [SignalId; 15] = {
+        use SignalId::*;
+        [
+            Return15m,
+            Return1h,
+            Return6h,
+            Return24h,
+            PriceVsSma30m,
+            PriceVsSma20d,
+            BreakoutHigh1h,
+            BreakoutHigh2h,
+            BreakoutHigh10d,
+            RangeWidth2h,
+            DrawdownFromHigh,
+            LiquidityChange1h,
+            LiquidityChange2h,
+            LiquidityDrawdownFromPeak,
+            PoolAgeMinutes,
+        ]
+    };
+
     /// The range a condition bound on this signal may use.
     pub fn range(self) -> (i64, i64) {
         use SignalId::*;
@@ -215,6 +236,33 @@ pub(crate) mod tests {
 
     fn at(minutes: i64) -> OffsetDateTime {
         t0() + Duration::minutes(minutes)
+    }
+
+    #[test]
+    fn all_lists_every_signal_once() {
+        use SignalId::*;
+        let distinct: std::collections::BTreeSet<_> = SignalId::ALL.into_iter().collect();
+        assert_eq!(distinct.len(), SignalId::ALL.len());
+        // Fails to compile when a signal is added, as a reminder to list it.
+        for id in SignalId::ALL {
+            match id {
+                Return15m
+                | Return1h
+                | Return6h
+                | Return24h
+                | PriceVsSma30m
+                | PriceVsSma20d
+                | BreakoutHigh1h
+                | BreakoutHigh2h
+                | BreakoutHigh10d
+                | RangeWidth2h
+                | DrawdownFromHigh
+                | LiquidityChange1h
+                | LiquidityChange2h
+                | LiquidityDrawdownFromPeak
+                | PoolAgeMinutes => {}
+            }
+        }
     }
 
     #[test]

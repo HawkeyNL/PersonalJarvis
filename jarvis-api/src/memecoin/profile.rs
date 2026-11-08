@@ -15,6 +15,9 @@ use jarvis_onchain::filter::FilterRules;
 use jarvis_onchain::paper::CostModel;
 use jarvis_onchain::strategy::StrategyParams;
 use jarvis_onchain::types::ExtensionKind;
+
+use super::agent::AgentSettings;
+use super::STRATEGY_VERSION_FLOOR;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::Duration;
@@ -38,16 +41,38 @@ struct ProfileFile {
     max_position_usd: Decimal,
     max_open_positions: usize,
     filter: FilterFile,
-    strategy: StrategyFile,
+    /// Deprecated: the single strategy of profiles written before typed
+    /// strategies. It no longer enters; it only names the exit rules of the
+    /// positions it opened.
+    #[serde(default)]
+    strategy: Option<StrategyFile>,
     costs: CostFile,
+    /// Claude decides the paper entries and exits and reviews the strategies
+    /// daily. Absent: off, and each strategy enters on its own signal.
+    #[serde(default)]
+    agent: Option<AgentFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentFile {
+    /// Lower than the code caps only.
+    #[serde(default)]
+    max_calls_per_hour: Option<u32>,
+    #[serde(default)]
+    max_calls_per_day: Option<u32>,
+    /// Strategies Claude creates start enabled (on unless set false).
+    #[serde(default = "on")]
+    new_strategies_enabled: bool,
 }
 
 fn on() -> bool {
     true
 }
 
-/// Everything that decides results. It is recorded per strategy version, so
-/// changing any of it without a new version stops the trader.
+/// Everything that decided the results of a legacy strategy. It is recorded
+/// per legacy version, so changing any of it without a new version stops
+/// the trader while the profile still has a `strategy`.
 #[derive(Serialize)]
 struct Versioned<'a> {
     stake_usd: &'a Decimal,
@@ -142,11 +167,15 @@ pub struct PaperProfile {
     pub max_position_usd: Decimal,
     pub max_open_positions: usize,
     pub rules: FilterRules,
-    pub strategy: StrategyParams,
+    /// Deprecated legacy strategy, if the profile still has one. Its version
+    /// is below [`STRATEGY_VERSION_FLOOR`].
+    pub strategy: Option<StrategyParams>,
     pub costs: CostModel,
-    /// Canonical JSON of everything that decides results, recorded with
-    /// [`StrategyParams::version`].
-    pub versioned_params: String,
+    /// Canonical JSON of everything that decided the legacy strategy's
+    /// results, recorded with its version; `None` without one.
+    pub versioned_params: Option<String>,
+    /// `None`: Claude takes no part.
+    pub agent: Option<AgentSettings>,
 }
 
 fn seconds(value: u64, field: &str) -> Result<Duration, String> {
@@ -156,6 +185,36 @@ fn seconds(value: u64, field: &str) -> Result<Duration, String> {
     i64::try_from(value)
         .map(Duration::seconds)
         .map_err(|_| format!("{field} is out of range"))
+}
+
+/// The deprecated legacy strategy, validated against the code bounds. Its
+/// version must stay below [`STRATEGY_VERSION_FLOOR`], where typed strategy
+/// versions start, so the two can never collide.
+fn legacy_strategy(s: &StrategyFile) -> Result<StrategyParams, String> {
+    if s.version >= STRATEGY_VERSION_FLOOR {
+        return Err(format!(
+            "strategy.version must be below {STRATEGY_VERSION_FLOOR}"
+        ));
+    }
+    let strategy = StrategyParams {
+        version: s.version,
+        min_buy_ratio_bps: s.min_buy_ratio_bps,
+        min_momentum_bps: s.min_momentum_bps,
+        max_momentum_bps: s.max_momentum_bps,
+        position_share_bps: s.position_share_bps,
+        max_liquidity_share_bps: s.max_liquidity_share_bps,
+        take_profit_bps: s.take_profit_bps,
+        stop_loss_bps: s.stop_loss_bps,
+        liquidity_drop_exit_bps: s.liquidity_drop_exit_bps,
+        max_hold: seconds(s.max_hold_secs, "max_hold_secs")?,
+        entry_slippage_bps: s.entry_slippage_bps,
+        exit_slippage_bps: s.exit_slippage_bps,
+        intent_ttl: seconds(s.intent_ttl_secs, "intent_ttl_secs")?,
+    };
+    strategy
+        .validate()
+        .map_err(|error| format!("strategy parameters: {error}"))?;
+    Ok(strategy)
 }
 
 /// A base58 Solana address, as the schema also requires.
@@ -219,25 +278,7 @@ impl PaperProfile {
                 "min_lp_lock_remaining_secs",
             )?,
         };
-        let s = &v.strategy;
-        let strategy = StrategyParams {
-            version: s.version,
-            min_buy_ratio_bps: s.min_buy_ratio_bps,
-            min_momentum_bps: s.min_momentum_bps,
-            max_momentum_bps: s.max_momentum_bps,
-            position_share_bps: s.position_share_bps,
-            max_liquidity_share_bps: s.max_liquidity_share_bps,
-            take_profit_bps: s.take_profit_bps,
-            stop_loss_bps: s.stop_loss_bps,
-            liquidity_drop_exit_bps: s.liquidity_drop_exit_bps,
-            max_hold: seconds(s.max_hold_secs, "max_hold_secs")?,
-            entry_slippage_bps: s.entry_slippage_bps,
-            exit_slippage_bps: s.exit_slippage_bps,
-            intent_ttl: seconds(s.intent_ttl_secs, "intent_ttl_secs")?,
-        };
-        strategy
-            .validate()
-            .map_err(|error| format!("strategy parameters: {error}"))?;
+        let strategy = v.strategy.as_ref().map(legacy_strategy).transpose()?;
         let costs = CostModel {
             dex_fee_bps: v.costs.dex_fee_bps,
             network_fee_usd: v.costs.network_fee_usd,
@@ -248,15 +289,21 @@ impl PaperProfile {
         if !costs.is_valid() || costs.failure_rate >= Decimal::ONE {
             return Err("cost model is out of range".into());
         }
-        let versioned_params = serde_json::to_string(&Versioned {
-            stake_usd: &v.stake_usd,
-            max_position_usd: &v.max_position_usd,
-            max_open_positions: v.max_open_positions,
-            filter: &v.filter,
-            strategy: &v.strategy,
-            costs: &v.costs,
-        })
-        .map_err(|error| format!("paper profile cannot be recorded: {error}"))?;
+        let versioned_params = v
+            .strategy
+            .as_ref()
+            .map(|strategy| {
+                serde_json::to_string(&Versioned {
+                    stake_usd: &v.stake_usd,
+                    max_position_usd: &v.max_position_usd,
+                    max_open_positions: v.max_open_positions,
+                    filter: &v.filter,
+                    strategy,
+                    costs: &v.costs,
+                })
+                .map_err(|error| format!("paper profile cannot be recorded: {error}"))
+            })
+            .transpose()?;
         Ok(Self {
             watchlist: file.watchlist,
             discovery: file.discovery,
@@ -268,6 +315,16 @@ impl PaperProfile {
             strategy,
             costs,
             versioned_params,
+            agent: file
+                .agent
+                .map(|a| {
+                    AgentSettings::new(
+                        a.max_calls_per_hour,
+                        a.max_calls_per_day,
+                        a.new_strategies_enabled,
+                    )
+                })
+                .transpose()?,
         })
     }
 
@@ -353,7 +410,7 @@ pub(crate) mod tests {
     #[test]
     fn parses_and_records_canonical_params() {
         let profile = fixture();
-        assert_eq!(profile.strategy.version, 3);
+        assert_eq!(profile.strategy.as_ref().map(|s| s.version), Some(3));
         assert_eq!(profile.rules.max_snapshot_age, Duration::minutes(1));
         assert!(profile.discovery, "discovery is on by default");
         // Formatting and the candidate sources do not change the recorded
@@ -372,6 +429,17 @@ pub(crate) mod tests {
                 .versioned_params,
             profile.versioned_params
         );
+    }
+
+    #[test]
+    fn the_legacy_strategy_is_optional_and_below_the_typed_versions() {
+        let mut json = fixture_json();
+        json.as_object_mut().unwrap().remove("strategy");
+        let profile = PaperProfile::parse(&json.to_string()).unwrap();
+        assert!(profile.strategy.is_none() && profile.versioned_params.is_none());
+        let mut json = fixture_json();
+        json["strategy"]["version"] = STRATEGY_VERSION_FLOOR.into();
+        assert!(PaperProfile::parse(&json.to_string()).is_err());
     }
 
     #[test]
@@ -420,5 +488,35 @@ pub(crate) mod tests {
         let mut json = fixture_json();
         json["filter"]["allowed_extensions"] = serde_json::json!(["unknown"]);
         assert!(PaperProfile::parse(&json.to_string()).is_err());
+    }
+
+    #[test]
+    fn the_agent_is_off_unless_configured_and_config_only_lowers_its_caps() {
+        assert!(fixture().agent.is_none());
+        let mut json = fixture_json();
+        json["agent"] = serde_json::json!({});
+        let agent = PaperProfile::parse(&json.to_string())
+            .unwrap()
+            .agent
+            .unwrap();
+        assert_eq!((agent.max_calls_per_hour, agent.max_calls_per_day), (4, 48));
+        assert!(agent.new_strategies_enabled);
+        json["agent"] = serde_json::json!({"max_calls_per_hour": 2, "max_calls_per_day": 10,
+            "new_strategies_enabled": false});
+        let agent = PaperProfile::parse(&json.to_string())
+            .unwrap()
+            .agent
+            .unwrap();
+        assert_eq!((agent.max_calls_per_hour, agent.max_calls_per_day), (2, 10));
+        assert!(!agent.new_strategies_enabled);
+        for agent in [
+            serde_json::json!({"max_calls_per_hour": 5}),
+            serde_json::json!({"max_calls_per_day": 49}),
+            serde_json::json!({"max_calls_per_hour": 0}),
+            serde_json::json!({"model": "x"}),
+        ] {
+            json["agent"] = agent.clone();
+            assert!(PaperProfile::parse(&json.to_string()).is_err(), "{agent}");
+        }
     }
 }
