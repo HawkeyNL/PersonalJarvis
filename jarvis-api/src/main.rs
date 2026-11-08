@@ -554,6 +554,15 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    // The GitHub poller for roadmap links is off unless both the repo
+    // allowlist and the systemd credential are there (docs/ROADMAPS.md); a
+    // bad value is logged and leaves it off. The token is never an env var.
+    let (github, github_token) = jarvis_api::roadmaps::github::configure(
+        &std::env::var(jarvis_api::roadmaps::github::REPOS_ENV).unwrap_or_default(),
+        std::env::var_os("CREDENTIALS_DIRECTORY")
+            .as_deref()
+            .map(Path::new),
+    );
     let state = AppState {
         realtime: Default::default(),
         db,
@@ -639,6 +648,7 @@ async fn main() -> anyhow::Result<()> {
             config.memecoin_paper_enabled,
         )),
         auto_research: Default::default(),
+        github,
     };
 
     jarvis_api::refresh_usage_snapshot(&state).await;
@@ -678,6 +688,13 @@ async fn main() -> anyhow::Result<()> {
             client.as_ref().clone(),
             config.ibkr_broker_socket.clone().into(),
         );
+    }
+    if let Some(token) = github_token {
+        if let Err(reason) =
+            jarvis_api::roadmaps::github::start(state.db.clone(), state.github.clone(), token)
+        {
+            tracing::error!(reason, "GitHub roadmap sync disabled");
+        }
     }
     if config.memecoin_paper_enabled {
         if let Err(reason) = start_memecoin_paper(&config, &state).await {

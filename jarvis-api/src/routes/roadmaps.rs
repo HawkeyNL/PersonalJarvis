@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::error::bad_request;
+use crate::roadmaps::github::SyncRefused;
 use crate::roadmaps::store;
 use crate::roadmaps::{ItemPatch, NewItem, NewRoadmap, RoadmapError, RoadmapPatch, MAX_HISTORY};
 use crate::{AppState, Authed};
@@ -155,6 +156,10 @@ pub(crate) async fn create_item(
     Query(revision): Query<RevisionQuery>,
     Json(input): Json<NewItem>,
 ) -> ApiResult {
+    state
+        .github
+        .check_links(&input.links)
+        .map_err(bad_request)?;
     let device = authed.device.id.to_string();
     let (item_id, roadmap) = bounded(store::create_item(
         &state.db,
@@ -176,6 +181,10 @@ pub(crate) async fn update_item(
     Query(revision): Query<RevisionQuery>,
     Json(patch): Json<ItemPatch>,
 ) -> ApiResult {
+    state
+        .github
+        .check_links(patch.links.iter().flatten())
+        .map_err(bad_request)?;
     let device = authed.device.id.to_string();
     bounded(store::update_item(
         &state.db,
@@ -261,4 +270,45 @@ pub(crate) async fn reject_proposal(
     ))
     .await?;
     Ok(Json(json!({ "rejected": true })))
+}
+
+/// Ask the GitHub poller for a pass now (all roadmaps), at most once a
+/// minute. The roadmap must exist and not be archived.
+pub(crate) async fn sync(
+    _authed: Authed,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    if !state.github.configured() {
+        return Err(error(StatusCode::CONFLICT, "GitHub sync is not configured"));
+    }
+    let roadmap = bounded(store::get(&state.db, &id.to_string()))
+        .await?
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "not found"))?;
+    if roadmap.roadmap.archived_at.is_some() {
+        return Err(error(StatusCode::CONFLICT, "roadmap is archived"));
+    }
+    match state.github.request_sync() {
+        Ok(()) => Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true })))),
+        Err(SyncRefused::NotConfigured) => {
+            Err(error(StatusCode::CONFLICT, "GitHub sync is not configured"))
+        }
+        Err(SyncRefused::AuthFailed) => Err(error(
+            StatusCode::CONFLICT,
+            "GitHub refused the token; replace it and restart Core",
+        )),
+        Err(SyncRefused::TooSoon) => Err(error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "sync at most once a minute",
+        )),
+    }
+}
+
+/// Whether the GitHub poller is configured, its allowlist and how its last
+/// pass went.
+pub(crate) async fn github_status(_authed: Authed, State(state): State<AppState>) -> ApiResult {
+    let mut body = json!(state.github.status());
+    body["configured"] = state.github.configured().into();
+    body["repos"] = json!(state.github.repos());
+    Ok(Json(body))
 }

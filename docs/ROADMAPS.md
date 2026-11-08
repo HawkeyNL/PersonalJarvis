@@ -7,8 +7,8 @@ served through `/v1/roadmaps`. Nothing is seeded; every roadmap is the
 owner's.
 
 Owner edits always win. Changes that do not come from the owner are either
-applied by deterministic code (the GitHub poller, planned) or proposed and
-applied only when the owner accepts them (Jarvis).
+applied by deterministic code (the GitHub poller) or proposed and applied
+only when the owner accepts them (Jarvis).
 
 ## API
 
@@ -30,6 +30,8 @@ refused. Each database call is bounded by 10 seconds (503 when it fails).
 | GET | `/v1/roadmaps/{id}/proposals` | Pending proposals, oldest first |
 | POST | `/v1/roadmaps/{id}/proposals/{pid}/accept` | Apply a proposal |
 | POST | `/v1/roadmaps/{id}/proposals/{pid}/reject` | Reject a proposal |
+| POST | `/v1/roadmaps/{id}/sync` | Ask the GitHub poller for a pass now (202), at most once a minute |
+| GET | `/v1/roadmaps/github` | The GitHub poller: `configured`, `repos`, `state`, `last_poll_at`, `last_error` |
 
 Writes and accepts answer with the whole roadmap: `{roadmap, items}`.
 `roadmap` has `id`, `title`, `description`, `phases`, `revision`,
@@ -40,7 +42,7 @@ and `updated_at`.
 Errors are `{"error": "…"}`: 400 for invalid input (the message says which
 rule), 404 for an unknown roadmap, item or proposal, 409 for a revision
 conflict, an archived roadmap, a stale proposal or a limit, 413 for a body
-over 64 KiB.
+over 64 KiB, 429 for a second sync within a minute.
 
 ### Revisions
 
@@ -64,6 +66,9 @@ revision.
   - `{"kind": "release", "repo": "owner/name", "tag": "v1.2.3"}`
   - `{"kind": "url", "url": "https://…"}` (https only, no credentials, at most
     500 characters)
+  - Once `JARVIS_GITHUB_REPOS` is set, a `pr`, `issue` or `release` link
+    must name one of its repositories (400 otherwise). Links stored before
+    stay, but are not fetched.
   - `state` is the GitHub state the poller cached. Clients cannot set it; a
     link that stays on the item keeps it.
 - `auto_status` is the status the GitHub poller last derived. Owner edits
@@ -121,15 +126,140 @@ answer is 409. Rejecting only records the decision.
 There is no route that creates a proposal: only Core code does, through
 `roadmaps::store::create_proposal`.
 
+## GitHub
+
+Core can follow the PRs, issues and releases that items link to and move
+those items forward by itself. It polls GitHub every 10 minutes (there is
+no webhook) with a read-only token the owner provides. It is off until both
+the token and the repo allowlist are there.
+
+### What it does
+
+For each repository in the allowlist that a roadmap links to, a pass reads:
+
+- `GET /repos/{repo}/issues?state=all&sort=updated&direction=desc&per_page=30`,
+  after the first pass only what changed since the previous one (`since`,
+  with 5 minutes of overlap). This list holds pull requests as well as
+  issues. The pull request list itself is not used: 50 pull requests with
+  their bodies come to more than the 1 MiB answer limit. The window moves on
+  only when every linked item it covers is stored; after a failed or
+  conflicting write the next pass reads the same window again. A list too
+  large to read leaves each linked item to a single fetch.
+- `GET /repos/{repo}/releases?per_page=10`.
+- One by one, and only when the lists cannot answer: a linked PR or issue
+  that is not in the window or that links disagree on (`/pulls/{n}`,
+  `/issues/{n}`; 404 or 410 is `not_found`), a linked release
+  that is not among the latest ten (`/releases/tags/{tag}`), and once per
+  merged PR its merge commit.
+- `GET /repos/{repo}/compare/{tag}...{merge commit}` to see whether a
+  published release contains a merged PR. The answer is cached.
+
+At most 100 single fetches per pass; the rest waits for the next pass.
+Every request has a 15 second timeout and an answer of at most 1 MiB, uses
+`If-None-Match` with the ETag of the previous answer where the address does
+not change, and goes only to `https://api.github.com`: a redirect is
+followed only to that same origin, so the token never reaches another
+host. No proxy is used.
+
+Each link gets a cached `state`:
+
+| Link | `state` | Item status it stands for |
+| --- | --- | --- |
+| `pr` | `open`, `draft` | `in_progress` |
+| `pr` | `merged` | `ready` |
+| `pr` | `released` (a published release contains the merge) | `live` |
+| `issue` | `completed` (closed as completed) | `ready` |
+| `release` | `published` | `live` |
+| `pr`, `issue` | `closed`, `not_found`; issue `open` | badge only |
+| `release` | `unreleased`, `prerelease` | badge only |
+
+An item stands for the most advanced status among its links. When a pass
+changes a link's state so that the item stands for a more advanced status
+than before, and the item is behind that status and not `blocked`, the
+status moves forward to it. It never moves back, never leaves `blocked`,
+and an owner's status edit holds until GitHub shows something new (a PR
+that stays open does not undo the owner moving the item back to `planned`;
+the same PR being merged later moves it to `ready`). `auto_status` is set to
+the status the links stand for.
+
+Each roadmap with changed links is written in one revision, author
+`github`, without a device, like any other write: when the owner changed
+the roadmap in the meantime, nothing is written and the next pass builds
+on the new revision. Every such write raises the revision, also when only a
+badge changed (for example a PR closed without merging), so a client
+editing at that moment gets a 409 and reloads, and a pending Jarvis
+proposal becomes stale.
+
+### What it never does
+
+- Write anything to GitHub: it only sends `GET` requests, with a read-only
+  token.
+- Fetch a `url` link, a repository outside the allowlist or any host but
+  `api.github.com`.
+- Log the token or put it in Core's environment, which child processes
+  inherit: it is only sent in the `Authorization` header to
+  `api.github.com`.
+- Move an item backwards or out of `blocked`, or override an owner's edit
+  without a new GitHub fact.
+
+### Failures
+
+- A timeout, a 5xx answer, an answer over 1 MiB or a repository the token
+  cannot read: the pass keeps the last known states and `state` is `error`
+  with a fixed `last_error`. When only some repositories or roadmaps
+  failed, the others are stored and the next pass comes on time; when the
+  whole pass failed, the next one waits 20, 40 and then 60 minutes until
+  one succeeds.
+- Rate limited (403 or 429 with `Retry-After` or an exhausted
+  `X-RateLimit-Remaining`): `state` is `rate_limited` and the next pass
+  waits until GitHub's reset, at least 10 minutes and at most an hour.
+- 401 (wrong, expired or revoked token): `state` is `auth_failed` and the
+  poller stops until Core restarts. Cached states stay.
+- A missing token or allowlist: `state` is `not_configured`; an invalid
+  one is logged and shown in `last_error`. Core always starts.
+
+`POST /v1/roadmaps/{id}/sync` answers 409 when the poller is not configured
+or stopped on a 401, and 429 within a minute of the previous sync. During a
+rate limit the sync waits for the limit.
+
+### Owner setup
+
+1. Create a fine-grained personal access token on GitHub (Settings →
+   Developer settings → Fine-grained tokens):
+   - Expiration: 90 days.
+   - Repository access: *Only select repositories*, the ones in the
+     allowlist.
+   - Repository permissions, all **Read-only**: Metadata, Contents, Pull
+     requests, Issues. Nothing else, and no account permissions.
+2. Store it on the Home Node as a systemd credential, root-only:
+
+   ```bash
+   sudo install -d -m 0700 -o root -g root /etc/credstore
+   sudo bash -c 'umask 077; read -rsp "GitHub token: " token && printf "%s" "$token" > /etc/credstore/jarvis.github_token'
+   sudo chown root:root /etc/credstore/jarvis.github_token
+   sudo chmod 0400 /etc/credstore/jarvis.github_token
+   ```
+
+   The Core unit loads it with `LoadCredential=github_token:jarvis.github_token`.
+   This names a credential instead of a path, so systemd looks in
+   `/etc/credstore/` (and `/run/credstore/`, `/usr/lib/credstore/`), and a
+   missing file does not stop Core from starting, which an absolute path
+   would. Core reads `$CREDENTIALS_DIRECTORY/github_token` once at startup.
+3. Set the allowlist in `/etc/jarvis/core.env`, comma-separated, at most 20:
+
+   ```
+   JARVIS_GITHUB_REPOS=HawkeyNL/PersonalJarvis
+   ```
+
+4. Restart Core (`sudo systemctl restart jarvis-core`): the token and the
+   allowlist are read only at startup. `GET /v1/roadmaps/github` then shows
+   `configured: true` and, after the first pass, `state: ok`.
+
+To rotate the token before it expires, replace the file and restart Core.
+To turn the poller off, remove the file or the allowlist and restart.
+
 ## What is next
 
-- **GitHub poller:** periodically, for linked PRs, issues and releases in
-  an allowlisted set of repositories, with a read-only token. It caches each
-  link's `state` and moves an item's status forward only (PR open →
-  `in_progress`; merged or issue completed → `ready`; release containing the
-  merge → `live`), as author `github`. An owner's status edit wins. The repo
-  allowlist comes with it; until then links are stored as given and never
-  fetched.
 - **Realtime event:** `roadmap.changed {id, revision}`, once every client
   ignores event types it does not know.
 - **Proposals from Jarvis:** a bounded task that reads the roadmap and typed

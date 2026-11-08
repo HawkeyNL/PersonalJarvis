@@ -73,6 +73,10 @@ grep -Fq 'ReadOnlyPaths=/var/lib/jarvis/agents' "$core_unit"
 grep -Fxq 'ExecReload=/bin/kill -HUP $MAINPID' "$core_unit"
 ! grep -Fq 'SupplementaryGroups=jarvis-codex' "$core_unit"
 grep -Fq 'After=network-online.target jarvis-surrealdb.service' "$core_unit"
+# The GitHub token is an optional credential: a name, not a path, so a
+# missing one never stops Core; never an environment file.
+[[ $(grep '^LoadCredential' "$core_unit") == 'LoadCredential=github_token:jarvis.github_token' ]]
+! grep -Eiq '^EnvironmentFile=.*github' "$core_unit"
 grep -Fq 'User=root' "$db_unit"
 grep -Fq 'start-production-surrealdb' "$db_unit"
 grep -Fq 'jarvis-opensandbox.service' "$verify"

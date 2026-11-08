@@ -236,4 +236,6 @@ pub struct AppState {
     pub memecoin: Arc<crate::memecoin::PaperHandle>,
     /// The single slot and caps of automatic web search runs.
     pub auto_research: Arc<crate::auto_research::AutoResearch>,
+    /// GitHub poller for roadmap links and its repo allowlist; off by default.
+    pub github: Arc<crate::roadmaps::github::GithubHandle>,
 }
