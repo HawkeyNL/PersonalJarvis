@@ -1756,13 +1756,14 @@ mod tests {
         let mut left = db
             .query(
                 "SELECT VALUE kind FROM memecoin_decisions; \
-                 SELECT VALUE price_usd FROM memecoin_observations ORDER BY at; \
+                 SELECT VALUE price_usd FROM memecoin_observations; \
                  SELECT VALUE mint FROM memecoin_universe;",
             )
             .await?
             .check()?;
         let kinds: Vec<String> = left.take(0)?;
-        let prices: Vec<String> = left.take(1)?;
+        let mut prices: Vec<String> = left.take(1)?;
+        prices.sort();
         let universe: Vec<String> = left.take(2)?;
         assert_eq!(kinds, ["worker_unavailable"]);
         assert_eq!(prices, ["1", "5", "6"]);
