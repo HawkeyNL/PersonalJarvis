@@ -106,10 +106,15 @@ drop, stop loss, trailing stop (the version's `trailing_stop_bps` below the peak
 that peak was above cost; the peak is stored with the position, so a restart
 keeps it), take profit and time stop. Positions of a legacy profile version
 exit by the parameters recorded for that version. A version that no longer
-fits the profile's filter rules only exits.
+fits the profile's filter rules only exits. A position whose version has no
+usable rules recorded gets only the time stop, after 30 days, and is logged
+every tick until then.
 
 The overview reports the whole paper book (every strategy). The hourly gate
-snapshot is written per strategy, for its active version. Trades, net result
+snapshot is written per strategy, for its active version; one that fails is
+logged and skipped until the next hour. Typed versions are only recorded
+above 1 000 000, with parameters that name the same strategy, version,
+parent and family as their row. Trades, net result
 (after failed-attempt fees and AI cost), expectancy, win rate and maximum
 drawdown per strategy, over all its versions, are available to Core as
 `store::strategy_performance`; there is no route for them yet.
@@ -198,7 +203,9 @@ cost a candidate, never let one through.
 - `GET /v1/trading/meme/overview`: enabled, running, paused, stake, equity,
   P&L net of fees, failed attempts and AI cost, open positions (each with its
   strategy version), gate report and goal progress, for the whole paper
-  book. It no longer has a top-level `strategy_version`.
+  book. The top-level `strategy_version` is **deprecated** and kept for
+  older clients: it is the active version of the first strategy by id
+  (normally `a-survivor-momentum`) and scopes nothing else in the response.
 - `GET /v1/trading/meme/candidates?limit=1..100` (default 50).
 - `GET /v1/trading/meme/trades?limit=1..100`: closed paper trades.
 - `POST /v1/trading/meme/pause`: stops entries at once and persists the pause

@@ -14,7 +14,10 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use jarvis_onchain::backtest::{performance, Performance};
+use jarvis_onchain::config::{Family, StrategyConfig};
 use jarvis_store::Database;
+
+use super::STRATEGY_VERSION_FLOOR;
 
 /// Candidate decisions and gate snapshots are kept this long.
 pub const RETENTION_DAYS: u32 = 30;
@@ -338,6 +341,16 @@ pub enum StrategyFamily {
     C,
 }
 
+impl From<Family> for StrategyFamily {
+    fn from(family: Family) -> Self {
+        match family {
+            Family::A => Self::A,
+            Family::B => Self::B,
+            Family::C => Self::C,
+        }
+    }
+}
+
 impl StrategyFamily {
     fn as_str(self) -> &'static str {
         match self {
@@ -434,13 +447,23 @@ fn valid_text(text: &str, max_chars: usize) -> bool {
     text.chars().count() <= max_chars && !text.chars().any(char::is_control)
 }
 
+/// A typed version lies above [`STRATEGY_VERSION_FLOOR`], and its parameters
+/// are a [`StrategyConfig`] naming the same strategy, version, parent and
+/// family as the row.
 fn validate_version(version: &StrategyVersion) -> Result<()> {
-    let valid = version.version >= 1
+    let config_matches = serde_json::from_str::<StrategyConfig>(&version.params).is_ok_and(|c| {
+        c.id == version.strategy_id
+            && c.version == version.version
+            && c.parent == version.parent_version
+            && StrategyFamily::from(c.family) == version.family
+    });
+    let valid = version.version > STRATEGY_VERSION_FLOOR
         && valid_strategy_id(&version.strategy_id)
         && version
             .parent_version
-            .is_none_or(|parent| parent >= 1 && parent < version.version)
+            .is_none_or(|parent| parent > STRATEGY_VERSION_FLOOR && parent < version.version)
         && (2..=MAX_PARAMS).contains(&version.params.chars().count())
+        && config_matches
         && version
             .rationale
             .as_deref()
@@ -1659,17 +1682,38 @@ mod tests {
 
     const OTHER: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
 
-    fn seed(at: OffsetDateTime) -> StrategyVersion {
+    /// Typed versions are numbered from here.
+    const V: u32 = STRATEGY_VERSION_FLOOR;
+
+    /// Version `V + n` of `id`, derived from `V + parent`, with matching
+    /// config parameters.
+    fn typed(n: u32, id: &str, family: StrategyFamily, parent: Option<u32>) -> StrategyVersion {
+        let index = match family {
+            StrategyFamily::A => 0,
+            StrategyFamily::B => 1,
+            StrategyFamily::C => 2,
+        };
+        let mut config = jarvis_onchain::config::seeds()[index].clone();
+        config.id = id.into();
+        config.version = V + n;
+        config.parent = parent.map(|p| V + p);
         StrategyVersion {
-            version: 1,
-            strategy_id: "momentum-a".into(),
-            family: StrategyFamily::A,
-            parent_version: None,
+            version: V + n,
+            strategy_id: id.into(),
+            family,
+            parent_version: config.parent,
             author: StrategyAuthor::Seed,
-            params: r#"{"a":1}"#.into(),
+            params: serde_json::to_string(&config).unwrap(),
             rationale: None,
             backtest: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn seed(at: OffsetDateTime) -> StrategyVersion {
+        StrategyVersion {
             created_at: at,
+            ..typed(1, "momentum-a", StrategyFamily::A, None)
         }
     }
 
@@ -1692,14 +1736,39 @@ mod tests {
     #[test]
     fn strategy_versions_are_checked_before_the_database() {
         let good = StrategyVersion {
-            version: 5,
-            parent_version: Some(4),
             rationale: Some("é".repeat(600)),
             backtest: Some(format!("\"{}\"", "x".repeat(4094))),
-            ..seed(OffsetDateTime::UNIX_EPOCH)
+            ..typed(5, "momentum-a", StrategyFamily::A, Some(4))
         };
         assert!(validate_version(&good).is_ok());
+        let legacy = typed(5, "momentum-a", StrategyFamily::A, None);
         for bad in [
+            // At or below the floor, legacy numbers.
+            StrategyVersion {
+                version: V,
+                ..typed(0, "momentum-a", StrategyFamily::A, None)
+            },
+            StrategyVersion {
+                parent_version: Some(4),
+                ..legacy.clone()
+            },
+            // Parameters that do not describe this row.
+            StrategyVersion {
+                params: typed(6, "momentum-a", StrategyFamily::A, Some(4)).params,
+                ..good.clone()
+            },
+            StrategyVersion {
+                params: typed(5, "other", StrategyFamily::A, Some(4)).params,
+                ..good.clone()
+            },
+            StrategyVersion {
+                family: StrategyFamily::B,
+                ..good.clone()
+            },
+            StrategyVersion {
+                params: r#"{"a":1}"#.into(),
+                ..good.clone()
+            },
             StrategyVersion {
                 strategy_id: "Momentum".into(),
                 ..good.clone()
@@ -1713,7 +1782,7 @@ mod tests {
                 ..good.clone()
             },
             StrategyVersion {
-                parent_version: Some(5),
+                parent_version: Some(V + 5),
                 ..good.clone()
             },
             StrategyVersion {
@@ -1838,15 +1907,16 @@ mod tests {
         // including a legacy one, is a conflict.
         insert_strategy_version(&db, &seed(now)).await?;
         insert_strategy_version(&db, &seed(now + Duration::minutes(1))).await?;
-        register_strategy_version(&db, 2, "{}").await?;
+        register_strategy_version(&db, V + 2, "{}").await?;
         for conflict in [
             StrategyVersion {
-                params: r#"{"a":2}"#.into(),
+                rationale: Some("Other content.".into()),
                 ..seed(now)
             },
+            // Recorded as a legacy version.
             StrategyVersion {
-                version: 2,
-                ..seed(now)
+                created_at: now,
+                ..typed(2, "momentum-a", StrategyFamily::A, None)
             },
         ] {
             assert!(matches!(
@@ -1855,21 +1925,18 @@ mod tests {
             ));
         }
         let child = StrategyVersion {
-            version: 3,
-            parent_version: Some(1),
             author: StrategyAuthor::Claude,
             rationale: Some("Tighter stop.".into()),
             backtest: Some(r#"{"trades":12}"#.into()),
-            ..seed(now)
+            created_at: now,
+            ..typed(3, "momentum-a", StrategyFamily::A, Some(1))
         };
         insert_strategy_version(&db, &child).await?;
         insert_strategy_version(
             &db,
             &StrategyVersion {
-                version: 4,
-                strategy_id: "dip-b".into(),
-                family: StrategyFamily::B,
-                ..seed(now)
+                created_at: now,
+                ..typed(4, "dip-b", StrategyFamily::B, None)
             },
         )
         .await?;
@@ -1878,22 +1945,22 @@ mod tests {
             [child, seed(now)]
         );
 
-        assert!(insert_strategy(&db, "momentum-a", 1, true, "seed").await?);
-        assert!(!insert_strategy(&db, "momentum-a", 1, true, "seed").await?);
+        assert!(insert_strategy(&db, "momentum-a", V + 1, true, "seed").await?);
+        assert!(!insert_strategy(&db, "momentum-a", V + 1, true, "seed").await?);
         // A strategy only trades versions of its own.
-        assert!(insert_strategy(&db, "dip-b", 1, true, "seed")
+        assert!(insert_strategy(&db, "dip-b", V + 1, true, "seed")
             .await
             .is_err());
-        assert!(insert_strategy(&db, "dip-b", 4, false, "seed").await?);
-        assert!(set_active_version(&db, "momentum-a", 3, "claude").await?);
-        assert!(set_active_version(&db, "momentum-a", 4, "claude")
+        assert!(insert_strategy(&db, "dip-b", V + 4, false, "seed").await?);
+        assert!(set_active_version(&db, "momentum-a", V + 3, "claude").await?);
+        assert!(set_active_version(&db, "momentum-a", V + 4, "claude")
             .await
             .is_err());
         // Only the owner lifts an owner's disable.
         assert!(set_strategy_enabled(&db, "momentum-a", false, true, "device-1").await?);
         assert!(!set_strategy_enabled(&db, "momentum-a", true, false, "claude").await?);
         assert!(!set_strategy_enabled(&db, "momentum-a", false, false, "claude").await?);
-        assert!(set_active_version(&db, "momentum-a", 1, "claude").await?);
+        assert!(set_active_version(&db, "momentum-a", V + 1, "claude").await?);
         let strategies = list_strategies(&db).await?;
         assert_eq!(strategies.len(), 2);
         let momentum = &strategies[1];
@@ -1905,7 +1972,7 @@ mod tests {
                 momentum.disabled_by_owner,
                 momentum.changed_by.as_str()
             ),
-            ("momentum-a", 1, false, true, "device-1")
+            ("momentum-a", V + 1, false, true, "device-1")
         );
         assert!(set_strategy_enabled(&db, "momentum-a", true, true, "device-1").await?);
         let momentum = &list_strategies(&db).await?[1];
@@ -2040,29 +2107,15 @@ mod tests {
         // A child version must derive from its own strategy.
         let seed_a = seed(now);
         insert_strategy_version(&db, &seed_a).await?;
-        let other = StrategyVersion {
-            version: 2,
-            strategy_id: "dip-b".into(),
-            family: StrategyFamily::B,
-            ..seed(now)
-        };
-        insert_strategy_version(&db, &other).await?;
+        insert_strategy_version(&db, &typed(2, "dip-b", StrategyFamily::B, None)).await?;
         for parent in [2, 9] {
-            let child = StrategyVersion {
-                version: 10,
-                parent_version: Some(parent),
-                ..seed(now)
-            };
+            let child = typed(10, "momentum-a", StrategyFamily::A, Some(parent));
             assert!(matches!(
                 insert_strategy_version(&db, &child).await,
                 Err(MemecoinStoreError::InvalidData)
             ));
         }
-        let child = StrategyVersion {
-            version: 3,
-            parent_version: Some(1),
-            ..seed(now)
-        };
+        let child = typed(3, "momentum-a", StrategyFamily::A, Some(1));
         insert_strategy_version(&db, &child).await?;
 
         // Trips of both versions of momentum-a count, dip-b's do not.
@@ -2076,7 +2129,7 @@ mod tests {
                 &Trip {
                     id: id.clone(),
                     mint: MINT.into(),
-                    strategy_version: version,
+                    strategy_version: V + version,
                     tokens: d("10"),
                     cost_usd: d("10"),
                     entry_liquidity_usd: d("50000"),
@@ -2106,8 +2159,8 @@ mod tests {
             assert!(close_trip(&db, &id, &close).await?);
         }
         assert!(!set_peak_value(&db, "p0", d("13")).await?);
-        add_cost(&db, CostKind::FailedTx, 3, d("0.5"), opened).await?;
-        add_cost(&db, CostKind::FailedTx, 2, d("7"), opened).await?;
+        add_cost(&db, CostKind::FailedTx, V + 3, d("0.5"), opened).await?;
+        add_cost(&db, CostKind::FailedTx, V + 2, d("7"), opened).await?;
 
         let result = strategy_performance(&db, "momentum-a").await?;
         assert_eq!(result.closed.trades, 4);

@@ -28,7 +28,7 @@ use jarvis_market_data::pools;
 use jarvis_market_data::rpc::{CrossCheckedRpc, RpcEndpoint};
 use jarvis_market_data::snapshot::{to_snapshot, Observation};
 use jarvis_market_data::{ApiKey, MarketDataError};
-use jarvis_onchain::config::{seeds, Family, StrategyConfig};
+use jarvis_onchain::config::{seeds, StrategyConfig};
 use jarvis_onchain::filter::{self, FilterRules, RejectReason, Verdict};
 use jarvis_onchain::gate::{self, GateReport, GateRules};
 use jarvis_onchain::goals::{self, Progress};
@@ -46,8 +46,7 @@ use jarvis_store::Database;
 use profile::is_mint;
 pub use profile::PaperProfile;
 use store::{
-    Candidate, Cost, CostKind, GateSnapshot, StrategyAuthor, StrategyFamily, StrategyVersion, Trip,
-    TripClose,
+    Candidate, Cost, CostKind, GateSnapshot, StrategyAuthor, StrategyVersion, Trip, TripClose,
 };
 
 pub const TICK_INTERVAL: StdDuration = StdDuration::from_secs(60);
@@ -74,6 +73,16 @@ const CLOCK_TOLERANCE: Duration = Duration::minutes(5);
 /// Typed strategy versions start above this; legacy profile versions stay
 /// below it. Versions are unique across strategies, so the two never collide.
 pub const STRATEGY_VERSION_FLOOR: u32 = 1_000_000;
+/// Exits of a position whose version has no usable rules: only the time
+/// stop, at the longest hold any typed version may have. The price-based
+/// fields are never read, as such a position is evaluated without a mark.
+const TIME_STOP_ONLY: ExitRules = ExitRules {
+    take_profit_bps: strategy::bounds::TAKE_PROFIT_BPS.1,
+    stop_loss_bps: strategy::bounds::STOP_LOSS_BPS.1,
+    trailing_stop_bps: None,
+    liquidity_drop_exit_bps: strategy::bounds::LIQUIDITY_DROP_BPS.1,
+    max_hold: strategy::bounds::CONFIG_MAX_HOLD.1,
+};
 /// Sell quotes are taken into USDC.
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -152,6 +161,11 @@ impl Drop for RunningGuard {
 /// What the overview shows, for the whole paper book (every strategy).
 #[derive(Debug, Clone)]
 pub struct PaperView {
+    /// Deprecated, kept for clients written for a single strategy: the
+    /// active version of the first strategy by id (normally
+    /// `a-survivor-momentum`), or seed A's version before any is listed. It
+    /// does not scope anything else in the view.
+    pub strategy_version: u32,
     pub at: OffsetDateTime,
     pub stake_usd: Decimal,
     pub pnl: Pnl,
@@ -471,7 +485,8 @@ enum Rules {
     /// Exits only: a legacy profile version, or a typed one that no longer
     /// validates against the profile's rules.
     ExitOnly(ExitRules),
-    /// Nothing usable is recorded; its positions are not exited.
+    /// Nothing usable is recorded; its positions only get the time stop
+    /// ([`TIME_STOP_ONLY`]).
     Unusable,
 }
 
@@ -854,12 +869,6 @@ impl PaperTask {
                     rules: Rules::Unusable,
                 },
             };
-            if matches!(parsed.rules, Rules::Unusable) {
-                tracing::error!(
-                    version,
-                    "memecoin paper: strategy version has no usable rules; its positions are not exited"
-                );
-            }
             self.versions.insert(version, parsed);
         }
         Ok(())
@@ -944,6 +953,7 @@ impl PaperTask {
         let now = OffsetDateTime::now_utc();
         let mut marks = marks_of(&pairs, &mints, now);
 
+        let mut unusable = 0;
         // Exits first, for every held position, by the rules of the version
         // that opened it, also while paused or its strategy is disabled. A
         // position whose exit failed EXIT_FAILURE_CAP times is stuck.
@@ -951,17 +961,19 @@ impl PaperTask {
             let Some(mark) = marks.get(&trip.mint).copied() else {
                 continue;
             };
-            let Some(rules) = versions
+            let known = versions
                 .get(&trip.strategy_version)
-                .and_then(|v| v.rules.exit_rules())
-            else {
-                continue;
-            };
+                .and_then(|v| v.rules.exit_rules());
+            if known.is_none() {
+                unusable += 1;
+            }
+            let rules = known.unwrap_or(TIME_STOP_ONLY);
             let held_position = position(trip);
+            // Without rules of its own only the time stop applies.
             let reason = strategy::exit_reason(
                 &held_position,
                 trip.peak_value_usd,
-                Some(mark),
+                known.and(Some(mark)),
                 &rules,
                 &p.costs,
                 now,
@@ -970,11 +982,14 @@ impl PaperTask {
                 let peak =
                     strategy::track_peak(trip.peak_value_usd, &held_position, mark, &p.costs);
                 if let Some(peak) = peak.filter(|_| peak > trip.peak_value_usd) {
-                    let stored = store::set_peak_value(db, &trip.id, peak);
-                    if !bounded("peak value", stored).await? {
-                        return Err("paper trip was not open");
+                    // Best effort: a lost peak only lets the trail start lower.
+                    match bounded("peak value", store::set_peak_value(db, &trip.id, peak)).await {
+                        Ok(true) => trip.peak_value_usd = Some(peak),
+                        Ok(false) => {
+                            tracing::warn!(mint = %trip.mint, "memecoin paper: peak of a trip that is not open")
+                        }
+                        Err(_) => {}
                     }
-                    trip.peak_value_usd = Some(peak);
                 }
                 continue;
             };
@@ -1033,6 +1048,13 @@ impl PaperTask {
                     }
                 }
             }
+        }
+
+        if unusable > 0 {
+            tracing::error!(
+                positions = unusable,
+                "memecoin paper: positions without usable strategy rules; only the time stop applies"
+            );
         }
 
         // Strategies that may enter: enabled, with an active version that
@@ -1276,6 +1298,11 @@ impl PaperTask {
             })
             .collect();
         let view = PaperView {
+            strategy_version: strategies
+                .iter()
+                .flatten()
+                .next()
+                .map_or(STRATEGY_VERSION_FLOOR + 1, |s| s.active_version),
             at: now,
             stake_usd: p.stake_usd,
             pnl,
@@ -1298,14 +1325,15 @@ impl PaperTask {
             .last_gate_at
             .is_none_or(|at| now - at >= GATE_SNAPSHOT_EVERY);
         if let (true, Ok(strategies)) = (snapshot_due, &strategies) {
-            let mut stored = true;
+            // Hourly even if one fails: a failed write is logged and skipped.
+            self.last_gate_at = Some(now);
             for version in strategies.iter().map(|s| s.active_version) {
                 let Some(report) = book
                     .version_ledger(version)
                     .ok()
                     .and_then(|ledger| gate::evaluate(&ledger, &marks, &p.costs, &rules).ok())
                 else {
-                    stored = false;
+                    tracing::warn!(version, "memecoin paper: gate snapshot cannot be computed");
                     continue;
                 };
                 let snapshot = GateSnapshot {
@@ -1318,12 +1346,7 @@ impl PaperTask {
                     net_result_usd: report.net_result_usd,
                     net_expectancy_usd: report.net_expectancy_usd,
                 };
-                stored &= bounded("gate snapshot", store::insert_gate_snapshot(db, &snapshot))
-                    .await
-                    .is_ok();
-            }
-            if stored {
-                self.last_gate_at = Some(now);
+                let _ = bounded("gate snapshot", store::insert_gate_snapshot(db, &snapshot)).await;
             }
         }
         Ok(stats)
@@ -1348,11 +1371,7 @@ pub async fn seed_strategies(db: &Database, base: &FilterRules) -> Result<(), &'
         let version = StrategyVersion {
             version: config.version,
             strategy_id: config.id.clone(),
-            family: match config.family {
-                Family::A => StrategyFamily::A,
-                Family::B => StrategyFamily::B,
-                Family::C => StrategyFamily::C,
-            },
+            family: config.family.into(),
             parent_version: None,
             author: StrategyAuthor::Seed,
             params,
@@ -1476,6 +1495,7 @@ mod tests {
     use jarvis_onchain::types::LpStatus;
 
     use super::profile::tests::{fixture, fixture_json, MINT_A, MINT_B};
+    use super::store::StrategyFamily;
     use super::*;
 
     fn d(value: &str) -> Decimal {
@@ -1857,7 +1877,10 @@ mod tests {
         let series = store::load_series(&db, MINT_A, OffsetDateTime::now_utc(), 10).await?;
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].price_usd, d("0.001"));
-        assert_eq!(handle.view().ok_or("no view")?.open.len(), 3);
+        let view = handle.view().ok_or("no view")?;
+        assert_eq!(view.open.len(), 3);
+        // Deprecated, for single-strategy clients: the first strategy's version.
+        assert_eq!(view.strategy_version, a);
 
         // Tick 2: the owner disables B; its position still exits at the
         // take profit. A rises: its peak value is stored, it holds on.
@@ -1945,6 +1968,30 @@ mod tests {
             .await?;
         assert!(task.handle.paused());
         assert_eq!((stats.observed, stats.entries), (0, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn a_position_without_rules_still_gets_the_time_stop(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let db = connect("memecoin_rules").await?;
+        // Opened under a version that was never recorded, 31 days ago.
+        let mut orphan = trip("orphan", MINT_A, 0, None);
+        orphan.strategy_version = 77;
+        orphan.opened_at = OffsetDateTime::now_utc() - Duration::days(31);
+        store::open_trip(&db, &orphan).await?;
+        let mut task = PaperTask::new(watching(&[MINT_A]), Arc::new(PaperHandle::new(true)));
+        let market = FixtureMarket::new(&[(MINT_A, "0.25", Duration::hours(2))]);
+        let stats = task
+            .tick(&db, &market, &mut || Decimal::new(999_999, 6))
+            .await?;
+        assert_eq!(stats.exits, 1);
+        let closed = store::recent_closed_trips(&db, 1).await?;
+        assert_eq!(
+            closed[0].close.as_ref().ok_or("open")?.exit_reason,
+            "time_stop"
+        );
         Ok(())
     }
 
