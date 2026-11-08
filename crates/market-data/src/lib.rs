@@ -1,9 +1,9 @@
 //! Read-only market-data clients for the on-chain memecoin trader.
 //!
 //! Every client here only *reads* public data: DexScreener pairs, RugCheck
-//! token reports, Solana JSON-RPC account reads and Jupiter quotes. Nothing in
-//! this crate signs, builds or sends a transaction, and no swap or execution
-//! endpoint is called. [`snapshot`] maps the raw reads into
+//! token reports, Solana JSON-RPC account and transaction reads and Jupiter
+//! quotes. Nothing in this crate signs, builds or sends a transaction, and no
+//! swap or execution endpoint is called. [`snapshot`] maps the raw reads into
 //! [`jarvis_onchain::types::TokenSnapshot`] for the deterministic core.
 //!
 //! All responses are untrusted input:
@@ -24,6 +24,7 @@ use serde::{Deserialize, Deserializer};
 use zeroize::Zeroizing;
 
 pub mod dexscreener;
+pub mod discovery;
 mod http;
 pub mod jupiter;
 pub mod pools;
@@ -137,11 +138,24 @@ impl fmt::Debug for ApiKey {
 /// Check that `address` looks like a Solana address (base58, 32..=44 chars)
 /// before it is put into a URL path or request.
 pub(crate) fn validate_address(address: &str) -> Result<(), MarketDataError> {
+    check_base58(address, 32..=44, "address")
+}
+
+/// Same for a transaction signature (64 bytes, at most 88 base58 chars).
+pub(crate) fn validate_signature(signature: &str) -> Result<(), MarketDataError> {
+    check_base58(signature, 64..=88, "signature")
+}
+
+fn check_base58(
+    text: &str,
+    len: std::ops::RangeInclusive<usize>,
+    what: &'static str,
+) -> Result<(), MarketDataError> {
     const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    if (32..=44).contains(&address.len()) && address.bytes().all(|b| BASE58.contains(&b)) {
+    if len.contains(&text.len()) && text.bytes().all(|b| BASE58.contains(&b)) {
         Ok(())
     } else {
-        Err(MarketDataError::InvalidInput("address"))
+        Err(MarketDataError::InvalidInput(what))
     }
 }
 

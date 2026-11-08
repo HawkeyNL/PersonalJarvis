@@ -252,7 +252,7 @@ fn burned_or_unknown(
 }
 
 /// Base58 (Bitcoin alphabet) text of a public key.
-fn base58(bytes: &[u8]) -> String {
+pub(crate) fn base58(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     // Little-endian base-58 digits of the big-endian number in `bytes`.
     let mut digits: Vec<u8> = Vec::with_capacity(44);
