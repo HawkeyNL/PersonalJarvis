@@ -2,45 +2,52 @@
 //!
 //! It has no wallet, no signer and no execution path, and no LLM output
 //! reaches it. Each tick it reloads the paper ledger from the database,
-//! values open positions and simulates exits (also while paused), then, if
-//! not paused, observes a few watchlist mints and mints found by
-//! [`discovery`], runs the hard filters and the strategy, and simulates
-//! entries. A [`TradeIntent`] is used on the spot by the simulator and never
-//! stored or sent anywhere.
+//! values open positions and simulates exits by the rules of the strategy
+//! version that opened each one (also while paused or when that strategy is
+//! disabled), records the price and liquidity it saw, then, if not paused,
+//! observes a few watchlist mints and mints found by [`discovery`], runs the
+//! hard filters and every enabled strategy's active [`StrategyConfig`] on
+//! signals from those recorded observations, and simulates entries. Nothing
+//! it decides is stored as an order or sent anywhere.
 //!
-//! [`TradeIntent`]: jarvis_onchain::strategy::TradeIntent
 //! [`discovery`]: jarvis_market_data::discovery
 
 pub mod profile;
 pub mod store;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
 use jarvis_market_data::dexscreener::{DexScreenerClient, Pair};
-use jarvis_market_data::discovery::{Discovery, PollStats};
+use jarvis_market_data::discovery::{self, Discovery, Migration, PollStats};
 use jarvis_market_data::jupiter::{JupiterClient, QuoteRequest};
 use jarvis_market_data::pools;
 use jarvis_market_data::rpc::{CrossCheckedRpc, RpcEndpoint};
 use jarvis_market_data::snapshot::{to_snapshot, Observation};
 use jarvis_market_data::{ApiKey, MarketDataError};
-use jarvis_onchain::filter::{self, RejectReason, Verdict};
+use jarvis_onchain::config::{seeds, StrategyConfig};
+use jarvis_onchain::filter::{self, FilterRules, RejectReason, Verdict};
 use jarvis_onchain::gate::{self, GateReport, GateRules};
 use jarvis_onchain::goals::{self, Progress};
 use jarvis_onchain::paper::{self, Fill, Ledger, LedgerError, Mark, Pnl};
 use jarvis_onchain::research::{apply_research, ResearchAdjustment};
-use jarvis_onchain::strategy::{self, ExitReason};
+use jarvis_onchain::signals::{Observation as SeriesPoint, Series};
+use jarvis_onchain::strategy::{self, ExitReason, ExitRules};
 use jarvis_onchain::types::{Position, TokenSnapshot};
 use rand::Rng;
 use rust_decimal::Decimal;
-use time::{Duration, OffsetDateTime};
+use serde::Deserialize;
+use time::{Date, Duration, OffsetDateTime, UtcOffset};
 
 use jarvis_store::Database;
+use profile::is_mint;
 pub use profile::PaperProfile;
-use store::{Candidate, Cost, CostKind, GateSnapshot, Trip, TripClose};
+use store::{
+    Candidate, Cost, CostKind, GateSnapshot, StrategyAuthor, StrategyVersion, Trip, TripClose,
+};
 
 pub const TICK_INTERVAL: StdDuration = StdDuration::from_secs(60);
 /// A whole tick, provider pacing included. Cancelling it is safe: the next
@@ -63,6 +70,19 @@ pub const EXIT_FAILURE_CAP: u32 = 10;
 /// was ahead before: stop instead of stamping events into the future, which
 /// would stretch the paper gate's duration.
 const CLOCK_TOLERANCE: Duration = Duration::minutes(5);
+/// Typed strategy versions start above this; legacy profile versions stay
+/// below it. Versions are unique across strategies, so the two never collide.
+pub const STRATEGY_VERSION_FLOOR: u32 = 1_000_000;
+/// Exits of a position whose version has no usable rules: only the time
+/// stop, at the longest hold any typed version may have. The price-based
+/// fields are never read, as such a position is evaluated without a mark.
+const TIME_STOP_ONLY: ExitRules = ExitRules {
+    take_profit_bps: strategy::bounds::TAKE_PROFIT_BPS.1,
+    stop_loss_bps: strategy::bounds::STOP_LOSS_BPS.1,
+    trailing_stop_bps: None,
+    liquidity_drop_exit_bps: strategy::bounds::LIQUIDITY_DROP_BPS.1,
+    max_hold: strategy::bounds::CONFIG_MAX_HOLD.1,
+};
 /// Sell quotes are taken into USDC.
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -138,9 +158,13 @@ impl Drop for RunningGuard {
     }
 }
 
-/// What the overview shows, for the current strategy version.
+/// What the overview shows, for the whole paper book (every strategy).
 #[derive(Debug, Clone)]
 pub struct PaperView {
+    /// Deprecated, kept for clients written for a single strategy: the
+    /// active version of the first strategy by id (normally
+    /// `a-survivor-momentum`), or seed A's version before any is listed. It
+    /// does not scope anything else in the view.
     pub strategy_version: u32,
     pub at: OffsetDateTime,
     pub stake_usd: Decimal,
@@ -448,27 +472,186 @@ pub struct TickStats {
     pub provider_errors: usize,
 }
 
+/// What a recorded strategy version lets the paper loop do.
+#[derive(Debug, Clone)]
+enum Rules {
+    /// A typed version that validates against the profile's filter rules:
+    /// it enters while its strategy is enabled, with `filter` (the profile's
+    /// rules tightened by the config).
+    Config {
+        config: Box<StrategyConfig>,
+        filter: FilterRules,
+    },
+    /// Exits only: a legacy profile version, or a typed one that no longer
+    /// validates against the profile's rules.
+    ExitOnly(ExitRules),
+    /// Nothing usable is recorded; its positions only get the time stop
+    /// ([`TIME_STOP_ONLY`]).
+    Unusable,
+}
+
+impl Rules {
+    fn exit_rules(&self) -> Option<ExitRules> {
+        match self {
+            Rules::Config { config, .. } => Some(config.exit_rules()),
+            Rules::ExitOnly(rules) => Some(*rules),
+            Rules::Unusable => None,
+        }
+    }
+}
+
+/// A recorded strategy version. Versions never change, so the task keeps
+/// them once read.
+#[derive(Debug, Clone)]
+struct Version {
+    /// `None` for a legacy version.
+    strategy_id: Option<String>,
+    rules: Rules,
+}
+
+/// The exit side of a legacy version's recorded profile parameters.
+#[derive(Deserialize)]
+struct LegacyParams {
+    strategy: LegacyExit,
+}
+
+#[derive(Deserialize)]
+struct LegacyExit {
+    take_profit_bps: u32,
+    stop_loss_bps: u32,
+    liquidity_drop_exit_bps: u32,
+    max_hold_secs: u64,
+}
+
+fn parse_version(
+    version: u32,
+    strategy_id: Option<String>,
+    params: &str,
+    base: &FilterRules,
+) -> Version {
+    let rules = match serde_json::from_str::<StrategyConfig>(params) {
+        Ok(config) if config.version == version && strategy_id.as_ref() == Some(&config.id) => {
+            match config.validate(base) {
+                Ok(filter) => Rules::Config {
+                    config: Box::new(config),
+                    filter,
+                },
+                Err(error) => {
+                    tracing::warn!(version, %error, "memecoin paper: strategy version does not fit the profile; exits only");
+                    Rules::ExitOnly(config.exit_rules())
+                }
+            }
+        }
+        Ok(_) => Rules::Unusable,
+        Err(_) => match serde_json::from_str::<LegacyParams>(params) {
+            Ok(LegacyParams { strategy: s }) => i64::try_from(s.max_hold_secs)
+                .map(|secs| {
+                    Rules::ExitOnly(ExitRules {
+                        take_profit_bps: s.take_profit_bps,
+                        stop_loss_bps: s.stop_loss_bps,
+                        trailing_stop_bps: None,
+                        liquidity_drop_exit_bps: s.liquidity_drop_exit_bps,
+                        max_hold: Duration::seconds(secs),
+                    })
+                })
+                .unwrap_or(Rules::Unusable),
+            Err(_) => Rules::Unusable,
+        },
+    };
+    Version { strategy_id, rules }
+}
+
+/// Per-strategy entry limits on top of the profile's global ones, counted
+/// from the stored trips at the start of a tick.
+struct Caps<'a> {
+    /// Positions one strategy may hold: an equal share of the profile's
+    /// `max_open_positions` among the enabled strategies, at least one.
+    max_open: usize,
+    today: Date,
+    open: HashMap<&'a str, usize>,
+    entries_today: HashMap<&'a str, u32>,
+    last_exit: HashMap<(&'a str, &'a str), OffsetDateTime>,
+}
+
+impl<'a> Caps<'a> {
+    fn new(
+        trips: impl Iterator<Item = &'a Trip>,
+        owner: impl Fn(u32) -> Option<&'a str>,
+        max_open: usize,
+        now: OffsetDateTime,
+    ) -> Self {
+        let mut caps = Caps {
+            max_open,
+            today: now.to_offset(UtcOffset::UTC).date(),
+            open: HashMap::new(),
+            entries_today: HashMap::new(),
+            last_exit: HashMap::new(),
+        };
+        for trip in trips {
+            let Some(id) = owner(trip.strategy_version) else {
+                continue;
+            };
+            if trip.opened_at.to_offset(UtcOffset::UTC).date() == caps.today {
+                *caps.entries_today.entry(id).or_default() += 1;
+            }
+            match &trip.close {
+                None => *caps.open.entry(id).or_default() += 1,
+                Some(close) => {
+                    let last = caps
+                        .last_exit
+                        .entry((id, trip.mint.as_str()))
+                        .or_insert(close.closed_at);
+                    *last = (*last).max(close.closed_at);
+                }
+            }
+        }
+        caps
+    }
+
+    /// Whether strategy `id` may enter `mint` at `at`: below its share of
+    /// open positions and its entries for the UTC day, and past its
+    /// cooldown since it last left `mint`.
+    fn allow(&self, id: &str, config: &StrategyConfig, mint: &str, at: OffsetDateTime) -> bool {
+        let open = self.open.get(id).copied().unwrap_or(0);
+        let entries = self.entries_today.get(id).copied().unwrap_or(0);
+        let cooling = self
+            .last_exit
+            .get(&(id, mint))
+            .is_some_and(|left| at - *left < config.token_cooldown());
+        open < self.max_open && entries < config.max_entries_per_day && !cooling
+    }
+
+    fn entered(&mut self, id: &'a str) {
+        *self.open.entry(id).or_default() += 1;
+        *self.entries_today.entry(id).or_default() += 1;
+    }
+}
+
 /// State the task keeps between ticks. Everything else is reloaded.
 pub struct PaperTask {
     pub profile: PaperProfile,
     pub handle: Arc<PaperHandle>,
-    /// Last observation per mint, to pace providers and to write a
-    /// candidate row only when its verdict changes.
-    seen: HashMap<String, (Option<&'static str>, OffsetDateTime)>,
+    /// Last observation per mint with the filter verdict per strategy
+    /// version, to pace providers and to write a candidate row only when a
+    /// verdict changes.
+    seen: HashMap<String, (BTreeMap<u32, Option<&'static str>>, OffsetDateTime)>,
     last_gate_at: Option<OffsetDateTime>,
     /// `None` when the profile turns discovery off.
     discovery: Option<Discovery>,
     last_discovery_at: Option<OffsetDateTime>,
+    /// Discovered mints already stored in the universe.
+    universe_saved: HashSet<String>,
+    versions: HashMap<u32, Version>,
 }
 
 /// Up to [`MAX_ENTRY_CANDIDATES_PER_TICK`] mints to observe: not held, not
 /// observed within [`OBSERVE_COOLDOWN`], watchlist before discovered mints,
 /// then least recently observed first.
-fn entry_candidates<'a>(
+fn entry_candidates<'a, T>(
     watchlist: &'a [String],
     discovered: impl Iterator<Item = &'a String>,
     held: &BTreeSet<String>,
-    seen: &HashMap<String, (Option<&'static str>, OffsetDateTime)>,
+    seen: &HashMap<String, (T, OffsetDateTime)>,
     now: OffsetDateTime,
 ) -> Vec<&'a String> {
     let mut due: Vec<(bool, &String)> = watchlist
@@ -490,12 +673,35 @@ fn entry_candidates<'a>(
     due.into_iter().map(|(_, m)| m).collect()
 }
 
-/// The whole stored ledger for the current strategy version.
-async fn load_history(db: &Database, version: u32) -> Result<Ledger, &'static str> {
+/// The whole stored paper book, checked to replay exactly.
+struct Book {
+    trips: Vec<Trip>,
+    costs: Vec<Cost>,
+    ledger: Ledger,
+}
+
+impl Book {
+    /// The ledger of one strategy version alone.
+    fn version_ledger(&self, version: u32) -> Result<Ledger, &'static str> {
+        let trips: Vec<&Trip> = self
+            .trips
+            .iter()
+            .filter(|t| t.strategy_version == version)
+            .collect();
+        let costs: Vec<&Cost> = self
+            .costs
+            .iter()
+            .filter(|c| c.strategy_version == version)
+            .collect();
+        replay(&trips, &costs).map_err(|_| "paper ledger does not replay")
+    }
+}
+
+async fn load_book(db: &Database) -> Result<Book, &'static str> {
     let trips = bounded("trips", store::load_trips(db)).await?;
     let costs = bounded("costs", store::load_costs(db)).await?;
     // Every stored result must recompute, whatever its version.
-    replay(
+    let ledger = replay(
         &trips.iter().collect::<Vec<_>>(),
         &costs.iter().collect::<Vec<_>>(),
     )
@@ -503,15 +709,130 @@ async fn load_history(db: &Database, version: u32) -> Result<Ledger, &'static st
         tracing::error!(?error, "memecoin paper ledger does not replay");
         "paper ledger does not replay"
     })?;
-    let ours: Vec<&Trip> = trips
+    Ok(Book {
+        trips,
+        costs,
+        ledger,
+    })
+}
+
+/// Price and liquidity of each of `mints` with a main pool in `pairs`.
+fn marks_of(pairs: &[Pair], mints: &[&str], now: OffsetDateTime) -> BTreeMap<String, Mark> {
+    mints
         .iter()
-        .filter(|t| t.strategy_version == version)
+        .filter_map(|mint| {
+            let snapshot = main_pair(pairs, mint).and_then(|pair| pair_snapshot(pair, now))?;
+            Some((
+                (*mint).to_owned(),
+                Mark {
+                    price_usd: snapshot.price_usd,
+                    liquidity_usd: snapshot.liquidity_usd,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Store what was seen of each mint this tick, for the signals. Best
+/// effort: a lost observation only thins a series.
+async fn record_observations(db: &Database, marks: &BTreeMap<String, Mark>, now: OffsetDateTime) {
+    let _ = bounded("observations", async {
+        for (mint, mark) in marks {
+            let observation = store::Observation {
+                mint: mint.clone(),
+                at: now,
+                price_usd: mark.price_usd,
+                liquidity_usd: mark.liquidity_usd,
+            };
+            store::record_observation(db, &observation).await?;
+        }
+        Ok(())
+    })
+    .await;
+}
+
+/// The recent series of `mint`, ending with `snapshot`, which is what an
+/// entry would fill at.
+async fn load_series(
+    db: &Database,
+    mint: &str,
+    snapshot: &TokenSnapshot,
+) -> Result<Series, &'static str> {
+    let at = snapshot.observed_at;
+    let stored = store::load_series(db, mint, at, store::MAX_SERIES_POINTS);
+    let mut points: Vec<SeriesPoint> = bounded("series", stored)
+        .await?
+        .into_iter()
+        .map(|o| SeriesPoint {
+            at: o.at,
+            price_usd: o.price_usd,
+            liquidity_usd: o.liquidity_usd,
+        })
         .collect();
-    let our_costs: Vec<&Cost> = costs
-        .iter()
-        .filter(|c| c.strategy_version == version)
+    if points.last().is_none_or(|last| last.at < at) {
+        points.push(SeriesPoint {
+            at,
+            price_usd: snapshot.price_usd,
+            liquidity_usd: snapshot.liquidity_usd,
+        });
+    }
+    Ok(Series {
+        pool_created_at: snapshot.pool_created_at,
+        points,
+    })
+}
+
+/// Store the discovered mints not stored yet, so a restart keeps the
+/// discovery window.
+async fn save_universe(db: &Database, discovery: &Discovery, saved: &mut HashSet<String>) {
+    let new: Vec<store::UniverseEntry> = discovery
+        .migrations()
+        .filter(|m| !saved.contains(&m.mint) && is_mint(&m.mint) && is_mint(&m.pool))
+        .map(|m| store::UniverseEntry {
+            mint: m.mint.clone(),
+            pool: m.pool.clone(),
+            program: pools::PUMPSWAP_PROGRAM.to_owned(),
+            migrated_at: m.migrated_at,
+        })
         .collect();
-    replay(&ours, &our_costs).map_err(|_| "paper ledger does not replay")
+    if new.is_empty() {
+        return;
+    }
+    let stored = bounded("universe", async {
+        for entry in &new {
+            store::upsert_universe(db, entry).await?;
+        }
+        Ok(())
+    })
+    .await;
+    if stored.is_ok() {
+        saved.extend(new.into_iter().map(|entry| entry.mint));
+    }
+    saved.retain(|mint| discovery.knows(mint));
+}
+
+/// Load the stored universe of the discovery window into `discovery`.
+async fn restore_universe(
+    db: &Database,
+    discovery: &mut Discovery,
+    saved: &mut HashSet<String>,
+    now: OffsetDateTime,
+) {
+    let stored = store::load_universe(db, now - discovery::MAX_AGE, discovery::MAX_MINTS);
+    let Ok(entries) = bounded("universe", stored).await else {
+        return;
+    };
+    for entry in entries {
+        let migration = Migration {
+            mint: entry.mint,
+            pool: entry.pool,
+            migrated_at: entry.migrated_at,
+        };
+        let mint = migration.mint.clone();
+        if discovery.remember(migration, now) {
+            saved.insert(mint);
+        }
+    }
 }
 
 impl PaperTask {
@@ -523,13 +844,40 @@ impl PaperTask {
             seen: HashMap::new(),
             last_gate_at: None,
             last_discovery_at: None,
+            universe_saved: HashSet::new(),
+            versions: HashMap::new(),
         }
     }
 
+    /// Read the strategy versions in `needed` that are not known yet.
+    async fn load_versions(
+        &mut self,
+        db: &Database,
+        needed: &BTreeSet<u32>,
+    ) -> Result<(), &'static str> {
+        for &version in needed {
+            if self.versions.contains_key(&version) {
+                continue;
+            }
+            let stored = bounded("strategy version", store::version_params(db, version)).await?;
+            let parsed = match stored {
+                Some((strategy_id, params)) => {
+                    parse_version(version, strategy_id, &params, &self.profile.rules)
+                }
+                None => Version {
+                    strategy_id: None,
+                    rules: Rules::Unusable,
+                },
+            };
+            self.versions.insert(version, parsed);
+        }
+        Ok(())
+    }
+
     /// One tick. `Err` stops the tick; nothing is simulated without its
-    /// write having succeeded first. Exits need only the held positions, so
-    /// a problem with the stored history stops entries and the report, never
-    /// exits.
+    /// write having succeeded first. Exits need only the held positions and
+    /// their versions, so a problem with the stored history or the strategy
+    /// list stops entries and the report, never exits.
     pub async fn tick(
         &mut self,
         db: &Database,
@@ -560,9 +908,20 @@ impl PaperTask {
             last = Some(at);
             at
         };
+        let book = load_book(db).await;
+        let strategies = bounded("strategies", store::list_strategies(db)).await;
+        let needed: BTreeSet<u32> = held
+            .iter()
+            .map(|t| t.strategy_version)
+            .chain(
+                book.iter()
+                    .flat_map(|b| b.trips.iter().map(|t| t.strategy_version)),
+            )
+            .chain(strategies.iter().flatten().map(|s| s.active_version))
+            .collect();
+        self.load_versions(db, &needed).await?;
         let p = &self.profile;
-        let version = p.strategy.version;
-        let history = load_history(db, version).await;
+        let versions = &self.versions;
         // A stored pause latches; a failed read pauses this tick only.
         let read_failed = match bounded("pause state", store::control(db)).await {
             Ok(control) => {
@@ -592,46 +951,52 @@ impl PaperTask {
             }
         };
         let now = OffsetDateTime::now_utc();
-        let mut marks = BTreeMap::new();
-        for mint in &mints {
-            if let Some(snapshot) =
-                main_pair(&pairs, mint).and_then(|pair| pair_snapshot(pair, now))
-            {
-                marks.insert(
-                    (*mint).to_owned(),
-                    Mark {
-                        price_usd: snapshot.price_usd,
-                        liquidity_usd: snapshot.liquidity_usd,
-                    },
-                );
-            }
-        }
+        let mut marks = marks_of(&pairs, &mints, now);
 
-        // Exits first, for every held position and also while paused. A
+        let mut unusable = 0;
+        // Exits first, for every held position, by the rules of the version
+        // that opened it, also while paused or its strategy is disabled. A
         // position whose exit failed EXIT_FAILURE_CAP times is stuck.
         for trip in held.iter_mut().filter(|t| !t.stuck) {
-            let Some(snapshot) =
-                main_pair(&pairs, &trip.mint).and_then(|pair| pair_snapshot(pair, now))
-            else {
+            let Some(mark) = marks.get(&trip.mint).copied() else {
                 continue;
             };
-            let Some(intent) = strategy::evaluate_exit(
-                &position(trip),
-                &snapshot,
-                &p.strategy,
+            let known = versions
+                .get(&trip.strategy_version)
+                .and_then(|v| v.rules.exit_rules());
+            if known.is_none() {
+                unusable += 1;
+            }
+            let rules = known.unwrap_or(TIME_STOP_ONLY);
+            let held_position = position(trip);
+            // Without rules of its own only the time stop applies.
+            let reason = strategy::exit_reason(
+                &held_position,
+                trip.peak_value_usd,
+                known.and(Some(mark)),
+                &rules,
                 &p.costs,
-                p.rules.max_snapshot_age,
                 now,
-            ) else {
-                continue;
-            };
-            let strategy::IntentKind::Exit(reason) = intent.kind else {
+            );
+            let Some(reason) = reason else {
+                let peak =
+                    strategy::track_peak(trip.peak_value_usd, &held_position, mark, &p.costs);
+                if let Some(peak) = peak.filter(|_| peak > trip.peak_value_usd) {
+                    // Best effort: a lost peak only lets the trail start lower.
+                    match bounded("peak value", store::set_peak_value(db, &trip.id, peak)).await {
+                        Ok(true) => trip.peak_value_usd = Some(peak),
+                        Ok(false) => {
+                            tracing::warn!(mint = %trip.mint, "memecoin paper: peak of a trip that is not open")
+                        }
+                        Err(_) => {}
+                    }
+                }
                 continue;
             };
             match paper::sell(
                 trip.tokens,
-                snapshot.price_usd,
-                snapshot.liquidity_usd,
+                mark.price_usd,
+                mark.liquidity_usd,
                 &p.costs,
                 roll(),
             ) {
@@ -685,13 +1050,36 @@ impl PaperTask {
             }
         }
 
+        if unusable > 0 {
+            tracing::error!(
+                positions = unusable,
+                "memecoin paper: positions without usable strategy rules; only the time stop applies"
+            );
+        }
+
+        // Strategies that may enter: enabled, with an active version that
+        // fits the profile. Ordered by id, which is also their priority.
+        let enabled: Vec<(&str, u32, &StrategyConfig, &FilterRules)> = strategies
+            .iter()
+            .flatten()
+            .filter(|s| s.enabled)
+            .filter_map(|s| match versions.get(&s.active_version) {
+                Some(Version {
+                    strategy_id: Some(owner),
+                    rules: Rules::Config { config, filter },
+                }) if *owner == s.id => Some((s.id.as_str(), s.active_version, &**config, filter)),
+                _ => None,
+            })
+            .collect();
+        let entries_possible = book.is_ok() && !enabled.is_empty();
+
         // New candidates from pump.fun migrations, only when entries can
         // follow.
         let poll_due = self
             .last_discovery_at
             .is_none_or(|at| now - at >= DISCOVERY_EVERY);
         if let Some(discovery) = self.discovery.as_mut() {
-            if poll_due && history.is_ok() && !paused() {
+            if poll_due && entries_possible && !paused() {
                 self.last_discovery_at = Some(now);
                 let poll = source.discover(discovery, now);
                 match tokio::time::timeout(DISCOVERY_TIMEOUT, poll).await {
@@ -707,11 +1095,12 @@ impl PaperTask {
                     }
                     Err(_) => tracing::warn!("memecoin paper: discovery poll timed out"),
                 }
+                save_universe(db, discovery, &mut self.universe_saved).await;
             }
         }
 
-        // Entries need an intact history: a few watchlist or discovered mints
-        // not held at the start of the tick.
+        // Entries need an intact history and an enabled strategy: a few
+        // watchlist or discovered mints not held at the start of the tick.
         let mut open = held.iter().filter(|t| t.close.is_none()).count();
         let discovery = self.discovery.as_ref();
         self.seen
@@ -721,7 +1110,7 @@ impl PaperTask {
             .flat_map(|d| d.due(now))
             .map(|migration| &migration.mint);
         let mut due = entry_candidates(&p.watchlist, discovered, &held_mints, &self.seen, now);
-        if history.is_err() {
+        if !entries_possible {
             due.clear();
         }
         // Discovered mints were not in the first DexScreener call.
@@ -732,15 +1121,32 @@ impl PaperTask {
             .collect();
         if !extra.is_empty() {
             match source.pairs(&extra).await {
-                Ok(more) => pairs.extend(more),
+                Ok(more) => {
+                    marks.extend(marks_of(&more, &extra, now));
+                    pairs.extend(more);
+                }
                 Err(error) => {
                     stats.provider_errors += 1;
                     tracing::warn!(%error, "memecoin paper: no market data for discovered mints");
                 }
             }
         }
+        record_observations(db, &marks, now).await;
+
+        let per_strategy = (p.max_open_positions / enabled.len().max(1)).max(1);
+        let owner = |version: u32| {
+            versions
+                .get(&version)
+                .and_then(|v| v.strategy_id.as_deref())
+        };
+        let mut caps = Caps::new(
+            book.iter().flat_map(|b| b.trips.iter()),
+            owner,
+            per_strategy,
+            now,
+        );
         let deny_list = BTreeSet::new();
-        for mint in due {
+        'mints: for mint in due {
             if paused() || open >= p.max_open_positions {
                 break;
             }
@@ -757,16 +1163,25 @@ impl PaperTask {
                 None => None,
             };
             let at = OffsetDateTime::now_utc();
-            let reason = match &observed {
-                None => Some("data_unavailable"),
-                Some(snapshot) => match filter::check(snapshot, &p.rules, &deny_list, at) {
-                    Verdict::Accept => None,
-                    Verdict::Reject(reason) => Some(reject_reason(reason)),
-                },
-            };
-            let changed = self.seen.get(mint).is_none_or(|(last, _)| *last != reason);
-            self.seen.insert(mint.clone(), (reason, at));
-            if changed {
+            // The hard filter, with each strategy's tightened rules.
+            let verdicts: BTreeMap<u32, Option<&'static str>> = enabled
+                .iter()
+                .map(|(_, version, _, rules)| {
+                    let reason = match &observed {
+                        None => Some("data_unavailable"),
+                        Some(snapshot) => match filter::check(snapshot, rules, &deny_list, at) {
+                            Verdict::Accept => None,
+                            Verdict::Reject(reason) => Some(reject_reason(reason)),
+                        },
+                    };
+                    (*version, reason)
+                })
+                .collect();
+            let before = self.seen.get(mint).map(|(verdicts, _)| verdicts);
+            for (&version, &reason) in &verdicts {
+                if before.is_some_and(|b| b.get(&version) == Some(&reason)) {
+                    continue;
+                }
                 let candidate = Candidate {
                     id: uuid::Uuid::now_v7().to_string(),
                     mint: mint.clone(),
@@ -779,74 +1194,87 @@ impl PaperTask {
                 // Best effort: a lost decision row must not stop trading.
                 let _ = bounded("candidate", store::insert_candidate(db, &candidate)).await;
             }
-            let Some(snapshot) = observed.filter(|_| reason.is_none()) else {
+            let accepting: Vec<_> = enabled
+                .iter()
+                .filter(|(_, version, ..)| verdicts.get(version) == Some(&None))
+                .collect();
+            self.seen.insert(mint.clone(), (verdicts, at));
+            let Some(snapshot) = observed.filter(|_| !accepting.is_empty()) else {
                 continue;
             };
             stats.accepted += 1;
-            let Some(intent) = strategy::evaluate_entry(
-                &snapshot,
-                &p.strategy,
-                &p.rules,
-                &deny_list,
-                p.max_position_usd,
-                at,
-            ) else {
+            let Ok(series) = load_series(db, mint, &snapshot).await else {
                 continue;
             };
-            // No research step runs yet; it could only veto or shrink.
-            let size = apply_research(intent.amount_in, ResearchAdjustment::Keep);
-            if paused() {
+            // The first strategy whose limits and signal allow it enters.
+            for &&(id, version, config, _) in &accepting {
+                if !caps.allow(id, config, mint, at) || !config.entry_signal(&series, at) {
+                    continue;
+                }
+                let Some(size) = config.entry_size(snapshot.liquidity_usd, p.max_position_usd)
+                else {
+                    continue;
+                };
+                // No research step runs yet; it could only veto or shrink.
+                let size = apply_research(size, ResearchAdjustment::Keep);
+                if paused() {
+                    break 'mints;
+                }
+                match paper::buy(
+                    size,
+                    snapshot.price_usd,
+                    snapshot.liquidity_usd,
+                    &p.costs,
+                    roll(),
+                ) {
+                    Some(Fill::Filled {
+                        amount_out,
+                        fees_usd,
+                    }) => {
+                        let trip = Trip {
+                            id: uuid::Uuid::now_v7().to_string(),
+                            mint: mint.clone(),
+                            strategy_version: version,
+                            tokens: amount_out,
+                            cost_usd: size.checked_add(fees_usd).ok_or("paper entry overflow")?,
+                            entry_liquidity_usd: snapshot.liquidity_usd,
+                            opened_at: stamp(),
+                            exit_failures: 0,
+                            stuck: false,
+                            peak_value_usd: None,
+                            close: None,
+                        };
+                        bounded("open trip", store::open_trip(db, &trip)).await?;
+                        held.push(trip);
+                        open += 1;
+                        caps.entered(id);
+                        stats.entries += 1;
+                    }
+                    Some(Fill::Failed { fees_usd }) => {
+                        let cost =
+                            store::add_cost(db, CostKind::FailedTx, version, fees_usd, stamp());
+                        bounded("add cost", cost).await?;
+                        stats.failed_attempts += 1;
+                    }
+                    None => {}
+                }
                 break;
-            }
-            match paper::buy(
-                size,
-                snapshot.price_usd,
-                snapshot.liquidity_usd,
-                &p.costs,
-                roll(),
-            ) {
-                Some(Fill::Filled {
-                    amount_out,
-                    fees_usd,
-                }) => {
-                    let trip = Trip {
-                        id: uuid::Uuid::now_v7().to_string(),
-                        mint: mint.clone(),
-                        strategy_version: version,
-                        tokens: amount_out,
-                        cost_usd: size.checked_add(fees_usd).ok_or("paper entry overflow")?,
-                        entry_liquidity_usd: snapshot.liquidity_usd,
-                        opened_at: stamp(),
-                        exit_failures: 0,
-                        stuck: false,
-                        close: None,
-                    };
-                    bounded("open trip", store::open_trip(db, &trip)).await?;
-                    held.push(trip);
-                    open += 1;
-                    stats.entries += 1;
-                }
-                Some(Fill::Failed { fees_usd }) => {
-                    let cost = store::add_cost(db, CostKind::FailedTx, version, fees_usd, stamp());
-                    bounded("add cost", cost).await?;
-                    stats.failed_attempts += 1;
-                }
-                None => {}
             }
         }
 
-        // Report on the current strategy version, from the stored ledger.
-        history?;
+        // Report on the whole paper book, from the stored ledger.
+        book?;
         // ponytail: reloads the whole ledger every tick; keep it in memory if it grows large.
-        let ledger = load_history(db, version).await?;
+        let book = load_book(db).await?;
         let rules = GateRules {
             min_closed_trades: gate::MIN_CLOSED_TRADES,
             min_duration: gate::MIN_DURATION,
             min_trading_days: gate::MIN_TRADING_DAYS,
         };
-        let report = gate::evaluate(&ledger, &marks, &p.costs, &rules)
+        let report = gate::evaluate(&book.ledger, &marks, &p.costs, &rules)
             .map_err(|_| "paper gate cannot be computed")?;
-        let pnl = ledger
+        let pnl = book
+            .ledger
             .pnl(&marks, &p.costs)
             .map_err(|_| "paper result cannot be computed")?;
         let equity_usd = p
@@ -870,7 +1298,11 @@ impl PaperTask {
             })
             .collect();
         let view = PaperView {
-            strategy_version: version,
+            strategy_version: strategies
+                .iter()
+                .flatten()
+                .next()
+                .map_or(STRATEGY_VERSION_FLOOR + 1, |s| s.active_version),
             at: now,
             stake_usd: p.stake_usd,
             pnl,
@@ -888,29 +1320,81 @@ impl PaperTask {
         if let Ok(mut slot) = self.handle.view.write() {
             *slot = Some(view);
         }
-        if self
+        // An hourly gate snapshot per strategy, of its active version.
+        let snapshot_due = self
             .last_gate_at
-            .is_none_or(|at| now - at >= GATE_SNAPSHOT_EVERY)
-        {
-            let snapshot = GateSnapshot {
-                id: uuid::Uuid::now_v7().to_string(),
-                at: now,
-                strategy_version: version,
-                closed_trades: report.closed_trades as u64,
-                duration_secs: report.duration.whole_seconds().max(0) as u64,
-                trading_days: report.trading_days as u64,
-                net_result_usd: report.net_result_usd,
-                net_expectancy_usd: report.net_expectancy_usd,
-            };
-            if bounded("gate snapshot", store::insert_gate_snapshot(db, &snapshot))
-                .await
-                .is_ok()
-            {
-                self.last_gate_at = Some(now);
+            .is_none_or(|at| now - at >= GATE_SNAPSHOT_EVERY);
+        if let (true, Ok(strategies)) = (snapshot_due, &strategies) {
+            // Hourly even if one fails: a failed write is logged and skipped.
+            self.last_gate_at = Some(now);
+            for version in strategies.iter().map(|s| s.active_version) {
+                let Some(report) = book
+                    .version_ledger(version)
+                    .ok()
+                    .and_then(|ledger| gate::evaluate(&ledger, &marks, &p.costs, &rules).ok())
+                else {
+                    tracing::warn!(version, "memecoin paper: gate snapshot cannot be computed");
+                    continue;
+                };
+                let snapshot = GateSnapshot {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    at: now,
+                    strategy_version: version,
+                    closed_trades: report.closed_trades as u64,
+                    duration_secs: report.duration.whole_seconds().max(0) as u64,
+                    trading_days: report.trading_days as u64,
+                    net_result_usd: report.net_result_usd,
+                    net_expectancy_usd: report.net_expectancy_usd,
+                };
+                let _ = bounded("gate snapshot", store::insert_gate_snapshot(db, &snapshot)).await;
             }
         }
         Ok(stats)
     }
+}
+
+/// Record the seed strategies A, B and C with versions above
+/// [`STRATEGY_VERSION_FLOOR`] and enable each new one. Idempotent: an
+/// existing strategy keeps its active version and enabled state. A seed that
+/// would loosen the profile's filter rules, or whose version is recorded
+/// with other content, is left out and logged; the others still run.
+pub async fn seed_strategies(db: &Database, base: &FilterRules) -> Result<(), &'static str> {
+    for (index, mut config) in seeds().into_iter().enumerate() {
+        let index = u32::try_from(index).map_err(|_| "too many seeds")?;
+        config.version = STRATEGY_VERSION_FLOOR + 1 + index;
+        if let Err(error) = config.validate(base) {
+            tracing::warn!(strategy = %config.id, %error, "memecoin paper: seed strategy left out; it would loosen the profile");
+            continue;
+        }
+        let params =
+            serde_json::to_string(&config).map_err(|_| "seed strategy cannot be recorded")?;
+        let version = StrategyVersion {
+            version: config.version,
+            strategy_id: config.id.clone(),
+            family: config.family.into(),
+            parent_version: None,
+            author: StrategyAuthor::Seed,
+            params,
+            rationale: None,
+            backtest: None,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        match tokio::time::timeout(DB_TIMEOUT, store::insert_strategy_version(db, &version)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(store::MemecoinStoreError::VersionConflict)) => {
+                tracing::error!(strategy = %config.id, version = config.version, "memecoin paper: seed strategy left out; its version is recorded with other content");
+                continue;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "memecoin paper database call failed");
+                return Err("database call failed");
+            }
+            Err(_) => return Err("database call timed out"),
+        }
+        let insert = store::insert_strategy(db, &config.id, config.version, true, "seed");
+        bounded("seed strategy", insert).await?;
+    }
+    Ok(())
 }
 
 /// Settings for [`start`]; secrets stay inside `market`.
@@ -921,8 +1405,9 @@ pub struct StartConfig {
     pub resume_paused_at: Option<OffsetDateTime>,
 }
 
-/// Record the strategy version, apply a configured resume and spawn the
-/// interval task. An error leaves the trader off; Core keeps running.
+/// Record the legacy strategy version, seed the strategies, apply a
+/// configured resume and spawn the interval task. An error leaves the
+/// trader off; Core keeps running.
 pub async fn start(
     db: Database,
     handle: Arc<PaperHandle>,
@@ -933,14 +1418,18 @@ pub async fn start(
         market,
         resume_paused_at,
     } = config;
-    let register =
-        store::register_strategy_version(&db, profile.strategy.version, &profile.versioned_params);
-    bounded("strategy version", register).await.map_err(|error| {
-        format!(
-            "strategy version {} cannot be recorded ({error}); a changed profile needs a new version",
-            profile.strategy.version
-        )
-    })?;
+    if let (Some(strategy), Some(params)) = (&profile.strategy, &profile.versioned_params) {
+        let register = store::register_strategy_version(&db, strategy.version, params);
+        bounded("strategy version", register).await.map_err(|error| {
+            format!(
+                "strategy version {} cannot be recorded ({error}); a changed profile needs a new version",
+                strategy.version
+            )
+        })?;
+    }
+    seed_strategies(&db, &profile.rules)
+        .await
+        .map_err(|error| format!("strategies cannot be seeded ({error})"))?;
     if let Some(paused_at) = resume_paused_at {
         match bounded("resume", store::resume(&db, paused_at)).await {
             Ok(true) => tracing::warn!(%paused_at, "memecoin paper pause cleared by configuration"),
@@ -948,8 +1437,11 @@ pub async fn start(
             Err(_) => tracing::warn!("memecoin paper resume failed"),
         }
     }
-    let version = profile.strategy.version;
     let mut task = PaperTask::new(profile, handle.clone());
+    if let Some(discovery) = task.discovery.as_mut() {
+        let now = OffsetDateTime::now_utc();
+        restore_universe(&db, discovery, &mut task.universe_saved, now).await;
+    }
     handle.running.store(true, Ordering::SeqCst);
     let guard = RunningGuard(handle.clone());
     tokio::spawn(async move {
@@ -989,10 +1481,7 @@ pub async fn start(
             }
         }
     });
-    tracing::info!(
-        strategy_version = version,
-        "memecoin PAPER trader running (no execution path)"
-    );
+    tracing::info!("memecoin PAPER trader running (no execution path)");
     Ok(())
 }
 
@@ -1001,9 +1490,12 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Mutex;
 
+    use jarvis_onchain::config::{Condition, FilterOverrides, Op};
+    use jarvis_onchain::signals::SignalId;
     use jarvis_onchain::types::LpStatus;
 
-    use super::profile::tests::{fixture, MINT_A, MINT_B};
+    use super::profile::tests::{fixture, fixture_json, MINT_A, MINT_B};
+    use super::store::StrategyFamily;
     use super::*;
 
     fn d(value: &str) -> Decimal {
@@ -1011,12 +1503,16 @@ mod tests {
     }
 
     fn pair(mint: &str, price: &str, liquidity: &str) -> Pair {
+        aged_pair(mint, price, liquidity, Duration::days(3))
+    }
+
+    fn aged_pair(mint: &str, price: &str, liquidity: &str, age: Duration) -> Pair {
         serde_json::from_value(serde_json::json!({
             "chainId": "solana", "dexId": "raydium", "pairAddress": format!("pool-{mint}"),
             "baseToken": {"address": mint}, "quoteToken": {"address": USDC_MINT},
             "priceUsd": price, "liquidity": {"usd": liquidity},
             "txns": {"m5": {"buys": 40, "sells": 10}}, "priceChange": {"m5": 12.5},
-            "pairCreatedAt": (OffsetDateTime::now_utc() - Duration::days(3)).unix_timestamp() * 1000,
+            "pairCreatedAt": (OffsetDateTime::now_utc() - age).unix_timestamp() * 1000,
         }))
         .unwrap()
     }
@@ -1033,6 +1529,7 @@ mod tests {
             opened_at: t0 + Duration::seconds(opened),
             exit_failures: 0,
             stuck: false,
+            peak_value_usd: None,
             close: close.map(|(at, usd_out, net)| TripClose {
                 closed_at: t0 + Duration::seconds(at),
                 usd_out: d(usd_out),
@@ -1098,8 +1595,8 @@ mod tests {
         let discovered = names("d", 6);
         let held = BTreeSet::from(["w0".to_owned()]);
         let mut seen = HashMap::new();
-        seen.insert("w1".to_owned(), (None, now - Duration::minutes(1)));
-        seen.insert("d0".to_owned(), (None, now - Duration::hours(1)));
+        seen.insert("w1".to_owned(), ((), now - Duration::minutes(1)));
+        seen.insert("d0".to_owned(), ((), now - Duration::hours(1)));
         // A discovered mint already on the watchlist counts once.
         let extra = "w2".to_owned();
         let picked = entry_candidates(
@@ -1122,21 +1619,121 @@ mod tests {
         }
     }
 
-    /// Fixture market data: `MINT_A` passes every filter, `MINT_B` has an
-    /// unsecured pool (as every live snapshot has today).
+    #[test]
+    fn versions_parse_into_what_they_allow() {
+        let base = fixture().rules;
+        let mut config = seeds()[0].clone();
+        config.version = STRATEGY_VERSION_FLOOR + 1;
+        let id = Some(config.id.clone());
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed = parse_version(config.version, id.clone(), &json, &base);
+        assert!(matches!(parsed.rules, Rules::Config { .. }));
+        assert_eq!(parsed.strategy_id, id);
+        // Under stricter base rules the seed would loosen them: exits only.
+        let mut strict = fixture_json();
+        strict["filter"]["min_liquidity_usd"] = "100000".into();
+        let strict = PaperProfile::parse(&strict.to_string()).unwrap().rules;
+        let parsed = parse_version(config.version, id.clone(), &json, &strict);
+        assert!(matches!(parsed.rules, Rules::ExitOnly(rules) if rules == config.exit_rules()));
+        // Recorded under another version or strategy: nothing usable.
+        let other = parse_version(config.version + 1, id.clone(), &json, &base);
+        assert!(matches!(other.rules, Rules::Unusable));
+        let other = parse_version(config.version, Some("b".into()), &json, &base);
+        assert!(matches!(other.rules, Rules::Unusable));
+        // A legacy profile version exits by its recorded parameters.
+        let legacy = fixture().versioned_params.unwrap();
+        let parsed = parse_version(3, None, &legacy, &base);
+        let rules = fixture().strategy.unwrap().exit_rules();
+        assert!(matches!(parsed.rules, Rules::ExitOnly(r) if r == rules));
+        assert!(matches!(
+            parse_version(3, None, "{}", &base).rules,
+            Rules::Unusable
+        ));
+    }
+
+    #[test]
+    fn caps_limit_positions_entries_per_day_and_reentry() {
+        let now = OffsetDateTime::now_utc();
+        let config = seeds()[0].clone();
+        let at = |ago: Duration| now - ago;
+        let mut open = trip("open", MINT_A, 0, None);
+        open.opened_at = at(Duration::hours(1));
+        let mut closed = trip("closed", MINT_B, 0, None);
+        closed.opened_at = at(Duration::hours(3));
+        closed.close = Some(TripClose {
+            closed_at: at(Duration::hours(2)),
+            usd_out: d("30"),
+            exit_fees_usd: d("0"),
+            net_pnl_usd: d("5"),
+            exit_reason: "take_profit",
+        });
+        // Version 9 belongs to no strategy and is not counted.
+        let mut other = trip("other", USDC_MINT, 0, None);
+        other.strategy_version = 9;
+        other.opened_at = at(Duration::minutes(1));
+        let trips = [open, closed, other];
+        let owner = |version: u32| (version == 3).then_some("a");
+        let start_of_day = now.replace_time(time::Time::MIDNIGHT);
+        let opened_today = |t: &Trip| t.opened_at >= start_of_day;
+        let today = trips[..2].iter().filter(|t| opened_today(t)).count() as u32;
+
+        let caps = Caps::new(trips.iter(), owner, 2, now);
+        assert_eq!(caps.open.get("a"), Some(&1));
+        assert_eq!(caps.entries_today.get("a").copied().unwrap_or(0), today);
+        // `a` left MINT_B two hours ago; its cooldown is 6 hours.
+        assert!(!caps.allow("a", &config, MINT_B, now));
+        assert!(caps.allow("a", &config, MINT_B, at(-Duration::hours(4))));
+        assert!(caps.allow("b", &config, MINT_B, now));
+        // One more open position fills `a`'s share of two.
+        let mut full = Caps::new(trips.iter(), owner, 2, now);
+        assert!(full.allow("a", &config, USDC_MINT, now));
+        full.entered("a");
+        assert!(!full.allow("a", &config, USDC_MINT, now));
+        // Entries per UTC day count the closed ones too.
+        let mut daily = Caps::new(trips.iter(), owner, 10, now);
+        while daily.entries_today.get("a").copied().unwrap_or(0) < config.max_entries_per_day {
+            assert!(daily.allow("a", &config, USDC_MINT, now));
+            daily.entered("a");
+        }
+        assert!(!daily.allow("a", &config, USDC_MINT, now));
+    }
+
+    /// Fixture market data: every pool's LP is burned; each mint has its own
+    /// pool age, so test strategies can tell them apart.
     struct FixtureMarket {
-        price_a: Mutex<Decimal>,
+        prices: Mutex<HashMap<String, Decimal>>,
+        ages: HashMap<String, Duration>,
         /// Paused by the owner while the first candidate is observed.
         pause_on_observe: Option<Arc<PaperHandle>>,
+    }
+
+    impl FixtureMarket {
+        fn new(mints: &[(&str, &str, Duration)]) -> Self {
+            Self {
+                prices: Mutex::new(mints.iter().map(|(m, p, _)| ((*m).into(), d(p))).collect()),
+                ages: mints
+                    .iter()
+                    .map(|(m, _, age)| ((*m).into(), *age))
+                    .collect(),
+                pause_on_observe: None,
+            }
+        }
+
+        fn set_price(&self, mint: &str, price: &str) {
+            self.prices.lock().unwrap().insert(mint.into(), d(price));
+        }
     }
 
     #[async_trait]
     impl MarketSource for FixtureMarket {
         async fn pairs(&self, mints: &[&str]) -> Result<Vec<Pair>, MarketDataError> {
-            let price = self.price_a.lock().unwrap().to_string();
+            let prices = self.prices.lock().unwrap();
             Ok(mints
                 .iter()
-                .map(|m| pair(m, if *m == MINT_A { &price } else { "0.002" }, "100000"))
+                .filter_map(|m| {
+                    let price = prices.get(*m)?.to_string();
+                    Some(aged_pair(m, &price, "100000", self.ages[*m]))
+                })
                 .collect())
         }
 
@@ -1154,19 +1751,15 @@ mod tests {
             s.freeze_authority_revoked = true;
             s.top_holders_share = d("0.1");
             s.sell_impact_bps = Some(50);
-            s.lp = if pair.base_token.address == MINT_A {
-                LpStatus::Burned
-            } else {
-                LpStatus::Unknown
-            };
+            s.lp = LpStatus::Burned;
             Ok(s)
         }
     }
 
-    #[tokio::test]
-    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
-    async fn tick_simulates_entries_and_exits_on_fixture_data(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    const MINT_C: &str = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN";
+    const MINT_D: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+
+    async fn connect(prefix: &str) -> Result<Database, Box<dyn std::error::Error>> {
         use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
         let db = Surreal::new::<Ws>(std::env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
         db.signin(Root {
@@ -1174,95 +1767,320 @@ mod tests {
             password: &std::env::var("JARVIS_SURREAL_TEST_PASS")?,
         })
         .await?;
-        db.use_ns(format!("memecoin_tick_{}", uuid::Uuid::now_v7().simple()))
+        db.use_ns(format!("{prefix}_{}", uuid::Uuid::now_v7().simple()))
             .use_db("core")
             .await?;
         jarvis_store::apply_baseline_schema(&db).await?;
+        Ok(db)
+    }
+
+    /// A profile observing `watchlist`, with room for four positions.
+    fn watching(watchlist: &[&str]) -> PaperProfile {
+        let mut json = fixture_json();
+        json["watchlist"] = serde_json::json!(watchlist);
+        json["max_open_positions"] = 4.into();
+        PaperProfile::parse(&json.to_string()).unwrap()
+    }
+
+    /// Seed A, B and C, then switch each to a child version that enters on
+    /// pool age alone: A from 30 minutes to 5 hours (trailing stop, one
+    /// entry a day), B from 6 to 72 hours, C from 14 days. Returns the
+    /// versions in that order.
+    async fn pool_age_strategies(
+        db: &Database,
+        profile: &PaperProfile,
+    ) -> Result<[u32; 3], Box<dyn std::error::Error>> {
+        seed_strategies(db, &profile.rules).await?;
+        let mut versions = [0; 3];
+        let families = [StrategyFamily::A, StrategyFamily::B, StrategyFamily::C];
+        let ages = [(30, Some(300)), (360, Some(4_320)), (14 * 24 * 60, None)];
+        for (i, mut config) in seeds().into_iter().enumerate() {
+            let seed = STRATEGY_VERSION_FLOOR + 1 + i as u32;
+            config.version = seed + 10;
+            config.parent = Some(seed);
+            config.filters = FilterOverrides::default();
+            let (a, b) = ages[i];
+            let op = if b.is_some() { Op::Between } else { Op::Gt };
+            config.entry = vec![Condition {
+                signal: SignalId::PoolAgeMinutes,
+                op,
+                a,
+                b,
+            }];
+            if i == 0 {
+                config.take_profit_bps = 100_000;
+                config.trailing_stop_bps = Some(2_000);
+                config.max_entries_per_day = 1;
+            } else if i == 1 {
+                config.take_profit_bps = 5_000;
+            }
+            config.validate(&profile.rules)?;
+            let version = StrategyVersion {
+                version: config.version,
+                strategy_id: config.id.clone(),
+                family: families[i],
+                parent_version: Some(seed),
+                author: StrategyAuthor::Claude,
+                params: serde_json::to_string(&config)?,
+                rationale: None,
+                backtest: None,
+                created_at: OffsetDateTime::now_utc(),
+            };
+            store::insert_strategy_version(db, &version).await?;
+            assert!(store::set_active_version(db, &config.id, config.version, "test").await?);
+            versions[i] = config.version;
+        }
+        Ok(versions)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn ticks_run_three_strategies_with_their_own_limits(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let db = connect("memecoin_tick").await?;
+        // MINT_A suits A, MINT_B and MINT_D suit B, MINT_C suits C.
+        let watchlist = [MINT_A, MINT_B, MINT_C, MINT_D];
+        let profile = watching(&watchlist);
+        let [a, b, c] = pool_age_strategies(&db, &profile).await?;
         let handle = Arc::new(PaperHandle::new(true));
-        let mut task = PaperTask::new(fixture(), handle.clone());
-        let market = FixtureMarket {
-            price_a: Mutex::new(d("0.001")),
-            pause_on_observe: None,
-        };
+        let mut task = PaperTask::new(profile, handle.clone());
+        let market = FixtureMarket::new(&[
+            (MINT_A, "0.001", Duration::hours(2)),
+            (MINT_B, "0.001", Duration::hours(10)),
+            (MINT_C, "0.002", Duration::days(20)),
+            (MINT_D, "0.001", Duration::hours(7)),
+        ]);
         // Rolls at or above the 10% failure rate fill; a roll of 0 fails.
         let mut no_failure = || Decimal::new(999_999, 6);
+        let version_of = |trips: &[Trip], mint: &str| {
+            trips
+                .iter()
+                .find(|t| t.mint == mint)
+                .map(|t| t.strategy_version)
+        };
 
-        // Tick 1: A is accepted and bought, B is rejected for its pool.
+        // Tick 1: each strategy enters its mint. With four positions shared
+        // by three strategies each may hold one, so B skips MINT_D.
         let stats = task.tick(&db, &market, &mut no_failure).await?;
-        assert_eq!((stats.observed, stats.accepted, stats.entries), (2, 1, 1));
-        let candidates = store::recent_candidates(&db, 10).await?;
-        let reasons: BTreeSet<_> = candidates.iter().map(|c| c.reason.as_deref()).collect();
-        assert_eq!(reasons, BTreeSet::from([None, Some("lp_not_secured")]));
+        assert_eq!((stats.observed, stats.accepted, stats.entries), (4, 4, 3));
         let trips = store::load_trips(&db).await?;
-        assert_eq!(trips.len(), 1);
-        assert_eq!(trips[0].mint, MINT_A);
+        assert_eq!(version_of(&trips, MINT_A), Some(a));
+        assert_eq!(version_of(&trips, MINT_B), Some(b));
+        assert_eq!(version_of(&trips, MINT_C), Some(c));
+        assert_eq!(version_of(&trips, MINT_D), None);
         assert_eq!(trips[0].cost_usd, d("25.011"));
+        // A filter verdict per mint and strategy version.
+        let candidates = store::recent_candidates(&db, 100).await?;
+        assert_eq!(candidates.len(), 12);
+        assert!(candidates.iter().all(|c| c.reason.is_none()));
+        // What was seen is recorded for the signals.
+        let series = store::load_series(&db, MINT_A, OffsetDateTime::now_utc(), 10).await?;
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].price_usd, d("0.001"));
         let view = handle.view().ok_or("no view")?;
-        assert_eq!(view.open.len(), 1);
-        assert!(
-            view.equity_usd < view.stake_usd,
-            "fees and price impact cost money"
-        );
+        assert_eq!(view.open.len(), 3);
+        // Deprecated, for single-strategy clients: the first strategy's version.
+        assert_eq!(view.strategy_version, a);
 
-        // Tick 2: A doubles; the take profit closes it. B is in its cooldown,
-        // so no provider is asked about it again.
-        *market.price_a.lock().unwrap() = d("0.002");
+        // Tick 2: the owner disables B; its position still exits at the
+        // take profit. A rises: its peak value is stored, it holds on.
+        assert!(store::set_strategy_enabled(&db, "b-base-reclaim", false, true, "device-1").await?);
+        market.set_price(MINT_A, "0.0015");
+        market.set_price(MINT_B, "0.002");
         let stats = task.tick(&db, &market, &mut no_failure).await?;
-        assert_eq!((stats.observed, stats.exits), (0, 1));
+        assert_eq!((stats.observed, stats.exits, stats.entries), (0, 1, 0));
         let closed = store::recent_closed_trips(&db, 10).await?;
-        let close = closed[0].close.as_ref().ok_or("not closed")?;
-        assert_eq!(close.exit_reason, "take_profit");
-        assert!(close.net_pnl_usd > Decimal::ZERO);
-        let view = handle.view().ok_or("no view")?;
-        assert_eq!(view.gate.closed_trades, 1);
-        assert!(!view.gate.passed);
-        assert!(view.equity_usd > view.stake_usd);
-        assert_eq!(store::recent_candidates(&db, 10).await?.len(), 2);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].mint, MINT_B);
+        assert_eq!(
+            closed[0].close.as_ref().ok_or("open")?.exit_reason,
+            "take_profit"
+        );
+        let held = store::load_held_trips(&db).await?;
+        let a_trip = held.iter().find(|t| t.mint == MINT_A).ok_or("A not held")?;
+        assert!(a_trip.peak_value_usd.ok_or("no peak")? > d("35"));
 
-        // Tick 3 (cooldown over): the buy attempt fails and its fees are a cost.
+        // Tick 3: A falls more than 20% below its peak, still above cost:
+        // the trailing stop sells. MINT_B and MINT_D suit only the disabled
+        // B, so nothing enters.
+        market.set_price(MINT_A, "0.0011");
+        task.seen.clear();
+        let stats = task.tick(&db, &market, &mut no_failure).await?;
+        assert_eq!((stats.observed, stats.exits, stats.entries), (2, 1, 0));
+        let closed = store::recent_closed_trips(&db, 10).await?;
+        let a_close = closed[0].close.as_ref().ok_or("open")?;
+        assert_eq!(
+            (closed[0].mint.as_str(), a_close.exit_reason),
+            (MINT_A, "trailing_stop")
+        );
+        assert!(a_close.net_pnl_usd > Decimal::ZERO);
+
+        // Tick 4: the owner enables B again. A has used its entry for the
+        // day and B its cooldown on MINT_B, so only B on MINT_D tries; the
+        // attempt fails and its fees are a cost of B's version.
+        assert!(store::set_strategy_enabled(&db, "b-base-reclaim", true, true, "device-1").await?);
         task.seen.clear();
         let mut always_fail = || Decimal::ZERO;
         let stats = task.tick(&db, &market, &mut always_fail).await?;
-        assert_eq!((stats.entries, stats.failed_attempts), (0, 1));
-        assert_eq!(store::load_costs(&db).await?[0].usd, d("0.011"));
-        assert!(handle.view().ok_or("no view")?.pnl.failed_tx_fees_usd > Decimal::ZERO);
+        assert_eq!(
+            (stats.observed, stats.entries, stats.failed_attempts),
+            (3, 0, 1)
+        );
+        let costs = store::load_costs(&db).await?;
+        assert_eq!(costs.len(), 1);
+        assert_eq!((costs[0].strategy_version, costs[0].usd), (b, d("0.011")));
 
-        // Tick 4: a stored pause is picked up and stops entries.
-        store::pause(&db, "device").await?;
-        task.seen.clear();
-        let stats = task.tick(&db, &market, &mut no_failure).await?;
-        assert!(handle.paused());
-        assert_eq!((stats.observed, stats.entries), (0, 0));
-        assert_eq!(store::load_trips(&db).await?.len(), 1);
+        // Results per strategy, over all of its versions.
+        let b_result = store::strategy_performance(&db, "b-base-reclaim").await?;
+        assert_eq!(
+            (b_result.closed.trades, b_result.closed.win_rate_bps),
+            (1, 10_000)
+        );
+        assert_eq!(b_result.costs_usd, d("0.011"));
+        assert_eq!(b_result.net_usd, b_result.closed.net_usd - d("0.011"));
+        let c_result = store::strategy_performance(&db, "c-established-trend").await?;
+        assert_eq!(c_result.closed.trades, 0);
         Ok(())
     }
 
     #[tokio::test]
     #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
     async fn a_pause_during_a_tick_stops_the_next_buy() -> Result<(), Box<dyn std::error::Error>> {
-        use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
-        let db = Surreal::new::<Ws>(std::env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
-        db.signin(Root {
-            username: &std::env::var("JARVIS_SURREAL_TEST_USER")?,
-            password: &std::env::var("JARVIS_SURREAL_TEST_PASS")?,
-        })
-        .await?;
-        db.use_ns(format!("memecoin_pause_{}", uuid::Uuid::now_v7().simple()))
-            .use_db("core")
-            .await?;
-        jarvis_store::apply_baseline_schema(&db).await?;
+        let db = connect("memecoin_pause").await?;
+        let profile = watching(&[MINT_A]);
+        pool_age_strategies(&db, &profile).await?;
         let handle = Arc::new(PaperHandle::new(true));
-        let mut task = PaperTask::new(fixture(), handle.clone());
+        let mut task = PaperTask::new(profile, handle.clone());
         // The owner pauses while A, which would be bought, is observed.
-        let market = FixtureMarket {
-            price_a: Mutex::new(d("0.001")),
-            pause_on_observe: Some(handle.clone()),
-        };
+        let mut market = FixtureMarket::new(&[(MINT_A, "0.001", Duration::hours(2))]);
+        market.pause_on_observe = Some(handle.clone());
         let stats = task
             .tick(&db, &market, &mut || Decimal::new(999_999, 6))
             .await?;
         assert_eq!((stats.observed, stats.accepted, stats.entries), (1, 1, 0));
         assert!(store::load_trips(&db).await?.is_empty());
+
+        // A stored pause is picked up by the next tick.
+        store::pause(&db, "device").await?;
+        let mut task = PaperTask::new(watching(&[MINT_A]), Arc::new(PaperHandle::new(true)));
+        let stats = task
+            .tick(&db, &market, &mut || Decimal::new(999_999, 6))
+            .await?;
+        assert!(task.handle.paused());
+        assert_eq!((stats.observed, stats.entries), (0, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn a_position_without_rules_still_gets_the_time_stop(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let db = connect("memecoin_rules").await?;
+        // Opened under a version that was never recorded, 31 days ago.
+        let mut orphan = trip("orphan", MINT_A, 0, None);
+        orphan.strategy_version = 77;
+        orphan.opened_at = OffsetDateTime::now_utc() - Duration::days(31);
+        store::open_trip(&db, &orphan).await?;
+        let mut task = PaperTask::new(watching(&[MINT_A]), Arc::new(PaperHandle::new(true)));
+        let market = FixtureMarket::new(&[(MINT_A, "0.25", Duration::hours(2))]);
+        let stats = task
+            .tick(&db, &market, &mut || Decimal::new(999_999, 6))
+            .await?;
+        assert_eq!(stats.exits, 1);
+        let closed = store::recent_closed_trips(&db, 1).await?;
+        assert_eq!(
+            closed[0].close.as_ref().ok_or("open")?.exit_reason,
+            "time_stop"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn seeding_is_idempotent_and_never_reuses_a_version(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let db = connect("memecoin_seed").await?;
+        let profile = fixture();
+        // A legacy version recorded before typed strategies existed.
+        let legacy = profile.versioned_params.clone().ok_or("no legacy params")?;
+        store::register_strategy_version(&db, 3, &legacy).await?;
+
+        // Base rules that seeds A and B would loosen leave them out.
+        let mut strict = fixture_json();
+        strict["filter"]["min_liquidity_usd"] = "100000".into();
+        let strict = PaperProfile::parse(&strict.to_string())?;
+        seed_strategies(&db, &strict.rules).await?;
+        let ids = |s: &[store::Strategy]| s.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&store::list_strategies(&db).await?),
+            ["c-established-trend"]
+        );
+
+        seed_strategies(&db, &profile.rules).await?;
+        assert!(
+            store::set_strategy_enabled(&db, "a-survivor-momentum", false, true, "device-1")
+                .await?
+        );
+        seed_strategies(&db, &profile.rules).await?;
+        let strategies = store::list_strategies(&db).await?;
+        assert_eq!(
+            ids(&strategies),
+            [
+                "a-survivor-momentum",
+                "b-base-reclaim",
+                "c-established-trend"
+            ]
+        );
+        // Seeding again keeps the owner's disable and the active versions.
+        assert!(!strategies[0].enabled && strategies[0].disabled_by_owner);
+        assert!(strategies[1].enabled && strategies[2].enabled);
+        let mut seen = BTreeSet::from([3]);
+        for (i, strategy) in strategies.iter().enumerate() {
+            let expected = STRATEGY_VERSION_FLOOR + 1 + i as u32;
+            assert_eq!(strategy.active_version, expected);
+            let versions = store::list_strategy_versions(&db, &strategy.id, 10).await?;
+            assert_eq!(versions.len(), 1);
+            assert_eq!(versions[0].author, StrategyAuthor::Seed);
+            assert!(seen.insert(versions[0].version), "versions never collide");
+        }
+        // The legacy version is untouched.
+        let (owner, params) = store::version_params(&db, 3).await?.ok_or("legacy gone")?;
+        assert_eq!((owner, params), (None, legacy));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn the_universe_outlives_a_restart() -> Result<(), Box<dyn std::error::Error>> {
+        let db = connect("memecoin_universe").await?;
+        let now = OffsetDateTime::now_utc();
+        let migration = |mint: &str, age| Migration {
+            mint: mint.into(),
+            pool: MINT_B.into(),
+            migrated_at: now - age,
+        };
+        let mut before = Discovery::new();
+        let mut saved = HashSet::new();
+        assert!(before.remember(migration(MINT_A, Duration::hours(1)), now));
+        save_universe(&db, &before, &mut saved).await;
+        assert!(saved.contains(MINT_A));
+        // A stored entry beyond the discovery window stays out.
+        store::upsert_universe(
+            &db,
+            &store::UniverseEntry {
+                mint: MINT_C.into(),
+                pool: MINT_B.into(),
+                program: pools::PUMPSWAP_PROGRAM.into(),
+                migrated_at: now - Duration::days(4),
+            },
+        )
+        .await?;
+
+        let mut after = Discovery::new();
+        let mut restored = HashSet::new();
+        restore_universe(&db, &mut after, &mut restored, now).await;
+        assert!(after.knows(MINT_A) && !after.knows(MINT_C));
+        assert_eq!(restored, HashSet::from([MINT_A.to_owned()]));
         Ok(())
     }
 }

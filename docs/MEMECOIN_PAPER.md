@@ -1,8 +1,9 @@
 # Memecoin paper trader
 
-Core can run the on-chain memecoin strategy as a **paper** simulation: it reads
-public market data, applies the hard filters and the strategy from
-`jarvis-onchain`, and simulates fills, fees and failed attempts. It has no
+Core can run the on-chain memecoin strategies as a **paper** simulation: it
+reads public market data, applies the hard filters and several typed
+strategies from `jarvis-onchain` side by side, and simulates fills, fees and
+failed attempts. It has no
 wallet, no signer and no execution path, and no LLM output reaches it. Results
 are stored in schemas 0014 and 0017 and shown through `/v1/trading/meme/*`.
 
@@ -51,26 +52,85 @@ no values on purpose.
   (fraction), `max_sell_impact_bps`, `allowed_extensions` (snake_case
   Token-2022 extension names), `max_snapshot_age_secs`,
   `min_lp_lock_remaining_secs`.
-- `strategy`: `version` and the `StrategyParams` fields of `jarvis-onchain`
-  (`*_secs` for durations); validated against the code-fixed bounds.
+- `strategy` (optional, **deprecated**): `version` and the `StrategyParams`
+  fields of `jarvis-onchain` (`*_secs` for durations); validated against the
+  code-fixed bounds, with `version` below 1 000 000. This single strategy of
+  older profiles no longer enters. It is still read so the positions it
+  opened keep exiting by its rules; drop it once none are held.
 - `costs`: `dex_fee_bps`, `network_fee_usd`, `priority_fee_usd`,
   `failure_rate` (fraction, below 1).
 
-Everything except `watchlist`, `discovery` and `goal_multiple` is recorded
-with the strategy version. Changing any of it without raising
-`strategy.version` keeps the trader off; that includes rewriting `"25"` as
-`"25.0"`, since decimals keep their scale. Reports and the paper gate cover
-the current version only; open positions of an older version are still
-exited.
+While the profile has a `strategy`, everything except `watchlist`,
+`discovery` and `goal_multiple` is recorded with its version. Changing any of
+it without raising `strategy.version` keeps the trader off; that includes
+rewriting `"25"` as `"25.0"`, since decimals keep their scale. The filter
+rules, costs and sizes apply to every strategy and are not versioned with the
+typed strategies.
+
+## Strategies
+
+At startup Core records the seed strategies `a-survivor-momentum`,
+`b-base-reclaim` and `c-established-trend` (families A, B and C of
+`jarvis-onchain::config`) as versions 1 000 001 to 1 000 003, author `seed`,
+and enables each one it creates. Versions are unique across strategies;
+typed versions start above 1 000 000 and profile versions stay below, so
+they never collide. Seeding is idempotent: an existing strategy keeps its
+active version and its enabled or owner-disabled state. A seed whose filter
+overrides would loosen the profile's filter rules, or whose version is
+already recorded with other content, is left out and logged; the others
+still run.
+
+Each tick, every **enabled** strategy's active version is evaluated, in id
+order:
+
+- The hard filter runs with the profile's rules tightened by the version's
+  overrides. A candidate row is written per mint and strategy version, when
+  that verdict changes.
+- The entry conditions read signals computed from our own recorded
+  observations: every price and liquidity seen in the last 25 hours plus the
+  daily ones before, at most 2000 points, ending with the snapshot an entry
+  would fill at.
+- The entry size is the version's share of `max_position_usd`, capped by its
+  share of pool liquidity.
+- Limits: the profile's `max_open_positions` and one position per mint
+  across all strategies; per strategy an equal share of `max_open_positions`
+  among the enabled strategies (at least one), its `max_entries_per_day` per
+  UTC day, and its `token_cooldown_secs` since it last left that mint.
+- The first strategy whose limits and signal allow it makes the one entry
+  attempt for that mint this tick; its trip and any failed-attempt cost carry
+  that strategy's version.
+
+A **disabled** strategy makes no new entries; its open positions still exit.
+Every position exits by the rules of the version that opened it: liquidity
+drop, stop loss, trailing stop (the version's `trailing_stop_bps` below the peak executable value, once
+that peak was above cost; the peak is stored with the position, so a restart
+keeps it), take profit and time stop. Positions of a legacy profile version
+exit by the parameters recorded for that version. A version that no longer
+fits the profile's filter rules only exits. A position whose version has no
+usable rules recorded gets only the time stop, after 30 days, and is logged
+every tick until then.
+
+The overview reports the whole paper book (every strategy). The hourly gate
+snapshot is written per strategy, for its active version; one that fails is
+logged and skipped until the next hour. Typed versions are only recorded
+above 1 000 000, with parameters that name the same strategy, version,
+parent and family as their row. Trades, net result
+(after failed-attempt fees and AI cost), expectancy, win rate and maximum
+drawdown per strategy, over all its versions, are available to Core as
+`store::strategy_performance`; there is no route for them yet.
 
 ## What a tick does
 
 Every 60 s: value held positions and simulate exits (also while paused);
-then, if the stored ledger replays exactly and the trader is not paused,
-poll discovery (at most every 2 minutes), observe up to 5 mints (watchlist
-first, then discovered mints; each at most every 15 minutes, through the
-per-provider pacing of `jarvis-market-data`), run the filter and the
-strategy, and simulate entries; finally report from the stored ledger. A
+then, if the stored ledger replays exactly, a strategy is enabled and the
+trader is not paused, poll discovery (at most every 2 minutes), observe up to
+5 mints (watchlist first, then discovered mints; each at most every 15
+minutes, through the per-provider pacing of `jarvis-market-data`), run the
+filter and the strategies, and simulate entries; finally report from the
+stored ledger. The price and liquidity of every held, watchlist and observed
+mint are recorded each tick for the signals. Discovered mints are only seen
+when they are observed as candidates, so their series are sparser than the
+watchlist's. A
 write failure stops the tick before anything is simulated on it.
 
 - An exit that fails or cannot be priced is retried on later ticks; after 10
@@ -128,8 +188,10 @@ migrated curve is ignored. Its mint and pool are kept.
   (the oldest is dropped first). A mint is offered as a candidate from
   30 minutes after its migration on. With 5 observations per tick, shared
   with the watchlist, a busy day can leave some unobserved.
-- State is in memory only. After a restart discovery starts from the newest
-  200 signatures; nothing is stored until a mint becomes a candidate row.
+- Discovered mints are stored in the universe table after each poll, and
+  those within the 72-hour window are loaded again at startup, so a restart
+  keeps them. The poll position is not stored: after a restart discovery
+  starts from the newest 200 signatures.
 
 Discovery reads only the primary RPC provider. A discovered mint is just a
 name to look at: it goes through the same DexScreener pair, cross-checked
@@ -139,8 +201,11 @@ cost a candidate, never let one through.
 ## API (owner session, like every `/v1` route)
 
 - `GET /v1/trading/meme/overview`: enabled, running, paused, stake, equity,
-  P&L net of fees, failed attempts and AI cost, open positions, gate report,
-  goal progress.
+  P&L net of fees, failed attempts and AI cost, open positions (each with its
+  strategy version), gate report and goal progress, for the whole paper
+  book. The top-level `strategy_version` is **deprecated** and kept for
+  older clients: it is the active version of the first strategy by id
+  (normally `a-survivor-momentum`) and scopes nothing else in the response.
 - `GET /v1/trading/meme/candidates?limit=1..100` (default 50).
 - `GET /v1/trading/meme/trades?limit=1..100`: closed paper trades.
 - `POST /v1/trading/meme/pause`: stops entries at once and persists the pause

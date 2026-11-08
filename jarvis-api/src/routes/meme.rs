@@ -77,6 +77,7 @@ pub(crate) async fn overview(_authed: Authed, State(state): State<AppState>) -> 
         "resume": "configuration only (JARVIS_MEMECOIN_PAPER_RESUME_PAUSED_AT)",
     });
     if let Some(view) = handle.view() {
+        // Deprecated: see `PaperView::strategy_version`.
         body["strategy_version"] = view.strategy_version.into();
         body["as_of"] = ts(view.at).into();
         body["stake_usd"] = money(view.stake_usd).into();

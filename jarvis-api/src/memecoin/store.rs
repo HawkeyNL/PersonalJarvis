@@ -13,7 +13,11 @@ use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use jarvis_onchain::backtest::{performance, Performance};
+use jarvis_onchain::config::{Family, StrategyConfig};
 use jarvis_store::Database;
+
+use super::STRATEGY_VERSION_FLOOR;
 
 /// Candidate decisions and gate snapshots are kept this long.
 pub const RETENTION_DAYS: u32 = 30;
@@ -33,6 +37,12 @@ const PRUNE_MAX_BATCHES: usize = 20;
 pub const MAX_LEDGER_ROWS: usize = 100_000;
 /// The most rows a listing returns.
 pub const MAX_LIST: usize = 100;
+/// A series for signals holds every observation of this many recent hours
+/// (enough for the 24-hour signals) plus the daily ones before them ...
+pub const SERIES_FULL_HOURS: i64 = 25;
+/// ... and at most this many points, the newest kept: one a minute for
+/// [`SERIES_FULL_HOURS`] plus [`OBSERVATION_RETENTION_DAYS`] daily ones fit.
+pub const MAX_SERIES_POINTS: usize = 2_000;
 
 /// Database detail is logged by the caller, never returned to clients.
 #[derive(Debug)]
@@ -106,6 +116,8 @@ pub struct Trip {
     pub exit_failures: u32,
     /// Held, but exits stopped after [`Trip::exit_failures`] reached the cap.
     pub stuck: bool,
+    /// Highest executable value seen while held, for the trailing stop.
+    pub peak_value_usd: Option<Decimal>,
     pub close: Option<TripClose>,
 }
 
@@ -329,6 +341,16 @@ pub enum StrategyFamily {
     C,
 }
 
+impl From<Family> for StrategyFamily {
+    fn from(family: Family) -> Self {
+        match family {
+            Family::A => Self::A,
+            Family::B => Self::B,
+            Family::C => Self::C,
+        }
+    }
+}
+
 impl StrategyFamily {
     fn as_str(self) -> &'static str {
         match self {
@@ -425,13 +447,23 @@ fn valid_text(text: &str, max_chars: usize) -> bool {
     text.chars().count() <= max_chars && !text.chars().any(char::is_control)
 }
 
+/// A typed version lies above [`STRATEGY_VERSION_FLOOR`], and its parameters
+/// are a [`StrategyConfig`] naming the same strategy, version, parent and
+/// family as the row.
 fn validate_version(version: &StrategyVersion) -> Result<()> {
-    let valid = version.version >= 1
+    let config_matches = serde_json::from_str::<StrategyConfig>(&version.params).is_ok_and(|c| {
+        c.id == version.strategy_id
+            && c.version == version.version
+            && c.parent == version.parent_version
+            && StrategyFamily::from(c.family) == version.family
+    });
+    let valid = version.version > STRATEGY_VERSION_FLOOR
         && valid_strategy_id(&version.strategy_id)
         && version
             .parent_version
-            .is_none_or(|parent| parent >= 1 && parent < version.version)
+            .is_none_or(|parent| parent > STRATEGY_VERSION_FLOOR && parent < version.version)
         && (2..=MAX_PARAMS).contains(&version.params.chars().count())
+        && config_matches
         && version
             .rationale
             .as_deref()
@@ -492,6 +524,12 @@ const VERSION_FIELDS: &str = "version, strategy_id, family, parent_version, auth
 /// exactly this content (its `created_at` aside). A version never changes.
 pub async fn insert_strategy_version(db: &Database, version: &StrategyVersion) -> Result<()> {
     validate_version(version)?;
+    if let Some(parent) = version.parent_version {
+        // A version derives only from a recorded version of its own strategy.
+        if version_strategy(db, parent).await?.as_deref() != Some(version.strategy_id.as_str()) {
+            return Err(MemecoinStoreError::InvalidData);
+        }
+    }
     let stored: Vec<StrategyVersionRow> = rows(
         db,
         &format!(
@@ -552,6 +590,29 @@ pub async fn list_strategy_versions(
     )
     .await?;
     rows.into_iter().map(StrategyVersion::try_from).collect()
+}
+
+/// The strategy (`None` for a legacy version) and parameter JSON recorded
+/// for `version`, if it is recorded.
+pub async fn version_params(
+    db: &Database,
+    version: u32,
+) -> Result<Option<(Option<String>, String)>> {
+    #[derive(Deserialize)]
+    struct Row {
+        strategy_id: Option<String>,
+        params: String,
+    }
+    let rows: Vec<Row> = rows(
+        db,
+        "SELECT strategy_id, params FROM memecoin_strategy_versions WHERE version = $version",
+        json!({"version": version}),
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .map(|row| (row.strategy_id, row.params)))
 }
 
 /// The strategy `version` belongs to, if it is recorded with one.
@@ -704,7 +765,11 @@ pub async fn set_strategy_enabled(
 }
 
 pub async fn open_trip(db: &Database, trip: &Trip) -> Result<()> {
-    if trip.close.is_some() || trip.stuck || trip.exit_failures != 0 {
+    if trip.close.is_some()
+        || trip.stuck
+        || trip.exit_failures != 0
+        || trip.peak_value_usd.is_some()
+    {
         return Err(MemecoinStoreError::InvalidData);
     }
     run(
@@ -769,6 +834,23 @@ pub async fn record_exit_failure(db: &Database, id: &str, cap: u32) -> Result<Op
     Ok(status.first().map(|status| status == "stuck"))
 }
 
+/// Store a new peak value of an open trip. `false` when no open trip has
+/// this id.
+pub async fn set_peak_value(db: &Database, id: &str, peak_value_usd: Decimal) -> Result<bool> {
+    if peak_value_usd < Decimal::ZERO {
+        return Err(MemecoinStoreError::InvalidData);
+    }
+    let changed: Vec<String> = record_rows(
+        db,
+        "UPDATE $rid SET peak_value_usd = $peak WHERE status = 'open' RETURN VALUE record::id(id)",
+        "memecoin_paper_trips",
+        id,
+        json!({"peak": peak_value_usd.to_string()}),
+    )
+    .await?;
+    Ok(changed.len() == 1)
+}
+
 #[derive(Deserialize)]
 struct TripRow {
     id: String,
@@ -787,6 +869,7 @@ struct TripRow {
     exit_fees_usd: Option<String>,
     net_pnl_usd: Option<String>,
     exit_reason: Option<String>,
+    peak_value_usd: Option<String>,
 }
 
 impl TryFrom<TripRow> for Trip {
@@ -821,6 +904,7 @@ impl TryFrom<TripRow> for Trip {
             entry_liquidity_usd: decimal(&row.entry_liquidity_usd)?,
             opened_at: row.opened_at,
             exit_failures: row.exit_failures,
+            peak_value_usd: optional_decimal(row.peak_value_usd.as_deref())?,
             stuck: match (row.status.as_str(), &close) {
                 ("stuck", None) => true,
                 ("open", None) | ("closed", Some(_)) => false,
@@ -832,7 +916,8 @@ impl TryFrom<TripRow> for Trip {
 }
 
 const TRIP_FIELDS: &str = "record::id(id) AS id, mint, strategy_version, tokens, cost_usd, \
-    entry_liquidity_usd, status, exit_failures, opened_at, closed_at, usd_out, exit_fees_usd, net_pnl_usd, exit_reason";
+    entry_liquidity_usd, status, exit_failures, opened_at, closed_at, usd_out, exit_fees_usd, net_pnl_usd, exit_reason, \
+    peak_value_usd";
 
 fn bounded<T>(rows: Vec<T>) -> Result<Vec<T>> {
     if rows.len() > MAX_LEDGER_ROWS {
@@ -1208,6 +1293,49 @@ pub async fn record_observation(db: &Database, observation: &Observation) -> Res
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct ObservationRow {
+    #[serde(with = "time::serde::rfc3339")]
+    at: OffsetDateTime,
+    price_usd: String,
+    liquidity_usd: String,
+}
+
+/// The observations of `mint` up to `now` that signals read, oldest first:
+/// all of the last [`SERIES_FULL_HOURS`] and the daily ones before; the
+/// newest `limit`, at most [`MAX_SERIES_POINTS`].
+pub async fn load_series(
+    db: &Database,
+    mint: &str,
+    now: OffsetDateTime,
+    limit: usize,
+) -> Result<Vec<Observation>> {
+    let rows: Vec<ObservationRow> = rows(
+        db,
+        "SELECT at, price_usd, liquidity_usd FROM memecoin_observations \
+         WHERE mint = $mint AND at <= <datetime>$now AND (daily = true OR at >= <datetime>$since) \
+         ORDER BY at DESC LIMIT $limit",
+        json!({
+            "mint": mint,
+            "now": rfc3339(now)?,
+            "since": rfc3339(now - time::Duration::hours(SERIES_FULL_HOURS))?,
+            "limit": limit.min(MAX_SERIES_POINTS),
+        }),
+    )
+    .await?;
+    rows.into_iter()
+        .rev()
+        .map(|row| {
+            Ok(Observation {
+                mint: mint.to_owned(),
+                at: row.at,
+                price_usd: decimal(&row.price_usd)?,
+                liquidity_usd: decimal(&row.liquidity_usd)?,
+            })
+        })
+        .collect()
+}
+
 /// A recently migrated token discovery may consider.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UniverseEntry {
@@ -1240,6 +1368,95 @@ pub async fn upsert_universe(db: &Database, entry: &UniverseEntry) -> Result<()>
     )
     .await?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct UniverseRow {
+    mint: String,
+    pool: String,
+    program: String,
+    #[serde(with = "time::serde::rfc3339")]
+    migrated_at: OffsetDateTime,
+}
+
+/// Universe entries migrated at or after `since`, newest first, at most
+/// `limit`.
+pub async fn load_universe(
+    db: &Database,
+    since: OffsetDateTime,
+    limit: usize,
+) -> Result<Vec<UniverseEntry>> {
+    let rows: Vec<UniverseRow> = rows(
+        db,
+        "SELECT mint, pool, program, migrated_at FROM memecoin_universe \
+         WHERE migrated_at >= <datetime>$since ORDER BY migrated_at DESC LIMIT $limit",
+        json!({"since": rfc3339(since)?, "limit": limit}),
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| UniverseEntry {
+            mint: row.mint,
+            pool: row.pool,
+            program: row.program,
+            migrated_at: row.migrated_at,
+        })
+        .collect())
+}
+
+/// How one strategy did in paper, over all of its versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrategyPerformance {
+    /// Closed round trips, in close order.
+    pub closed: Performance,
+    /// Fees of failed attempts and AI cost recorded for its versions.
+    pub costs_usd: Decimal,
+    /// `closed.net_usd` minus `costs_usd`.
+    pub net_usd: Decimal,
+}
+
+/// Trades, net result, expectancy, win rate and drawdown of one strategy.
+/// Open positions are left out.
+pub async fn strategy_performance(db: &Database, strategy_id: &str) -> Result<StrategyPerformance> {
+    #[derive(Deserialize)]
+    struct ClosedRow {
+        net_pnl_usd: String,
+    }
+    if !valid_strategy_id(strategy_id) {
+        return Err(MemecoinStoreError::InvalidData);
+    }
+    let mut response = run(
+        db,
+        &format!(
+            "LET $versions = (SELECT VALUE version FROM memecoin_strategy_versions \
+             WHERE strategy_id = $strategy_id); \
+             SELECT net_pnl_usd, closed_at FROM memecoin_paper_trips \
+             WHERE status = 'closed' AND strategy_version IN $versions ORDER BY closed_at LIMIT {limit}; \
+             SELECT VALUE usd FROM memecoin_paper_costs WHERE strategy_version IN $versions LIMIT {limit};",
+            limit = MAX_LEDGER_ROWS + 1
+        ),
+        json!({"strategy_id": strategy_id}),
+    )
+    .await?;
+    let closed: Vec<ClosedRow> = bounded(response.take(1)?)?;
+    let costs: Vec<String> = bounded(response.take(2)?)?;
+    let pnls = closed
+        .iter()
+        .map(|row| decimal(&row.net_pnl_usd))
+        .collect::<Result<Vec<_>>>()?;
+    let costs_usd = costs.iter().try_fold(Decimal::ZERO, |sum, usd| {
+        sum.checked_add(decimal(usd)?)
+            .ok_or(MemecoinStoreError::InvalidData)
+    })?;
+    let closed = performance(pnls.into_iter()).map_err(|_| MemecoinStoreError::InvalidData)?;
+    Ok(StrategyPerformance {
+        net_usd: closed
+            .net_usd
+            .checked_sub(costs_usd)
+            .ok_or(MemecoinStoreError::InvalidData)?,
+        closed,
+        costs_usd,
+    })
 }
 
 /// Delete, in bounded batches: candidate decisions and gate snapshots after
@@ -1365,6 +1582,7 @@ mod tests {
             opened_at: now - Duration::hours(2),
             exit_failures: 0,
             stuck: false,
+            peak_value_usd: None,
             close: None,
         };
         open_trip(&db, &trip).await?;
@@ -1464,17 +1682,38 @@ mod tests {
 
     const OTHER: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
 
-    fn seed(at: OffsetDateTime) -> StrategyVersion {
+    /// Typed versions are numbered from here.
+    const V: u32 = STRATEGY_VERSION_FLOOR;
+
+    /// Version `V + n` of `id`, derived from `V + parent`, with matching
+    /// config parameters.
+    fn typed(n: u32, id: &str, family: StrategyFamily, parent: Option<u32>) -> StrategyVersion {
+        let index = match family {
+            StrategyFamily::A => 0,
+            StrategyFamily::B => 1,
+            StrategyFamily::C => 2,
+        };
+        let mut config = jarvis_onchain::config::seeds()[index].clone();
+        config.id = id.into();
+        config.version = V + n;
+        config.parent = parent.map(|p| V + p);
         StrategyVersion {
-            version: 1,
-            strategy_id: "momentum-a".into(),
-            family: StrategyFamily::A,
-            parent_version: None,
+            version: V + n,
+            strategy_id: id.into(),
+            family,
+            parent_version: config.parent,
             author: StrategyAuthor::Seed,
-            params: r#"{"a":1}"#.into(),
+            params: serde_json::to_string(&config).unwrap(),
             rationale: None,
             backtest: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn seed(at: OffsetDateTime) -> StrategyVersion {
+        StrategyVersion {
             created_at: at,
+            ..typed(1, "momentum-a", StrategyFamily::A, None)
         }
     }
 
@@ -1497,14 +1736,39 @@ mod tests {
     #[test]
     fn strategy_versions_are_checked_before_the_database() {
         let good = StrategyVersion {
-            version: 5,
-            parent_version: Some(4),
             rationale: Some("é".repeat(600)),
             backtest: Some(format!("\"{}\"", "x".repeat(4094))),
-            ..seed(OffsetDateTime::UNIX_EPOCH)
+            ..typed(5, "momentum-a", StrategyFamily::A, Some(4))
         };
         assert!(validate_version(&good).is_ok());
+        let legacy = typed(5, "momentum-a", StrategyFamily::A, None);
         for bad in [
+            // At or below the floor, legacy numbers.
+            StrategyVersion {
+                version: V,
+                ..typed(0, "momentum-a", StrategyFamily::A, None)
+            },
+            StrategyVersion {
+                parent_version: Some(4),
+                ..legacy.clone()
+            },
+            // Parameters that do not describe this row.
+            StrategyVersion {
+                params: typed(6, "momentum-a", StrategyFamily::A, Some(4)).params,
+                ..good.clone()
+            },
+            StrategyVersion {
+                params: typed(5, "other", StrategyFamily::A, Some(4)).params,
+                ..good.clone()
+            },
+            StrategyVersion {
+                family: StrategyFamily::B,
+                ..good.clone()
+            },
+            StrategyVersion {
+                params: r#"{"a":1}"#.into(),
+                ..good.clone()
+            },
             StrategyVersion {
                 strategy_id: "Momentum".into(),
                 ..good.clone()
@@ -1518,7 +1782,7 @@ mod tests {
                 ..good.clone()
             },
             StrategyVersion {
-                parent_version: Some(5),
+                parent_version: Some(V + 5),
                 ..good.clone()
             },
             StrategyVersion {
@@ -1643,15 +1907,16 @@ mod tests {
         // including a legacy one, is a conflict.
         insert_strategy_version(&db, &seed(now)).await?;
         insert_strategy_version(&db, &seed(now + Duration::minutes(1))).await?;
-        register_strategy_version(&db, 2, "{}").await?;
+        register_strategy_version(&db, V + 2, "{}").await?;
         for conflict in [
             StrategyVersion {
-                params: r#"{"a":2}"#.into(),
+                rationale: Some("Other content.".into()),
                 ..seed(now)
             },
+            // Recorded as a legacy version.
             StrategyVersion {
-                version: 2,
-                ..seed(now)
+                created_at: now,
+                ..typed(2, "momentum-a", StrategyFamily::A, None)
             },
         ] {
             assert!(matches!(
@@ -1660,21 +1925,18 @@ mod tests {
             ));
         }
         let child = StrategyVersion {
-            version: 3,
-            parent_version: Some(1),
             author: StrategyAuthor::Claude,
             rationale: Some("Tighter stop.".into()),
             backtest: Some(r#"{"trades":12}"#.into()),
-            ..seed(now)
+            created_at: now,
+            ..typed(3, "momentum-a", StrategyFamily::A, Some(1))
         };
         insert_strategy_version(&db, &child).await?;
         insert_strategy_version(
             &db,
             &StrategyVersion {
-                version: 4,
-                strategy_id: "dip-b".into(),
-                family: StrategyFamily::B,
-                ..seed(now)
+                created_at: now,
+                ..typed(4, "dip-b", StrategyFamily::B, None)
             },
         )
         .await?;
@@ -1683,22 +1945,22 @@ mod tests {
             [child, seed(now)]
         );
 
-        assert!(insert_strategy(&db, "momentum-a", 1, true, "seed").await?);
-        assert!(!insert_strategy(&db, "momentum-a", 1, true, "seed").await?);
+        assert!(insert_strategy(&db, "momentum-a", V + 1, true, "seed").await?);
+        assert!(!insert_strategy(&db, "momentum-a", V + 1, true, "seed").await?);
         // A strategy only trades versions of its own.
-        assert!(insert_strategy(&db, "dip-b", 1, true, "seed")
+        assert!(insert_strategy(&db, "dip-b", V + 1, true, "seed")
             .await
             .is_err());
-        assert!(insert_strategy(&db, "dip-b", 4, false, "seed").await?);
-        assert!(set_active_version(&db, "momentum-a", 3, "claude").await?);
-        assert!(set_active_version(&db, "momentum-a", 4, "claude")
+        assert!(insert_strategy(&db, "dip-b", V + 4, false, "seed").await?);
+        assert!(set_active_version(&db, "momentum-a", V + 3, "claude").await?);
+        assert!(set_active_version(&db, "momentum-a", V + 4, "claude")
             .await
             .is_err());
         // Only the owner lifts an owner's disable.
         assert!(set_strategy_enabled(&db, "momentum-a", false, true, "device-1").await?);
         assert!(!set_strategy_enabled(&db, "momentum-a", true, false, "claude").await?);
         assert!(!set_strategy_enabled(&db, "momentum-a", false, false, "claude").await?);
-        assert!(set_active_version(&db, "momentum-a", 1, "claude").await?);
+        assert!(set_active_version(&db, "momentum-a", V + 1, "claude").await?);
         let strategies = list_strategies(&db).await?;
         assert_eq!(strategies.len(), 2);
         let momentum = &strategies[1];
@@ -1710,7 +1972,7 @@ mod tests {
                 momentum.disabled_by_owner,
                 momentum.changed_by.as_str()
             ),
-            ("momentum-a", 1, false, true, "device-1")
+            ("momentum-a", V + 1, false, true, "device-1")
         );
         assert!(set_strategy_enabled(&db, "momentum-a", true, true, "device-1").await?);
         let momentum = &list_strategies(&db).await?[1];
@@ -1774,6 +2036,142 @@ mod tests {
         assert_eq!(kinds, ["worker_unavailable"]);
         assert_eq!(prices, ["1", "5", "6"]);
         assert_eq!(universe, [OTHER]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn series_peaks_lineage_and_performance_round_trip(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+        db.signin(Root {
+            username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+            password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+        })
+        .await?;
+        db.use_ns(format!("memecoin_{}", uuid::Uuid::now_v7().simple()))
+            .use_db("core")
+            .await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+
+        // A series holds the last 25 hours and the daily points before, up
+        // to `now`, oldest first; a limit keeps the newest.
+        let at = |day: u8,
+                  hour: u8,
+                  minute: u8|
+         -> std::result::Result<_, time::error::ComponentRange> {
+            Ok(
+                time::Date::from_calendar_date(2030, time::Month::January, day)?
+                    .with_hms(hour, minute, 0)?
+                    .assume_utc(),
+            )
+        };
+        let now = at(10, 12, 0)?;
+        let points = [
+            (at(8, 10, 0)?, "1"), // daily
+            (at(8, 11, 0)?, "2"), // too old and not daily
+            (at(9, 13, 0)?, "3"), // daily
+            (at(9, 14, 0)?, "4"),
+            (at(10, 11, 0)?, "5"), // daily
+            (at(10, 11, 30)?, "6"),
+            (at(10, 12, 30)?, "7"), // after now
+        ];
+        for (at, price) in points {
+            record_observation(
+                &db,
+                &Observation {
+                    mint: MINT.into(),
+                    at,
+                    price_usd: d(price),
+                    liquidity_usd: d("50000"),
+                },
+            )
+            .await?;
+        }
+        let prices = |series: Vec<Observation>| {
+            series
+                .into_iter()
+                .map(|o| o.price_usd.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            prices(load_series(&db, MINT, now, MAX_SERIES_POINTS).await?),
+            ["1", "3", "4", "5", "6"]
+        );
+        assert_eq!(
+            prices(load_series(&db, MINT, now, 3).await?),
+            ["4", "5", "6"]
+        );
+        assert!(load_series(&db, OTHER, now, 10).await?.is_empty());
+
+        // A child version must derive from its own strategy.
+        let seed_a = seed(now);
+        insert_strategy_version(&db, &seed_a).await?;
+        insert_strategy_version(&db, &typed(2, "dip-b", StrategyFamily::B, None)).await?;
+        for parent in [2, 9] {
+            let child = typed(10, "momentum-a", StrategyFamily::A, Some(parent));
+            assert!(matches!(
+                insert_strategy_version(&db, &child).await,
+                Err(MemecoinStoreError::InvalidData)
+            ));
+        }
+        let child = typed(3, "momentum-a", StrategyFamily::A, Some(1));
+        insert_strategy_version(&db, &child).await?;
+
+        // Trips of both versions of momentum-a count, dip-b's do not.
+        let opened = OffsetDateTime::now_utc() - Duration::days(1);
+        let results = [(1, "2"), (3, "-1"), (1, "-3"), (3, "4"), (2, "100")];
+        for (i, (version, pnl)) in results.into_iter().enumerate() {
+            let id = format!("p{i}");
+            let start = opened + Duration::minutes(10 * i as i64);
+            open_trip(
+                &db,
+                &Trip {
+                    id: id.clone(),
+                    mint: MINT.into(),
+                    strategy_version: V + version,
+                    tokens: d("10"),
+                    cost_usd: d("10"),
+                    entry_liquidity_usd: d("50000"),
+                    opened_at: start,
+                    exit_failures: 0,
+                    stuck: false,
+                    peak_value_usd: None,
+                    close: None,
+                },
+            )
+            .await?;
+            if i == 0 {
+                // Peaks are stored while the trip is open, never after.
+                assert!(set_peak_value(&db, &id, d("12.5")).await?);
+                assert_eq!(
+                    load_held_trips(&db).await?[0].peak_value_usd,
+                    Some(d("12.5"))
+                );
+            }
+            let close = TripClose {
+                closed_at: start + Duration::minutes(5),
+                usd_out: d("10") + d(pnl),
+                exit_fees_usd: d("0"),
+                net_pnl_usd: d(pnl),
+                exit_reason: "trailing_stop",
+            };
+            assert!(close_trip(&db, &id, &close).await?);
+        }
+        assert!(!set_peak_value(&db, "p0", d("13")).await?);
+        add_cost(&db, CostKind::FailedTx, V + 3, d("0.5"), opened).await?;
+        add_cost(&db, CostKind::FailedTx, V + 2, d("7"), opened).await?;
+
+        let result = strategy_performance(&db, "momentum-a").await?;
+        assert_eq!(result.closed.trades, 4);
+        assert_eq!(result.closed.net_usd, d("2"));
+        assert_eq!(result.closed.expectancy_usd, d("0.5"));
+        assert_eq!(result.closed.win_rate_bps, 5_000);
+        assert_eq!(result.closed.max_drawdown_usd, d("4"));
+        assert_eq!((result.costs_usd, result.net_usd), (d("0.5"), d("1.5")));
+        let none = strategy_performance(&db, "missing").await?;
+        assert_eq!((none.closed.trades, none.net_usd), (0, Decimal::ZERO));
+        assert!(strategy_performance(&db, "Not An Id").await.is_err());
         Ok(())
     }
 }
