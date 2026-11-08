@@ -105,8 +105,10 @@ Line numbers come from `76668a7`.
     their behaviour on 3.x is **unverified** and the drill must cover them.
   - Since `0017_memecoin_strategies.surql`: a byte bound in an `ASSERT`
     (`bytes::len(<bytes>$value)`), also tested on 2.6.5 only.
-  - Since `0018_roadmaps.surql`: `ASSERT`s on array elements (`phases.*`,
-    `depends_on.*`, `ops.*`), `array::distinct`, `ALLINSIDE` and
+  - Since `0018_roadmaps.surql`: `ASSERT`s on array elements through
+    `DEFINE FIELD OVERWRITE phases.*` (also `depends_on.*`, `ops.*`; 2.x
+    already defines `x[*]` for a typed array, so a plain `DEFINE FIELD`
+    fails), `array::distinct`, `ALLINSIDE` and
     `string::starts_with` in `ASSERT`s; the roadmap store also runs `FOR`
     loops with `CREATE`/`UPDATE` and `THROW` inside one transaction. Tested
     on 2.6.5 only.

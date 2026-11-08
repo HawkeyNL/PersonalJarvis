@@ -493,7 +493,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
             x,
             &format!(", status = 'stale', decided_at = time::now(), decided_by = '{d}'"),
         ),
-        proposal(x, ", status = 'accepted'"),
+        proposal(x, ", status = 'accepted', decided_at = time::now()"),
         proposal(x, "").replace("time::now() + 14d", "time::now() - 1d"),
     ] {
         assert!(db.query(&bad).await?.check().is_err(), "{bad}");

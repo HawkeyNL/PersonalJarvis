@@ -549,7 +549,17 @@ impl Draft {
                         .is_some_and(|phase| !phases.contains(phase))
                     {
                         item.phase = None;
-                        self.updated.insert(item.id.clone());
+                        if !self.created.contains(&item.id) {
+                            self.updated.insert(item.id.clone());
+                        }
+                        self.changes.push(Change {
+                            action: Action::ItemUpdated,
+                            item_id: Some(item.id.clone()),
+                            title: item.title.clone(),
+                            fields: vec!["phase".to_string()],
+                            from_status: None,
+                            to_status: None,
+                        });
                     }
                 }
             }
@@ -1104,7 +1114,18 @@ mod tests {
             .unwrap();
         assert_eq!(draft.items[0].phase, None);
         assert_eq!(draft.writes().updates.len(), 1);
-        assert_eq!(draft.changes[0].fields, ["phases"]);
+        let fields: Vec<_> = draft
+            .changes
+            .iter()
+            .map(|c| (c.action, c.fields.clone()))
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                (Action::ItemUpdated, vec!["phase".to_string()]),
+                (Action::RoadmapUpdated, vec!["phases".to_string()])
+            ]
+        );
         // A created item that is updated or deleted in the same draft is
         // written once, or not at all.
         let mut draft = Draft::new(snapshot(0));

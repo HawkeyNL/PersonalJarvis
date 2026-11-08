@@ -46,28 +46,11 @@ async fn rows<T: DeserializeOwned>(db: &Database, query: &str, bindings: Value) 
     Ok(run(db, query, bindings).await?.take(0)?)
 }
 
-/// A row as a binding without `null` fields, so an absent option is NONE
-/// for the schema.
-fn row_json(row: &impl Serialize) -> Result<Value> {
-    let mut value = serde_json::to_value(row).map_err(|_| RoadmapError::InvalidData)?;
-    if let Some(fields) = value.as_object_mut() {
-        fields.retain(|_, field| !field.is_null());
-    }
-    Ok(value)
-}
-
-fn rows_json<'a, T: Serialize + 'a>(rows: impl IntoIterator<Item = &'a T>) -> Result<Value> {
-    rows.into_iter()
-        .map(row_json)
-        .collect::<Result<Vec<_>>>()
-        .map(Value::from)
-}
-
 fn changes_json(changes: &[Change]) -> Result<Value> {
     changes
         .iter()
         .map(|change| {
-            let mut value = row_json(change)?;
+            let mut value = serde_json::to_value(change).map_err(|_| RoadmapError::InvalidData)?;
             value["id"] = uuid::Uuid::now_v7().to_string().into();
             Ok(value)
         })
@@ -122,6 +105,8 @@ pub async fn get(db: &Database, id: &str) -> Result<Option<Snapshot>> {
 }
 
 /// Create a roadmap. At most [`MAX_ROADMAPS`] are not archived.
+// ponytail: the count and the insert touch no shared key, so two concurrent
+// creates can end at 21; add a counter row both write if that ever matters.
 pub async fn create(db: &Database, input: &NewRoadmap, device_id: &str) -> Result<Snapshot> {
     validate_new_roadmap(input)?;
     let id = uuid::Uuid::now_v7().to_string();
@@ -242,8 +227,8 @@ async fn commit(
             "phases": draft.roadmap.phases,
             "archive": draft.archive,
             "deletes": writes.deletes,
-            "updates": rows_json(writes.updates)?,
-            "creates": rows_json(writes.creates)?,
+            "updates": writes.updates,
+            "creates": writes.creates,
             "changes": changes_json(&draft.changes)?,
             "author": if proposal_id.is_some() { "jarvis" } else { "owner" },
             "device": device_id,
@@ -437,6 +422,7 @@ pub async fn list_proposals(db: &Database, id: &str) -> Result<Vec<Proposal>> {
 /// current revision. The operations are tried on that revision now, so an
 /// accept at the same revision applies them as checked here. At most
 /// [`MAX_PENDING_PROPOSALS`] are pending per roadmap.
+// ponytail: same check-then-insert as `create`; only Core code proposes.
 pub async fn create_proposal(
     db: &Database,
     id: &str,
