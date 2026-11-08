@@ -348,7 +348,9 @@ fn market_exit(
     }
     if let Some(trail) = rules.trailing_stop_bps {
         let peak = peak_value_usd.unwrap_or(value).max(value);
-        if peak > position.cost_usd && scaled <= peak.checked_mul(keep(trail))? {
+        // An overflowing peak only disables the trail, never the checks below.
+        let floor = peak.checked_mul(keep(trail));
+        if peak > position.cost_usd && floor.is_some_and(|floor| scaled <= floor) {
             return Some(ExitReason::TrailingStop);
         }
     }
@@ -682,6 +684,11 @@ mod tests {
         assert_eq!(reason(&rules, low_peak, "0.0008"), None);
         // Stop loss still wins over the trail.
         assert_eq!(reason(&rules, peak, "0.0007"), Some(ExitReason::StopLoss));
+        // A peak too large to multiply disables only the trail.
+        assert_eq!(
+            reason(&rules, Some(Decimal::MAX), "0.0017"),
+            Some(ExitReason::TakeProfit)
+        );
     }
 
     #[test]

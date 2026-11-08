@@ -3,7 +3,9 @@
 //! Pure and deterministic: the same config, series and cost model always
 //! give the same report. Observations of all tokens are replayed in time
 //! order (ties by mint), so the per-day entry limit and the per-token
-//! cooldown apply across tokens as they would live.
+//! cooldown apply across tokens as they would live. An entry signal fills at
+//! the token's *next* observation, never at the price that triggered it: live
+//! trading always pays some latency between decision and fill.
 //!
 //! Fills use the size-aware paper fills of [`crate::paper`] and P&L the
 //! paper [`Ledger`], so a backtest is never kinder than paper trading.
@@ -12,15 +14,19 @@
 //! failure rate `p`. A position still open when its series ends is sold at
 //! the last observation, or written off if that cannot be priced.
 //!
-//! The hard safety filter needs fields a price series does not have, so the
-//! series are expected to come from tokens that passed it when recorded.
+//! Of the hard safety filter, only the rules a price series can evaluate are
+//! applied here: minimum liquidity and minimum pool age of the mandate's rules
+//! tightened by the config. Everything else (authorities, extensions, LP,
+//! holder concentration, sell route) is assumed checked when the series was
+//! recorded.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rust_decimal::{Decimal, RoundingStrategy};
 use time::{Date, OffsetDateTime, UtcOffset};
 
 use crate::config::{ConfigError, StrategyConfig};
+use crate::filter::FilterRules;
 use crate::paper::{self, checked_sum, CostModel, Fill, Ledger, LedgerError, Mark};
 use crate::signals::{Observation, Series};
 use crate::strategy::{self, ExitReason};
@@ -72,15 +78,17 @@ struct Open {
     peak_value_usd: Option<Decimal>,
 }
 
-/// Replay `config` over `series_by_token`. `max_position_usd` is the
-/// mandate's per-position limit the entry size is a share of.
+/// Replay `config` over `series_by_token`. `base` is the mandate's filter
+/// rules and `max_position_usd` its per-position limit, which the entry size
+/// is a share of.
 pub fn backtest(
     config: &StrategyConfig,
+    base: &FilterRules,
     series_by_token: &BTreeMap<String, Series>,
     costs: &CostModel,
     max_position_usd: Decimal,
 ) -> Result<BacktestReport, BacktestError> {
-    config.validate()?;
+    let filter = config.validate(base)?;
     if !costs.is_valid() {
         return Err(BacktestError::InvalidCosts);
     }
@@ -111,6 +119,8 @@ pub fn backtest(
     let mut open: BTreeMap<&str, Open> = BTreeMap::new();
     let mut last_exit: BTreeMap<&str, OffsetDateTime> = BTreeMap::new();
     let mut entries_by_day: BTreeMap<Date, u32> = BTreeMap::new();
+    // Mints whose entry signal fired on their previous observation.
+    let mut pending: BTreeSet<&str> = BTreeSet::new();
     let mut trades = Vec::new();
 
     for (now, mint, i) in events {
@@ -143,13 +153,21 @@ pub fn backtest(
         }
 
         let day = now.to_offset(UtcOffset::UTC).date();
-        let cooling = last_exit
-            .get(mint)
-            .is_some_and(|at| now - *at < config.token_cooldown());
         let day_full = entries_by_day.get(&day).copied().unwrap_or(0) >= config.max_entries_per_day;
         // No entry on the last observation: it could never be exited.
-        if cooling || day_full || i + 1 == series.points.len() || !config.entry_signal(series, now)
-        {
+        let last = i + 1 == series.points.len();
+        if !pending.remove(mint) {
+            let cooling = last_exit
+                .get(mint)
+                .is_some_and(|at| now - *at < config.token_cooldown());
+            let filtered = obs.liquidity_usd >= filter.min_liquidity_usd
+                && now - series.pool_created_at >= filter.min_pool_age;
+            if !(cooling || day_full || last) && filtered && config.entry_signal(series, now) {
+                pending.insert(mint);
+            }
+            continue;
+        }
+        if day_full || last {
             continue;
         }
         let Some(position) = enter(config, mint, obs, costs, max_position_usd) else {
@@ -261,10 +279,11 @@ fn report(trades: Vec<BacktestTrade>) -> Result<BacktestReport, BacktestError> {
     let pnls = || trades.iter().map(|t| t.net_pnl_usd);
     let net_usd = checked_sum(pnls())?;
     let count = Decimal::from(trades.len());
+    let overflow = || BacktestError::Ledger(LedgerError::Overflow);
     let expectancy_usd = if trades.is_empty() {
         Decimal::ZERO
     } else {
-        net_usd / count
+        net_usd.checked_div(count).ok_or_else(overflow)?
     };
     let wins = trades
         .iter()
@@ -277,14 +296,19 @@ fn report(trades: Vec<BacktestTrade>) -> Result<BacktestReport, BacktestError> {
     };
     let gross_win = checked_sum(pnls().filter(|v| *v > Decimal::ZERO))?;
     let gross_loss = -checked_sum(pnls().filter(|v| *v < Decimal::ZERO))?;
-    let profit_factor = (gross_loss > Decimal::ZERO).then(|| gross_win / gross_loss);
+    let profit_factor = if gross_loss > Decimal::ZERO {
+        Some(gross_win.checked_div(gross_loss).ok_or_else(overflow)?)
+    } else {
+        None
+    };
 
     let (mut cumulative, mut high, mut max_drawdown_usd) =
         (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
     for pnl in pnls() {
         cumulative = checked_sum([cumulative, pnl].into_iter())?;
         high = high.max(cumulative);
-        max_drawdown_usd = max_drawdown_usd.max(high - cumulative);
+        let drop = high.checked_sub(cumulative).ok_or_else(overflow)?;
+        max_drawdown_usd = max_drawdown_usd.max(drop);
     }
     Ok(BacktestReport {
         trades,
@@ -300,6 +324,8 @@ fn report(trades: Vec<BacktestTrade>) -> Result<BacktestReport, BacktestError> {
 mod tests {
     use super::*;
     use crate::config::{seeds, Condition, Op};
+    use crate::filter::tests::rules;
+    use crate::filter::Loosening;
     use crate::signals::SignalId;
     use crate::testutil::{costs, d, t0, Rng};
     use time::Duration;
@@ -341,7 +367,7 @@ mod tests {
             .iter()
             .map(|(m, s)| ((*m).to_owned(), s.clone()))
             .collect();
-        backtest(c, &map, &costs(), d("15")).unwrap()
+        backtest(c, &rules(), &map, &costs(), d("15")).unwrap()
     }
 
     fn reasons(r: &BacktestReport) -> Vec<Option<ExitReason>> {
@@ -350,12 +376,12 @@ mod tests {
 
     #[test]
     fn take_profit_stop_loss_and_end_of_data() {
-        // Flat hour, +20% (entry), then +60% (take profit).
-        let up = series(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.4, 1.9, 1.9]);
-        // Entry, then -30% (stop loss).
-        let down = series(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 0.8, 0.8]);
-        // Entry, then the data ends.
-        let ends = series(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.25]);
+        // Flat hour, +20% (signal), fill, then +58% (take profit).
+        let up = series(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.9, 1.9]);
+        // Signal, fill, then -33% (stop loss).
+        let down = series(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 0.8, 0.8]);
+        // Signal, fill, then the data ends.
+        let ends = series(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.25]);
         let r = run(&config(), &[("up", up), ("down", down), ("ends", ends)]);
         assert_eq!(
             reasons(&r),
@@ -375,6 +401,11 @@ mod tests {
         assert_eq!(r.expectancy_usd, r.net_usd / d("3"));
         assert!(r.profit_factor.unwrap() > Decimal::ONE);
         assert_eq!(r.max_drawdown_usd, -r.trades[0].net_pnl_usd);
+        // Filled one observation after the signal.
+        assert!(r
+            .trades
+            .iter()
+            .all(|t| t.opened_at == t0() + Duration::minutes(70)));
         // Entry size: the full 15 USD mandate share plus fees.
         assert!(r
             .trades
@@ -384,7 +415,7 @@ mod tests {
 
     #[test]
     fn trailing_stop_locks_in_gains() {
-        let prices = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.4, 1.6, 1.25, 1.25];
+        let prices = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.4, 1.6, 1.25, 1.25];
         let mut c = config();
         c.take_profit_bps = 100_000;
         let without = run(&c, &[("t", series(&prices))]);
@@ -392,13 +423,13 @@ mod tests {
         c.trailing_stop_bps = Some(2_000);
         let with = run(&c, &[("t", series(&prices))]);
         assert_eq!(reasons(&with), vec![Some(ExitReason::TrailingStop)]);
-        assert_eq!(with.trades[0].closed_at, t0() + Duration::minutes(90));
+        assert_eq!(with.trades[0].closed_at, t0() + Duration::minutes(100));
         assert!(with.trades[0].net_pnl_usd > Decimal::ZERO);
     }
 
     #[test]
     fn entries_per_day_and_cooldown_hold_across_tokens() {
-        let prices = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.9, 1.9];
+        let prices = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.9, 1.9];
         let tokens: Vec<(String, Series)> =
             (0..6).map(|i| (format!("m{i}"), series(&prices))).collect();
         let tokens: Vec<(&str, Series)> = tokens
@@ -412,11 +443,69 @@ mod tests {
         // One token pumping twice within the cooldown is entered once.
         c.token_cooldown_secs = 7_200;
         let twice = series(&[
-            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.9, 1.9, 1.9, 1.9, 1.9, 1.9, 2.5, 2.5,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.9, 1.9, 1.9, 1.9, 1.9, 2.5, 2.5,
         ]);
         assert_eq!(run(&c, &[("x", twice.clone())]).trades.len(), 1);
         c.token_cooldown_secs = 60;
         assert_eq!(run(&c, &[("x", twice)]).trades.len(), 2);
+    }
+
+    #[test]
+    fn entries_fill_at_the_next_observation() {
+        // The signal fires on the second-to-last point; its fill would be the
+        // last point, which could never be exited, so nothing trades.
+        let late = series(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.3]);
+        assert!(run(&config(), &[("late", late)]).trades.is_empty());
+    }
+
+    #[test]
+    fn filters_the_series_can_evaluate_apply() {
+        let prices = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.9, 1.9];
+        let tokens = [("m", series(&prices))];
+        assert_eq!(run(&config(), &tokens).trades.len(), 1);
+
+        let mut c = config();
+        c.filters.min_liquidity_usd = Some(d("250000"));
+        assert!(run(&c, &tokens).trades.is_empty());
+
+        // The signal comes 3 hours after pool creation.
+        let mut c = config();
+        c.filters.min_pool_age_secs = Some(4 * 3_600);
+        assert!(run(&c, &tokens).trades.is_empty());
+        c.filters.min_pool_age_secs = Some(3 * 3_600);
+        assert_eq!(run(&c, &tokens).trades.len(), 1);
+
+        // A looser override is refused before anything runs.
+        let mut c = config();
+        c.filters.min_liquidity_usd = Some(d("1"));
+        let map = BTreeMap::from([("m".to_owned(), series(&prices))]);
+        assert_eq!(
+            backtest(&c, &rules(), &map, &costs(), d("15")),
+            Err(BacktestError::Config(ConfigError::Loosening(Loosening {
+                field: "min_liquidity_usd"
+            })))
+        );
+    }
+
+    #[test]
+    fn absurd_results_are_an_error_not_a_panic() {
+        let trade = |pnl: Decimal| BacktestTrade {
+            mint: "m".to_owned(),
+            opened_at: t0(),
+            closed_at: t0(),
+            reason: None,
+            cost_usd: Decimal::ONE,
+            net_pnl_usd: pnl,
+        };
+        let overflow = Err(BacktestError::Ledger(LedgerError::Overflow));
+        let tiny = Decimal::new(1, 28);
+        assert_eq!(report(vec![trade(Decimal::MAX), trade(-tiny)]), overflow);
+        let swing = vec![
+            trade(Decimal::MAX),
+            trade(-Decimal::MAX),
+            trade(-Decimal::MAX),
+        ];
+        assert_eq!(report(swing), overflow);
     }
 
     #[test]
@@ -437,10 +526,13 @@ mod tests {
         let map: BTreeMap<String, Series> = tokens.into_iter().collect();
         let mut c = config();
         c.trailing_stop_bps = Some(1_500);
-        let first = backtest(&c, &map, &costs(), d("15")).unwrap();
+        let first = backtest(&c, &rules(), &map, &costs(), d("15")).unwrap();
         assert!(!first.trades.is_empty());
         for _ in 0..3 {
-            assert_eq!(backtest(&c, &map, &costs(), d("15")).unwrap(), first);
+            assert_eq!(
+                backtest(&c, &rules(), &map, &costs(), d("15")).unwrap(),
+                first
+            );
         }
         // Closes are reported in time order.
         assert!(first
@@ -456,7 +548,7 @@ mod tests {
         bad.stop_loss_bps = 0;
         let map = BTreeMap::from([("m".to_owned(), ok.clone())]);
         assert!(matches!(
-            backtest(&bad, &map, &costs(), d("15")),
+            backtest(&bad, &rules(), &map, &costs(), d("15")),
             Err(BacktestError::Config(_))
         ));
         let broken = CostModel {
@@ -464,7 +556,7 @@ mod tests {
             ..costs()
         };
         assert_eq!(
-            backtest(&config(), &map, &broken, d("15")),
+            backtest(&config(), &rules(), &map, &broken, d("15")),
             Err(BacktestError::InvalidCosts)
         );
         let mut unordered = ok.clone();
@@ -474,7 +566,7 @@ mod tests {
         for s in [unordered, zero] {
             let map = BTreeMap::from([("m".to_owned(), s)]);
             assert_eq!(
-                backtest(&config(), &map, &costs(), d("15")),
+                backtest(&config(), &rules(), &map, &costs(), d("15")),
                 Err(BacktestError::InvalidSeries("m".to_owned()))
             );
         }

@@ -5,8 +5,8 @@
 //! to exit. Configs may be proposed by a learning step, so
 //! [`StrategyConfig::validate`] refuses (never clamps) every value outside
 //! the code bounds in [`crate::strategy::bounds`] intersected with the
-//! bounds of the config's [`Family`]. Filter overrides can only make the
-//! mandate's [`FilterRules`] stricter ([`StrategyConfig::filter_rules`]).
+//! bounds of the config's [`Family`], and every filter override that would
+//! loosen the mandate's [`FilterRules`].
 //!
 //! Configs are parsed with unknown fields denied, so a misspelt field is an
 //! error rather than a silently ignored setting. Durations are whole seconds.
@@ -192,12 +192,16 @@ pub enum ConfigError {
     SignalNotAllowed { signal: SignalId, family: Family },
     #[error("entry condition {index} is malformed or outside its signal's range")]
     InvalidCondition { index: usize },
+    #[error(transparent)]
+    Loosening(#[from] Loosening),
 }
 
 impl StrategyConfig {
-    /// Refuse anything outside code bounds ∩ family bounds. Nothing is
-    /// clamped: an invalid config is an error, never a corrected config.
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    /// Refuse anything outside code bounds ∩ family bounds, or a filter
+    /// override looser than the mandate's `base` rules. Nothing is clamped:
+    /// an invalid config is an error, never a corrected config. On success
+    /// returns `base` tightened by the overrides.
+    pub fn validate(&self, base: &FilterRules) -> Result<FilterRules, ConfigError> {
         use bounds::*;
         let valid_id = (1..=32).contains(&self.id.len())
             && self
@@ -269,12 +273,12 @@ impl StrategyConfig {
             secs(self.token_cooldown_secs),
             TOKEN_COOLDOWN,
         )?;
-        Ok(())
+        Ok(self.filter_rules(base)?)
     }
 
     /// The mandate's `base` rules with this config's overrides applied, or
     /// the first override that would loosen them.
-    pub fn filter_rules(&self, base: &FilterRules) -> Result<FilterRules, Loosening> {
+    fn filter_rules(&self, base: &FilterRules) -> Result<FilterRules, Loosening> {
         let f = &self.filters;
         let mut rules = base.clone();
         if let Some(v) = f.min_liquidity_usd {
@@ -430,8 +434,7 @@ mod tests {
     fn seeds_validate_and_only_tighten() {
         let base = rules();
         for seed in seeds() {
-            assert_eq!(seed.validate(), Ok(()), "{}", seed.id);
-            let tight = seed.filter_rules(&base).expect("seed filters tighten");
+            let tight = seed.validate(&base).expect("seed validates");
             assert_eq!(base.tighten(tight.clone()), Ok(tight));
         }
     }
@@ -518,7 +521,7 @@ mod tests {
             let mut c = config();
             mutate(&mut c);
             let before = c.clone();
-            assert_eq!(c.validate(), *expected, "{c:?}");
+            assert_eq!(c.validate(&rules()).map(|_| ()), *expected, "{c:?}");
             assert_eq!(c, before, "validate never changes the config");
         }
     }
@@ -540,7 +543,7 @@ mod tests {
                 _ => c.entry[3].a = (v % 2_000_000) as i64 - 1_000_000,
             }
             let before = c.clone();
-            if c.validate().is_ok() {
+            if c.validate(&rules()).is_ok() {
                 assert!((1..=10_000).contains(&c.position_share_bps));
                 assert!((100..=9_000).contains(&c.stop_loss_bps));
                 assert!(c
@@ -577,14 +580,17 @@ mod tests {
             let mut c = config();
             c.filters = FilterOverrides::default();
             mutate(&mut c.filters);
-            assert_eq!(c.filter_rules(&base), Err(Loosening { field }));
+            assert_eq!(
+                c.validate(&base),
+                Err(ConfigError::Loosening(Loosening { field }))
+            );
         }
         let mut c = config();
         c.filters = FilterOverrides::default();
-        assert_eq!(c.filter_rules(&base), Ok(base.clone()));
+        assert_eq!(c.validate(&base), Ok(base.clone()));
         c.filters.max_sell_impact_bps = Some(1);
         c.filters.min_pool_age_secs = Some(u64::MAX);
-        let tight = c.filter_rules(&base).unwrap();
+        let tight = c.validate(&base).unwrap();
         assert_eq!(tight.max_sell_impact_bps, 1);
         assert_eq!(tight.min_pool_age, Duration::MAX);
     }
