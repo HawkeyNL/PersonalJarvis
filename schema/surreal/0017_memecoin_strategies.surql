@@ -19,7 +19,7 @@ DEFINE INDEX IF NOT EXISTS memecoin_strategy_versions_strategy ON memecoin_strat
 -- One row per strategy: the version it trades and whether it may enter.
 -- An owner's disable holds until the owner enables it again.
 DEFINE TABLE IF NOT EXISTS memecoin_strategies SCHEMAFULL PERMISSIONS NONE;
-DEFINE FIELD id ON memecoin_strategies TYPE string;
+DEFINE FIELD id ON memecoin_strategies TYPE string ASSERT record::id($value) = /^[a-z0-9-]{1,32}$/;
 DEFINE FIELD active_version ON memecoin_strategies TYPE int ASSERT $value >= 1;
 DEFINE FIELD enabled ON memecoin_strategies TYPE bool ASSERT $value = false OR disabled_by_owner = false;
 DEFINE FIELD disabled_by_owner ON memecoin_strategies TYPE bool;

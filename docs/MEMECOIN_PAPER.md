@@ -4,7 +4,7 @@ Core can run the on-chain memecoin strategy as a **paper** simulation: it reads
 public market data, applies the hard filters and the strategy from
 `jarvis-onchain`, and simulates fills, fees and failed attempts. It has no
 wallet, no signer and no execution path, and no LLM output reaches it. Results
-are stored in schema 0014 and shown through `/v1/trading/meme/*`.
+are stored in schemas 0014 and 0017 and shown through `/v1/trading/meme/*`.
 
 It is **off by default** (`JARVIS_MEMECOIN_PAPER_ENABLED=false`). Any
 configuration problem at startup leaves it off and logs why; Core keeps
@@ -81,9 +81,16 @@ write failure stops the tick before anything is simulated on it.
   tick, so events are never stamped into the future.
 - If the pause state cannot be read, that tick makes no entries.
 
-A candidate row is written only when a mint's verdict changes. Candidate rows
-and the hourly gate snapshots are pruned after 30 days; trips and costs are
-kept for the paper gate.
+A candidate row is written only when a mint's verdict changes. Daily
+housekeeping prunes, in bounded batches:
+
+- candidate rows and the hourly gate snapshots after 30 days;
+- strategy-agent decisions after 90 days;
+- price and liquidity observations after 72 hours, except the first one of
+  each mint and UTC day, which is kept for 60 days;
+- universe entries (recently migrated tokens) 7 days after the migration.
+
+Trips, costs, strategies and strategy versions are kept for the paper gate.
 
 **LP status:** the LP of the main pool (the deepest DexScreener pair; other
 pools of the token are not checked) is read on chain, only for PumpSwap,

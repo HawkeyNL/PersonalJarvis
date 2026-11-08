@@ -334,6 +334,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         strategy("b", "").replace("disabled_by_owner = false", "disabled_by_owner = true"),
         strategy("c", "").replace("'seed'", "''"),
         strategy("d", "").replace("active_version = 2", "active_version = 0"),
+        strategy("Bad_Id", ""),
         decision("x1", ", kind = 'buy'"),
         decision("x2", &format!(", kind = 'enter', mint = '{mint}'")),
         decision("x3", ", kind = 'skip', size_bps = 100"),

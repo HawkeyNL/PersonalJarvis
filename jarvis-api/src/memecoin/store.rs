@@ -645,8 +645,9 @@ pub async fn list_strategies(db: &Database) -> Result<Vec<Strategy>> {
         .collect())
 }
 
-/// Switch a strategy to `version`, which must be one of its own. `false`
-/// when there is no such strategy.
+/// Switch a strategy to `version`, which must be one of its own. A strategy
+/// the owner disabled keeps the owner's attribution. `false` when there is
+/// no such strategy.
 pub async fn set_active_version(
     db: &Database,
     id: &str,
@@ -660,8 +661,10 @@ pub async fn set_active_version(
     }
     let changed: Vec<String> = record_rows(
         db,
-        "UPDATE $rid SET active_version = $version, changed_at = time::now(), \
-         changed_by = $changed_by RETURN VALUE record::id(id)",
+        "UPDATE $rid SET active_version = $version, \
+         changed_at = IF disabled_by_owner THEN changed_at ELSE time::now() END, \
+         changed_by = IF disabled_by_owner THEN changed_by ELSE $changed_by END \
+         RETURN VALUE record::id(id)",
         "memecoin_strategies",
         id,
         json!({"version": version, "changed_by": changed_by}),
@@ -670,9 +673,11 @@ pub async fn set_active_version(
     Ok(changed.len() == 1)
 }
 
-/// Enable or disable a strategy. `owner` is true only when the caller has
-/// verified the owner: a strategy the owner disabled is only changed by the
-/// owner, so it keeps the owner's disable and its attribution. `false` when
+/// Enable or disable a strategy. Pass `owner = true` only for the owner's
+/// own change: an enable only after the owner's device signature for it was
+/// verified, a disable only from an authenticated owner session (an owner's
+/// disable needs no signature). A strategy the owner disabled is only
+/// changed by the owner, so it keeps the owner's disable and attribution. `false` when
 /// nothing changed or there is no such strategy.
 pub async fn set_strategy_enabled(
     db: &Database,
@@ -1693,6 +1698,7 @@ mod tests {
         assert!(set_strategy_enabled(&db, "momentum-a", false, true, "device-1").await?);
         assert!(!set_strategy_enabled(&db, "momentum-a", true, false, "claude").await?);
         assert!(!set_strategy_enabled(&db, "momentum-a", false, false, "claude").await?);
+        assert!(set_active_version(&db, "momentum-a", 1, "claude").await?);
         let strategies = list_strategies(&db).await?;
         assert_eq!(strategies.len(), 2);
         let momentum = &strategies[1];
@@ -1704,7 +1710,7 @@ mod tests {
                 momentum.disabled_by_owner,
                 momentum.changed_by.as_str()
             ),
-            ("momentum-a", 3, false, true, "device-1")
+            ("momentum-a", 1, false, true, "device-1")
         );
         assert!(set_strategy_enabled(&db, "momentum-a", true, true, "device-1").await?);
         let momentum = &list_strategies(&db).await?[1];
