@@ -87,8 +87,8 @@ refused 'invalid route' route_command set default ollama $'llama\t3.2'
 refused 'invalid route' route_command set default ollama "$(printf 'm%.0s' $(seq 257))"
 refused 'invalid route' route_command set default ollama ''
 refused 'allowed or off' route_command paid-api maybe
-refused 'on or off' route_command research-web-search maybe
-refused 'on or off' route_command research-web-search ON
+refused 'off, on or auto' route_command research-web-search maybe
+refused 'off, on or auto' route_command research-web-search ON
 refused 'unknown tier' route_command reset turbo
 
 # The owner can explicitly approve a paid fallback after a subscription.
@@ -111,6 +111,13 @@ route_command list > "$fixture/out"
 grep -Fxq 'research web search: on' "$fixture/out"
 route_command reset default > /dev/null
 jq -e '.research_web_search == "on" and .tiers == {}' "$routing_file" >/dev/null
+route_command research-web-search auto > /dev/null
+jq -e '.research_web_search == "auto" and .paid_api == "off"' "$routing_file" >/dev/null
+route_command list > "$fixture/out"
+grep -Fxq 'research web search: auto' "$fixture/out"
+route_command paid-api allowed > /dev/null
+jq -e '.research_web_search == "auto"' "$routing_file" >/dev/null
+route_command paid-api off > /dev/null
 route_command research-web-search off > /dev/null
 jq -e 'has("research_web_search") | not' "$routing_file" >/dev/null
 route_command set default claude-cli claude-opus-5 anthropic-api claude-opus-5 \
@@ -210,12 +217,14 @@ for document in '{"version":1}' '{"version":1,"paid_api":"off"}' '{"version":1,"
     "$(chain '[{"provider":"codex-cli","model":"gpt-6-luna"},{"provider":"claude-cli","model":"a"}]')" \
     "$(chain "[{\"provider\":\"ollama\",\"model\":\"$long_model\"}]")" \
     "$(chain "$nine")" \
+    '{"version":1,"research_web_search":"on"}' '{"version":1,"research_web_search":"auto"}' \
     "$(printf '{"version":1}%65522s' '')"; do
     valid_routing "$document" || { echo "rejected valid routing: ${document:0:120}" >&2; exit 1; }
 done
 for document in '' '[]' '{"tiers":{}}' '{"version":2}' '{"version":"1"}' '{"version":1.0}' \
     '{"version":1.00}' '{"version":1,"extra":true}' \
     '{"version":1,"paid_api":"maybe"}' '{"version":1,"paid_api":"OFF"}' '{"version":1,"paid_api":null}' \
+    '{"version":1,"research_web_search":"AUTO"}' '{"version":1,"research_web_search":true}' \
     '{"version":1}{"version":1}' '{"version":1,"tiers":null}' \
     '{"version":1,"tiers":{"turbo":{"chain":[]}}}' \
     '{"version":1,"tiers":{"default":{"chain":[{"provider":"ollama","model":"a","x":1}]}}}' \

@@ -95,6 +95,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         app_update_mirror: None,
         notifier: Default::default(),
         memecoin: Default::default(),
+        auto_research: Default::default(),
     }
 }
 

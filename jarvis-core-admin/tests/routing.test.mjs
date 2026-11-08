@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  applyConfirm, applyInOrder, baseline, changes, isPaidModel, kind, modelConfirm, restage, routeConfirm, stageConfirm,
+  applyConfirm, applyInOrder, baseline, changes, isPaidModel, kind, modelConfirm, researchLoosens, restage, routeConfirm, stageConfirm,
 } from "../src/components/models/routing.ts";
 
 const sub = { provider: "claude-cli", model: "claude-haiku-4-5" };
@@ -159,6 +159,13 @@ test("Apply confirm lists every change, says Core restarts, and is danger when i
   assert.match(spec.detail, /1\. Research web search: turn on\n2\. Cheap: use the built-in order/);
   assert.match(spec.detail, /No memory, history or device data is sent/);
 
+  const auto = baseline(saved);
+  auto.research_web_search = "auto";
+  spec = applyConfirm(changes(saved, auto));
+  assert.match(spec.detail, /1\. Research web search: turn on automatic search/);
+  assert.match(spec.detail, /No memory, history or device data is sent/);
+  assert.match(spec.detail, /names are not detected/);
+
   const allow = baseline(report({ paid_api: "off" }));
   allow.paid_api = "allowed";
   spec = applyConfirm(changes(report({ paid_api: "off" }), allow));
@@ -173,10 +180,12 @@ test("Apply confirm lists every change, says Core restarts, and is danger when i
 test("staging confirms: allow paid is danger, research on is primary, reset is danger and names the tier", () => {
   assert.equal(stageConfirm("allow_paid").tone, "danger");
   assert.equal(stageConfirm("research_on").tone, "primary");
+  assert.equal(stageConfirm("research_auto").tone, "primary");
+  assert.match(stageConfirm("research_auto").detail, /At most 10 automatic searches per hour and 40 per day/);
   const reset = stageConfirm("reset", "Hard");
   assert.equal(reset.tone, "danger");
   assert.match(reset.title, /Hard/);
-  for (const spec of [stageConfirm("allow_paid"), stageConfirm("research_on"), reset]) assert.match(spec.detail, /Nothing changes until you apply/);
+  for (const spec of [stageConfirm("allow_paid"), stageConfirm("research_on"), stageConfirm("research_auto"), reset]) assert.match(spec.detail, /Nothing changes until you apply/);
 });
 
 test("model confirms: enabling a paid model is danger, others primary, disable stays danger", () => {
@@ -200,4 +209,9 @@ test("HF route confirm names the model and route", () => {
   assert.equal(spec.tone, "primary");
   assert.match(spec.detail, /org\/model.*"fastest"/);
   assert.match(spec.detail, /does not enable this model/);
+});
+
+test("research web search: off -> on, off -> auto and on -> auto loosen; the reverse does not", () => {
+  for (const [from, to] of [["off", "on"], ["off", "auto"], ["on", "auto"]]) assert.ok(researchLoosens(from, to), `${from} -> ${to}`);
+  for (const [from, to] of [["on", "off"], ["auto", "off"], ["auto", "on"], ["on", "on"], ["off", "off"]]) assert.ok(!researchLoosens(from, to), `${from} -> ${to}`);
 });

@@ -186,7 +186,7 @@ Failure behaviour:
 Core reads routing only at startup and through the signed broker path; there
 is no file watcher. `GET /v1/system/models` reports `routing`,
 `routing_sha256`, `routing_unavailable_reason`, `research_web_search`
-(`on` or `off`, the effective state) and `routing_mutation`
+(`off`, `on` or `auto`, the effective state) and `routing_mutation`
 (`device-signed-model-route-v1` when the broker is available and the file is
 readable, otherwise `unavailable`).
 
@@ -200,7 +200,7 @@ sudo jarvis models route set cheap zai-api glm-5.3-flash claude-cli claude-haiku
 sudo jarvis models route set default claude-cli claude-opus-5 anthropic-api claude-opus-5 --metered-after-subscription
 sudo jarvis models route reset cheap
 sudo jarvis models route paid-api off
-sudo jarvis models route research-web-search on   # or off
+sudo jarvis models route research-web-search on   # or off, auto
 ```
 
 Every command takes the policy directory lock. Changes validate the complete
@@ -225,9 +225,9 @@ The canonical payload is compact JSON without whitespace, in this field order:
 `metered_after_subscription`; then `research_web_search`),
 `expected_routing_sha256`. An absent tier is omitted; `paid_api` and
 `metered_after_subscription` are always written; `research_web_search` is
-written only when `"on"`, so the fixed vector below is unchanged. An app that
-does not know the field drops it from a full replacement, which turns research
-off (fail closed). Only
+written only when `"on"` or `"auto"`, so the fixed vector below is unchanged.
+An app that does not know the field drops it from a full replacement, which
+turns research off (fail closed). Only
 `"` and `\` are escaped; `/` and non-ASCII characters are written as UTF-8.
 Fixed vector (in `crates/client-core/src/model_control.rs`):
 
@@ -247,11 +247,16 @@ the broker's 16 KiB frame.
 
 ### Research web search (off by default)
 
-`"research_web_search": "on"` is the owner's opt-in for web search. Absent or
-`"off"` is the default; an unusable routing file keeps it off. Turn it on or off
-with `sudo jarvis models route research-web-search on|off`, in the Core Admin
+`"research_web_search": "on"` is the owner's opt-in for web search (the apps
+call it "Ask"); `"auto"` also lets Core search by itself (see
+[Automatic web search](#automatic-web-search)). Absent or `"off"` is the
+default; an unusable routing file keeps it off. Set it with
+`sudo jarvis models route research-web-search off|on|auto`, in the Core Admin
 model routing card or with a signed app change. Like every routing
-change it restarts Core.
+change it restarts Core. Off -> on, off -> auto and on -> auto loosen the
+switch: clients confirm them first (`ResearchWebSearch` in
+`jarvis-client-core` is ordered strictest first). Every routing change,
+tighter or looser, needs the signed approval or the local root CLI.
 
 When it is on, only a request with the explicit mode `research` searches. A
 classifier that guesses "research" for an Auto request does not: that request
@@ -293,6 +298,50 @@ about to try its next subscription. Web content is untrusted: the model is told 
 ignore instructions in it, and it cannot trigger any other tool. Core stores
 the answer as `web:<model>` and later chat turns see it only as labelled,
 capped untrusted data (see `SUBSCRIPTION_WORKERS.md`, "Research runs").
+
+### Automatic web search
+
+With `"auto"`, explicit Research works as with `"on"`, and Core may also start
+a Research run by itself after an ordinary answer, so the latest question
+leaves the Home Node without the owner's click. It does so only for a runs-API
+answer (never `POST /v1/assistant/chat`) when all of these hold; otherwise the
+answer carries the usual `research_offer`:
+
+- the intent classifier advised research and a research run can start now
+  (a capable, owner-enabled subscription in the hard chain; the question is at
+  most 2000 characters);
+- the privacy gate passes (below);
+- no other automatic run is in flight, and fewer than 10 automatic runs
+  started in the last hour and 40 in the last day. Explicit Research runs do
+  not count. The counters live in memory and reset when Core restarts.
+
+The automatic run sends exactly what an explicit Research request sends (the
+question and the fixed instruction), stores the answer as `web:<model>`,
+records usage with `routing_mode` `research_auto`, and adds no user message.
+How clients see it is in [REALTIME_PROTOCOL.md](REALTIME_PROTOCOL.md#automatic-web-search),
+including the busy case: when the subscription worker's background slot is
+taken, the run fails and nothing is stored.
+
+**Privacy gate.** A deterministic check keeps the question on the offer button
+when it contains:
+
+- an email address;
+- 6 or more consecutive digits (phone, account or IBAN numbers);
+- a currency amount: `€`, `$`, `EUR` or `USD` with a number in the question,
+  or a number with a `k` suffix (`80k`);
+- a key-like token: a word starting with `sk-`, `ghp_` or `AKIA`, `-----BEGIN`,
+  or 24 or more consecutive ASCII letters and digits mixing both;
+- "my", "mijn" or "m'n" followed within three words by a word starting with
+  portfolio, positie, position, holding, account, rekening, IBKR, broker,
+  salaris, salary, wachtwoord or password;
+- a symbol the owner holds per the last IBKR sync (the snapshot the runtime
+  facts read), as a whole word in any case. When IBKR is linked but that
+  snapshot cannot be read, or does not list every held symbol, the gate fails
+  closed.
+
+Names, addresses and other free-text personal details are not detectable; a
+question that only carries those still searches automatically. Choose `on`
+when that is not acceptable.
 
 ## Routing, health and spend
 

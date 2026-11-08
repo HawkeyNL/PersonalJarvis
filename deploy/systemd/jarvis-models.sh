@@ -35,7 +35,7 @@ Usage:
   sudo jarvis-models route set <tier> <provider> <model> [<provider> <model>...] [--metered-after-subscription]
   sudo jarvis-models route reset <tier>
   sudo jarvis-models route paid-api <allowed|off>
-  sudo jarvis-models route research-web-search <on|off>
+  sudo jarvis-models route research-web-search <off|on|auto>
 
 `refresh` records configured models as discovered but leaves every remote or
 subscription-backed model disabled. Local Ollama remains enabled by default;
@@ -47,6 +47,8 @@ claude-cli, and `register` records one exact subscription pair, disabled.
 APIs off or on. It never enables a model: the allowlist still decides.
 `research-web-search on` lets explicit Research requests use the provider-hosted
 web search of an enabled subscription (claude-cli, codex-cli); off by default.
+`auto` also lets Core search by itself after an answer the classifier marks as
+research, within a privacy check and a rate cap.
 EOF
     exit 64
 }
@@ -524,7 +526,8 @@ show_model() {
 # `jarvis_llm::ModelRouting::parse`: known fields only, version 1, known tiers,
 # 1-9 entries, routable providers, 1-256 non-control model characters, no
 # duplicate pairs, no metered entry after a subscription entry unless the
-# tier sets `metered_after_subscription`, and `research_web_search` on or off.
+# tier sets `metered_after_subscription`, and `research_web_search` off, on or
+# auto.
 # Size is checked separately.
 # `version` must be the integer 1: Core reads it as u32, so 1.0 is refused (jq
 # canonicalizes 1e0 to 1; Core refuses it and fails closed). jq keeps the last
@@ -552,7 +555,7 @@ readonly routing_validator='
     fields(["version", "paid_api", "tiers", "research_web_search"]) and has("version")
     and (.version | type == "number" and tostring == "1")
     and ((has("paid_api") | not) or (.paid_api | IN("allowed", "off")))
-    and ((has("research_web_search") | not) or (.research_web_search | IN("off", "on")))
+    and ((has("research_web_search") | not) or (.research_web_search | IN("off", "on", "auto")))
     and ((has("tiers") | not)
          or (.tiers | fields(["cheap", "default", "hard"]) and all(.[]; tier_ok))))'
 readonly routing_providers='["anthropic-api","openai-api","deepseek-api","xai-api","zai-api","ollama","ollama-cloud","huggingface","claude-cli","codex-cli"]'
@@ -582,9 +585,9 @@ read_routing() {
     valid_routing "$document" ||
         fail "routing is invalid; remove it as root or replace it with a signed routing change"
     # Normalize: every writer emits the same explicit, duplicate-free shape.
-    # Research web search is written only when on, exactly as Core does.
+    # Research web search is written only when on or auto, exactly as Core does.
     jq '{version: 1, paid_api: (.paid_api // "allowed"), tiers: ((.tiers // {}) | with_entries(select(.value != null)))}
-        + (if .research_web_search == "on" then {research_web_search: "on"} else {} end)' <<<"$document"
+        + (if .research_web_search | IN("on", "auto") then {research_web_search} else {} end)' <<<"$document"
 }
 
 # Every routed pair must already be discovered in the model policy. Routing
@@ -693,10 +696,10 @@ set_paid_api() {
 
 set_research_web_search() {
     local state=$1
-    [[ $state =~ ^(on|off)$ ]] || fail "research-web-search takes on or off"
+    [[ $state =~ ^(on|off|auto)$ ]] || fail "research-web-search takes off, on or auto"
     local updated
     updated=$(read_routing | jq --arg state "$state" \
-        'if $state == "on" then .research_web_search = "on" else del(.research_web_search) end') || exit 1
+        'if $state == "off" then del(.research_web_search) else .research_web_search = $state end') || exit 1
     write_routing "$updated"
     echo "jarvis-models: research web search is now $state."
 }

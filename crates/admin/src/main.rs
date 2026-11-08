@@ -310,9 +310,11 @@ enum RouteCommand {
         state: PaidApiState,
     },
     /// `on` lets explicit Research requests use the provider-hosted web search
-    /// of an enabled subscription (claude-cli, codex-cli). Off by default.
+    /// of an enabled subscription (claude-cli, codex-cli); `auto` also lets
+    /// Core search after an answer the classifier marks as research. Off by
+    /// default.
     ResearchWebSearch {
-        state: OnOff,
+        state: WebSearchState,
     },
 }
 
@@ -324,9 +326,10 @@ enum RouteTier {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum OnOff {
-    On,
+enum WebSearchState {
     Off,
+    On,
+    Auto,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

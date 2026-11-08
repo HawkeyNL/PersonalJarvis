@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
-import { api, errorText, type ModelRecord, type OperationResult, type RouteTier, type RoutingReport } from "../admin";
+import { api, errorText, type ModelRecord, type OperationResult, type ResearchWebSearch, type RouteTier, type RoutingReport } from "../admin";
 import ConfirmDialog from "./ConfirmDialog.vue";
 import ErrorPanel from "./ErrorPanel.vue";
 import ResultPanel from "./ResultPanel.vue";
-import { MAX_CHAIN, ROUTE_PROVIDERS, TIERS, applyConfirm, applyInOrder, baseline, changes, entryKey as key, kind, paidAfterSubscription, restage, stageConfirm, type Change, type ConfirmSpec, type Staged } from "./models/routing";
+import { MAX_CHAIN, ROUTE_PROVIDERS, TIERS, applyConfirm, applyInOrder, baseline, changes, entryKey as key, kind, paidAfterSubscription, researchLoosens, restage, stageConfirm, type Change, type ConfirmSpec, type Staged } from "./models/routing";
 
 const props = defineProps<{ models: ModelRecord[] }>();
 const emit = defineEmits<{ changes: [count: number]; applying: [active: boolean] }>();
@@ -26,7 +26,7 @@ const error = ref("");
 const errorTitle = ref<string>();
 const results = ref<OperationResult[]>([]);
 // `list`: for Apply, exactly the changes the confirm showed; those are sent.
-type Pending = { kind: "allow_paid" | "research_on" | "reset" | "apply"; tier?: RouteTier; spec: ConfirmSpec; list?: Change[] };
+type Pending = { kind: "allow_paid" | "research_on" | "research_auto" | "reset" | "apply"; tier?: RouteTier; spec: ConfirmSpec; list?: Change[] };
 // Shallow: the confirmed list goes to the broker as plain objects, not proxies.
 const pending = shallowRef<Pending | null>(null);
 let alive = true;
@@ -70,6 +70,7 @@ function confirmed() {
   const draft = staged.value!;
   if (action.kind === "allow_paid") draft.paid_api = "allowed";
   else if (action.kind === "research_on") draft.research_web_search = "on";
+  else if (action.kind === "research_auto") draft.research_web_search = "auto";
   else {
     draft.tiers[action.tier!] = null;
     // The reset button that opened the confirm is gone now; focus the tier's model picker.
@@ -84,11 +85,15 @@ function togglePaid() {
   else if (savedPaid.value === "allowed") draft.paid_api = "allowed";
   else confirm("allow_paid");
 }
-function toggleResearch() {
+// Loosening past what Core has saved asks first; until then the select keeps
+// showing the staged value.
+function pickResearch(event: Event) {
+  const select = event.target as HTMLSelectElement;
+  const next = select.value as ResearchWebSearch;
   const draft = staged.value!;
-  if (draft.research_web_search === "on") draft.research_web_search = "off";
-  else if (savedResearch.value === "on") draft.research_web_search = "on";
-  else confirm("research_on");
+  if (!researchLoosens(savedResearch.value, next)) { draft.research_web_search = next; return; }
+  select.value = draft.research_web_search;
+  confirm(next === "auto" ? "research_auto" : "research_on");
 }
 function discard() { if (report.value) staged.value = baseline(report.value); }
 
@@ -134,11 +139,15 @@ onBeforeUnmount(() => { alive = false; });
         <button class="small secondary" :disabled="locked" @click="togglePaid">{{ staged.paid_api === "allowed" ? "Turn off" : "Allow" }}</button>
       </div>
     </div>
-    <div v-if="staged" class="paid-switch" :class="staged.research_web_search === 'on' ? 'allowed' : 'off'">
+    <div v-if="staged" class="paid-switch" :class="staged.research_web_search === 'off' ? 'off' : 'allowed'">
       <span>Research web search: <strong>{{ staged.research_web_search }}</strong><template v-if="staged.research_web_search !== savedResearch"> (not applied)</template></span>
-      <button class="small secondary" :disabled="locked" @click="toggleResearch">{{ staged.research_web_search === "on" ? "Turn off" : "Turn on" }}</button>
+      <select :value="staged.research_web_search" :disabled="locked" aria-label="Research web search" @change="pickResearch">
+        <option value="off">Off</option>
+        <option value="on">On: explicit Research only</option>
+        <option value="auto">Auto: also after research answers</option>
+      </select>
     </div>
-    <p class="usage-source">Research web search lets an explicit Research request search the web through an enabled subscription in the Hard tier (claude-cli, codex-cli), never a paid API. Only the question leaves the Home Node, to that provider and its search partners.</p>
+    <p class="usage-source">Research web search lets an explicit Research request search the web through an enabled subscription in the Hard tier (claude-cli, codex-cli), never a paid API. Only the question leaves the Home Node, to that provider and its search partners. Auto also searches by itself after an answer Jarvis marks as research, unless the question looks personal or financial, at most 10 times per hour and 40 per day.</p>
     <p class="usage-source">Paid APIs off keeps only subscriptions (claude-cli, codex-cli) and local Ollama in every tier. Routing only orders models: a model still has to be enabled, and disabled models are skipped. Changes wait here until you apply them; applying restarts Jarvis Core.</p>
     <ErrorPanel v-if="unavailable" title="Routing file needs repair" :message="`${REASONS[unavailable] ?? 'Routing is unavailable.'} Jarvis uses the built-in order without paid APIs until it is fixed as root (${unavailable}).`" />
     <ErrorPanel v-if="error" :message="error" :title="errorTitle" />

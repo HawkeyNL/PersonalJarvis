@@ -638,6 +638,7 @@ async fn main() -> anyhow::Result<()> {
         memecoin: Arc::new(jarvis_api::memecoin::PaperHandle::new(
             config.memecoin_paper_enabled,
         )),
+        auto_research: Default::default(),
     };
 
     jarvis_api::refresh_usage_snapshot(&state).await;

@@ -106,7 +106,7 @@ impl ModelToggleApproval {
 /// The owner routing document exactly as signed. Field order and the omission
 /// rules are part of the canonical payload: an absent tier is omitted, while
 /// `paid_api` and `metered_after_subscription` are always written.
-/// `research_web_search` is written last and only when `on`.
+/// `research_web_search` is written last and only when `on` or `auto`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingDocument {
@@ -119,13 +119,17 @@ pub struct RoutingDocument {
     pub research_web_search: ResearchWebSearch,
 }
 
-/// Owner opt-in for provider-hosted web search in explicit Research requests.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Owner opt-in for provider-hosted web search: `on` serves explicit
+/// Research requests, `auto` also lets Core search after an answer.
+/// Ordered from strictest to loosest, so a change to a greater value
+/// (off -> on, off -> auto, on -> auto) is a loosening.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ResearchWebSearch {
     #[default]
     Off,
     On,
+    Auto,
 }
 
 impl ResearchWebSearch {
@@ -379,10 +383,34 @@ mod tests {
             .unwrap()
             .ends_with(r#"}},"research_web_search":"on"},"expected_routing_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#));
         assert_ne!(changed.message().unwrap(), message);
+        let on = changed.message().unwrap();
+        changed.routing.research_web_search = ResearchWebSearch::Auto;
+        assert!(String::from_utf8(changed.canonical_payload().unwrap())
+            .unwrap()
+            .ends_with(r#"}},"research_web_search":"auto"},"expected_routing_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#));
+        assert_ne!(changed.message().unwrap(), on);
+        changed.routing.research_web_search = ResearchWebSearch::Off;
+        assert_eq!(changed.message().unwrap(), message);
         changed = approval;
         changed.routing.version = 2;
         assert!(changed.message().is_err());
         assert!(serde_json::from_str::<RoutingDocument>(r#"{"version":1,"extra":1}"#).is_err());
+    }
+
+    #[test]
+    fn research_web_search_parses_auto_and_orders_loosening() {
+        use ResearchWebSearch::{Auto, Off, On};
+        let parse = |raw: &str| serde_json::from_str::<RoutingDocument>(raw);
+        assert_eq!(
+            parse(r#"{"version":1,"research_web_search":"auto"}"#)
+                .unwrap()
+                .research_web_search,
+            Auto
+        );
+        assert!(parse(r#"{"version":1,"research_web_search":"AUTO"}"#).is_err());
+        // Loosening: off -> on, off -> auto, on -> auto. The reverse tightens.
+        assert!(On > Off && Auto > Off && Auto > On);
+        assert!(Off < On && On < Auto);
     }
 
     #[test]
