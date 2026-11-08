@@ -22,15 +22,23 @@
 //! 5. [`gate`]: is the paper record good enough to consider going live?
 //! 6. [`goals`]: how far the owner's goal (e.g. 2x) is, and what to do there.
 //!
+//! Typed strategy versions live in [`config`]: entry conditions on code-defined
+//! [`signals`] from our own observed price and liquidity series, bounded
+//! sizes and exits. [`backtest`] replays a config over recorded series with
+//! the paper fills and ledger.
+//!
 //! Money and token amounts are `rust_decimal::Decimal` (USD for money), never
 //! floats. Ratios are basis points (`bps`, 10 000 = 100%) or `Decimal`
 //! fractions where noted.
 
+pub mod backtest;
+pub mod config;
 pub mod filter;
 pub mod gate;
 pub mod goals;
 pub mod paper;
 pub mod research;
+pub mod signals;
 pub mod strategy;
 pub mod types;
 

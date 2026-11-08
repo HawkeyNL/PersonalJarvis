@@ -15,7 +15,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use jarvis_client_core::realtime::{
-    CanonicalMessage, ConversationMetadata, Event, MessageRole, RunIdentity,
+    CanonicalMessage, ConversationMetadata, Event, MessageRole, RunFailure, RunIdentity,
 };
 use jarvis_llm as llm;
 use jarvis_orchestrator as orchestrator;
@@ -278,9 +278,13 @@ pub(super) async fn execute_chat(
                 },
             );
         }
-        state
-            .realtime
-            .publish(authed.user.id, Event::AssistantStarted(run.clone()));
+        state.realtime.publish(
+            authed.user.id,
+            Event::AssistantStarted {
+                run: run.clone(),
+                web_search: false,
+            },
+        );
     }
 
     // A fresh topic starts with a clean slate; a continuation keeps its context.
@@ -423,35 +427,18 @@ pub(super) async fn execute_chat(
     }
     match reply {
         Ok(mut reply) => {
-            let estimated_usage = reply.backend.is_some() && reply.usage.is_none();
-            if estimated_usage {
-                // Missing stream usage must not turn a metered success into
-                // an unrecorded/free request. Charge a conservative input-byte
-                // ceiling plus framing and the requested output-token limit.
-                let input_bytes = chat
-                    .messages
-                    .iter()
-                    .map(|m| m.content.len().saturating_add(32))
-                    .sum::<usize>()
-                    .saturating_add(chat.system.as_ref().map_or(0, String::len))
-                    .saturating_add(1024);
-                reply.usage = Some(llm::Usage {
-                    input_tokens: input_bytes.min(i32::MAX as usize) as u32,
-                    output_tokens: chat.max_tokens,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 0,
-                });
-            }
+            let input_bytes = chat
+                .messages
+                .iter()
+                .map(|m| m.content.len().saturating_add(32))
+                .sum::<usize>()
+                .saturating_add(chat.system.as_ref().map_or(0, String::len));
+            let status = estimate_missing_usage(&mut reply, input_bytes, chat.max_tokens);
             record_usage_with_metadata(
                 &state,
                 &reply,
                 jarvis_usage::UsageMetadata {
-                    status: if estimated_usage {
-                        "succeeded_estimated_usage"
-                    } else {
-                        "succeeded"
-                    }
-                    .into(),
+                    status: status.into(),
                     ..metadata
                 },
             )
@@ -467,11 +454,27 @@ pub(super) async fn execute_chat(
             .await
             .map_err(|_| internal_error())?;
             if let Some(run) = &realtime_run {
-                let research_offer = crate::intent::research_offer(
-                    intent_kind,
-                    || state.llm.can_research(),
-                    &new_msg,
-                );
+                // Only a runs-API run (its user message was persisted first)
+                // may search by itself; the legacy endpoint never does.
+                let auto = if user_already_published {
+                    crate::auto_research::start(
+                        &state,
+                        intent_kind == Some(crate::intent::WorkKind::Research),
+                        &new_msg,
+                    )
+                    .await
+                } else {
+                    None
+                };
+                let research_offer = if auto.is_some() {
+                    None
+                } else {
+                    crate::intent::research_offer(
+                        intent_kind,
+                        || state.llm.can_research(),
+                        &new_msg,
+                    )
+                };
                 state.realtime.publish(
                     authed.user.id,
                     Event::AssistantCompleted {
@@ -488,6 +491,15 @@ pub(super) async fn execute_chat(
                         updated_at: OffsetDateTime::now_utc(),
                     }),
                 );
+                if let Some(slot) = auto {
+                    tokio::spawn(auto_research_run(
+                        state.clone(),
+                        slot,
+                        authed.user.id,
+                        run.clone(),
+                        new_msg.clone(),
+                    ));
+                }
             }
             Ok(Json(json!({
                 "reply": reply.text,
@@ -634,6 +646,135 @@ fn is_https_source(line: &str) -> bool {
         })
 }
 
+/// Missing usage on a backend reply must not turn a metered success into an
+/// unrecorded/free request: charge a conservative input-byte ceiling plus
+/// framing and the requested output-token limit. Returns the usage status.
+fn estimate_missing_usage(
+    reply: &mut llm::ChatReply,
+    input_bytes: usize,
+    max_tokens: u32,
+) -> &'static str {
+    if reply.backend.is_none() || reply.usage.is_some() {
+        return "succeeded";
+    }
+    reply.usage = Some(llm::Usage {
+        input_tokens: input_bytes.saturating_add(1024).min(i32::MAX as usize) as u32,
+        output_tokens: max_tokens,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+    });
+    "succeeded_estimated_usage"
+}
+
+/// Automatic web search after an answer: a second run on the same question
+/// with no user message of its own, marked `web_search` when it starts. A
+/// search that did not run (switched off meanwhile, worker slot busy, no
+/// subscription) fails this run and stores nothing; the answer stands and
+/// the owner can still ask for Research.
+async fn auto_research_run(
+    state: AppState,
+    slot: crate::auto_research::AutoSlot,
+    user: Uuid,
+    answered: RunIdentity,
+    question: String,
+) {
+    let _slot = slot;
+    let run = RunIdentity {
+        run_id: Uuid::now_v7(),
+        ..answered
+    };
+    state.realtime.publish(
+        user,
+        Event::AssistantStarted {
+            run: run.clone(),
+            web_search: true,
+        },
+    );
+    let started = Instant::now();
+    let Some((mut reply, model)) = auto_research_answer(
+        &state.model_routing.snapshot(),
+        state.llm.as_ref(),
+        &question,
+    )
+    .await
+    else {
+        state.realtime.publish(
+            user,
+            Event::AssistantFailed {
+                run,
+                reason: RunFailure::ProviderUnavailable,
+            },
+        );
+        return;
+    };
+    let status = estimate_missing_usage(&mut reply, question.len(), state.llm_max_tokens);
+    record_usage_with_metadata(
+        &state,
+        &reply,
+        jarvis_usage::UsageMetadata {
+            request_id: run.run_id.to_string(),
+            routing_mode: "research_auto".into(),
+            quality_tier: "hard".into(),
+            latency_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+            status: status.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    // The owner may have deleted the conversation while the search ran.
+    match append_to_live_conversation(&state.db, run.conversation_id, user, &reply.text, &model)
+        .await
+    {
+        Ok(Some((message, title))) => {
+            state.realtime.publish(
+                user,
+                Event::AssistantCompleted {
+                    run: run.clone(),
+                    message,
+                    research_offer: None,
+                },
+            );
+            state.realtime.publish(
+                user,
+                Event::ConversationUpdated(ConversationMetadata {
+                    id: run.conversation_id,
+                    title,
+                    updated_at: OffsetDateTime::now_utc(),
+                }),
+            );
+        }
+        Ok(None) => state.realtime.publish(
+            user,
+            Event::AssistantFailed {
+                run,
+                reason: RunFailure::Interrupted,
+            },
+        ),
+        Err(()) => state.realtime.publish(
+            user,
+            Event::AssistantFailed {
+                run,
+                reason: RunFailure::PersistenceUnavailable,
+            },
+        ),
+    }
+}
+
+/// The automatic search's answer and the model it is stored under
+/// (`web:<model>`), or `None` when no search ran: then only a fixed notice
+/// would remain, which an unrequested run does not store.
+async fn auto_research_answer(
+    routing: &llm::RoutingSnapshot,
+    brain: &dyn llm::LlmProvider,
+    question: &str,
+) -> Option<(llm::ChatReply, String)> {
+    let reply = research_reply(routing, brain, question).await;
+    reply.backend.is_some().then(|| {
+        let model = stored_model(llm::RoutingMode::Research, &reply);
+        (reply, model)
+    })
+}
+
 /// The answer to an explicit Research request. Off, too long or unavailable
 /// is a clear, fixed answer, never a silent paid-API or non-search answer.
 async fn research_reply(
@@ -651,7 +792,7 @@ async fn research_reply(
         stop_reason: Some("research_unavailable".into()),
         usage: None,
     };
-    if !routing.research_web_search_on() {
+    if !routing.research_allowed() {
         return notice(RESEARCH_OFF.into());
     }
     let Some(request) = llm::ResearchRequest::new(latest_question) else {
@@ -826,6 +967,55 @@ async fn append_message(
         model: model.map(str::to_string),
         created_at: at,
     })
+}
+
+/// Appends an assistant message only while the owner's conversation still
+/// exists. One transaction writes the conversation row first, so a concurrent
+/// delete either commits before it (nothing is stored) or conflicts. Returns
+/// the message and the conversation's current title, or `None` when the
+/// conversation is gone.
+async fn append_to_live_conversation(
+    db: &jarvis_store::Database,
+    conv_id: Uuid,
+    user_id: Uuid,
+    content: &str,
+    model: &str,
+) -> Result<Option<(CanonicalMessage, String)>, ()> {
+    let id = Uuid::now_v7();
+    let at = OffsetDateTime::now_utc();
+    let mut response = db
+        .query(
+            "BEGIN TRANSACTION; \
+             LET $conversation = UPDATE conversations SET updated_at = time::now() \
+             WHERE record::id(id) = $conversation_id AND user_id = $user_id RETURN AFTER; \
+             IF array::len($conversation) = 1 { CREATE chat_messages SET id = $id, \
+             conversation_id = $conversation_id, user_id = $user_id, role = 'assistant', \
+             content = $content, model = $model, created_at = <datetime>$at RETURN NONE; }; \
+             SELECT VALUE title FROM conversations \
+             WHERE record::id(id) = $conversation_id AND user_id = $user_id; \
+             COMMIT TRANSACTION;",
+        )
+        .bind(json!({"id": id.to_string(),
+            "at": at.format(&time::format_description::well_known::Rfc3339).map_err(|_| ())?,
+            "conversation_id": conv_id.to_string(), "user_id": user_id.to_string(),
+            "content": content, "model": model}))
+        .await
+        .map_err(|_| ())?
+        .check()
+        .map_err(|_| ())?;
+    let last = response.num_statements().checked_sub(1).ok_or(())?;
+    let titles: Vec<String> = response.take(last).map_err(|_| ())?;
+    Ok(titles.into_iter().next().map(|title| {
+        let message = CanonicalMessage {
+            id,
+            conversation_id: conv_id,
+            role: MessageRole::Assistant,
+            content: content.to_string(),
+            model: Some(model.to_string()),
+            created_at: at,
+        };
+        (message, title)
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1145,6 +1335,33 @@ mod tests {
         );
         let off = research_reply(&llm::RoutingSnapshot::default(), &Recorder::default(), "x").await;
         assert_eq!(stored_model(research, &off), "research");
+    }
+
+    #[tokio::test]
+    async fn automatic_search_stores_only_a_real_answer_as_web() {
+        let auto = routing(r#"{"version":1,"research_web_search":"auto"}"#);
+        let brain = Recorder::default();
+        let (reply, model) = auto_research_answer(&auto, &brain, " weer Amsterdam morgen ")
+            .await
+            .unwrap();
+        assert_eq!(model, "web:claude-opus-5");
+        assert_eq!(reply.text, "Answer\nSources:\nhttps://example.org/a");
+        assert_eq!(*brain.seen.lock().unwrap(), ["weer Amsterdam morgen"]);
+        // Worker slot busy or no subscription: nothing is stored, the run fails.
+        let busy = Recorder {
+            fail: true,
+            ..Default::default()
+        };
+        assert!(auto_research_answer(&auto, &busy, "weer?").await.is_none());
+        assert_eq!(busy.seen.lock().unwrap().len(), 1);
+        // Switched off meanwhile: no search at all.
+        let off = Recorder::default();
+        assert!(
+            auto_research_answer(&llm::RoutingSnapshot::default(), &off, "weer?")
+                .await
+                .is_none()
+        );
+        assert!(off.seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

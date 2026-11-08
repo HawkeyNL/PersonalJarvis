@@ -3,7 +3,8 @@
 //! grants access. The allowlist, the monthly cap and health still decide at
 //! attempt time. `paid_api: "off"` removes every metered backend.
 //! `research_web_search: "on"` is the owner's opt-in for explicit Research
-//! requests to use provider-hosted web search through a subscription worker.
+//! requests to use provider-hosted web search through a subscription worker;
+//! `"auto"` also lets Core start such a search by itself after an answer.
 
 use std::{collections::BTreeSet, sync::RwLock};
 
@@ -44,14 +45,17 @@ pub enum PaidApi {
     Off,
 }
 
-/// The owner's opt-in for provider-hosted web search in explicit Research
-/// requests. Off by default; only subscription workers ever search.
+/// The owner's opt-in for provider-hosted web search. Off by default; only
+/// subscription workers ever search. `On` serves explicit Research requests
+/// (the app's "Ask"); `Auto` also lets Core search after an answer the
+/// classifier marks as research, within its privacy gate and rate cap.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResearchWebSearch {
     #[default]
     Off,
     On,
+    Auto,
 }
 
 impl ResearchWebSearch {
@@ -226,14 +230,23 @@ impl RoutingSnapshot {
                 .is_some_and(|routing| routing.paid_api == PaidApi::Off)
     }
 
-    /// Research web search runs only with a usable routing file that turns
-    /// it on explicitly; an absent or unusable file keeps it off.
-    pub fn research_web_search_on(&self) -> bool {
-        self.unavailable_reason.is_none()
-            && self
-                .routing
-                .as_ref()
-                .is_some_and(|routing| routing.research_web_search == ResearchWebSearch::On)
+    /// The effective switch: only a usable routing file turns web search on;
+    /// an absent or unusable file keeps it off.
+    pub fn research_web_search(&self) -> ResearchWebSearch {
+        match (&self.routing, self.unavailable_reason) {
+            (Some(routing), None) => routing.research_web_search,
+            _ => ResearchWebSearch::Off,
+        }
+    }
+
+    /// An explicit Research request may search the web (`on` or `auto`).
+    pub fn research_allowed(&self) -> bool {
+        self.research_web_search() != ResearchWebSearch::Off
+    }
+
+    /// Core may start a search by itself after an answer.
+    pub fn research_auto(&self) -> bool {
+        self.research_web_search() == ResearchWebSearch::Auto
     }
 
     /// A brain pin or explicit provider choice must be refused, not silently
@@ -437,33 +450,55 @@ mod tests {
     }
 
     #[test]
-    fn research_web_search_is_off_unless_explicitly_on() {
+    fn research_web_search_is_off_unless_explicitly_on_or_auto() {
         let parse = |raw: &str| RoutingSnapshot {
             routing: Some(ModelRouting::parse(raw.as_bytes()).unwrap()),
             unavailable_reason: None,
         };
-        assert!(!RoutingSnapshot::default().research_web_search_on());
-        assert!(!parse(r#"{"version":1}"#).research_web_search_on());
-        assert!(!parse(r#"{"version":1,"research_web_search":"off"}"#).research_web_search_on());
-        assert!(parse(r#"{"version":1,"research_web_search":"on"}"#).research_web_search_on());
-        assert!(!RoutingSnapshot::unavailable("routing_invalid").research_web_search_on());
+        let off = [
+            RoutingSnapshot::default(),
+            parse(r#"{"version":1}"#),
+            parse(r#"{"version":1,"research_web_search":"off"}"#),
+            RoutingSnapshot::unavailable("routing_invalid"),
+        ];
+        for snapshot in &off {
+            assert!(!snapshot.research_allowed() && !snapshot.research_auto());
+        }
+        let on = parse(r#"{"version":1,"research_web_search":"on"}"#);
+        assert!(on.research_allowed() && !on.research_auto());
+        let auto = parse(r#"{"version":1,"research_web_search":"auto"}"#);
+        assert!(auto.research_allowed() && auto.research_auto());
+        // An unusable file keeps even a parsed auto switch off.
+        let failed = RoutingSnapshot {
+            unavailable_reason: Some("routing_reload_required"),
+            ..auto
+        };
+        assert!(!failed.research_allowed() && !failed.research_auto());
         for raw in [
             r#"{"version":1,"research_web_search":"ON"}"#,
+            r#"{"version":1,"research_web_search":"AUTO"}"#,
             r#"{"version":1,"research_web_search":true}"#,
             r#"{"version":1,"research_web_search":"live"}"#,
         ] {
             assert!(ModelRouting::parse(raw.as_bytes()).is_err(), "{raw}");
         }
-        // Off is omitted, so pre-existing documents keep their exact bytes.
-        let off = ModelRouting::parse(br#"{"version":1,"research_web_search":"off"}"#).unwrap();
+        // Off is omitted, so pre-existing documents keep their exact bytes;
+        // on and auto are written last.
+        let bytes = |raw: &str| {
+            serde_json::to_string(&ModelRouting::parse(raw.as_bytes()).unwrap()).unwrap()
+        };
         assert_eq!(
-            serde_json::to_string(&off).unwrap(),
+            bytes(r#"{"version":1,"research_web_search":"off"}"#),
             r#"{"version":1,"paid_api":"allowed","tiers":{}}"#
         );
-        let on = ModelRouting::parse(br#"{"version":1,"research_web_search":"on"}"#).unwrap();
-        assert!(serde_json::to_string(&on)
-            .unwrap()
-            .ends_with(r#""research_web_search":"on"}"#));
+        assert_eq!(
+            bytes(r#"{"version":1,"research_web_search":"on"}"#),
+            r#"{"version":1,"paid_api":"allowed","tiers":{},"research_web_search":"on"}"#
+        );
+        assert_eq!(
+            bytes(r#"{"research_web_search":"auto","paid_api":"off","version":1}"#),
+            r#"{"version":1,"paid_api":"off","tiers":{},"research_web_search":"auto"}"#
+        );
     }
 
     #[test]

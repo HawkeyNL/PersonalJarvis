@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 mod audit;
+pub mod auto_research;
 #[cfg(unix)]
 pub mod broker_replay;
 pub mod budget_gate;

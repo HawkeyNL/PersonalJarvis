@@ -1,10 +1,13 @@
 //! Read-only Solana JSON-RPC reads against two independent providers.
 //!
-//! Only `getAccountInfo` and `getTokenLargestAccounts` are called, at
-//! `confirmed` commitment. [`CrossCheckedRpc`] asks both providers and fails
-//! with [`MarketDataError::ProviderDisagreement`] unless they agree exactly;
-//! only values built from its reads (here and in [`crate::pools::read`]) are
-//! wrapped in the [`CrossChecked`] type the snapshot mapping takes.
+//! Only `getAccountInfo`, `getTokenLargestAccounts`, and for
+//! [`crate::discovery`] `getSignaturesForAddress` and `getTransaction`, are
+//! called, at `confirmed` commitment. [`CrossCheckedRpc`] asks both providers
+//! and fails with [`MarketDataError::ProviderDisagreement`] unless they agree
+//! exactly; only values built from its reads (here and in
+//! [`crate::pools::read`]) are wrapped in the [`CrossChecked`] type the
+//! snapshot mapping takes. Discovery reads the primary provider alone and
+//! never produces a [`CrossChecked`] value.
 // ponytail: response slots are not compared, so two providers that lag the
 // same way agree on stale state; pass `minContextSlot` if that shows up.
 
@@ -19,7 +22,7 @@ use zeroize::Zeroizing;
 
 use crate::http::{checked_url, Http, DEFAULT_BACKOFF};
 use crate::token2022::{parse_mint, MintAccount, TokenProgram};
-use crate::{u64_string, validate_address, MarketDataError, Provider};
+use crate::{u64_string, validate_address, validate_signature, MarketDataError, Provider};
 
 /// Spacing per provider: 4 requests/s, under the public mainnet per-method
 /// limit (40 per 10 s).
@@ -78,8 +81,21 @@ impl fmt::Debug for RpcClient {
 struct Reply<T> {
     jsonrpc: String,
     id: Value,
+    /// `None` only when the field is absent, so a method whose result may be
+    /// `null` (`getTransaction`) can ask for an `Option`.
+    #[serde(
+        default = "Option::default",
+        deserialize_with = "present",
+        bound(deserialize = "T: Deserialize<'de>")
+    )]
     result: Option<T>,
     error: Option<ReplyError>,
+}
+
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -112,6 +128,73 @@ pub struct TokenAccountBalance {
     pub address: String,
     #[serde(deserialize_with = "u64_string")]
     pub amount: u64,
+}
+
+/// Most signatures one `getSignaturesForAddress` call may ask for (RPC spec).
+const MAX_SIGNATURES_PER_CALL: usize = 1000;
+
+/// One entry of `getSignaturesForAddress`, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SignatureInfo {
+    pub signature: String,
+    pub block_time: Option<i64>,
+    /// `Some` when the transaction failed.
+    pub err: Option<Value>,
+}
+
+/// The parts of a `getTransaction` reply (`json` encoding) discovery reads.
+/// Legacy, v0 and v1 transactions share this shape.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Transaction {
+    pub block_time: Option<i64>,
+    pub meta: Option<TransactionMeta>,
+    pub transaction: TransactionBody,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TransactionBody {
+    pub message: Message,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Message {
+    pub account_keys: Vec<String>,
+    pub instructions: Vec<Instruction>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Instruction {
+    pub program_id_index: usize,
+    pub accounts: Vec<usize>,
+    /// Base58.
+    pub data: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TransactionMeta {
+    pub err: Option<Value>,
+    pub inner_instructions: Option<Vec<InnerInstructions>>,
+    /// Address-lookup-table keys of a v0 transaction, appended to the
+    /// message keys in this order.
+    pub loaded_addresses: Option<LoadedAddresses>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct InnerInstructions {
+    /// The top-level instruction these were invoked from.
+    pub index: usize,
+    pub instructions: Vec<Instruction>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct LoadedAddresses {
+    pub writable: Vec<String>,
+    pub readonly: Vec<String>,
 }
 
 impl RpcClient {
@@ -215,6 +298,50 @@ impl RpcClient {
             .await?;
         Ok(reply.value)
     }
+
+    /// Up to `limit` signatures of transactions that touched `address`,
+    /// newest first, stopping before `until` (exclusive) when given.
+    pub(crate) async fn signatures_for_address(
+        &self,
+        address: &str,
+        until: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SignatureInfo>, MarketDataError> {
+        validate_address(address)?;
+        if !(1..=MAX_SIGNATURES_PER_CALL).contains(&limit) {
+            return Err(MarketDataError::InvalidInput("signature limit"));
+        }
+        let mut config = json!({ "limit": limit, "commitment": "confirmed" });
+        if let Some(until) = until {
+            validate_signature(until)?;
+            config["until"] = json!(until);
+        }
+        let list: Vec<SignatureInfo> = self
+            .call("getSignaturesForAddress", json!([address, config]))
+            .await?;
+        if list.len() > limit {
+            return Err(self.invalid("more signatures than requested"));
+        }
+        Ok(list)
+    }
+
+    /// One transaction, `None` when the provider does not have it.
+    /// Versions up to 1 are accepted (pump.fun already sends v1).
+    pub(crate) async fn transaction(
+        &self,
+        signature: &str,
+    ) -> Result<Option<Transaction>, MarketDataError> {
+        validate_signature(signature)?;
+        self.call(
+            "getTransaction",
+            json!([signature, {
+                "encoding": "json",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 1
+            }]),
+        )
+        .await
+    }
 }
 
 /// Two independent RPC providers that must agree on every read.
@@ -241,6 +368,11 @@ impl CrossCheckedRpc {
     #[cfg(test)]
     pub(crate) fn from_clients(primary: RpcClient, secondary: RpcClient) -> Self {
         Self { primary, secondary }
+    }
+
+    /// The primary provider alone, for reads that need no agreement.
+    pub(crate) fn primary(&self) -> &RpcClient {
+        &self.primary
     }
 
     pub async fn mint(&self, mint: &str) -> Result<CrossChecked<MintAccount>, MarketDataError> {

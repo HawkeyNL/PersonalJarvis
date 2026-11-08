@@ -225,6 +225,10 @@ fn model_route_cli_is_typed_and_maps_to_the_helper() {
         ["route", "research-web-search", "off"]
     );
     assert_eq!(
+        route_helper_arguments(&["research-web-search", "auto"]).unwrap(),
+        ["route", "research-web-search", "auto"]
+    );
+    assert_eq!(
         route_helper_arguments(&["reset", "hard"]).unwrap(),
         ["route", "reset", "hard"]
     );
@@ -240,6 +244,7 @@ fn model_route_cli_is_typed_and_maps_to_the_helper() {
         &["set", "default", "ollama", "x\ny"],
         &["paid-api", "maybe"],
         &["research-web-search", "live"],
+        &["research-web-search", "AUTO"],
         &["research-web-search"],
         &["show"],
     ] {
@@ -302,6 +307,10 @@ fn routing_json_report_uses_core_reason_codes_and_never_echoes_content() {
         br#"{"version":1,"research_web_search":"on"}"#.to_vec(),
     )));
     assert_eq!(research["routing"]["research_web_search"], "on");
+    let auto = routing_report_from(Ok(Some(
+        br#"{"version":1,"research_web_search":"auto"}"#.to_vec(),
+    )));
+    assert_eq!(auto["routing"]["research_web_search"], "auto");
     assert_eq!(
         valid["routing"]["tiers"]["cheap"]["chain"][0]["model"],
         "llama3.2"

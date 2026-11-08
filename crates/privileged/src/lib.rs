@@ -305,6 +305,18 @@ mod tests {
             research.message().unwrap()
         );
         assert_ne!(research.message().unwrap(), approval.message().unwrap());
+        // Auto as well: the broker parses it and signs the same bytes.
+        research.routing.research_web_search =
+            jarvis_client_core::model_control::ResearchWebSearch::Auto;
+        let auto_request: SignedRequest =
+            serde_json::from_value(research.signed_request(&signature).unwrap()).unwrap();
+        assert_eq!(auto_request.message().unwrap(), research.message().unwrap());
+        assert_eq!(
+            routing_operation(&mut auto_request.clone())
+                .0
+                .research_web_search,
+            jarvis_llm::ResearchWebSearch::Auto
+        );
         // A different document cannot reuse the signature.
         let mut changed = request.clone();
         routing_operation(&mut changed).0.paid_api = jarvis_llm::PaidApi::Allowed;

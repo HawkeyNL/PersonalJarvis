@@ -3,11 +3,13 @@
 //! It has no wallet, no signer and no execution path, and no LLM output
 //! reaches it. Each tick it reloads the paper ledger from the database,
 //! values open positions and simulates exits (also while paused), then, if
-//! not paused, observes a few watchlist mints, runs the hard filters and the
-//! strategy, and simulates entries. A [`TradeIntent`] is used on the spot by
-//! the simulator and never stored or sent anywhere.
+//! not paused, observes a few watchlist mints and mints found by
+//! [`discovery`], runs the hard filters and the strategy, and simulates
+//! entries. A [`TradeIntent`] is used on the spot by the simulator and never
+//! stored or sent anywhere.
 //!
 //! [`TradeIntent`]: jarvis_onchain::strategy::TradeIntent
+//! [`discovery`]: jarvis_market_data::discovery
 
 pub mod profile;
 pub mod store;
@@ -19,6 +21,7 @@ use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
 use jarvis_market_data::dexscreener::{DexScreenerClient, Pair};
+use jarvis_market_data::discovery::{Discovery, PollStats};
 use jarvis_market_data::jupiter::{JupiterClient, QuoteRequest};
 use jarvis_market_data::pools;
 use jarvis_market_data::rpc::{CrossCheckedRpc, RpcEndpoint};
@@ -44,8 +47,13 @@ pub const TICK_INTERVAL: StdDuration = StdDuration::from_secs(60);
 /// tick reloads the ledger from the database.
 const TICK_TIMEOUT: StdDuration = StdDuration::from_secs(55);
 const DB_TIMEOUT: StdDuration = StdDuration::from_secs(10);
-/// Watchlist mints observed for an entry per tick.
+/// Watchlist and discovered mints observed for an entry per tick.
 pub const MAX_ENTRY_CANDIDATES_PER_TICK: usize = 5;
+/// pump.fun migrations are polled at most this often ...
+const DISCOVERY_EVERY: Duration = Duration::minutes(2);
+/// ... and for at most this long, so a slow provider leaves the tick time
+/// for entries. A cut-off poll keeps what it handled and resumes next time.
+const DISCOVERY_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 /// A mint is observed again for an entry at most this often.
 const OBSERVE_COOLDOWN: Duration = Duration::minutes(15);
 const GATE_SNAPSHOT_EVERY: Duration = Duration::hours(1);
@@ -172,6 +180,15 @@ pub trait MarketSource: Send + Sync {
         sell_usd: Decimal,
         now: OffsetDateTime,
     ) -> Result<TokenSnapshot, MarketDataError>;
+    /// Poll new pump.fun migrations into `discovery`. A source without
+    /// discovery finds nothing.
+    async fn discover(
+        &self,
+        _discovery: &mut Discovery,
+        _now: OffsetDateTime,
+    ) -> Result<PollStats, MarketDataError> {
+        Ok(PollStats::default())
+    }
 }
 
 pub struct LiveMarket {
@@ -267,6 +284,14 @@ impl MarketSource for LiveMarket {
             sell_quote: quote.as_ref(),
         })
     }
+
+    async fn discover(
+        &self,
+        discovery: &mut Discovery,
+        now: OffsetDateTime,
+    ) -> Result<PollStats, MarketDataError> {
+        discovery.poll(&self.rpc, now).await
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -356,6 +381,7 @@ fn exit_reason(reason: ExitReason) -> &'static str {
         ExitReason::StopLoss => "stop_loss",
         ExitReason::TakeProfit => "take_profit",
         ExitReason::TimeStop => "time_stop",
+        ExitReason::TrailingStop => "trailing_stop",
     }
 }
 
@@ -411,6 +437,7 @@ async fn bounded<T>(
 /// Per-tick counters for the log line.
 #[derive(Debug, Default, PartialEq)]
 pub struct TickStats {
+    pub discovered: usize,
     pub observed: usize,
     pub accepted: usize,
     pub entries: usize,
@@ -429,6 +456,38 @@ pub struct PaperTask {
     /// candidate row only when its verdict changes.
     seen: HashMap<String, (Option<&'static str>, OffsetDateTime)>,
     last_gate_at: Option<OffsetDateTime>,
+    /// `None` when the profile turns discovery off.
+    discovery: Option<Discovery>,
+    last_discovery_at: Option<OffsetDateTime>,
+}
+
+/// Up to [`MAX_ENTRY_CANDIDATES_PER_TICK`] mints to observe: not held, not
+/// observed within [`OBSERVE_COOLDOWN`], watchlist before discovered mints,
+/// then least recently observed first.
+fn entry_candidates<'a>(
+    watchlist: &'a [String],
+    discovered: impl Iterator<Item = &'a String>,
+    held: &BTreeSet<String>,
+    seen: &HashMap<String, (Option<&'static str>, OffsetDateTime)>,
+    now: OffsetDateTime,
+) -> Vec<&'a String> {
+    let mut due: Vec<(bool, &String)> = watchlist
+        .iter()
+        .map(|m| (false, m))
+        .chain(
+            discovered
+                .filter(|m| !watchlist.contains(m))
+                .map(|m| (true, m)),
+        )
+        .filter(|(_, m)| !held.contains(*m))
+        .filter(|(_, m)| {
+            seen.get(*m)
+                .is_none_or(|(_, at)| now - *at >= OBSERVE_COOLDOWN)
+        })
+        .collect();
+    due.sort_by_key(|(discovered, m)| (*discovered, seen.get(*m).map(|(_, at)| *at)));
+    due.truncate(MAX_ENTRY_CANDIDATES_PER_TICK);
+    due.into_iter().map(|(_, m)| m).collect()
 }
 
 /// The whole stored ledger for the current strategy version.
@@ -458,10 +517,12 @@ async fn load_history(db: &Database, version: u32) -> Result<Ledger, &'static st
 impl PaperTask {
     pub fn new(profile: PaperProfile, handle: Arc<PaperHandle>) -> Self {
         Self {
+            discovery: profile.discovery.then(Discovery::new),
             profile,
             handle,
             seen: HashMap::new(),
             last_gate_at: None,
+            last_discovery_at: None,
         }
     }
 
@@ -522,7 +583,7 @@ impl PaperTask {
                 .map(String::as_str)
                 .filter(|m| !held_mints.contains(*m)),
         );
-        let pairs = match source.pairs(&mints).await {
+        let mut pairs = match source.pairs(&mints).await {
             Ok(pairs) => pairs,
             Err(error) => {
                 stats.provider_errors += 1;
@@ -624,23 +685,59 @@ impl PaperTask {
             }
         }
 
-        // Entries need an intact history: a few watchlist mints not held at
-        // the start of the tick, least recently observed first.
+        // New candidates from pump.fun migrations, only when entries can
+        // follow.
+        let poll_due = self
+            .last_discovery_at
+            .is_none_or(|at| now - at >= DISCOVERY_EVERY);
+        if let Some(discovery) = self.discovery.as_mut() {
+            if poll_due && history.is_ok() && !paused() {
+                self.last_discovery_at = Some(now);
+                let poll = source.discover(discovery, now);
+                match tokio::time::timeout(DISCOVERY_TIMEOUT, poll).await {
+                    Ok(Ok(poll)) => {
+                        stats.discovered = poll.found;
+                        if poll.gap {
+                            tracing::warn!("memecoin paper: discovery skipped older migrations");
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        stats.provider_errors += 1;
+                        tracing::warn!(%error, "memecoin paper: discovery poll failed");
+                    }
+                    Err(_) => tracing::warn!("memecoin paper: discovery poll timed out"),
+                }
+            }
+        }
+
+        // Entries need an intact history: a few watchlist or discovered mints
+        // not held at the start of the tick.
         let mut open = held.iter().filter(|t| t.close.is_none()).count();
-        let mut due: Vec<&String> = p
-            .watchlist
-            .iter()
-            .filter(|m| !held_mints.contains(*m))
-            .filter(|m| {
-                self.seen
-                    .get(*m)
-                    .is_none_or(|(_, at)| now - *at >= OBSERVE_COOLDOWN)
-            })
-            .collect();
-        due.sort_by_key(|m| self.seen.get(*m).map(|(_, at)| *at));
-        due.truncate(MAX_ENTRY_CANDIDATES_PER_TICK);
+        let discovery = self.discovery.as_ref();
+        self.seen
+            .retain(|m, _| p.watchlist.contains(m) || discovery.is_some_and(|d| d.knows(m)));
+        let discovered = discovery
+            .into_iter()
+            .flat_map(|d| d.due(now))
+            .map(|migration| &migration.mint);
+        let mut due = entry_candidates(&p.watchlist, discovered, &held_mints, &self.seen, now);
         if history.is_err() {
             due.clear();
+        }
+        // Discovered mints were not in the first DexScreener call.
+        let extra: Vec<&str> = due
+            .iter()
+            .map(|m| m.as_str())
+            .filter(|m| !mints.contains(m))
+            .collect();
+        if !extra.is_empty() {
+            match source.pairs(&extra).await {
+                Ok(more) => pairs.extend(more),
+                Err(error) => {
+                    stats.provider_errors += 1;
+                    tracing::warn!(%error, "memecoin paper: no market data for discovered mints");
+                }
+            }
         }
         let deny_list = BTreeSet::new();
         for mint in due {
@@ -874,6 +971,7 @@ pub async fn start(
             let changed = handle.note_outcome(error);
             match (outcome, error) {
                 (Ok(Ok(stats)), _) => tracing::info!(
+                    discovered = stats.discovered,
                     observed = stats.observed,
                     accepted = stats.accepted,
                     entries = stats.entries,
@@ -988,6 +1086,32 @@ mod tests {
             filter::check(&snapshot, &fixture().rules, &BTreeSet::new(), now),
             Verdict::Reject(RejectReason::MintAuthorityActive)
         );
+    }
+
+    #[test]
+    fn entry_candidates_put_the_watchlist_first_and_respect_the_cooldown() {
+        let now = OffsetDateTime::now_utc();
+        let names = |prefix: &str, n: usize| -> Vec<String> {
+            (0..n).map(|i| format!("{prefix}{i}")).collect()
+        };
+        let watchlist = names("w", 3);
+        let discovered = names("d", 6);
+        let held = BTreeSet::from(["w0".to_owned()]);
+        let mut seen = HashMap::new();
+        seen.insert("w1".to_owned(), (None, now - Duration::minutes(1)));
+        seen.insert("d0".to_owned(), (None, now - Duration::hours(1)));
+        // A discovered mint already on the watchlist counts once.
+        let extra = "w2".to_owned();
+        let picked = entry_candidates(
+            &watchlist,
+            discovered.iter().chain([&extra]),
+            &held,
+            &seen,
+            now,
+        );
+        // w0 is held, w1 cooling down; never-observed discovered mints come
+        // before d0, which was observed an hour ago.
+        assert_eq!(picked, ["w2", "d1", "d2", "d3", "d4"]);
     }
 
     #[test]
