@@ -344,6 +344,7 @@ fn exit_reason(reason: ExitReason) -> &'static str {
         ExitReason::StopLoss => "stop_loss",
         ExitReason::TakeProfit => "take_profit",
         ExitReason::TimeStop => "time_stop",
+        ExitReason::TrailingStop => "trailing_stop",
     }
 }
 

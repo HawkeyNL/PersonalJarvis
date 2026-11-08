@@ -20,7 +20,7 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use time::{Duration, OffsetDateTime};
 
 use crate::filter::{self, FilterRules, Verdict};
-use crate::paper::{self, CostModel};
+use crate::paper::{self, CostModel, Mark};
 use crate::types::{Position, TokenSnapshot};
 
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
@@ -68,6 +68,15 @@ pub mod bounds {
     pub const ENTRY_SLIPPAGE_BPS: (u32, u32) = (1, 1_000);
     pub const EXIT_SLIPPAGE_BPS: (u32, u32) = (1, 5_000);
     pub const INTENT_TTL: (Duration, Duration) = (Duration::seconds(1), Duration::seconds(120));
+
+    // Extra bounds for `crate::config::StrategyConfig`. Each family narrows
+    // them further (see `crate::config`).
+    pub const TRAILING_STOP_BPS: (u32, u32) = (100, 9_000);
+    /// Configs may hold longer than [`MAX_HOLD`] so trend family C fits.
+    pub const CONFIG_MAX_HOLD: (Duration, Duration) = (Duration::minutes(1), Duration::days(30));
+    pub const ENTRY_CONDITIONS: (usize, usize) = (1, 8);
+    pub const ENTRIES_PER_DAY: (u32, u32) = (1, 24);
+    pub const TOKEN_COOLDOWN: (Duration, Duration) = (Duration::minutes(1), Duration::days(30));
 }
 
 /// A parameter outside its code-fixed bounds.
@@ -120,7 +129,7 @@ impl StrategyParams {
     }
 }
 
-fn within<T: PartialOrd>(
+pub(crate) fn within<T: PartialOrd>(
     field: &'static str,
     value: T,
     (min, max): (T, T),
@@ -160,6 +169,33 @@ pub enum ExitReason {
     StopLoss,
     TakeProfit,
     TimeStop,
+    TrailingStop,
+}
+
+/// The exit side of a parameter set. A `trailing_stop_bps` of `None` turns
+/// the trailing stop off, which is what [`StrategyParams`] always uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitRules {
+    pub take_profit_bps: u32,
+    pub stop_loss_bps: u32,
+    /// Exit once executable value falls this far below its peak, but only
+    /// after the peak was above cost: it protects gains, the stop loss
+    /// handles losers.
+    pub trailing_stop_bps: Option<u32>,
+    pub liquidity_drop_exit_bps: u32,
+    pub max_hold: Duration,
+}
+
+impl StrategyParams {
+    pub fn exit_rules(&self) -> ExitRules {
+        ExitRules {
+            take_profit_bps: self.take_profit_bps,
+            stop_loss_bps: self.stop_loss_bps,
+            trailing_stop_bps: None,
+            liquidity_drop_exit_bps: self.liquidity_drop_exit_bps,
+            max_hold: self.max_hold,
+        }
+    }
 }
 
 /// Decide whether to enter `s`. Returns `None` for invalid parameters, a
@@ -212,9 +248,10 @@ pub fn evaluate_entry(
 }
 
 /// Decide whether to exit `position` given the latest snapshot of its pool.
-/// Checks run safety-first: liquidity drop, stop loss, take profit, time
-/// stop. Price-based exits value the whole position at what selling it would
-/// return along the pool curve, not at the mid price.
+/// Checks run safety-first: liquidity drop, stop loss, trailing stop (never
+/// set by [`StrategyParams`]), take profit, time stop. Price-based exits
+/// value the whole position at what selling it would return along the pool
+/// curve, not at the mid price.
 ///
 /// Only a fresh snapshot (within `max_snapshot_age`) of the position's own
 /// mint may drive a price-based exit. Otherwise, and for data too absurd to
@@ -233,12 +270,11 @@ pub fn evaluate_exit(
 ) -> Option<TradeIntent> {
     let usable =
         s.mint == position.mint && s.observed_at <= now && now - s.observed_at <= max_snapshot_age;
-    let reason = usable
-        .then(|| market_exit(position, s, params, costs))
-        .flatten()
-        .or_else(|| {
-            (now - position.opened_at >= params.max_hold).then_some(ExitReason::TimeStop)
-        })?;
+    let mark = usable.then_some(Mark {
+        price_usd: s.price_usd,
+        liquidity_usd: s.liquidity_usd,
+    });
+    let reason = exit_reason(position, None, mark, &params.exit_rules(), costs, now)?;
     Some(TradeIntent {
         strategy_version: params.version,
         mint: position.mint.clone(),
@@ -255,36 +291,71 @@ pub fn evaluate_exit(
     })
 }
 
-/// Liquidity drop, stop loss or take profit; `None` when none fires or the
-/// numbers overflow. A fresh price of zero or less, or an invalid cost
-/// model, is a stop loss: the position can no longer be valued.
+/// Why `position` should be closed now, if at all. `mark` is the latest
+/// usable price and liquidity of its pool; `None` (no fresh data) leaves
+/// only the time stop. `peak_value_usd` is the highest executable value seen
+/// so far (see [`track_peak`]); the current value always counts as well.
+pub fn exit_reason(
+    position: &Position,
+    peak_value_usd: Option<Decimal>,
+    mark: Option<Mark>,
+    rules: &ExitRules,
+    costs: &CostModel,
+    now: OffsetDateTime,
+) -> Option<ExitReason> {
+    mark.and_then(|m| market_exit(position, peak_value_usd, m, rules, costs))
+        .or_else(|| (now - position.opened_at >= rules.max_hold).then_some(ExitReason::TimeStop))
+}
+
+/// The new peak executable value of `position` after observing `mark`.
+/// Unchanged when the mark cannot be valued.
+pub fn track_peak(
+    peak_value_usd: Option<Decimal>,
+    position: &Position,
+    mark: Mark,
+    costs: &CostModel,
+) -> Option<Decimal> {
+    let value = paper::sell_value(position.tokens, mark.price_usd, mark.liquidity_usd, costs);
+    peak_value_usd.max(value)
+}
+
+/// Liquidity drop, stop loss, trailing stop or take profit; `None` when none
+/// fires or the numbers overflow. A fresh price of zero or less, or an
+/// invalid cost model, is a stop loss: the position can no longer be valued.
 fn market_exit(
     position: &Position,
-    s: &TokenSnapshot,
-    params: &StrategyParams,
+    peak_value_usd: Option<Decimal>,
+    m: Mark,
+    rules: &ExitRules,
     costs: &CostModel,
 ) -> Option<ExitReason> {
     let keep = |bps: u32| BPS - Decimal::from(bps.min(10_000));
     let floor = position
         .entry_liquidity_usd
-        .checked_mul(keep(params.liquidity_drop_exit_bps))?;
-    if s.liquidity_usd.checked_mul(BPS)? <= floor {
+        .checked_mul(keep(rules.liquidity_drop_exit_bps))?;
+    if m.liquidity_usd.checked_mul(BPS)? <= floor {
         return Some(ExitReason::LiquidityDrop);
     }
     // A position that cannot be valued (dead price, or a broken cost model
     // that would otherwise silently block every price exit) is cut.
-    if s.price_usd <= Decimal::ZERO || !costs.is_valid() {
+    if m.price_usd <= Decimal::ZERO || !costs.is_valid() {
         return Some(ExitReason::StopLoss);
     }
-    let value = paper::sell_value(position.tokens, s.price_usd, s.liquidity_usd, costs)?
-        .checked_mul(BPS)?;
-    if value <= position.cost_usd.checked_mul(keep(params.stop_loss_bps))? {
+    let value = paper::sell_value(position.tokens, m.price_usd, m.liquidity_usd, costs)?;
+    let scaled = value.checked_mul(BPS)?;
+    if scaled <= position.cost_usd.checked_mul(keep(rules.stop_loss_bps))? {
         return Some(ExitReason::StopLoss);
+    }
+    if let Some(trail) = rules.trailing_stop_bps {
+        let peak = peak_value_usd.unwrap_or(value).max(value);
+        if peak > position.cost_usd && scaled <= peak.checked_mul(keep(trail))? {
+            return Some(ExitReason::TrailingStop);
+        }
     }
     let target = position
         .cost_usd
-        .checked_mul(BPS + Decimal::from(params.take_profit_bps))?;
-    (value >= target).then_some(ExitReason::TakeProfit)
+        .checked_mul(BPS + Decimal::from(rules.take_profit_bps))?;
+    (scaled >= target).then_some(ExitReason::TakeProfit)
 }
 
 #[cfg(test)]
@@ -576,6 +647,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(intent.max_slippage_bps, bounds::EXIT_SLIPPAGE_BPS.1);
+    }
+
+    #[test]
+    fn trailing_stop_fires_from_the_peak_only_after_a_gain() {
+        let p = position("40");
+        let mark = |price: &str| Mark {
+            price_usd: d(price),
+            liquidity_usd: d("200000"),
+        };
+        let mut rules = params().exit_rules();
+        assert_eq!(rules.trailing_stop_bps, None);
+        let reason = |rules: &ExitRules, peak, price| {
+            exit_reason(&p, peak, Some(mark(price)), rules, &costs(), t0())
+        };
+
+        // Off by default: a fall from a high peak changes nothing.
+        let peak = track_peak(None, &p, mark("0.0014"), &costs());
+        assert!(peak > Some(d("55")));
+        assert_eq!(reason(&rules, peak, "0.0011"), None);
+
+        rules.trailing_stop_bps = Some(2_000);
+        assert_eq!(
+            reason(&rules, peak, "0.0011"),
+            Some(ExitReason::TrailingStop)
+        );
+        assert_eq!(reason(&rules, peak, "0.00113"), None);
+        // The peak only moves up, and an unpriceable mark keeps it.
+        assert_eq!(track_peak(peak, &p, mark("0.0012"), &costs()), peak);
+        assert_eq!(track_peak(peak, &p, mark("0"), &costs()), peak);
+        // Never armed while the peak is at or below cost: the stop loss rules.
+        let low_peak = track_peak(None, &p, mark("0.00095"), &costs());
+        assert!(low_peak < Some(d("40")));
+        assert_eq!(reason(&rules, low_peak, "0.0008"), None);
+        // Stop loss still wins over the trail.
+        assert_eq!(reason(&rules, peak, "0.0007"), Some(ExitReason::StopLoss));
     }
 
     #[test]
