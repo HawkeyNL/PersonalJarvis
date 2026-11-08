@@ -14,6 +14,7 @@ mod fallback;
 mod huggingface;
 mod huggingface_catalog;
 mod live_policy;
+mod meme_prompts;
 mod model_policy;
 mod ollama;
 mod openai_compat;

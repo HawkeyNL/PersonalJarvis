@@ -554,13 +554,13 @@ CLI version before `JARVIS_CODEX_REVIEWED_VERSION` is bumped.
 **Bounds.** A research run stops after 300 seconds and its reply deadline is
 305 seconds (Core waits 310 seconds). Ordinary runs keep 120 seconds and a
 125-second reply deadline. Each worker runs at most two requests at once and
-at most one of them may be a research run; a second research request while
-one runs is refused (`runtime_failure`), never queued, so one slot always
-stays free for chat. A research failure does not put the subscription into
-the router's cooldown for chat, except an authentication failure or a plan
-limit. The output bounds are unchanged (Claude: 256 KiB CLI result; Codex:
-512 KiB per event, 4 MiB stream, 128 KiB answer). The worker reads Core's
-request within 5 seconds.
+at most one of them may be a background run (research, or on Claude a typed
+task, see below); a second background request while one runs is refused
+(`runtime_failure`), never queued, so one slot always stays free for chat. A
+research failure does not put the subscription into the router's cooldown for
+chat, except an authentication failure or a plan limit. The output bounds are
+unchanged (Claude: 256 KiB CLI result; Codex: 512 KiB per event, 4 MiB stream,
+128 KiB answer). The worker reads Core's request within 5 seconds.
 
 **Prompt injection.** Search results can contain instructions. The research
 instruction tells the model to treat web content as data, and the worker
@@ -690,3 +690,38 @@ whether `--ignore-user-config` also skips a global `AGENTS.md` in the login
 home. `codex login status` prints its status line to stderr, possibly after
 `WARNING:` lines, and exits 1 when logged out (verified with codex-cli
 0.160.0); the worker and the accounts CLI read both streams line by line.
+
+## Typed Claude tasks (memecoin paper decisions)
+
+The Claude worker also accepts a `task` field: `meme_decision` or
+`meme_strategy_review`. Core sends one only through
+`ClaudeCliProvider::meme_task`, which talks to the Claude worker directly and
+never through the router, so a failure is an error for the caller and never a
+fallback to a paid API or another provider. Decisions use the provider's
+default model, strategy reviews its hard model.
+
+The worker refuses a task request unless:
+
+- the system text is exactly that task's fixed prompt
+  (`crates/llm/src/meme_prompts.rs`): no persona, runtime facts or other text;
+- the prompt is one JSON object of at most 16 KiB;
+- `research` is false.
+
+A task runs the same reviewed invocation as ordinary chat (`--tools ""`, no
+`WebSearch`, MCP denied) with the fixed prompt as `--system-prompt-file`. It
+stops after 90 seconds (reply deadline 95 seconds; Core waits 100 seconds). It
+shares the one background slot with research, so a busy slot refuses the task
+(`runtime_failure`), never queues it, and chat always keeps its own slot. The
+fixed prompts tell the model that the input is numbers-only data with opaque
+ids, that instructions in it are never followed, and that the output is one
+JSON object. The model's output is still untrusted: the caller must validate
+it strictly before using it (nothing in Core uses these tasks yet).
+
+The Codex chat worker refuses every request with a `task`.
+
+**Deployment order.** Requests without `task` are unchanged on the wire, so an
+older Core keeps working with this worker. A worker that predates the field
+refuses a task request as an unknown field (`runtime_failure`), and the worker
+compares the system text with the prompt compiled into its own binary. The
+worker binary therefore ships in the same release as the Core that sends
+tasks, and any change to a fixed prompt needs both again.
