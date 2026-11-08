@@ -76,6 +76,15 @@ An unrecognized backend is not classified as local or subscription: it is
 unavailable to the router, and pricing diagnostics use an unknown,
 conservative estimate rather than zero cost.
 
+`jarvis-claude.service` sets the same `IPAddressDeny` and
+`IPAddressAllow=127.0.0.53` as the Codex chat worker (see its unit hardening
+below): the CLI reaches the internet and the resolver stub, never Core, Ollama
+or the LAN. Core talks to the worker over the inherited Unix socket, which
+these rules do not affect. Rollback: a drop-in
+`/etc/systemd/system/jarvis-claude.service.d/override.conf` with `[Service]`
+and an empty `IPAddressDeny=`, then `sudo systemctl daemon-reload` and
+`sudo systemctl restart jarvis-claude.socket`.
+
 Core Admin deliberately reports Claude billing as `overage_unverified` even
 when `claude auth status` confirms a subscription login. The CLI cannot verify
 the separate account-level extra-usage setting. Linking the account is not a

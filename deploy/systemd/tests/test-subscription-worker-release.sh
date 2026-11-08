@@ -50,10 +50,14 @@ for directive in NoNewPrivileges=true CapabilityBoundingSet= LockPersonality=tru
     RestrictSUIDSGID=true PrivateTmp=true ProtectHome=true ProtectSystem=strict \
     ProtectControlGroups=true ProtectKernelModules=true ProtectKernelTunables=true \
     ProtectProc=invisible 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' \
-    UMask=0077 TasksMax=64 MemoryMax=2G StateDirectoryMode=0700 RuntimeDirectoryMode=0700; do
+    UMask=0077 TasksMax=64 MemoryMax=2G StateDirectoryMode=0700 RuntimeDirectoryMode=0700 \
+    'IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7' \
+    IPAddressAllow=127.0.0.53; do
     grep -Fxq "$directive" "$service"
     grep -Fxq "$directive" "$chat_service"
 done
+# The Claude worker, too, may reach only the resolver stub on loopback.
+[[ $(grep -c '^IPAddress' "$service") == 2 ]]
 chat_hidden=$(grep -E '^InaccessiblePaths=' "$chat_service")
 [[ $chat_hidden == 'InaccessiblePaths=/etc/jarvis /var/lib/jarvis '* ]]
 for path in -/var/lib/jarvis-claude -/var/lib/jarvis-codex-chat -/var/lib/jarvis-codex-broker \
