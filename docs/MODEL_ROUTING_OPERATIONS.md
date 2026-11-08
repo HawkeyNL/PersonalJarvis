@@ -290,8 +290,9 @@ owner clicks (the safe Markdown renderer), never load them automatically (no
 link previews, images, prefetch or embeds), so viewing an answer contacts no
 third party. Turning the switch off also stops a research request that is
 about to try its next subscription. Web content is untrusted: the model is told to
-ignore instructions in it, and it cannot trigger any other tool (see
-`SUBSCRIPTION_WORKERS.md`, "Research runs").
+ignore instructions in it, and it cannot trigger any other tool. Core stores
+the answer as `web:<model>` and later chat turns see it only as labelled,
+capped untrusted data (see `SUBSCRIPTION_WORKERS.md`, "Research runs").
 
 ## Routing, health and spend
 

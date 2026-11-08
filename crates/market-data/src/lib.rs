@@ -26,6 +26,7 @@ use zeroize::Zeroizing;
 pub mod dexscreener;
 mod http;
 pub mod jupiter;
+pub mod pools;
 pub mod rpc;
 pub mod rugcheck;
 pub mod snapshot;
@@ -180,14 +181,21 @@ pub(crate) mod testutil {
     /// A local plain-HTTP server answering every request with `response`.
     /// Returns its base URL and the raw bytes of the last request seen.
     pub async fn serve(response: Vec<u8>) -> (String, Arc<Mutex<Vec<u8>>>) {
+        serve_with(move |_| response.clone()).await
+    }
+
+    /// Like [`serve`], answering each request with `respond(request)`.
+    pub async fn serve_with(
+        respond: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+    ) -> (String, Arc<Mutex<Vec<u8>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let last = seen.clone();
-        let response = Arc::new(response);
+        let respond = Arc::new(respond);
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let response = response.clone();
+                let respond = respond.clone();
                 let last = last.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
@@ -197,6 +205,7 @@ pub(crate) mod testutil {
                         if let Some(end) = header_end(&request) {
                             let body_len = content_length(&request[..end]);
                             if request.len() >= end + body_len {
+                                let response = respond(&request);
                                 *last.lock().unwrap() = std::mem::take(&mut request);
                                 if socket.write_all(&response).await.is_err() {
                                     return;
