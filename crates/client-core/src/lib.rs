@@ -20,6 +20,9 @@ pub const AGENT_APPROVAL_DOMAIN: &[u8] = b"jarvis/agent-approval/v1\0";
 pub const LOGIN_DOMAIN: &[u8] = b"jarvis-login-v1\0";
 pub const UNLOCK_APPROVAL_DOMAIN: &[u8] = b"jarvis-unlock-approval-v1\0";
 pub const UNLOCK_CODE_DOMAIN: &[u8] = b"jarvis-unlock-code-v1\0";
+pub const MEME_STRATEGY_ENABLE_DOMAIN: &[u8] = b"jarvis-meme-strategy-enable-v1\0";
+/// `message` value of the enable challenge for [`meme_strategy_enable_message`].
+pub const MEME_STRATEGY_ENABLE_MESSAGE_V1: &str = "meme-strategy-enable-v1";
 /// `approval_message` value in `GET /v1/agent/pending` for [`agent_approval_message`].
 pub const AGENT_APPROVAL_MESSAGE_V1: &str = "agent-approval-v1";
 /// Largest stored action JSON (UTF-8 bytes) that `GET /v1/agent/pending` lists
@@ -60,6 +63,8 @@ pub enum ProtocolError {
     InvalidChallenge,
     #[error("pairing fingerprint does not match the candidate key")]
     PairingFingerprintMismatch,
+    #[error("invalid strategy enable approval")]
+    InvalidStrategyEnable,
 }
 
 /// The pairing fingerprint of a raw 32-byte Ed25519 public key: lowercase hex
@@ -171,6 +176,37 @@ pub fn agent_approval_message(
     message.extend_from_slice(pending_id.as_bytes());
     message.extend_from_slice(nonce);
     message.extend_from_slice(action_sha256);
+    message.extend_from_slice(device_id.as_bytes());
+    Ok(message)
+}
+
+/// Canonical, domain-separated v1 bytes the owner's device signs to enable
+/// one paper strategy again. Bound to the strategy, the exact version it will
+/// trade (`config_sha256` is the SHA-256 of that version's stored parameter
+/// JSON, as hex-encoded in the enable challenge), the challenge nonce and the
+/// signing device. `strategy_id` matches `^[a-z0-9-]{1,32}$` and is
+/// length-prefixed; every other field has a fixed width.
+pub fn meme_strategy_enable_message(
+    strategy_id: &str,
+    version: u32,
+    config_sha256: &[u8],
+    nonce: &[u8],
+    device_id: Uuid,
+) -> Result<Vec<u8>, ProtocolError> {
+    let valid_id = (1..=32).contains(&strategy_id.len())
+        && strategy_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !valid_id || config_sha256.len() != 32 || nonce.len() != 32 {
+        return Err(ProtocolError::InvalidStrategyEnable);
+    }
+    let mut message = Vec::with_capacity(MEME_STRATEGY_ENABLE_DOMAIN.len() + 117);
+    message.extend_from_slice(MEME_STRATEGY_ENABLE_DOMAIN);
+    message.push(strategy_id.len() as u8);
+    message.extend_from_slice(strategy_id.as_bytes());
+    message.extend_from_slice(&version.to_be_bytes());
+    message.extend_from_slice(config_sha256);
+    message.extend_from_slice(nonce);
     message.extend_from_slice(device_id.as_bytes());
     Ok(message)
 }
@@ -428,6 +464,39 @@ mod tests {
             login_message(id, device, &nonce[..31]),
             Err(ProtocolError::InvalidChallenge)
         );
+    }
+
+    /// Fixed strategy-enable vector for the Swift and Kotlin clients.
+    #[test]
+    fn meme_strategy_enable_v1_matches_golden_bytes() {
+        let device = Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap();
+        let nonce: Vec<u8> = (0_u8..32).collect();
+        let sha = [0xab_u8; 32];
+        let message = meme_strategy_enable_message("b-base", 1_000_002, &sha, &nonce, device);
+        assert_eq!(
+            hex::encode(message.unwrap()),
+            concat!(
+                "6a61727669732d6d656d652d73747261746567792d656e61626c652d763100",
+                "06",
+                "622d62617365",
+                "000f4242",
+                "abababababababababababababababababababababababababababababababab",
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                "ffeeddccbbaa99887766554433221100"
+            )
+        );
+        for (id, sha, nonce) in [
+            ("", &sha[..], &nonce[..]),
+            ("B-base", &sha[..], &nonce[..]),
+            (&"a".repeat(33), &sha[..], &nonce[..]),
+            ("b-base", &sha[..31], &nonce[..]),
+            ("b-base", &sha[..], &nonce[..31]),
+        ] {
+            assert_eq!(
+                meme_strategy_enable_message(id, 1, sha, nonce, device),
+                Err(ProtocolError::InvalidStrategyEnable)
+            );
+        }
     }
 
     /// Fixed unlock-code vectors shared with the TypeScript, Swift and Kotlin clients.

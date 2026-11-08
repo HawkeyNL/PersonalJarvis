@@ -102,6 +102,8 @@ impl Inner {
             Event::VoiceStarted { .. } => "voice.started",
             Event::VoiceStopped { .. } => "voice.stopped",
             Event::VoiceFailed { .. } => "voice.failed",
+            Event::MemeStrategyChanged { .. } => "trading.meme.strategy_changed",
+            Event::MemeDecision { .. } => "trading.meme.decision",
         };
         let Some(envelope) = self.envelope(event) else {
             return;
@@ -385,6 +387,17 @@ impl Hub {
     pub fn publish(&self, user: Uuid, event: Event) {
         let Ok(mut inner) = self.0.lock() else { return };
         inner.publish(user, event);
+    }
+
+    /// [`Self::publish`] to every connected user, for events of Core's own
+    /// background tasks (Jarvis has one owner account).
+    pub fn publish_all(&self, event: Event) {
+        let Ok(mut inner) = self.0.lock() else { return };
+        let users: std::collections::BTreeSet<Uuid> =
+            inner.sinks.values().map(|sink| sink.user).collect();
+        for user in users {
+            inner.publish(user, event.clone());
+        }
     }
 }
 

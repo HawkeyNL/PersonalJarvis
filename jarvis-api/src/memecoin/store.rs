@@ -628,8 +628,10 @@ async fn version_strategy(db: &Database, version: u32) -> Result<Option<String>>
 
 /// Create a strategy that trades `active_version`, a version of its own.
 /// `false` when the strategy already exists. At most [`MAX_LIST`] exist, so
-/// [`list_strategies`] always returns all of them. Only the paper task writes
-/// strategies, so the check and the write cannot race.
+/// [`list_strategies`] always returns all of them. Seeding (before the paper
+/// task starts) and the daily review (one at a time) create strategies, and
+/// a review stays far below the cap, so the check and the write cannot race
+/// past it.
 pub async fn insert_strategy(
     db: &Database,
     id: &str,
@@ -759,6 +761,29 @@ pub async fn set_strategy_enabled(
         "memecoin_strategies",
         id,
         json!({"enabled": enabled, "owner": owner, "changed_by": changed_by}),
+    )
+    .await?;
+    Ok(changed.len() == 1)
+}
+
+/// The owner's signed enable: enable `id` only while it still trades
+/// `version`, the version the owner's device signed for. `false` otherwise.
+pub async fn enable_strategy_version(
+    db: &Database,
+    id: &str,
+    version: u32,
+    changed_by: &str,
+) -> Result<bool> {
+    if !(1..=MAX_CHANGED_BY).contains(&changed_by.chars().count()) {
+        return Err(MemecoinStoreError::InvalidData);
+    }
+    let changed: Vec<String> = record_rows(
+        db,
+        "UPDATE $rid SET enabled = true, disabled_by_owner = false, changed_at = time::now(), \
+         changed_by = $changed_by WHERE active_version = $version RETURN VALUE record::id(id)",
+        "memecoin_strategies",
+        id,
+        json!({"version": version, "changed_by": changed_by}),
     )
     .await?;
     Ok(changed.len() == 1)
@@ -1051,6 +1076,45 @@ pub async fn load_costs(db: &Database) -> Result<Vec<Cost>> {
         .collect()
 }
 
+/// The newest hourly gate snapshot of `version`, if any.
+pub async fn latest_gate_snapshot(db: &Database, version: u32) -> Result<Option<GateSnapshot>> {
+    #[derive(Deserialize)]
+    struct Row {
+        id: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+        strategy_version: u32,
+        closed_trades: u64,
+        duration_secs: u64,
+        trading_days: u64,
+        net_result_usd: String,
+        net_expectancy_usd: String,
+    }
+    let rows: Vec<Row> = rows(
+        db,
+        "SELECT record::id(id) AS id, at, strategy_version, closed_trades, duration_secs, \
+         trading_days, net_result_usd, net_expectancy_usd FROM memecoin_gate_snapshots \
+         WHERE strategy_version = $version ORDER BY at DESC LIMIT 1",
+        json!({"version": version}),
+    )
+    .await?;
+    rows.into_iter()
+        .next()
+        .map(|row| {
+            Ok(GateSnapshot {
+                id: row.id,
+                at: row.at,
+                strategy_version: row.strategy_version,
+                closed_trades: row.closed_trades,
+                duration_secs: row.duration_secs,
+                trading_days: row.trading_days,
+                net_result_usd: decimal(&row.net_result_usd)?,
+                net_expectancy_usd: decimal(&row.net_expectancy_usd)?,
+            })
+        })
+        .transpose()
+}
+
 pub async fn insert_gate_snapshot(db: &Database, snapshot: &GateSnapshot) -> Result<()> {
     run(
         db,
@@ -1207,10 +1271,12 @@ fn valid_decision(decision: &Decision) -> bool {
         && decision.output_tokens.is_none_or(|n| n <= MAX_TOKENS)
 }
 
-pub async fn append_decision(db: &Database, decision: &Decision) -> Result<()> {
+/// Record a decision; returns its id.
+pub async fn append_decision(db: &Database, decision: &Decision) -> Result<String> {
     if !valid_decision(decision) {
         return Err(MemecoinStoreError::InvalidData);
     }
+    let id = uuid::Uuid::now_v7().to_string();
     run(
         db,
         "CREATE memecoin_decisions SET id = $id, at = <datetime>$at, call_id = $call_id, kind = $kind, \
@@ -1218,7 +1284,7 @@ pub async fn append_decision(db: &Database, decision: &Decision) -> Result<()> {
          reason_code = $reason_code, rationale = $rationale, model = $model, \
          input_tokens = $input_tokens, output_tokens = $output_tokens RETURN NONE",
         json!({
-            "id": uuid::Uuid::now_v7().to_string(),
+            "id": id,
             "at": rfc3339(decision.at)?,
             "call_id": decision.call_id,
             "kind": decision.kind.as_str(),
@@ -1233,7 +1299,88 @@ pub async fn append_decision(db: &Database, decision: &Decision) -> Result<()> {
         }),
     )
     .await?;
-    Ok(())
+    Ok(id)
+}
+
+/// A recorded decision, as listed for the owner.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct StoredDecision {
+    pub id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+    pub call_id: String,
+    pub kind: String,
+    pub strategy_version: Option<u32>,
+    pub mint: Option<String>,
+    pub size_bps: Option<u32>,
+    pub reason_code: Option<String>,
+    /// Display only: never fed into a prompt or a later task input.
+    pub rationale: Option<String>,
+    pub model: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+/// Newest decisions first, at most [`MAX_LIST`].
+pub async fn recent_decisions(db: &Database, limit: usize) -> Result<Vec<StoredDecision>> {
+    rows(
+        db,
+        "SELECT record::id(id) AS id, at, call_id, kind, strategy_version, mint, size_bps, \
+         reason_code, rationale, model, input_tokens, output_tokens FROM memecoin_decisions \
+         ORDER BY at DESC LIMIT $limit",
+        json!({"limit": limit.min(MAX_LIST)}),
+    )
+    .await
+}
+
+/// What the call budget reads of one decision row: never its rationale.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CallRow {
+    pub call_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+    pub kind: String,
+    pub reason_code: Option<String>,
+}
+
+/// Rows of the calls made since `since`, oldest first. A call writes at
+/// most a few dozen rows and at most 48 decision calls and a review fit in a
+/// day, so the cap is never reached in use.
+pub async fn recent_calls(db: &Database, since: OffsetDateTime) -> Result<Vec<CallRow>> {
+    rows(
+        db,
+        "SELECT call_id, at, kind, reason_code FROM memecoin_decisions \
+         WHERE at >= <datetime>$since ORDER BY at LIMIT 5000",
+        json!({"since": rfc3339(since)?}),
+    )
+    .await
+}
+
+/// The highest recorded strategy version, legacy ones included.
+pub async fn max_version(db: &Database) -> Result<Option<u32>> {
+    #[derive(Deserialize)]
+    struct Row {
+        version: u32,
+    }
+    let rows: Vec<Row> = rows(
+        db,
+        "SELECT version FROM memecoin_strategy_versions ORDER BY version DESC LIMIT 1",
+        json!({}),
+    )
+    .await?;
+    Ok(rows.first().map(|row| row.version))
+}
+
+/// Versions written by Claude since `since`.
+pub async fn claude_versions_since(db: &Database, since: OffsetDateTime) -> Result<usize> {
+    let versions: Vec<u32> = rows(
+        db,
+        "SELECT VALUE version FROM memecoin_strategy_versions \
+         WHERE author = 'claude' AND created_at >= <datetime>$since LIMIT 1000",
+        json!({"since": rfc3339(since)?}),
+    )
+    .await?;
+    Ok(versions.len())
 }
 
 /// Price and liquidity of a mint at one moment.
