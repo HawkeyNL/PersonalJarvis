@@ -442,9 +442,37 @@ fn valid_strategy_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// Bounded display text without control characters.
+/// Bounded display text without control or format characters.
 fn valid_text(text: &str, max_chars: usize) -> bool {
-    text.chars().count() <= max_chars && !text.chars().any(char::is_control)
+    text.chars().count() <= max_chars && !text.chars().any(|c| c.is_control() || is_format_char(c))
+}
+
+/// Unicode format characters (general category Cf): bidi overrides and
+/// isolates, zero-width characters and tags, which can make display text
+/// read differently from what it holds.
+pub(crate) fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}'
+        | '\u{0600}'..='\u{0605}'
+        | '\u{061C}'
+        | '\u{06DD}'
+        | '\u{070F}'
+        | '\u{0890}'..='\u{0891}'
+        | '\u{08E2}'
+        | '\u{180E}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206F}'
+        | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{110BD}'
+        | '\u{110CD}'
+        | '\u{13430}'..='\u{1343F}'
+        | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0001}'
+        | '\u{E0020}'..='\u{E007F}')
 }
 
 /// A typed version lies above [`STRATEGY_VERSION_FLOOR`], and its parameters
@@ -1343,14 +1371,14 @@ pub struct CallRow {
     pub reason_code: Option<String>,
 }
 
-/// Rows of the calls made since `since`, oldest first. A call writes at
-/// most a few dozen rows and at most 48 decision calls and a review fit in a
-/// day, so the cap is never reached in use.
+/// Rows of the calls made since `since`, newest first, so the cap keeps the
+/// newest. A call writes at most a few dozen rows and at most 48 calls fit in
+/// a day, so the cap is not reached in use.
 pub async fn recent_calls(db: &Database, since: OffsetDateTime) -> Result<Vec<CallRow>> {
     rows(
         db,
         "SELECT call_id, at, kind, reason_code FROM memecoin_decisions \
-         WHERE at >= <datetime>$since ORDER BY at LIMIT 5000",
+         WHERE at >= <datetime>$since ORDER BY at DESC LIMIT 5000",
         json!({"since": rfc3339(since)?}),
     )
     .await
@@ -2002,6 +2030,14 @@ mod tests {
             },
             Decision {
                 reason_code: Some("a".repeat(33)),
+                ..hold.clone()
+            },
+            Decision {
+                rationale: Some("buy\u{202e}now".into()),
+                ..hold.clone()
+            },
+            Decision {
+                rationale: Some("zero\u{200b}width".into()),
                 ..hold.clone()
             },
             Decision {

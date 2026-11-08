@@ -150,25 +150,31 @@ whatever Claude does or whether it answers at all.
   300 characters). Ids must come from the input and appear once, and the
   entries' `size_bps` sum to at most 10 000. Anything else drops the whole
   reply, recorded as `invalid_output` with the reason.
-- **Checked again.** An entry still needs, on a fresh observation: its
-  strategy enabled at the same version, no position in the mint, a free slot,
+- **Checked again.** An entry still needs an intact stored ledger (the
+  limits are counted from it; otherwise `book_unavailable`) and, on a fresh
+  observation: its strategy enabled at the same version, no position in the mint, a free slot,
   the strategy's open, daily and cooldown limits, and the hard filter. Its
   size is `size_bps` of what the strategy would enter (its share of
   `max_position_usd`, capped by its liquidity share), within the free paper
   stake. A refused action is recorded as `skip` with the reason (for example
   `strategy_limit`, `no_slot`, `liquidity_too_low`). Exits sell at the tick's
   price with exit reason `agent_exit`.
-- **Recorded.** Every action and failure is a decision row: `enter`, `skip`,
-  `exit`, `hold`, `worker_unavailable` or `invalid_output`, with the model.
-  The call's token counts are on its first row only, so rows add up.
+- **Recorded.** Every call starts with a `skip` row with reason
+  `call_started`, written before the call is made; if it cannot be written,
+  the call is not made. Then every action and failure is a decision row:
+  `enter`, `skip`, `exit`, `hold`, `worker_unavailable` or
+  `invalid_output`, with the model. The call's token counts are on its first
+  row after the reply only, so rows add up.
 
 **Budget.** A decision call runs only when there are eligible candidates or
 open positions. Decision and review calls together run at most every 15
 minutes, 4 per hour and 48 per day (rolling; `agent` can only lower the last
 two). A decision Claude answered is carried out early in the next tick,
 before new candidates are observed; each fresh observation for one of its
-entries is cut off after 5 seconds. The budget is counted from the decision
-rows, so a restart does not reset it. A busy or absent worker (it shares one
+entries is cut off after 5 seconds, and entries still left after 20 seconds
+are skipped (`apply_deadline`). The budget is counted from the decision
+rows, including the `call_started` row of a call still running or cut off
+by a restart, so a restart does not reset it. A busy or absent worker (it shares one
 background slot with research) skips that cycle without an alarm. A plan
 limit backs every call off for 1, 2, then 6 hours. Three invalid replies in a
 row pause decisions for 6 hours; the overview shows `paused_until` and
@@ -211,6 +217,10 @@ reason it was refused.
   be reached; a `503` then means the disable holds only until the next
   restart, so retry), and it holds as the owner's disable. Its positions keep exiting. Audited as
   `memecoin.strategy.disable`.
+- What a signature enables is the **strategy**, not one version: while it
+  stays enabled, later versions Claude writes for it become active without a
+  new signature, each within `StrategyConfig::validate` against the
+  profile's rules and the review's caps. To stop that, disable the strategy.
 - **Enable** needs a device signature, from a device that can approve
   (iOS, Android or macOS): ask for a challenge, then sign
   `meme_strategy_enable_message` (`jarvis-client-core`, domain

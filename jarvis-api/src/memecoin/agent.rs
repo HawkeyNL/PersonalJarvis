@@ -205,6 +205,16 @@ impl CallRecord {
         }
     }
 
+    /// Record that the call starts, before it is made: the budget counts
+    /// it even if Core stops before the reply. `false` when it could not be
+    /// recorded; the call is then not made.
+    pub(super) async fn start(mut self, db: &Database) -> bool {
+        let row = self.row(DecisionKind::Skip, None, None, None, Some("call_started"));
+        bounded("decision", store::append_decision(db, &row))
+            .await
+            .is_ok()
+    }
+
     pub(super) async fn failed(mut self, db: &Database, error: &LlmError, events: Option<&Hub>) {
         let (kind, reason) = failure(error);
         let row = self.row(kind, None, None, None, Some(reason));
@@ -627,11 +637,15 @@ fn valid_reason_code(code: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-/// Control characters stripped and surrounding space trimmed; `Err` when
-/// longer than `max` characters, `None` when nothing is left.
+/// Control and format characters (bidi overrides, zero-width) stripped and
+/// surrounding space trimmed; `Err` when longer than `max` characters,
+/// `None` when nothing is left.
 fn display_text(text: Option<String>, max: usize) -> Result<Option<String>, &'static str> {
     let Some(text) = text else { return Ok(None) };
-    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+    let text: String = text
+        .chars()
+        .filter(|c| !c.is_control() && !store::is_format_char(*c))
+        .collect();
     let text = text.trim();
     if text.chars().count() > max {
         return Err("rationale_too_long");
@@ -887,6 +901,9 @@ pub async fn run_review(env: ReviewEnv) {
         let row = record.row(DecisionKind::Hold, None, None, None, Some(reason));
         return record.write(&env.db, row, env.events.as_ref()).await;
     };
+    if !CallRecord::new(call_id.clone(), None).start(&env.db).await {
+        return;
+    }
     let reply = match env.brain.run(WorkerTask::MemeStrategyReview, &input).await {
         Ok(reply) => reply,
         Err(error) => return record.failed(&env.db, &error, env.events.as_ref()).await,
@@ -1391,7 +1408,7 @@ pub(crate) mod tests {
         let reply = r#"{"actions":[{"action":"exit","id":"p1"},
             {"action":"enter","id":"c0","size_bps":6000,"reason_code":"breakout_2h"},
             {"action":"enter","id":"c10","size_bps":4000,"reason_code":"base"}],
-            "rationale":"  Exit the laggard,\u0007 buy the breakout.\n"}"#;
+            "rationale":"  Exit the\u200b laggard,\u0007 buy the\u202e breakout.\n"}"#;
         let decision = parse_decision(reply, 11, 2).unwrap();
         assert_eq!(
             decision.choices,
@@ -1560,6 +1577,10 @@ pub(crate) mod tests {
         let b = budget(&rows(&full, now), &caps, now);
         assert_eq!(b.calls_last_day, 48);
         assert!(!b.decision_open);
+        // A call counts from the row written before it is made.
+        let started = rows(&[("d-1", 5, "skip", Some("call_started"))], now);
+        let b = budget(&started, &caps, now);
+        assert!(!b.decision_open && b.calls_last_hour == 1);
         // A review call counts like a decision; a review that made no call
         // does not.
         let review = rows(&[("r-1", 10, "propose", Some("accepted"))], now);

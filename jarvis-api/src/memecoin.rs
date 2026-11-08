@@ -92,9 +92,12 @@ const TIME_STOP_ONLY: ExitRules = ExitRules {
     liquidity_drop_exit_bps: strategy::bounds::LIQUIDITY_DROP_BPS.1,
     max_hold: strategy::bounds::CONFIG_MAX_HOLD.1,
 };
-/// One fresh observation for an entry Claude chose. With up to ten entries
-/// per decision, a slow provider cannot hold the tick past its timeout.
+/// One fresh observation for an entry Claude chose ...
 const AGENT_ENTRY_OBSERVE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+/// ... and all of a decision's entries together: those left when this has
+/// passed are skipped (`apply_deadline`), so applying a decision leaves the
+/// tick most of [`TICK_TIMEOUT`].
+const AGENT_APPLY_DEADLINE: StdDuration = StdDuration::from_secs(20);
 /// Sell quotes are taken into USDC.
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -1264,6 +1267,7 @@ impl PaperTask {
                 stamp: &mut stamp,
                 stats: &mut stats,
                 read_failed,
+                book_ok: book.is_ok(),
             };
             agent_apply(agent, &mut env).await?;
         }
@@ -1484,6 +1488,7 @@ impl PaperTask {
                 stamp: &mut stamp,
                 stats: &mut stats,
                 read_failed,
+                book_ok: book.is_ok(),
             };
             agent_schedule(agent, &mut env, book.as_ref().ok()).await?;
         }
@@ -1595,6 +1600,8 @@ struct AgentEnv<'t, 'a> {
     stamp: &'t mut (dyn FnMut() -> OffsetDateTime + Send),
     stats: &'t mut TickStats,
     read_failed: bool,
+    /// The stored ledger replays; without it the limits cannot be counted.
+    book_ok: bool,
 }
 
 impl AgentEnv<'_, '_> {
@@ -1682,6 +1689,13 @@ async fn agent_schedule(
         return Ok(());
     };
     agent.last_decision = Some(now);
+    // Recorded before the call, so a call cut off by a restart still counts.
+    if !agent::CallRecord::new(call.call_id.clone(), None)
+        .start(env.db)
+        .await
+    {
+        return Ok(());
+    }
     let brain = agent.brain.clone();
     let input = call.input.clone();
     let reply = tokio::spawn(async move { brain.run(WorkerTask::MemeDecision, &input).await });
@@ -1801,6 +1815,7 @@ async fn apply_decision(
     // Exits first: they free slots and stake.
     choices.sort_by_key(|c| !matches!(c, agent::Choice::Exit { .. }));
     let mut free_stake = None;
+    let deadline = tokio::time::Instant::now() + AGENT_APPLY_DEADLINE;
     for choice in choices {
         let row = match choice {
             agent::Choice::Hold => record.row(DecisionKind::Hold, None, None, None, None),
@@ -1813,7 +1828,11 @@ async fn apply_decision(
                 reason_code,
             } => {
                 let candidate = &call.candidates[candidate];
-                let entry = agent_enter(env, candidate, size_bps, &mut free_stake).await?;
+                let entry = if tokio::time::Instant::now() >= deadline {
+                    Err("apply_deadline")
+                } else {
+                    agent_enter(env, candidate, size_bps, &mut free_stake).await?
+                };
                 match entry {
                     Ok(()) => record.row(
                         DecisionKind::Enter,
@@ -1932,7 +1951,10 @@ async fn agent_enter(
         return Ok(Err("strategy_changed"));
     };
     let now = OffsetDateTime::now_utc();
-    let refusal = if env.paused() {
+    let refusal = if !env.book_ok {
+        // The limits are counted from the stored ledger.
+        Some("book_unavailable")
+    } else if env.paused() {
         Some("paused")
     } else if env.handle.disabled(id) {
         Some("strategy_disabled")
@@ -2923,7 +2945,9 @@ mod tests {
         db: &Database,
     ) -> Result<Vec<store::StoredDecision>, Box<dyn std::error::Error>> {
         let mut rows = store::recent_decisions(db, 100).await?;
-        rows.retain(|row| row.call_id.starts_with("d-"));
+        rows.retain(|row| {
+            row.call_id.starts_with("d-") && row.reason_code.as_deref() != Some("call_started")
+        });
         Ok(rows)
     }
 
@@ -3051,6 +3075,52 @@ mod tests {
         );
         let status = handle.agent().ok_or("no status")?;
         assert!(status.budget.paused_until.is_none() && status.budget.backoff_until.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn claude_entries_wait_for_an_intact_ledger() -> Result<(), Box<dyn std::error::Error>> {
+        let db = connect("memecoin_agent_ledger").await?;
+        let mut json = fixture_json();
+        json["watchlist"] = serde_json::json!([MINT_A]);
+        json["max_open_positions"] = 4.into();
+        json["agent"] = serde_json::json!({});
+        let profile = PaperProfile::parse(&json.to_string())?;
+        pool_age_strategies(&db, &profile).await?;
+        let brain = ScriptedBrain::new();
+        let mut task = PaperTask::new(profile, Arc::new(PaperHandle::new(true)))
+            .with_agent(Some(brain.clone()), None);
+        let market = FixtureMarket::new(&[(MINT_A, "0.001", Duration::hours(2))]);
+        let mut no_failure = || Decimal::new(999_999, 6);
+        task.tick(&db, &market, &mut no_failure).await?;
+        settle(&task).await;
+        brain.reply(Ok(
+            r#"{"actions":[{"action":"enter","id":"c0","size_bps":10000,"reason_code":"momentum"}]}"#
+                .into(),
+        ));
+        task.tick(&db, &market, &mut no_failure).await?;
+        settle(&task).await;
+        // The stored ledger stops replaying before the reply is applied:
+        // without it the limits cannot be counted, so nothing enters.
+        let tampered = trip("tampered", MINT_C, 0, None);
+        store::open_trip(&db, &tampered).await?;
+        let close = trip("tampered", MINT_C, 0, Some((60, "30", "6")))
+            .close
+            .ok_or("no close")?;
+        assert!(store::close_trip(&db, "tampered", &close).await?);
+        assert!(task.tick(&db, &market, &mut no_failure).await.is_err());
+        assert!(store::load_held_trips(&db).await?.is_empty());
+        let rows = agent_rows(&db).await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (
+                rows[0].kind.as_str(),
+                rows[0].reason_code.as_deref(),
+                rows[0].mint.as_deref()
+            ),
+            ("skip", Some("book_unavailable"), Some(MINT_A))
+        );
         Ok(())
     }
 
@@ -3200,7 +3270,12 @@ mod tests {
         db.query("DELETE memecoin_decisions").await?.check()?;
         review(serde_json::json!([proposal("s9", 0, |_| {})]));
         agent::run_review(env()).await;
-        let rows = store::recent_decisions(&db, 10).await?;
+        let mut rows = store::recent_decisions(&db, 10).await?;
+        // The call was recorded before it was made.
+        assert_eq!(
+            rows.pop().and_then(|r| r.reason_code),
+            Some("call_started".into())
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(
             (rows[0].kind.as_str(), rows[0].reason_code.as_deref()),

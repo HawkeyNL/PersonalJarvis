@@ -1814,6 +1814,20 @@ async fn memecoin_strategies_disable_at_once_and_enable_only_with_a_fresh_signat
     // Nothing to enable yet.
     let challenge = call("POST", format!("{a}/enable/challenge"), None).await?;
     assert_eq!(challenge.status(), StatusCode::CONFLICT);
+    // Only a device that can approve may ask for a challenge.
+    let set_platform = |platform: &'static str| {
+        let db = db.clone();
+        async move {
+            db.query("UPDATE devices SET platform = $platform WHERE record::id(id) = $id")
+                .bind(json!({"platform": platform, "id": device.to_string()}))
+                .await?
+                .check()
+        }
+    };
+    set_platform("linux").await?;
+    let challenge = call("POST", format!("{a}/enable/challenge"), None).await?;
+    assert_eq!(challenge.status(), StatusCode::FORBIDDEN);
+    set_platform("ios").await?;
 
     // Disabling needs only the session, and holds as the owner's.
     let disabled = call("POST", format!("{a}/disable"), None).await?;
