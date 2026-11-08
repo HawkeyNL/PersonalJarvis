@@ -234,4 +234,6 @@ pub struct AppState {
     pub notifier: crate::notify::Notifier,
     /// Memecoin PAPER trader state shared with its task; off by default.
     pub memecoin: Arc<crate::memecoin::PaperHandle>,
+    /// The single slot and caps of automatic web search runs.
+    pub auto_research: Arc<crate::auto_research::AutoResearch>,
 }

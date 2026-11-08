@@ -94,7 +94,7 @@ impl Inner {
             Event::ConversationUpdated(_) => "conversation.updated",
             Event::ConversationDeleted { .. } => "conversation.deleted",
             Event::MessageCreated { .. } => "message.created",
-            Event::AssistantStarted(_) => "assistant.started",
+            Event::AssistantStarted { .. } => "assistant.started",
             Event::AssistantDelta { .. } => "assistant.delta",
             Event::AssistantCompleted { .. } => "assistant.completed",
             Event::AssistantFailed { .. } => "assistant.failed",

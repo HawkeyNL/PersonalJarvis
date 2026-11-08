@@ -86,7 +86,7 @@ export interface HfProvidersResponse {
 }
 export type RouteTier = "cheap" | "default" | "hard";
 export type PaidApi = "allowed" | "off";
-export type ResearchWebSearch = "on" | "off";
+export type ResearchWebSearch = "off" | "on" | "auto";
 export interface RouteEntry { provider: string; model: string }
 export interface TierRoute { chain: RouteEntry[]; metered_after_subscription: boolean }
 export interface RoutingReport {

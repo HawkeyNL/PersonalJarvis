@@ -85,7 +85,15 @@ pub enum Event {
         message: CanonicalMessage,
     },
     #[serde(rename = "assistant.started")]
-    AssistantStarted(RunIdentity),
+    AssistantStarted {
+        #[serde(flatten)]
+        run: RunIdentity,
+        /// True only for a run Core started by itself to search the web after
+        /// an answer (automatic web search); it has no user message of its
+        /// own. Absent otherwise and from older Cores.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        web_search: bool,
+    },
     #[serde(rename = "assistant.delta")]
     AssistantDelta { run: RunIdentity, text: String },
     #[serde(rename = "assistant.completed")]
@@ -236,6 +244,41 @@ mod tests {
         assert!(!cursor.accept(&event));
         event.protocol = 99;
         assert!(!cursor.accept(&event));
+    }
+
+    #[test]
+    fn started_web_search_marker_is_optional_on_the_wire() {
+        let id = Uuid::nil();
+        let run = RunIdentity {
+            run_id: id,
+            request_id: id,
+            conversation_id: id,
+        };
+        let ordinary = Event::AssistantStarted {
+            run: run.clone(),
+            web_search: false,
+        };
+        // An ordinary start keeps the old flat payload, so old payloads decode.
+        let old = serde_json::to_value(&ordinary).unwrap();
+        assert_eq!(old["type"], "assistant.started");
+        assert_eq!(old["payload"], serde_json::to_value(&run).unwrap());
+        assert_eq!(serde_json::from_value::<Event>(old).unwrap(), ordinary);
+        let automatic = Event::AssistantStarted {
+            run: run.clone(),
+            web_search: true,
+        };
+        let new = serde_json::to_value(&automatic).unwrap();
+        assert_eq!(new["payload"]["web_search"], true);
+        assert_eq!(new["payload"]["run_id"], id.to_string());
+        assert_eq!(
+            serde_json::from_value::<Event>(new.clone()).unwrap(),
+            automatic
+        );
+        // A client that only knows the run identity ignores the marker.
+        assert_eq!(
+            serde_json::from_value::<RunIdentity>(new["payload"].clone()).unwrap(),
+            run
+        );
     }
 
     #[test]

@@ -504,7 +504,8 @@ a coding unit are enabled or running together.
 
 Both workers accept a `research` flag in the request. Core sets it only for an
 explicit Research request while the owner's `research_web_search` switch in
-`routing.json` is on (see `MODEL_ROUTING_OPERATIONS.md`). The request then
+`routing.json` is on or auto, or for an automatic web search run when it is
+auto (see `MODEL_ROUTING_OPERATIONS.md`). The request then
 carries only the latest question (at most 2000 characters; the worker accepts
 at most 8 KiB) and a fixed research instruction. Without the flag, both
 workers run exactly as described above, with every tool off.

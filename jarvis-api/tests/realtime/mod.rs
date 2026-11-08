@@ -772,3 +772,180 @@ async fn disconnect_and_provider_failure_never_repeat_or_lose_the_user_message(
     }
     Ok(())
 }
+
+/// Answers chat at once; research can wait until released, so a test can
+/// delete the conversation while an automatic web search runs.
+struct AutoFake {
+    research_started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    pause: bool,
+}
+#[async_trait::async_trait]
+impl LlmProvider for AutoFake {
+    fn label(&self) -> &str {
+        "auto-fixture"
+    }
+    fn can_research(&self) -> bool {
+        true
+    }
+    async fn chat(&self, _: &ChatRequest) -> Result<ChatReply, LlmError> {
+        Ok(ChatReply {
+            text: "Plain answer.".into(),
+            model: "fixture-model".into(),
+            backend: Some("ollama".into()),
+            requested_route: None,
+            actual_provider: None,
+            fallback_count: 0,
+            stop_reason: Some("stop".into()),
+            usage: None,
+        })
+    }
+    async fn research(&self, _: &jarvis_llm::ResearchRequest) -> Result<ChatReply, LlmError> {
+        if self.pause {
+            self.research_started.notify_one();
+            self.release.notified().await;
+        }
+        Ok(ChatReply {
+            text: "Web answer\nSources:\nhttps://example.org/a".into(),
+            model: "claude-opus-5".into(),
+            backend: Some("claude-cli".into()),
+            requested_route: None,
+            actual_provider: None,
+            fallback_count: 0,
+            stop_reason: Some("end_turn".into()),
+            usage: None,
+        })
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* server"]
+async fn automatic_web_search_follows_the_answer_and_never_writes_into_a_deleted_conversation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jarvis_client_core::realtime::RunFailure;
+    for delete in [false, true] {
+        let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+        db.signin(Root {
+            username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+            password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+        })
+        .await?;
+        db.use_ns(format!("realtime_{}", Uuid::now_v7().simple()))
+            .use_db("fixture")
+            .await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+        let owner = jarvis_identity::first_user_or_create(&db, "fixture").await?;
+        let (device, token) = device_token(&db, owner.id).await;
+        let research_started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut fixture = state(db.clone(), None).await;
+        fixture.llm = Arc::new(AutoFake {
+            research_started: research_started.clone(),
+            release: release.clone(),
+            pause: delete,
+        });
+        fixture.fast_intent_router = Some(Arc::new(IntentRouterChain::new(
+            None,
+            Some(Arc::new(FakeJev(Arc::new(AtomicUsize::new(0))))),
+            LayaMode::Off,
+            0.95,
+            0.75,
+        )));
+        fixture.model_routing =
+            Arc::new(jarvis_llm::LiveRouting::new(jarvis_llm::RoutingSnapshot {
+                routing: Some(jarvis_llm::ModelRouting::parse(
+                    br#"{"version":1,"research_web_search":"auto"}"#,
+                )?),
+                unavailable_reason: None,
+            }));
+        let hub = fixture.realtime.clone();
+        let mut display = hub.subscribe(owner.id, device).unwrap();
+        let app = build_router(fixture);
+        let (status, run) = post(
+            &app,
+            &token,
+            "/v1/assistant/runs",
+            json!({"request_id":Uuid::now_v7(),
+                "messages":[{"role":"user","content":"weer Amsterdam morgen"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{run}");
+        let conversation: Uuid = serde_json::from_value(run["conversation_id"].clone())?;
+        let mut answered = false;
+        let mut automatic = None;
+        loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(5), display.receiver.recv())
+                .await?
+                .unwrap();
+            match &envelope.event {
+                Event::AssistantCompleted {
+                    message,
+                    research_offer,
+                    ..
+                } if automatic.is_none() => {
+                    // Auto replaces the offer; the answer comes first.
+                    assert!(research_offer.is_none());
+                    assert_eq!(message.content, "Plain answer.");
+                    answered = true;
+                }
+                Event::AssistantStarted {
+                    run,
+                    web_search: true,
+                } => {
+                    assert!(answered, "the search starts after the answer");
+                    automatic = Some(run.run_id);
+                    if delete {
+                        tokio::time::timeout(Duration::from_secs(5), research_started.notified())
+                            .await?;
+                        // The answered run may still hold the conversation briefly.
+                        let mut deleted = StatusCode::CONFLICT;
+                        for _ in 0..100 {
+                            deleted = app
+                                .clone()
+                                .oneshot(
+                                    Request::builder()
+                                        .method("DELETE")
+                                        .uri(format!("/v1/conversations/{conversation}"))
+                                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                                        .body(Body::empty())?,
+                                )
+                                .await?
+                                .status();
+                            if deleted != StatusCode::CONFLICT {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        assert_eq!(deleted, StatusCode::OK);
+                        release.notify_one();
+                    }
+                }
+                Event::AssistantCompleted { run, message, .. } if automatic == Some(run.run_id) => {
+                    assert!(!delete, "a deleted conversation gets no web answer");
+                    assert_eq!(message.model.as_deref(), Some("web:claude-opus-5"));
+                    break;
+                }
+                Event::AssistantFailed { run, reason } if automatic == Some(run.run_id) => {
+                    assert!(delete, "{reason:?}");
+                    assert_eq!(*reason, RunFailure::Interrupted);
+                    break;
+                }
+                Event::AssistantFailed { .. } => panic!("{envelope:?}"),
+                _ => {}
+            }
+        }
+        let models: Vec<Option<String>> = db
+            .query("SELECT VALUE model FROM chat_messages WHERE conversation_id = $conversation")
+            .bind(json!({"conversation": conversation.to_string()}))
+            .await?
+            .take(0)?;
+        if delete {
+            assert!(models.is_empty(), "{models:?}");
+        } else {
+            // The user's message, the answer and the web answer; no second user message.
+            assert_eq!(models.len(), 3, "{models:?}");
+            assert!(models.contains(&Some("web:claude-opus-5".into())));
+        }
+    }
+    Ok(())
+}
