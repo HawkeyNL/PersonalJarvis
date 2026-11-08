@@ -11,6 +11,8 @@ pub const MAX_REPLY_BYTES: usize = 256 * 1024;
 pub const MAX_SYSTEM_BYTES: usize = 12 * 1024;
 /// Longest research prompt a worker accepts (the bounded question in UTF-8).
 pub const MAX_RESEARCH_PROMPT_BYTES: usize = 4 * crate::types::MAX_RESEARCH_QUESTION_CHARS;
+/// Longest task input: one numbers-only JSON object.
+pub const MAX_TASK_PROMPT_BYTES: usize = 16 * 1024;
 
 /// The reviewed CLI contract is Claude Code 2.1.248+ within its 2.1 line.
 /// `--restricted` first appeared in 2.1.248. A later minor/major line needs
@@ -62,12 +64,38 @@ pub struct ClaudeWorkerRequest {
     /// exact shape.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub research: bool,
+    /// A typed task: its fixed system prompt, a JSON object as input and no
+    /// tool at all. Omitted when absent, so ordinary requests keep their exact
+    /// shape; a worker that predates the field refuses it as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<WorkerTask>,
+}
+
+/// The fixed-prompt tasks the Claude worker runs. Each one shares the single
+/// background slot with research, so chat always keeps a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerTask {
+    MemeDecision,
+    MemeStrategyReview,
+}
+
+impl WorkerTask {
+    /// The only system text a request for this task may carry.
+    pub fn system_prompt(self) -> &'static str {
+        match self {
+            Self::MemeDecision => crate::meme_prompts::MEME_DECISION_SYSTEM_PROMPT,
+            Self::MemeStrategyReview => crate::meme_prompts::MEME_STRATEGY_REVIEW_SYSTEM_PROMPT,
+        }
+    }
 }
 
 impl ClaudeWorkerRequest {
     pub fn valid(&self) -> bool {
         let prompt_limit = if self.research {
             MAX_RESEARCH_PROMPT_BYTES
+        } else if self.task.is_some() {
+            MAX_TASK_PROMPT_BYTES
         } else {
             48 * 1024
         };
@@ -77,6 +105,16 @@ impl ClaudeWorkerRequest {
             // Nothing but the fixed research prompt rides along with a search.
             && (!self.research
                 || self.system.as_deref() == Some(crate::types::RESEARCH_SYSTEM_PROMPT))
+            // A task carries only its fixed prompt and one JSON object, never
+            // a web search.
+            && self.task.is_none_or(|task| {
+                !self.research
+                    && self.system.as_deref() == Some(task.system_prompt())
+                    && serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                        &self.prompt,
+                    )
+                    .is_ok()
+            })
             && self
                 .system
                 .as_deref()
@@ -155,6 +193,7 @@ mod tests {
             system: None,
             prompt: "hello".into(),
             research: false,
+            task: None,
         };
         assert!(request.valid());
         assert!(!serde_json::to_string(&request)
@@ -166,6 +205,7 @@ mod tests {
             system: Some(crate::types::RESEARCH_SYSTEM_PROMPT.into()),
             prompt: "x".repeat(MAX_RESEARCH_PROMPT_BYTES),
             research: true,
+            task: None,
         };
         assert!(research.valid());
         assert!(!ClaudeWorkerRequest {
@@ -185,6 +225,7 @@ mod tests {
                 system,
                 prompt: "hello".into(),
                 research: true,
+                task: None,
             }
             .valid());
         }
@@ -199,8 +240,71 @@ mod tests {
             system: None,
             prompt: "hello".into(),
             research: false,
+            task: None,
         }
         .valid());
+    }
+
+    fn task_request(task: WorkerTask, prompt: String) -> ClaudeWorkerRequest {
+        ClaudeWorkerRequest {
+            protocol: 1,
+            model: "claude-sonnet-5".into(),
+            system: Some(task.system_prompt().into()),
+            prompt,
+            research: false,
+            task: Some(task),
+        }
+    }
+
+    #[test]
+    fn task_requests_carry_only_their_fixed_prompt_and_a_bounded_json_object() {
+        for task in [WorkerTask::MemeDecision, WorkerTask::MemeStrategyReview] {
+            let ok = task_request(task, r#"{"c1":{"liq_usd":1200.5}}"#.into());
+            assert!(ok.valid());
+            let wire = serde_json::to_value(&ok).unwrap();
+            assert!(wire["task"].is_string());
+            assert!(wire.get("research").is_none());
+
+            let mut wrong_system = task_request(task, "{}".into());
+            for system in [
+                None,
+                Some("You are Jarvis.".to_owned()),
+                Some(crate::types::RESEARCH_SYSTEM_PROMPT.to_owned()),
+                Some(format!("{} ", task.system_prompt())),
+            ] {
+                wrong_system.system = system;
+                assert!(!wrong_system.valid());
+            }
+            for prompt in ["[1,2]", "42", "\"x\"", "not json", "{} {}", " "] {
+                assert!(!task_request(task, prompt.into()).valid(), "{prompt}");
+            }
+            let padding = MAX_TASK_PROMPT_BYTES - r#"{"p":""}"#.len();
+            let largest = format!(r#"{{"p":"{}"}}"#, "x".repeat(padding));
+            assert!(task_request(task, largest.clone()).valid());
+            let oversize = format!(r#"{{"p":"{}"}}"#, "x".repeat(padding + 1));
+            assert!(!task_request(task, oversize).valid());
+            assert!(!ClaudeWorkerRequest {
+                research: true,
+                ..task_request(task, "{}".into())
+            }
+            .valid());
+        }
+        // The other task's prompt is not this task's prompt.
+        let mut swapped = task_request(WorkerTask::MemeDecision, "{}".into());
+        swapped.system = Some(WorkerTask::MemeStrategyReview.system_prompt().into());
+        assert!(!swapped.valid());
+        // Unknown task names are refused at the wire.
+        let unknown = r#"{"protocol":1,"model":"m","system":null,"prompt":"{}","task":"shell"}"#;
+        assert!(serde_json::from_str::<ClaudeWorkerRequest>(unknown).is_err());
+    }
+
+    #[test]
+    fn requests_without_a_task_keep_their_wire_shape_both_ways() {
+        // What an older Core sends still parses, as an ordinary request.
+        let old = r#"{"protocol":1,"model":"m","system":null,"prompt":"hi"}"#;
+        let request = serde_json::from_str::<ClaudeWorkerRequest>(old).unwrap();
+        assert!(request.task.is_none() && request.valid());
+        assert_eq!(serde_json::to_string(&request).unwrap(), old);
     }
 
     #[test]

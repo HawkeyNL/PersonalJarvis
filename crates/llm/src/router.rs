@@ -460,7 +460,7 @@ impl LlmProvider for RouterProvider {
 
     /// Mirrors the checks in [`Self::research`] without starting a run.
     fn can_research(&self) -> bool {
-        self.routing.snapshot().research_web_search_on()
+        self.routing.snapshot().research_allowed()
             && self
                 .plan(Tier::Hard, true, None)
                 .iter()
@@ -566,7 +566,7 @@ impl LlmProvider for RouterProvider {
     /// subscription workers of the hard-tier plan. A paid API never searches,
     /// so there is no metered fallback at all.
     async fn research(&self, req: &ResearchRequest) -> Result<ChatReply, LlmError> {
-        if !self.routing.snapshot().research_web_search_on() {
+        if !self.routing.snapshot().research_allowed() {
             return Err(LlmError::NotConfigured("research web search is off".into()));
         }
         let mut last = None;
@@ -576,7 +576,7 @@ impl LlmProvider for RouterProvider {
                 continue;
             }
             // The owner may switch research off while a request is in flight.
-            if !self.routing.snapshot().research_web_search_on() {
+            if !self.routing.snapshot().research_allowed() {
                 return Err(LlmError::NotConfigured("research web search is off".into()));
             }
             let Some(model) = self.choose_model(&candidate.id, pinned.as_deref(), None, Tier::Hard)
@@ -1666,13 +1666,20 @@ mod tests {
         );
         assert_eq!(research_calls(&f), [0, 1, 0, 0]);
         // Without an owner chain the built-in hard order applies: claude-cli.
-        let f = research_fleet(r#"{"version":1,"research_web_search":"on"}"#, &[]);
-        let reply = f.router.research(&question()).await.unwrap();
-        assert_eq!(
-            (reply.backend.as_deref(), reply.model.as_str()),
-            (Some("claude-cli"), "claude-opus-5")
-        );
-        assert_eq!(research_calls(&f), [1, 0, 0, 0]);
+        // Auto allows explicit Research exactly like on.
+        for raw in [
+            r#"{"version":1,"research_web_search":"on"}"#,
+            r#"{"version":1,"research_web_search":"auto"}"#,
+        ] {
+            let f = research_fleet(raw, &[]);
+            assert!(f.router.can_research(), "{raw}");
+            let reply = f.router.research(&question()).await.unwrap();
+            assert_eq!(
+                (reply.backend.as_deref(), reply.model.as_str()),
+                (Some("claude-cli"), "claude-opus-5")
+            );
+            assert_eq!(research_calls(&f), [1, 0, 0, 0]);
+        }
     }
 
     #[tokio::test]

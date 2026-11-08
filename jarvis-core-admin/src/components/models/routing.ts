@@ -48,6 +48,10 @@ function sameTier(saved: TierRoute | null, draft: TierRoute | null): boolean {
   return !!saved && !!draft && JSON.stringify([saved.chain, saved.metered_after_subscription]) === JSON.stringify([draft.chain, draft.metered_after_subscription]);
 }
 const chainText = (chain: RouteEntry[]) => chain.map(entryKey).join(" → ");
+const RESEARCH_SUMMARY: Record<ResearchWebSearch, string> = { off: "turn off", on: "turn on", auto: "turn on automatic search" };
+const RESEARCH_ORDER: ResearchWebSearch[] = ["off", "on", "auto"];
+/** Off -> on, off -> auto and on -> auto loosen: they need a confirm first. */
+export const researchLoosens = (from: ResearchWebSearch, to: ResearchWebSearch) => RESEARCH_ORDER.indexOf(to) > RESEARCH_ORDER.indexOf(from);
 
 /**
  * The broker calls Apply makes, in page order: paid APIs, research web search,
@@ -61,7 +65,7 @@ export function changes(report: RoutingReport, staged: Staged): Change[] {
     list.push({ key: "paid_api", request: { action: "paid_api", state: staged.paid_api }, summary: staged.paid_api === "off" ? "Paid APIs: turn off" : "Paid APIs: allow" });
   }
   if (staged.research_web_search !== saved.research_web_search) {
-    list.push({ key: "research_web_search", request: { action: "research_web_search", state: staged.research_web_search }, summary: `Research web search: turn ${staged.research_web_search}` });
+    list.push({ key: "research_web_search", request: { action: "research_web_search", state: staged.research_web_search }, summary: `Research web search: ${RESEARCH_SUMMARY[staged.research_web_search]}` });
   }
   for (const { tier, label } of TIERS) {
     const draft = staged.tiers[tier];
@@ -117,13 +121,15 @@ export interface ConfirmSpec { title: string; detail: string; label: string; ton
 
 const PAID_DETAIL = "Metered provider APIs become eligible again in every tier, within the monthly budget. Providers bill each call.";
 const RESEARCH_DETAIL = "Explicit Research requests send only the question, with a fixed instruction, to your Claude or ChatGPT subscription, which searches the web with its provider-hosted search. No memory, history or device data is sent. Web results are untrusted; answers list their sources.";
+const AUTO_DETAIL = "Automatic search also sends the question without a click, after an answer Jarvis marks as research. A question with an email address, a long number, an amount, key-like text, your portfolio or account, or a symbol you hold stays a button; names are not detected. At most 10 automatic searches per hour and 40 per day.";
 const STAGED_NOTE = "Nothing changes until you apply.";
 
 /** Confirms before a change is staged; the Apply confirm follows later. */
-export function stageConfirm(action: "allow_paid" | "research_on" | "reset", tierLabel = ""): ConfirmSpec {
+export function stageConfirm(action: "allow_paid" | "research_on" | "research_auto" | "reset", tierLabel = ""): ConfirmSpec {
   switch (action) {
     case "allow_paid": return { title: "Allow paid APIs?", detail: `${PAID_DETAIL} ${STAGED_NOTE}`, label: "Allow paid APIs", tone: "danger" };
     case "research_on": return { title: "Turn on research web search?", detail: `${RESEARCH_DETAIL} ${STAGED_NOTE}`, label: "Turn on web search", tone: "primary" };
+    case "research_auto": return { title: "Turn on automatic web search?", detail: `${RESEARCH_DETAIL} ${AUTO_DETAIL} ${STAGED_NOTE}`, label: "Turn on automatic search", tone: "primary" };
     case "reset": return { title: `Use the built-in order for ${tierLabel}?`, detail: `Your order for the ${tierLabel} tier, including edits you have not applied, is replaced by the built-in order. ${STAGED_NOTE}`, label: `Use built-in order for ${tierLabel}`, tone: "danger" };
   }
 }
@@ -136,7 +142,8 @@ export function applyConfirm(list: Change[]): ConfirmSpec {
   const risky = list.some((change) => (change.request.action === "paid_api" && change.request.state === "allowed") || change.request.action === "reset" || (change.request.action === "set" && change.request.metered_after_subscription));
   const notes = [
     list.some((change) => change.request.action === "paid_api" && change.request.state === "allowed") ? PAID_DETAIL : "",
-    list.some((change) => change.request.action === "research_web_search" && change.request.state === "on") ? RESEARCH_DETAIL : "",
+    list.some((change) => change.request.action === "research_web_search" && change.request.state !== "off") ? RESEARCH_DETAIL : "",
+    list.some((change) => change.request.action === "research_web_search" && change.request.state === "auto") ? AUTO_DETAIL : "",
   ].filter(Boolean);
   const count = list.length === 1 ? "1 routing change" : `${list.length} routing changes`;
   return {

@@ -46,7 +46,12 @@ Public events:
 
 - `conversation.created`, `conversation.updated`, `conversation.deleted`
 - `message.created` with canonical message and originating request ID
-- `assistant.started` with run/request/conversation IDs
+- `assistant.started` with run/request/conversation IDs and, only for an
+  automatic web search run, `web_search: true` (absent otherwise; older
+  clients ignore it). Such a run follows the `assistant.completed` of the
+  answer it extends, reuses that run's request ID, has a new run ID and no
+  `message.created` of its own; see
+  [Automatic web search](#automatic-web-search).
 - `assistant.delta` with run identity and public assistant text only
 - `assistant.completed` with the canonical persisted assistant message and,
   only when the intent classifier advised research and an owner-started
@@ -54,12 +59,42 @@ Public events:
   owner's own latest question, trimmed. It is advisory and not stored. Core
   never searches on it; an app may show a button whose click sends exactly
   that question as a new run with `"mode": "research"`. Older apps ignore it.
+  It is absent when Core starts an automatic web search instead.
 - `assistant.failed` with a fixed safe reason code
 - `voice.owner_changed`, `voice.started`, `voice.stopped`, `voice.failed`
 
 There are no arbitrary tool payloads, hidden reasoning fields, provider response
 objects, authorization headers, system prompts or private scratchpads in these
 types. Logs record lifecycle/status, not message text or bearer-bearing URLs.
+
+## Automatic web search
+
+With `research_web_search: "auto"` (see `MODEL_ROUTING_OPERATIONS.md`) Core
+may extend a runs-API answer by itself; `POST /v1/assistant/chat` never does.
+After the answer's `assistant.completed` (without `research_offer`), Core
+publishes `assistant.started` with `web_search: true`, runs Research on the
+same latest question, stores the answer as `web:<model>` and publishes
+`assistant.completed`. It only does so when the classifier advised research,
+a research run can start, the privacy gate passes, no automatic run is in
+flight and the rate cap allows; otherwise the answer carries the usual
+`research_offer`. The run claims no voice ownership, so it is not spoken, and
+it does not hold the conversation's run reservation: a new owner message may
+run beside it, and the web answer is then stored after that message.
+
+If the search does not run after the run started (the switch went off, the
+subscription worker's one background slot was busy with another research or
+task run, or no subscription answered), Core publishes `assistant.failed` with
+`provider_unavailable` and stores nothing: an unrequested run never leaves a
+"research unavailable" notice in the conversation. The answer before it
+stands and the owner can still ask for Research. A failure cannot fall back to
+the offer, because the answer's `assistant.completed` was already sent.
+
+The web answer is stored only while the conversation still exists, in one
+transaction that also writes the conversation row. When the owner deleted the
+conversation during the search, the run ends with `assistant.failed` and
+`interrupted`, nothing is stored and no `conversation.updated` follows. A
+completed run's `conversation.updated` carries the title read in that
+transaction.
 
 ## Runs and persistence
 

@@ -8,7 +8,7 @@ use tokio::{io::AsyncReadExt, io::AsyncWriteExt, net::UnixStream};
 
 use crate::{
     claude_worker_protocol::{
-        ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState, MAX_REPLY_BYTES,
+        ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState, WorkerTask, MAX_REPLY_BYTES,
         MAX_REQUEST_BYTES, SOCKET,
     },
     types::{
@@ -21,6 +21,8 @@ use crate::{
 const WORKER_TIMEOUT: Duration = Duration::from_secs(125);
 /// Research runs search the web first; the worker stops them at 300 s.
 const RESEARCH_WORKER_TIMEOUT: Duration = Duration::from_secs(310);
+/// Typed tasks run without tools; the worker stops them at 90 s.
+const TASK_WORKER_TIMEOUT: Duration = Duration::from_secs(100);
 
 pub struct ClaudeCliProvider {
     model_default: String,
@@ -51,6 +53,35 @@ impl ClaudeCliProvider {
             Tier::Default => &self.model_default,
             Tier::Hard => &self.model_hard,
             Tier::Cheap => &self.model_cheap,
+        }
+    }
+
+    /// A typed, fixed-prompt task sent straight to the Claude subscription
+    /// worker. It never goes through the router: a busy worker (refused, never
+    /// queued), a plan limit or an outage is an error for the caller, never a
+    /// fallback to a paid API or another provider.
+    pub async fn meme_task(
+        &self,
+        task: WorkerTask,
+        input: &serde_json::Value,
+    ) -> Result<ChatReply, LlmError> {
+        CLAUDE_WORKER
+            .send(self.task_request(task, input), TASK_WORKER_TIMEOUT)
+            .await
+    }
+
+    fn task_request(&self, task: WorkerTask, input: &serde_json::Value) -> ClaudeWorkerRequest {
+        let model = match task {
+            WorkerTask::MemeDecision => &self.model_default,
+            WorkerTask::MemeStrategyReview => &self.model_hard,
+        };
+        ClaudeWorkerRequest {
+            protocol: 1,
+            model: model.clone(),
+            system: Some(task.system_prompt().to_owned()),
+            prompt: input.to_string(),
+            research: false,
+            task: Some(task),
         }
     }
 }
@@ -101,6 +132,7 @@ impl SubscriptionWorker {
             system: req.system.clone(),
             prompt: build_bounded_prompt(&req.messages),
             research: false,
+            task: None,
         };
         self.send(request, WORKER_TIMEOUT).await
     }
@@ -232,6 +264,7 @@ fn research_worker_request(model: String, req: &ResearchRequest) -> ClaudeWorker
         system: Some(RESEARCH_SYSTEM_PROMPT.to_owned()),
         prompt: req.question().to_owned(),
         research: true,
+        task: None,
     }
 }
 
@@ -320,5 +353,116 @@ mod tests {
             "claude".into(),
         );
         assert!(matches!(unavailable, Err(LlmError::NotConfigured(_))));
+    }
+
+    fn provider() -> ClaudeCliProvider {
+        ClaudeCliProvider::new(
+            "unused",
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-haiku-5",
+        )
+    }
+
+    #[test]
+    fn decisions_use_the_default_model_and_reviews_the_hard_one() {
+        let input = serde_json::json!({"candidates": {"c1": {"liq_usd": 1200.5}}});
+        let decision = provider().task_request(WorkerTask::MemeDecision, &input);
+        assert_eq!(decision.model, "claude-sonnet-5");
+        let review = provider().task_request(WorkerTask::MemeStrategyReview, &input);
+        assert_eq!(review.model, "claude-opus-5");
+        assert!(decision.valid() && review.valid());
+        // A non-object input never leaves Core.
+        let list = provider().task_request(WorkerTask::MemeDecision, &serde_json::json!([1]));
+        assert!(!list.valid());
+    }
+
+    /// A fake worker on a private socket that answers exactly one request
+    /// with `reply` and reports what it received plus whether a second
+    /// connection followed. Never the real worker socket.
+    async fn fake_worker(
+        reply: ClaudeWorkerReply,
+    ) -> (
+        SubscriptionWorker,
+        tokio::task::JoinHandle<(serde_json::Value, bool)>,
+    ) {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "jarvis-task-test-{}-{}.sock",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let socket: &'static str = path.to_str().unwrap().to_owned().leak();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            stream
+                .write_all(&serde_json::to_vec(&reply).unwrap())
+                .await
+                .unwrap();
+            drop(stream);
+            let again = tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_ok();
+            let _ = std::fs::remove_file(&path);
+            (serde_json::from_slice(&bytes).unwrap(), again)
+        });
+        let worker = SubscriptionWorker {
+            socket,
+            backend: "claude-cli",
+            name: "Claude",
+        };
+        (worker, server)
+    }
+
+    #[tokio::test]
+    async fn task_reaches_the_worker_once_with_its_exact_wire_shape() {
+        let reply = ClaudeWorkerReply {
+            text: Some(r#"{"actions":[{"action":"hold"}]}"#.into()),
+            ..ClaudeWorkerReply::failure(ClaudeWorkerState::Completed)
+        };
+        let (worker, server) = fake_worker(reply).await;
+        let input = serde_json::json!({"positions": {"p1": {"pnl_bps": -120}}});
+        let request = provider().task_request(WorkerTask::MemeDecision, &input);
+        let answer = worker.send(request, TASK_WORKER_TIMEOUT).await.unwrap();
+        assert_eq!(answer.text, r#"{"actions":[{"action":"hold"}]}"#);
+        assert_eq!(answer.backend.as_deref(), Some("claude-cli"));
+        let (wire, again) = server.await.unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "protocol": 1,
+                "model": "claude-sonnet-5",
+                "system": WorkerTask::MemeDecision.system_prompt(),
+                "prompt": r#"{"positions":{"p1":{"pnl_bps":-120}}}"#,
+                "task": "meme_decision",
+            })
+        );
+        assert!(!again);
+    }
+
+    #[tokio::test]
+    async fn busy_and_plan_limit_are_errors_without_retry_or_fallback() {
+        // A busy background slot is refused by the worker as a runtime failure.
+        for (state, status) in [
+            (ClaudeWorkerState::RuntimeFailure, 503),
+            (ClaudeWorkerState::PlanLimit, 429),
+        ] {
+            let (worker, server) = fake_worker(ClaudeWorkerReply::failure(state)).await;
+            let request =
+                provider().task_request(WorkerTask::MemeStrategyReview, &serde_json::json!({}));
+            let error = worker.send(request, TASK_WORKER_TIMEOUT).await.unwrap_err();
+            assert!(
+                matches!(error, LlmError::Api { status: got, .. } if got == status),
+                "{error:?}"
+            );
+            let (wire, again) = server.await.unwrap();
+            assert_eq!(wire["task"], "meme_strategy_review");
+            assert_eq!(wire["model"], "claude-opus-5");
+            assert!(!again, "a failed task is never retried");
+        }
     }
 }

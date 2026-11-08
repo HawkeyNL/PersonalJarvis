@@ -40,7 +40,9 @@ A JSON object; unknown fields are refused. Amounts are decimal strings, ratios
 in basis points, durations in seconds (at most 30 days). The repository ships
 no values on purpose.
 
-- `watchlist`: 1–20 distinct base58 mints to observe (no discovery yet).
+- `watchlist`: 1–20 distinct base58 mints to observe.
+- `discovery` (optional, default `true`): also observe mints from pump.fun
+  migrations (below). `false` limits the trader to the watchlist.
 - `goal_multiple`: target multiple of the stake (above 1), for progress only.
 - `stake_usd`, `max_position_usd`, `max_open_positions` (1–10): simulation
   inputs only, never limits for live trading. The stake must cover
@@ -54,17 +56,19 @@ no values on purpose.
 - `costs`: `dex_fee_bps`, `network_fee_usd`, `priority_fee_usd`,
   `failure_rate` (fraction, below 1).
 
-Everything except `watchlist` and `goal_multiple` is recorded with the strategy
-version. Changing any of it without raising `strategy.version` keeps the
-trader off; that includes rewriting `"25"` as `"25.0"`, since decimals keep
-their scale. Reports and the paper gate cover the current version only; open
-positions of an older version are still exited.
+Everything except `watchlist`, `discovery` and `goal_multiple` is recorded
+with the strategy version. Changing any of it without raising
+`strategy.version` keeps the trader off; that includes rewriting `"25"` as
+`"25.0"`, since decimals keep their scale. Reports and the paper gate cover
+the current version only; open positions of an older version are still
+exited.
 
 ## What a tick does
 
 Every 60 s: value held positions and simulate exits (also while paused);
 then, if the stored ledger replays exactly and the trader is not paused,
-observe up to 5 watchlist mints (each at most every 15 minutes, through the
+poll discovery (at most every 2 minutes), observe up to 5 mints (watchlist
+first, then discovered mints; each at most every 15 minutes, through the
 per-provider pacing of `jarvis-market-data`), run the filter and the
 strategy, and simulate entries; finally report from the stored ledger. A
 write failure stops the tick before anything is simulated on it.
@@ -102,6 +106,35 @@ venues such as CLMM or DLMM, LP in a wallet, a Raydium pool authority or a
 third-party locker, unreadable data, the two RPC providers disagreeing) is
 rejected with `lp_not_secured`; time locks are never recognised. The verified
 pool vaults are left out of the top-holder share.
+
+## Discovery
+
+When a pump.fun bonding curve completes, pump.fun migrates it to a PumpSwap
+pool. Every migration writes to the pump.fun migration account
+(`39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg`, the `withdraw_authority` of
+pump.fun's Global account), so discovery polls `getSignaturesForAddress` on
+that account and reads each new transaction with `getTransaction`. A
+transaction counts only if a top-level pump.fun `migrate` or `migrate_v2`
+instruction succeeded and called PumpSwap; a repeated migrate on an already
+migrated curve is ignored. Its mint and pool are kept.
+
+- At most 200 signatures per poll and 25 transactions read per poll; the
+  rest is read on the next poll. A poll is cut off after 15 s.
+- Failed transactions and signatures older than 72 hours are skipped
+  unread, and a transaction that does not parse is skipped. A malformed
+  signature list, a rate limit or a transport error ends the poll, which
+  resumes at the same signature later.
+- At most 2000 mints are kept, each once, for 72 hours after its migration
+  (the oldest is dropped first). A mint is offered as a candidate from
+  30 minutes after its migration on. With 5 observations per tick, shared
+  with the watchlist, a busy day can leave some unobserved.
+- State is in memory only. After a restart discovery starts from the newest
+  200 signatures; nothing is stored until a mint becomes a candidate row.
+
+Discovery reads only the primary RPC provider. A discovered mint is just a
+name to look at: it goes through the same DexScreener pair, cross-checked
+RPC reads and hard filters as a watchlist mint, so a wrong answer can only
+cost a candidate, never let one through.
 
 ## API (owner session, like every `/v1` route)
 

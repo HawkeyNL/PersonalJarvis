@@ -23,21 +23,26 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
 };
 
-/// Parallel runs per worker. At most one of them may be a research run, so a
-/// long web search never takes every slot from ordinary chat.
+/// Parallel runs per worker. At most one of them may be a background run
+/// (research or a typed task), so a long web search or a scheduled task never
+/// takes every slot from ordinary chat.
 pub const MAX_PARALLEL_RUNS: usize = 2;
-pub const MAX_PARALLEL_RESEARCH_RUNS: usize = 1;
-const _: () = assert!(MAX_PARALLEL_RESEARCH_RUNS < MAX_PARALLEL_RUNS);
+pub const MAX_PARALLEL_BACKGROUND_RUNS: usize = 1;
+const _: () = assert!(MAX_PARALLEL_BACKGROUND_RUNS < MAX_PARALLEL_RUNS);
 /// Core writes its whole request at once; a stalled peer loses its slot.
 pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 /// An owner-enabled research run searches the web first.
 const RESEARCH_RUN_TIMEOUT: Duration = Duration::from_secs(300);
+/// A typed task answers one bounded JSON object without tools.
+const TASK_RUN_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How long the official CLI may run.
-pub fn run_timeout(research: bool) -> Duration {
-    if research {
+pub fn run_timeout(request: &ClaudeWorkerRequest) -> Duration {
+    if request.research {
         RESEARCH_RUN_TIMEOUT
+    } else if request.task.is_some() {
+        TASK_RUN_TIMEOUT
     } else {
         RUN_TIMEOUT
     }
@@ -45,17 +50,18 @@ pub fn run_timeout(research: bool) -> Duration {
 
 /// The reply deadline after the request was read: the run's own deadline
 /// (which stops the CLI) always fires first.
-pub fn reply_deadline(research: bool) -> Duration {
-    run_timeout(research) + Duration::from_secs(5)
+pub fn reply_deadline(request: &ClaudeWorkerRequest) -> Duration {
+    run_timeout(request) + Duration::from_secs(5)
 }
 
-/// Ordinary chat needs no extra slot (`Some(None)`). A research run needs the
-/// research slot; `None` means it is taken and the request is refused.
-pub fn research_slot(
-    research: bool,
+/// Ordinary chat needs no extra slot (`Some(None)`). Research and typed tasks
+/// share the one background slot; `None` means it is taken and the request is
+/// refused, never queued.
+pub fn background_slot(
+    request: &ClaudeWorkerRequest,
     slots: &Arc<Semaphore>,
 ) -> Option<Option<OwnedSemaphorePermit>> {
-    if !research {
+    if !request.research && request.task.is_none() {
         return Some(None);
     }
     slots.clone().try_acquire_owned().ok().map(Some)
@@ -161,24 +167,53 @@ pub fn validate_root_binary(path: &str) -> Result<()> {
 #[cfg(test)]
 mod slot_tests {
     use super::*;
+    use jarvis_llm::claude_worker_protocol::WorkerTask;
 
-    #[test]
-    fn research_keeps_the_chat_deadline_short_and_its_own_bounded() {
-        assert_eq!(reply_deadline(false), Duration::from_secs(125));
-        assert_eq!(reply_deadline(true), Duration::from_secs(305));
-        assert!(run_timeout(false) < reply_deadline(false));
-        assert!(run_timeout(true) < reply_deadline(true));
+    fn request(research: bool, task: Option<WorkerTask>) -> ClaudeWorkerRequest {
+        ClaudeWorkerRequest {
+            protocol: 1,
+            model: "m".into(),
+            system: None,
+            prompt: "{}".into(),
+            research,
+            task,
+        }
     }
 
     #[test]
-    fn only_one_research_run_at_a_time_and_chat_never_waits_for_it() {
-        let slots = Arc::new(Semaphore::new(MAX_PARALLEL_RESEARCH_RUNS));
-        let first = research_slot(true, &slots).expect("first research run");
-        assert!(first.is_some());
-        assert!(research_slot(true, &slots).is_none());
-        // Chat is unaffected while research holds its slot.
-        assert!(matches!(research_slot(false, &slots), Some(None)));
-        drop(first);
-        assert!(research_slot(true, &slots).is_some());
+    fn background_runs_keep_the_chat_deadline_short_and_their_own_bounded() {
+        let chat = request(false, None);
+        let research = request(true, None);
+        let task = request(false, Some(WorkerTask::MemeDecision));
+        assert_eq!(reply_deadline(&chat), Duration::from_secs(125));
+        assert_eq!(reply_deadline(&research), Duration::from_secs(305));
+        assert_eq!(run_timeout(&task), Duration::from_secs(90));
+        assert_eq!(reply_deadline(&task), Duration::from_secs(95));
+        for request in [chat, research, task] {
+            assert!(run_timeout(&request) < reply_deadline(&request));
+        }
+    }
+
+    #[test]
+    fn research_and_tasks_share_one_background_slot_and_chat_never_waits() {
+        let chat = request(false, None);
+        let research = request(true, None);
+        let decision = request(false, Some(WorkerTask::MemeDecision));
+        let review = request(false, Some(WorkerTask::MemeStrategyReview));
+        for (first, second) in [
+            (&research, &decision),
+            (&decision, &research),
+            (&decision, &review),
+            (&research, &research),
+        ] {
+            let slots = Arc::new(Semaphore::new(MAX_PARALLEL_BACKGROUND_RUNS));
+            let held = background_slot(first, &slots).expect("first background run");
+            assert!(held.is_some());
+            assert!(background_slot(second, &slots).is_none());
+            // Chat is unaffected while a background run holds the slot.
+            assert!(matches!(background_slot(&chat, &slots), Some(None)));
+            drop(held);
+            assert!(background_slot(second, &slots).is_some());
+        }
     }
 }

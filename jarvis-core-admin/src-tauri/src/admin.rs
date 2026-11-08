@@ -219,13 +219,15 @@ impl PaidApi {
     }
 }
 
-/// Owner opt-in for provider-hosted web search in explicit Research requests.
+/// Owner opt-in for provider-hosted web search: `on` for explicit Research
+/// requests, `auto` also after an answer the classifier marks as research.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResearchWebSearch {
     #[default]
     Off,
     On,
+    Auto,
 }
 
 impl ResearchWebSearch {
@@ -233,6 +235,7 @@ impl ResearchWebSearch {
         match self {
             Self::Off => "off",
             Self::On => "on",
+            Self::Auto => "auto",
         }
     }
 }
@@ -2882,6 +2885,10 @@ mod tests {
             route_arguments(r#"{"action":"research_web_search","state":"off"}"#).unwrap(),
             ["models", "route", "research-web-search", "off"]
         );
+        assert_eq!(
+            route_arguments(r#"{"action":"research_web_search","state":"auto"}"#).unwrap(),
+            ["models", "route", "research-web-search", "auto"]
+        );
     }
 
     #[test]
@@ -2909,6 +2916,7 @@ mod tests {
             r#"{"action":"set","tier":"cheap","chain":[{"provider":"ollama","model":"a"}]}"#.to_owned(),
             r#"{"action":"paid_api","state":"maybe"}"#.to_owned(),
             r#"{"action":"research_web_search","state":"live"}"#.to_owned(),
+            r#"{"action":"research_web_search","state":"AUTO"}"#.to_owned(),
             r#"{"action":"research_web_search"}"#.to_owned(),
             r#"{"action":"reset","tier":"hard","shell":"id"}"#.to_owned(),
             r#"{"action":"enable","tier":"hard"}"#.to_owned(),
@@ -2938,6 +2946,14 @@ mod tests {
         assert_eq!(
             research.routing.unwrap().research_web_search,
             ResearchWebSearch::On
+        );
+        let auto: RoutingReport = serde_json::from_str(
+            r#"{"routing":{"version":1,"paid_api":"allowed","tiers":{},"research_web_search":"auto"},"routing_unavailable_reason":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            auto.routing.unwrap().research_web_search,
+            ResearchWebSearch::Auto
         );
         assert_eq!(
             routing.tiers[&RouteTier::Cheap].chain[0].provider,

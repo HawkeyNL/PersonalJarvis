@@ -12,8 +12,8 @@ use jarvis_llm::claude_worker_protocol::{
 };
 use serde::Deserialize;
 use subscription_worker::{
-    authorized_peer, inherited_listener, named_uid, read_request, reply_deadline, research_slot,
-    run_timeout, send, validate_private_dir, validate_root_binary, MAX_PARALLEL_RESEARCH_RUNS,
+    authorized_peer, background_slot, inherited_listener, named_uid, read_request, reply_deadline,
+    run_timeout, send, validate_private_dir, validate_root_binary, MAX_PARALLEL_BACKGROUND_RUNS,
     MAX_PARALLEL_RUNS, REQUEST_READ_TIMEOUT,
 };
 use tokio::{
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
     validate_private_dir(RUNTIME, worker_uid)?;
     let listener = inherited_listener()?;
     let permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_RUNS));
-    let research_permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_RESEARCH_RUNS));
+    let background_permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_BACKGROUND_RUNS));
     loop {
         let (mut stream, _) = listener.accept().await?;
         if !authorized_peer(&stream, core_uid) {
@@ -77,23 +77,23 @@ async fn main() -> Result<()> {
             .await;
             continue;
         };
-        let research_permits = research_permits.clone();
+        let background_permits = background_permits.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let failure = |stage| failed(ClaudeWorkerState::RuntimeFailure, stage);
             let reply =
                 match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request(&mut stream)).await {
-                    Ok(Ok(request)) => match research_slot(request.research, &research_permits) {
-                        Some(_research_permit) => {
-                            let deadline = reply_deadline(request.research);
+                    Ok(Ok(request)) => match background_slot(&request, &background_permits) {
+                        Some(_background_permit) => {
+                            let deadline = reply_deadline(&request);
                             match tokio::time::timeout(deadline, handle(request)).await {
                                 Ok(Ok(reply)) => reply,
                                 Ok(Err(_)) => failure("run I/O error"),
                                 Err(_) => failure("reply deadline"),
                             }
                         }
-                        // The one research slot is busy: refuse, never queue.
-                        None => failure("research slot busy"),
+                        // The one background slot is busy: refuse, never queue.
+                        None => failure("background slot busy"),
                     },
                     _ => failure("invalid request"),
                 };
@@ -195,8 +195,7 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
     }
     let mut command = clean_command();
     command.args(cli_args(
-        &request.model,
-        request.research,
+        &request,
         system_file.as_ref().map(|file| file.path()),
     ));
     command
@@ -214,7 +213,7 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
     drop(stdin);
     let stdout = child.stdout.take().context("Claude stdout unavailable")?;
     let mut bytes = Vec::new();
-    let Ok(output) = tokio::time::timeout(run_timeout(request.research), async {
+    let Ok(output) = tokio::time::timeout(run_timeout(&request), async {
         stdout
             .take((MAX_REPLY_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
@@ -247,15 +246,17 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
 /// Only an owner-enabled research run gets exactly one tool: `WebSearch`,
 /// which runs on Anthropic's side and returns titles and URLs. `WebFetch` (a
 /// host-side fetch) stays unavailable: `--restricted` removes it unless
-/// `--tools` names it, and `--tools` names only WebSearch.
-fn cli_args(model: &str, research: bool, system_prompt: Option<&Path>) -> Vec<OsString> {
+/// `--tools` names it, and `--tools` names only WebSearch. A typed task never
+/// searches (its request cannot be a research run), so it runs with no tool.
+fn cli_args(request: &ClaudeWorkerRequest, system_prompt: Option<&Path>) -> Vec<OsString> {
+    let research = request.research;
     let tools = if research { "WebSearch" } else { "" };
     let mut args: Vec<OsString> = [
         "-p",
         "--output-format",
         "json",
         "--model",
-        model,
+        &request.model,
         "--restricted",
         "--strict-mcp-config",
         "--no-session-persistence",
@@ -352,6 +353,7 @@ fn clean_command() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jarvis_llm::claude_worker_protocol::WorkerTask;
 
     #[test]
     fn api_auth_and_unknown_status_never_count_as_subscription() {
@@ -398,8 +400,23 @@ mod tests {
         assert_eq!(command.as_std().get_current_dir(), Some(Path::new(RUNTIME)));
     }
 
+    fn request(research: bool, task: Option<WorkerTask>) -> ClaudeWorkerRequest {
+        ClaudeWorkerRequest {
+            protocol: 1,
+            model: "claude-opus-5".into(),
+            system: None,
+            prompt: "{}".into(),
+            research,
+            task,
+        }
+    }
+
     fn argv(research: bool, system_prompt: Option<&Path>) -> String {
-        cli_args("claude-opus-5", research, system_prompt)
+        task_argv(&request(research, None), system_prompt)
+    }
+
+    fn task_argv(request: &ClaudeWorkerRequest, system_prompt: Option<&Path>) -> String {
+        cli_args(request, system_prompt)
             .iter()
             .map(|arg| arg.to_str().unwrap())
             .collect::<Vec<_>>()
@@ -415,7 +432,7 @@ mod tests {
              --no-session-persistence --tools  --disallowedTools mcp__* \
              --disable-slash-commands --system-prompt-file /run/jarvis-claude/.tmpX"
         );
-        assert_eq!(cli_args("m", false, None)[9], OsString::from(""));
+        assert_eq!(cli_args(&request(false, None), None)[9], OsString::from(""));
         assert_eq!(
             argv(true, Some(prompt)),
             "-p --output-format json --model claude-opus-5 --restricted --strict-mcp-config \
@@ -435,6 +452,28 @@ mod tests {
                 "--mcp-config",
             ] {
                 assert!(!args.contains(forbidden), "{forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn task_runs_use_the_reviewed_tool_free_invocation_and_the_requested_model() {
+        let prompt = Path::new("/run/jarvis-claude/.tmpX");
+        for task in [WorkerTask::MemeDecision, WorkerTask::MemeStrategyReview] {
+            let mut request = request(false, Some(task));
+            request.model = "claude-sonnet-5".into();
+            let args = cli_args(&request, Some(prompt));
+            assert_eq!(args[9], OsString::from(""));
+            assert_eq!(
+                task_argv(&request, Some(prompt)),
+                "-p --output-format json --model claude-sonnet-5 --restricted \
+                 --strict-mcp-config --no-session-persistence --tools  \
+                 --disallowedTools mcp__* --disable-slash-commands \
+                 --system-prompt-file /run/jarvis-claude/.tmpX"
+            );
+            let joined = task_argv(&request, None);
+            for forbidden in ["WebSearch", "WebFetch", "--allowedTools", "--max-turns"] {
+                assert!(!joined.contains(forbidden), "{forbidden}");
             }
         }
     }

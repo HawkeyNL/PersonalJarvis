@@ -44,7 +44,7 @@ impl VoiceGate {
                 self.buffer.stop();
                 vec![SpeechAction::Stop]
             }
-            Event::AssistantStarted(run)
+            Event::AssistantStarted { run, .. }
                 if self.enabled
                     && self.owner == Some(self.device)
                     && self.owner_run == Some(run.run_id) =>
@@ -256,7 +256,10 @@ mod tests {
             device_id: Some(Uuid::nil()),
             run_id: Some(run.run_id),
         });
-        gate.event(&Event::AssistantStarted(run.clone()));
+        gate.event(&Event::AssistantStarted {
+            run: run.clone(),
+            web_search: false,
+        });
         gate
     }
 

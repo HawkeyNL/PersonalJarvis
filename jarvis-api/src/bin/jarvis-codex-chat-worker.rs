@@ -17,8 +17,8 @@ use jarvis_llm::{
     },
 };
 use subscription_worker::{
-    authorized_peer, inherited_listener, named_uid, read_request, reply_deadline, research_slot,
-    run_timeout, send, validate_private_dir, validate_root_binary, MAX_PARALLEL_RESEARCH_RUNS,
+    authorized_peer, background_slot, inherited_listener, named_uid, read_request, reply_deadline,
+    run_timeout, send, validate_private_dir, validate_root_binary, MAX_PARALLEL_BACKGROUND_RUNS,
     MAX_PARALLEL_RUNS, REQUEST_READ_TIMEOUT,
 };
 use tokio::{
@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
     validate_private_dir(RUNTIME, worker_uid)?;
     let listener = inherited_listener()?;
     let permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_RUNS));
-    let research_permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_RESEARCH_RUNS));
+    let research_permits = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_BACKGROUND_RUNS));
     // Under PrivatePIDs this process is PID 1 of its namespace, which ignores
     // SIGTERM without a handler; stop promptly when systemd asks.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -93,11 +93,14 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let _permit = permit;
             let failure = || ClaudeWorkerReply::failure(ClaudeWorkerState::RuntimeFailure);
-            let reply =
-                match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request(&mut stream)).await {
-                    Ok(Ok(request)) => match research_slot(request.research, &research_permits) {
+            let reply = match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request(&mut stream))
+                .await
+            {
+                // Typed tasks are Claude-only; this worker refuses them.
+                Ok(Ok(request)) if request.task.is_none() => {
+                    match background_slot(&request, &research_permits) {
                         Some(_research_permit) => {
-                            let deadline = reply_deadline(request.research);
+                            let deadline = reply_deadline(&request);
                             match tokio::time::timeout(deadline, handle(request, reviewed)).await {
                                 Ok(Ok(reply)) => reply,
                                 _ => failure(),
@@ -105,9 +108,10 @@ async fn main() -> Result<()> {
                         }
                         // The one research slot is busy: refuse, never queue.
                         None => failure(),
-                    },
-                    _ => failure(),
-                };
+                    }
+                }
+                _ => failure(),
+            };
             let _ = send(&mut stream, reply).await;
         });
     }
@@ -131,7 +135,7 @@ async fn handle(request: ClaudeWorkerRequest, reviewed: &str) -> Result<ClaudeWo
             ClaudeWorkerState::SubscriptionUnavailable,
         ));
     }
-    let limit = run_timeout(request.research).saturating_sub(started.elapsed());
+    let limit = run_timeout(&request).saturating_sub(started.elapsed());
     run_official_client(request, limit).await
 }
 
