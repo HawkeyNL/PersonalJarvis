@@ -13,6 +13,7 @@ mod chat_context;
 pub(crate) mod coding;
 pub(crate) mod meme;
 pub(crate) mod portfolio;
+pub(crate) mod roadmaps;
 pub(crate) mod runs;
 mod runtime_facts;
 pub(crate) mod services;

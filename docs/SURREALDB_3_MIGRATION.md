@@ -105,6 +105,11 @@ Line numbers come from `76668a7`.
     their behaviour on 3.x is **unverified** and the drill must cover them.
   - Since `0017_memecoin_strategies.surql`: a byte bound in an `ASSERT`
     (`bytes::len(<bytes>$value)`), also tested on 2.6.5 only.
+  - Since `0018_roadmaps.surql`: `ASSERT`s on array elements (`phases.*`,
+    `depends_on.*`, `ops.*`), `array::distinct`, `ALLINSIDE` and
+    `string::starts_with` in `ASSERT`s; the roadmap store also runs `FOR`
+    loops with `CREATE`/`UPDATE` and `THROW` inside one transaction. Tested
+    on 2.6.5 only.
 - **`id` fields:** 19 tables declare `DEFINE FIELD id ON <t> TYPE string`.
   - Records are created as `CREATE <t> SET id = $id, …` with a string UUID.
   - Lookups use `WHERE record::id(id) = $id`.
@@ -439,7 +444,7 @@ tagged otherwise.
    - Compare names and kinds after normalising the output; the format
      differs between majors [unverified].
    - `schema_version:baseline.version` must equal the current version
-     (17 since `0017_memecoin_strategies.surql`).
+     (18 since `0018_roadmaps.surql`).
 3. **Content checksums per table:**
    - Run `SELECT * FROM <t> ORDER BY id` on both sides with `--json`.
    - Normalise with jq: sort keys, canonical datetimes in UTC RFC 3339,

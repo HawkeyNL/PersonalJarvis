@@ -1721,3 +1721,186 @@ async fn trading_routes_serve_the_synced_portfolio_read_only(
     }
     Ok(())
 }
+
+const ROADMAP_ROUTES: [(&str, &str); 12] = [
+    ("GET", "/v1/roadmaps"),
+    ("POST", "/v1/roadmaps"),
+    ("GET", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"),
+    ("PATCH", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b?expected_revision=1"),
+    ("DELETE", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b?expected_revision=1"),
+    ("POST", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/items?expected_revision=1"),
+    ("PATCH", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/items/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c?expected_revision=1"),
+    ("DELETE", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/items/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c?expected_revision=1"),
+    ("GET", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/history?limit=5"),
+    ("GET", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/proposals"),
+    ("POST", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/proposals/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c/accept"),
+    ("POST", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/proposals/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c/reject"),
+];
+
+#[tokio::test]
+async fn roadmap_routes_refuse_missing_or_invalid_sessions() {
+    // An unconnected database cannot authenticate any token.
+    let app = build_router(state(jarvis_store::Database::init(), None).await);
+    for (method, path) in ROADMAP_ROUTES {
+        for authorization in [None, Some("Bearer not-a-session")] {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(value) = authorization {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(r#"{"title":"x"}"#)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn roadmap_routes_validate_and_guard_revisions() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db, None).await);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let call = |method: &str, path: &str, body: Option<String>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if body.is_some() {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        app.clone().oneshot(
+            request
+                .body(body.map_or_else(Body::empty, Body::from))
+                .unwrap(),
+        )
+    };
+
+    let created = call(
+        "POST",
+        "/v1/roadmaps",
+        Some(json!({"title": "Plan", "phases": ["Now"]}).to_string()),
+    )
+    .await?;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = json_body(created).await;
+    let id = created["roadmap"]["id"].as_str().ok_or("id")?.to_owned();
+    assert_eq!(created["roadmap"]["revision"], 1);
+    let base = format!("/v1/roadmaps/{id}");
+
+    let item = call(
+        "POST",
+        &format!("{base}/items?expected_revision=1"),
+        Some(json!({"title": "A", "phase": "Now", "links": [{"kind": "url", "url": "https://example.com"}]}).to_string()),
+    )
+    .await?;
+    assert_eq!(item.status(), StatusCode::OK);
+    let item = json_body(item).await;
+    assert_eq!(item["roadmap"]["revision"], 2);
+    assert_eq!(item["items"][0]["status"], "planned");
+    let item_id = item["item_id"].as_str().ok_or("item_id")?.to_owned();
+
+    let patch = |revision: u64, body: Value| {
+        call(
+            "PATCH",
+            &format!("{base}/items/{item_id}?expected_revision={revision}"),
+            Some(body.to_string()),
+        )
+    };
+    assert_eq!(
+        patch(1, json!({"status": "ready"})).await?.status(),
+        StatusCode::CONFLICT
+    );
+    for bad in [
+        json!({"status": "done"}),
+        json!({"auto_status": "live"}),
+        json!({"links": [{"kind": "url", "url": "http://example.com"}]}),
+        json!({"links": [{"kind": "pr", "repo": "not a repo", "number": 1}]}),
+        json!({"phase": "Later"}),
+        json!({"title": ""}),
+    ] {
+        let status = patch(2, bad.clone()).await?.status();
+        assert!(status.is_client_error(), "{bad} {status}");
+    }
+    let missing_revision = call(
+        "PATCH",
+        &format!("{base}/items/{item_id}"),
+        Some(json!({"status": "ready"}).to_string()),
+    )
+    .await?;
+    assert_eq!(missing_revision.status(), StatusCode::BAD_REQUEST);
+    let too_large = patch(2, json!({"notes": "n".repeat(70 * 1024)})).await?;
+    assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let moved = patch(2, json!({"status": "in_progress"})).await?;
+    assert_eq!(moved.status(), StatusCode::OK);
+    assert_eq!(json_body(moved).await["roadmap"]["revision"], 3);
+
+    let history = json_body(call("GET", &format!("{base}/history"), None).await?).await;
+    let changes = history["changes"].as_array().ok_or("changes")?;
+    assert_eq!(changes.len(), 3);
+    assert_eq!(changes[0]["from_status"], "planned");
+    assert_eq!(changes[0]["to_status"], "in_progress");
+    assert_eq!(changes[0]["author"], "owner");
+    for bad in ["limit=0", "limit=101", "limit=x"] {
+        let response = call("GET", &format!("{base}/history?{bad}"), None).await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let proposals = json_body(call("GET", &format!("{base}/proposals"), None).await?).await;
+    assert_eq!(proposals["proposals"], json!([]));
+    let unknown = uuid::Uuid::now_v7();
+    for action in ["accept", "reject"] {
+        let response = call(
+            "POST",
+            &format!("{base}/proposals/{unknown}/{action}"),
+            None,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{action}");
+    }
+    assert_eq!(
+        call("GET", &format!("/v1/roadmaps/{unknown}"), None)
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call("GET", "/v1/roadmaps/not-a-uuid", None).await?.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // DELETE archives: still readable, no longer listed or writable.
+    let archived = call("DELETE", &format!("{base}?expected_revision=3"), None).await?;
+    assert_eq!(archived.status(), StatusCode::OK);
+    assert!(json_body(archived).await["roadmap"]["archived_at"].is_string());
+    let listed = json_body(call("GET", "/v1/roadmaps", None).await?).await;
+    assert_eq!(listed["roadmaps"], json!([]));
+    let listed = json_body(call("GET", "/v1/roadmaps?archived=true", None).await?).await;
+    assert_eq!(listed["roadmaps"][0]["id"], id.as_str());
+    assert_eq!(
+        patch(4, json!({"status": "ready"})).await?.status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(call("GET", &base, None).await?.status(), StatusCode::OK);
+    Ok(())
+}

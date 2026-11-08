@@ -171,7 +171,8 @@ pub async fn prune_security_audit(db: &jarvis_store::Database) -> Result<usize, 
 /// Hourly audit housekeeping: report dropped unauthenticated events even when
 /// no new one arrives, then apply retention to audit rows, to the expired
 /// login challenges and pairing requests that anonymous callers can create,
-/// and to the paper trader's candidate decisions and gate snapshots.
+/// to the paper trader's candidate decisions and gate snapshots, and to
+/// roadmap history and decided or expired roadmap proposals.
 pub async fn run_audit_maintenance(state: &AppState) {
     flush_dropped_audit(state).await;
     match tokio::time::timeout(
@@ -206,6 +207,17 @@ pub async fn run_audit_maintenance(state: &AppState) {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => tracing::warn!(%error, "memecoin paper retention failed"),
         Err(_) => tracing::warn!("memecoin paper retention timed out"),
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        crate::roadmaps::store::prune(&state.db),
+    )
+    .await
+    {
+        Ok(Ok(deleted)) if deleted > 0 => tracing::info!(deleted, "roadmap history retention"),
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "roadmap history retention failed"),
+        Err(_) => tracing::warn!("roadmap history retention timed out"),
     }
 }
 
