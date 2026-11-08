@@ -30,6 +30,9 @@ const MAX_SECS: u64 = 30 * 24 * 60 * 60;
 #[serde(deny_unknown_fields)]
 struct ProfileFile {
     watchlist: Vec<String>,
+    /// Also observe mints from pump.fun migrations (on unless set false).
+    #[serde(default = "on")]
+    discovery: bool,
     goal_multiple: Decimal,
     stake_usd: Decimal,
     max_position_usd: Decimal,
@@ -37,6 +40,10 @@ struct ProfileFile {
     filter: FilterFile,
     strategy: StrategyFile,
     costs: CostFile,
+}
+
+fn on() -> bool {
+    true
 }
 
 /// Everything that decides results. It is recorded per strategy version, so
@@ -128,6 +135,8 @@ struct CostFile {
 #[derive(Debug, Clone)]
 pub struct PaperProfile {
     pub watchlist: Vec<String>,
+    /// Candidates from pump.fun migrations next to the watchlist.
+    pub discovery: bool,
     pub goal_multiple: Decimal,
     pub stake_usd: Decimal,
     pub max_position_usd: Decimal,
@@ -250,6 +259,7 @@ impl PaperProfile {
         .map_err(|error| format!("paper profile cannot be recorded: {error}"))?;
         Ok(Self {
             watchlist: file.watchlist,
+            discovery: file.discovery,
             goal_multiple: file.goal_multiple,
             stake_usd: file.stake_usd,
             max_position_usd: file.max_position_usd,
@@ -345,10 +355,14 @@ pub(crate) mod tests {
         let profile = fixture();
         assert_eq!(profile.strategy.version, 3);
         assert_eq!(profile.rules.max_snapshot_age, Duration::minutes(1));
-        // Formatting and the watchlist do not change the recorded version.
+        assert!(profile.discovery, "discovery is on by default");
+        // Formatting and the candidate sources do not change the recorded
+        // version.
         let mut other = fixture_json();
         other["watchlist"] = serde_json::json!([MINT_B]);
+        other["discovery"] = false.into();
         let reparsed = PaperProfile::parse(&serde_json::to_string_pretty(&other).unwrap()).unwrap();
+        assert!(!reparsed.discovery);
         assert_eq!(reparsed.versioned_params, profile.versioned_params);
         let mut changed = fixture_json();
         changed["costs"]["dex_fee_bps"] = 30.into();
