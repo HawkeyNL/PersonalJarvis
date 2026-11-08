@@ -1956,7 +1956,7 @@ async fn memecoin_strategies_disable_at_once_and_enable_only_with_a_fresh_signat
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(disables, ["disabled", "disabled"]);
+    assert_eq!(disables, ["disabled", "not_found", "disabled"]);
 
     // Decisions are listed within bounds.
     let decisions = json_body(call("GET", "/v1/trading/meme/decisions".into(), None).await?).await;
