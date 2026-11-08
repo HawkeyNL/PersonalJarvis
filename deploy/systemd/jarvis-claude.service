@@ -32,6 +32,13 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectProc=invisible
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Internet only: no loopback services (Core, Ollama), LAN, link-local,
+# CGNAT/Tailscale or ULA ranges. Core reaches the worker over the inherited
+# Unix socket, which these rules do not affect. 127.0.0.53 is the
+# systemd-resolved stub that /etc/resolv.conf points to on the Home Node; a
+# host without it needs its resolver address here instead.
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.0.0.53
 InaccessiblePaths=/etc/jarvis /var/lib/jarvis /var/lib/jarvis-codex
 TasksMax=64
 MemoryMax=2G
