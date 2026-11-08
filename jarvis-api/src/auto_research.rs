@@ -18,12 +18,12 @@ const PER_DAY: usize = 40;
 const HOUR: Duration = Duration::from_secs(60 * 60);
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const HOLDINGS_TIMEOUT: Duration = Duration::from_secs(2);
-/// How many words after "my"/"mijn" still count as near.
+/// How many words after a possessive still count as near.
 const POSSESSIVE_REACH: usize = 3;
 /// With the typographic apostrophe phone keyboards insert, too.
-const POSSESSIVES: [&str; 4] = ["my", "mijn", "m'n", "m’n"];
+const POSSESSIVES: [&str; 7] = ["my", "our", "mijn", "m'n", "m’n", "ons", "onze"];
 /// Prefixes, so plurals and compounds match too ("posities", "brokerage").
-const PERSONAL_WORDS: [&str; 12] = [
+const PERSONAL_WORDS: [&str; 29] = [
     "portfolio",
     "positie",
     "position",
@@ -36,7 +36,31 @@ const PERSONAL_WORDS: [&str; 12] = [
     "salary",
     "wachtwoord",
     "password",
+    "aandeel",
+    "aandelen",
+    "belegging",
+    "hypotheek",
+    "pensioen",
+    "saldo",
+    "spaar",
+    "schuld",
+    "share",
+    "stock",
+    "invest",
+    "mortgage",
+    "pension",
+    "balance",
+    "debt",
+    "loan",
+    "lening",
 ];
+/// Currency words that make a number an amount (whole words, any case).
+const CURRENCY_WORDS: [&str; 7] = ["eur", "euro", "euros", "usd", "dollar", "dollars", "gbp"];
+/// A contiguous digit run this long is private (phone, account numbers).
+const MIN_DIGIT_RUN: usize = 6;
+/// Digits split by single separators (`4111 1111`, `06-1234`) are private
+/// from this many digits on, or from [`MIN_DIGIT_RUN`] groups on (`1 2 3 4 5 6`).
+const MIN_SEPARATED_DIGITS: usize = 8;
 const KEY_PREFIXES: [&str; 3] = ["sk-", "ghp_", "AKIA"];
 const MIN_KEY_RUN: usize = 24;
 
@@ -125,14 +149,22 @@ async fn held_symbols(state: &AppState) -> Option<Vec<String>> {
     if state.ibkr.is_none() {
         return Some(Vec::new());
     }
-    match tokio::time::timeout(
+    let read = tokio::time::timeout(
         HOLDINGS_TIMEOUT,
         crate::ibkr::store::load_portfolio(&state.db),
     )
-    .await
-    {
-        Ok(Ok(None)) => Some(Vec::new()),
-        Ok(Ok(Some(portfolio))) if portfolio.skipped.len() >= portfolio.skipped_count => Some(
+    .await;
+    every_held_symbol(read.ok().and_then(Result::ok))
+}
+
+/// `snapshot` is `None` when the read failed or timed out, `Some(None)`
+/// before the first sync.
+fn every_held_symbol(
+    snapshot: Option<Option<crate::ibkr::store::Portfolio>>,
+) -> Option<Vec<String>> {
+    match snapshot? {
+        None => Some(Vec::new()),
+        Some(portfolio) if portfolio.skipped.len() >= portfolio.skipped_count => Some(
             portfolio
                 .positions
                 .into_iter()
@@ -140,13 +172,14 @@ async fn held_symbols(state: &AppState) -> Option<Vec<String>> {
                 .chain(portfolio.skipped.into_iter().map(|skipped| skipped.symbol))
                 .collect(),
         ),
-        _ => None,
+        Some(_) => None,
     }
 }
 
 /// Whether the question may carry personal or financial details and must
-/// stay an offer: an email address, 6+ consecutive digits, a currency amount,
-/// a key-like token, "my"/"mijn" near an account word, or a held symbol.
+/// stay an offer: an email address, a long number, a currency amount, a
+/// key-like token, a possessive near a money or account word, or a held
+/// symbol.
 pub(crate) fn is_private(question: &str, held_symbols: &[String]) -> bool {
     let lower = question.to_lowercase();
     has_email(question)
@@ -170,14 +203,34 @@ fn has_email(text: &str) -> bool {
     })
 }
 
+/// 6+ contiguous digits, or digit groups joined by single ` `, `-`, `.` or
+/// `/` with 8+ digits or 6+ groups in total (IBAN, card and phone numbers).
 fn has_digit_run(text: &str) -> bool {
-    runs(text, |c| c.is_ascii_digit()).any(|run| run.len() >= 6)
+    let (mut total, mut groups, mut group, mut after_separator) = (0, 0, 0, false);
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            groups += usize::from(group == 0);
+            group += 1;
+            total += 1;
+            after_separator = false;
+            if group >= MIN_DIGIT_RUN || total >= MIN_SEPARATED_DIGITS || groups >= MIN_DIGIT_RUN {
+                return true;
+            }
+        } else if group > 0 && !after_separator && matches!(c, ' ' | '-' | '.' | '/') {
+            after_separator = true;
+            group = 0;
+        } else {
+            (total, groups, group, after_separator) = (0, 0, 0, false);
+        }
+    }
+    false
 }
 
-/// A currency sign or code with a number anywhere in the question, or a
+/// A currency sign or word with a number anywhere in the question, or a
 /// number with a `k` suffix ("80k").
 fn has_amount(lower: &str) -> bool {
-    let currency = lower.contains(['€', '$']) || has_word(lower, "eur") || has_word(lower, "usd");
+    let currency =
+        lower.contains(['€', '$', '£']) || CURRENCY_WORDS.iter().any(|word| has_word(lower, word));
     (currency && lower.contains(|c: char| c.is_ascii_digit()))
         || runs(lower, char::is_alphanumeric).any(|word| {
             word.strip_suffix('k').is_some_and(|digits| {
@@ -282,12 +335,68 @@ mod tests {
             ("nieuws over asml?", true),
             ("koers brk.b", true),
             ("ASMLX nieuws", false),
+            ("Rust 1.82.0 release notes", false),
+            ("top 10 films van 2024", false),
+            ("hoe laat is het in Tokyo om 9 uur?", false),
+            ("waarom is ons land zo nat?", false),
+            ("NL91 ABNA 0417 1643 00", true),
+            ("is 4111 1111 1111 1111 een testkaart?", true),
+            ("bel 06 1234 5678", true),
+            ("bel +31 6 12 34 56 78", true),
+            ("06-1234-5678 nummer van wie?", true),
+            ("1 2 3 4 5 6", true),
+            ("is 2500 euro per maand veel?", true),
+            ("100 dollars to yen", true),
+            ("is £300 a lot?", true),
+            ("300 GBP in EUR", true),
+            ("hoe staat mijn aandelen pakket?", true),
+            ("onze hypotheek rente", true),
+            ("is our mortgage too high", true),
+            ("my pension fund returns", true),
+            ("my stocks today", true),
         ] {
             assert_eq!(is_private(question, &held), private, "{question}");
         }
         // Without holdings a symbol is just a word.
         assert!(!is_private("ASML nieuws vandaag", &[]));
         assert!(!is_private("blank symbol", &[" ".to_owned()]));
+    }
+
+    #[test]
+    fn holdings_fail_closed_unless_every_held_symbol_is_known() {
+        use crate::ibkr::store::{Holding, Portfolio, Skipped};
+        let portfolio = |skipped_count| Portfolio {
+            as_of: time::OffsetDateTime::UNIX_EPOCH,
+            net_liquidation: Default::default(),
+            cash: Default::default(),
+            positions: vec![Holding {
+                conid: 1,
+                symbol: "ASML".into(),
+                name: None,
+                asset_class: "STK".into(),
+                currency: "EUR".into(),
+                quantity: Default::default(),
+                avg_cost: Default::default(),
+                last_price: Default::default(),
+                market_value: Default::default(),
+                unrealized_pnl: None,
+            }],
+            skipped: vec![Skipped {
+                symbol: "AAPL".into(),
+                currency: Some("USD".into()),
+            }],
+            skipped_count,
+        };
+        // Read error or timeout.
+        assert_eq!(every_held_symbol(None), None);
+        // Linked, never synced: nothing is held yet.
+        assert_eq!(every_held_symbol(Some(None)), Some(Vec::new()));
+        assert_eq!(
+            every_held_symbol(Some(Some(portfolio(1)))),
+            Some(vec!["ASML".to_owned(), "AAPL".to_owned()])
+        );
+        // More skipped positions than the snapshot names.
+        assert_eq!(every_held_symbol(Some(Some(portfolio(2)))), None);
     }
 
     #[test]

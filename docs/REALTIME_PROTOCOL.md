@@ -89,6 +89,13 @@ task run, or no subscription answered), Core publishes `assistant.failed` with
 stands and the owner can still ask for Research. A failure cannot fall back to
 the offer, because the answer's `assistant.completed` was already sent.
 
+The web answer is stored only while the conversation still exists, in one
+transaction that also writes the conversation row. When the owner deleted the
+conversation during the search, the run ends with `assistant.failed` and
+`interrupted`, nothing is stored and no `conversation.updated` follows. A
+completed run's `conversation.updated` carries the title read in that
+transaction.
+
 ## Runs and persistence
 
 New clients POST `/v1/assistant/runs` with `request_id` (UUID), `messages`, and

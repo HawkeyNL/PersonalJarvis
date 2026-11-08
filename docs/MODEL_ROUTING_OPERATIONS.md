@@ -254,8 +254,10 @@ default; an unusable routing file keeps it off. Set it with
 `sudo jarvis models route research-web-search off|on|auto`, in the Core Admin
 model routing card or with a signed app change. Like every routing
 change it restarts Core. Off -> on, off -> auto and on -> auto loosen the
-switch: clients confirm them first (`ResearchWebSearch` in
-`jarvis-client-core` is ordered strictest first). Every routing change,
+switch, and clients confirm them first: native clients through
+`ResearchWebSearch` in `jarvis-client-core` (ordered strictest first), Core
+Admin through its own `RESEARCH_ORDER` in
+`jarvis-core-admin/src/components/models/routing.ts`. Every routing change,
 tighter or looser, needs the signed approval or the local root CLI.
 
 When it is on, only a request with the explicit mode `research` searches. A
@@ -320,20 +322,30 @@ question and the fixed instruction), stores the answer as `web:<model>`,
 records usage with `routing_mode` `research_auto`, and adds no user message.
 How clients see it is in [REALTIME_PROTOCOL.md](REALTIME_PROTOCOL.md#automatic-web-search),
 including the busy case: when the subscription worker's background slot is
-taken, the run fails and nothing is stored.
+taken, the run fails and nothing is stored. The web answer is written only
+while the conversation still exists, in one transaction with the
+conversation row; when the owner deleted it during the search, the run fails
+and nothing is stored.
 
 **Privacy gate.** A deterministic check keeps the question on the offer button
 when it contains:
 
 - an email address;
-- 6 or more consecutive digits (phone, account or IBAN numbers);
-- a currency amount: `€`, `$`, `EUR` or `USD` with a number in the question,
-  or a number with a `k` suffix (`80k`);
+- a long number: 6 or more contiguous digits, or digit groups joined by
+  single spaces, `-`, `.` or `/` with 8 or more digits or 6 or more groups in
+  total (`4111 1111 1111 1111`, `06 1234 5678`, `+31 6 12 34 56 78`,
+  `1 2 3 4 5 6`, and the digits of `NL91 ABNA 0417 1643 00`). Dates such as
+  `2024-11-08` count too;
+- a currency amount: `€`, `$`, `£`, or the whole word `EUR`, `euro`, `euros`,
+  `USD`, `dollar`, `dollars` or `GBP`, with a number in the question; or a
+  number with a `k` suffix (`80k`);
 - a key-like token: a word starting with `sk-`, `ghp_` or `AKIA`, `-----BEGIN`,
   or 24 or more consecutive ASCII letters and digits mixing both;
-- "my", "mijn" or "m'n" followed within three words by a word starting with
-  portfolio, positie, position, holding, account, rekening, IBKR, broker,
-  salaris, salary, wachtwoord or password;
+- "my", "our", "mijn", "m'n", "ons" or "onze" followed within three words by
+  a word starting with portfolio, positie, position, holding, account,
+  rekening, IBKR, broker, salaris, salary, wachtwoord, password, aandeel,
+  aandelen, belegging, hypotheek, pensioen, saldo, spaar, schuld, lening,
+  share, stock, invest, mortgage, pension, balance, debt or loan;
 - a symbol the owner holds per the last IBKR sync (the snapshot the runtime
   facts read), as a whole word in any case. When IBKR is linked but that
   snapshot cannot be read, or does not list every held symbol, the gate fails

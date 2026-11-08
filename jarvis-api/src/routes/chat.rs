@@ -497,7 +497,6 @@ pub(super) async fn execute_chat(
                         slot,
                         authed.user.id,
                         run.clone(),
-                        conv_title.clone(),
                         new_msg.clone(),
                     ));
                 }
@@ -677,7 +676,6 @@ async fn auto_research_run(
     slot: crate::auto_research::AutoSlot,
     user: Uuid,
     answered: RunIdentity,
-    title: String,
     question: String,
 ) {
     let _slot = slot;
@@ -723,17 +721,11 @@ async fn auto_research_run(
         },
     )
     .await;
-    match append_message(
-        &state.db,
-        run.conversation_id,
-        user,
-        "assistant",
-        &reply.text,
-        Some(&model),
-    )
-    .await
+    // The owner may have deleted the conversation while the search ran.
+    match append_to_live_conversation(&state.db, run.conversation_id, user, &reply.text, &model)
+        .await
     {
-        Ok(message) => {
+        Ok(Some((message, title))) => {
             state.realtime.publish(
                 user,
                 Event::AssistantCompleted {
@@ -751,7 +743,14 @@ async fn auto_research_run(
                 }),
             );
         }
-        Err(_) => state.realtime.publish(
+        Ok(None) => state.realtime.publish(
+            user,
+            Event::AssistantFailed {
+                run,
+                reason: RunFailure::Interrupted,
+            },
+        ),
+        Err(()) => state.realtime.publish(
             user,
             Event::AssistantFailed {
                 run,
@@ -968,6 +967,55 @@ async fn append_message(
         model: model.map(str::to_string),
         created_at: at,
     })
+}
+
+/// Appends an assistant message only while the owner's conversation still
+/// exists. One transaction writes the conversation row first, so a concurrent
+/// delete either commits before it (nothing is stored) or conflicts. Returns
+/// the message and the conversation's current title, or `None` when the
+/// conversation is gone.
+async fn append_to_live_conversation(
+    db: &jarvis_store::Database,
+    conv_id: Uuid,
+    user_id: Uuid,
+    content: &str,
+    model: &str,
+) -> Result<Option<(CanonicalMessage, String)>, ()> {
+    let id = Uuid::now_v7();
+    let at = OffsetDateTime::now_utc();
+    let mut response = db
+        .query(
+            "BEGIN TRANSACTION; \
+             LET $conversation = UPDATE conversations SET updated_at = time::now() \
+             WHERE record::id(id) = $conversation_id AND user_id = $user_id RETURN AFTER; \
+             IF array::len($conversation) = 1 { CREATE chat_messages SET id = $id, \
+             conversation_id = $conversation_id, user_id = $user_id, role = 'assistant', \
+             content = $content, model = $model, created_at = <datetime>$at RETURN NONE; }; \
+             SELECT VALUE title FROM conversations \
+             WHERE record::id(id) = $conversation_id AND user_id = $user_id; \
+             COMMIT TRANSACTION;",
+        )
+        .bind(json!({"id": id.to_string(),
+            "at": at.format(&time::format_description::well_known::Rfc3339).map_err(|_| ())?,
+            "conversation_id": conv_id.to_string(), "user_id": user_id.to_string(),
+            "content": content, "model": model}))
+        .await
+        .map_err(|_| ())?
+        .check()
+        .map_err(|_| ())?;
+    let last = response.num_statements().checked_sub(1).ok_or(())?;
+    let titles: Vec<String> = response.take(last).map_err(|_| ())?;
+    Ok(titles.into_iter().next().map(|title| {
+        let message = CanonicalMessage {
+            id,
+            conversation_id: conv_id,
+            role: MessageRole::Assistant,
+            content: content.to_string(),
+            model: Some(model.to_string()),
+            created_at: at,
+        };
+        (message, title)
+    }))
 }
 
 #[derive(Deserialize)]
