@@ -1,4 +1,4 @@
-//! Typed repository for the memecoin paper trader (schema 0014).
+//! Typed repository for the memecoin paper trader (schemas 0014 and 0017).
 //!
 //! Paper only: these rows record what the simulator decided and what it
 //! would have earned. None of them is an order or a limit. Money and token
@@ -17,6 +17,14 @@ use jarvis_store::Database;
 
 /// Candidate decisions and gate snapshots are kept this long.
 pub const RETENTION_DAYS: u32 = 30;
+/// Strategy-agent decisions are kept this long.
+pub const DECISION_RETENTION_DAYS: u32 = 90;
+/// Every observation is kept this long, then only the daily one.
+pub const OBSERVATION_FULL_HOURS: u32 = 72;
+/// Daily observations are kept this long.
+pub const OBSERVATION_RETENTION_DAYS: u32 = 60;
+/// Universe entries are kept this long after their migration.
+pub const UNIVERSE_RETENTION_DAYS: u32 = 7;
 /// Rows deleted per statement and statements per table per sweep.
 const PRUNE_BATCH: usize = 5_000;
 const PRUNE_MAX_BATCHES: usize = 20;
@@ -173,7 +181,14 @@ const CANDIDATE_REASONS: &[&str] = &[
     "no_sell_route",
     "sell_impact_too_high",
 ];
-const EXIT_REASONS: &[&str] = &["liquidity_drop", "stop_loss", "take_profit", "time_stop"];
+const EXIT_REASONS: &[&str] = &[
+    "liquidity_drop",
+    "stop_loss",
+    "take_profit",
+    "time_stop",
+    "trailing_stop",
+    "agent_exit",
+];
 
 fn rfc3339(at: OffsetDateTime) -> Result<String> {
     at.format(&Rfc3339)
@@ -305,6 +320,370 @@ pub async fn register_strategy_version(db: &Database, version: u32, params: &str
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrategyFamily {
+    A,
+    B,
+    C,
+}
+
+impl StrategyFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::A => "a",
+            Self::B => "b",
+            Self::C => "c",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "a" => Ok(Self::A),
+            "b" => Ok(Self::B),
+            "c" => Ok(Self::C),
+            _ => Err(MemecoinStoreError::InvalidData),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrategyAuthor {
+    Seed,
+    Claude,
+}
+
+impl StrategyAuthor {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Seed => "seed",
+            Self::Claude => "claude",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "seed" => Ok(Self::Seed),
+            "claude" => Ok(Self::Claude),
+            _ => Err(MemecoinStoreError::InvalidData),
+        }
+    }
+}
+
+/// A strategy version with its lineage. Never changes once recorded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StrategyVersion {
+    /// Unique across all strategies.
+    pub version: u32,
+    pub strategy_id: String,
+    pub family: StrategyFamily,
+    pub parent_version: Option<u32>,
+    pub author: StrategyAuthor,
+    /// Canonical parameter JSON.
+    pub params: String,
+    /// Display only: never fed into a prompt or a later task input.
+    pub rationale: Option<String>,
+    /// Canonical backtest JSON.
+    pub backtest: Option<String>,
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Strategy {
+    pub id: String,
+    pub active_version: u32,
+    pub enabled: bool,
+    /// Only the owner can enable it again.
+    pub disabled_by_owner: bool,
+    pub changed_at: OffsetDateTime,
+    pub changed_by: String,
+}
+
+const MAX_RATIONALE: usize = 600;
+const MAX_BACKTEST_BYTES: usize = 4096;
+const MAX_PARAMS: usize = 8192;
+const MAX_CHANGED_BY: usize = 64;
+
+fn valid_strategy_id(id: &str) -> bool {
+    (1..=32).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Bounded display text without control characters.
+fn valid_text(text: &str, max_chars: usize) -> bool {
+    text.chars().count() <= max_chars && !text.chars().any(char::is_control)
+}
+
+fn validate_version(version: &StrategyVersion) -> Result<()> {
+    let valid = version.version >= 1
+        && valid_strategy_id(&version.strategy_id)
+        && version
+            .parent_version
+            .is_none_or(|parent| parent >= 1 && parent < version.version)
+        && (2..=MAX_PARAMS).contains(&version.params.chars().count())
+        && version
+            .rationale
+            .as_deref()
+            .is_none_or(|text| valid_text(text, MAX_RATIONALE))
+        && version.backtest.as_deref().is_none_or(|json| {
+            (2..=MAX_BACKTEST_BYTES).contains(&json.len())
+                && serde_json::from_str::<serde::de::IgnoredAny>(json).is_ok()
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(MemecoinStoreError::InvalidData)
+    }
+}
+
+#[derive(Deserialize)]
+struct StrategyVersionRow {
+    version: u32,
+    strategy_id: Option<String>,
+    family: Option<String>,
+    parent_version: Option<u32>,
+    author: Option<String>,
+    params: String,
+    rationale: Option<String>,
+    backtest: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+}
+
+impl TryFrom<StrategyVersionRow> for StrategyVersion {
+    type Error = MemecoinStoreError;
+
+    fn try_from(row: StrategyVersionRow) -> Result<Self> {
+        let (Some(strategy_id), Some(family), Some(author)) =
+            (row.strategy_id, row.family, row.author)
+        else {
+            // A legacy version belongs to no strategy.
+            return Err(MemecoinStoreError::InvalidData);
+        };
+        Ok(Self {
+            version: row.version,
+            strategy_id,
+            family: StrategyFamily::parse(&family)?,
+            parent_version: row.parent_version,
+            author: StrategyAuthor::parse(&author)?,
+            params: row.params,
+            rationale: row.rationale,
+            backtest: row.backtest,
+            created_at: row.created_at,
+        })
+    }
+}
+
+const VERSION_FIELDS: &str = "version, strategy_id, family, parent_version, author, params, \
+    rationale, backtest, created_at";
+
+/// Record a strategy version, or confirm that it is already recorded with
+/// exactly this content (its `created_at` aside). A version never changes.
+pub async fn insert_strategy_version(db: &Database, version: &StrategyVersion) -> Result<()> {
+    validate_version(version)?;
+    let stored: Vec<StrategyVersionRow> = rows(
+        db,
+        &format!(
+            "SELECT {VERSION_FIELDS} FROM memecoin_strategy_versions WHERE version = $version"
+        ),
+        json!({"version": version.version}),
+    )
+    .await?;
+    if let Some(row) = stored.into_iter().next() {
+        let existing =
+            StrategyVersion::try_from(row).map_err(|_| MemecoinStoreError::VersionConflict)?;
+        return if existing
+            == (StrategyVersion {
+                created_at: existing.created_at,
+                ..version.clone()
+            }) {
+            Ok(())
+        } else {
+            Err(MemecoinStoreError::VersionConflict)
+        };
+    }
+    run(
+        db,
+        "CREATE memecoin_strategy_versions SET id = $id, version = $version, params = $params, \
+         created_at = <datetime>$created_at, strategy_id = $strategy_id, family = $family, \
+         parent_version = $parent_version, author = $author, rationale = $rationale, \
+         backtest = $backtest RETURN NONE",
+        json!({
+            "id": version.version.to_string(),
+            "version": version.version,
+            "params": version.params,
+            "created_at": rfc3339(version.created_at)?,
+            "strategy_id": version.strategy_id,
+            "family": version.family.as_str(),
+            "parent_version": version.parent_version,
+            "author": version.author.as_str(),
+            "rationale": version.rationale,
+            "backtest": version.backtest,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Newest versions of one strategy first, at most [`MAX_LIST`].
+pub async fn list_strategy_versions(
+    db: &Database,
+    strategy_id: &str,
+    limit: usize,
+) -> Result<Vec<StrategyVersion>> {
+    let rows: Vec<StrategyVersionRow> = rows(
+        db,
+        &format!(
+            "SELECT {VERSION_FIELDS} FROM memecoin_strategy_versions WHERE strategy_id = $strategy_id \
+             ORDER BY version DESC LIMIT $limit"
+        ),
+        json!({"strategy_id": strategy_id, "limit": limit.min(MAX_LIST)}),
+    )
+    .await?;
+    rows.into_iter().map(StrategyVersion::try_from).collect()
+}
+
+/// The strategy `version` belongs to, if it is recorded with one.
+async fn version_strategy(db: &Database, version: u32) -> Result<Option<String>> {
+    let owners: Vec<Option<String>> = rows(
+        db,
+        "SELECT VALUE strategy_id FROM memecoin_strategy_versions WHERE version = $version",
+        json!({"version": version}),
+    )
+    .await?;
+    Ok(owners.into_iter().next().flatten())
+}
+
+/// Create a strategy that trades `active_version`, a version of its own.
+/// `false` when the strategy already exists. Only the paper task writes
+/// strategies, so the check and the write cannot race.
+pub async fn insert_strategy(
+    db: &Database,
+    id: &str,
+    active_version: u32,
+    enabled: bool,
+    changed_by: &str,
+) -> Result<bool> {
+    if !valid_strategy_id(id)
+        || !(1..=MAX_CHANGED_BY).contains(&changed_by.chars().count())
+        || version_strategy(db, active_version).await?.as_deref() != Some(id)
+    {
+        return Err(MemecoinStoreError::InvalidData);
+    }
+    let existing: Vec<String> = record_rows(
+        db,
+        "SELECT VALUE record::id(id) FROM $rid",
+        "memecoin_strategies",
+        id,
+        json!({}),
+    )
+    .await?;
+    if !existing.is_empty() {
+        return Ok(false);
+    }
+    run(
+        db,
+        "CREATE memecoin_strategies SET id = $id, active_version = $active_version, \
+         enabled = $enabled, disabled_by_owner = false, changed_at = time::now(), \
+         changed_by = $changed_by RETURN NONE",
+        json!({
+            "id": id,
+            "active_version": active_version,
+            "enabled": enabled,
+            "changed_by": changed_by,
+        }),
+    )
+    .await?;
+    Ok(true)
+}
+
+#[derive(Deserialize)]
+struct StrategyRow {
+    id: String,
+    active_version: u32,
+    enabled: bool,
+    disabled_by_owner: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    changed_at: OffsetDateTime,
+    changed_by: String,
+}
+
+/// Every strategy by id, at most [`MAX_LIST`].
+pub async fn list_strategies(db: &Database) -> Result<Vec<Strategy>> {
+    let rows: Vec<StrategyRow> = rows(
+        db,
+        "SELECT record::id(id) AS id, active_version, enabled, disabled_by_owner, changed_at, \
+         changed_by FROM memecoin_strategies ORDER BY id LIMIT $limit",
+        json!({"limit": MAX_LIST}),
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| Strategy {
+            id: row.id,
+            active_version: row.active_version,
+            enabled: row.enabled,
+            disabled_by_owner: row.disabled_by_owner,
+            changed_at: row.changed_at,
+            changed_by: row.changed_by,
+        })
+        .collect())
+}
+
+/// Switch a strategy to `version`, which must be one of its own. `false`
+/// when there is no such strategy.
+pub async fn set_active_version(
+    db: &Database,
+    id: &str,
+    version: u32,
+    changed_by: &str,
+) -> Result<bool> {
+    if !(1..=MAX_CHANGED_BY).contains(&changed_by.chars().count())
+        || version_strategy(db, version).await?.as_deref() != Some(id)
+    {
+        return Err(MemecoinStoreError::InvalidData);
+    }
+    let changed: Vec<String> = record_rows(
+        db,
+        "UPDATE $rid SET active_version = $version, changed_at = time::now(), \
+         changed_by = $changed_by RETURN VALUE record::id(id)",
+        "memecoin_strategies",
+        id,
+        json!({"version": version, "changed_by": changed_by}),
+    )
+    .await?;
+    Ok(changed.len() == 1)
+}
+
+/// Enable or disable a strategy. `owner` is true only when the caller has
+/// verified the owner: an owner's disable can only be lifted by the owner,
+/// so any other enable of such a strategy changes nothing. `false` when
+/// nothing changed or there is no such strategy.
+pub async fn set_strategy_enabled(
+    db: &Database,
+    id: &str,
+    enabled: bool,
+    owner: bool,
+    changed_by: &str,
+) -> Result<bool> {
+    if !(1..=MAX_CHANGED_BY).contains(&changed_by.chars().count()) {
+        return Err(MemecoinStoreError::InvalidData);
+    }
+    let changed: Vec<String> = record_rows(
+        db,
+        "UPDATE $rid SET enabled = $enabled, \
+         disabled_by_owner = IF $owner THEN !$enabled ELSE disabled_by_owner END, \
+         changed_at = time::now(), changed_by = $changed_by \
+         WHERE $owner OR !$enabled OR disabled_by_owner = false RETURN VALUE record::id(id)",
+        "memecoin_strategies",
+        id,
+        json!({"enabled": enabled, "owner": owner, "changed_by": changed_by}),
+    )
+    .await?;
+    Ok(changed.len() == 1)
 }
 
 pub async fn open_trip(db: &Database, trip: &Trip) -> Result<()> {
@@ -643,18 +1022,235 @@ pub async fn resume(db: &Database, paused_at: OffsetDateTime) -> Result<bool> {
     Ok(cleared.len() == 1)
 }
 
-/// Delete candidate decisions and gate snapshots older than
-/// [`RETENTION_DAYS`], in bounded batches. The paper ledger itself (trips
-/// and costs) is kept: the paper gate needs its whole history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionKind {
+    Enter,
+    Skip,
+    Exit,
+    Hold,
+    Propose,
+    WorkerUnavailable,
+    InvalidOutput,
+}
+
+impl DecisionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enter => "enter",
+            Self::Skip => "skip",
+            Self::Exit => "exit",
+            Self::Hold => "hold",
+            Self::Propose => "propose",
+            Self::WorkerUnavailable => "worker_unavailable",
+            Self::InvalidOutput => "invalid_output",
+        }
+    }
+}
+
+/// One decision of the strategy agent, or why it could not decide.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Decision {
+    pub at: OffsetDateTime,
+    pub call_id: String,
+    pub kind: DecisionKind,
+    pub strategy_version: Option<u32>,
+    pub mint: Option<String>,
+    /// Share of the strategy's budget; only on `enter`.
+    pub size_bps: Option<u32>,
+    /// snake_case, at most 32 characters.
+    pub reason_code: Option<String>,
+    /// Display only: never fed into a prompt or a later task input.
+    pub rationale: Option<String>,
+    pub model: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+const MAX_DECISION_RATIONALE: usize = 300;
+const MAX_TOKENS: u64 = 100_000_000;
+
+fn valid_decision(decision: &Decision) -> bool {
+    let enter = decision.kind == DecisionKind::Enter;
+    let id_like = |value: &str, extra: &[u8]| {
+        (1..=64).contains(&value.len())
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || extra.contains(&b))
+    };
+    id_like(&decision.call_id, b"")
+        && decision.strategy_version.is_none_or(|v| v >= 1)
+        && enter == decision.size_bps.is_some()
+        && decision
+            .size_bps
+            .is_none_or(|bps| (1..=10_000).contains(&bps))
+        && (!matches!(decision.kind, DecisionKind::Enter | DecisionKind::Exit)
+            || decision.mint.is_some())
+        && decision.reason_code.as_deref().is_none_or(|code| {
+            (1..=32).contains(&code.len())
+                && code.starts_with(|c: char| c.is_ascii_lowercase())
+                && code
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        })
+        && decision
+            .rationale
+            .as_deref()
+            .is_none_or(|text| valid_text(text, MAX_DECISION_RATIONALE))
+        && decision
+            .model
+            .as_deref()
+            .is_none_or(|model| id_like(model, b".:"))
+        && decision.input_tokens.is_none_or(|n| n <= MAX_TOKENS)
+        && decision.output_tokens.is_none_or(|n| n <= MAX_TOKENS)
+}
+
+pub async fn append_decision(db: &Database, decision: &Decision) -> Result<()> {
+    if !valid_decision(decision) {
+        return Err(MemecoinStoreError::InvalidData);
+    }
+    run(
+        db,
+        "CREATE memecoin_decisions SET id = $id, at = <datetime>$at, call_id = $call_id, kind = $kind, \
+         strategy_version = $strategy_version, mint = $mint, size_bps = $size_bps, \
+         reason_code = $reason_code, rationale = $rationale, model = $model, \
+         input_tokens = $input_tokens, output_tokens = $output_tokens RETURN NONE",
+        json!({
+            "id": uuid::Uuid::now_v7().to_string(),
+            "at": rfc3339(decision.at)?,
+            "call_id": decision.call_id,
+            "kind": decision.kind.as_str(),
+            "strategy_version": decision.strategy_version,
+            "mint": decision.mint,
+            "size_bps": decision.size_bps,
+            "reason_code": decision.reason_code,
+            "rationale": decision.rationale,
+            "model": decision.model,
+            "input_tokens": decision.input_tokens,
+            "output_tokens": decision.output_tokens,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Price and liquidity of a mint at one moment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Observation {
+    pub mint: String,
+    pub at: OffsetDateTime,
+    pub price_usd: Decimal,
+    pub liquidity_usd: Decimal,
+}
+
+/// The record key of the observation kept for `mint` on its UTC day.
+fn daily_key(mint: &str, at: OffsetDateTime) -> String {
+    format!("{mint}-{}", at.to_offset(time::UtcOffset::UTC).date())
+}
+
+/// Record an observation. The first one of each mint and UTC day is the
+/// daily one that outlives [`OBSERVATION_FULL_HOURS`]. Only the paper task
+/// writes observations, so the check and the write cannot race.
+pub async fn record_observation(db: &Database, observation: &Observation) -> Result<()> {
+    if observation.price_usd < Decimal::ZERO || observation.liquidity_usd < Decimal::ZERO {
+        return Err(MemecoinStoreError::InvalidData);
+    }
+    let day = daily_key(&observation.mint, observation.at);
+    let stored: Vec<String> = record_rows(
+        db,
+        "SELECT VALUE record::id(id) FROM $rid",
+        "memecoin_observations",
+        &day,
+        json!({}),
+    )
+    .await?;
+    let (key, daily) = if stored.is_empty() {
+        (day, true)
+    } else {
+        (uuid::Uuid::now_v7().to_string(), false)
+    };
+    record_rows::<serde::de::IgnoredAny>(
+        db,
+        "CREATE $rid SET id = $id, mint = $mint, at = <datetime>$at, price_usd = $price_usd, \
+         liquidity_usd = $liquidity_usd, daily = $daily RETURN NONE",
+        "memecoin_observations",
+        &key,
+        json!({
+            "id": key,
+            "mint": observation.mint,
+            "at": rfc3339(observation.at)?,
+            "price_usd": observation.price_usd.to_string(),
+            "liquidity_usd": observation.liquidity_usd.to_string(),
+            "daily": daily,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// A recently migrated token discovery may consider.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UniverseEntry {
+    pub mint: String,
+    pub pool: String,
+    pub program: String,
+    pub migrated_at: OffsetDateTime,
+}
+
+/// Record or replace the universe entry of a mint.
+pub async fn upsert_universe(db: &Database, entry: &UniverseEntry) -> Result<()> {
+    record_rows::<serde::de::IgnoredAny>(
+        db,
+        "UPSERT $rid SET id = $mint, mint = $mint, pool = $pool, program = $program, \
+         migrated_at = <datetime>$migrated_at RETURN NONE",
+        "memecoin_universe",
+        &entry.mint,
+        json!({
+            "mint": entry.mint,
+            "pool": entry.pool,
+            "program": entry.program,
+            "migrated_at": rfc3339(entry.migrated_at)?,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Delete, in bounded batches: candidate decisions and gate snapshots after
+/// [`RETENTION_DAYS`], agent decisions after [`DECISION_RETENTION_DAYS`],
+/// observations after [`OBSERVATION_FULL_HOURS`] except the daily ones, which
+/// go after [`OBSERVATION_RETENTION_DAYS`], and universe entries
+/// [`UNIVERSE_RETENTION_DAYS`] after their migration. The paper ledger itself
+/// (trips and costs) and the strategies are kept: the paper gate needs their
+/// whole history.
 pub async fn prune(db: &Database) -> Result<usize> {
     let mut total = 0;
-    for (table, field) in [
-        ("memecoin_candidates", "observed_at"),
-        ("memecoin_gate_snapshots", "at"),
+    for (table, expired) in [
+        (
+            "memecoin_candidates",
+            format!("observed_at < time::now() - {RETENTION_DAYS}d"),
+        ),
+        (
+            "memecoin_gate_snapshots",
+            format!("at < time::now() - {RETENTION_DAYS}d"),
+        ),
+        (
+            "memecoin_decisions",
+            format!("at < time::now() - {DECISION_RETENTION_DAYS}d"),
+        ),
+        (
+            "memecoin_observations",
+            format!(
+                "at < time::now() - {OBSERVATION_RETENTION_DAYS}d \
+                 OR (daily = false AND at < time::now() - {OBSERVATION_FULL_HOURS}h)"
+            ),
+        ),
+        (
+            "memecoin_universe",
+            format!("migrated_at < time::now() - {UNIVERSE_RETENTION_DAYS}d"),
+        ),
     ] {
         let query = format!(
-            "LET $ids = (SELECT VALUE id FROM {table} \
-             WHERE {field} < time::now() - {RETENTION_DAYS}d LIMIT {PRUNE_BATCH}); \
+            "LET $ids = (SELECT VALUE id FROM {table} WHERE {expired} LIMIT {PRUNE_BATCH}); \
              DELETE $ids RETURN NONE; RETURN array::len($ids);"
         );
         for _ in 0..PRUNE_MAX_BATCHES {
@@ -835,6 +1431,315 @@ mod tests {
         assert_eq!(recent_candidates(&db, 10).await?.len(), 1);
         // The ledger is never pruned.
         assert_eq!(load_trips(&db).await?.len(), 2);
+        Ok(())
+    }
+
+    const OTHER: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+
+    fn seed(at: OffsetDateTime) -> StrategyVersion {
+        StrategyVersion {
+            version: 1,
+            strategy_id: "momentum-a".into(),
+            family: StrategyFamily::A,
+            parent_version: None,
+            author: StrategyAuthor::Seed,
+            params: r#"{"a":1}"#.into(),
+            rationale: None,
+            backtest: None,
+            created_at: at,
+        }
+    }
+
+    fn enter(at: OffsetDateTime) -> Decision {
+        Decision {
+            at,
+            call_id: "0193f0c2-7a1b-7c3d-8e4f-5a6b7c8d9e0f".into(),
+            kind: DecisionKind::Enter,
+            strategy_version: Some(3),
+            mint: Some(MINT.into()),
+            size_bps: Some(2_500),
+            reason_code: Some("volume_spike".into()),
+            rationale: Some("Volume rose.".into()),
+            model: Some("claude-sonnet-4-5".into()),
+            input_tokens: Some(900),
+            output_tokens: Some(120),
+        }
+    }
+
+    #[test]
+    fn strategy_versions_are_checked_before_the_database() {
+        let good = StrategyVersion {
+            version: 5,
+            parent_version: Some(4),
+            rationale: Some("é".repeat(600)),
+            backtest: Some(format!("\"{}\"", "x".repeat(4094))),
+            ..seed(OffsetDateTime::UNIX_EPOCH)
+        };
+        assert!(validate_version(&good).is_ok());
+        for bad in [
+            StrategyVersion {
+                strategy_id: "Momentum".into(),
+                ..good.clone()
+            },
+            StrategyVersion {
+                strategy_id: String::new(),
+                ..good.clone()
+            },
+            StrategyVersion {
+                strategy_id: "a".repeat(33),
+                ..good.clone()
+            },
+            StrategyVersion {
+                parent_version: Some(5),
+                ..good.clone()
+            },
+            StrategyVersion {
+                params: "{".into(),
+                ..good.clone()
+            },
+            StrategyVersion {
+                rationale: Some("é".repeat(601)),
+                ..good.clone()
+            },
+            StrategyVersion {
+                rationale: Some("line\nbreak".into()),
+                ..good.clone()
+            },
+            StrategyVersion {
+                backtest: Some("{trades: 3}".into()),
+                ..good.clone()
+            },
+            // 2050 characters, but 4098 bytes.
+            StrategyVersion {
+                backtest: Some(format!("\"{}\"", "é".repeat(2048))),
+                ..good.clone()
+            },
+        ] {
+            assert!(validate_version(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn decisions_are_checked_before_the_database() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let hold = Decision {
+            kind: DecisionKind::Hold,
+            mint: None,
+            size_bps: None,
+            ..enter(now)
+        };
+        assert!(valid_decision(&enter(now)));
+        assert!(valid_decision(&hold));
+        for bad in [
+            Decision {
+                size_bps: None,
+                ..enter(now)
+            },
+            Decision {
+                size_bps: Some(10_001),
+                ..enter(now)
+            },
+            Decision {
+                mint: None,
+                ..enter(now)
+            },
+            Decision {
+                kind: DecisionKind::Exit,
+                size_bps: None,
+                mint: None,
+                ..enter(now)
+            },
+            Decision {
+                size_bps: Some(100),
+                ..hold.clone()
+            },
+            Decision {
+                call_id: "call 1".into(),
+                ..hold.clone()
+            },
+            Decision {
+                reason_code: Some("Volume-Spike".into()),
+                ..hold.clone()
+            },
+            Decision {
+                reason_code: Some("a".repeat(33)),
+                ..hold.clone()
+            },
+            Decision {
+                rationale: Some("r".repeat(301)),
+                ..hold.clone()
+            },
+            Decision {
+                model: Some("model/../x".into()),
+                ..hold.clone()
+            },
+            Decision {
+                input_tokens: Some(MAX_TOKENS + 1),
+                ..hold.clone()
+            },
+        ] {
+            assert!(!valid_decision(&bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_daily_observation_is_keyed_by_utc_day() -> std::result::Result<(), time::error::Error> {
+        // 2026-11-09 01:00 at UTC+2 is still 2026-11-08 in UTC.
+        let at = OffsetDateTime::from_unix_timestamp(1_794_178_800)?
+            .to_offset(time::UtcOffset::from_hms(2, 0, 0)?);
+        assert_eq!(daily_key(MINT, at), format!("{MINT}-2026-11-08"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn strategies_decisions_and_market_data_round_trip_and_prune(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+        db.signin(Root {
+            username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+            password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+        })
+        .await?;
+        db.use_ns(format!("memecoin_{}", uuid::Uuid::now_v7().simple()))
+            .use_db("core")
+            .await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+        let now = OffsetDateTime::now_utc();
+
+        // Seeding again is a no-op; other content under a recorded version,
+        // including a legacy one, is a conflict.
+        insert_strategy_version(&db, &seed(now)).await?;
+        insert_strategy_version(&db, &seed(now + Duration::minutes(1))).await?;
+        register_strategy_version(&db, 2, "{}").await?;
+        for conflict in [
+            StrategyVersion {
+                params: r#"{"a":2}"#.into(),
+                ..seed(now)
+            },
+            StrategyVersion {
+                version: 2,
+                ..seed(now)
+            },
+        ] {
+            assert!(matches!(
+                insert_strategy_version(&db, &conflict).await,
+                Err(MemecoinStoreError::VersionConflict)
+            ));
+        }
+        let child = StrategyVersion {
+            version: 3,
+            parent_version: Some(1),
+            author: StrategyAuthor::Claude,
+            rationale: Some("Tighter stop.".into()),
+            backtest: Some(r#"{"trades":12}"#.into()),
+            ..seed(now)
+        };
+        insert_strategy_version(&db, &child).await?;
+        insert_strategy_version(
+            &db,
+            &StrategyVersion {
+                version: 4,
+                strategy_id: "dip-b".into(),
+                family: StrategyFamily::B,
+                ..seed(now)
+            },
+        )
+        .await?;
+        assert_eq!(
+            list_strategy_versions(&db, "momentum-a", 10).await?,
+            [child, seed(now)]
+        );
+
+        assert!(insert_strategy(&db, "momentum-a", 1, true, "seed").await?);
+        assert!(!insert_strategy(&db, "momentum-a", 1, true, "seed").await?);
+        // A strategy only trades versions of its own.
+        assert!(insert_strategy(&db, "dip-b", 1, true, "seed")
+            .await
+            .is_err());
+        assert!(insert_strategy(&db, "dip-b", 4, false, "seed").await?);
+        assert!(set_active_version(&db, "momentum-a", 3, "claude").await?);
+        assert!(set_active_version(&db, "momentum-a", 4, "claude")
+            .await
+            .is_err());
+        // Only the owner lifts an owner's disable.
+        assert!(set_strategy_enabled(&db, "momentum-a", false, true, "device-1").await?);
+        assert!(!set_strategy_enabled(&db, "momentum-a", true, false, "claude").await?);
+        assert!(set_strategy_enabled(&db, "momentum-a", false, false, "claude").await?);
+        let strategies = list_strategies(&db).await?;
+        assert_eq!(strategies.len(), 2);
+        let momentum = &strategies[1];
+        assert_eq!(
+            (
+                momentum.id.as_str(),
+                momentum.active_version,
+                momentum.enabled,
+                momentum.disabled_by_owner,
+                momentum.changed_by.as_str()
+            ),
+            ("momentum-a", 3, false, true, "claude")
+        );
+        assert!(set_strategy_enabled(&db, "momentum-a", true, true, "device-1").await?);
+        let momentum = &list_strategies(&db).await?[1];
+        assert!(momentum.enabled && !momentum.disabled_by_owner);
+        assert!(!set_strategy_enabled(&db, "missing", false, true, "device-1").await?);
+
+        append_decision(&db, &enter(now - Duration::days(91))).await?;
+        append_decision(
+            &db,
+            &Decision {
+                kind: DecisionKind::WorkerUnavailable,
+                mint: None,
+                size_bps: None,
+                ..enter(now)
+            },
+        )
+        .await?;
+
+        let five_days_ago = (now - Duration::days(5)).date();
+        let observation = |at: OffsetDateTime, price: &str| Observation {
+            mint: MINT.into(),
+            at,
+            price_usd: d(price),
+            liquidity_usd: d("50000"),
+        };
+        for (at, price) in [
+            (five_days_ago.with_hms(10, 0, 0)?.assume_utc(), "1"),
+            (five_days_ago.with_hms(11, 0, 0)?.assume_utc(), "2"),
+            (now - Duration::days(61), "4"),
+            (now - Duration::hours(2), "5"),
+            (now - Duration::hours(1), "6"),
+        ] {
+            record_observation(&db, &observation(at, price)).await?;
+        }
+
+        let entry = |mint: &str, migrated_at| UniverseEntry {
+            mint: mint.into(),
+            pool: OTHER.into(),
+            program: OTHER.into(),
+            migrated_at,
+        };
+        upsert_universe(&db, &entry(MINT, now)).await?;
+        upsert_universe(&db, &entry(MINT, now - Duration::days(8))).await?;
+        upsert_universe(&db, &entry(OTHER, now)).await?;
+
+        // The 91-day decision, the 61-day and the second 5-day observation,
+        // and the 8-day universe entry.
+        assert_eq!(prune(&db).await?, 4);
+        let mut left = db
+            .query(
+                "SELECT VALUE kind FROM memecoin_decisions; \
+                 SELECT VALUE price_usd FROM memecoin_observations ORDER BY at; \
+                 SELECT VALUE mint FROM memecoin_universe;",
+            )
+            .await?
+            .check()?;
+        let kinds: Vec<String> = left.take(0)?;
+        let prices: Vec<String> = left.take(1)?;
+        let universe: Vec<String> = left.take(2)?;
+        assert_eq!(kinds, ["worker_unavailable"]);
+        assert_eq!(prices, ["1", "5", "6"]);
+        assert_eq!(universe, [OTHER]);
         Ok(())
     }
 }
