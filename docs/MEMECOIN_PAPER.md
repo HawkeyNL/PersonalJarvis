@@ -85,10 +85,16 @@ A candidate row is written only when a mint's verdict changes. Candidate rows
 and the hourly gate snapshots are pruned after 30 days; trips and costs are
 kept for the paper gate.
 
-**Known limit:** market data cannot yet tell whether a pool's LP is burned or
-locked, so every live candidate is rejected with `lp_not_secured` until LP
-reading is added to `jarvis-market-data`. The trader then only records
-decisions.
+**LP status:** the LP of the main pool (the deepest DexScreener pair; other
+pools of the token are not checked) is read on chain, only for PumpSwap,
+Raydium AMM v4 and Raydium CPMM pools. The pool account must be owned by one
+of those programs and hold the pair's two mints. LP counts as burned when the
+LP mint supply is zero, or when at most 1% of it sits outside accounts owned
+by the incinerator or, for PumpSwap, the pool itself. Everything else (other
+venues such as CLMM or DLMM, LP in a wallet, a Raydium pool authority or a
+third-party locker, unreadable data, the two RPC providers disagreeing) is
+rejected with `lp_not_secured`; time locks are never recognised. The verified
+pool vaults are left out of the top-holder share.
 
 ## API (owner session, like every `/v1` route)
 

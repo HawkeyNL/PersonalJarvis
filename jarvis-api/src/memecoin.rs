@@ -20,6 +20,7 @@ use std::time::Duration as StdDuration;
 use async_trait::async_trait;
 use jarvis_market_data::dexscreener::{DexScreenerClient, Pair};
 use jarvis_market_data::jupiter::{JupiterClient, QuoteRequest};
+use jarvis_market_data::pools;
 use jarvis_market_data::rpc::{CrossCheckedRpc, RpcEndpoint};
 use jarvis_market_data::snapshot::{to_snapshot, Observation};
 use jarvis_market_data::{ApiKey, MarketDataError};
@@ -211,8 +212,17 @@ impl MarketSource for LiveMarket {
         now: OffsetDateTime,
     ) -> Result<TokenSnapshot, MarketDataError> {
         let mint = pair.base_token.address.as_str();
-        let (mint_account, largest) =
-            tokio::try_join!(self.rpc.mint(mint), self.rpc.largest_accounts(mint))?;
+        let (mint_account, largest, pool) = tokio::join!(
+            self.rpc.mint(mint),
+            self.rpc.largest_accounts(mint),
+            pools::read(&self.rpc, pair)
+        );
+        let (mint_account, largest) = (mint_account?, largest?);
+        // A pool that cannot be read leaves the LP `Unknown` and its vaults in
+        // the holder share: both reject.
+        let pool = pool
+            .map_err(|error| tracing::warn!(%error, %mint, "memecoin paper: pool not read"))
+            .ok();
         // Quote selling the largest position the simulation may open: a
         // smaller entry can only have less price impact.
         let sell_amount = pair
@@ -251,6 +261,8 @@ impl MarketSource for LiveMarket {
             mint_account: Some(&mint_account),
             largest_accounts: Some(&largest),
             excluded_accounts: &[],
+            // Also leaves the pool's vaults out of the holder share.
+            lp: pool.as_ref(),
             sell_amount,
             sell_quote: quote.as_ref(),
         })
@@ -365,6 +377,7 @@ fn pair_snapshot(pair: &Pair, now: OffsetDateTime) -> Option<TokenSnapshot> {
         mint_account: None,
         largest_accounts: None,
         excluded_accounts: &[],
+        lp: None,
         sell_amount: 0,
         sell_quote: None,
     })
