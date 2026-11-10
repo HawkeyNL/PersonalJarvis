@@ -1,0 +1,20 @@
+# Weekly grouped dependency update PRs.
+# Core Admin (jarvis-core-admin) is left out until PR CI builds it.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Amsterdam
+    open-pull-requests-limit: 5
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # Pinned on purpose: the SurrealDB 4 move waits for an off-host backup
+      # and CI guards the exact version (security/DEPENDENCY_EXCEPTIONS.md).
+      - dependency-name: surrealdb

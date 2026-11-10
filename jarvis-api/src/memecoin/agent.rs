@@ -1063,16 +1063,15 @@ async fn apply_proposal(
     room.versions -= 1;
     room.next_version = version.checked_add(1).ok_or("versions_exhausted")?;
     let enabled = match existing {
-        // Never enables: an owner-disabled strategy keeps its disable.
-        Some(strategy) => {
+        // Never enables: an owner-disabled strategy keeps its disable. The
+        // flag comes from the write, not the snapshot taken before the call,
+        // so an owner's disable meanwhile is not reported as enabled.
+        Some(_) => {
             let switch = store::set_active_version(&env.db, &config.id, version, CLAUDE);
-            if !bounded("active version", switch)
+            bounded("active version", switch)
                 .await
                 .map_err(|_| "store_failed")?
-            {
-                return Err("store_failed");
-            }
-            strategy.enabled
+                .ok_or("store_failed")?
         }
         None => {
             let enabled = env.settings.new_strategies_enabled;

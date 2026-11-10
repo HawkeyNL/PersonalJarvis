@@ -29,6 +29,7 @@ use tokio::sync::Notify;
 use jarvis_store::Database;
 
 use super::{github_repo, release_tag, store, Draft, Link, LinkKind, RoadmapError, Snapshot};
+use crate::realtime::Hub;
 
 pub const API_BASE: &str = "https://api.github.com";
 /// Comma-separated `owner/name` repositories the poller may read.
@@ -278,6 +279,7 @@ pub fn start(
     db: Database,
     handle: Arc<GithubHandle>,
     token: HeaderValue,
+    events: Hub,
 ) -> Result<(), &'static str> {
     let poller = Url::parse(API_BASE)
         .map_err(|_| "GitHub API base is invalid")
@@ -290,7 +292,7 @@ pub fn start(
                 last_error: Some(reason),
             })
         })?;
-    tokio::spawn(poller.run(db, handle));
+    tokio::spawn(poller.run(db, handle, events));
     tracing::info!("GitHub roadmap sync running (read-only)");
     Ok(())
 }
@@ -551,11 +553,11 @@ impl Poller {
         })
     }
 
-    async fn run(mut self, db: Database, handle: Arc<GithubHandle>) {
+    async fn run(mut self, db: Database, handle: Arc<GithubHandle>, events: Hub) {
         let mut failures: u32 = 0;
         let mut last: Option<(PollState, Option<&'static str>)> = None;
         loop {
-            let outcome = self.pass(&db).await;
+            let outcome = self.pass(&db, &events).await;
             let (state, error, delay) = settle(outcome, &mut failures);
             handle.set(PollStatus {
                 state,
@@ -585,14 +587,18 @@ impl Poller {
 
     /// One pass over every roadmap that is not archived. `Ok(Some(_))` when
     /// some repo or write failed; what succeeded is kept.
-    async fn pass(&mut self, db: &Database) -> Result<Option<&'static str>, PollError> {
+    async fn pass(
+        &mut self,
+        db: &Database,
+        events: &Hub,
+    ) -> Result<Option<&'static str>, PollError> {
         let roadmaps = load(db).await?;
         let cached = cached_states(&roadmaps, &self.repos);
         let (states, mut error, windows) = self.states(&cached).await?;
         // A failed repo has no window; the others may still move on.
         let mut stored = true;
         for snapshot in roadmaps {
-            match write(db, snapshot, &self.repos, &states).await {
+            match write(db, events, snapshot, &self.repos, &states).await {
                 Ok(written) => stored &= written,
                 Err(reason) => {
                     stored = false;
@@ -995,6 +1001,7 @@ async fn load(db: &Database) -> Result<Vec<Snapshot>, PollError> {
 /// same issues window again and builds on the new revision.
 async fn write(
     db: &Database,
+    events: &Hub,
     snapshot: Snapshot,
     repos: &[String],
     states: &HashMap<Target, String>,
@@ -1017,7 +1024,7 @@ async fn write(
             .github_update(id, found)
             .map_err(|_| "roadmap item vanished")?;
     }
-    match tokio::time::timeout(DB_TIMEOUT, store::commit_github(db, &draft)).await {
+    match tokio::time::timeout(DB_TIMEOUT, store::commit_github(db, &draft, events)).await {
         Ok(Ok(())) => Ok(true),
         Ok(Err(RoadmapError::Conflict | RoadmapError::Archived | RoadmapError::NotFound)) => {
             Ok(false)

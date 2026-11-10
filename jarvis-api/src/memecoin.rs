@@ -101,11 +101,10 @@ const AGENT_APPLY_DEADLINE: StdDuration = StdDuration::from_secs(20);
 /// Sell quotes are taken into USDC.
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-/// Core does not send the memecoin realtime events yet.
-// TODO(release order): apps released before the one that ignores unknown
-// realtime event types (app PR #118, merged but not released) fail on them.
-// Turn this on only in a Core release after that app release is out.
-pub const EMIT_MEME_EVENTS: bool = false;
+/// Core sends the memecoin realtime events. Apps from 0.1.27 on (app PR
+/// #118) ignore event types they do not know; older apps fail on them. Kept
+/// as a switch to turn the events off again in one place.
+pub const EMIT_MEME_EVENTS: bool = true;
 
 /// Publish a memecoin event, while [`EMIT_MEME_EVENTS`] allows it.
 pub(crate) fn announce(events: Option<&Hub>, event: Event) {
@@ -2672,7 +2671,11 @@ mod tests {
                 created_at: OffsetDateTime::now_utc(),
             };
             store::insert_strategy_version(db, &version).await?;
-            assert!(store::set_active_version(db, &config.id, config.version, "test").await?);
+            assert!(
+                store::set_active_version(db, &config.id, config.version, "test")
+                    .await?
+                    .is_some()
+            );
             versions[i] = config.version;
         }
         Ok(versions)
@@ -3149,6 +3152,21 @@ mod tests {
         // The owner disabled B.
         assert!(store::set_strategy_enabled(&db, "b-base-reclaim", false, true, "device-1").await?);
         let brain = ScriptedBrain::new();
+        let hub = Hub::default();
+        let mut listener = hub
+            .subscribe(uuid::Uuid::now_v7(), uuid::Uuid::now_v7())
+            .ok_or("no subscription")?;
+        listener.receiver.try_recv()?;
+        // What apps heard since the last call: ids, versions and flags only.
+        let mut heard = || {
+            std::iter::from_fn(|| listener.receiver.try_recv().ok())
+                .map(|envelope| envelope.event.clone())
+                .collect::<Vec<_>>()
+        };
+        let decision = |event: &Event| match event {
+            Event::MemeDecision { id } => uuid::Uuid::parse_str(id).is_ok(),
+            _ => false,
+        };
         let env = || agent::ReviewEnv {
             db: db.clone(),
             brain: brain.clone(),
@@ -3157,7 +3175,7 @@ mod tests {
             stake_usd: profile.stake_usd,
             max_position_usd: profile.max_position_usd,
             settings: agent::AgentSettings::new(None, None, false).unwrap(),
-            events: None,
+            events: Some(hub.clone()),
         };
         let review = |proposals: serde_json::Value| {
             brain.reply(Ok(serde_json::json!({"proposals": proposals}).to_string()))
@@ -3188,6 +3206,27 @@ mod tests {
         assert_eq!(input["new_versions"], 2);
         assert_eq!(input["strategies"]["s1"]["enabled"], 0);
         let (new_v, b_v) = (STRATEGY_VERSION_FLOOR + 4, STRATEGY_VERSION_FLOOR + 5);
+        // Each recorded version is heard with its strategy, each decision
+        // row by its id; the refused third proposal changes no strategy.
+        let events = heard();
+        assert_eq!(events.len(), 5, "{events:?}");
+        assert_eq!(
+            events[0],
+            Event::MemeStrategyChanged {
+                strategy_id: format!("claude-{new_v}"),
+                version: new_v,
+                enabled: false,
+            }
+        );
+        assert_eq!(
+            events[2],
+            Event::MemeStrategyChanged {
+                strategy_id: "b-base-reclaim".into(),
+                version: b_v,
+                enabled: false,
+            }
+        );
+        assert!([1, 3, 4].into_iter().all(|i| decision(&events[i])));
         assert_eq!(
             propose_rows(store::recent_decisions(&db, 100).await?),
             [
@@ -3241,6 +3280,8 @@ mod tests {
             (latest.kind.as_str(), latest.reason_code.as_deref()),
             ("hold", Some("no_room"))
         );
+        let events = heard();
+        assert!(events.len() == 1 && decision(&events[0]), "{events:?}");
 
         // Review 3, a day later: a loosening, a parent of another strategy and
         // an unchanged config are refused; an invalid reply records nothing else.
@@ -3265,6 +3306,12 @@ mod tests {
                 (None, Some("parent_mismatch".into())),
                 (None, Some("unchanged".into())),
             ]
+        );
+        // Refused proposals change no strategy.
+        let events = heard();
+        assert!(
+            events.len() == 3 && events.iter().all(decision),
+            "{events:?}"
         );
         assert_eq!(store::max_version(&db).await?, Some(b_v));
         db.query("DELETE memecoin_decisions").await?.check()?;
