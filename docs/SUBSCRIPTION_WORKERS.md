@@ -566,9 +566,9 @@ tool; the CLI fetches nothing itself. The event allowlist then also accepts
 `web_search` items (codex-rs `exec` JSONL `item.started|updated|completed` with
 `item.type == "web_search"`) whose `action.type` is `search`, or that have no
 action, and only when every query the item carries (`query`, `action.query`
-and each string in `action.queries`) is a string that the privacy gate
-(`jarvis_llm::privacy::is_private`, without the holdings, which Core already
-checked against the question) does not flag. By owner decision, `open_page`
+and each string in `action.queries`) is a string that the identifier check
+(`jarvis_llm::privacy::leaks_identifier`: no email address, key, possessive
+account word or long number; a plain date is fine) does not flag. By owner decision, `open_page`
 and `find_in_page` actions are refused. Codex CLI 0.166.0 has no setting that
 turns them off: `web_search` is `disabled | cached | indexed | live`, and
 those modes only set the hosted tool's `external_web_access` and
@@ -617,13 +617,13 @@ for a query the privacy gate flags (see above). The run's
 context holds only the question and that fixed instruction: no persona,
 memory, history or runtime facts. Both workers run the CLI with `TZ=UTC`, so
 the host's time zone never reaches the prompt. The question itself, or words
-from it, still leaves the host in a search query, so Core runs the
-deterministic privacy gate (`jarvis_llm::privacy::is_private`, listed in
-`MODEL_ROUTING_OPERATIONS.md`, "Privacy gate") on every Research question,
-explicit or automatic, before any worker is called. A flagged question gets a
-fixed notice asking the owner to rephrase it without personal details; while
-IBKR is linked but its holdings cannot be read, every question gets a fixed
-"could not be checked" notice. There is no override. Names and other free-text details are not detectable. No
+from it, still leaves the host in a search query, so Core runs a
+deterministic identifier check (`jarvis_llm::privacy::leaks_identifier`, see
+`MODEL_ROUTING_OPERATIONS.md`, "Privacy gate") on every Research question
+before any worker is called; an automatic run must also pass the wider
+`is_private` gate first. A flagged question gets a fixed notice asking the
+owner to rephrase it without personal details; there is no override. Names
+and other free-text details are not detectable. No
 unit or network change is needed: the search runs on the provider's side and
 neither worker fetches web pages itself.
 

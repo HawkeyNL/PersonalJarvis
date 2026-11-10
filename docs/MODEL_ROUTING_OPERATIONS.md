@@ -355,10 +355,20 @@ Names, addresses and other free-text personal details are not detectable; a
 question that only carries those still searches automatically. Choose `on`
 when that is not acceptable.
 
-Explicit Research requests pass the same gate, with `on` and with `auto`. A
-flagged question is not searched at all: Core answers with a fixed notice
-asking the owner to rephrase it without personal details, and there is no
-override.
+**Identifier check.** Every Research question, explicit (with `on` and with
+`auto`) or automatic, must also pass a narrower check, and so must every
+search query the subscription workers see (see
+`SUBSCRIPTION_WORKERS.md`, "Research runs"). It flags only personal
+identifiers: an email address, a key-like token, the possessive rule above,
+and the long-number rule above, except that a run that is exactly one date
+(`YYYY-MM-DD`, `YYYY/MM/DD`, `DD-MM-YYYY`, `DD/MM/YYYY` or `DD.MM.YYYY`, with a
+1-2 digit day and month, a valid day and month and a year from 1900 to 2099)
+is not a number. A date with another digit group joined to it by a separator
+still counts. Amounts, the `k` suffix and held symbols are not checked here: an
+explicit search on a price or a held symbol is the owner's own choice, and an
+automatic one has already passed the gate above. A flagged explicit question
+is not searched at all: Core answers with a fixed notice asking the owner to
+rephrase it without personal details, and there is no override.
 
 ## Routing, health and spend
 
