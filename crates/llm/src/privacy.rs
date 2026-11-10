@@ -103,9 +103,9 @@ fn has_digit_run(text: &str, dates_allowed: bool) -> bool {
     })
 }
 
-/// Maximal runs of ASCII digit groups joined by single separators (any
-/// whitespace, including no-break spaces, `-`, `–`, `.`, `/` or `_`), each
-/// group with the separator before it (`'\0'` for the first).
+/// Maximal runs of ASCII digit groups joined by single separators (see
+/// [`is_separator`]), each group with the separator before it (`'\0'` for
+/// the first).
 fn digit_runs(text: &str) -> Vec<Vec<(char, &str)>> {
     let (mut runs, mut run) = (Vec::new(), Vec::new());
     let (mut start, mut separator) = (None, '\0');
@@ -116,7 +116,7 @@ fn digit_runs(text: &str) -> Vec<Vec<(char, &str)>> {
         }
         if let Some(begin) = start.take() {
             run.push((separator, &text[begin..at]));
-            if c.is_whitespace() || matches!(c, '-' | '–' | '.' | '/' | '_') {
+            if is_separator(c) {
                 separator = c;
                 continue;
             }
@@ -128,6 +128,25 @@ fn digit_runs(text: &str) -> Vec<Vec<(char, &str)>> {
         }
     }
     runs
+}
+
+/// Any whitespace (no-break spaces included), `-`, `.`, `/`, `_`, a Unicode
+/// hyphen or dash (U+2010 to U+2015), the minus sign, or an invisible format
+/// character (soft hyphen, zero-width space and joiners, word joiner, BOM).
+fn is_separator(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '-' | '.'
+                | '/'
+                | '_'
+                | '\u{2010}'..='\u{2015}'
+                | '\u{2212}'
+                | '\u{ad}'
+                | '\u{200b}'..='\u{200d}'
+                | '\u{2060}'
+                | '\u{feff}'
+        )
 }
 
 /// The whole run is one plausible date: `YYYY-MM-DD`, `YYYY/MM/DD`,
@@ -325,6 +344,16 @@ mod tests {
             ("06–1234–5678", true),
             ("10\u{a0}11\u{a0}2026", true),
             ("10–11–2026", true),
+            ("4111—1111—1111—1111", true),
+            ("06\u{2011}1234\u{2011}5678", true),
+            ("06\u{2212}1234\u{2212}5678", true),
+            ("06\u{200b}1234\u{200b}5678", true),
+            ("06\u{ad}1234\u{ad}5678", true),
+            // Only `-`, `/` and `.` make a date.
+            ("2024_11_08", true),
+            ("2024–11–08", true),
+            ("2024\u{a0}11\u{a0}08", true),
+            ("2024\n11\n08", true),
             ("mijn portfolio rendement", true),
             ("my brokerage account", true),
             ("sk-proj-a1b2c3d4e5f6g7h8i9j0k1l2", true),

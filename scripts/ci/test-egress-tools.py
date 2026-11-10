@@ -35,6 +35,19 @@ class EgressToolTests(unittest.TestCase):
             self.assertEqual(self.rules(WORKER, text), [], text)
         self.assertEqual(self.rules(OTHER, '"BashScript WebFetcher"'), [])
 
+    def test_literals_spanning_lines_are_scanned(self):
+        for text in ['let s = "allow\n Bash(git:*)";', 'r#"{\n  tools: Bash, WebFetch\n}"#',
+                     'br##"x\n"WebFetch"\n"##', 'Command::new(\n    CLAUDE_BIN,\n)',
+                     '"/opt/runtime\\\n/claude"']:
+            self.assertEqual(len(self.rules(OTHER, text)), 1, text)
+        # A quote in a char literal or a comment does not start a literal.
+        self.assertEqual(self.rules(OTHER, "let q = '\"'; // \"Bash\nlet b = Bash;"), [])
+        self.assertEqual(self.rules(OTHER, 'let u = "https://example.org"; // Bash'), [])
+        # An escaped quote does not end a literal.
+        self.assertEqual(len(self.rules(OTHER, '"x \\" WebFetch"')), 1)
+        self.assertEqual(self.rules(OTHER, 'r"WebSearch"; "a \\" b"; WebFetch'), [])
+        self.assertEqual([line for line, _ in egress.violations(OTHER, 'a\nb\n"x\nBash"')], [3])
+
     def test_cli_paths_only_in_reviewed_files(self):
         for text in ['const BIN: &str = "/usr/local/bin/claude";', '"/opt/x/codex"',
                      'format!("{home}/bin/claude")']:

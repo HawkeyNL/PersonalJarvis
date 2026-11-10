@@ -534,9 +534,10 @@ identifier check (`jarvis_llm::privacy::leaks_identifier`, as for Codex) does
 not flag, and on any line that is not a JSON object with a type. That
 includes the CLI's own `EndConversation`. Claude Code's `WebSearch` tool makes
 its own inner call to the web search backend, and the queries of that call
-are not in the outer stream: the worker checks only the outer `input.query`.
-The inner model sees only that checked query, never the question or the rest
-of the run.
+are not in the outer stream. The worker checks every string in the outer
+`input` (the query and any `allowed_domains` or `blocked_domains`); the inner
+call gets only that checked input, never the question or the rest of the run.
+What the inner call then searches for is not visible to the worker.
 Unlike the Codex event allowlist, other event types and content blocks that
 are not tool use pass: the CLI adds event types between releases, and
 `--tools WebSearch` already keeps every other tool out of the run.
@@ -574,7 +575,8 @@ and each string in `action.queries`) is a string that the identifier check
 (`jarvis_llm::privacy::leaks_identifier`: no email address, key, possessive
 account word or long number; a plain date is fine) does not flag. A completed
 search item must carry at least one non-empty query; one without any is
-refused. By owner decision, `open_page` and `find_in_page` actions are
+refused, and so is a turn that completes while a started search item (tracked
+by its `id`) never completed. By owner decision, `open_page` and `find_in_page` actions are
 refused. Codex CLI 0.166.0 has no setting that
 turns them off: `web_search` is `disabled | cached | indexed | live`, and
 those modes only set the hosted tool's `external_web_access` and
@@ -592,9 +594,11 @@ open has already left OpenAI's side by then. The worker then kills the run's
 process group and discards the answer, so nothing from that run reaches Core.
 
 `codex exec` may add its own environment context to the prompt, such as the
-time zone (always `UTC` in a research run, see below) or the empty working
-directory; the worker
-cannot remove it. Newer
+current date, the time zone or the empty working directory; the worker cannot
+remove it. Codex CLI 0.166.0 takes the time zone name from the host's
+`/etc/localtime` (`iana-time-zone`, `core/src/session/turn_context.rs`
+`local_time_context`), which ignores `TZ`, so the host's zone name still
+reaches a Codex prompt; `TZ=UTC` only fixes the date. Newer
 codex-rs releases also have a standalone search path in which the CLI itself
 POSTs the query to an OpenAI search endpoint from the host. Both, and the
 `web_search` event and item names above, must be re-checked against the exact
@@ -623,8 +627,9 @@ and both workers kill and discard a run that uses any other tool or searches
 for a query the identifier check flags (see above). The run's
 context holds only the question and that fixed instruction: no persona,
 memory, history or runtime facts. In a research run both workers run the CLI
-with `TZ=UTC`, so the host's time zone never reaches the prompt; chat and
-typed tasks keep their environment unchanged. The question itself, or words
+with `TZ=UTC`; chat and typed tasks keep their environment unchanged. For
+Claude Code this is unverified beyond the variable being set; Codex still
+reads the zone name from `/etc/localtime` (see above). The question itself, or words
 from it, still leaves the host in a search query, so Core runs a
 deterministic identifier check (`jarvis_llm::privacy::leaks_identifier`, see
 `MODEL_ROUTING_OPERATIONS.md`, "Privacy gate") on every Research question

@@ -68,9 +68,12 @@ pub fn codex_subscription_status(output: &[u8]) -> &'static str {
 /// `error`). It must be re-checked against the reviewed CLI version.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodexEvent {
-    /// Session or turn lifecycle, reasoning, a partial agent message, or a
-    /// provider-hosted web search in a research run.
+    /// Session or turn lifecycle, reasoning or a partial agent message.
     Benign,
+    /// A provider-hosted web search item in a research run that passed the
+    /// checks. The worker refuses a turn that completes while a started
+    /// search never completed, so every search's query gets checked.
+    Search { id: String, completed: bool },
     /// A completed agent message: the latest one is the answer.
     AgentMessage(String),
     /// The turn finished normally.
@@ -118,7 +121,12 @@ pub fn parse_codex_event(line: &[u8], research: bool) -> CodexEvent {
                         && search_action(item)
                         && search_queries_pass(item, kind == "item.completed") =>
                 {
-                    CodexEvent::Benign
+                    item["id"]
+                        .as_str()
+                        .map_or(CodexEvent::Refused, |id| CodexEvent::Search {
+                            id: id.into(),
+                            completed: kind == "item.completed",
+                        })
                 }
                 _ => CodexEvent::Refused,
             }
@@ -399,9 +407,11 @@ mod tests {
             r#"{"type":"item.completed","item":{"id":"i4","type":"web_search","query":"bitcoin price usd 2026","action":{"type":"search","queries":["nieuws 2026-11-10","ASML Q3 2026 kwartaalcijfers"]}}}"#,
         ];
         for line in searches {
-            assert_eq!(
-                parse_codex_event(line.as_bytes(), true),
-                CodexEvent::Benign,
+            assert!(
+                matches!(
+                    parse_codex_event(line.as_bytes(), true),
+                    CodexEvent::Search { .. }
+                ),
                 "{line}"
             );
             assert_eq!(
@@ -457,12 +467,32 @@ mod tests {
             r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"","action":{"type":"search","queries":["rust release"]}}}"#,
             r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","action":{"type":"search","query":"rust release"}}}"#,
         ] {
-            assert_eq!(
-                parse_codex_event(line.as_bytes(), true),
-                CodexEvent::Benign,
+            assert!(
+                matches!(
+                    parse_codex_event(line.as_bytes(), true),
+                    CodexEvent::Search { .. }
+                ),
                 "{line}"
             );
         }
+        // A search item without an id cannot be tracked to completion.
+        assert_eq!(
+            parse_codex_event(
+                br#"{"type":"item.started","item":{"type":"web_search","query":"q","action":{"type":"search"}}}"#,
+                true
+            ),
+            CodexEvent::Refused
+        );
+        assert_eq!(
+            parse_codex_event(
+                br#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q"}}"#,
+                true
+            ),
+            CodexEvent::Search {
+                id: "i1".into(),
+                completed: true
+            }
+        );
     }
 
     #[test]

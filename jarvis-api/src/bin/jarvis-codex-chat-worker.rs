@@ -371,6 +371,7 @@ async fn read_events(
 ) -> std::io::Result<Option<Events>> {
     let mut reader = tokio::io::BufReader::new(stdout);
     let mut events = Events::default();
+    let mut open_searches = std::collections::HashSet::new();
     let mut total = 0;
     let mut line = Vec::new();
     loop {
@@ -393,7 +394,22 @@ async fn read_events(
         }
         match parse_codex_event(&line, research) {
             CodexEvent::Benign => {}
+            CodexEvent::Search {
+                id,
+                completed: false,
+            } => {
+                open_searches.insert(id);
+            }
+            CodexEvent::Search {
+                id,
+                completed: true,
+            } => {
+                open_searches.remove(&id);
+            }
             CodexEvent::AgentMessage(text) => events.answer = Some(text),
+            // A search that started but never completed was never checked
+            // with its final query.
+            CodexEvent::TurnCompleted if !open_searches.is_empty() => return Ok(None),
             CodexEvent::TurnCompleted => events.completed = true,
             CodexEvent::Error(message) if events.errors.len() < MAX_ERROR_EVENTS => {
                 events.errors.push(message)
@@ -538,6 +554,14 @@ mod tests {
             "--yolo",
             "--add-dir",
             "--search",
+            "--enable",
+            "--disable",
+            "-p",
+            "--profile",
+            "-C",
+            "--cd",
+            "-i",
+            "--image",
         ] {
             assert!(
                 !argv
@@ -611,6 +635,17 @@ mod tests {
         let reply = finish(fake_run_as(&[SEARCH, ANSWER, DONE], "true", false).await);
         assert!(matches!(reply.state, ClaudeWorkerState::ToolUseRefused));
         assert!(reply.text.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_search_that_never_completes_is_refused_at_turn_end() {
+        let started = r#"{"type":"item.started","item":{"id":"i0","type":"web_search","query":"","action":{"type":"search"}}}"#;
+        let reply = finish(fake_run_as(&[started, ANSWER, DONE], "true", true).await);
+        assert!(matches!(reply.state, ClaudeWorkerState::ToolUseRefused));
+        assert!(reply.text.is_none());
+        // Started, then completed with a checked query: fine.
+        let reply = finish(fake_run_as(&[started, SEARCH, ANSWER, DONE], "true", true).await);
+        assert!(matches!(reply.state, ClaudeWorkerState::Completed));
     }
 
     #[tokio::test]

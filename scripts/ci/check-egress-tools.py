@@ -12,7 +12,10 @@ Fails when tracked Rust source:
 - uses `SandboxProfile::Browser` beyond its existing profile definitions.
 
 The allowlists are explicit on purpose: a new use needs a review and an
-update here.
+update here. String literals are found across lines (plain, byte and raw
+strings; comments and char literals are skipped). Names built at run time
+(`concat!`, a bare "claude" found through PATH, an enum variant) are not
+caught: this guard is a tripwire, not a proof.
 """
 import argparse
 from pathlib import Path
@@ -25,7 +28,7 @@ WORKERS = {
     "jarvis-api/src/bin/jarvis-codex-chat-worker.rs",
 }
 SPAWN = re.compile(r"Command::new\(\s*[^)]*(?:claude|codex)", re.IGNORECASE)
-CLI_PATH = re.compile(r'"[^"\n]*/(?:claude|codex)"')
+CLI_PATH = re.compile(r"/(?:claude|codex)\Z")
 # Account linking runs the CLI through systemd-run as its own identity; the
 # runtime installers download, verify and install it (and test that).
 CLI_PATH_FILES = WORKERS | {
@@ -33,7 +36,16 @@ CLI_PATH_FILES = WORKERS | {
     "crates/admin/src/ai_accounts/runtime.rs",
     "crates/admin/src/ai_accounts/runtime/codex.rs",
 }
-TOOLS = re.compile(r'"[^"\n]*\b(?:WebFetch|Bash)\b[^"\n]*"|mcp__')
+TOOLS = re.compile(r"\b(?:WebFetch|Bash)\b")
+MCP = re.compile(r"mcp__")
+# A line comment, a char literal, or a (byte, raw) string literal.
+TOKENS = re.compile(
+    r"//[^\n]*"
+    r"|'(?:[^'\\\n]|\\.)'"
+    r'|(?<![A-Za-z0-9_])b?r(#*)"(.*?)"\1'
+    r'|b?"((?:[^"\\]|\\.)*)"',
+    re.DOTALL,
+)
 # The Claude Code executor deny-list and its test; the Claude worker's
 # `--disallowedTools mcp__*` and its argv and stream tests.
 TOOL_FILES = {
@@ -45,15 +57,30 @@ BROWSER = re.compile(r"SandboxProfile::(?:Browser\b|\*|\{[^}]*\bBrowser\b)")
 BROWSER_USES = {"crates/sandbox/src/lib.rs": 5}
 
 
+def literals(text):
+    """(line, content) of every string literal in Rust source."""
+    for match in TOKENS.finditer(text):
+        content = match.group(2) if match.group(2) is not None else match.group(3)
+        if content is not None:
+            yield text.count("\n", 0, match.start()) + 1, content
+
+
 def violations(name, text):
+    line_of = lambda offset: text.count("\n", 0, offset) + 1
+    found = set()
+    if name not in WORKERS:
+        found |= {(line_of(match.start()), "claude/codex CLI spawned outside the worker binaries")
+                  for match in SPAWN.finditer(text)}
+    for number, content in literals(text):
+        if CLI_PATH.search(content) and name not in CLI_PATH_FILES:
+            found.add((number, "claude/codex CLI path outside the reviewed files"))
+        if TOOLS.search(content) and name not in TOOL_FILES:
+            found.add((number, "WebFetch, Bash or mcp__ tool outside a reviewed deny-list"))
+    if name not in TOOL_FILES:
+        found |= {(line_of(match.start()), "WebFetch, Bash or mcp__ tool outside a reviewed deny-list")
+                  for match in MCP.finditer(text)}
+    yield from sorted(found)
     lines = text.splitlines()
-    for number, line in enumerate(lines, 1):
-        if SPAWN.search(line) and name not in WORKERS:
-            yield number, "claude/codex CLI spawned outside the worker binaries"
-        if CLI_PATH.search(line) and name not in CLI_PATH_FILES:
-            yield number, "claude/codex CLI path outside the reviewed files"
-        if TOOLS.search(line) and name not in TOOL_FILES:
-            yield number, "WebFetch, Bash or mcp__ tool outside a reviewed deny-list"
     browser = [number for number, line in enumerate(lines, 1) if BROWSER.search(line)]
     if len(browser) != BROWSER_USES.get(name, 0):
         yield (browser or [1])[0], f"SandboxProfile::Browser used {len(browser)} times, reviewed {BROWSER_USES.get(name, 0)}"

@@ -333,7 +333,9 @@ when it contains:
 - an email address;
 - a long number: 6 or more contiguous digits, or digit groups joined by a
   single separator (any whitespace, including no-break spaces and tabs, `-`,
-  the en dash `–`, `.`, `/` or `_`) with 8 or more digits or 6 or more groups in
+  `.`, `/`, `_`, a Unicode hyphen or dash such as `–` or `—`, the minus sign,
+  or an invisible soft hyphen or zero-width character) with 8 or more digits
+  or 6 or more groups in
   total (`4111 1111 1111 1111`, `06 1234 5678`, `+31 6 12 34 56 78`,
   `1 2 3 4 5 6`, and the digits of `NL91 ABNA 0417 1643 00`). Dates such as
   `2024-11-08` count too;

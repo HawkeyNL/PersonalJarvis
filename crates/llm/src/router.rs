@@ -1765,6 +1765,69 @@ mod tests {
         }
     }
 
+    /// Core picks its research notice from the error the router returns: the
+    /// last subscription's failure decides, a worker refusal included.
+    #[tokio::test]
+    async fn research_returns_the_last_subscription_failure() {
+        struct Fails(&'static str, u16, &'static str);
+        #[async_trait]
+        impl LlmProvider for Fails {
+            fn label(&self) -> &str {
+                self.0
+            }
+            async fn chat(&self, _req: &ChatRequest) -> Result<ChatReply, LlmError> {
+                Err(LlmError::Empty)
+            }
+            async fn research(&self, _req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+                Err(LlmError::Api {
+                    status: self.1,
+                    body: self.2.into(),
+                })
+            }
+        }
+        let refused = (502, "Claude run attempted tool use and was refused");
+        let unavailable = (503, "Codex subscription unavailable");
+        for (first, second, expected) in [
+            (refused, unavailable, "unavailable"),
+            (unavailable, refused, "tool_use_refused"),
+        ] {
+            let c = vec![
+                CatalogModel {
+                    backend: "claude-cli".into(),
+                    id: "claude-opus-5".into(),
+                    class: ModelClass::Heavy,
+                },
+                CatalogModel {
+                    backend: "codex-cli".into(),
+                    id: "gpt-6-luna".into(),
+                    class: ModelClass::Heavy,
+                },
+            ];
+            let router = RouterProvider::with_policy(
+                vec![
+                    Candidate {
+                        id: "claude-cli".into(),
+                        provider: Arc::new(Fails("claude-cli", first.0, first.1)),
+                    },
+                    Candidate {
+                        id: "codex-cli".into(),
+                        provider: Arc::new(Fails("codex-cli", second.0, second.1)),
+                    },
+                ],
+                always_available(),
+                c.clone(),
+                allow_catalog(&c),
+            )
+            .with_routing(Arc::new(LiveRouting::new(routing(
+                r#"{"version":1,"research_web_search":"on","tiers":{"hard":{"chain":[
+                    {"provider":"claude-cli","model":"claude-opus-5"},
+                    {"provider":"codex-cli","model":"gpt-6-luna"}]}}}"#,
+            ))));
+            let error = router.research(&question()).await.unwrap_err();
+            assert_eq!(error.usage_failure_category(), expected);
+        }
+    }
+
     #[tokio::test]
     async fn research_switched_off_mid_request_stops_further_attempts() {
         struct SwitchOffThenFail(Arc<LiveRouting>);
