@@ -529,9 +529,9 @@ Code transcripts: `system`, `assistant` (with `message.content` blocks such as
 results) and a final `result` event with the same fields as
 `--output-format json`. The worker stops the run's process group and returns
 `tool_use_refused` on any tool-use block (`tool_use`, `server_tool_use`,
-`mcp_tool_use`) other than a `WebSearch` whose query is a string the privacy
-gate (`jarvis_llm::privacy::is_private`, without the holdings, which Core
-already checked against the question) does not flag, and on any line that is
+`mcp_tool_use`) other than a `WebSearch` whose query is a string the
+identifier check (`jarvis_llm::privacy::leaks_identifier`, as for Codex) does
+not flag, and on any line that is
 not a JSON object with a type. That includes the CLI's own `EndConversation`.
 Unlike the Codex event allowlist, other event types and content blocks that
 are not tool use pass: the CLI adds event types between releases, and
@@ -613,7 +613,7 @@ publish, post, submit, comment or reply anywhere, only to read. The worker
 limits what an injected instruction could do: Claude has no tool except
 `WebSearch` (besides the CLI's own `EndConversation`) and at most 8 turns,
 and both workers kill and discard a run that uses any other tool or searches
-for a query the privacy gate flags (see above). The run's
+for a query the identifier check flags (see above). The run's
 context holds only the question and that fixed instruction: no persona,
 memory, history or runtime facts. Both workers run the CLI with `TZ=UTC`, so
 the host's time zone never reaches the prompt. The question itself, or words

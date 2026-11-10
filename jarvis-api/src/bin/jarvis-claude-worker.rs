@@ -11,7 +11,7 @@ use jarvis_llm::{
         claude_subscription_status, reviewed_claude_version, ClaudeWorkerReply,
         ClaudeWorkerRequest, ClaudeWorkerState, MAX_REPLY_BYTES,
     },
-    privacy::is_private,
+    privacy::leaks_identifier,
 };
 use serde::Deserialize;
 use subscription_worker::{
@@ -301,7 +301,7 @@ fn cli_args(request: &ClaudeWorkerRequest, system_prompt: Option<&Path>) -> Vec<
 
 /// A research run: the reviewed invocation with its event stream inspected
 /// line by line. A tool call other than `WebSearch`, a search query the
-/// privacy gate flags, or a line the worker cannot read stops the whole
+/// identifier check flags, or a line the worker cannot read stops the whole
 /// process group and discards the run. The event arrives after the CLI
 /// produced it, so this detects and discards; it cannot prevent.
 async fn run_research(mut command: Command, prompt: &str, limit: Duration) -> ClaudeWorkerReply {
@@ -396,9 +396,9 @@ enum StreamEvent {
 /// `{"type":"user",...}` carrying tool results, and a final
 /// `{"type":"result",...}` with the same fields as `--output-format json`.
 /// Any tool-use block (`tool_use`, `server_tool_use`, `mcp_tool_use`) other
-/// than a `WebSearch` whose query passes the privacy gate is refused, as is a
-/// line that is not a JSON object with a type or an assistant message without
-/// a content list. Other event types carry no tool call and pass.
+/// than a `WebSearch` whose query passes the identifier check is refused, as
+/// is a line that is not a JSON object with a type or an assistant message
+/// without a content list. Other event types carry no tool call and pass.
 fn stream_event(line: &[u8]) -> StreamEvent {
     use serde_json::Value;
     let Ok(event) = serde_json::from_slice::<Value>(line) else {
@@ -420,8 +420,9 @@ fn stream_event(line: &[u8]) -> StreamEvent {
 }
 
 /// A content block without tool use, or the one allowed search: `WebSearch`
-/// with a string query that [`is_private`] does not flag. Core already gated
-/// the question with the owner's holdings; the worker does not know them.
+/// with a string query that [`leaks_identifier`] does not flag: no email
+/// address, key, possessive account word or long number (a plain date is
+/// fine).
 fn allowed_block(block: &serde_json::Value) -> bool {
     let Some(kind) = block.get("type").and_then(serde_json::Value::as_str) else {
         return false;
@@ -433,7 +434,7 @@ fn allowed_block(block: &serde_json::Value) -> bool {
         && block["name"] == "WebSearch"
         && block["input"]["query"]
             .as_str()
-            .is_some_and(|query| !is_private(query, &[]))
+            .is_some_and(|query| !leaks_identifier(query))
 }
 
 fn parse_cli_reply(bytes: &[u8]) -> ClaudeWorkerReply {
@@ -649,6 +650,8 @@ mod tests {
             SEARCH,
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"Links: ..."}]}}"#,
             r#"{"type":"rate_limit_event","rate_limit_info":{}}"#,
+            // Prices, dates and symbols are not identifiers.
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"WebSearch","input":{"query":"bitcoin price usd 2026 op 10/11/2026 ASML"}}]}}"#,
             "",
         ] {
             assert!(
@@ -672,6 +675,8 @@ mod tests {
             tool("WebSearch", r#"{"query":"mijn portfolio rendement"}"#),
             tool("WebSearch", r#"{"query":"bel 0612345678"}"#),
             tool("WebSearch", r#"{"query":"jan.devries@example.nl"}"#),
+            tool("WebSearch", r#"{"query":"NL91ABNA0417164300 rente"}"#),
+            tool("WebSearch", r#"{"query":"2026-11-10 06 1234"}"#),
             tool("WebSearch", r#"{"query":["rust"]}"#),
             tool("WebSearch", "{}"),
             r#"{"type":"assistant","message":{"content":[{"type":"server_tool_use","id":"s1","name":"web_search","input":{"query":"rust"}}]}}"#.into(),
