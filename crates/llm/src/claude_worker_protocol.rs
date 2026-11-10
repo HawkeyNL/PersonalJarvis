@@ -147,9 +147,9 @@ pub enum ClaudeWorkerState {
     ModelUnavailable,
     RuntimeFailure,
     /// The run tried a tool (command, search, MCP, file change), searched for
-    /// a query the privacy gate flags, or emitted an event the worker cannot
-    /// prove harmless; it was stopped and its answer discarded. The Codex chat
-    /// worker returns this, and the Claude worker in research runs.
+    /// a query the identifier check flags, or emitted an event the worker
+    /// cannot prove harmless; it was stopped and its answer discarded. The
+    /// Codex chat worker returns this, and the Claude worker in research runs.
     ToolUseRefused,
 }
 

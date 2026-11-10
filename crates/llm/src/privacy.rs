@@ -56,13 +56,26 @@ const MIN_KEY_RUN: usize = 24;
 pub fn is_private(question: &str, held_symbols: &[String]) -> bool {
     let lower = question.to_lowercase();
     has_email(question)
-        || has_digit_run(question)
+        || has_digit_run(question, false)
         || has_amount(&lower)
         || has_key(question)
         || has_possessive(&lower)
         || held_symbols
             .iter()
             .any(|symbol| has_word(&lower, &symbol.trim().to_lowercase()))
+}
+
+/// Whether text that leaves the host in a search carries a personal
+/// identifier: an email address, a key-like token, a possessive near a money
+/// or account word, or a long number (account, card or phone; a plain date
+/// is not one). Narrower than [`is_private`]: no amounts, `k` suffix or held
+/// symbols, so ordinary price and date searches pass. It gates explicit
+/// Research, every search query a worker sees, and [`url_is_safe`] paths.
+pub fn leaks_identifier(text: &str) -> bool {
+    has_email(text)
+        || has_key(text)
+        || has_possessive(&text.to_lowercase())
+        || has_digit_run(text, true)
 }
 
 fn has_email(text: &str) -> bool {
@@ -78,25 +91,64 @@ fn has_email(text: &str) -> bool {
 
 /// 6+ contiguous digits, or digit groups joined by single ` `, `-`, `.` or
 /// `/` with 8+ digits or 6+ groups in total (IBAN, card and phone numbers).
-fn has_digit_run(text: &str) -> bool {
-    let (mut total, mut groups, mut group, mut after_separator) = (0, 0, 0, false);
-    for c in text.chars() {
+/// With `dates_allowed`, a run that is exactly one date is not private.
+fn has_digit_run(text: &str, dates_allowed: bool) -> bool {
+    digit_runs(text).iter().any(|run| {
+        let total: usize = run.iter().map(|(_, group)| group.len()).sum();
+        (run.iter().any(|(_, group)| group.len() >= MIN_DIGIT_RUN)
+            || total >= MIN_SEPARATED_DIGITS
+            || run.len() >= MIN_DIGIT_RUN)
+            && !(dates_allowed && is_date(run))
+    })
+}
+
+/// Maximal runs of ASCII digit groups joined by single ` `, `-`, `.` or `/`,
+/// each group with the separator before it (`'\0'` for the first).
+fn digit_runs(text: &str) -> Vec<Vec<(char, &str)>> {
+    let (mut runs, mut run) = (Vec::new(), Vec::new());
+    let (mut start, mut separator) = (None, '\0');
+    for (at, c) in text.char_indices().chain([(text.len(), '\0')]) {
         if c.is_ascii_digit() {
-            groups += usize::from(group == 0);
-            group += 1;
-            total += 1;
-            after_separator = false;
-            if group >= MIN_DIGIT_RUN || total >= MIN_SEPARATED_DIGITS || groups >= MIN_DIGIT_RUN {
-                return true;
+            start.get_or_insert(at);
+            continue;
+        }
+        if let Some(begin) = start.take() {
+            run.push((separator, &text[begin..at]));
+            if matches!(c, ' ' | '-' | '.' | '/') {
+                separator = c;
+                continue;
             }
-        } else if group > 0 && !after_separator && matches!(c, ' ' | '-' | '.' | '/') {
-            after_separator = true;
-            group = 0;
-        } else {
-            (total, groups, group, after_separator) = (0, 0, 0, false);
+        }
+        // Any other character, or a second separator, ends the run.
+        separator = '\0';
+        if !run.is_empty() {
+            runs.push(std::mem::take(&mut run));
         }
     }
-    false
+    runs
+}
+
+/// The whole run is one plausible date: `YYYY-MM-DD`, `YYYY/MM/DD`,
+/// `DD-MM-YYYY`, `DD/MM/YYYY` or `DD.MM.YYYY`, with a 1-2 digit day and
+/// month and a year from 1900 to 2099. A digit group joined to it by a
+/// separator makes the run longer, so it is no longer a date.
+fn is_date(run: &[(char, &str)]) -> bool {
+    let [(_, first), (separator, middle), (second_separator, last)] = run else {
+        return false;
+    };
+    let (year, day) = match separator {
+        '-' | '/' if first.len() == 4 => (first, last),
+        '-' | '/' | '.' => (last, first),
+        _ => return false,
+    };
+    let number = |digits: &str| digits.parse::<u16>().ok();
+    separator == second_separator
+        && year.len() == 4
+        && (1..=2).contains(&day.len())
+        && (1..=2).contains(&middle.len())
+        && number(year).is_some_and(|year| (1900..=2099).contains(&year))
+        && number(middle).is_some_and(|month| (1..=12).contains(&month))
+        && number(day).is_some_and(|day| (1..=31).contains(&day))
 }
 
 /// A currency sign or word with a number anywhere in the question, or a
@@ -173,7 +225,7 @@ fn has_prefix_word(text: &str, prefix: &str) -> bool {
 
 /// Whether a URL may be opened or searched without carrying personal data:
 /// http(s) only, no user info, no `?` query or `#` fragment, a domain host
-/// (never an IP literal) and a path that [`is_private`] does not flag.
+/// (never an IP literal) and a path that [`leaks_identifier`] does not flag.
 pub fn url_is_safe(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
@@ -185,7 +237,7 @@ pub fn url_is_safe(url: &str) -> bool {
         && parsed.fragment().is_none()
         // `domain()` is `None` for an IPv4 or IPv6 literal.
         && parsed.domain().is_some()
-        && !is_private(&percent_decoded(parsed.path()), &[])
+        && !leaks_identifier(&percent_decoded(parsed.path()))
 }
 
 /// `%XX` escapes decoded (lossy), so an encoded `@` or digit still counts.
@@ -276,6 +328,54 @@ mod tests {
     }
 
     #[test]
+    fn identifier_gate_table() {
+        for (text, leaks) in [
+            ("bitcoin price usd 2026", false),
+            ("nieuws 2026-11-10", false),
+            ("EUR/USD koers 2026", false),
+            ("bitcoin 100k prediction", false),
+            ("ASML kwartaalcijfers Q3 2026", false),
+            ("10/11/2026 storm", false),
+            ("storm 2026/11/10 en 1-1-2027", false),
+            ("verkiezingen 29.10.2025 uitslag", false),
+            ("is €2500 per maand veel?", false),
+            ("Rust 1.82.0 release notes", false),
+            ("my bike was stolen", false),
+            ("jan@example.com", true),
+            ("06-12345678", true),
+            ("0612345678", true),
+            ("06 1234 5678", true),
+            ("+31 6 12 34 56 78", true),
+            ("NL91ABNA0417164300", true),
+            ("NL91 ABNA 0417 1643 00", true),
+            ("4111 1111 1111 1111", true),
+            ("4111-1111-1111-1111", true),
+            ("mijn portfolio rendement", true),
+            ("my brokerage account", true),
+            ("sk-proj-a1b2c3d4e5f6g7h8i9j0k1l2", true),
+            ("token a1b2c3d4e5f6g7h8i9j0k1l2m3", true),
+            // A number joined to a date makes the run longer: not a date.
+            ("2026-11-10 06", true),
+            ("06 10-11-2026", true),
+            ("10-11-2026-1234", true),
+            ("2026-11-10/12", true),
+            // Not a plausible date: the digits count.
+            ("06-12-3456", true),
+            ("31-13-2026", true),
+            ("00-11-2026", true),
+            ("2026-11-32", true),
+            ("1234-11-10", true),
+            ("2026.11.10", true),
+            ("10-11/2026", true),
+            ("10 11 2026", true),
+            ("100-11-2026", true),
+            ("10-011-2026", true),
+        ] {
+            assert_eq!(leaks_identifier(text), leaks, "{text}");
+        }
+    }
+
+    #[test]
     fn url_gate_table() {
         for (url, safe) in [
             ("https://www.rust-lang.org/", true),
@@ -309,9 +409,11 @@ mod tests {
             ("https://example.org/call/%30612345678", false),
             ("https://example.org/my-portfolio/today", false),
             ("https://example.org/mijn/rekening", false),
-            ("https://example.org/pay/2500-eur", false),
+            ("https://example.org/pay/2500-eur", true),
             ("https://example.org/key/sk-proj-abc", false),
-            ("https://example.org/archive/2024/11/08/rust", false),
+            ("https://example.org/archive/2024/11/08/rust", true),
+            ("https://example.org/archive/2024/11/08/0612345678", false),
+            ("https://example.org/iban/NL91ABNA0417164300", false),
             ("https://example.org/%zz/%4", true),
         ] {
             assert_eq!(url_is_safe(url), safe, "{url}");
