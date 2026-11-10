@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -83,6 +84,8 @@ pub struct PollStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncRefused {
     NotConfigured,
+    /// Configured, but the poller could not start.
+    NotRunning,
     AuthFailed,
     TooSoon,
 }
@@ -92,6 +95,8 @@ pub struct GithubHandle {
     /// The allowlist as configured; empty when not set.
     repos: Vec<String>,
     configured: bool,
+    /// Set when [`start`] failed: no poller runs to wake.
+    start_failed: AtomicBool,
     status: RwLock<PollStatus>,
     wake: Notify,
     last_sync: Mutex<Option<Instant>>,
@@ -109,6 +114,7 @@ impl GithubHandle {
         Self {
             repos,
             configured,
+            start_failed: AtomicBool::new(false),
             status: RwLock::new(PollStatus {
                 state: if configured {
                     PollState::Starting
@@ -177,6 +183,9 @@ impl GithubHandle {
     pub fn request_sync(&self) -> Result<(), SyncRefused> {
         if !self.configured {
             return Err(SyncRefused::NotConfigured);
+        }
+        if self.start_failed.load(Ordering::Acquire) {
+            return Err(SyncRefused::NotRunning);
         }
         if self.status().state == PollState::AuthFailed {
             return Err(SyncRefused::AuthFailed);
@@ -274,6 +283,7 @@ pub fn start(
         .map_err(|_| "GitHub API base is invalid")
         .and_then(|base| Poller::new(base, token, handle.repos.clone()))
         .inspect_err(|reason| {
+            handle.start_failed.store(true, Ordering::Release);
             handle.set(PollStatus {
                 state: PollState::Error,
                 last_poll_at: None,
@@ -461,6 +471,39 @@ fn next_delay(failures: u32) -> Duration {
         .min(MAX_BACKOFF)
 }
 
+/// The state to show and the delay before the next pass, after one pass's
+/// outcome and `failures` failed passes in a row before it.
+fn settle(
+    outcome: Result<Option<&'static str>, PollError>,
+    failures: &mut u32,
+) -> (PollState, Option<&'static str>, Duration) {
+    match outcome {
+        Ok(None) => {
+            *failures = 0;
+            (PollState::Ok, None, POLL_INTERVAL)
+        }
+        // One repo or roadmap failed: the others stay on time.
+        Ok(Some(reason)) => {
+            *failures = 0;
+            (PollState::Error, Some(reason), POLL_INTERVAL)
+        }
+        Err(PollError::Failed(reason)) => {
+            *failures = failures.saturating_add(1);
+            (PollState::Error, Some(reason), next_delay(*failures))
+        }
+        Err(PollError::RateLimited(wait)) => (
+            PollState::RateLimited,
+            Some("GitHub rate limit reached"),
+            wait.clamp(POLL_INTERVAL, MAX_BACKOFF),
+        ),
+        Err(PollError::Auth) => (
+            PollState::AuthFailed,
+            Some("GitHub refused the token; replace it and restart Core"),
+            Duration::ZERO,
+        ),
+    }
+}
+
 struct Poller {
     client: reqwest::Client,
     base: Url,
@@ -513,31 +556,7 @@ impl Poller {
         let mut last: Option<(PollState, Option<&'static str>)> = None;
         loop {
             let outcome = self.pass(&db).await;
-            let (state, error, delay) = match outcome {
-                Ok(None) => {
-                    failures = 0;
-                    (PollState::Ok, None, POLL_INTERVAL)
-                }
-                // One repo or roadmap failed: the others stay on time.
-                Ok(Some(reason)) => {
-                    failures = 0;
-                    (PollState::Error, Some(reason), POLL_INTERVAL)
-                }
-                Err(PollError::Failed(reason)) => {
-                    failures = failures.saturating_add(1);
-                    (PollState::Error, Some(reason), next_delay(failures))
-                }
-                Err(PollError::RateLimited(wait)) => (
-                    PollState::RateLimited,
-                    Some("GitHub rate limit reached"),
-                    wait.clamp(POLL_INTERVAL, MAX_BACKOFF),
-                ),
-                Err(PollError::Auth) => (
-                    PollState::AuthFailed,
-                    Some("GitHub refused the token; replace it and restart Core"),
-                    Duration::ZERO,
-                ),
-            };
+            let (state, error, delay) = settle(outcome, &mut failures);
             handle.set(PollStatus {
                 state,
                 last_poll_at: Some(OffsetDateTime::now_utc()),
@@ -591,7 +610,8 @@ impl Poller {
 
     /// The current state of every target GitHub told us about this pass,
     /// the first repo error, and the new issues window of each repo whose
-    /// targets are all up to date.
+    /// targets are all up to date. When every repo with targets failed, the
+    /// pass failed as a whole, so the poller backs off.
     async fn states(
         &mut self,
         cached: &HashMap<Target, Option<String>>,
@@ -613,6 +633,7 @@ impl Poller {
         let mut states = HashMap::new();
         let mut error = None;
         let mut windows = Vec::new();
+        let mut synced = 0;
         for repo in self.repos.clone() {
             let targets: Vec<(&Target, &Option<String>)> =
                 cached.iter().filter(|(t, _)| t.repo() == repo).collect();
@@ -620,8 +641,10 @@ impl Poller {
                 continue;
             }
             match self.repo_states(&repo, &targets, &mut states).await {
-                Ok(Some(started)) => windows.push((repo, started)),
-                Ok(None) => {}
+                Ok(window) => {
+                    synced += 1;
+                    windows.extend(window.map(|started| (repo, started)));
+                }
                 Err(PollError::Failed(reason)) => {
                     tracing::warn!(repo, reason, "GitHub repository not synced");
                     error.get_or_insert(reason);
@@ -629,7 +652,10 @@ impl Poller {
                 Err(other) => return Err(other),
             }
         }
-        Ok((states, error, windows))
+        match error {
+            Some(reason) if synced == 0 => Err(PollError::Failed(reason)),
+            _ => Ok((states, error, windows)),
+        }
     }
 
     /// The states of one repo's targets; the start of this pass when every
@@ -1283,6 +1309,49 @@ mod tests {
         assert_eq!(windows.len(), 1);
     }
 
+    #[tokio::test]
+    async fn a_pass_where_every_repo_fails_backs_off() {
+        let (base, _) = server(Arc::new(|_: &str| {
+            reply("500 Internal Server Error", "", "{}")
+        }))
+        .await;
+        let mut poller = poller(base);
+        let cached = HashMap::from([(pr(1), None)]);
+        let mut failures = 0;
+        for delay in [POLL_INTERVAL * 2, POLL_INTERVAL * 4, MAX_BACKOFF] {
+            let outcome = poller.states(&cached).await.map(|(_, error, _)| error);
+            assert_eq!(
+                outcome,
+                Err(PollError::Failed("GitHub answered with an error"))
+            );
+            assert_eq!(
+                settle(outcome, &mut failures),
+                (
+                    PollState::Error,
+                    Some("GitHub answered with an error"),
+                    delay
+                )
+            );
+        }
+        // One repo failing while another syncs is no reason to back off.
+        let (base, _) = server(Arc::new(|head: &str| match path(head) {
+            p if p.starts_with("/repos/Other/Repo/issues?") => reply("200 OK", "", "[]"),
+            "/repos/Other/Repo/releases?per_page=10" => reply("200 OK", "", "[]"),
+            "/repos/Other/Repo/pulls/1" => reply("200 OK", "", r#"{"state":"open"}"#),
+            _ => reply("500 Internal Server Error", "", "{}"),
+        }))
+        .await;
+        let mut token = HeaderValue::from_static("Bearer test-token-0123456789");
+        token.set_sensitive(true);
+        let repos = vec!["Owner/Repo".to_string(), "Other/Repo".to_string()];
+        let mut poller = Poller::new(base, token, repos).unwrap();
+        let cached = HashMap::from([(pr(1), None), (Target::Pr("Other/Repo".into(), 1), None)]);
+        let outcome = poller.states(&cached).await.map(|(_, error, _)| error);
+        assert_eq!(outcome, Ok(Some("GitHub answered with an error")));
+        assert_eq!(settle(outcome, &mut failures).2, POLL_INTERVAL);
+        assert_eq!(failures, 0);
+    }
+
     #[test]
     fn links_that_disagree_on_a_target_are_fetched_again() {
         let now = OffsetDateTime::now_utc();
@@ -1402,6 +1471,10 @@ mod tests {
         assert_eq!(handle.status().state, PollState::Starting);
         assert_eq!(handle.request_sync(), Ok(()));
         assert_eq!(handle.request_sync(), Err(SyncRefused::TooSoon));
+        // A poller that failed to start is never woken.
+        let (handle, _) = configure("a/b", Some(dir.path()));
+        handle.start_failed.store(true, Ordering::Release);
+        assert_eq!(handle.request_sync(), Err(SyncRefused::NotRunning));
     }
 
     #[test]

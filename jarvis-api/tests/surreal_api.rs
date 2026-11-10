@@ -2165,3 +2165,129 @@ async fn roadmap_routes_validate_and_guard_revisions() -> Result<(), Box<dyn std
     assert_eq!(call("GET", &base, None).await?.status(), StatusCode::OK);
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn roadmap_sync_and_link_allowlist_routes() -> Result<(), Box<dyn std::error::Error>> {
+    use jarvis_api::roadmaps::github;
+
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    // The same database behind a router without GitHub and one with the
+    // allowlist `a/b` and a token (no poller is started).
+    let open = build_router(state(db.clone(), None).await);
+    let (token, _) = enroll_login(&open, &SigningKey::from_bytes(&rand::random())).await;
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join(github::TOKEN_CREDENTIAL),
+        "github_pat_0123456789abcdefABCDEF",
+    )?;
+    let mut allow_state = state(db, None).await;
+    allow_state.github = github::configure("a/b", Some(dir.path())).0;
+    assert!(allow_state.github.configured());
+    let allow = build_router(allow_state);
+    let call = |app: &axum::Router, method: &str, path: &str, body: Option<Value>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if body.is_some() {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        app.clone().oneshot(
+            request
+                .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                .unwrap(),
+        )
+    };
+    let pr = |repo: &str, number: u64| json!({"kind": "pr", "repo": repo, "number": number});
+
+    let created = call(
+        &open,
+        "POST",
+        "/v1/roadmaps",
+        Some(json!({"title": "Plan"})),
+    )
+    .await?;
+    let id = json_body(created).await["roadmap"]["id"]
+        .as_str()
+        .ok_or("id")?
+        .to_owned();
+    let base = format!("/v1/roadmaps/{id}");
+    // Before the allowlist, any repo may be linked.
+    let item = call(
+        &open,
+        "POST",
+        &format!("{base}/items?expected_revision=1"),
+        Some(json!({"title": "A", "links": [pr("x/y", 1)]})),
+    )
+    .await?;
+    assert_eq!(item.status(), StatusCode::OK);
+    let item_id = json_body(item).await["item_id"]
+        .as_str()
+        .ok_or("item_id")?
+        .to_owned();
+
+    // Sync: 409 without GitHub, 202 once, then 429 within a minute.
+    let sync = format!("{base}/sync");
+    assert_eq!(
+        call(&open, "POST", &sync, None).await?.status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(&allow, "POST", &sync, None).await?.status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        call(&allow, "POST", &sync, None).await?.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // With the allowlist, a new link must name one of its repos, on create
+    // and on update; a link already on the item may stay.
+    let create = |links: Value| {
+        call(
+            &allow,
+            "POST",
+            &format!("{base}/items?expected_revision=2"),
+            Some(json!({"title": "B", "links": links})),
+        )
+    };
+    assert_eq!(
+        create(json!([pr("x/y", 2)])).await?.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        create(json!([pr("A/B", 2)])).await?.status(),
+        StatusCode::OK
+    );
+    let update = |revision: u64, links: Value| {
+        call(
+            &allow,
+            "PATCH",
+            &format!("{base}/items/{item_id}?expected_revision={revision}"),
+            Some(json!({ "links": links })),
+        )
+    };
+    assert_eq!(
+        update(3, json!([pr("x/y", 1), pr("x/z", 1)]))
+            .await?
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let kept = update(3, json!([pr("x/y", 1), pr("a/b", 3)])).await?;
+    assert_eq!(kept.status(), StatusCode::OK);
+    assert_eq!(json_body(kept).await["roadmap"]["revision"], 4);
+    Ok(())
+}

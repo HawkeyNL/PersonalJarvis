@@ -71,13 +71,17 @@ revision.
   - `{"kind": "release", "repo": "owner/name", "tag": "v1.2.3"}`
   - `{"kind": "url", "url": "https://…"}` (https only, no credentials, at most
     500 characters)
-  - Once `JARVIS_GITHUB_REPOS` is set, a `pr`, `issue` or `release` link
-    must name one of its repositories (400 otherwise). Links stored before
-    stay, but are not fetched.
+  - Once `JARVIS_GITHUB_REPOS` is set, a new `pr`, `issue` or `release`
+    link must name one of its repositories (400 otherwise), also when it
+    comes with an accepted proposal (nothing is applied and the proposal
+    stays pending). Links already on the item may stay, but are not
+    fetched.
   - `state` is the GitHub state the poller cached. Clients cannot set it; a
     link that stays on the item keeps it.
-- `auto_status` is the status the GitHub poller last derived. Owner edits
-  never write it.
+- `auto_status` is the status the item's links stand for, from their
+  cached GitHub states. Clients cannot set it; the poller sets it, and an
+  edit of `links` derives it again from the links that stay (the item's
+  `status` is not changed by that).
 
 Roadmap `title` is 1 to 120 characters on one line, `description` 1 to 2000
 characters, `phases` at most 20 distinct names of 1 to 60 characters. Text
@@ -201,9 +205,10 @@ proposal becomes stale.
   token.
 - Fetch a `url` link, a repository outside the allowlist or any host but
   `api.github.com`.
-- Log the token or put it in Core's environment, which child processes
-  inherit: it is only sent in the `Authorization` header to
-  `api.github.com`.
+- Log the token or put it in Core's environment: it is only sent in the
+  `Authorization` header to `api.github.com`. Child processes do not get
+  it through the environment, but any process running as Core's user can
+  read the credential file.
 - Move an item backwards or out of `blocked`, or override an owner's edit
   without a new GitHub fact.
 
@@ -213,8 +218,8 @@ proposal becomes stale.
   cannot read: the pass keeps the last known states and `state` is `error`
   with a fixed `last_error`. When only some repositories or roadmaps
   failed, the others are stored and the next pass comes on time; when the
-  whole pass failed, the next one waits 20, 40 and then 60 minutes until
-  one succeeds.
+  whole pass failed (every linked repository, or loading the roadmaps), the
+  next one waits 20, 40 and then 60 minutes until one succeeds.
 - Rate limited (403 or 429 with `Retry-After` or an exhausted
   `X-RateLimit-Remaining`): `state` is `rate_limited` and the next pass
   waits until GitHub's reset, at least 10 minutes and at most an hour.
@@ -223,8 +228,8 @@ proposal becomes stale.
 - A missing token or allowlist: `state` is `not_configured`; an invalid
   one is logged and shown in `last_error`. Core always starts.
 
-`POST /v1/roadmaps/{id}/sync` answers 409 when the poller is not configured
-or stopped on a 401, and 429 within a minute of the previous sync. During a
+`POST /v1/roadmaps/{id}/sync` answers 409 when the poller is not configured,
+could not start or stopped on a 401, and 429 within a minute of the previous sync. During a
 rate limit the sync waits for the limit.
 
 ### Owner setup

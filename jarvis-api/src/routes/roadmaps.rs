@@ -181,10 +181,8 @@ pub(crate) async fn update_item(
     Query(revision): Query<RevisionQuery>,
     Json(patch): Json<ItemPatch>,
 ) -> ApiResult {
-    state
-        .github
-        .check_links(patch.links.iter().flatten())
-        .map_err(bad_request)?;
+    // Only links the item does not have yet must be allowlisted; the store
+    // checks that against the revision it writes on.
     let device = authed.device.id.to_string();
     bounded(store::update_item(
         &state.db,
@@ -193,6 +191,7 @@ pub(crate) async fn update_item(
         &item.to_string(),
         &patch,
         &device,
+        &state.github,
     ))
     .await
     .map(snapshot)
@@ -251,6 +250,7 @@ pub(crate) async fn accept_proposal(
         &id.to_string(),
         &proposal.to_string(),
         &device,
+        &state.github,
     ))
     .await
     .map(snapshot)
@@ -292,6 +292,9 @@ pub(crate) async fn sync(
         Ok(()) => Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true })))),
         Err(SyncRefused::NotConfigured) => {
             Err(error(StatusCode::CONFLICT, "GitHub sync is not configured"))
+        }
+        Err(SyncRefused::NotRunning) => {
+            Err(error(StatusCode::CONFLICT, "GitHub sync is not running"))
         }
         Err(SyncRefused::AuthFailed) => Err(error(
             StatusCode::CONFLICT,

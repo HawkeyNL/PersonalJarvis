@@ -471,6 +471,23 @@ fn progress(status: Status) -> u8 {
     }
 }
 
+/// The links in `after` that the same item did not have in `before`: every
+/// link of a new item, and only the added links of an existing one.
+pub(crate) fn added_links<'a>(before: &[Item], after: &'a [Item]) -> Vec<&'a Link> {
+    after
+        .iter()
+        .flat_map(|item| {
+            let old = before
+                .iter()
+                .find(|old| old.id == item.id)
+                .map_or(&[][..], |old| &old.links);
+            item.links
+                .iter()
+                .filter(move |link| !old.iter().any(|o| o.same_target(link)))
+        })
+        .collect()
+}
+
 /// The most advanced status the item's links stand for.
 pub fn derived_status(links: &[Link]) -> Option<Status> {
     links
@@ -729,6 +746,11 @@ impl Draft {
         }
         if let Some(links) = new_links {
             new.links = links;
+        }
+        // Kept links keep their cached state, so this matches what the
+        // poller would derive; a removed link no longer counts.
+        if new.links != old.links {
+            new.auto_status = derived_status(&new.links);
         }
         let fields: Vec<String> = [
             ("title", old.title != new.title),
@@ -1358,6 +1380,64 @@ mod tests {
         assert_eq!(draft.items[0].status, Status::Blocked);
         assert_eq!(draft.items[0].auto_status, Some(Status::Live));
         assert!(draft.changes[0].to_status.is_none());
+
+        // An owner's links edit re-derives auto_status from the links kept;
+        // the status itself stays.
+        let mut snap = snapshot(1);
+        snap.items[0].status = Status::Ready;
+        snap.items[0].links = vec![with(&pr, "merged")];
+        snap.items[0].auto_status = Some(Status::Ready);
+        let id = snap.items[0].id.clone();
+        let mut draft = Draft::new(snap);
+        let links = |links: Vec<Link>| ItemPatch {
+            links: Some(links),
+            ..ItemPatch::default()
+        };
+        draft
+            .update_item(&id, &links(vec![pr.clone(), release.clone()]))
+            .unwrap();
+        assert_eq!(draft.items[0].auto_status, Some(Status::Ready));
+        assert_eq!(draft.items[0].links[0].state.as_deref(), Some("merged"));
+        draft
+            .update_item(&id, &links(vec![release.clone()]))
+            .unwrap();
+        assert_eq!(draft.items[0].auto_status, None);
+        assert_eq!(draft.items[0].status, Status::Ready);
+    }
+
+    #[test]
+    fn added_links_are_only_the_new_ones() {
+        let pr = |number| Link {
+            repo: Some("a/b".into()),
+            number: Some(number),
+            ..link(LinkKind::Pr)
+        };
+        let mut before = snapshot(1).items;
+        before[0].links = vec![Link {
+            state: Some("open".into()),
+            ..pr(1)
+        }];
+        let mut after = before.clone();
+        after[0].links = vec![pr(1), pr(2)];
+        let mut new = after[0].clone();
+        new.id = uuid::Uuid::now_v7().to_string();
+        new.links = vec![pr(3)];
+        after.push(new);
+        assert_eq!(added_links(&before, &after), [&pr(2), &pr(3)]);
+
+        // Once the allowlist is set, a link already on the item may stay
+        // although it names another repo; a new one may not.
+        let (allowlist, _) = github::configure("a/b", None);
+        let outside = |number| Link {
+            repo: Some("x/y".into()),
+            ..pr(number)
+        };
+        before[0].links = vec![outside(1)];
+        after.truncate(1);
+        after[0].links = vec![outside(1), pr(2)];
+        assert!(allowlist.check_links(added_links(&before, &after)).is_ok());
+        after[0].links.push(outside(4));
+        assert!(allowlist.check_links(added_links(&before, &after)).is_err());
     }
 
     #[test]
