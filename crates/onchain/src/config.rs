@@ -11,7 +11,7 @@
 //! Configs are parsed with unknown fields denied, so a misspelt field is an
 //! error rather than a silently ignored setting. Durations are whole seconds.
 
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use time::Duration;
 
@@ -313,6 +313,22 @@ impl StrategyConfig {
 
     pub fn token_cooldown(&self) -> Duration {
         secs(self.token_cooldown_secs)
+    }
+
+    /// USD to spend on an entry: the config's share of the mandate's
+    /// `max_position_usd`, capped by its share of pool liquidity and rounded
+    /// down to cents. `None` when that is nothing or overflows.
+    pub fn entry_size(&self, liquidity_usd: Decimal, max_position_usd: Decimal) -> Option<Decimal> {
+        let bps = Decimal::from(10_000);
+        let by_mandate =
+            max_position_usd.checked_mul(Decimal::from(self.position_share_bps))? / bps;
+        let by_liquidity =
+            liquidity_usd.checked_mul(Decimal::from(self.max_liquidity_share_bps))? / bps;
+        // Round down: rounding up could exceed the mandate limit by a cent.
+        let size = by_mandate
+            .min(by_liquidity)
+            .round_dp_with_strategy(2, RoundingStrategy::ToZero);
+        (size > Decimal::ZERO).then_some(size)
     }
 }
 

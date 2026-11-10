@@ -121,6 +121,21 @@ pub enum Event {
     VoiceStopped { run_id: Uuid, device_id: Uuid },
     #[serde(rename = "voice.failed")]
     VoiceFailed { run_id: Uuid, device_id: Uuid },
+    /// A memecoin paper strategy changed its active version or enabled
+    /// state. A hint to reload `GET /v1/trading/meme/strategies/{id}`.
+    /// Core does not send it yet: apps released before they ignore unknown
+    /// event types would fail on it.
+    #[serde(rename = "trading.meme.strategy_changed")]
+    MemeStrategyChanged {
+        strategy_id: String,
+        version: u32,
+        enabled: bool,
+    },
+    /// The strategy agent recorded a paper decision; reload
+    /// `GET /v1/trading/meme/decisions`. Not sent yet, like
+    /// [`Event::MemeStrategyChanged`].
+    #[serde(rename = "trading.meme.decision")]
+    MemeDecision { id: String },
 }
 
 /// Fixed safe failure codes, not raw provider errors.
@@ -279,6 +294,26 @@ mod tests {
             serde_json::from_value::<RunIdentity>(new["payload"].clone()).unwrap(),
             run
         );
+    }
+
+    #[test]
+    fn memecoin_events_carry_only_ids_and_state() {
+        let changed = Event::MemeStrategyChanged {
+            strategy_id: "b-base-reclaim".into(),
+            version: 1_000_002,
+            enabled: false,
+        };
+        let wire = serde_json::to_value(&changed).unwrap();
+        assert_eq!(wire["type"], "trading.meme.strategy_changed");
+        assert_eq!(
+            wire["payload"],
+            serde_json::json!({"strategy_id": "b-base-reclaim", "version": 1_000_002, "enabled": false})
+        );
+        assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), changed);
+        let decision = Event::MemeDecision { id: "d1".into() };
+        let wire = serde_json::to_value(&decision).unwrap();
+        assert_eq!(wire["type"], "trading.meme.decision");
+        assert_eq!(wire["payload"], serde_json::json!({"id": "d1"}));
     }
 
     #[test]

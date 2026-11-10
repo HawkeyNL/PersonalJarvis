@@ -194,6 +194,24 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/trading/meme/candidates", get(routes::meme::candidates))
         .route("/v1/trading/meme/trades", get(routes::meme::trades))
         .route("/v1/trading/meme/pause", post(routes::meme::pause))
+        .route("/v1/trading/meme/strategies", get(routes::meme::strategies))
+        .route(
+            "/v1/trading/meme/strategies/{id}",
+            get(routes::meme::strategy),
+        )
+        .route(
+            "/v1/trading/meme/strategies/{id}/disable",
+            post(routes::meme::disable),
+        )
+        .route(
+            "/v1/trading/meme/strategies/{id}/enable/challenge",
+            post(routes::meme::enable_challenge),
+        )
+        .route(
+            "/v1/trading/meme/strategies/{id}/enable",
+            post(routes::meme::enable).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route("/v1/trading/meme/decisions", get(routes::meme::decisions))
         .route(
             "/v1/roadmaps",
             get(routes::roadmaps::list)

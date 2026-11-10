@@ -1425,11 +1425,26 @@ async fn month_statistics_break_down_agents_latency_failures_and_fallbacks(
     Ok(())
 }
 
-const MEME_ROUTES: [(&str, &str); 4] = [
+const MEME_ROUTES: [(&str, &str); 10] = [
     ("GET", "/v1/trading/meme/overview"),
     ("GET", "/v1/trading/meme/candidates?limit=5"),
     ("GET", "/v1/trading/meme/trades"),
     ("POST", "/v1/trading/meme/pause"),
+    ("GET", "/v1/trading/meme/strategies"),
+    ("GET", "/v1/trading/meme/strategies/a-survivor-momentum"),
+    (
+        "POST",
+        "/v1/trading/meme/strategies/a-survivor-momentum/disable",
+    ),
+    (
+        "POST",
+        "/v1/trading/meme/strategies/a-survivor-momentum/enable/challenge",
+    ),
+    (
+        "POST",
+        "/v1/trading/meme/strategies/a-survivor-momentum/enable",
+    ),
+    ("GET", "/v1/trading/meme/decisions?limit=5"),
 ];
 
 #[tokio::test]
@@ -1718,6 +1733,251 @@ async fn trading_routes_serve_the_synced_portfolio_read_only(
             call(&on, "GET", path).await?.status(),
             StatusCode::NOT_FOUND
         );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn memecoin_strategies_disable_at_once_and_enable_only_with_a_fresh_signature(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jarvis_api::memecoin::{self, store};
+    use rust_decimal::Decimal;
+
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    // Base rules none of the seeds loosens.
+    let rules = jarvis_onchain::filter::FilterRules {
+        min_liquidity_usd: Decimal::ZERO,
+        min_pool_age: time::Duration::ZERO,
+        max_top_holders_share: Decimal::ONE,
+        max_sell_impact_bps: 10_000,
+        allowed_extensions: vec![],
+        max_snapshot_age: time::Duration::minutes(1),
+        min_lp_lock_remaining: time::Duration::ZERO,
+    };
+    memecoin::seed_strategies(&db, &rules).await?;
+    let app = build_router(state(db.clone(), None).await);
+    let signing = SigningKey::from_bytes(&rand::random());
+    let (token, _) = enroll_login(&app, &signing).await;
+    let call = |method: &'static str, path: String, body: Option<Value>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        let body = match body {
+            Some(body) => {
+                request = request.header(header::CONTENT_TYPE, "application/json");
+                Body::from(body.to_string())
+            }
+            None => Body::empty(),
+        };
+        app.clone().oneshot(request.body(body).unwrap())
+    };
+    let me = json_body(call("GET", "/v1/auth/me".into(), None).await?).await;
+    let device: uuid::Uuid = me["device_id"].as_str().ok_or("no device")?.parse()?;
+    let base = "/v1/trading/meme/strategies";
+    let a = format!("{base}/a-survivor-momentum");
+
+    let listed = json_body(call("GET", base.into(), None).await?).await;
+    assert_eq!(listed["strategies"].as_array().map(Vec::len), Some(3));
+    assert_eq!(listed["strategies"][0]["family"], "a");
+    assert_eq!(listed["strategies"][0]["performance"]["trades"], 0);
+    let detail = json_body(call("GET", a.clone(), None).await?).await;
+    assert_eq!(detail["enabled"], true);
+    assert_eq!(detail["versions"][0]["author"], "seed");
+    assert_eq!(detail["versions"][0]["diff"], Value::Null);
+    assert_eq!(detail["versions"][0]["config"]["id"], "a-survivor-momentum");
+    assert_eq!(
+        detail["active_config_sha256"].as_str().map(str::len),
+        Some(64)
+    );
+    assert_eq!(
+        call("GET", format!("{base}/A!"), None).await?.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call("GET", format!("{base}/missing"), None).await?.status(),
+        StatusCode::NOT_FOUND
+    );
+    // Nothing to enable yet.
+    let challenge = call("POST", format!("{a}/enable/challenge"), None).await?;
+    assert_eq!(challenge.status(), StatusCode::CONFLICT);
+    // Only a device that can approve may ask for a challenge.
+    let set_platform = |platform: &'static str| {
+        let db = db.clone();
+        async move {
+            db.query("UPDATE devices SET platform = $platform WHERE record::id(id) = $id")
+                .bind(json!({"platform": platform, "id": device.to_string()}))
+                .await?
+                .check()
+        }
+    };
+    set_platform("linux").await?;
+    let challenge = call("POST", format!("{a}/enable/challenge"), None).await?;
+    assert_eq!(challenge.status(), StatusCode::FORBIDDEN);
+    set_platform("ios").await?;
+
+    // Disabling needs only the session, and holds as the owner's.
+    let disabled = call("POST", format!("{a}/disable"), None).await?;
+    assert_eq!(disabled.status(), StatusCode::OK);
+    let detail = json_body(call("GET", a.clone(), None).await?).await;
+    assert_eq!(
+        (
+            detail["enabled"].clone(),
+            detail["disabled_by_owner"].clone()
+        ),
+        (json!(false), json!(true))
+    );
+    assert_eq!(
+        call("POST", format!("{base}/missing/disable"), None)
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let enable = |signature: String| {
+        call(
+            "POST",
+            format!("{a}/enable"),
+            Some(json!({ "signature": signature })),
+        )
+    };
+    let new_challenge = || async {
+        let response = call("POST", format!("{a}/enable/challenge"), None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await
+    };
+    let sign = |challenge: &Value, version: u32| {
+        let message = jarvis_client_core::meme_strategy_enable_message(
+            "a-survivor-momentum",
+            version,
+            &hex::decode(challenge["config_sha256"].as_str().unwrap()).unwrap(),
+            &hex::decode(challenge["nonce"].as_str().unwrap()).unwrap(),
+            device,
+        )
+        .unwrap();
+        hex::encode(signing.sign(&message).to_bytes())
+    };
+    // Without a challenge there is nothing to sign.
+    assert_eq!(
+        enable("00".repeat(64)).await?.status(),
+        StatusCode::CONFLICT
+    );
+    // A signature over other bytes fails and uses the challenge up.
+    let first = new_challenge().await;
+    assert_eq!(first["message"], "meme-strategy-enable-v1");
+    // The challenge carries the exact bytes it binds.
+    let config_json = first["config_json"].as_str().ok_or("no config")?;
+    assert_eq!(
+        first["config_sha256"],
+        hex::encode(sha2::Sha256::digest(config_json.as_bytes()))
+    );
+    let version = u32::try_from(first["version"].as_u64().ok_or("no version")?)?;
+    assert_eq!(
+        enable(sign(&first, version + 1)).await?.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        enable(sign(&first, version)).await?.status(),
+        StatusCode::CONFLICT
+    );
+    // A good signature enables it, once.
+    let second = new_challenge().await;
+    let good = sign(&second, version);
+    assert_eq!(enable(good.clone()).await?.status(), StatusCode::OK);
+    let detail = json_body(call("GET", a.clone(), None).await?).await;
+    assert_eq!(
+        (
+            detail["enabled"].clone(),
+            detail["disabled_by_owner"].clone()
+        ),
+        (json!(true), json!(false))
+    );
+    assert_eq!(enable(good).await?.status(), StatusCode::CONFLICT);
+
+    // A version switch after the challenge voids the signature.
+    assert_eq!(
+        call("POST", format!("{a}/disable"), None).await?.status(),
+        StatusCode::OK
+    );
+    let third = new_challenge().await;
+    let mut config = jarvis_onchain::config::seeds()[0].clone();
+    config.version = version + 10;
+    config.parent = Some(version);
+    config.stop_loss_bps = 1_500;
+    store::insert_strategy_version(
+        &db,
+        &store::StrategyVersion {
+            version: config.version,
+            strategy_id: config.id.clone(),
+            family: store::StrategyFamily::A,
+            parent_version: Some(version),
+            author: store::StrategyAuthor::Claude,
+            params: serde_json::to_string(&config)?,
+            rationale: Some("Tighter stop.".into()),
+            backtest: None,
+            created_at: time::OffsetDateTime::now_utc(),
+        },
+    )
+    .await?;
+    assert!(store::set_active_version(&db, "a-survivor-momentum", config.version, "claude").await?);
+    assert_eq!(
+        enable(sign(&third, version)).await?.status(),
+        StatusCode::CONFLICT
+    );
+    let detail = json_body(call("GET", a.clone(), None).await?).await;
+    assert_eq!(detail["enabled"], false);
+    assert_eq!(detail["active_version"], config.version);
+    assert_eq!(detail["versions"][0]["rationale"], "Tighter stop.");
+    assert_eq!(
+        detail["versions"][0]["diff"],
+        json!([{"field": "stop_loss_bps", "from": 2_000, "to": 1_500}])
+    );
+
+    // Every enable attempt and disable is audited with its device.
+    let outcomes: Vec<String> = db
+        .query("SELECT VALUE outcome FROM (SELECT outcome, ts FROM security_audit WHERE event = 'memecoin.strategy.enable' ORDER BY ts)")
+        .await?
+        .check()?
+        .take(0)?;
+    assert_eq!(
+        outcomes,
+        [
+            "no_challenge",
+            "denied",
+            "no_challenge",
+            "enabled",
+            "no_challenge",
+            "changed"
+        ]
+    );
+    let disables: Vec<String> = db
+        .query("SELECT VALUE outcome FROM (SELECT outcome, ts FROM security_audit WHERE event = 'memecoin.strategy.disable' ORDER BY ts)")
+        .await?
+        .check()?
+        .take(0)?;
+    assert_eq!(disables, ["disabled", "not_found", "disabled"]);
+
+    // Decisions are listed within bounds.
+    let decisions = json_body(call("GET", "/v1/trading/meme/decisions".into(), None).await?).await;
+    assert_eq!(decisions["decisions"], json!([]));
+    for bad in ["limit=0", "limit=101", "limit=x"] {
+        let response = call("GET", format!("/v1/trading/meme/decisions?{bad}"), None).await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
     }
     Ok(())
 }
