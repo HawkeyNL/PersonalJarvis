@@ -95,7 +95,8 @@ const MAX_SEPARATOR_RUN: usize = 3;
 
 /// 6+ contiguous digits, or digit groups joined by separators (see
 /// [`digit_runs`]) with 8+ digits or 6+ groups in total (IBAN, card and
-/// phone numbers). Any digit counts (see [`is_digit`]). Other punctuation or
+/// phone numbers). Any numeric character counts, superscripts and fullwidth
+/// digits included. Other punctuation or
 /// a letter ends a number, so `06,1234,5678` passes: this is a heuristic,
 /// not a complete detector.
 /// With `dates_allowed`, a run that is exactly one date is not private.
@@ -131,7 +132,9 @@ fn digit_runs(text: &str) -> Vec<Vec<(char, String)>> {
     let (mut group, mut joint, mut before) = (String::new(), String::new(), '\0');
     let visible = text.chars().filter(|c| !is_invisible(*c));
     for c in visible.chain(['\0']) {
-        if is_digit(c) {
+        // Any numeric character, superscripts included: only an amount
+        // needs a real digit (see `is_digit`).
+        if c.is_numeric() {
             if group.is_empty() {
                 before = match (run.is_empty(), joint.chars().count()) {
                     (true, _) => '\0',
@@ -202,18 +205,22 @@ fn is_invisible(c: char) -> bool {
                 | '\u{202a}'..='\u{202e}'
                 | '\u{2060}'..='\u{206f}'
                 | '\u{20d0}'..='\u{20ff}'
+                | '\u{2800}'
                 | '\u{3164}'
                 | '\u{fe00}'..='\u{fe0f}'
                 | '\u{fe20}'..='\u{fe2f}'
                 | '\u{feff}'
                 | '\u{ffa0}'
                 | '\u{fff0}'..='\u{fffb}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
                 | '\u{e0000}'..='\u{e0fff}'
         )
 }
 
-/// A digit in any script (fullwidth included), but not a superscript,
-/// subscript, fraction or Roman numeral, so `m²` or `½` is no number.
+/// A digit in an amount: any script (fullwidth included), but not a
+/// superscript, subscript, fraction or Roman numeral, so `m²` or `½` next to
+/// a currency word is no amount.
 fn is_digit(c: char) -> bool {
     c.is_numeric()
         && !matches!(
@@ -449,6 +456,11 @@ mod tests {
             ("1920×1080 monitor", false),
             ("2024→2025", false),
             ("prijs per m² in 2026", false),
+            ("⁰⁶¹²³⁴⁵⁶⁷⁸", true),
+            ("₀₆₁₂₃₄₅₆₇₈", true),
+            ("06\u{2800}1234\u{2800}5678", true),
+            ("06\u{1bca0}1234\u{1bca0}5678", true),
+            ("06\u{1d173}1234\u{1d173}5678", true),
             // Two years are a range, not a number; a third group is.
             ("inflatie 2024 - 2025", false),
             ("2024-2025 verkiezingen", false),
@@ -498,6 +510,7 @@ mod tests {
         assert!(is_private("salary of ８０k", &[]));
         assert!(is_private("inflatie 2024 - 2025", &[]));
         assert!(!is_private("prijs per m² in de stad", &[]));
+        assert!(!is_private("prijs in euro per m²", &[]));
         assert!(!is_private("½ liter melk", &[]));
     }
 }

@@ -337,15 +337,15 @@ when it contains:
   and fullwidth look-alikes such as `–`, `—` and the minus sign) with 8 or
   more digits or 6 or more groups in total (`4111 1111 1111 1111`,
   `06 1234 5678`, `06 - 1234 - 5678`, `+31 6 12 34 56 78`, `1 2 3 4 5 6`, and
-  the digits of `NL91 ABNA 0417 1643 00`). Any decimal digit counts,
-  fullwidth ones included, but not superscripts, fractions or Roman
-  numerals. Invisible characters (control, zero-width and bidi characters,
+  the digits of `NL91 ABNA 0417 1643 00`). Any numeric character counts,
+  fullwidth and superscript digits included. Invisible characters (control, zero-width and bidi characters,
   blank fillers, combining marks, variation selectors) are ignored, so they
   never split a number. A letter, a visible symbol (`€`, `×`, `→`) or other
   punctuation such as `,` ends a number: this is a heuristic, not a complete
   detector.
   Dates such as `2024-11-08` and year ranges such as `2024 - 2025` count too;
-- a currency amount (any digit counts, as above): `€`, `$`, `£`, or the whole word `EUR`, `euro`, `euros`,
+- a currency amount (any digit counts, fullwidth included, but not a
+  superscript, fraction or Roman numeral, so `m²` is no amount): `€`, `$`, `£`, or the whole word `EUR`, `euro`, `euros`,
   `USD`, `dollar`, `dollars` or `GBP`, with a number in the question; or a
   number with a `k` suffix (`80k`);
 - a key-like token: a word starting with `sk-`, `ghp_` or `AKIA`, `-----BEGIN`,
