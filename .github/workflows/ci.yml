@@ -39,6 +39,14 @@ jobs:
       - run: python3 scripts/ci/check-deployment-privacy.py
       - run: python3 scripts/ci/test-deployment-privacy.py
 
+  egress-tools:
+    name: Web egress tool guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 scripts/ci/check-egress-tools.py
+      - run: python3 scripts/ci/test-egress-tools.py
+
   rust-validation:
     name: Rust — fmt, clippy, test
     runs-on: ubuntu-latest

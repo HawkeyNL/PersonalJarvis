@@ -510,14 +510,44 @@ carries only the latest question (at most 2000 characters; the worker accepts
 at most 8 KiB) and a fixed research instruction. Without the flag, both
 workers run exactly as described above, with every tool off.
 
-**Claude.** A research run changes only the tool flags of the reviewed
-invocation:
+**Claude.** A research run changes only the output format and the tool flags
+of the reviewed invocation:
 
 ```text
-claude -p --output-format json --model <model> --restricted --strict-mcp-config
+claude -p --output-format stream-json --model <model> --restricted --strict-mcp-config
   --no-session-persistence --tools WebSearch --disallowedTools mcp__*
-  --disable-slash-commands --allowedTools WebSearch --max-turns 8 [--system-prompt-file <private file>]
+  --disable-slash-commands --verbose --allowedTools WebSearch --max-turns 8
+  [--system-prompt-file <private file>]
 ```
+
+The worker reads the stream line by line (`-p` emits `stream-json` only with
+`--verbose`). The event shapes were checked against the installed Claude Code
+2.1.311, its `--help` and changelog, and the tool-use records of local Claude
+Code transcripts: `system`, `assistant` (with `message.content` blocks such as
+`text`, `thinking` and `tool_use`, where a search is
+`{"type":"tool_use","name":"WebSearch","input":{"query":...}}`), `user` (tool
+results) and a final `result` event with the same fields as
+`--output-format json`. The worker stops the run's process group and returns
+`tool_use_refused` on any tool-use block (`tool_use`, `server_tool_use`,
+`mcp_tool_use`) other than a `WebSearch` whose query is a string the
+identifier check (`jarvis_llm::privacy::leaks_identifier`, as for Codex) does
+not flag, and on any line that is not a JSON object with a type. That
+includes the CLI's own `EndConversation`. Claude Code's `WebSearch` tool makes
+its own inner call to the web search backend, and the queries of that call
+are not in the outer stream. The worker checks every string and number in
+the outer `input` (the query and any `allowed_domains` or `blocked_domains`); the inner
+call gets only that checked input, never the question or the rest of the run.
+What the inner call then searches for is not visible to the worker.
+Unlike the Codex event allowlist, other event types and content blocks that
+are not tool use pass: the CLI adds event types between releases, and
+`--tools WebSearch` already keeps every other tool out of the run.
+The answer comes only from the final `result` event; a run without one is a
+`runtime_failure`. Each line keeps the 256 KiB bound of the single JSON
+reply, and the whole stream is bounded at 4 MiB. Like the Codex check, this
+detects and discards: the event reaches the worker after the CLI produced the
+tool call, so the search may already have run. A real research run with this
+invocation has not been accepted on the Home Node yet. Ordinary chat and typed
+tasks keep `--output-format json` unchanged.
 
 `--tools WebSearch` makes `WebSearch` the only built-in tool (the CLI
 reference: `--tools` restricts the built-in tools to the named ones;
@@ -539,14 +569,36 @@ run has not been accepted on the Home Node yet.
 `disabled | cached | indexed | live`). The search is OpenAI's hosted web search
 tool; the CLI fetches nothing itself. The event allowlist then also accepts
 `web_search` items (codex-rs `exec` JSONL `item.started|updated|completed` with
-`item.type == "web_search"`) whose `action.type` is `search`, `open_page` or
-`find_in_page`, or that have no action. Every other tool item (command, MCP,
-collab tool, file change, plan update), a web search with an unknown or
+`item.type == "web_search"`) whose `action.type` is `search`, or that have no
+action, and only when every query the item carries (`query`, `action.query`
+and each string in `action.queries`) is a string that the identifier check
+(`jarvis_llm::privacy::leaks_identifier`: no email address, key, possessive
+account word or long number; a plain date is fine) does not flag. A completed
+search item must carry at least one non-empty query; one without any is
+refused, and so is a turn that completes, or a stream that ends, while a
+started search item (tracked by its `id`) never completed. By owner decision, `open_page` and `find_in_page` actions are
+refused. Codex CLI 0.166.0 has no setting that
+turns them off: `web_search` is `disabled | cached | indexed | live`, and
+those modes only set the hosted tool's `external_web_access` and
+`indexed_web_access`; `tools.web_search` only takes `context_size`,
+`allowed_domains` and `location` (codex-rs `rust-v0.166.0`,
+`core/src/tools/hosted_spec.rs` and `protocol/src/config_types.rs`). Every
+other tool item (command, MCP, collab tool, file change, plan update), a page
+open or find, a flagged or non-string query, a web search with an unknown or
 `other` action, a web search in an ordinary run, and any unknown event still
 stops the whole run with `tool_use_refused`.
 
+This is detect and discard, not prevention: the item reaches the worker after
+the provider ran the search or opened the page, so a flagged query or a page
+open has already left OpenAI's side by then. The worker then kills the run's
+process group and discards the answer, so nothing from that run reaches Core.
+
 `codex exec` may add its own environment context to the prompt, such as the
-time zone or the empty working directory; the worker cannot remove it. Newer
+current date, the time zone or the empty working directory; the worker cannot
+remove it. Codex CLI 0.166.0 takes the time zone name from the host's
+`/etc/localtime` (`iana-time-zone`, `core/src/session/turn_context.rs`
+`local_time_context`), which ignores `TZ`, so the host's zone name still
+reaches a Codex prompt; `TZ=UTC` only fixes the date. Newer
 codex-rs releases also have a standalone search path in which the CLI itself
 POSTs the query to an OpenAI search endpoint from the host. Both, and the
 `web_search` event and item names above, must be re-checked against the exact
@@ -559,18 +611,39 @@ at most one of them may be a background run (research, or on Claude a typed
 task, see below); a second background request while one runs is refused
 (`runtime_failure`), never queued, so one slot always stays free for chat. A
 research failure does not put the subscription into the router's cooldown for
-chat, except an authentication failure or a plan limit. The output bounds are
-unchanged (Claude: 256 KiB CLI result; Codex: 512 KiB per event, 4 MiB stream,
-128 KiB answer). The worker reads Core's request within 5 seconds.
+chat, except an authentication failure or a plan limit. The output bounds of
+chat and tasks are unchanged (Claude: 256 KiB CLI result; Codex: 512 KiB per
+event, 4 MiB stream, 128 KiB answer); a Claude research run adds 256 KiB per
+event and a 4 MiB stream. The worker reads Core's request within 5 seconds.
 
-**Prompt injection.** Search results can contain instructions. The research
-instruction tells the model to treat web content as data, and the worker
+**Prompt injection and privacy.** Search results can contain instructions.
+The research instruction tells the model to treat web content as data, never
+to put personal information (names, contact details, account numbers,
+amounts, holdings or a location) in a search query or URL, and never to
+publish, post, submit, comment or reply anywhere, only to read. The worker
 limits what an injected instruction could do: Claude has no tool except
 `WebSearch` (besides the CLI's own `EndConversation`) and at most 8 turns,
-and Codex runs that use any other tool are killed and discarded. The run's
-context holds only the question, so there is no private data to leak into a
-search query. No unit or network change is needed: the search runs on the
-provider's side and neither worker fetches web pages itself.
+and both workers kill and discard a run that uses any other tool or searches
+for a query the identifier check flags (see above). The run's
+context holds only the question and that fixed instruction: no persona,
+memory, history or runtime facts. In a research run both workers run the CLI
+with `TZ=UTC`; chat and typed tasks keep their environment unchanged. For
+Claude Code this is unverified beyond the variable being set; Codex still
+reads the zone name from `/etc/localtime` (see above). The question itself, or words
+from it, still leaves the host in a search query, so Core runs a
+deterministic identifier check (`jarvis_llm::privacy::leaks_identifier`, see
+`MODEL_ROUTING_OPERATIONS.md`, "Privacy gate") on every Research question
+before any worker is called; an automatic run must also pass the wider
+`is_private` gate first. A flagged question gets a fixed notice asking the
+owner to rephrase it without personal details; there is no override. When a
+worker stops a run (`tool_use_refused`), Core answers with a fixed notice that
+the search was stopped to protect privacy, not with the "unavailable" notice.
+That refusal ends the research run: the router never retries the question on
+another subscription. Any other research failure moves on to the next
+subscription, and the last failure decides the notice. Names and other
+free-text details are not detectable. No unit or network change is needed:
+the search runs on the provider's side and neither worker fetches web pages
+itself.
 
 **Marking and containment in Core.** Core stores a completed research answer
 with the model `web:<model>` (metering keeps the plain model; a fixed notice

@@ -20,6 +20,7 @@ use jarvis_llm::claude_worker_protocol::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
+    process::Child,
     sync::{OwnedSemaphorePermit, Semaphore},
 };
 
@@ -162,6 +163,22 @@ pub fn validate_root_binary(path: &str) -> Result<()> {
         bail!("unsafe official runtime executable");
     }
     Ok(())
+}
+
+/// Kill the run's whole process group, then reap the CLI and whatever of its
+/// group was re-parented to this worker (the Codex chat worker is PID 1 under
+/// `PrivatePIDs`; elsewhere only the CLI itself is this worker's child).
+/// Either the CLI is not reaped yet, or a group member still holds its output
+/// open (the only wait after the CLI is reaped), so the group id is still in
+/// use and cannot belong to another run.
+pub async fn stop_group(child: &mut Child, group: libc::pid_t) {
+    unsafe { libc::kill(-group, libc::SIGKILL) };
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    let reap = tokio::task::spawn_blocking(move || {
+        while unsafe { libc::waitpid(-group, std::ptr::null_mut(), 0) } > 0 {}
+    });
+    let _ = tokio::time::timeout(Duration::from_secs(5), reap).await;
 }
 
 #[cfg(test)]

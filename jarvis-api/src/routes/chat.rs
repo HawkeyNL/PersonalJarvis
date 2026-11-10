@@ -559,6 +559,12 @@ const RESEARCH_OFF: &str = "Research is off. The owner can turn on web search wi
 `sudo jarvis models route research-web-search on` or in Core Admin (Model routing).";
 const RESEARCH_UNAVAILABLE: &str = "Research is unavailable right now: no enabled \
 subscription (claude-cli or codex-cli) could run the question. No paid API was used.";
+const RESEARCH_STOPPED: &str = "The web search was stopped to protect your privacy: \
+the run tried a search or tool that is not allowed, and its answer was discarded. \
+Rephrase the question without personal details and ask again.";
+const RESEARCH_PRIVATE: &str = "Research did not run: the question may contain \
+personal details, such as an email address, a phone, account or card number, a key, \
+or your own portfolio or account. Rephrase it without personal details and ask again.";
 const RESEARCH_EMPTY: &str = "The web search returned no usable answer. \
 Ask again or rephrase the question.";
 /// Longest research answer, in characters, that is stored.
@@ -775,8 +781,10 @@ async fn auto_research_answer(
     })
 }
 
-/// The answer to an explicit Research request. Off, too long or unavailable
-/// is a clear, fixed answer, never a silent paid-API or non-search answer.
+/// The answer to an explicit Research request. Off, too long, carrying a
+/// personal identifier ([`llm::privacy::leaks_identifier`]) or unavailable is
+/// a clear, fixed answer, never a silent paid-API or non-search answer. There
+/// is no override. An automatic run passed the wider `is_private` first.
 async fn research_reply(
     routing: &llm::RoutingSnapshot,
     brain: &dyn llm::LlmProvider,
@@ -801,6 +809,9 @@ async fn research_reply(
             llm::MAX_RESEARCH_QUESTION_CHARS
         ));
     };
+    if llm::privacy::leaks_identifier(request.question()) {
+        return notice(RESEARCH_PRIVATE.into());
+    }
     match brain.research(&request).await {
         // The run happened: its model and usage stay for metering, only an
         // answer that the cleanup emptied becomes a fixed text.
@@ -814,6 +825,11 @@ async fn research_reply(
                 },
                 ..reply
             }
+        }
+        // A worker stopped the run: a tool or search query it may not run.
+        Err(error) if error.usage_failure_category() == "tool_use_refused" => {
+            tracing::warn!("research stopped by the worker");
+            notice(RESEARCH_STOPPED.into())
         }
         Err(error) => {
             tracing::warn!(failure = ?error.failure_category(), "research unavailable");
@@ -1233,6 +1249,7 @@ mod tests {
     struct Recorder {
         seen: Mutex<Vec<String>>,
         fail: bool,
+        refused: bool,
         answer: Option<&'static str>,
     }
 
@@ -1251,6 +1268,12 @@ mod tests {
             self.seen.lock().unwrap().push(req.question().to_owned());
             if self.fail {
                 return Err(llm::LlmError::NotConfigured("no subscription".into()));
+            }
+            if self.refused {
+                return Err(llm::LlmError::Api {
+                    status: 502,
+                    body: "Claude run attempted tool use and was refused".into(),
+                });
             }
             Ok(llm::ChatReply {
                 text: self
@@ -1305,6 +1328,48 @@ mod tests {
         let reply = research_reply(&on, &brain, &long).await;
         assert!(reply.text.contains("too long"));
         assert_eq!(brain.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn private_research_questions_are_refused_and_call_nothing() {
+        let brain = Recorder::default();
+        let on = routing(r#"{"version":1,"research_web_search":"on"}"#);
+        for question in [
+            "hoe doet mijn portfolio het?",
+            "mail jan.devries@example.nl over het weer",
+            "bel 06-12345678 terug",
+            "NL91ABNA0417164300 rente?",
+            "is sk-proj-a1b2c3d4e5f6g7h8i9j0k1l2 still valid?",
+        ] {
+            let reply = research_reply(&on, &brain, question).await;
+            assert_eq!(reply.text, RESEARCH_PRIVATE, "{question}");
+            assert!(reply.backend.is_none());
+        }
+        assert!(brain.seen.lock().unwrap().is_empty());
+        // Amounts, dates and symbols are not identifiers: an explicit
+        // search on them is the owner's choice.
+        for question in [
+            "ASML nieuws vandaag",
+            "bitcoin price usd 2026",
+            "nieuws 2026-11-10",
+        ] {
+            let reply = research_reply(&on, &brain, question).await;
+            assert_eq!(reply.text, "Answer\nSources:\nhttps://example.org/a");
+        }
+        assert_eq!(brain.seen.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_run_the_worker_stopped_gets_the_privacy_notice() {
+        let brain = Recorder {
+            refused: true,
+            ..Default::default()
+        };
+        let on = routing(r#"{"version":1,"research_web_search":"on"}"#);
+        let reply = research_reply(&on, &brain, "nieuws?").await;
+        assert_eq!(reply.text, RESEARCH_STOPPED);
+        assert!(reply.backend.is_none());
+        assert_ne!(RESEARCH_STOPPED, RESEARCH_UNAVAILABLE);
     }
 
     #[tokio::test]

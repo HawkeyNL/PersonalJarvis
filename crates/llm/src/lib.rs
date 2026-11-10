@@ -18,6 +18,7 @@ mod meme_prompts;
 mod model_policy;
 mod ollama;
 mod openai_compat;
+pub mod privacy;
 mod router;
 mod routing;
 mod stream;
