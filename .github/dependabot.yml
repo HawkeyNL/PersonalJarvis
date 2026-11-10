@@ -1,0 +1,31 @@
+# Weekly grouped dependency and security update PRs.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories:
+      - "/"
+      - "/jarvis-core-admin/src-tauri"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Amsterdam
+    open-pull-requests-limit: 5
+    groups:
+      cargo:
+        patterns: ["*"]
+    ignore:
+      # Pinned on purpose: the SurrealDB 4 move waits for an off-host backup
+      # and CI guards the exact version (security/DEPENDENCY_EXCEPTIONS.md).
+      - dependency-name: surrealdb
+  - package-ecosystem: npm
+    directory: "/jarvis-core-admin"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Amsterdam
+    open-pull-requests-limit: 5
+    groups:
+      npm:
+        patterns: ["*"]
