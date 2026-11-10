@@ -334,6 +334,8 @@ fn clean_command() -> Command {
         .env("CLAUDE_CONFIG_DIR", format!("{HOME}/.claude"))
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("LANG", "C.UTF-8")
+        // The CLI may tell the model the local time zone: never the host's.
+        .env("TZ", "UTC")
         // Only the root-installed runtime may run; never self-update into HOME.
         .env("DISABLE_UPDATES", "1")
         .env("DISABLE_AUTOUPDATER", "1")
@@ -380,6 +382,7 @@ mod tests {
                 )
             })
             .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(environment.get("TZ"), Some(&Some("UTC")));
         assert_eq!(environment.get("DISABLE_UPDATES"), Some(&Some("1")));
         assert_eq!(environment.get("DISABLE_AUTOUPDATER"), Some(&Some("1")));
         assert_eq!(

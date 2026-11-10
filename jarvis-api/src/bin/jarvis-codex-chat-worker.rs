@@ -484,6 +484,8 @@ fn clean_command(program: &str, workdir: &Path) -> Command {
         .env("LOGNAME", IDENTITY)
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("LANG", "C.UTF-8")
+        // `codex exec` adds the time zone to the prompt: never the host's.
+        .env("TZ", "UTC")
         .current_dir(workdir);
     command
 }
@@ -618,6 +620,7 @@ mod tests {
         assert!(!env.contains("API_KEY"), "{env}");
         assert!(!env.contains("canary"), "{env}");
         assert!(env.lines().any(|line| line == "HOME=/var/lib/jarvis-codex"));
+        assert!(env.lines().any(|line| line == "TZ=UTC"));
     }
 
     #[tokio::test]

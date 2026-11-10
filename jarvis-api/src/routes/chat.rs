@@ -386,10 +386,12 @@ pub(super) async fn execute_chat(
     // research path receives the latest question alone: no persona, memory,
     // history or device data.
     let reply = if requested_mode == llm::RoutingMode::Research {
+        let held = crate::auto_research::held_symbols(&state).await;
         Ok(research_reply(
             &state.model_routing.snapshot(),
             state.llm.as_ref(),
             &new_msg,
+            held.as_deref(),
         )
         .await)
     } else if let Some(run) = &realtime_run {
@@ -559,6 +561,9 @@ const RESEARCH_OFF: &str = "Research is off. The owner can turn on web search wi
 `sudo jarvis models route research-web-search on` or in Core Admin (Model routing).";
 const RESEARCH_UNAVAILABLE: &str = "Research is unavailable right now: no enabled \
 subscription (claude-cli or codex-cli) could run the question. No paid API was used.";
+const RESEARCH_PRIVATE: &str = "Research did not run: the question may contain \
+personal details, such as an amount, an account number, contact details or a holding. \
+Rephrase it without personal details and ask again.";
 const RESEARCH_EMPTY: &str = "The web search returned no usable answer. \
 Ask again or rephrase the question.";
 /// Longest research answer, in characters, that is stored.
@@ -768,19 +773,23 @@ async fn auto_research_answer(
     brain: &dyn llm::LlmProvider,
     question: &str,
 ) -> Option<(llm::ChatReply, String)> {
-    let reply = research_reply(routing, brain, question).await;
+    // `auto_research::start` already ran the privacy gate with the holdings.
+    let reply = research_reply(routing, brain, question, Some(&[])).await;
     reply.backend.is_some().then(|| {
         let model = stored_model(llm::RoutingMode::Research, &reply);
         (reply, model)
     })
 }
 
-/// The answer to an explicit Research request. Off, too long or unavailable
-/// is a clear, fixed answer, never a silent paid-API or non-search answer.
+/// The answer to an explicit Research request. Off, too long, private or
+/// unavailable is a clear, fixed answer, never a silent paid-API or
+/// non-search answer. `held_symbols` is `None` when the holdings could not be
+/// read; the question then counts as private. There is no override.
 async fn research_reply(
     routing: &llm::RoutingSnapshot,
     brain: &dyn llm::LlmProvider,
     latest_question: &str,
+    held_symbols: Option<&[String]>,
 ) -> llm::ChatReply {
     let notice = |text: String| llm::ChatReply {
         text,
@@ -801,6 +810,9 @@ async fn research_reply(
             llm::MAX_RESEARCH_QUESTION_CHARS
         ));
     };
+    if held_symbols.is_none_or(|held| llm::privacy::is_private(request.question(), held)) {
+        return notice(RESEARCH_PRIVATE.into());
+    }
     match brain.research(&request).await {
         // The run happened: its model and usage stay for metering, only an
         // answer that the cleanup emptied becomes a fixed text.
@@ -1283,7 +1295,7 @@ mod tests {
             routing(r#"{"version":1,"paid_api":"off"}"#),
             llm::RoutingSnapshot::unavailable("routing_invalid"),
         ] {
-            let reply = research_reply(&snapshot, &brain, "nieuws?").await;
+            let reply = research_reply(&snapshot, &brain, "nieuws?", Some(&[])).await;
             assert_eq!(reply.text, RESEARCH_OFF);
             assert!(reply.backend.is_none());
         }
@@ -1294,7 +1306,13 @@ mod tests {
     async fn research_sends_only_the_latest_question() {
         let brain = Recorder::default();
         let on = routing(r#"{"version":1,"research_web_search":"on"}"#);
-        let reply = research_reply(&on, &brain, "  Wat is de laatste Rust-release?  ").await;
+        let reply = research_reply(
+            &on,
+            &brain,
+            "  Wat is de laatste Rust-release?  ",
+            Some(&[]),
+        )
+        .await;
         assert_eq!(reply.text, "Answer\nSources:\nhttps://example.org/a");
         assert_eq!(
             *brain.seen.lock().unwrap(),
@@ -1302,9 +1320,33 @@ mod tests {
         );
         // Overlong: refused with a clear answer, never cut or sent.
         let long = "x".repeat(llm::MAX_RESEARCH_QUESTION_CHARS + 1);
-        let reply = research_reply(&on, &brain, &long).await;
+        let reply = research_reply(&on, &brain, &long, Some(&[])).await;
         assert!(reply.text.contains("too long"));
         assert_eq!(brain.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn private_research_questions_are_refused_and_call_nothing() {
+        let brain = Recorder::default();
+        let on = routing(r#"{"version":1,"research_web_search":"on"}"#);
+        let held = ["ASML".to_owned()];
+        for (question, holdings) in [
+            ("hoe doet mijn portfolio het?", Some(&[][..])),
+            ("is €2500 per maand veel?", Some(&[])),
+            ("mail jan.devries@example.nl over het weer", Some(&[])),
+            ("ASML nieuws vandaag", Some(&held[..])),
+            // Holdings unreadable: fail closed, even for a harmless question.
+            ("weer Amsterdam morgen", None),
+        ] {
+            let reply = research_reply(&on, &brain, question, holdings).await;
+            assert_eq!(reply.text, RESEARCH_PRIVATE, "{question}");
+            assert!(reply.backend.is_none());
+        }
+        assert!(brain.seen.lock().unwrap().is_empty());
+        // Without the holding, the same question searches.
+        let reply = research_reply(&on, &brain, "ASML nieuws vandaag", Some(&[])).await;
+        assert_eq!(reply.text, "Answer\nSources:\nhttps://example.org/a");
+        assert_eq!(*brain.seen.lock().unwrap(), ["ASML nieuws vandaag"]);
     }
 
     #[tokio::test]
@@ -1314,7 +1356,7 @@ mod tests {
             ..Default::default()
         };
         let on = routing(r#"{"version":1,"research_web_search":"on"}"#);
-        let reply = research_reply(&on, &brain, "nieuws?").await;
+        let reply = research_reply(&on, &brain, "nieuws?", Some(&[])).await;
         assert_eq!(reply.text, RESEARCH_UNAVAILABLE);
         assert!(reply.backend.is_none());
     }
@@ -1323,7 +1365,7 @@ mod tests {
     async fn research_answers_are_stored_as_web_and_notices_are_not() {
         let on = routing(r#"{"version":1,"research_web_search":"on"}"#);
         let research = llm::RoutingMode::Research;
-        let answer = research_reply(&on, &Recorder::default(), "nieuws?").await;
+        let answer = research_reply(&on, &Recorder::default(), "nieuws?", Some(&[])).await;
         assert_eq!(
             answer.model, "claude-opus-5",
             "metering keeps the plain model"
@@ -1333,7 +1375,13 @@ mod tests {
             stored_model(llm::RoutingMode::Auto, &answer),
             "claude-opus-5"
         );
-        let off = research_reply(&llm::RoutingSnapshot::default(), &Recorder::default(), "x").await;
+        let off = research_reply(
+            &llm::RoutingSnapshot::default(),
+            &Recorder::default(),
+            "x",
+            Some(&[]),
+        )
+        .await;
         assert_eq!(stored_model(research, &off), "research");
     }
 
@@ -1371,7 +1419,7 @@ mod tests {
             ..Default::default()
         };
         let on = routing(r#"{"version":1,"research_web_search":"on"}"#);
-        let reply = research_reply(&on, &brain, "nieuws?").await;
+        let reply = research_reply(&on, &brain, "nieuws?", Some(&[])).await;
         assert_eq!(reply.text, RESEARCH_EMPTY);
         assert_eq!(reply.model, "claude-opus-5");
     }

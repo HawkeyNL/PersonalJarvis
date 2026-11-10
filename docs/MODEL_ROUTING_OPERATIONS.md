@@ -355,6 +355,11 @@ Names, addresses and other free-text personal details are not detectable; a
 question that only carries those still searches automatically. Choose `on`
 when that is not acceptable.
 
+Explicit Research requests pass the same gate, with `on` and with `auto`. A
+flagged question is not searched at all: Core answers with a fixed notice
+asking the owner to rephrase it without personal details, and there is no
+override.
+
 ## Routing, health and spend
 
 Requests use `auto` (default), `fast`, `deep`, or `research`. Older `tier`
