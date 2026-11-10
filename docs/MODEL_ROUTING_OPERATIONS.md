@@ -362,11 +362,13 @@ search query the subscription workers see (see
 identifiers: an email address, a key-like token, the possessive rule above,
 and the long-number rule above, except that a run that is exactly one date
 (`YYYY-MM-DD`, `YYYY/MM/DD`, `DD-MM-YYYY`, `DD/MM/YYYY` or `DD.MM.YYYY`, with a
-1-2 digit day and month, a valid day and month and a year from 1900 to 2099)
+1-2 digit day from 1 to 31, a month from 1 to 12 and a year from 1900 to 2099)
 is not a number. A date with another digit group joined to it by a separator
 still counts. Amounts, the `k` suffix and held symbols are not checked here: an
 explicit search on a price or a held symbol is the owner's own choice, and an
-automatic one has already passed the gate above. A flagged explicit question
+automatic question has already passed the gate above. The search queries the
+model writes in an automatic run get only this narrower check, so an amount
+the model adds to a query does not stop the run. A flagged explicit question
 is not searched at all: Core answers with a fixed notice asking the owner to
 rephrase it without personal details, and there is no override.
 
