@@ -33,6 +33,7 @@ mod error;
 mod extract;
 pub mod ibkr;
 pub mod intent;
+pub mod jobs;
 #[cfg(unix)]
 pub mod local_devices;
 mod mcp;

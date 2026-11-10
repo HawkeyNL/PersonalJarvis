@@ -69,6 +69,8 @@ jarvis-market-data.workspace = true
 rust_decimal.workspace = true
 rand.workspace = true
 time.workspace = true
+# Wall-clock schedules in Europe/Amsterdam (already in the tree).
+jiff = "0.2.35"
 sha2.workspace = true
 semver.workspace = true
 tokio-util.workspace = true
