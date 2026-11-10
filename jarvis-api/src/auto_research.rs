@@ -102,7 +102,7 @@ pub(crate) async fn start(
 /// The symbols the owner holds per the last IBKR sync (the snapshot runtime
 /// facts read). `None`, so the gate fails closed, when IBKR is linked but the
 /// snapshot cannot be read or does not list every held symbol.
-pub(crate) async fn held_symbols(state: &AppState) -> Option<Vec<String>> {
+async fn held_symbols(state: &AppState) -> Option<Vec<String>> {
     if state.ibkr.is_none() {
         return Some(Vec::new());
     }
