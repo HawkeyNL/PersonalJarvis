@@ -11,6 +11,7 @@ pub(crate) mod auth;
 pub(crate) mod chat;
 mod chat_context;
 pub(crate) mod coding;
+pub(crate) mod jobs;
 pub(crate) mod meme;
 pub(crate) mod portfolio;
 pub(crate) mod roadmaps;

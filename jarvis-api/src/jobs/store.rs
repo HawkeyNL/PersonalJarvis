@@ -269,6 +269,18 @@ pub struct Finish {
     pub priorities: Vec<Priority>,
 }
 
+impl Finish {
+    pub fn failed(error_code: &'static str) -> Self {
+        Self {
+            status: RunStatus::Failed,
+            error_code: Some(error_code),
+            facts: None,
+            summary: None,
+            priorities: Vec::new(),
+        }
+    }
+}
+
 /// Record how a running run ended; a run that is no longer running (Core
 /// restarted and marked it interrupted) stays as it is.
 pub async fn finish_run(db: &Database, run_id: &str, finish: &Finish) -> Result<bool> {

@@ -136,6 +136,14 @@ pub enum Event {
     /// A roadmap write committed `revision`; reload `GET /v1/roadmaps/{id}`.
     #[serde(rename = "roadmap.changed")]
     RoadmapChanged { id: String, revision: u64 },
+    /// A scheduled job's run ended, or its slot was recorded as missed;
+    /// reload `GET /v1/jobs/runs/{run_id}`.
+    #[serde(rename = "jobs.run_finished")]
+    JobRunFinished {
+        job_id: String,
+        run_id: String,
+        status: String,
+    },
 }
 
 /// Fixed safe failure codes, not raw provider errors.
@@ -330,6 +338,26 @@ mod tests {
             serde_json::json!({"id": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "revision": 7})
         );
         assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), changed);
+    }
+
+    #[test]
+    fn job_run_finished_carries_only_ids_and_status() {
+        let finished = Event::JobRunFinished {
+            job_id: "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(),
+            run_id: "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c".into(),
+            status: "partial".into(),
+        };
+        let wire = serde_json::to_value(&finished).unwrap();
+        assert_eq!(wire["type"], "jobs.run_finished");
+        assert_eq!(
+            wire["payload"],
+            serde_json::json!({
+                "job_id": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+                "run_id": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c",
+                "status": "partial"
+            })
+        );
+        assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), finished);
     }
 
     #[test]
