@@ -15,9 +15,10 @@ use time::OffsetDateTime;
 
 use jarvis_store::Database;
 
+use super::github::GithubHandle;
 use super::{
-    check, text, validate_new_roadmap, Action, Change, Draft, Item, ItemPatch, NewItem, NewRoadmap,
-    ProposalOp, Result, Roadmap, RoadmapError, RoadmapPatch, Snapshot, Status,
+    added_links, check, text, validate_new_roadmap, Action, Change, Draft, Item, ItemPatch,
+    NewItem, NewRoadmap, ProposalOp, Result, Roadmap, RoadmapError, RoadmapPatch, Snapshot, Status,
     HISTORY_RETENTION_DAYS, MAX_HISTORY, MAX_ITEMS, MAX_OP_BYTES, MAX_PENDING_PROPOSALS,
     MAX_PROPOSAL_OPS, MAX_RATIONALE, MAX_ROADMAPS, PROPOSAL_TTL_DAYS,
 };
@@ -176,13 +177,14 @@ async fn proposal_pending(db: &Database, id: &str, proposal_id: &str) -> Result<
     Ok(!found.is_empty())
 }
 
-/// Commit a non-empty draft at the revision it was loaded at. With a
-/// proposal, the changes are Jarvis's, accepted from `device_id`, and the
-/// proposal is marked accepted in the same transaction.
+/// Commit a non-empty draft at the revision it was loaded at. The changes
+/// are the owner's from `device_id`; with a proposal they are Jarvis's,
+/// accepted from `device_id`, and the proposal is marked accepted in the same
+/// transaction; without a device they are the GitHub poller's.
 async fn commit(
     db: &Database,
     draft: &Draft,
-    device_id: &str,
+    device_id: Option<&str>,
     proposal_id: Option<&str>,
 ) -> Result<()> {
     draft.finish()?;
@@ -200,9 +202,9 @@ async fn commit(
              IF array::len($bumped) != 1 {{ THROW 'roadmap revision conflict'; }}; \
              DELETE roadmap_items WHERE roadmap_id = $id AND record::id(id) IN $deletes RETURN NONE; \
              FOR $item IN $updates {{ UPDATE roadmap_items SET title = $item.title, \
-               status = $item.status, phase = $item.phase, position = $item.position, \
-               notes = $item.notes, depends_on = $item.depends_on, links = $item.links, \
-               updated_at = time::now() \
+               status = $item.status, auto_status = $item.auto_status, phase = $item.phase, \
+               position = $item.position, notes = $item.notes, depends_on = $item.depends_on, \
+               links = $item.links, updated_at = time::now() \
                WHERE roadmap_id = $id AND record::id(id) = $item.id RETURN NONE; }}; \
              FOR $item IN $creates {{ CREATE roadmap_items SET id = $item.id, roadmap_id = $id, \
                title = $item.title, status = $item.status, phase = $item.phase, \
@@ -230,7 +232,11 @@ async fn commit(
             "updates": writes.updates,
             "creates": writes.creates,
             "changes": changes_json(&draft.changes)?,
-            "author": if proposal_id.is_some() { "jarvis" } else { "owner" },
+            "author": match (device_id, proposal_id) {
+                (_, Some(_)) => "jarvis",
+                (Some(_), None) => "owner",
+                (None, None) => "github",
+            },
             "device": device_id,
             "proposal": proposal_id,
             "accepting": proposal_id.is_some(),
@@ -256,11 +262,22 @@ async fn commit(
 /// roadmap as stored.
 async fn save(db: &Database, draft: Draft, device_id: &str) -> Result<Snapshot> {
     if !draft.is_empty() {
-        commit(db, &draft, device_id, None).await?;
+        commit(db, &draft, Some(device_id), None).await?;
     }
     get(db, &draft.roadmap.id)
         .await?
         .ok_or(RoadmapError::NotFound)
+}
+
+/// Commit the GitHub poller's draft (see [`Draft::github_update`]) as
+/// author `github`, at the revision it was loaded at: when the owner changed
+/// the roadmap meanwhile, nothing is written and the answer is
+/// [`RoadmapError::Conflict`].
+pub async fn commit_github(db: &Database, draft: &Draft) -> Result<()> {
+    if draft.is_empty() {
+        return Ok(());
+    }
+    commit(db, draft, None, None).await
 }
 
 pub async fn update(
@@ -302,9 +319,14 @@ pub async fn update_item(
     item_id: &str,
     patch: &ItemPatch,
     device_id: &str,
+    github: &GithubHandle,
 ) -> Result<Snapshot> {
     let mut draft = load(db, id, Some(expected)).await?;
+    let before = draft.items.clone();
     draft.update_item(item_id, patch)?;
+    github
+        .check_links(added_links(&before, &draft.items))
+        .map_err(RoadmapError::Invalid)?;
     save(db, draft, device_id).await
 }
 
@@ -499,12 +521,14 @@ async fn mark_stale(db: &Database, proposal_id: &str) -> Result<()> {
 
 /// Apply a pending proposal atomically, as Jarvis's change accepted from
 /// `device_id`. A proposal made against another revision is marked stale
-/// and nothing changes.
+/// and nothing changes; one that adds a link outside the GitHub allowlist
+/// is refused and stays pending.
 pub async fn accept_proposal(
     db: &Database,
     id: &str,
     proposal_id: &str,
     device_id: &str,
+    github: &GithubHandle,
 ) -> Result<Snapshot> {
     let found: Vec<ProposalRow> = rows(
         db,
@@ -521,11 +545,15 @@ pub async fn accept_proposal(
         mark_stale(db, proposal_id).await?;
         return Err(RoadmapError::Stale);
     }
+    let before = draft.items.clone();
     for op in &proposal.ops {
         draft.apply(op)?;
     }
     check(!draft.is_empty(), "the proposal changes nothing")?;
-    match commit(db, &draft, device_id, Some(proposal_id)).await {
+    github
+        .check_links(added_links(&before, &draft.items))
+        .map_err(RoadmapError::Invalid)?;
+    match commit(db, &draft, Some(device_id), Some(proposal_id)).await {
         Err(RoadmapError::Conflict) => {
             mark_stale(db, proposal_id).await?;
             Err(RoadmapError::Stale)
@@ -715,22 +743,33 @@ mod tests {
             ..ItemPatch::default()
         };
         assert!(matches!(
-            update_item(&db, &id, 3, &a, &cycle, &device).await,
+            update_item(&db, &id, 3, &a, &cycle, &device, &GithubHandle::default()).await,
             Err(RoadmapError::Invalid(_))
         ));
         let moved = ItemPatch {
             status: Some(Status::InProgress),
             ..ItemPatch::default()
         };
-        let roadmap = update_item(&db, &id, 3, &a, &moved, &device).await?;
+        let roadmap =
+            update_item(&db, &id, 3, &a, &moved, &device, &GithubHandle::default()).await?;
         assert_eq!(roadmap.roadmap.revision, 4);
         // A patch that changes nothing writes nothing.
-        let roadmap = update_item(&db, &id, 4, &a, &moved, &device).await?;
+        let roadmap =
+            update_item(&db, &id, 4, &a, &moved, &device, &GithubHandle::default()).await?;
         assert_eq!(roadmap.roadmap.revision, 4);
         // Unknown items are not found.
         let unknown = uuid::Uuid::now_v7().to_string();
         assert!(matches!(
-            update_item(&db, &id, 4, &unknown, &moved, &device).await,
+            update_item(
+                &db,
+                &id,
+                4,
+                &unknown,
+                &moved,
+                &device,
+                &GithubHandle::default()
+            )
+            .await,
             Err(RoadmapError::NotFound)
         ));
         // Two writers on one revision: exactly one wins.
@@ -813,6 +852,57 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn github_writes_are_audited_and_revision_guarded(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = database().await?;
+        let device = uuid::Uuid::now_v7().to_string();
+        let id = create(&db, &plan("Plan"), &device).await?.roadmap.id;
+        let pr = Link {
+            kind: LinkKind::Pr,
+            repo: Some("HawkeyNL/PersonalJarvis".into()),
+            number: Some(7),
+            tag: None,
+            url: None,
+            state: None,
+        };
+        let new_item = NewItem {
+            links: vec![pr],
+            ..item("A")
+        };
+        let (a, loaded) = create_item(&db, &id, 1, &new_item, &device).await?;
+        let mut draft = Draft::new(loaded);
+        draft.github_update(&a, &[Some("open".into())])?;
+        commit_github(&db, &draft).await?;
+        let roadmap = get(&db, &id).await?.ok_or("roadmap missing")?;
+        assert_eq!(roadmap.roadmap.revision, 3);
+        let stored = &roadmap.items[0];
+        assert_eq!(stored.status, Status::InProgress);
+        assert_eq!(stored.auto_status, Some(Status::InProgress));
+        assert_eq!(stored.links[0].state.as_deref(), Some("open"));
+        let change = &history(&db, &id, 1).await?[0];
+        assert_eq!(change.author, "github");
+        assert_eq!(change.device_id, None);
+        assert_eq!(change.fields, ["links", "status"]);
+        // A draft built on an older revision writes nothing.
+        assert!(matches!(
+            commit_github(&db, &draft).await,
+            Err(RoadmapError::Conflict)
+        ));
+        // An owner edit keeps the cached state and auto_status.
+        let back = ItemPatch {
+            status: Some(Status::Planned),
+            ..ItemPatch::default()
+        };
+        let roadmap =
+            update_item(&db, &id, 3, &a, &back, &device, &GithubHandle::default()).await?;
+        assert_eq!(roadmap.items[0].status, Status::Planned);
+        assert_eq!(roadmap.items[0].auto_status, Some(Status::InProgress));
+        assert_eq!(roadmap.items[0].links[0].state.as_deref(), Some("open"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
     async fn proposals_accept_atomically_go_stale_and_expire(
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = database().await?;
@@ -847,9 +937,35 @@ mod tests {
         assert_eq!(listed[0].ops, ops);
         assert_eq!(listed[0].rationale.as_deref(), Some("PR merged."));
 
+        // A proposal that adds a link outside the allowlist is refused on
+        // accept: nothing is applied and it stays pending.
+        let outside = [ProposalOp::CreateItem {
+            item: NewItem {
+                links: vec![Link {
+                    kind: LinkKind::Pr,
+                    repo: Some("x/y".into()),
+                    number: Some(1),
+                    tag: None,
+                    url: None,
+                    state: None,
+                }],
+                ..item("C")
+            },
+        }];
+        let refused = create_proposal(&db, &id, 2, &outside, None).await?;
+        let (allowlist, _) = crate::roadmaps::github::configure("a/b", None);
+        assert!(matches!(
+            accept_proposal(&db, &id, &refused, &device, &allowlist).await,
+            Err(RoadmapError::Invalid(_))
+        ));
+        assert_eq!(get(&db, &id).await?.unwrap().roadmap.revision, 2);
+        assert_eq!(list_proposals(&db, &id).await?.len(), 2);
+        reject_proposal(&db, &id, &refused, &device).await?;
+
         // Accepting applies every operation in one revision, as Jarvis's
         // change accepted from the device.
-        let roadmap = accept_proposal(&db, &id, &accepted, &device).await?;
+        let roadmap =
+            accept_proposal(&db, &id, &accepted, &device, &GithubHandle::default()).await?;
         assert_eq!(roadmap.roadmap.revision, 3);
         assert_eq!(roadmap.items.len(), 2);
         assert_eq!(roadmap.items[0].status, Status::Ready);
@@ -859,7 +975,7 @@ mod tests {
             && c.proposal_id.as_deref() == Some(accepted.as_str())
             && c.device_id.as_deref() == Some(device.as_str())));
         assert!(matches!(
-            accept_proposal(&db, &id, &accepted, &device).await,
+            accept_proposal(&db, &id, &accepted, &device, &GithubHandle::default()).await,
             Err(RoadmapError::NotFound)
         ));
         assert!(list_proposals(&db, &id).await?.is_empty());
@@ -885,7 +1001,7 @@ mod tests {
         };
         update(&db, &id, 3, &renamed, &device).await?;
         assert!(matches!(
-            accept_proposal(&db, &id, &stale, &device).await,
+            accept_proposal(&db, &id, &stale, &device, &GithubHandle::default()).await,
             Err(RoadmapError::Stale)
         ));
         assert_eq!(get(&db, &id).await?.unwrap().roadmap.revision, 4);
@@ -895,7 +1011,10 @@ mod tests {
             Err(RoadmapError::NotFound)
         ));
         assert!(list_proposals(&db, &id).await?.is_empty());
-        assert_eq!(statuses(&db).await?, ["accepted", "stale", "rejected"]);
+        assert_eq!(
+            statuses(&db).await?,
+            ["accepted", "rejected", "stale", "rejected"]
+        );
 
         // At most 10 pending proposals per roadmap.
         let notes = |n: usize| ProposalOp::UpdateItem {
@@ -925,7 +1044,7 @@ mod tests {
         )
         .await?;
         assert!(list_proposals(&db, &id).await?.is_empty());
-        assert_eq!(prune(&db).await?, 2);
+        assert_eq!(prune(&db).await?, 3);
         let mut expected = vec!["accepted", "stale"];
         expected.extend(["expired"; MAX_PENDING_PROPOSALS]);
         assert_eq!(statuses(&db).await?, expected);

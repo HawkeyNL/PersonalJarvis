@@ -236,6 +236,8 @@ pub fn build_router(state: AppState) -> Router {
                 .delete(routes::roadmaps::delete_item)
                 .layer(DefaultBodyLimit::max(routes::roadmaps::BODY_LIMIT)),
         )
+        .route("/v1/roadmaps/github", get(routes::roadmaps::github_status))
+        .route("/v1/roadmaps/{id}/sync", post(routes::roadmaps::sync))
         .route("/v1/roadmaps/{id}/history", get(routes::roadmaps::history))
         .route(
             "/v1/roadmaps/{id}/proposals",
