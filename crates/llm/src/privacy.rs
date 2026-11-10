@@ -370,9 +370,19 @@ mod tests {
             ("10 11 2026", true),
             ("100-11-2026", true),
             ("10-011-2026", true),
+            // Year limits, a short date, and dates joined into one run.
+            ("01-01-1899", true),
+            ("31-12-2099", false),
+            ("01-01-2100", true),
+            ("1/1/2026", false),
+            ("10-11-2026 10-11-2026", true),
+            ("10-11-2026  0612", false),
         ] {
             assert_eq!(leaks_identifier(text), leaks, "{text}");
         }
+        // The auto-mode gate still counts dates as long numbers.
+        assert!(is_private("nieuws 2026-11-10", &[]));
+        assert!(!is_private("1234--5678", &[]));
     }
 
     #[test]
