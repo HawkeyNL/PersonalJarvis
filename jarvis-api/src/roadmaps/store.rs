@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 
+use jarvis_client_core::realtime::Event;
 use jarvis_store::Database;
 
 use super::github::GithubHandle;
@@ -22,6 +23,7 @@ use super::{
     HISTORY_RETENTION_DAYS, MAX_HISTORY, MAX_ITEMS, MAX_OP_BYTES, MAX_PENDING_PROPOSALS,
     MAX_PROPOSAL_OPS, MAX_RATIONALE, MAX_ROADMAPS, PROPOSAL_TTL_DAYS,
 };
+use crate::realtime::Hub;
 
 /// Rows deleted per statement and statements per table per sweep.
 const PRUNE_BATCH: usize = 5_000;
@@ -57,6 +59,14 @@ fn changes_json(changes: &[Change]) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()
         .map(Value::from)
+}
+
+/// Tell connected apps that roadmap `id` committed `revision`; they reload it.
+fn announce(events: &Hub, id: &str, revision: u64) {
+    events.publish_all(Event::RoadmapChanged {
+        id: id.to_owned(),
+        revision,
+    });
 }
 
 /// Roadmaps that are not archived, oldest first; or the newest archived ones.
@@ -108,7 +118,12 @@ pub async fn get(db: &Database, id: &str) -> Result<Option<Snapshot>> {
 /// Create a roadmap. At most [`MAX_ROADMAPS`] are not archived.
 // ponytail: the count and the insert touch no shared key, so two concurrent
 // creates can end at 21; add a counter row both write if that ever matters.
-pub async fn create(db: &Database, input: &NewRoadmap, device_id: &str) -> Result<Snapshot> {
+pub async fn create(
+    db: &Database,
+    input: &NewRoadmap,
+    device_id: &str,
+    events: &Hub,
+) -> Result<Snapshot> {
     validate_new_roadmap(input)?;
     let id = uuid::Uuid::now_v7().to_string();
     let changes = [Change {
@@ -148,6 +163,7 @@ pub async fn create(db: &Database, input: &NewRoadmap, device_id: &str) -> Resul
         }
         return Err(error.into());
     }
+    announce(events, &id, 1);
     get(db, &id).await?.ok_or(RoadmapError::InvalidData)
 }
 
@@ -180,12 +196,14 @@ async fn proposal_pending(db: &Database, id: &str, proposal_id: &str) -> Result<
 /// Commit a non-empty draft at the revision it was loaded at. The changes
 /// are the owner's from `device_id`; with a proposal they are Jarvis's,
 /// accepted from `device_id`, and the proposal is marked accepted in the same
-/// transaction; without a device they are the GitHub poller's.
+/// transaction; without a device they are the GitHub poller's. Once
+/// committed, `events` hears `roadmap.changed`.
 async fn commit(
     db: &Database,
     draft: &Draft,
     device_id: Option<&str>,
     proposal_id: Option<&str>,
+    events: &Hub,
 ) -> Result<()> {
     draft.finish()?;
     let writes = draft.writes();
@@ -243,6 +261,7 @@ async fn commit(
         }))
         .await?;
     let Err(error) = response.check() else {
+        announce(events, id, expected + 1);
         return Ok(());
     };
     // Explain the failure from the current state; anything else is a
@@ -260,9 +279,9 @@ async fn commit(
 
 /// Commit the owner's draft (nothing when it changes nothing) and return the
 /// roadmap as stored.
-async fn save(db: &Database, draft: Draft, device_id: &str) -> Result<Snapshot> {
+async fn save(db: &Database, draft: Draft, device_id: &str, events: &Hub) -> Result<Snapshot> {
     if !draft.is_empty() {
-        commit(db, &draft, Some(device_id), None).await?;
+        commit(db, &draft, Some(device_id), None, events).await?;
     }
     get(db, &draft.roadmap.id)
         .await?
@@ -273,11 +292,11 @@ async fn save(db: &Database, draft: Draft, device_id: &str) -> Result<Snapshot> 
 /// author `github`, at the revision it was loaded at: when the owner changed
 /// the roadmap meanwhile, nothing is written and the answer is
 /// [`RoadmapError::Conflict`].
-pub async fn commit_github(db: &Database, draft: &Draft) -> Result<()> {
+pub async fn commit_github(db: &Database, draft: &Draft, events: &Hub) -> Result<()> {
     if draft.is_empty() {
         return Ok(());
     }
-    commit(db, draft, None, None).await
+    commit(db, draft, None, None, events).await
 }
 
 pub async fn update(
@@ -286,17 +305,24 @@ pub async fn update(
     expected: u64,
     patch: &RoadmapPatch,
     device_id: &str,
+    events: &Hub,
 ) -> Result<Snapshot> {
     let mut draft = load(db, id, Some(expected)).await?;
     draft.update_roadmap(patch)?;
-    save(db, draft, device_id).await
+    save(db, draft, device_id, events).await
 }
 
 /// Archive a roadmap; it stays readable but no longer changes.
-pub async fn archive(db: &Database, id: &str, expected: u64, device_id: &str) -> Result<Snapshot> {
+pub async fn archive(
+    db: &Database,
+    id: &str,
+    expected: u64,
+    device_id: &str,
+    events: &Hub,
+) -> Result<Snapshot> {
     let mut draft = load(db, id, Some(expected)).await?;
     draft.archive();
-    save(db, draft, device_id).await
+    save(db, draft, device_id, events).await
 }
 
 /// Add an item; returns its id and the roadmap.
@@ -306,12 +332,14 @@ pub async fn create_item(
     expected: u64,
     input: &NewItem,
     device_id: &str,
+    events: &Hub,
 ) -> Result<(String, Snapshot)> {
     let mut draft = load(db, id, Some(expected)).await?;
     let item_id = draft.create_item(input)?;
-    Ok((item_id, save(db, draft, device_id).await?))
+    Ok((item_id, save(db, draft, device_id, events).await?))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_item(
     db: &Database,
     id: &str,
@@ -320,6 +348,7 @@ pub async fn update_item(
     patch: &ItemPatch,
     device_id: &str,
     github: &GithubHandle,
+    events: &Hub,
 ) -> Result<Snapshot> {
     let mut draft = load(db, id, Some(expected)).await?;
     let before = draft.items.clone();
@@ -327,7 +356,7 @@ pub async fn update_item(
     github
         .check_links(added_links(&before, &draft.items))
         .map_err(RoadmapError::Invalid)?;
-    save(db, draft, device_id).await
+    save(db, draft, device_id, events).await
 }
 
 pub async fn delete_item(
@@ -336,10 +365,11 @@ pub async fn delete_item(
     expected: u64,
     item_id: &str,
     device_id: &str,
+    events: &Hub,
 ) -> Result<Snapshot> {
     let mut draft = load(db, id, Some(expected)).await?;
     draft.delete_item(item_id)?;
-    save(db, draft, device_id).await
+    save(db, draft, device_id, events).await
 }
 
 /// One audited change.
@@ -529,6 +559,7 @@ pub async fn accept_proposal(
     proposal_id: &str,
     device_id: &str,
     github: &GithubHandle,
+    events: &Hub,
 ) -> Result<Snapshot> {
     let found: Vec<ProposalRow> = rows(
         db,
@@ -553,7 +584,7 @@ pub async fn accept_proposal(
     github
         .check_links(added_links(&before, &draft.items))
         .map_err(RoadmapError::Invalid)?;
-    match commit(db, &draft, Some(device_id), Some(proposal_id)).await {
+    match commit(db, &draft, Some(device_id), Some(proposal_id), events).await {
         Err(RoadmapError::Conflict) => {
             mark_stale(db, proposal_id).await?;
             Err(RoadmapError::Stale)
@@ -670,6 +701,25 @@ mod tests {
         Ok(found.into_iter().map(|row| row.status).collect())
     }
 
+    /// A subscriber on `hub`, past its ready event.
+    fn listen(hub: &Hub) -> crate::realtime::Subscription {
+        let mut listener = hub
+            .subscribe(uuid::Uuid::now_v7(), uuid::Uuid::now_v7())
+            .expect("subscription");
+        listener.receiver.try_recv().expect("ready event");
+        listener
+    }
+
+    /// The `roadmap.changed` events `listener` heard since the last call.
+    fn heard(listener: &mut crate::realtime::Subscription) -> Vec<(String, u64)> {
+        std::iter::from_fn(|| listener.receiver.try_recv().ok())
+            .map(|envelope| match &envelope.event {
+                Event::RoadmapChanged { id, revision } => (id.clone(), *revision),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect()
+    }
+
     fn item(title: &str) -> NewItem {
         NewItem {
             title: title.into(),
@@ -683,15 +733,21 @@ mod tests {
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = database().await?;
         let device = uuid::Uuid::now_v7().to_string();
+        let hub = Hub::default();
+        let events = &hub;
+        let mut listener = listen(&hub);
 
-        let created = create(&db, &plan("Plan"), &device).await?;
+        let created = create(&db, &plan("Plan"), &device, events).await?;
         let id = created.roadmap.id.clone();
         assert_eq!(created.roadmap.revision, 1);
         assert!(created.items.is_empty());
         assert!(matches!(
-            create(&db, &plan(" "), &device).await,
+            create(&db, &plan(" "), &device, events).await,
             Err(RoadmapError::Invalid(_))
         ));
+        // Every committed write is heard once, with its revision; a refused
+        // one is not.
+        assert_eq!(heard(&mut listener), [(id.clone(), 1)]);
 
         // Items, links and dependencies round-trip; every write is one revision.
         let pr = Link {
@@ -713,6 +769,7 @@ mod tests {
                 ..item("A")
             },
             &device,
+            events,
         )
         .await?;
         assert_eq!(roadmap.roadmap.revision, 2);
@@ -730,11 +787,13 @@ mod tests {
                 ..item("B")
             },
             &device,
+            events,
         )
         .await?;
+        assert_eq!(heard(&mut listener), [(id.clone(), 2), (id.clone(), 3)]);
         // A stale revision is a conflict and changes nothing.
         assert!(matches!(
-            create_item(&db, &id, 2, &item("C"), &device).await,
+            create_item(&db, &id, 2, &item("C"), &device, events).await,
             Err(RoadmapError::Conflict)
         ));
         // A cycle is refused.
@@ -743,19 +802,47 @@ mod tests {
             ..ItemPatch::default()
         };
         assert!(matches!(
-            update_item(&db, &id, 3, &a, &cycle, &device, &GithubHandle::default()).await,
+            update_item(
+                &db,
+                &id,
+                3,
+                &a,
+                &cycle,
+                &device,
+                &GithubHandle::default(),
+                events
+            )
+            .await,
             Err(RoadmapError::Invalid(_))
         ));
         let moved = ItemPatch {
             status: Some(Status::InProgress),
             ..ItemPatch::default()
         };
-        let roadmap =
-            update_item(&db, &id, 3, &a, &moved, &device, &GithubHandle::default()).await?;
+        let roadmap = update_item(
+            &db,
+            &id,
+            3,
+            &a,
+            &moved,
+            &device,
+            &GithubHandle::default(),
+            events,
+        )
+        .await?;
         assert_eq!(roadmap.roadmap.revision, 4);
         // A patch that changes nothing writes nothing.
-        let roadmap =
-            update_item(&db, &id, 4, &a, &moved, &device, &GithubHandle::default()).await?;
+        let roadmap = update_item(
+            &db,
+            &id,
+            4,
+            &a,
+            &moved,
+            &device,
+            &GithubHandle::default(),
+            events,
+        )
+        .await?;
         assert_eq!(roadmap.roadmap.revision, 4);
         // Unknown items are not found.
         let unknown = uuid::Uuid::now_v7().to_string();
@@ -767,11 +854,13 @@ mod tests {
                 &unknown,
                 &moved,
                 &device,
-                &GithubHandle::default()
+                &GithubHandle::default(),
+                events
             )
             .await,
             Err(RoadmapError::NotFound)
         ));
+        assert_eq!(heard(&mut listener), [(id.clone(), 4)]);
         // Two writers on one revision: exactly one wins.
         let rename = |title: &str| RoadmapPatch {
             title: Some(title.into()),
@@ -779,8 +868,8 @@ mod tests {
         };
         let (one, two) = (rename("One"), rename("Two"));
         let (first, second) = tokio::join!(
-            update(&db, &id, 4, &one, &device),
-            update(&db, &id, 4, &two, &device)
+            update(&db, &id, 4, &one, &device, events),
+            update(&db, &id, 4, &two, &device, events)
         );
         assert_eq!(
             [&first, &second].iter().filter(|r| r.is_ok()).count(),
@@ -790,8 +879,9 @@ mod tests {
         assert!([first, second]
             .into_iter()
             .any(|r| matches!(r, Err(RoadmapError::Conflict))));
+        assert_eq!(heard(&mut listener), [(id.clone(), 5)]);
         // Deleting A leaves B without the dependency, audited on B too.
-        let roadmap = delete_item(&db, &id, 5, &a, &device).await?;
+        let roadmap = delete_item(&db, &id, 5, &a, &device, events).await?;
         assert_eq!(roadmap.items.len(), 1);
         assert!(roadmap.items[0].depends_on.is_empty());
         assert_eq!(roadmap.roadmap.revision, 6);
@@ -829,22 +919,23 @@ mod tests {
         ));
 
         // Archive instead of delete: readable, listed apart, frozen.
-        let archived = archive(&db, &id, 6, &device).await?;
+        let archived = archive(&db, &id, 6, &device, events).await?;
         assert!(archived.roadmap.archived_at.is_some());
         assert_eq!(archived.items.len(), 1);
         assert!(list(&db, false).await?.is_empty());
         assert_eq!(list(&db, true).await?.len(), 1);
         assert!(matches!(
-            create_item(&db, &id, 7, &item("Late"), &device).await,
+            create_item(&db, &id, 7, &item("Late"), &device, events).await,
             Err(RoadmapError::Archived)
         ));
+        assert_eq!(heard(&mut listener), [(id.clone(), 6), (id.clone(), 7)]);
 
         // At most 20 roadmaps that are not archived.
         for n in 0..MAX_ROADMAPS {
-            create(&db, &plan(&format!("Plan {n}")), &device).await?;
+            create(&db, &plan(&format!("Plan {n}")), &device, events).await?;
         }
         assert!(matches!(
-            create(&db, &plan("One too many"), &device).await,
+            create(&db, &plan("One too many"), &device, events).await,
             Err(RoadmapError::Limit(_))
         ));
         Ok(())
@@ -856,7 +947,13 @@ mod tests {
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = database().await?;
         let device = uuid::Uuid::now_v7().to_string();
-        let id = create(&db, &plan("Plan"), &device).await?.roadmap.id;
+        let hub = Hub::default();
+        let events = &hub;
+        let mut listener = listen(&hub);
+        let id = create(&db, &plan("Plan"), &device, events)
+            .await?
+            .roadmap
+            .id;
         let pr = Link {
             kind: LinkKind::Pr,
             repo: Some("HawkeyNL/PersonalJarvis".into()),
@@ -869,10 +966,12 @@ mod tests {
             links: vec![pr],
             ..item("A")
         };
-        let (a, loaded) = create_item(&db, &id, 1, &new_item, &device).await?;
+        let (a, loaded) = create_item(&db, &id, 1, &new_item, &device, events).await?;
         let mut draft = Draft::new(loaded);
         draft.github_update(&a, &[Some("open".into())])?;
-        commit_github(&db, &draft).await?;
+        assert_eq!(heard(&mut listener), [(id.clone(), 1), (id.clone(), 2)]);
+        commit_github(&db, &draft, events).await?;
+        assert_eq!(heard(&mut listener), [(id.clone(), 3)]);
         let roadmap = get(&db, &id).await?.ok_or("roadmap missing")?;
         assert_eq!(roadmap.roadmap.revision, 3);
         let stored = &roadmap.items[0];
@@ -885,16 +984,26 @@ mod tests {
         assert_eq!(change.fields, ["links", "status"]);
         // A draft built on an older revision writes nothing.
         assert!(matches!(
-            commit_github(&db, &draft).await,
+            commit_github(&db, &draft, events).await,
             Err(RoadmapError::Conflict)
         ));
+        assert!(heard(&mut listener).is_empty());
         // An owner edit keeps the cached state and auto_status.
         let back = ItemPatch {
             status: Some(Status::Planned),
             ..ItemPatch::default()
         };
-        let roadmap =
-            update_item(&db, &id, 3, &a, &back, &device, &GithubHandle::default()).await?;
+        let roadmap = update_item(
+            &db,
+            &id,
+            3,
+            &a,
+            &back,
+            &device,
+            &GithubHandle::default(),
+            events,
+        )
+        .await?;
         assert_eq!(roadmap.items[0].status, Status::Planned);
         assert_eq!(roadmap.items[0].auto_status, Some(Status::InProgress));
         assert_eq!(roadmap.items[0].links[0].state.as_deref(), Some("open"));
@@ -907,8 +1016,14 @@ mod tests {
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = database().await?;
         let device = uuid::Uuid::now_v7().to_string();
-        let id = create(&db, &plan("Plan"), &device).await?.roadmap.id;
-        let (a, _) = create_item(&db, &id, 1, &item("A"), &device).await?;
+        let hub = Hub::default();
+        let events = &hub;
+        let mut listener = listen(&hub);
+        let id = create(&db, &plan("Plan"), &device, events)
+            .await?
+            .roadmap
+            .id;
+        let (a, _) = create_item(&db, &id, 1, &item("A"), &device, events).await?;
         let ready = |item_id: &str| ProposalOp::UpdateItem {
             item_id: item_id.into(),
             patch: ItemPatch {
@@ -955,18 +1070,27 @@ mod tests {
         let refused = create_proposal(&db, &id, 2, &outside, None).await?;
         let (allowlist, _) = crate::roadmaps::github::configure("a/b", None);
         assert!(matches!(
-            accept_proposal(&db, &id, &refused, &device, &allowlist).await,
+            accept_proposal(&db, &id, &refused, &device, &allowlist, events).await,
             Err(RoadmapError::Invalid(_))
         ));
         assert_eq!(get(&db, &id).await?.unwrap().roadmap.revision, 2);
+        assert_eq!(heard(&mut listener), [(id.clone(), 1), (id.clone(), 2)]);
         assert_eq!(list_proposals(&db, &id).await?.len(), 2);
         reject_proposal(&db, &id, &refused, &device).await?;
 
         // Accepting applies every operation in one revision, as Jarvis's
         // change accepted from the device.
-        let roadmap =
-            accept_proposal(&db, &id, &accepted, &device, &GithubHandle::default()).await?;
+        let roadmap = accept_proposal(
+            &db,
+            &id,
+            &accepted,
+            &device,
+            &GithubHandle::default(),
+            events,
+        )
+        .await?;
         assert_eq!(roadmap.roadmap.revision, 3);
+        assert_eq!(heard(&mut listener), [(id.clone(), 3)]);
         assert_eq!(roadmap.items.len(), 2);
         assert_eq!(roadmap.items[0].status, Status::Ready);
         let changes = history(&db, &id, 2).await?;
@@ -975,7 +1099,15 @@ mod tests {
             && c.proposal_id.as_deref() == Some(accepted.as_str())
             && c.device_id.as_deref() == Some(device.as_str())));
         assert!(matches!(
-            accept_proposal(&db, &id, &accepted, &device, &GithubHandle::default()).await,
+            accept_proposal(
+                &db,
+                &id,
+                &accepted,
+                &device,
+                &GithubHandle::default(),
+                events
+            )
+            .await,
             Err(RoadmapError::NotFound)
         ));
         assert!(list_proposals(&db, &id).await?.is_empty());
@@ -999,11 +1131,14 @@ mod tests {
             title: Some("Renamed".into()),
             ..RoadmapPatch::default()
         };
-        update(&db, &id, 3, &renamed, &device).await?;
+        update(&db, &id, 3, &renamed, &device, events).await?;
         assert!(matches!(
-            accept_proposal(&db, &id, &stale, &device, &GithubHandle::default()).await,
+            accept_proposal(&db, &id, &stale, &device, &GithubHandle::default(), events).await,
             Err(RoadmapError::Stale)
         ));
+        // Only the owner's rename was heard: the accepted proposal applied
+        // nothing again and the stale one nothing at all.
+        assert_eq!(heard(&mut listener), [(id.clone(), 4)]);
         assert_eq!(get(&db, &id).await?.unwrap().roadmap.revision, 4);
         reject_proposal(&db, &id, &rejected, &device).await?;
         assert!(matches!(

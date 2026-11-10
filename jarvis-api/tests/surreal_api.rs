@@ -1743,6 +1743,7 @@ async fn trading_routes_serve_the_synced_portfolio_read_only(
 async fn memecoin_strategies_disable_at_once_and_enable_only_with_a_fresh_signature(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use jarvis_api::memecoin::{self, store};
+    use jarvis_client_core::realtime::Event;
     use rust_decimal::Decimal;
 
     let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
@@ -1769,7 +1770,24 @@ async fn memecoin_strategies_disable_at_once_and_enable_only_with_a_fresh_signat
         min_lp_lock_remaining: time::Duration::ZERO,
     };
     memecoin::seed_strategies(&db, &rules).await?;
-    let app = build_router(state(db.clone(), None).await);
+    let state = state(db.clone(), None).await;
+    let mut listener = state
+        .realtime
+        .subscribe(uuid::Uuid::now_v7(), uuid::Uuid::now_v7())
+        .ok_or("no subscription")?;
+    listener.receiver.try_recv()?;
+    // What apps heard since the last call.
+    let mut heard = || {
+        std::iter::from_fn(|| listener.receiver.try_recv().ok())
+            .map(|envelope| envelope.event.clone())
+            .collect::<Vec<_>>()
+    };
+    let changed = |version: u32, enabled: bool| Event::MemeStrategyChanged {
+        strategy_id: "a-survivor-momentum".into(),
+        version,
+        enabled,
+    };
+    let app = build_router(state);
     let signing = SigningKey::from_bytes(&rand::random());
     let (token, _) = enroll_login(&app, &signing).await;
     let call = |method: &'static str, path: String, body: Option<Value>| {
@@ -1797,6 +1815,7 @@ async fn memecoin_strategies_disable_at_once_and_enable_only_with_a_fresh_signat
     assert_eq!(listed["strategies"][0]["performance"]["trades"], 0);
     let detail = json_body(call("GET", a.clone(), None).await?).await;
     assert_eq!(detail["enabled"], true);
+    let seeded = u32::try_from(detail["active_version"].as_u64().ok_or("no version")?)?;
     assert_eq!(detail["versions"][0]["author"], "seed");
     assert_eq!(detail["versions"][0]["diff"], Value::Null);
     assert_eq!(detail["versions"][0]["config"]["id"], "a-survivor-momentum");
@@ -1841,12 +1860,14 @@ async fn memecoin_strategies_disable_at_once_and_enable_only_with_a_fresh_signat
         ),
         (json!(false), json!(true))
     );
+    assert_eq!(heard(), [changed(seeded, false)]);
     assert_eq!(
         call("POST", format!("{base}/missing/disable"), None)
             .await?
             .status(),
         StatusCode::NOT_FOUND
     );
+    assert!(heard().is_empty());
 
     let enable = |signature: String| {
         call(
@@ -1899,7 +1920,10 @@ async fn memecoin_strategies_disable_at_once_and_enable_only_with_a_fresh_signat
     // A good signature enables it, once.
     let second = new_challenge().await;
     let good = sign(&second, version);
+    // Refused enables are not heard.
+    assert!(heard().is_empty());
     assert_eq!(enable(good.clone()).await?.status(), StatusCode::OK);
+    assert_eq!(heard(), [changed(version, true)]);
     let detail = json_body(call("GET", a.clone(), None).await?).await;
     assert_eq!(
         (
@@ -1909,6 +1933,7 @@ async fn memecoin_strategies_disable_at_once_and_enable_only_with_a_fresh_signat
         (json!(true), json!(false))
     );
     assert_eq!(enable(good).await?.status(), StatusCode::CONFLICT);
+    assert!(heard().is_empty());
 
     // A version switch after the challenge voids the signature.
     assert_eq!(
@@ -1935,11 +1960,15 @@ async fn memecoin_strategies_disable_at_once_and_enable_only_with_a_fresh_signat
         },
     )
     .await?;
-    assert!(store::set_active_version(&db, "a-survivor-momentum", config.version, "claude").await?);
+    assert_eq!(
+        store::set_active_version(&db, "a-survivor-momentum", config.version, "claude").await?,
+        Some(false)
+    );
     assert_eq!(
         enable(sign(&third, version)).await?.status(),
         StatusCode::CONFLICT
     );
+    assert_eq!(heard(), [changed(version, false)]);
     let detail = json_body(call("GET", a.clone(), None).await?).await;
     assert_eq!(detail["enabled"], false);
     assert_eq!(detail["active_version"], config.version);
@@ -2041,7 +2070,13 @@ async fn roadmap_routes_validate_and_guard_revisions() -> Result<(), Box<dyn std
         .use_db("core")
         .await?;
     jarvis_store::apply_baseline_schema(&db).await?;
-    let app = build_router(state(db, None).await);
+    let state = state(db, None).await;
+    let mut listener = state
+        .realtime
+        .subscribe(uuid::Uuid::now_v7(), uuid::Uuid::now_v7())
+        .ok_or("no subscription")?;
+    listener.receiver.try_recv()?;
+    let app = build_router(state);
     let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
     let call = |method: &str, path: &str, body: Option<String>| {
         let mut request = Request::builder()
@@ -2163,6 +2198,21 @@ async fn roadmap_routes_validate_and_guard_revisions() -> Result<(), Box<dyn std
         StatusCode::CONFLICT
     );
     assert_eq!(call("GET", &base, None).await?.status(), StatusCode::OK);
+
+    // Apps heard each committed write once, with its revision, and none of
+    // the refused ones.
+    let heard: Vec<_> = std::iter::from_fn(|| listener.receiver.try_recv().ok())
+        .map(|envelope| envelope.event.clone())
+        .collect();
+    let committed: Vec<_> = (1..=4)
+        .map(
+            |revision| jarvis_client_core::realtime::Event::RoadmapChanged {
+                id: id.clone(),
+                revision,
+            },
+        )
+        .collect();
+    assert_eq!(heard, committed);
     Ok(())
 }
 
