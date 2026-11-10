@@ -146,9 +146,10 @@ pub enum ClaudeWorkerState {
     /// a staged model rollout). Never a reason to try a paid API instead.
     ModelUnavailable,
     RuntimeFailure,
-    /// The run tried a tool (command, search, MCP, file change) or emitted an
-    /// event the worker cannot prove harmless; it was stopped and its answer
-    /// discarded. Only the Codex chat worker returns this.
+    /// The run tried a tool (command, search, MCP, file change), searched for
+    /// a query the privacy gate flags, or emitted an event the worker cannot
+    /// prove harmless; it was stopped and its answer discarded. The Codex chat
+    /// worker returns this, and the Claude worker in research runs.
     ToolUseRefused,
 }
 

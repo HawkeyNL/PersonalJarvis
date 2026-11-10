@@ -510,14 +510,36 @@ carries only the latest question (at most 2000 characters; the worker accepts
 at most 8 KiB) and a fixed research instruction. Without the flag, both
 workers run exactly as described above, with every tool off.
 
-**Claude.** A research run changes only the tool flags of the reviewed
-invocation:
+**Claude.** A research run changes only the output format and the tool flags
+of the reviewed invocation:
 
 ```text
-claude -p --output-format json --model <model> --restricted --strict-mcp-config
+claude -p --output-format stream-json --model <model> --restricted --strict-mcp-config
   --no-session-persistence --tools WebSearch --disallowedTools mcp__*
-  --disable-slash-commands --allowedTools WebSearch --max-turns 8 [--system-prompt-file <private file>]
+  --disable-slash-commands --verbose --allowedTools WebSearch --max-turns 8
+  [--system-prompt-file <private file>]
 ```
+
+The worker reads the stream line by line (`-p` emits `stream-json` only with
+`--verbose`). The event shapes were checked against the installed Claude Code
+2.1.311, its `--help` and changelog, and the tool-use records of local Claude
+Code transcripts: `system`, `assistant` (with `message.content` blocks such as
+`text`, `thinking` and `tool_use`, where a search is
+`{"type":"tool_use","name":"WebSearch","input":{"query":...}}`), `user` (tool
+results) and a final `result` event with the same fields as
+`--output-format json`. The worker stops the run's process group and returns
+`tool_use_refused` on any tool-use block (`tool_use`, `server_tool_use`,
+`mcp_tool_use`) other than a `WebSearch` whose query is a string the privacy
+gate (`jarvis_llm::privacy::is_private`, without the holdings, which Core
+already checked against the question) does not flag, and on any line that is
+not a JSON object with a type. That includes the CLI's own `EndConversation`.
+The answer comes only from the final `result` event; a run without one is a
+`runtime_failure`. Each line keeps the 256 KiB bound of the single JSON
+reply, and the whole stream is bounded at 4 MiB. Like the Codex check, this
+detects and discards: the event reaches the worker after the CLI produced the
+tool call, so the search may already have run. A real research run with this
+invocation has not been accepted on the Home Node yet. Ordinary chat and typed
+tasks keep `--output-format json` unchanged.
 
 `--tools WebSearch` makes `WebSearch` the only built-in tool (the CLI
 reference: `--tools` restricts the built-in tools to the named ones;
@@ -576,8 +598,8 @@ task, see below); a second background request while one runs is refused
 (`runtime_failure`), never queued, so one slot always stays free for chat. A
 research failure does not put the subscription into the router's cooldown for
 chat, except an authentication failure or a plan limit. The output bounds are
-unchanged (Claude: 256 KiB CLI result; Codex: 512 KiB per event, 4 MiB stream,
-128 KiB answer). The worker reads Core's request within 5 seconds.
+unchanged (Claude: 256 KiB CLI result, and in a research run 256 KiB per event
+and a 4 MiB stream; Codex: 512 KiB per event, 4 MiB stream, 128 KiB answer). The worker reads Core's request within 5 seconds.
 
 **Prompt injection and privacy.** Search results can contain instructions.
 The research instruction tells the model to treat web content as data, never
@@ -586,7 +608,8 @@ amounts, holdings or a location) in a search query or URL, and never to
 publish, post, submit, comment or reply anywhere, only to read. The worker
 limits what an injected instruction could do: Claude has no tool except
 `WebSearch` (besides the CLI's own `EndConversation`) and at most 8 turns,
-and Codex runs that use any other tool are killed and discarded. The run's
+and both workers kill and discard a run that uses any other tool or searches
+for a query the privacy gate flags (see above). The run's
 context holds only the question and that fixed instruction: no persona,
 memory, history or runtime facts. Both workers run the CLI with `TZ=UTC`, so
 the host's time zone never reaches the prompt. The question itself, or words

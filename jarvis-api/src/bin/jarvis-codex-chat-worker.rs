@@ -18,12 +18,12 @@ use jarvis_llm::{
 };
 use subscription_worker::{
     authorized_peer, background_slot, inherited_listener, named_uid, read_request, reply_deadline,
-    run_timeout, send, validate_private_dir, validate_root_binary, MAX_PARALLEL_BACKGROUND_RUNS,
-    MAX_PARALLEL_RUNS, REQUEST_READ_TIMEOUT,
+    run_timeout, send, stop_group, validate_private_dir, validate_root_binary,
+    MAX_PARALLEL_BACKGROUND_RUNS, MAX_PARALLEL_RUNS, REQUEST_READ_TIMEOUT,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::{Child, Command},
+    process::Command,
     sync::Semaphore,
 };
 
@@ -407,21 +407,6 @@ async fn read_events(
             CodexEvent::Refused => return Ok(None),
         }
     }
-}
-
-/// Kill the run's whole process group, then reap the CLI and whatever of its
-/// group was re-parented to this worker (it is PID 1 under `PrivatePIDs`).
-/// Either the CLI is not reaped yet, or a group member still holds its output
-/// open (the only wait after the CLI is reaped), so the group id is still in
-/// use and cannot belong to another run.
-async fn stop_group(child: &mut Child, group: libc::pid_t) {
-    unsafe { libc::kill(-group, libc::SIGKILL) };
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-    let reap = tokio::task::spawn_blocking(move || {
-        while unsafe { libc::waitpid(-group, std::ptr::null_mut(), 0) } > 0 {}
-    });
-    let _ = tokio::time::timeout(Duration::from_secs(5), reap).await;
 }
 
 /// Drain a stream completely, keeping only its last `cap` bytes.
