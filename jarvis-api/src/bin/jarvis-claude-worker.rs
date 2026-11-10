@@ -576,6 +576,22 @@ mod tests {
             .join(" ")
     }
 
+    /// Flags and tools that would widen what a run may touch, as substrings
+    /// of the whole argv (`--dangerously*` included). CI guard.
+    fn assert_no_widening_tokens(args: &str) {
+        for forbidden in [
+            "--settings",
+            "--add-dir",
+            "--permission-mode",
+            "--dangerously",
+            "--agents",
+            "Agent",
+            "Task",
+        ] {
+            assert!(!args.contains(forbidden), "{forbidden} in {args}");
+        }
+    }
+
     #[test]
     fn argv_is_exactly_the_reviewed_invocation() {
         let prompt = Path::new("/run/jarvis-claude/.tmpX");
@@ -596,6 +612,8 @@ mod tests {
         // Never the host-side fetch, never an MCP or command tool.
         for research in [false, true] {
             let args = argv(research, None);
+            assert_no_widening_tokens(&args);
+            assert_no_widening_tokens(&argv(research, Some(prompt)));
             for forbidden in [
                 "--bare",
                 "WebFetch",
@@ -625,6 +643,8 @@ mod tests {
                  --system-prompt-file /run/jarvis-claude/.tmpX"
             );
             let joined = task_argv(&request, None);
+            assert_no_widening_tokens(&joined);
+            assert_no_widening_tokens(&task_argv(&request, Some(prompt)));
             for forbidden in [
                 "WebSearch",
                 "WebFetch",
