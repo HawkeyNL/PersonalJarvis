@@ -763,6 +763,15 @@ async fn start_memecoin_paper(
             profile,
             market: Box::new(market),
             resume_paused_at,
+            // Typed tasks go straight to the Claude subscription worker,
+            // never through the router or a paid API.
+            brain: Some(Arc::new(jarvis_llm::ClaudeCliProvider::new(
+                &config.llm_claude_cli_bin,
+                &config.llm_model,
+                &config.llm_model_hard,
+                &config.llm_model_cheap,
+            ))),
+            events: Some(state.realtime.clone()),
         },
     )
     .await

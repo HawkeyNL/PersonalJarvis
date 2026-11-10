@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rust_decimal::{Decimal, RoundingStrategy};
+use rust_decimal::Decimal;
 use time::{Date, OffsetDateTime, UtcOffset};
 
 use crate::config::{ConfigError, StrategyConfig};
@@ -31,8 +31,6 @@ use crate::paper::{self, checked_sum, CostModel, Fill, Ledger, LedgerError, Mark
 use crate::signals::{Observation, Series};
 use crate::strategy::{self, ExitReason};
 use crate::types::Position;
-
-const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 
 /// One simulated round trip.
 #[derive(Debug, Clone, PartialEq)]
@@ -194,17 +192,7 @@ fn enter(
     costs: &CostModel,
     max_position_usd: Decimal,
 ) -> Option<Position> {
-    let by_mandate = max_position_usd.checked_mul(Decimal::from(config.position_share_bps))? / BPS;
-    let by_liquidity = obs
-        .liquidity_usd
-        .checked_mul(Decimal::from(config.max_liquidity_share_bps))?
-        / BPS;
-    let size = by_mandate
-        .min(by_liquidity)
-        .round_dp_with_strategy(2, RoundingStrategy::ToZero);
-    if size <= Decimal::ZERO {
-        return None;
-    }
+    let size = config.entry_size(obs.liquidity_usd, max_position_usd)?;
     let (tokens, fees) = fill(paper::buy(
         size,
         obs.price_usd,
@@ -276,41 +264,72 @@ fn failed_fees(costs: &CostModel) -> Option<Decimal> {
 }
 
 fn report(trades: Vec<BacktestTrade>) -> Result<BacktestReport, BacktestError> {
-    let pnls = || trades.iter().map(|t| t.net_pnl_usd);
-    let net_usd = checked_sum(pnls())?;
-    let count = Decimal::from(trades.len());
-    let overflow = || BacktestError::Ledger(LedgerError::Overflow);
-    let expectancy_usd = if trades.is_empty() {
+    let p = performance(trades.iter().map(|t| t.net_pnl_usd))?;
+    Ok(BacktestReport {
+        trades,
+        net_usd: p.net_usd,
+        expectancy_usd: p.expectancy_usd,
+        win_rate_bps: p.win_rate_bps,
+        max_drawdown_usd: p.max_drawdown_usd,
+        profit_factor: p.profit_factor,
+    })
+}
+
+/// Results of a run of round trips, in close order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Performance {
+    pub trades: usize,
+    pub net_usd: Decimal,
+    /// Mean net P&L per trade; zero without trades.
+    pub expectancy_usd: Decimal,
+    /// Share of trades with a positive net P&L, bps.
+    pub win_rate_bps: u32,
+    /// Largest drop of cumulative net P&L from its running high (from zero).
+    pub max_drawdown_usd: Decimal,
+    /// Gross wins over gross losses; `None` without losing trades.
+    pub profit_factor: Option<Decimal>,
+}
+
+/// The [`Performance`] of round trips with these net results, in close
+/// order. Shared by backtests and the paper ledger, so both are measured the
+/// same way.
+pub fn performance(
+    pnls: impl Iterator<Item = Decimal> + Clone,
+) -> Result<Performance, LedgerError> {
+    let trades = pnls.clone().count();
+    let net_usd = checked_sum(pnls.clone())?;
+    let expectancy_usd = if trades == 0 {
         Decimal::ZERO
     } else {
-        net_usd.checked_div(count).ok_or_else(overflow)?
+        net_usd
+            .checked_div(Decimal::from(trades))
+            .ok_or(LedgerError::Overflow)?
     };
-    let wins = trades
-        .iter()
-        .filter(|t| t.net_pnl_usd > Decimal::ZERO)
-        .count();
-    let win_rate_bps = if trades.is_empty() {
-        0
-    } else {
-        u32::try_from(wins * 10_000 / trades.len()).unwrap_or(10_000)
-    };
-    let gross_win = checked_sum(pnls().filter(|v| *v > Decimal::ZERO))?;
-    let gross_loss = -checked_sum(pnls().filter(|v| *v < Decimal::ZERO))?;
+    let wins = pnls.clone().filter(|v| *v > Decimal::ZERO).count();
+    let win_rate_bps = (wins * 10_000)
+        .checked_div(trades)
+        .map_or(0, |bps| u32::try_from(bps).unwrap_or(10_000));
+    let gross_win = checked_sum(pnls.clone().filter(|v| *v > Decimal::ZERO))?;
+    let gross_loss = -checked_sum(pnls.clone().filter(|v| *v < Decimal::ZERO))?;
     let profit_factor = if gross_loss > Decimal::ZERO {
-        Some(gross_win.checked_div(gross_loss).ok_or_else(overflow)?)
+        Some(
+            gross_win
+                .checked_div(gross_loss)
+                .ok_or(LedgerError::Overflow)?,
+        )
     } else {
         None
     };
 
     let (mut cumulative, mut high, mut max_drawdown_usd) =
         (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
-    for pnl in pnls() {
+    for pnl in pnls {
         cumulative = checked_sum([cumulative, pnl].into_iter())?;
         high = high.max(cumulative);
-        let drop = high.checked_sub(cumulative).ok_or_else(overflow)?;
+        let drop = high.checked_sub(cumulative).ok_or(LedgerError::Overflow)?;
         max_drawdown_usd = max_drawdown_usd.max(drop);
     }
-    Ok(BacktestReport {
+    Ok(Performance {
         trades,
         net_usd,
         expectancy_usd,
@@ -570,5 +589,27 @@ mod tests {
                 Err(BacktestError::InvalidSeries("m".to_owned()))
             );
         }
+    }
+
+    #[test]
+    fn performance_on_a_fixed_set() {
+        let p = performance([d("2"), d("-1"), d("-3"), d("4")].into_iter()).unwrap();
+        assert_eq!(p.trades, 4);
+        assert_eq!(p.net_usd, d("2"));
+        assert_eq!(p.expectancy_usd, d("0.5"));
+        assert_eq!(p.win_rate_bps, 5_000);
+        // Cumulative 2, 1, -2, 2: the drop from 2 to -2.
+        assert_eq!(p.max_drawdown_usd, d("4"));
+        assert_eq!(p.profit_factor, Some(d("1.5")));
+        let none = performance(std::iter::empty()).unwrap();
+        assert_eq!(
+            (
+                none.trades,
+                none.net_usd,
+                none.win_rate_bps,
+                none.profit_factor
+            ),
+            (0, Decimal::ZERO, 0, None)
+        );
     }
 }
