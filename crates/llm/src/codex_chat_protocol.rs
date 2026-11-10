@@ -3,7 +3,7 @@
 //! only the socket, the identity and the reviewed official runtime differ.
 
 use crate::claude_worker_protocol::ClaudeWorkerState;
-use crate::privacy::is_private;
+use crate::privacy::leaks_identifier;
 
 pub const SOCKET: &str = "/run/jarvis-codex-chat.sock";
 
@@ -78,8 +78,8 @@ pub enum CodexEvent {
     /// A structured error message, used only to classify a failure.
     Error(String),
     /// Anything else: a command, a web search outside a research run, a page
-    /// open or find, a search query the privacy gate flags, MCP or tool call,
-    /// file change, plan update, an unknown event or item type, or an
+    /// open or find, a search query the identifier check flags, MCP or tool
+    /// call, file change, plan update, an unknown event or item type, or an
     /// unparseable line.
     /// The worker stops the run and discards its answer.
     Refused,
@@ -88,9 +88,9 @@ pub enum CodexEvent {
 /// Fail closed: only the event and item types listed here are allowed. A
 /// `web_search` item (the provider-hosted search; codex-rs `WebSearchItem`)
 /// is allowed only in an owner-enabled research run, only as a plain search
-/// and only when the privacy gate passes every query it carries; every other
-/// tool item still stops the run. The item arrives after the provider ran the
-/// search, so this detects and discards; it cannot prevent.
+/// and only when the identifier check passes every query it carries; every
+/// other tool item still stops the run. The item arrives after the provider
+/// ran the search, so this detects and discards; it cannot prevent.
 pub fn parse_codex_event(line: &[u8], research: bool) -> CodexEvent {
     use serde_json::Value;
     let Ok(event) = serde_json::from_slice::<Value>(line) else {
@@ -137,9 +137,8 @@ fn search_action(item: &serde_json::Value) -> bool {
 }
 
 /// Every query the item carries (`query`, `action.query`, `action.queries`)
-/// is a string that [`is_private`] does not flag. Core already gated the
-/// question with the owner's holdings; the worker does not know them, so
-/// this check runs without.
+/// is a string that [`leaks_identifier`] does not flag: no email address,
+/// key, possessive account word or long number (a plain date is fine).
 fn search_queries_pass(item: &serde_json::Value) -> bool {
     use serde_json::Value;
     let action = &item["action"];
@@ -152,7 +151,7 @@ fn search_queries_pass(item: &serde_json::Value) -> bool {
         .into_iter()
         .filter(|query| !query.is_null())
         .chain(queries)
-        .all(|query| query.as_str().is_some_and(|query| !is_private(query, &[])))
+        .all(|query| query.as_str().is_some_and(|query| !leaks_identifier(query)))
 }
 
 /// Classify a failed `codex exec` run. Only trusted sources count: structured
@@ -385,6 +384,8 @@ mod tests {
             r#"{"type":"item.updated","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"search","queries":["rust release","rust 1.97"]}}}"#,
             r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"search"},"results":[]}}"#,
             r#"{"type":"item.completed","item":{"id":"i3","type":"web_search","query":"x"}}"#,
+            // Prices, dates and symbols are not identifiers.
+            r#"{"type":"item.completed","item":{"id":"i4","type":"web_search","query":"bitcoin price usd 2026","action":{"type":"search","queries":["nieuws 2026-11-10","ASML Q3 2026 kwartaalcijfers"]}}}"#,
         ];
         for line in searches {
             assert_eq!(
@@ -431,7 +432,7 @@ mod tests {
             r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"mijn portfolio rendement","action":{"type":"search","query":"rendement"}}}"#,
             r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"rendement","action":{"type":"search","query":"jan.devries@example.nl"}}}"#,
             r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"search","queries":["weer","IBAN NL91ABNA0417164300"]}}}"#,
-            r#"{"type":"item.started","item":{"id":"i1","type":"web_search","query":"is 2500 EUR per maand veel"}}"#,
+            r#"{"type":"item.started","item":{"id":"i1","type":"web_search","query":"bel 06-12345678 terug"}}"#,
             // Not a string, or not a list of strings: refused, never skipped.
             r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":7,"action":{"type":"search"}}}"#,
             r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"search","query":["x"]}}}"#,

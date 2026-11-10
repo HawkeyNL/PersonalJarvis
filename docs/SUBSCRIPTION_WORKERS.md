@@ -541,9 +541,9 @@ tool; the CLI fetches nothing itself. The event allowlist then also accepts
 `web_search` items (codex-rs `exec` JSONL `item.started|updated|completed` with
 `item.type == "web_search"`) whose `action.type` is `search`, or that have no
 action, and only when every query the item carries (`query`, `action.query`
-and each string in `action.queries`) is a string that the privacy gate
-(`jarvis_llm::privacy::is_private`, without the holdings, which Core already
-checked against the question) does not flag. By owner decision, `open_page`
+and each string in `action.queries`) is a string that the identifier check
+(`jarvis_llm::privacy::leaks_identifier`: no email address, key, possessive
+account word or long number; a plain date is fine) does not flag. By owner decision, `open_page`
 and `find_in_page` actions are refused. Codex CLI 0.166.0 has no setting that
 turns them off: `web_search` is `disabled | cached | indexed | live`, and
 those modes only set the hosted tool's `external_web_access` and
