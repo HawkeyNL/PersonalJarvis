@@ -594,6 +594,9 @@ mod tests {
             r#"{"type":"item.completed","item":{"id":"i5","type":"file_change","changes":[]}}"#,
             r#"{"type":"item.completed","item":{"id":"i6","type":"collab_tool_call"}}"#,
             r#"{"type":"item.completed","item":{"id":"i7","type":"web_search","action":{"type":"other"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i8","type":"web_search","query":"q","action":{"type":"open_page","url":"https://example.org"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i9","type":"web_search","query":"q","action":{"type":"find_in_page","url":"https://example.org","pattern":"x"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i10","type":"web_search","query":"my portfolio","action":{"type":"search","query":"my portfolio"}}}"#,
             r#"{"type":"something_new"}"#,
             "not json",
         ] {
