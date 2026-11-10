@@ -616,10 +616,10 @@ the host's time zone never reaches the prompt. The question itself, or words
 from it, still leaves the host in a search query, so Core runs the
 deterministic privacy gate (`jarvis_llm::privacy::is_private`, listed in
 `MODEL_ROUTING_OPERATIONS.md`, "Privacy gate") on every Research question,
-explicit or automatic, before any worker is called. A flagged question, or
-any question while IBKR is linked but its holdings cannot be read, gets a
-fixed notice asking the owner to rephrase it without personal details; there
-is no override. Names and other free-text details are not detectable. No
+explicit or automatic, before any worker is called. A flagged question gets a
+fixed notice asking the owner to rephrase it without personal details; while
+IBKR is linked but its holdings cannot be read, every question gets a fixed
+"could not be checked" notice. There is no override. Names and other free-text details are not detectable. No
 unit or network change is needed: the search runs on the provider's side and
 neither worker fetches web pages itself.
 
