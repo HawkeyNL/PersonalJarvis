@@ -43,7 +43,7 @@ const PERSONAL_WORDS: [&str; 29] = [
 const CURRENCY_WORDS: [&str; 7] = ["eur", "euro", "euros", "usd", "dollar", "dollars", "gbp"];
 /// A contiguous digit run this long is private (phone, account numbers).
 const MIN_DIGIT_RUN: usize = 6;
-/// Digits split by single separators (`4111 1111`, `06-1234`) are private
+/// Digits split by separators (`4111 1111`, `06-1234`) are private
 /// from this many digits on, or from [`MIN_DIGIT_RUN`] groups on (`1 2 3 4 5 6`).
 const MIN_SEPARATED_DIGITS: usize = 8;
 const KEY_PREFIXES: [&str; 3] = ["sk-", "ghp_", "AKIA"];
@@ -104,8 +104,19 @@ fn has_digit_run(text: &str, dates_allowed: bool) -> bool {
         (run.iter().any(|(_, group)| digits(group) >= MIN_DIGIT_RUN)
             || total >= MIN_SEPARATED_DIGITS
             || run.len() >= MIN_DIGIT_RUN)
-            && !(dates_allowed && is_date(run))
+            && !(dates_allowed && (is_date(run) || is_year_range(run)))
     })
+}
+
+/// Two plausible years and nothing else (`2024-2025`, `1990 – 2000`).
+fn is_year_range(run: &[(char, String)]) -> bool {
+    let year = |digits: &String| {
+        digits.len() == 4
+            && digits
+                .parse::<u16>()
+                .is_ok_and(|year| (1900..=2099).contains(&year))
+    };
+    matches!(run, [(_, from), (_, to)] if year(from) && year(to))
 }
 
 /// Maximal runs of digit groups, each with the separator before it: the
@@ -173,13 +184,13 @@ fn is_separator(c: char) -> bool {
         )
 }
 
-/// Invisible format characters: soft hyphen, Mongolian vowel separator,
-/// zero-width space and joiners, word joiner, invisible operators, BOM.
+/// Ignored inside a number: any non-ASCII character that is neither a
+/// letter or digit, whitespace nor a separator. That covers format and
+/// bidi controls, zero-width characters, combining marks, variation
+/// selectors, tags and symbols such as `·`, so none of them can split a
+/// number; it only ever joins more digits.
 fn is_invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{ad}' | '\u{180e}' | '\u{200b}'..='\u{200d}' | '\u{2060}'..='\u{2064}' | '\u{feff}'
-    )
+    !c.is_ascii() && !c.is_alphanumeric() && !c.is_whitespace() && !is_separator(c)
 }
 
 /// The whole run is one plausible date: `YYYY-MM-DD`, `YYYY/MM/DD`,
@@ -212,11 +223,10 @@ fn is_date(run: &[(char, String)]) -> bool {
 fn has_amount(lower: &str) -> bool {
     let currency =
         lower.contains(['€', '$', '£']) || CURRENCY_WORDS.iter().any(|word| has_word(lower, word));
-    (currency && lower.contains(|c: char| c.is_ascii_digit()))
+    (currency && lower.contains(char::is_numeric))
         || runs(lower, char::is_alphanumeric).any(|word| {
-            word.strip_suffix('k').is_some_and(|digits| {
-                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
-            })
+            word.strip_suffix('k')
+                .is_some_and(|digits| !digits.is_empty() && digits.chars().all(char::is_numeric))
         })
 }
 
@@ -393,6 +403,18 @@ mod tests {
             ("2026 - 11 - 10", true),
             ("1234--5678", false),
             ("1234 -- 5678", false),
+            ("06\u{200e}1234\u{200e}5678", true),
+            ("06\u{fe0f}1234\u{fe0f}5678", true),
+            ("06\u{301}1234\u{301}5678", true),
+            ("06\u{e0020}1234\u{e0020}5678", true),
+            ("06·1234·5678", true),
+            ("06\u{30fb}1234\u{30fb}5678", true),
+            // Two years are a range, not a number; a third group is.
+            ("inflatie 2024 - 2025", false),
+            ("2024-2025 verkiezingen", false),
+            ("1990 – 2000", false),
+            ("2024 - 2025 06", true),
+            ("1234-2025", true),
             // Only `-`, `/` and `.` make a date.
             ("2024_11_08", true),
             ("2024–11–08", true),
@@ -432,5 +454,8 @@ mod tests {
         // The auto-mode gate still counts dates as long numbers.
         assert!(is_private("nieuws 2026-11-10", &[]));
         assert!(!is_private("1234--5678", &[]));
+        assert!(is_private("is €２５００ per maand veel?", &[]));
+        assert!(is_private("salary of ８０k", &[]));
+        assert!(is_private("inflatie 2024 - 2025", &[]));
     }
 }

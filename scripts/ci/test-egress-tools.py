@@ -58,6 +58,13 @@ class EgressToolTests(unittest.TestCase):
                          [(2, "unparsed quote: string literals could not be scanned")])
         self.assertEqual(self.rules(WORKER, 'let b = x"y;'),
                          ["unparsed quote: string literals could not be scanned"])
+        # Nested block comments fail closed; unicode and hex char escapes parse.
+        self.assertIn("nested block comment: could not be scanned",
+                      self.rules(OTHER, '/* /* x */ *//* y */ let y = "Bash";'))
+        for escape in ["'\\u{22}'", "'\\x22'"]:
+            text = escape + '"\'""/*" let y = "Bash"; /* */'
+            self.assertNotEqual(self.rules(OTHER, text), [], text)
+            self.assertEqual(self.rules(OTHER, f'let q = {escape}; let s = "ok";'), [], escape)
 
     def test_cli_paths_only_in_reviewed_files(self):
         for text in ['const BIN: &str = "/usr/local/bin/claude";', '"/opt/x/codex"',
