@@ -690,9 +690,12 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     if let Some(token) = github_token {
-        if let Err(reason) =
-            jarvis_api::roadmaps::github::start(state.db.clone(), state.github.clone(), token)
-        {
+        if let Err(reason) = jarvis_api::roadmaps::github::start(
+            state.db.clone(),
+            state.github.clone(),
+            token,
+            state.realtime.clone(),
+        ) {
             tracing::error!(reason, "GitHub roadmap sync disabled");
         }
     }

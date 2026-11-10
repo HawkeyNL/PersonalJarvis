@@ -57,6 +57,13 @@ moved on, nothing is written and the answer is 409, so the client reloads
 and tries again. A write that changes nothing writes nothing and keeps the
 revision.
 
+After every committed write (the owner's, an accepted proposal or the
+GitHub poller's) Core sends the realtime event
+`roadmap.changed {"id": "…", "revision": N}` to every connected app (see
+`REALTIME_PROTOCOL.md`). It carries only the roadmap id and the new
+revision; the app reloads `GET /v1/roadmaps/{id}`. A refused, stale or empty
+write sends nothing.
+
 ### Items
 
 - `title`: 1 to 200 characters on one line.
@@ -270,7 +277,5 @@ To turn the poller off, remove the file or the allowlist and restart.
 
 ## What is next
 
-- **Realtime event:** `roadmap.changed {id, revision}`, once every client
-  ignores event types it does not know.
 - **Proposals from Jarvis:** a bounded task that reads the roadmap and typed
   GitHub facts and records proposals, never applying them itself.

@@ -123,8 +123,6 @@ pub enum Event {
     VoiceFailed { run_id: Uuid, device_id: Uuid },
     /// A memecoin paper strategy changed its active version or enabled
     /// state. A hint to reload `GET /v1/trading/meme/strategies/{id}`.
-    /// Core does not send it yet: apps released before they ignore unknown
-    /// event types would fail on it.
     #[serde(rename = "trading.meme.strategy_changed")]
     MemeStrategyChanged {
         strategy_id: String,
@@ -132,10 +130,12 @@ pub enum Event {
         enabled: bool,
     },
     /// The strategy agent recorded a paper decision; reload
-    /// `GET /v1/trading/meme/decisions`. Not sent yet, like
-    /// [`Event::MemeStrategyChanged`].
+    /// `GET /v1/trading/meme/decisions`.
     #[serde(rename = "trading.meme.decision")]
     MemeDecision { id: String },
+    /// A roadmap write committed `revision`; reload `GET /v1/roadmaps/{id}`.
+    #[serde(rename = "roadmap.changed")]
+    RoadmapChanged { id: String, revision: u64 },
 }
 
 /// Fixed safe failure codes, not raw provider errors.
@@ -314,6 +314,22 @@ mod tests {
         let wire = serde_json::to_value(&decision).unwrap();
         assert_eq!(wire["type"], "trading.meme.decision");
         assert_eq!(wire["payload"], serde_json::json!({"id": "d1"}));
+        assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), decision);
+    }
+
+    #[test]
+    fn roadmap_changed_carries_only_id_and_revision() {
+        let changed = Event::RoadmapChanged {
+            id: "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(),
+            revision: 7,
+        };
+        let wire = serde_json::to_value(&changed).unwrap();
+        assert_eq!(wire["type"], "roadmap.changed");
+        assert_eq!(
+            wire["payload"],
+            serde_json::json!({"id": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "revision": 7})
+        );
+        assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), changed);
     }
 
     #[test]

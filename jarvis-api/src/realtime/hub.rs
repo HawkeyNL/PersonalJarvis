@@ -104,6 +104,7 @@ impl Inner {
             Event::VoiceFailed { .. } => "voice.failed",
             Event::MemeStrategyChanged { .. } => "trading.meme.strategy_changed",
             Event::MemeDecision { .. } => "trading.meme.decision",
+            Event::RoadmapChanged { .. } => "roadmap.changed",
         };
         let Some(envelope) = self.envelope(event) else {
             return;
