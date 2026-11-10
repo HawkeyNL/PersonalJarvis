@@ -280,12 +280,7 @@ async fn run_official_client(
         file.flush().await?;
         instructions = Some(path);
     }
-    let mut command = clean_command(CODEX, &workdir);
-    command.args(exec_args(
-        &request.model,
-        instructions.as_deref(),
-        request.research,
-    ));
+    let command = exec_command(&request, &workdir, instructions.as_deref());
     let outcome = run_cli(command, &request.prompt, limit, request.research).await?;
     Ok(finish(outcome))
 }
@@ -469,9 +464,23 @@ fn clean_command(program: &str, workdir: &Path) -> Command {
         .env("LOGNAME", IDENTITY)
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("LANG", "C.UTF-8")
-        // `codex exec` adds the time zone to the prompt: never the host's.
-        .env("TZ", "UTC")
         .current_dir(workdir);
+    command
+}
+
+/// The reviewed `codex exec` in the clean environment. Only a research run
+/// adds `TZ=UTC`: `codex exec` adds the time zone to the prompt, and that
+/// could reach a search query. Chat keeps its environment.
+fn exec_command(
+    request: &ClaudeWorkerRequest,
+    workdir: &Path,
+    instructions: Option<&Path>,
+) -> Command {
+    let mut command = clean_command(CODEX, workdir);
+    command.args(exec_args(&request.model, instructions, request.research));
+    if request.research {
+        command.env("TZ", "UTC");
+    }
     command
 }
 
@@ -522,6 +531,20 @@ mod tests {
             "mcp_servers",
         ] {
             assert!(!joined.contains(forbidden), "{forbidden} in {joined}");
+        }
+        // Exact tokens: `web_search=...` is a `-c` value, not `--search`.
+        for forbidden in [
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--yolo",
+            "--add-dir",
+            "--search",
+        ] {
+            assert!(
+                !argv
+                    .iter()
+                    .any(|arg| arg == forbidden || arg.starts_with(&format!("{forbidden}="))),
+                "{forbidden} in {joined}"
+            );
         }
     }
 
@@ -627,7 +650,39 @@ mod tests {
         assert!(!env.contains("API_KEY"), "{env}");
         assert!(!env.contains("canary"), "{env}");
         assert!(env.lines().any(|line| line == "HOME=/var/lib/jarvis-codex"));
-        assert!(env.lines().any(|line| line == "TZ=UTC"));
+        assert!(!env.contains("TZ="), "{env}");
+    }
+
+    #[test]
+    fn only_research_runs_get_a_utc_time_zone() {
+        let environment = |command: &Command| {
+            command
+                .as_std()
+                .get_envs()
+                .map(|(key, value)| (key.to_owned(), value.map(|value| value.to_owned())))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let workdir = Path::new("/run/jarvis-codex-chat/run-x/work");
+        let clean = environment(&clean_command(CODEX, workdir));
+        assert!(!clean.contains_key(std::ffi::OsStr::new("TZ")));
+        let request = |research| ClaudeWorkerRequest {
+            protocol: 1,
+            model: "gpt-6-luna".into(),
+            system: None,
+            prompt: "hi".into(),
+            research,
+            task: None,
+        };
+        assert_eq!(
+            environment(&exec_command(&request(false), workdir, None)),
+            clean
+        );
+        let mut research = environment(&exec_command(&request(true), workdir, None));
+        assert_eq!(
+            research.remove(std::ffi::OsStr::new("TZ")),
+            Some(Some("UTC".into()))
+        );
+        assert_eq!(research, clean);
     }
 
     #[tokio::test]

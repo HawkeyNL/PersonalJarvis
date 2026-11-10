@@ -114,7 +114,9 @@ pub fn parse_codex_event(line: &[u8], research: bool) -> CodexEvent {
                 }
                 Some("error") => message(&item["message"]),
                 Some("web_search")
-                    if research && search_action(item) && search_queries_pass(item) =>
+                    if research
+                        && search_action(item)
+                        && search_queries_pass(item, kind == "item.completed") =>
                 {
                     CodexEvent::Benign
                 }
@@ -138,8 +140,10 @@ fn search_action(item: &serde_json::Value) -> bool {
 
 /// Every query the item carries (`query`, `action.query`, `action.queries`)
 /// is a string that [`leaks_identifier`] does not flag: no email address,
-/// key, possessive account word or long number (a plain date is fine).
-fn search_queries_pass(item: &serde_json::Value) -> bool {
+/// key, possessive account word or long number (a plain date is fine). A
+/// completed search must carry at least one non-empty query, so a search the
+/// worker could not check never passes.
+fn search_queries_pass(item: &serde_json::Value, completed: bool) -> bool {
     use serde_json::Value;
     let action = &item["action"];
     let queries = match &action["queries"] {
@@ -147,11 +151,18 @@ fn search_queries_pass(item: &serde_json::Value) -> bool {
         Value::Array(queries) => queries.as_slice(),
         _ => return false,
     };
+    let mut checked = false;
     [&item["query"], &action["query"]]
         .into_iter()
         .filter(|query| !query.is_null())
         .chain(queries)
-        .all(|query| query.as_str().is_some_and(|query| !leaks_identifier(query)))
+        .all(|query| {
+            query.as_str().is_some_and(|query| {
+                checked |= !query.trim().is_empty();
+                !leaks_identifier(query)
+            })
+        })
+        && (checked || !completed)
 }
 
 /// Classify a failed `codex exec` run. Only trusted sources count: structured
@@ -424,6 +435,34 @@ mod tests {
             ),
             CodexEvent::AgentMessage("Answer".into())
         );
+    }
+
+    #[test]
+    fn a_completed_search_without_a_query_is_refused() {
+        for line in [
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search"}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","action":{"type":"search"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"","action":{"type":"search","query":" ","queries":[]}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":null,"action":{"type":"search","queries":[""]}}}"#,
+        ] {
+            assert_eq!(
+                parse_codex_event(line.as_bytes(), true),
+                CodexEvent::Refused,
+                "{line}"
+            );
+        }
+        // A started search may not have its query yet; any query will do.
+        for line in [
+            r#"{"type":"item.started","item":{"id":"i1","type":"web_search","query":"","action":{"type":"search"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"","action":{"type":"search","queries":["rust release"]}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","action":{"type":"search","query":"rust release"}}}"#,
+        ] {
+            assert_eq!(
+                parse_codex_event(line.as_bytes(), true),
+                CodexEvent::Benign,
+                "{line}"
+            );
+        }
     }
 
     #[test]

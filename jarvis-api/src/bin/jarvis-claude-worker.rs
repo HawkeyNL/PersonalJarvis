@@ -199,11 +199,7 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
             .set_permissions(fs::Permissions::from_mode(0o600))?;
         system_file = Some(file);
     }
-    let mut command = clean_command();
-    command.args(cli_args(
-        &request,
-        system_file.as_ref().map(|file| file.path()),
-    ));
+    let mut command = official_command(&request, system_file.as_ref().map(|file| file.path()));
     if request.research {
         return Ok(run_research(command, &request.prompt, run_timeout(&request)).await);
     }
@@ -475,6 +471,18 @@ fn failed(state: ClaudeWorkerState, stage: &str) -> ClaudeWorkerReply {
     ClaudeWorkerReply::failure(state)
 }
 
+/// The reviewed invocation in the clean environment. Only a research run
+/// adds `TZ=UTC`: the CLI may tell the model the local time zone, and that
+/// could reach a search query. Chat and tasks keep their environment.
+fn official_command(request: &ClaudeWorkerRequest, system_prompt: Option<&Path>) -> Command {
+    let mut command = clean_command();
+    command.args(cli_args(request, system_prompt));
+    if request.research {
+        command.env("TZ", "UTC");
+    }
+    command
+}
+
 fn clean_command() -> Command {
     let mut command = Command::new(CLAUDE);
     command
@@ -485,8 +493,6 @@ fn clean_command() -> Command {
         .env("CLAUDE_CONFIG_DIR", format!("{HOME}/.claude"))
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("LANG", "C.UTF-8")
-        // The CLI may tell the model the local time zone: never the host's.
-        .env("TZ", "UTC")
         // Only the root-installed runtime may run; never self-update into HOME.
         .env("DISABLE_UPDATES", "1")
         .env("DISABLE_AUTOUPDATER", "1")
@@ -520,10 +526,8 @@ mod tests {
         assert_eq!(claude_subscription_status(br#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}"#), "connected");
     }
 
-    #[test]
-    fn cli_environment_disables_self_updates() {
-        let command = clean_command();
-        let environment = command
+    fn environment(command: &Command) -> std::collections::BTreeMap<&str, Option<&str>> {
+        command
             .as_std()
             .get_envs()
             .map(|(key, value)| {
@@ -532,8 +536,32 @@ mod tests {
                     value.and_then(|value| value.to_str()),
                 )
             })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(environment.get("TZ"), Some(&Some("UTC")));
+            .collect()
+    }
+
+    #[test]
+    fn only_research_runs_get_a_utc_time_zone() {
+        let clean = clean_command();
+        let clean = environment(&clean);
+        assert!(!clean.contains_key("TZ"));
+        for (research, task) in [
+            (false, None),
+            (false, Some(WorkerTask::MemeDecision)),
+            (false, Some(WorkerTask::MemeStrategyReview)),
+        ] {
+            let command = official_command(&request(research, task), None);
+            assert_eq!(environment(&command), clean);
+        }
+        let command = official_command(&request(true, None), None);
+        let mut research = environment(&command);
+        assert_eq!(research.remove("TZ"), Some(Some("UTC")));
+        assert_eq!(research, clean);
+    }
+
+    #[test]
+    fn cli_environment_disables_self_updates() {
+        let command = clean_command();
+        let environment = environment(&command);
         assert_eq!(environment.get("DISABLE_UPDATES"), Some(&Some("1")));
         assert_eq!(environment.get("DISABLE_AUTOUPDATER"), Some(&Some("1")));
         assert_eq!(
@@ -590,6 +618,24 @@ mod tests {
             "Task",
         ] {
             assert!(!args.contains(forbidden), "{forbidden} in {args}");
+        }
+        // Exact tokens: `--strict-mcp-config` stays allowed.
+        for forbidden in [
+            "--mcp-config",
+            "--plugin-dir",
+            "--chrome",
+            "--resume",
+            "-r",
+            "--continue",
+            "-c",
+            "--include-partial-messages",
+        ] {
+            assert!(
+                !args
+                    .split(' ')
+                    .any(|arg| arg == forbidden || arg.starts_with(&format!("{forbidden}="))),
+                "{forbidden} in {args}"
+            );
         }
     }
 
