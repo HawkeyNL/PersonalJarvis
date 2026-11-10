@@ -111,43 +111,42 @@ fn has_digit_run(text: &str, dates_allowed: bool) -> bool {
     })
 }
 
-/// Two plausible years and nothing else (`2024-2025`, `1990 – 2000`).
-fn is_year_range(run: &[(char, String)]) -> bool {
+/// Two plausible years joined by a dash or `/` and nothing else
+/// (`2024-2025`, `1990 – 2000`, `2024/2025`); not by a space or a dot.
+fn is_year_range(run: &[(String, String)]) -> bool {
     let year = |digits: &String| {
         digits.len() == 4
             && digits
                 .parse::<u16>()
                 .is_ok_and(|year| (1900..=2099).contains(&year))
     };
-    matches!(run, [(_, from), (_, to)] if year(from) && year(to))
+    let joint = |joint: &str| joint.trim().chars().collect::<Vec<_>>();
+    matches!(run, [(_, from), (between, to)]
+        if year(from)
+            && year(to)
+            && matches!(joint(between)[..], ['-' | '/' | '\u{2010}'..='\u{2015}' | '\u{2212}']))
 }
 
-/// Maximal runs of digit groups, each with the separator before it: the
-/// single separator character, `' '` for a longer joint, `'\0'` for the
-/// first. Groups are joined by up to [`MAX_SEPARATOR_RUN`] separators (see
+/// Maximal runs of digit groups, each with the separators before it (empty
+/// for the first). Groups are joined by up to [`MAX_SEPARATOR_RUN`] separators (see
 /// [`is_separator`]) with at most one that is not whitespace. Invisible
 /// characters are dropped first, so they neither join nor split a number.
-fn digit_runs(text: &str) -> Vec<Vec<(char, String)>> {
+fn digit_runs(text: &str) -> Vec<Vec<(String, String)>> {
     let (mut runs, mut run) = (Vec::new(), Vec::new());
-    let (mut group, mut joint, mut before) = (String::new(), String::new(), '\0');
+    let (mut group, mut joint, mut before) = (String::new(), String::new(), String::new());
     let visible = text.chars().filter(|c| !is_invisible(*c));
     for c in visible.chain(['\0']) {
         // Any numeric character, superscripts included: only an amount
         // needs a real digit (see `is_digit`).
         if c.is_numeric() {
             if group.is_empty() {
-                before = match (run.is_empty(), joint.chars().count()) {
-                    (true, _) => '\0',
-                    (false, 1) => joint.chars().next().unwrap_or(' '),
-                    (false, _) => ' ',
-                };
-                joint.clear();
+                before = std::mem::take(&mut joint);
             }
             group.push(c);
             continue;
         }
         if !group.is_empty() {
-            run.push((before, std::mem::take(&mut group)));
+            run.push((std::mem::take(&mut before), std::mem::take(&mut group)));
         }
         let joins = !run.is_empty()
             && is_separator(c)
@@ -186,6 +185,9 @@ fn is_separator(c: char) -> bool {
 /// non-whitespace control characters, format and bidi controls, zero-width
 /// characters, blank fillers, combining marks, variation selectors and tags.
 /// Visible symbols (`€`, `×`, `→`) and letters still end a number.
+// ponytail: a hand-kept list with a known ceiling (std has no Unicode
+// categories); a script's own marks or a new invisible may still split a
+// number. Use a Unicode data crate if the gate ever has to be exhaustive.
 fn is_invisible(c: char) -> bool {
     (c.is_control() && !c.is_whitespace())
         || matches!(
@@ -213,7 +215,8 @@ fn is_invisible(c: char) -> bool {
                 | '\u{ffa0}'
                 | '\u{fff0}'..='\u{fffb}'
                 | '\u{1bca0}'..='\u{1bca3}'
-                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1d173}'..='\u{1d182}'
                 | '\u{e0000}'..='\u{e0fff}'
         )
 }
@@ -231,16 +234,16 @@ fn is_digit(c: char) -> bool {
 
 /// The whole run is one plausible date: `YYYY-MM-DD`, `YYYY/MM/DD`,
 /// `DD-MM-YYYY`, `DD/MM/YYYY` or `DD.MM.YYYY`, with a 1-2 digit day and
-/// month and a year from 1900 to 2099, each joined by one ASCII separator.
-/// A digit group joined to it makes the run longer, so it is no longer a
-/// date.
-fn is_date(run: &[(char, String)]) -> bool {
+/// month and a year from 1900 to 2099, each joined by exactly one ASCII
+/// separator. A digit group joined to it makes the run longer, so it is no
+/// longer a date.
+fn is_date(run: &[(String, String)]) -> bool {
     let [(_, first), (separator, middle), (second_separator, last)] = run else {
         return false;
     };
-    let (year, day) = match separator {
-        '-' | '/' if first.len() == 4 => (first, last),
-        '-' | '/' | '.' => (last, first),
+    let (year, day) = match separator.as_str() {
+        "-" | "/" if first.len() == 4 => (first, last),
+        "-" | "/" | "." => (last, first),
         _ => return false,
     };
     // ASCII digits only: `parse` refuses others, so `len` counts digits.
@@ -464,7 +467,13 @@ mod tests {
             // Two years are a range, not a number; a third group is.
             ("inflatie 2024 - 2025", false),
             ("2024-2025 verkiezingen", false),
+            ("2024-2025", false),
             ("1990 – 2000", false),
+            ("2024/2025", false),
+            ("1999 2045", true),
+            ("2012.2034", true),
+            ("06\u{13430}1234\u{13430}5678", true),
+            ("06\u{1d17b}1234\u{1d17b}5678", true),
             ("2024 - 2025 06", true),
             ("1234-2025", true),
             // Only `-`, `/` and `.` make a date.

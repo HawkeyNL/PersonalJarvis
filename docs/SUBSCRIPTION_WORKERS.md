@@ -637,11 +637,13 @@ before any worker is called; an automatic run must also pass the wider
 `is_private` gate first. A flagged question gets a fixed notice asking the
 owner to rephrase it without personal details; there is no override. When a
 worker stops a run (`tool_use_refused`), Core answers with a fixed notice that
-the search was stopped to protect privacy, not with the "unavailable" notice;
-if the router then tries another subscription and that one fails otherwise,
-the last failure decides the notice. Names and other free-text details are
-not detectable. No unit or network change is needed: the search runs on the provider's side and
-neither worker fetches web pages itself.
+the search was stopped to protect privacy, not with the "unavailable" notice.
+That refusal ends the research run: the router never retries the question on
+another subscription. Any other research failure moves on to the next
+subscription, and the last failure decides the notice. Names and other
+free-text details are not detectable. No unit or network change is needed:
+the search runs on the provider's side and neither worker fetches web pages
+itself.
 
 **Marking and containment in Core.** Core stores a completed research answer
 with the model `web:<model>` (metering keeps the plain model; a fixed notice

@@ -592,6 +592,12 @@ impl LlmProvider for RouterProvider {
                     return Ok(reply);
                 }
                 Err(LlmError::Refused) => return Err(LlmError::Refused),
+                // A worker stopped the run (a tool or a search query it may
+                // not run): the question is never retried on another
+                // subscription, and Core shows the privacy-stop notice.
+                Err(error) if error.usage_failure_category() == "tool_use_refused" => {
+                    return Err(error);
+                }
                 Err(error) => {
                     fallback_count += 1;
                     let failure = error.failure_category();
@@ -1765,11 +1771,12 @@ mod tests {
         }
     }
 
-    /// Core picks its research notice from the error the router returns: the
-    /// last subscription's failure decides, a worker refusal included.
+    /// A worker refusal ends the research chain at once: no retry on another
+    /// subscription. Any other failure moves on, and the last one decides.
     #[tokio::test]
-    async fn research_returns_the_last_subscription_failure() {
-        struct Fails(&'static str, u16, &'static str);
+    async fn a_worker_refusal_ends_the_research_chain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Fails(&'static str, u16, &'static str, AtomicUsize);
         #[async_trait]
         impl LlmProvider for Fails {
             fn label(&self) -> &str {
@@ -1779,6 +1786,7 @@ mod tests {
                 Err(LlmError::Empty)
             }
             async fn research(&self, _req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+                self.3.fetch_add(1, Ordering::SeqCst);
                 Err(LlmError::Api {
                     status: self.1,
                     body: self.2.into(),
@@ -1787,9 +1795,11 @@ mod tests {
         }
         let refused = (502, "Claude run attempted tool use and was refused");
         let unavailable = (503, "Codex subscription unavailable");
-        for (first, second, expected) in [
-            (refused, unavailable, "unavailable"),
-            (unavailable, refused, "tool_use_refused"),
+        let timeout = (504, "Codex worker timed out");
+        for (first, second, expected, second_calls) in [
+            (refused, unavailable, "tool_use_refused", 0),
+            (unavailable, refused, "tool_use_refused", 1),
+            (unavailable, timeout, "timeout", 1),
         ] {
             let c = vec![
                 CatalogModel {
@@ -1803,15 +1813,21 @@ mod tests {
                     class: ModelClass::Heavy,
                 },
             ];
+            let codex = Arc::new(Fails("codex-cli", second.0, second.1, AtomicUsize::new(0)));
             let router = RouterProvider::with_policy(
                 vec![
                     Candidate {
                         id: "claude-cli".into(),
-                        provider: Arc::new(Fails("claude-cli", first.0, first.1)),
+                        provider: Arc::new(Fails(
+                            "claude-cli",
+                            first.0,
+                            first.1,
+                            AtomicUsize::new(0),
+                        )),
                     },
                     Candidate {
                         id: "codex-cli".into(),
-                        provider: Arc::new(Fails("codex-cli", second.0, second.1)),
+                        provider: codex.clone(),
                     },
                 ],
                 always_available(),
@@ -1825,6 +1841,7 @@ mod tests {
             ))));
             let error = router.research(&question()).await.unwrap_err();
             assert_eq!(error.usage_failure_category(), expected);
+            assert_eq!(codex.3.load(Ordering::SeqCst), second_calls);
         }
     }
 

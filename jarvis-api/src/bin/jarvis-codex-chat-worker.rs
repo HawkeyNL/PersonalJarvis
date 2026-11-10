@@ -381,8 +381,10 @@ async fn read_events(
             .read_until(b'\n', &mut line)
             .await?;
         if read == 0 {
-            // A search still open at the end was never checked either.
-            return Ok(open_searches.is_empty().then_some(events));
+            // A completed turn with a search still open was never fully
+            // checked. A failed turn keeps its errors for classification;
+            // `finish` discards its answer anyway.
+            return Ok((open_searches.is_empty() || !events.completed).then_some(events));
         }
         total += read;
         if read > MAX_EVENT_LINE_BYTES || total > MAX_EVENT_STREAM_BYTES {
@@ -647,6 +649,11 @@ mod tests {
         // A search that starts after the turn completed is refused too.
         let reply = finish(fake_run_as(&[ANSWER, DONE, started], "true", true).await);
         assert!(matches!(reply.state, ClaudeWorkerState::ToolUseRefused));
+        // A turn that failed with a search open keeps its failure class.
+        let failed = r#"{"type":"turn.failed","error":{"message":"usage limit reached"}}"#;
+        let reply = finish(fake_run_as(&[started, failed], "exit 1", true).await);
+        assert!(matches!(reply.state, ClaudeWorkerState::PlanLimit));
+        assert!(reply.text.is_none());
         // Started, then completed with a checked query: fine.
         let reply = finish(fake_run_as(&[started, SEARCH, ANSWER, DONE], "true", true).await);
         assert!(matches!(reply.state, ClaudeWorkerState::Completed));
