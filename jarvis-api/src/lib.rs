@@ -10,7 +10,7 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::StatusCode,
     middleware,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use serde_json::{json, Value};
@@ -44,6 +44,7 @@ mod peer;
 mod persona;
 mod rate_limit;
 pub mod realtime;
+pub mod roadmaps;
 mod routes;
 mod state;
 mod validation;
@@ -211,6 +212,47 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::meme::enable).layer(DefaultBodyLimit::max(1024)),
         )
         .route("/v1/trading/meme/decisions", get(routes::meme::decisions))
+        .route(
+            "/v1/roadmaps",
+            get(routes::roadmaps::list)
+                .post(routes::roadmaps::create)
+                .layer(DefaultBodyLimit::max(routes::roadmaps::BODY_LIMIT)),
+        )
+        .route(
+            "/v1/roadmaps/{id}",
+            get(routes::roadmaps::get)
+                .patch(routes::roadmaps::update)
+                .delete(routes::roadmaps::archive)
+                .layer(DefaultBodyLimit::max(routes::roadmaps::BODY_LIMIT)),
+        )
+        .route(
+            "/v1/roadmaps/{id}/items",
+            post(routes::roadmaps::create_item)
+                .layer(DefaultBodyLimit::max(routes::roadmaps::BODY_LIMIT)),
+        )
+        .route(
+            "/v1/roadmaps/{id}/items/{item}",
+            patch(routes::roadmaps::update_item)
+                .delete(routes::roadmaps::delete_item)
+                .layer(DefaultBodyLimit::max(routes::roadmaps::BODY_LIMIT)),
+        )
+        .route("/v1/roadmaps/github", get(routes::roadmaps::github_status))
+        .route("/v1/roadmaps/{id}/sync", post(routes::roadmaps::sync))
+        .route("/v1/roadmaps/{id}/history", get(routes::roadmaps::history))
+        .route(
+            "/v1/roadmaps/{id}/proposals",
+            get(routes::roadmaps::proposals),
+        )
+        .route(
+            "/v1/roadmaps/{id}/proposals/{proposal}/accept",
+            post(routes::roadmaps::accept_proposal)
+                .layer(DefaultBodyLimit::max(routes::roadmaps::BODY_LIMIT)),
+        )
+        .route(
+            "/v1/roadmaps/{id}/proposals/{proposal}/reject",
+            post(routes::roadmaps::reject_proposal)
+                .layer(DefaultBodyLimit::max(routes::roadmaps::BODY_LIMIT)),
+        )
         .route("/v1/assistant/chat", post(assistant_chat))
         .route("/v1/assistant/runs", post(routes::runs::submit))
         .route("/v1/assistant/runs/{id}", get(routes::runs::status))

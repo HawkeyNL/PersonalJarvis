@@ -27,6 +27,14 @@ EnvironmentFile=-/etc/jarvis/secrets/market-data.env
 EnvironmentFile=-/etc/jarvis/secrets/ntfy.env
 # Optional APNs signing key for approval pushes to the iOS app.
 EnvironmentFile=-/etc/jarvis/secrets/apns.env
+# Optional read-only GitHub token for the roadmap poller (docs/ROADMAPS.md),
+# as a credential, never an environment variable: Core's child processes
+# inherit its environment. The source is a credential name, not a path, so
+# systemd looks for /etc/credstore/jarvis.github_token (and the other
+# credstore directories) and, unlike with an absolute path, a missing file
+# does not stop the unit: Core starts and the poller stays off. Core reads
+# $CREDENTIALS_DIRECTORY/github_token.
+LoadCredential=github_token:jarvis.github_token
 ExecStart=/opt/jarvis/current/jarvis-api
 # `systemctl reload` re-reads the staged private agent bundle only. A failed
 # reload keeps the previous bundle and reports the registry degraded.

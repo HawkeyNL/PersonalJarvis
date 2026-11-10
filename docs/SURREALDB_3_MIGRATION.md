@@ -84,7 +84,7 @@ Line numbers come from `76668a7`.
 ### 2.1 Schema files and migration runner
 
 - **Schema files:** `schema/surreal/0001_baseline.surql` …
-  `0010_coding_reservations.surql`, 384 lines, 23 tables.
+  `0018_roadmaps.surql`, 746 lines, 44 tables.
 - **Statement shape:**
   - Every file is one `BEGIN TRANSACTION; … COMMIT TRANSACTION;` block.
   - Tables are all `SCHEMAFULL PERMISSIONS NONE`.
@@ -94,9 +94,11 @@ Line numbers come from `76668a7`.
   `datetime`, `float`, `int`, `object`, `ASSERT $value …`, `UNIQUE`
   indexes (including on `bytes` columns and composite indexes), and
   `IF NOT EXISTS`.
-  - `OVERWRITE` and `FLEXIBLE` each appear exactly once, in
+  - `FLEXIBLE` appears exactly once, in
     `0010_coding_reservations.surql:31`:
     `DEFINE FIELD OVERWRITE checkpoint ON coding_sessions FLEXIBLE TYPE option<object>;`.
+    `OVERWRITE` first appears there; 0011, 0017 and 0018 use it again to
+    redefine fields.
   - There are no `VALUE`, `DEFAULT`, `READONLY`, futures, events,
     analyzers, search or vector indexes, relations or `DEFINE ACCESS`.
   - Since `0014_memecoin_paper.surql`: regex literals in `ASSERT`
@@ -105,7 +107,14 @@ Line numbers come from `76668a7`.
     their behaviour on 3.x is **unverified** and the drill must cover them.
   - Since `0017_memecoin_strategies.surql`: a byte bound in an `ASSERT`
     (`bytes::len(<bytes>$value)`), also tested on 2.6.5 only.
-- **`id` fields:** 19 tables declare `DEFINE FIELD id ON <t> TYPE string`.
+  - Since `0018_roadmaps.surql`: `ASSERT`s on array elements through
+    `DEFINE FIELD OVERWRITE phases.*` (also `depends_on.*`, `ops.*`; 2.x
+    already defines `x[*]` for a typed array, so a plain `DEFINE FIELD`
+    fails), `array::distinct`, `ALLINSIDE` and
+    `string::starts_with` in `ASSERT`s; the roadmap store also runs `FOR`
+    loops with `CREATE`/`UPDATE` and `THROW` inside one transaction. Tested
+    on 2.6.5 only.
+- **`id` fields:** 41 tables declare `DEFINE FIELD id ON <t> TYPE string`.
   - Records are created as `CREATE <t> SET id = $id, …` with a string UUID.
   - Lookups use `WHERE record::id(id) = $id`.
 - **Runner:** `crates/store/src/lib.rs:82-337`.
@@ -439,7 +448,7 @@ tagged otherwise.
    - Compare names and kinds after normalising the output; the format
      differs between majors [unverified].
    - `schema_version:baseline.version` must equal the current version
-     (17 since `0017_memecoin_strategies.surql`).
+     (18 since `0018_roadmaps.surql`).
 3. **Content checksums per table:**
    - Run `SELECT * FROM <t> ORDER BY id` on both sides with `--json`.
    - Normalise with jq: sort keys, canonical datetimes in UTC RFC 3339,

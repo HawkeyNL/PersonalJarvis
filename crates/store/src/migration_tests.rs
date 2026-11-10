@@ -26,7 +26,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 17);
+    assert_eq!(version.unwrap().version, 18);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
@@ -47,7 +47,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_eleven.unwrap().version, 17);
+    assert_eq!(from_eleven.unwrap().version, 18);
     db.use_db("from_twelve").await?;
     apply_through_twelve(&db).await?;
     // A v12 pairing row has none of the new optional fields and stays valid.
@@ -59,7 +59,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_twelve_version: Option<SchemaVersion> = from_twelve.take(0)?;
-    assert_eq!(from_twelve_version.unwrap().version, 17);
+    assert_eq!(from_twelve_version.unwrap().version, 18);
     let legacy_has_no_ip: Vec<bool> = from_twelve.take(1)?;
     assert_eq!(legacy_has_no_ip, [true]);
     // The database bounds the new fields even if Core validation regressed.
@@ -88,7 +88,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
-    assert_eq!(migrated_version.unwrap().version, 17);
+    assert_eq!(migrated_version.unwrap().version, 18);
     let legacy: Vec<String> = migrated.take(1)?;
     assert_eq!(legacy, ["password-set"]);
     db.query("CREATE account_actions SET id = 'reset', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
@@ -134,7 +134,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_thirteen.unwrap().version, 17);
+    assert_eq!(from_thirteen.unwrap().version, 18);
     // The paper tables enforce their shape even if Core validation regressed.
     let (mint, other) = (
         "So11111111111111111111111111111111111111112",
@@ -187,7 +187,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_fourteen.unwrap().version, 17);
+    assert_eq!(from_fourteen.unwrap().version, 18);
     // The IBKR read model enforces its shape even if Core validation regressed.
     let position = |id: &str, extra: &str| {
         format!("CREATE ibkr_positions SET id = '{id}', conid = {id}, symbol = 'VWCE', asset_class = 'STK', currency = 'EUR', quantity = '12.5', avg_cost = '101.25', last_price = '120', market_value = '1500', unrealized_pnl = '-3.5'{extra};")
@@ -232,7 +232,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_fifteen_version: Option<SchemaVersion> = from_fifteen.take(0)?;
-    assert_eq!(from_fifteen_version.unwrap().version, 17);
+    assert_eq!(from_fifteen_version.unwrap().version, 18);
     let legacy_has_no_anchor: Vec<bool> = from_fifteen.take(1)?;
     assert_eq!(legacy_has_no_anchor, [true]);
     db.query(session(
@@ -269,7 +269,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_sixteen_version: Option<SchemaVersion> = from_sixteen.take(0)?;
-    assert_eq!(from_sixteen_version.unwrap().version, 17);
+    assert_eq!(from_sixteen_version.unwrap().version, 18);
     let legacy_has_no_lineage: Vec<bool> = from_sixteen.take(1)?;
     assert_eq!(legacy_has_no_lineage, [true]);
     // Legacy rows still pass every rule when they are written again.
@@ -357,6 +357,144 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         universe(other, "").replace(&format!("pool = '{other}'"), "pool = 'not-base58-0OIl'"),
         "UPDATE memecoin_paper_trips:old SET exit_reason = 'panic';".to_string(),
         "UPDATE memecoin_paper_trips:old SET peak_value_usd = '-1';".to_string(),
+    ] {
+        assert!(db.query(&bad).await?.check().is_err(), "{bad}");
+    }
+    db.use_db("from_seventeen").await?;
+    apply_through_seventeen(&db).await?;
+    db.query(strategy("momentum-a", "").replace("active_version = 2", "active_version = 1"))
+        .await?
+        .check()?;
+    apply_baseline_schema(&db).await?;
+    let mut from_seventeen = db
+        .query("SELECT version FROM schema_version:baseline; SELECT VALUE record::id(id) FROM memecoin_strategies;")
+        .await?
+        .check()?;
+    let from_seventeen_version: Option<SchemaVersion> = from_seventeen.take(0)?;
+    assert_eq!(from_seventeen_version.unwrap().version, 18);
+    let kept: Vec<String> = from_seventeen.take(1)?;
+    assert_eq!(kept, ["momentum-a"]);
+    // The roadmap tables enforce their shape even if Core validation regressed.
+    let (r, i, d) = (
+        "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c",
+        "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d",
+    );
+    let roadmap = |id: &str, extra: &str| {
+        format!("CREATE roadmaps SET id = '{id}', title = 'Plan', description = NONE, phases = ['Now', 'Next'], revision = 1, created_at = time::now(), updated_at = time::now(){extra};")
+    };
+    db.query(roadmap(r, "")).await?.check()?;
+    let item = |id: &str, extra: &str| {
+        format!("CREATE roadmap_items SET id = '{id}', roadmap_id = '{r}', title = 'Item', status = 'planned', phase = 'Now', position = 0, depends_on = [], links = [], created_at = time::now(), updated_at = time::now(){extra};")
+    };
+    db.query(item(d, "")).await?.check()?;
+    db.query(item(i, &format!(", depends_on = ['{d}'], notes = 'Line one\nline two', links = [{{ kind: 'pr', repo: 'HawkeyNL/PersonalJarvis', number: 214, state: 'open' }}, {{ kind: 'release', repo: 'a/b', tag: 'v0.0.78' }}, {{ kind: 'url', url: 'https://example.com/a?b=c' }}], auto_status = 'in_progress'")))
+        .await?
+        .check()?;
+    let change = |id: &str, extra: &str| {
+        format!("CREATE roadmap_changes SET id = '{id}', roadmap_id = '{r}', revision = 2, at = time::now(), author = 'owner', device_id = '{d}', action = 'item_updated', item_id = '{i}', title = 'Item', fields = ['status'], from_status = 'planned', to_status = 'ready'{extra};")
+    };
+    db.query(change(i, "")).await?.check()?;
+    db.query(change(
+        d,
+        &format!(", author = 'jarvis', proposal_id = '{r}'"),
+    ))
+    .await?
+    .check()?;
+    db.query(change(r, ", author = 'github', device_id = NONE"))
+        .await?
+        .check()?;
+    let proposal = |id: &str, extra: &str| {
+        format!("CREATE roadmap_proposals SET id = '{id}', roadmap_id = '{r}', base_revision = 1, ops = ['{{\"op\":\"update_item\"}}'], rationale = 'Merged.', status = 'pending', created_at = time::now(), expires_at = time::now() + 14d{extra};")
+    };
+    db.query(proposal(r, "")).await?.check()?;
+    db.query(proposal(
+        i,
+        &format!(", status = 'accepted', decided_at = time::now(), decided_by = '{d}'"),
+    ))
+    .await?
+    .check()?;
+    db.query(proposal(d, ", status = 'stale', decided_at = time::now()"))
+        .await?
+        .check()?;
+    // Each case breaks exactly one rule.
+    let x = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5e";
+    for bad in [
+        roadmap(x, "").replace("'Plan'", "''"),
+        roadmap(x, &format!(", title = '{}'", "t".repeat(121))),
+        roadmap(x, "").replace("['Now', 'Next']", "['Now', 'Now']"),
+        roadmap(x, "").replace("['Now', 'Next']", "['']"),
+        roadmap(
+            x,
+            &format!(
+                ", phases = [{}]",
+                (0..21)
+                    .map(|n| format!("'p{n}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ),
+        roadmap(x, "").replace("revision = 1", "revision = 0"),
+        item(x, "").replace(&format!("roadmap_id = '{r}'"), "roadmap_id = 'plan'"),
+        item(x, "").replace("'planned'", "'done'"),
+        item(x, ", auto_status = 'done'"),
+        item(x, &format!(", title = '{}'", "t".repeat(201))),
+        item(x, "").replace("position = 0", "position = 100001"),
+        item(x, &format!(", notes = '{}'", "n".repeat(4001))),
+        item(x, &format!(", depends_on = ['{d}', '{d}']")),
+        item(x, ", depends_on = ['not-a-uuid']"),
+        item(x, ", links = [{ kind: 'commit' }]"),
+        item(x, ", links = [{ kind: 'pr', repo: 'owner', number: 1 }]"),
+        item(
+            x,
+            ", links = [{ kind: 'pr', repo: '-owner/repo', number: 1 }]",
+        ),
+        item(x, ", links = [{ kind: 'pr', repo: 'a/b', number: 0 }]"),
+        item(
+            x,
+            ", links = [{ kind: 'release', repo: 'a/b', tag: 'v 1' }]",
+        ),
+        item(x, ", links = [{ kind: 'url', url: 'http://example.com' }]"),
+        item(
+            x,
+            ", links = [{ kind: 'url', url: 'https://exa mple.com' }]",
+        ),
+        item(
+            x,
+            ", links = [{ kind: 'pr', repo: 'a/b', number: 1, state: 'Open!' }]",
+        ),
+        item(
+            x,
+            &format!(
+                ", links = [{}]",
+                ["{ kind: 'url', url: 'https://a.b' }"; 11].join(", ")
+            ),
+        ),
+        change(x, "").replace("'owner'", "'admin'"),
+        // An owner change without a device, a GitHub change with one, and
+        // a Jarvis change that is no accepted proposal.
+        change(x, ", device_id = NONE"),
+        change(x, ", author = 'github'"),
+        change(x, ", author = 'jarvis'"),
+        change(x, &format!(", proposal_id = '{r}'")),
+        change(x, "").replace("'item_updated'", "'item_moved'"),
+        change(x, ", item_id = NONE"),
+        change(x, "").replace("'item_updated'", "'roadmap_updated'"),
+        change(x, "").replace("['status']", "['owner']"),
+        change(x, ", to_status = 'done'"),
+        proposal(x, ", ops = []"),
+        proposal(x, &format!(", ops = [{}]", ["'{}'"; 21].join(", "))),
+        proposal(x, &format!(", ops = ['\"{}\"']", "é".repeat(12288))),
+        proposal(x, &format!(", rationale = '{}'", "r".repeat(1001))),
+        proposal(x, "").replace("'pending'", "'open'"),
+        proposal(x, ", decided_at = time::now()"),
+        proposal(x, ", status = 'rejected', decided_at = time::now()"),
+        proposal(
+            x,
+            &format!(", status = 'stale', decided_at = time::now(), decided_by = '{d}'"),
+        ),
+        proposal(x, ", status = 'accepted', decided_at = time::now()"),
+        proposal(x, "").replace("time::now() + 14d", "time::now() - 1d"),
     ] {
         assert!(db.query(&bad).await?.check().is_err(), "{bad}");
     }
