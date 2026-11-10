@@ -546,7 +546,8 @@ collab tool, file change, plan update), a web search with an unknown or
 stops the whole run with `tool_use_refused`.
 
 `codex exec` may add its own environment context to the prompt, such as the
-time zone or the empty working directory; the worker cannot remove it. Newer
+time zone (always `UTC`, see below) or the empty working directory; the worker
+cannot remove it. Newer
 codex-rs releases also have a standalone search path in which the CLI itself
 POSTs the query to an OpenAI search endpoint from the host. Both, and the
 `web_search` event and item names above, must be re-checked against the exact
@@ -563,14 +564,26 @@ chat, except an authentication failure or a plan limit. The output bounds are
 unchanged (Claude: 256 KiB CLI result; Codex: 512 KiB per event, 4 MiB stream,
 128 KiB answer). The worker reads Core's request within 5 seconds.
 
-**Prompt injection.** Search results can contain instructions. The research
-instruction tells the model to treat web content as data, and the worker
+**Prompt injection and privacy.** Search results can contain instructions.
+The research instruction tells the model to treat web content as data, never
+to put personal information (names, contact details, account numbers,
+amounts, holdings or a location) in a search query or URL, and never to
+publish, post, submit, comment or reply anywhere, only to read. The worker
 limits what an injected instruction could do: Claude has no tool except
 `WebSearch` (besides the CLI's own `EndConversation`) and at most 8 turns,
 and Codex runs that use any other tool are killed and discarded. The run's
-context holds only the question, so there is no private data to leak into a
-search query. No unit or network change is needed: the search runs on the
-provider's side and neither worker fetches web pages itself.
+context holds only the question and that fixed instruction: no persona,
+memory, history or runtime facts. Both workers run the CLI with `TZ=UTC`, so
+the host's time zone never reaches the prompt. The question itself, or words
+from it, still leaves the host in a search query, so Core runs a
+deterministic identifier check (`jarvis_llm::privacy::leaks_identifier`, see
+`MODEL_ROUTING_OPERATIONS.md`, "Privacy gate") on every Research question
+before any worker is called; an automatic run must also pass the wider
+`is_private` gate first. A flagged question gets a fixed notice asking the
+owner to rephrase it without personal details; there is no override. Names
+and other free-text details are not detectable. No
+unit or network change is needed: the search runs on the provider's side and
+neither worker fetches web pages itself.
 
 **Marking and containment in Core.** Core stores a completed research answer
 with the model `web:<model>` (metering keeps the plain model; a fixed notice
