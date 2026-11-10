@@ -208,7 +208,8 @@ pub async fn start_run(
              LET $job = (UPDATE scheduled_jobs \
                SET last_slot_at = IF $owner THEN last_slot_at ELSE $slot END \
                WHERE record::id(id) = $job_id \
-               AND ($owner OR (revision = $revision AND enabled = true)) RETURN VALUE id); \
+               AND ($owner OR (revision = $revision AND enabled = true \
+                 AND (last_slot_at = NONE OR last_slot_at < $slot))) RETURN VALUE id); \
              IF array::len($job) != 1 {{ THROW 'job changed'; }}; \
              IF $owner AND array::len((SELECT VALUE id FROM scheduled_job_runs \
                WHERE job_id = $job_id AND trigger = 'owner' \
@@ -570,11 +571,32 @@ mod tests {
         )
         .await?;
         assert!(runs.is_empty());
-        // The kind is free again.
-        assert_eq!(
-            create(&db, new_job(), None).await?.kind,
-            Kind::DependencyReview
-        );
+        // The kind is free again. With the zone, the newest slot at creation
+        // and after a reschedule counts as handled and never starts.
+        let tz = crate::jobs::time_zone().ok_or("zone")?;
+        let seeded = create(&db, new_job(), Some(&tz)).await?;
+        assert_eq!(seeded.kind, Kind::DependencyReview);
+        let handled = seeded.last_slot_at.ok_or("seeded slot")?;
+        assert!(handled <= seeded.created_at);
+        assert!(seeded.created_at - handled <= time::Duration::days(7));
+        assert!(matches!(
+            start_run(&db, &seeded, handled, Trigger::Schedule, RunStatus::Running).await,
+            Err(JobError::Conflict)
+        ));
+        let moved = update(
+            &db,
+            &seeded.id,
+            1,
+            &JobPatch {
+                cadence: Some(Cadence::Daily),
+                ..JobPatch::default()
+            },
+            Some(&tz),
+        )
+        .await?;
+        let handled = moved.last_slot_at.ok_or("seeded slot")?;
+        assert!(handled <= moved.updated_at);
+        assert!(moved.updated_at - handled <= time::Duration::days(1));
         Ok(())
     }
 
