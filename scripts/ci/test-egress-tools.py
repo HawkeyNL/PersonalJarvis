@@ -1,5 +1,7 @@
 import importlib.util
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location("egress", Path(__file__).with_name("check-egress-tools.py"))
@@ -17,7 +19,8 @@ class EgressToolTests(unittest.TestCase):
     def test_cli_spawn_only_in_the_workers(self):
         for text in ['Command::new("/usr/local/bin/claude")', "Command::new(CODEX)",
                      "std::process::Command::new( claude_bin )"]:
-            self.assertEqual(len(self.rules(OTHER, text)), 1, text)
+            self.assertIn("claude/codex CLI spawned outside the worker binaries",
+                          self.rules(OTHER, text), text)
             self.assertEqual(self.rules(WORKER, text), [], text)
         self.assertEqual(self.rules(OTHER, 'Command::new("/usr/bin/git")'), [])
 
@@ -26,6 +29,19 @@ class EgressToolTests(unittest.TestCase):
             self.assertEqual(len(self.rules(OTHER, text)), 1, text)
             self.assertEqual(self.rules("crates/agent/src/lib.rs", text), [], text)
         self.assertEqual(self.rules(OTHER, '"WebSearch" bash Bash'), [])
+        for text in ['allow: "Bash(git:*)"', '"WebFetch(domain:example.org)"',
+                     '"--tools", "WebSearch,WebFetch"', 'r#"{"name":"Bash"}"#']:
+            self.assertEqual(len(self.rules(OTHER, text)), 1, text)
+            self.assertEqual(self.rules(WORKER, text), [], text)
+        self.assertEqual(self.rules(OTHER, '"BashScript WebFetcher"'), [])
+
+    def test_cli_paths_only_in_reviewed_files(self):
+        for text in ['const BIN: &str = "/usr/local/bin/claude";', '"/opt/x/codex"',
+                     'format!("{home}/bin/claude")']:
+            self.assertEqual(len(self.rules(OTHER, text)), 1, text)
+            self.assertEqual(self.rules(WORKER, text), [], text)
+            self.assertEqual(self.rules("crates/admin/src/ai_accounts.rs", text), [], text)
+        self.assertEqual(self.rules(OTHER, '"/usr/local/bin/claude-helper" "codex.md"'), [])
 
     def test_browser_profile_gains_no_caller(self):
         for text in ["profile: SandboxProfile::Browser,", "use SandboxProfile::*;",
@@ -38,6 +54,11 @@ class EgressToolTests(unittest.TestCase):
 
     def test_current_tree_is_clean(self):
         self.assertEqual(egress.audit(Path(__file__).resolve().parents[2]), 0)
+
+    def test_no_rust_files_fails(self):
+        with tempfile.TemporaryDirectory() as empty:
+            subprocess.run(["git", "init", "-q", empty], check=True)
+            self.assertNotEqual(egress.audit(Path(empty)), 0)
 
 
 if __name__ == "__main__":

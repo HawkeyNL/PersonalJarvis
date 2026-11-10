@@ -4,7 +4,10 @@
 Fails when tracked Rust source:
 - spawns the claude or codex CLI (`Command::new(...)` naming it) outside the
   two subscription worker binaries;
-- names "WebFetch", "Bash" or an `mcp__` tool outside the known deny-lists
+- has a string literal ending in `/claude` or `/codex` (a CLI path) outside
+  the worker binaries and the reviewed account-linking and runtime installer;
+- names WebFetch or Bash inside any string literal ("Bash(git:*)",
+  "WebSearch,WebFetch"), or an `mcp__` tool, outside the known deny-lists
   and their tests;
 - uses `SandboxProfile::Browser` beyond its existing profile definitions.
 
@@ -22,7 +25,15 @@ WORKERS = {
     "jarvis-api/src/bin/jarvis-codex-chat-worker.rs",
 }
 SPAWN = re.compile(r"Command::new\(\s*[^)]*(?:claude|codex)", re.IGNORECASE)
-TOOLS = re.compile(r'"WebFetch"|"Bash"|mcp__')
+CLI_PATH = re.compile(r'"[^"\n]*/(?:claude|codex)"')
+# Account linking runs the CLI through systemd-run as its own identity; the
+# runtime installers download, verify and install it (and test that).
+CLI_PATH_FILES = WORKERS | {
+    "crates/admin/src/ai_accounts.rs",
+    "crates/admin/src/ai_accounts/runtime.rs",
+    "crates/admin/src/ai_accounts/runtime/codex.rs",
+}
+TOOLS = re.compile(r'"[^"\n]*\b(?:WebFetch|Bash)\b[^"\n]*"|mcp__')
 # The Claude Code executor deny-list and its test; the Claude worker's
 # `--disallowedTools mcp__*` and its argv and stream tests.
 TOOL_FILES = {
@@ -39,6 +50,8 @@ def violations(name, text):
     for number, line in enumerate(lines, 1):
         if SPAWN.search(line) and name not in WORKERS:
             yield number, "claude/codex CLI spawned outside the worker binaries"
+        if CLI_PATH.search(line) and name not in CLI_PATH_FILES:
+            yield number, "claude/codex CLI path outside the reviewed files"
         if TOOLS.search(line) and name not in TOOL_FILES:
             yield number, "WebFetch, Bash or mcp__ tool outside a reviewed deny-list"
     browser = [number for number, line in enumerate(lines, 1) if BROWSER.search(line)]
@@ -47,14 +60,18 @@ def violations(name, text):
 
 
 def audit(root):
-    names = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z", "--", "*.rs"]).split(b"\0")
+    names = sorted(filter(None, subprocess.check_output(
+        ["git", "-C", str(root), "ls-files", "-z", "--", "*.rs"]).split(b"\0")))
+    if not names:
+        print("Egress tool scan: no Rust files found")
+        return 1
     found = 0
-    for name in sorted(filter(None, names)):
+    for name in names:
         name = name.decode("utf-8")
         for line, rule in violations(name, (root / name).read_text(encoding="utf-8")):
             print(f"{name}:{line}: {rule}")
             found += 1
-    print(f"Egress tool scan: {len(names) - 1} Rust files, {found} violations")
+    print(f"Egress tool scan: {len(names)} Rust files, {found} violations")
     return found
 
 
