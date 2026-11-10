@@ -533,6 +533,9 @@ results) and a final `result` event with the same fields as
 gate (`jarvis_llm::privacy::is_private`, without the holdings, which Core
 already checked against the question) does not flag, and on any line that is
 not a JSON object with a type. That includes the CLI's own `EndConversation`.
+Unlike the Codex event allowlist, other event types and content blocks that
+are not tool use pass: the CLI adds event types between releases, and
+`--tools WebSearch` already keeps every other tool out of the run.
 The answer comes only from the final `result` event; a run without one is a
 `runtime_failure`. Each line keeps the 256 KiB bound of the single JSON
 reply, and the whole stream is bounded at 4 MiB. Like the Codex check, this
@@ -597,9 +600,10 @@ at most one of them may be a background run (research, or on Claude a typed
 task, see below); a second background request while one runs is refused
 (`runtime_failure`), never queued, so one slot always stays free for chat. A
 research failure does not put the subscription into the router's cooldown for
-chat, except an authentication failure or a plan limit. The output bounds are
-unchanged (Claude: 256 KiB CLI result, and in a research run 256 KiB per event
-and a 4 MiB stream; Codex: 512 KiB per event, 4 MiB stream, 128 KiB answer). The worker reads Core's request within 5 seconds.
+chat, except an authentication failure or a plan limit. The output bounds of
+chat and tasks are unchanged (Claude: 256 KiB CLI result; Codex: 512 KiB per
+event, 4 MiB stream, 128 KiB answer); a Claude research run adds 256 KiB per
+event and a 4 MiB stream. The worker reads Core's request within 5 seconds.
 
 **Prompt injection and privacy.** Search results can contain instructions.
 The research instruction tells the model to treat web content as data, never

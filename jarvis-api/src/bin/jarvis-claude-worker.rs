@@ -764,12 +764,14 @@ mod tests {
         let bash = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"id"}}]}}"#;
         let private = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"WebSearch","input":{"query":"my portfolio today"}}]}}"#;
         for line in [bash, private, "not json"] {
-            let reply = fake_research(&[SEARCH, line, RESULT], "true").await;
-            assert!(
-                matches!(reply.state, ClaudeWorkerState::ToolUseRefused),
-                "{line}"
-            );
-            assert!(reply.text.is_none(), "{line}");
+            for lines in [[SEARCH, line, RESULT], [SEARCH, RESULT, line]] {
+                let reply = fake_research(&lines, "true").await;
+                assert!(
+                    matches!(reply.state, ClaudeWorkerState::ToolUseRefused),
+                    "{line}"
+                );
+                assert!(reply.text.is_none(), "{line}");
+            }
         }
     }
 
@@ -783,6 +785,22 @@ mod tests {
             ),
         )
         .await;
+        assert!(matches!(reply.state, ClaudeWorkerState::RuntimeFailure));
+        assert!(reply.text.is_none());
+        // Benign lines within the line bound: within the stream bound they
+        // pass, beyond it the run fails.
+        let system_lines = |count: usize| {
+            format!(
+                "for i in $(seq {count}); do printf '{{\"type\":\"system\",\"p\":\"'; \
+                 head -c {} /dev/zero | tr '\\0' x; printf '\"}}\\n'; done; \
+                 printf '%s\\n' '{RESULT}'",
+                MAX_REPLY_BYTES / 2
+            )
+        };
+        let reply = fake_research(&[SEARCH], &system_lines(2)).await;
+        assert!(matches!(reply.state, ClaudeWorkerState::Completed));
+        let over = MAX_RESEARCH_STREAM_BYTES / (MAX_REPLY_BYTES / 2) + 1;
+        let reply = fake_research(&[SEARCH], &system_lines(over)).await;
         assert!(matches!(reply.state, ClaudeWorkerState::RuntimeFailure));
         assert!(reply.text.is_none());
     }
