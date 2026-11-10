@@ -1011,7 +1011,10 @@ mod tests {
             Err(RoadmapError::NotFound)
         ));
         assert!(list_proposals(&db, &id).await?.is_empty());
-        assert_eq!(statuses(&db).await?, ["accepted", "stale", "rejected"]);
+        assert_eq!(
+            statuses(&db).await?,
+            ["accepted", "rejected", "stale", "rejected"]
+        );
 
         // At most 10 pending proposals per roadmap.
         let notes = |n: usize| ProposalOp::UpdateItem {
