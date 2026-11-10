@@ -730,7 +730,8 @@ impl Draft {
         Ok(())
     }
 
-    /// Delete an item; items that depended on it no longer do.
+    /// Delete an item; items that depended on it no longer do, and each of
+    /// them is audited as updated.
     pub fn delete_item(&mut self, id: &str) -> Result<()> {
         let index = self
             .items
@@ -744,6 +745,14 @@ impl Draft {
                 if !self.created.contains(&item.id) {
                     self.updated.insert(item.id.clone());
                 }
+                self.changes.push(Change {
+                    action: Action::ItemUpdated,
+                    item_id: Some(item.id.clone()),
+                    title: item.title.clone(),
+                    fields: vec!["depends_on".to_string()],
+                    from_status: None,
+                    to_status: None,
+                });
             }
         }
         self.updated.remove(id);
@@ -1051,15 +1060,42 @@ mod tests {
         // 0 -> 2 -> 1 -> 0 is a cycle.
         draft.update_item(&ids[0], &depends(&[&ids[2]])).unwrap();
         assert!(matches!(draft.finish(), Err(RoadmapError::Invalid(_))));
-        // Deleting an item drops it from the items that depended on it.
-        let mut draft = Draft::new(snapshot(2));
-        let (a, b) = (draft.items[0].id.clone(), draft.items[1].id.clone());
-        draft.update_item(&b, &depends(&[&a])).unwrap();
-        draft.delete_item(&a).unwrap();
+        // Deleting an item drops it from the items that depended on it, and
+        // audits each of them.
+        let mut draft = Draft::new(snapshot(4));
+        let ids: Vec<String> = draft.items.iter().map(|item| item.id.clone()).collect();
+        draft.update_item(&ids[1], &depends(&[&ids[0]])).unwrap();
+        draft
+            .update_item(&ids[2], &depends(&[&ids[0], &ids[3]]))
+            .unwrap();
+        draft.changes.clear();
+        draft.delete_item(&ids[0]).unwrap();
         assert!(draft.items[0].depends_on.is_empty());
+        assert_eq!(draft.items[1].depends_on, [ids[3].clone()]);
+        let changes: Vec<_> = draft
+            .changes
+            .iter()
+            .map(|c| (c.action, c.item_id.clone(), c.fields.clone()))
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                (
+                    Action::ItemUpdated,
+                    Some(ids[1].clone()),
+                    vec!["depends_on".to_string()]
+                ),
+                (
+                    Action::ItemUpdated,
+                    Some(ids[2].clone()),
+                    vec!["depends_on".to_string()]
+                ),
+                (Action::ItemDeleted, Some(ids[0].clone()), vec![]),
+            ]
+        );
         let writes = draft.writes();
-        assert_eq!(writes.updates.len(), 1);
-        assert_eq!(writes.deletes, [a]);
+        assert_eq!(writes.updates.len(), 2);
+        assert_eq!(writes.deletes, [ids[0].clone()]);
         assert!(writes.creates.is_empty());
     }
 

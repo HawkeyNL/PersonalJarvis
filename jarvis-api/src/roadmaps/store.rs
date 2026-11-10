@@ -751,7 +751,7 @@ mod tests {
         assert!([first, second]
             .into_iter()
             .any(|r| matches!(r, Err(RoadmapError::Conflict))));
-        // Deleting A leaves B without the dependency.
+        // Deleting A leaves B without the dependency, audited on B too.
         let roadmap = delete_item(&db, &id, 5, &a, &device).await?;
         assert_eq!(roadmap.items.len(), 1);
         assert!(roadmap.items[0].depends_on.is_empty());
@@ -763,6 +763,7 @@ mod tests {
             actions,
             [
                 (6, Action::ItemDeleted),
+                (6, Action::ItemUpdated),
                 (5, Action::RoadmapUpdated),
                 (4, Action::ItemUpdated),
                 (3, Action::ItemCreated),
@@ -770,7 +771,9 @@ mod tests {
                 (1, Action::RoadmapCreated),
             ]
         );
-        let status = &changes[2];
+        assert_eq!(changes[1].item_id.as_deref(), Some(b.as_str()));
+        assert_eq!(changes[1].fields, ["depends_on"]);
+        let status = &changes[3];
         assert_eq!(status.item_id.as_deref(), Some(a.as_str()));
         assert_eq!(status.fields, ["status"]);
         assert_eq!(

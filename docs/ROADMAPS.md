@@ -6,9 +6,14 @@ change and the changes Jarvis proposes. They live in schema 0018
 served through `/v1/roadmaps`. Nothing is seeded; every roadmap is the
 owner's.
 
-Owner edits always win. Changes that do not come from the owner are either
-applied by deterministic code (the GitHub poller, planned) or proposed and
-applied only when the owner accepts them (Jarvis).
+Jarvis's language model never changes a roadmap: what it produces is only
+ever a proposal, which Core applies only when the owner accepts it from a
+device, and only if the roadmap has not changed since the proposal was made.
+The only writer besides the owner is deterministic code, the GitHub poller
+(planned, see [What is next](#what-is-next)): it may only move an item's
+status forward, and an owner's status edit wins over it. Every write names
+the revision it was made on, so no writer, the owner included, overwrites a
+change it has not seen.
 
 ## API
 
