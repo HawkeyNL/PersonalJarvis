@@ -539,11 +539,26 @@ run has not been accepted on the Home Node yet.
 `disabled | cached | indexed | live`). The search is OpenAI's hosted web search
 tool; the CLI fetches nothing itself. The event allowlist then also accepts
 `web_search` items (codex-rs `exec` JSONL `item.started|updated|completed` with
-`item.type == "web_search"`) whose `action.type` is `search`, `open_page` or
-`find_in_page`, or that have no action. Every other tool item (command, MCP,
-collab tool, file change, plan update), a web search with an unknown or
+`item.type == "web_search"`) whose `action.type` is `search`, or that have no
+action, and only when every query the item carries (`query`, `action.query`
+and each string in `action.queries`) is a string that the privacy gate
+(`jarvis_llm::privacy::is_private`, without the holdings, which Core already
+checked against the question) does not flag. By owner decision, `open_page`
+and `find_in_page` actions are refused. Codex CLI 0.166.0 has no setting that
+turns them off: `web_search` is `disabled | cached | indexed | live`, and
+those modes only set the hosted tool's `external_web_access` and
+`indexed_web_access`; `tools.web_search` only takes `context_size`,
+`allowed_domains` and `location` (codex-rs `rust-v0.166.0`,
+`core/src/tools/hosted_spec.rs` and `protocol/src/config_types.rs`). Every
+other tool item (command, MCP, collab tool, file change, plan update), a page
+open or find, a flagged or non-string query, a web search with an unknown or
 `other` action, a web search in an ordinary run, and any unknown event still
 stops the whole run with `tool_use_refused`.
+
+This is detect and discard, not prevention: the item reaches the worker after
+the provider ran the search or opened the page, so a flagged query or a page
+open has already left OpenAI's side by then. The worker then kills the run's
+process group and discards the answer, so nothing from that run reaches Core.
 
 `codex exec` may add its own environment context to the prompt, such as the
 time zone (always `UTC`, see below) or the empty working directory; the worker

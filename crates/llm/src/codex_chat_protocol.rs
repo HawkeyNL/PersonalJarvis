@@ -3,6 +3,7 @@
 //! only the socket, the identity and the reviewed official runtime differ.
 
 use crate::claude_worker_protocol::ClaudeWorkerState;
+use crate::privacy::is_private;
 
 pub const SOCKET: &str = "/run/jarvis-codex-chat.sock";
 
@@ -76,17 +77,20 @@ pub enum CodexEvent {
     TurnCompleted,
     /// A structured error message, used only to classify a failure.
     Error(String),
-    /// Anything else: a command, a web search outside a research run, MCP or
-    /// tool call, file change, plan update, an unknown event or item type, or
-    /// an unparseable line.
+    /// Anything else: a command, a web search outside a research run, a page
+    /// open or find, a search query the privacy gate flags, MCP or tool call,
+    /// file change, plan update, an unknown event or item type, or an
+    /// unparseable line.
     /// The worker stops the run and discards its answer.
     Refused,
 }
 
 /// Fail closed: only the event and item types listed here are allowed. A
 /// `web_search` item (the provider-hosted search; codex-rs `WebSearchItem`)
-/// is allowed only in an owner-enabled research run, and only with a known
-/// search action; every other tool item still stops the run.
+/// is allowed only in an owner-enabled research run, only as a plain search
+/// and only when the privacy gate passes every query it carries; every other
+/// tool item still stops the run. The item arrives after the provider ran the
+/// search, so this detects and discards; it cannot prevent.
 pub fn parse_codex_event(line: &[u8], research: bool) -> CodexEvent {
     use serde_json::Value;
     let Ok(event) = serde_json::from_slice::<Value>(line) else {
@@ -109,7 +113,9 @@ pub fn parse_codex_event(line: &[u8], research: bool) -> CodexEvent {
                     })
                 }
                 Some("error") => message(&item["message"]),
-                Some("web_search") if research && known_web_search_action(item) => {
+                Some("web_search")
+                    if research && search_action(item) && search_queries_pass(item) =>
+                {
                     CodexEvent::Benign
                 }
                 _ => CodexEvent::Refused,
@@ -119,17 +125,34 @@ pub fn parse_codex_event(line: &[u8], research: bool) -> CodexEvent {
     }
 }
 
-/// codex-rs `WebSearchAction`: `search`, `open_page` and `find_in_page` run
-/// on the provider's side. A missing action (older CLIs) is the search
-/// itself; `other` or anything unknown is refused.
-fn known_web_search_action(item: &serde_json::Value) -> bool {
+/// codex-rs `WebSearchAction` (checked against codex-cli 0.166.0): `search`,
+/// `open_page`, `find_in_page` or `other`. Only `search` is allowed; a page
+/// open or find is refused by owner decision, and that CLI has no setting
+/// that turns them off. A missing action (older CLIs) is the search itself.
+fn search_action(item: &serde_json::Value) -> bool {
     match item.get("action") {
         None => true,
-        Some(action) => matches!(
-            action.get("type").and_then(serde_json::Value::as_str),
-            Some("search" | "open_page" | "find_in_page")
-        ),
+        Some(action) => action.get("type").and_then(serde_json::Value::as_str) == Some("search"),
     }
+}
+
+/// Every query the item carries (`query`, `action.query`, `action.queries`)
+/// is a string that [`is_private`] does not flag. Core already gated the
+/// question with the owner's holdings; the worker does not know them, so
+/// this check runs without.
+fn search_queries_pass(item: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    let action = &item["action"];
+    let queries = match &action["queries"] {
+        Value::Null => &[][..],
+        Value::Array(queries) => queries.as_slice(),
+        _ => return false,
+    };
+    [&item["query"], &action["query"]]
+        .into_iter()
+        .filter(|query| !query.is_null())
+        .chain(queries)
+        .all(|query| query.as_str().is_some_and(|query| !is_private(query, &[])))
 }
 
 /// Classify a failed `codex exec` run. Only trusted sources count: structured
@@ -359,8 +382,8 @@ mod tests {
     fn web_search_is_accepted_only_in_research_runs() {
         let searches = [
             r#"{"type":"item.started","item":{"id":"i1","type":"web_search","query":"","action":{"type":"search","query":"rust release"}}}"#,
-            r#"{"type":"item.updated","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"open_page","url":"https://example.org"}}}"#,
-            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"find_in_page","url":"https://example.org","pattern":"x"}}}"#,
+            r#"{"type":"item.updated","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"search","queries":["rust release","rust 1.97"]}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"search"},"results":[]}}"#,
             r#"{"type":"item.completed","item":{"id":"i3","type":"web_search","query":"x"}}"#,
         ];
         for line in searches {
@@ -375,8 +398,12 @@ mod tests {
                 "{line}"
             );
         }
-        // An unknown or catch-all search action is refused even in research.
+        // Page opens and finds are refused by owner decision, and an unknown
+        // or catch-all action is refused too, even in research.
         for line in [
+            r#"{"type":"item.updated","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"open_page","url":"https://example.org"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"find_in_page","url":"https://example.org","pattern":"x"}}}"#,
+            r#"{"type":"item.started","item":{"id":"i1","type":"web_search","query":"","action":{"type":"open_page"}}}"#,
             r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"other"}}}"#,
             r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"download"}}}"#,
             r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{}}}"#,
@@ -396,5 +423,26 @@ mod tests {
             ),
             CodexEvent::AgentMessage("Answer".into())
         );
+    }
+
+    #[test]
+    fn a_search_query_with_personal_details_is_refused() {
+        for line in [
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"mijn portfolio rendement","action":{"type":"search","query":"rendement"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"rendement","action":{"type":"search","query":"jan.devries@example.nl"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"search","queries":["weer","IBAN NL91ABNA0417164300"]}}}"#,
+            r#"{"type":"item.started","item":{"id":"i1","type":"web_search","query":"is 2500 EUR per maand veel"}}"#,
+            // Not a string, or not a list of strings: refused, never skipped.
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":7,"action":{"type":"search"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"search","query":["x"]}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"search","queries":"x"}}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"web_search","query":"q","action":{"type":"search","queries":[1]}}}"#,
+        ] {
+            assert_eq!(
+                parse_codex_event(line.as_bytes(), true),
+                CodexEvent::Refused,
+                "{line}"
+            );
+        }
     }
 }
