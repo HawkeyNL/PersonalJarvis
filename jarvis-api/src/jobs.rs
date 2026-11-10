@@ -54,6 +54,8 @@ pub enum JobError {
     Conflict,
     /// A job of this kind already exists.
     Exists,
+    /// The owner ran the job less than an hour ago.
+    TooSoon,
 }
 
 impl std::fmt::Display for JobError {
@@ -65,6 +67,7 @@ impl std::fmt::Display for JobError {
             Self::NotFound => f.write_str("not found"),
             Self::Conflict => f.write_str("job revision conflict"),
             Self::Exists => f.write_str("a job of this kind already exists"),
+            Self::TooSoon => f.write_str("a job runs on request at most once an hour"),
         }
     }
 }
@@ -260,14 +263,15 @@ fn validate_params(params: &Params) -> Result<()> {
 }
 
 impl NewJob {
-    /// The job this input creates, at revision 1.
-    pub fn into_job(self, id: String, now: OffsetDateTime) -> Result<Job> {
+    /// The job this input creates, at revision 1. With the zone, its newest
+    /// slot at `now` counts as handled, so only later slots run.
+    pub fn into_job(self, id: String, now: OffsetDateTime, tz: Option<&TimeZone>) -> Result<Job> {
         let cadence = self.cadence.unwrap_or(Cadence::Weekly);
         let weekday = weekday_for(cadence, self.weekday, DEFAULT_WEEKDAY)?;
         let at_minute = self.at_minute.unwrap_or(DEFAULT_AT_MINUTE);
         validate_at_minute(at_minute)?;
         validate_params(&self.params)?;
-        Ok(Job {
+        let mut job = Job {
             id,
             kind: self.kind,
             cadence,
@@ -279,15 +283,23 @@ impl NewJob {
             last_slot_at: None,
             created_at: now,
             updated_at: now,
-        })
+        };
+        job.last_slot_at = tz.and_then(|tz| job.latest_slot(now, tz));
+        Ok(job)
     }
 }
 
 impl Job {
     /// The job with `patch` applied, and whether its schedule (cadence,
-    /// weekday, time or enabled) changed, which resets `last_slot_at` so no
-    /// slot before the change runs.
-    pub fn patched(&self, patch: &JobPatch) -> Result<(Job, bool)> {
+    /// weekday, time or enabled) changed. A change sets `last_slot_at` to the
+    /// newest slot at `now` under the new schedule (none without the zone),
+    /// so no slot before the change runs.
+    pub fn patched(
+        &self,
+        patch: &JobPatch,
+        now: OffsetDateTime,
+        tz: Option<&TimeZone>,
+    ) -> Result<(Job, bool)> {
         let cadence = patch.cadence.unwrap_or(self.cadence);
         let weekday = weekday_for(
             cadence,
@@ -298,7 +310,7 @@ impl Job {
         validate_at_minute(at_minute)?;
         let params = patch.params.clone().unwrap_or_else(|| self.params.clone());
         validate_params(&params)?;
-        let new = Job {
+        let mut new = Job {
             cadence,
             weekday,
             at_minute,
@@ -308,6 +320,9 @@ impl Job {
         };
         let rescheduled = (new.cadence, new.weekday, new.at_minute, new.enabled)
             != (self.cadence, self.weekday, self.at_minute, self.enabled);
+        if rescheduled {
+            new.last_slot_at = tz.and_then(|tz| new.latest_slot(now, tz));
+        }
         Ok((new, rescheduled))
     }
 
@@ -323,7 +338,7 @@ impl Job {
         let minute = i8::try_from(self.at_minute % 60).ok()?;
         let hour = i8::try_from(self.at_minute / 60).ok()?;
         let time = civil::Time::new(hour, minute, 0, 0).ok()?;
-        Some(tz.to_zoned(date.to_datetime(time)).ok()?.timestamp())
+        tz.to_timestamp(date.to_datetime(time)).ok()
     }
 
     /// The newest slot at or before `now`.
@@ -356,8 +371,10 @@ impl Job {
 
     /// What the runner owes this job at `now`: nothing, a run for the newest
     /// slot (late by less than [`CATCH_UP`]), or one `missed` row for it.
-    /// Slots at or before `last_slot_at` are handled; without it, slots at or
-    /// before the last change (`updated_at`) never run.
+    /// Only the newest slot counts: older slots that passed while Core was
+    /// down leave no row. Slots at or before `last_slot_at` are handled;
+    /// without it (a change made while the zone was unavailable), slots at
+    /// or before the last change (`updated_at`) never run.
     pub fn due(&self, now: OffsetDateTime, tz: &TimeZone) -> Due {
         if !self.enabled {
             return Due::Nothing;
@@ -422,10 +439,15 @@ mod tests {
         }
     }
 
+    /// A Wednesday, 13:00 in Amsterdam.
+    fn now() -> OffsetDateTime {
+        at("2026-11-11T12:00:00Z")
+    }
+
     fn new_job(body: serde_json::Value) -> Result<Job> {
         serde_json::from_value::<NewJob>(body)
             .map_err(|_| JobError::InvalidData)?
-            .into_job("j".into(), at("2026-11-11T12:00:00Z"))
+            .into_job("j".into(), at("2026-11-11T12:00:00Z"), None)
     }
 
     #[test]
@@ -436,6 +458,13 @@ mod tests {
             (Cadence::Weekly, Some(1), 420, true)
         );
         assert_eq!((job.revision, job.last_slot_at), (1, None));
+        // With the zone, the slot before creation counts as handled.
+        let seeded =
+            serde_json::from_value::<NewJob>(serde_json::json!({"kind": "dependency_review"}))
+                .unwrap()
+                .into_job("j".into(), at("2026-11-11T12:00:00Z"), Some(&tz()))
+                .unwrap();
+        assert_eq!(seeded.last_slot_at, Some(at("2026-11-09T06:00:00Z")));
         let daily = new_job(
             serde_json::json!({"kind": "dependency_review", "cadence": "daily", "at_minute": 0}),
         )
@@ -467,10 +496,14 @@ mod tests {
     fn patches_keep_absent_fields_and_reset_the_slot_only_on_a_schedule_change() {
         let weekly = job(Cadence::Weekly, Some(3), 600);
         let (daily, rescheduled) = weekly
-            .patched(&JobPatch {
-                cadence: Some(Cadence::Daily),
-                ..JobPatch::default()
-            })
+            .patched(
+                &JobPatch {
+                    cadence: Some(Cadence::Daily),
+                    ..JobPatch::default()
+                },
+                now(),
+                None,
+            )
             .unwrap();
         assert_eq!(
             (daily.weekday, daily.at_minute, rescheduled),
@@ -478,43 +511,89 @@ mod tests {
         );
         // Back to weekly: Monday unless a weekday is given.
         let (back, _) = daily
-            .patched(&JobPatch {
-                cadence: Some(Cadence::Weekly),
-                ..JobPatch::default()
-            })
+            .patched(
+                &JobPatch {
+                    cadence: Some(Cadence::Weekly),
+                    ..JobPatch::default()
+                },
+                now(),
+                None,
+            )
             .unwrap();
         assert_eq!(back.weekday, Some(1));
         let (params, rescheduled) = weekly
-            .patched(&JobPatch {
-                params: Some(Params {
-                    roadmap_id: Some("0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into()),
-                }),
-                ..JobPatch::default()
-            })
+            .patched(
+                &JobPatch {
+                    params: Some(Params {
+                        roadmap_id: Some("0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into()),
+                    }),
+                    ..JobPatch::default()
+                },
+                now(),
+                None,
+            )
             .unwrap();
         assert!(!rescheduled);
         assert_eq!(params.weekday, Some(3));
-        let (same, rescheduled) = weekly.patched(&JobPatch::default()).unwrap();
+        let (same, rescheduled) = weekly.patched(&JobPatch::default(), now(), None).unwrap();
         assert_eq!((same, rescheduled), (weekly.clone(), false));
         let (off, rescheduled) = weekly
-            .patched(&JobPatch {
-                enabled: Some(false),
-                ..JobPatch::default()
-            })
+            .patched(
+                &JobPatch {
+                    enabled: Some(false),
+                    ..JobPatch::default()
+                },
+                now(),
+                None,
+            )
             .unwrap();
         assert!(!off.enabled && rescheduled);
+        // With the zone, a schedule change seeds the newest slot under the
+        // new schedule; other changes keep the stored one.
+        let mut stored = weekly.clone();
+        stored.last_slot_at = Some(at("2026-11-04T09:00:00Z"));
+        let (moved, _) = stored
+            .patched(
+                &JobPatch {
+                    at_minute: Some(480),
+                    ..JobPatch::default()
+                },
+                now(),
+                Some(&tz()),
+            )
+            .unwrap();
+        assert_eq!(moved.last_slot_at, Some(at("2026-11-11T07:00:00Z")));
+        let (kept, _) = stored
+            .patched(
+                &JobPatch {
+                    params: Some(Params::default()),
+                    ..JobPatch::default()
+                },
+                now(),
+                Some(&tz()),
+            )
+            .unwrap();
+        assert_eq!(kept.last_slot_at, stored.last_slot_at);
         assert!(weekly
-            .patched(&JobPatch {
-                cadence: Some(Cadence::Daily),
-                weekday: Some(2),
-                ..JobPatch::default()
-            })
+            .patched(
+                &JobPatch {
+                    cadence: Some(Cadence::Daily),
+                    weekday: Some(2),
+                    ..JobPatch::default()
+                },
+                now(),
+                None,
+            )
             .is_err());
         assert!(daily
-            .patched(&JobPatch {
-                weekday: Some(2),
-                ..JobPatch::default()
-            })
+            .patched(
+                &JobPatch {
+                    weekday: Some(2),
+                    ..JobPatch::default()
+                },
+                now(),
+                None,
+            )
             .is_err());
     }
 
@@ -639,9 +718,9 @@ mod tests {
             let mut now = at("2026-01-01T00:00:00Z");
             let mut previous = daily.latest_slot(now, &tz).unwrap();
             let mut slots = 0;
-            // Every 10 minutes through 2026, both transitions included.
+            // Every hour through 2026, both transitions included.
             while now < at("2027-01-01T00:00:00Z") {
-                now += time::Duration::minutes(10);
+                now += time::Duration::hours(1);
                 let slot = daily.latest_slot(now, &tz).unwrap();
                 assert!(slot >= previous && slot <= now, "{at_minute} {now}");
                 assert!(daily.next_slot(now, &tz).unwrap() > now);

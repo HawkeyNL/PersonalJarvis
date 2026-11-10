@@ -27,18 +27,18 @@ DEFINE INDEX IF NOT EXISTS scheduled_jobs_kind ON scheduled_jobs FIELDS kind UNI
 -- One row per run, written before the run starts. A scheduled run has the
 -- slot it ran for; an owner's run the time it was asked for. `facts` is the
 -- JSON the run collected, `priorities` point into it by `ref`, `summary` is
--- display only. Pruned after 180 days.
+-- display only and comes with its source. Pruned after 180 days.
 DEFINE TABLE IF NOT EXISTS scheduled_job_runs SCHEMAFULL PERMISSIONS NONE;
 DEFINE FIELD id ON scheduled_job_runs TYPE string;
 DEFINE FIELD job_id ON scheduled_job_runs TYPE string ASSERT $value = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 DEFINE FIELD kind ON scheduled_job_runs TYPE string ASSERT $value IN ['dependency_review'];
 DEFINE FIELD slot_at ON scheduled_job_runs TYPE datetime;
 DEFINE FIELD trigger ON scheduled_job_runs TYPE string ASSERT $value IN ['schedule', 'owner'];
-DEFINE FIELD status ON scheduled_job_runs TYPE string ASSERT $value IN ['running', 'ok', 'partial', 'failed', 'missed', 'interrupted'] AND ($value = 'running') = (finished_at = NONE);
+DEFINE FIELD status ON scheduled_job_runs TYPE string ASSERT $value IN ['running', 'ok', 'partial', 'failed', 'missed', 'interrupted'] AND ($value = 'running') = (finished_at = NONE) AND (summary = NONE) = (summary_source = NONE);
 DEFINE FIELD error_code ON scheduled_job_runs TYPE option<string> ASSERT $value = NONE OR $value = /^[a-z][a-z_]{0,47}$/;
 DEFINE FIELD facts ON scheduled_job_runs TYPE option<string> ASSERT $value = NONE OR (string::len($value) >= 2 AND bytes::len(<bytes>$value) <= 65536);
 DEFINE FIELD summary ON scheduled_job_runs TYPE option<string> ASSERT $value = NONE OR (string::len($value) >= 1 AND string::len($value) <= 2000);
-DEFINE FIELD summary_source ON scheduled_job_runs TYPE option<string> ASSERT ($value = NONE OR $value IN ['claude', 'deterministic']) AND ($value = NONE) = (summary = NONE);
+DEFINE FIELD summary_source ON scheduled_job_runs TYPE option<string> ASSERT $value = NONE OR $value IN ['claude', 'deterministic'];
 DEFINE FIELD priorities ON scheduled_job_runs TYPE array<object, 20>;
 DEFINE FIELD priorities.*.ref ON scheduled_job_runs TYPE string ASSERT $value = /^[ap][1-9][0-9]{0,3}$/;
 DEFINE FIELD priorities.*.rank ON scheduled_job_runs TYPE int ASSERT $value >= 1 AND $value <= 20;

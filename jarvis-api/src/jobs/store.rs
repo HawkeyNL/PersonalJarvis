@@ -7,6 +7,7 @@
 //! reloads. All values are bound parameters; only constants are formatted
 //! into queries.
 
+use jiff::tz::TimeZone;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
@@ -15,8 +16,9 @@ use time::OffsetDateTime;
 use jarvis_store::Database;
 
 use super::{
-    Job, JobError, JobPatch, NewJob, Priority, Result, Run, RunStatus, SummarySource, Trigger,
-    MAX_FACTS_BYTES, MAX_RUNS, RUN_RETENTION_DAYS,
+    check, Job, JobError, JobPatch, NewJob, Priority, Result, Run, RunStatus, SummarySource,
+    Trigger, MAX_FACTS_BYTES, MAX_PRIORITIES, MAX_REASON, MAX_RUNS, MAX_SUMMARY,
+    RUN_RETENTION_DAYS,
 };
 
 /// An owner may start a job at most once per this many hours.
@@ -33,6 +35,16 @@ const RUN_FIELDS: &str = "record::id(id) AS id, job_id, kind, slot_at, trigger, 
 async fn run(db: &Database, query: &str, bindings: Value) -> Result<surrealdb::Response> {
     Ok(db.query(query).bind(bindings).await?.check()?)
 }
+
+/// A slot as bound text; queries cast it with `<datetime>`.
+fn slot(at: Option<OffsetDateTime>) -> Result<Option<String>> {
+    at.map(|at| at.format(&Rfc3339).map_err(|_| JobError::InvalidData))
+        .transpose()
+}
+
+/// Sets `last_slot_at` from the bound `$last_slot_at`, which may be NONE.
+const SET_LAST_SLOT: &str =
+    "last_slot_at = IF $last_slot_at = NONE THEN NONE ELSE <datetime>$last_slot_at END";
 
 async fn rows<T: DeserializeOwned>(db: &Database, query: &str, bindings: Value) -> Result<Vec<T>> {
     Ok(run(db, query, bindings).await?.take(0)?)
@@ -58,20 +70,21 @@ pub async fn get(db: &Database, id: &str) -> Result<Option<Job>> {
     Ok(found.into_iter().next())
 }
 
-/// Create a job; at most one per kind.
-pub async fn create(db: &Database, input: NewJob) -> Result<Job> {
-    let job = input.into_job(uuid::Uuid::now_v7().to_string(), OffsetDateTime::now_utc())?;
+/// Create a job; at most one per kind (a unique index). With the zone, the
+/// newest slot at creation counts as handled.
+pub async fn create(db: &Database, input: NewJob, tz: Option<&TimeZone>) -> Result<Job> {
+    let job = input.into_job(
+        uuid::Uuid::now_v7().to_string(),
+        OffsetDateTime::now_utc(),
+        tz,
+    )?;
     let response = db
-        .query(
-            "BEGIN TRANSACTION; \
-             IF array::len((SELECT VALUE id FROM scheduled_jobs WHERE kind = $kind)) > 0 \
-               { THROW 'job exists'; }; \
-             CREATE scheduled_jobs SET id = $id, kind = $kind, cadence = $cadence, \
+        .query(format!(
+            "CREATE scheduled_jobs SET id = $id, kind = $kind, cadence = $cadence, \
                weekday = $weekday, at_minute = $at_minute, enabled = $enabled, revision = 1, \
-               params = $params, last_slot_at = NONE, created_at = time::now(), \
-               updated_at = time::now() RETURN NONE; \
-             COMMIT TRANSACTION;",
-        )
+               params = $params, {SET_LAST_SLOT}, created_at = time::now(), \
+               updated_at = time::now() RETURN NONE"
+        ))
         .bind(json!({
             "id": job.id,
             "kind": job.kind,
@@ -80,6 +93,7 @@ pub async fn create(db: &Database, input: NewJob) -> Result<Job> {
             "at_minute": job.at_minute,
             "enabled": job.enabled,
             "params": job.params,
+            "last_slot_at": slot(job.last_slot_at)?,
         }))
         .await?;
     if let Err(error) = response.check() {
@@ -94,22 +108,29 @@ pub async fn create(db: &Database, input: NewJob) -> Result<Job> {
 }
 
 /// Change a job at revision `expected`; a change that changes nothing writes
-/// nothing. A schedule change clears `last_slot_at`, so no slot before it
-/// runs; otherwise the runner's value is kept as stored.
-pub async fn update(db: &Database, id: &str, expected: u64, patch: &JobPatch) -> Result<Job> {
+/// nothing. A schedule change sets `last_slot_at` as [`Job::patched`] says,
+/// so no slot before it runs; otherwise the runner's value is kept as stored.
+pub async fn update(
+    db: &Database,
+    id: &str,
+    expected: u64,
+    patch: &JobPatch,
+    tz: Option<&TimeZone>,
+) -> Result<Job> {
     let job = get(db, id).await?.ok_or(JobError::NotFound)?;
     if job.revision != expected {
         return Err(JobError::Conflict);
     }
-    let (new, rescheduled) = job.patched(patch)?;
+    let (new, rescheduled) = job.patched(patch, OffsetDateTime::now_utc(), tz)?;
     if new == job {
         return Ok(job);
     }
-    let updated: Vec<u64> = rows(
+    let updated: Vec<u64> = run(
         db,
-        "UPDATE scheduled_jobs SET cadence = $cadence, weekday = $weekday, \
+        "LET $seed = IF $last_slot_at = NONE THEN NONE ELSE <datetime>$last_slot_at END; \
+         UPDATE scheduled_jobs SET cadence = $cadence, weekday = $weekday, \
            at_minute = $at_minute, enabled = $enabled, params = $params, \
-           last_slot_at = IF $rescheduled THEN NONE ELSE last_slot_at END, \
+           last_slot_at = IF $rescheduled THEN $seed ELSE last_slot_at END, \
            revision = $revision, updated_at = time::now() \
          WHERE record::id(id) = $id AND revision = $expected RETURN VALUE revision",
         json!({
@@ -122,9 +143,11 @@ pub async fn update(db: &Database, id: &str, expected: u64, patch: &JobPatch) ->
             "enabled": new.enabled,
             "params": new.params,
             "rescheduled": rescheduled,
+            "last_slot_at": slot(new.last_slot_at)?,
         }),
     )
-    .await?;
+    .await?
+    .take(1)?;
     if updated.is_empty() {
         return Err(match get(db, id).await? {
             None => JobError::NotFound,
@@ -159,9 +182,10 @@ pub async fn delete(db: &Database, id: &str, expected: u64) -> Result<()> {
 
 /// Write the row of a run before it starts, or a `missed` row, and return
 /// its id. A scheduled row is written only while the job is enabled and at
-/// the revision `job` was loaded at, and records `slot_at` as handled; an
-/// owner's row only once per [`OWNER_RUN_HOURS`]. A refused write (also a
-/// second row for the same slot) is an error and writes nothing.
+/// the revision `job` was loaded at, and records `slot_at` as handled
+/// ([`JobError::Conflict`] otherwise, also for a slot already handled); an
+/// owner's row starts running, once per [`OWNER_RUN_HOURS`]
+/// ([`JobError::TooSoon`]). A refused write writes nothing.
 pub async fn start_run(
     db: &Database,
     job: &Job,
@@ -169,13 +193,16 @@ pub async fn start_run(
     trigger: Trigger,
     status: RunStatus,
 ) -> Result<String> {
-    if !matches!(status, RunStatus::Running | RunStatus::Missed) {
-        return Err(JobError::Invalid("a run starts as running or missed"));
+    let valid = match trigger {
+        Trigger::Schedule => matches!(status, RunStatus::Running | RunStatus::Missed),
+        Trigger::Owner => status == RunStatus::Running,
+    };
+    if !valid {
+        return Err(JobError::Invalid("not a starting run state"));
     }
     let run_id = uuid::Uuid::now_v7().to_string();
-    run(
-        db,
-        &format!(
+    let response = db
+        .query(format!(
             "BEGIN TRANSACTION; \
              LET $slot = <datetime>$slot_at; \
              LET $job = (UPDATE scheduled_jobs \
@@ -193,8 +220,8 @@ pub async fn start_run(
                finished_at = IF $status = 'running' THEN NONE ELSE time::now() END \
                RETURN NONE; \
              COMMIT TRANSACTION;"
-        ),
-        json!({
+        ))
+        .bind(json!({
             "id": run_id,
             "job_id": job.id,
             "revision": job.revision,
@@ -203,10 +230,31 @@ pub async fn start_run(
             "owner": trigger == Trigger::Owner,
             "trigger": trigger,
             "status": status,
+        }))
+        .await?;
+    let Err(error) = response.check() else {
+        return Ok(run_id);
+    };
+    // Explain the refusal from the current state; anything else is a
+    // database error.
+    let Some(current) = get(db, &job.id).await? else {
+        return Err(JobError::NotFound);
+    };
+    let refused = match trigger {
+        Trigger::Owner => last_owner_run(db, &job.id).await?.is_some_and(|at| {
+            OffsetDateTime::now_utc() - at < time::Duration::hours(OWNER_RUN_HOURS.into())
         }),
-    )
-    .await?;
-    Ok(run_id)
+        Trigger::Schedule => {
+            current.revision != job.revision
+                || !current.enabled
+                || current.last_slot_at.is_some_and(|at| at >= slot_at)
+        }
+    };
+    Err(match (refused, trigger) {
+        (true, Trigger::Owner) => JobError::TooSoon,
+        (true, Trigger::Schedule) => JobError::Conflict,
+        (false, _) => error.into(),
+    })
 }
 
 /// How a run ended.
@@ -223,14 +271,33 @@ pub struct Finish {
 /// Record how a running run ended; a run that is no longer running (Core
 /// restarted and marked it interrupted) stays as it is.
 pub async fn finish_run(db: &Database, run_id: &str, finish: &Finish) -> Result<bool> {
-    if matches!(finish.status, RunStatus::Running | RunStatus::Missed)
-        || finish
+    check(
+        !matches!(finish.status, RunStatus::Running | RunStatus::Missed),
+        "not a final run state",
+    )?;
+    check(
+        finish
             .facts
             .as_ref()
-            .is_some_and(|f| f.len() > MAX_FACTS_BYTES)
-    {
-        return Err(JobError::Invalid("not a final run state"));
-    }
+            .is_none_or(|facts| (2..=MAX_FACTS_BYTES).contains(&facts.len())),
+        "facts must be 2 bytes to 64 KiB",
+    )?;
+    check(
+        finish.summary.as_ref().is_none_or(|(summary, _)| {
+            !summary.trim().is_empty() && summary.chars().count() <= MAX_SUMMARY
+        }),
+        "summary must be 1 to 2000 characters",
+    )?;
+    check(
+        finish.priorities.len() <= MAX_PRIORITIES
+            && finish.priorities.iter().all(|priority| {
+                valid_ref(&priority.reference)
+                    && (1..=MAX_PRIORITIES).contains(&usize::from(priority.rank))
+                    && !priority.reason.trim().is_empty()
+                    && priority.reason.chars().count() <= MAX_REASON
+            }),
+        "priorities must be at most 20 valid entries",
+    )?;
     let (summary, source) = match &finish.summary {
         Some((summary, source)) => (Some(summary.as_str()), Some(*source)),
         None => (None, None),
@@ -253,6 +320,16 @@ pub async fn finish_run(db: &Database, run_id: &str, finish: &Finish) -> Result<
     )
     .await?;
     Ok(!updated.is_empty())
+}
+
+/// `a1`, `p12`: a letter for the kind of fact and its number (the schema's
+/// rule).
+pub fn valid_ref(reference: &str) -> bool {
+    let mut chars = reference.chars();
+    matches!(chars.next(), Some('a' | 'p'))
+        && matches!(chars.next(), Some('1'..='9'))
+        && reference.len() <= 5
+        && chars.all(|c| c.is_ascii_digit())
 }
 
 /// Mark every run that is still running as interrupted: no run survives a
@@ -377,19 +454,29 @@ mod tests {
         OffsetDateTime::parse(value, &Rfc3339).expect("slot")
     }
 
+    #[test]
+    fn refs_match_the_schema_rule() {
+        for ok in ["a1", "p12", "a9999"] {
+            assert!(valid_ref(ok), "{ok}");
+        }
+        for bad in ["", "a", "a0", "x1", "A1", "a01", "a10000", "a1 ", "p-1"] {
+            assert!(!valid_ref(bad), "{bad}");
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
     async fn jobs_are_one_per_kind_and_revision_guarded(
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = database().await?;
-        let job = create(&db, new_job()).await?;
+        let job = create(&db, new_job(), None).await?;
         assert_eq!(
             (job.cadence, job.weekday, job.at_minute, job.revision),
             (Cadence::Weekly, Some(1), 420, 1)
         );
         assert!(job.enabled && job.last_slot_at.is_none());
         assert!(matches!(
-            create(&db, new_job()).await,
+            create(&db, new_job(), None).await,
             Err(JobError::Exists)
         ));
         assert_eq!(list(&db).await?, std::slice::from_ref(&job));
@@ -410,17 +497,23 @@ mod tests {
                 }),
                 ..JobPatch::default()
             },
+            None,
         )
         .await?;
         assert_eq!(linked.revision, 2);
         assert_eq!(linked.last_slot_at, Some(monday));
         assert_eq!(linked.params.roadmap_id.as_deref(), Some(roadmap));
         assert!(matches!(
-            update(&db, id, 1, &JobPatch::default()).await,
+            update(&db, id, 1, &JobPatch::default(), None).await,
             Err(JobError::Conflict)
         ));
         // Nothing changes: no new revision.
-        assert_eq!(update(&db, id, 2, &JobPatch::default()).await?.revision, 2);
+        assert_eq!(
+            update(&db, id, 2, &JobPatch::default(), None)
+                .await?
+                .revision,
+            2
+        );
         let daily = update(
             &db,
             id,
@@ -430,6 +523,7 @@ mod tests {
                 at_minute: Some(1439),
                 ..JobPatch::default()
             },
+            None,
         )
         .await?;
         assert_eq!(
@@ -449,14 +543,15 @@ mod tests {
                 &JobPatch {
                     weekday: Some(2),
                     ..JobPatch::default()
-                }
+                },
+                None,
             )
             .await,
             Err(JobError::Invalid(_))
         ));
         let unknown = uuid::Uuid::now_v7().to_string();
         assert!(matches!(
-            update(&db, &unknown, 1, &JobPatch::default()).await,
+            update(&db, &unknown, 1, &JobPatch::default(), None).await,
             Err(JobError::NotFound)
         ));
 
@@ -476,7 +571,10 @@ mod tests {
         .await?;
         assert!(runs.is_empty());
         // The kind is free again.
-        assert_eq!(create(&db, new_job()).await?.kind, Kind::DependencyReview);
+        assert_eq!(
+            create(&db, new_job(), None).await?.kind,
+            Kind::DependencyReview
+        );
         Ok(())
     }
 
@@ -485,17 +583,16 @@ mod tests {
     async fn runs_are_written_first_once_per_slot_and_interrupted_on_restart(
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = database().await?;
-        let job = create(&db, new_job()).await?;
+        let job = create(&db, new_job(), None).await?;
         let monday = slot("2026-11-09T06:00:00Z");
         let run_id = start_run(&db, &job, monday, Trigger::Schedule, RunStatus::Running).await?;
         assert_eq!(get(&db, &job.id).await?.unwrap().last_slot_at, Some(monday));
         // The same slot twice, or from a job that changed meanwhile, writes
         // nothing.
-        assert!(
-            start_run(&db, &job, monday, Trigger::Schedule, RunStatus::Missed)
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            start_run(&db, &job, monday, Trigger::Schedule, RunStatus::Missed).await,
+            Err(JobError::Conflict)
+        ));
         update(
             &db,
             &job.id,
@@ -504,14 +601,14 @@ mod tests {
                 at_minute: Some(480),
                 ..JobPatch::default()
             },
+            None,
         )
         .await?;
         let next = slot("2026-11-16T07:00:00Z");
-        assert!(
-            start_run(&db, &job, next, Trigger::Schedule, RunStatus::Running)
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            start_run(&db, &job, next, Trigger::Schedule, RunStatus::Running).await,
+            Err(JobError::Conflict)
+        ));
         let off = update(
             &db,
             &job.id,
@@ -520,26 +617,32 @@ mod tests {
                 enabled: Some(false),
                 ..JobPatch::default()
             },
+            None,
         )
         .await?;
-        assert!(
-            start_run(&db, &off, next, Trigger::Schedule, RunStatus::Running)
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            start_run(&db, &off, next, Trigger::Schedule, RunStatus::Running).await,
+            Err(JobError::Conflict)
+        ));
 
         // The owner may run a disabled job, once an hour; the slot stays.
         let now = OffsetDateTime::now_utc();
         let owner = start_run(&db, &off, now, Trigger::Owner, RunStatus::Running).await?;
-        assert!(start_run(
-            &db,
-            &off,
-            now + time::Duration::seconds(1),
-            Trigger::Owner,
-            RunStatus::Running
-        )
-        .await
-        .is_err());
+        assert!(matches!(
+            start_run(
+                &db,
+                &off,
+                now + time::Duration::seconds(1),
+                Trigger::Owner,
+                RunStatus::Running
+            )
+            .await,
+            Err(JobError::TooSoon)
+        ));
+        assert!(matches!(
+            start_run(&db, &off, now, Trigger::Owner, RunStatus::Missed).await,
+            Err(JobError::Invalid(_))
+        ));
         assert!(last_owner_run(&db, &job.id).await?.is_some());
         assert_eq!(get(&db, &job.id).await?.unwrap().last_slot_at, None);
 
@@ -557,16 +660,28 @@ mod tests {
         assert!(finish_run(&db, &run_id, &finish).await?);
         // A finished run stays finished.
         assert!(!finish_run(&db, &run_id, &finish).await?);
-        assert!(finish_run(
-            &db,
-            &run_id,
-            &Finish {
+        for bad in [
+            Finish {
                 status: RunStatus::Running,
                 ..finish.clone()
-            }
-        )
-        .await
-        .is_err());
+            },
+            Finish {
+                summary: Some((" ".into(), SummarySource::Claude)),
+                ..finish.clone()
+            },
+            Finish {
+                priorities: vec![Priority {
+                    reference: "x1".into(),
+                    ..finish.priorities[0].clone()
+                }],
+                ..finish.clone()
+            },
+        ] {
+            assert!(matches!(
+                finish_run(&db, &run_id, &bad).await,
+                Err(JobError::Invalid(_))
+            ));
+        }
 
         // A restart interrupts what still runs.
         assert_eq!(interrupt_running(&db).await?, std::slice::from_ref(&owner));
