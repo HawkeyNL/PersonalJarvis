@@ -95,7 +95,9 @@ const MAX_SEPARATOR_RUN: usize = 3;
 
 /// 6+ contiguous digits, or digit groups joined by separators (see
 /// [`digit_runs`]) with 8+ digits or 6+ groups in total (IBAN, card and
-/// phone numbers). Any decimal digit counts, fullwidth ones included.
+/// phone numbers). Any digit counts (see [`is_digit`]). Other punctuation or
+/// a letter ends a number, so `06,1234,5678` passes: this is a heuristic,
+/// not a complete detector.
 /// With `dates_allowed`, a run that is exactly one date is not private.
 fn has_digit_run(text: &str, dates_allowed: bool) -> bool {
     digit_runs(text).iter().any(|run| {
@@ -129,7 +131,7 @@ fn digit_runs(text: &str) -> Vec<Vec<(char, String)>> {
     let (mut group, mut joint, mut before) = (String::new(), String::new(), '\0');
     let visible = text.chars().filter(|c| !is_invisible(*c));
     for c in visible.chain(['\0']) {
-        if c.is_numeric() {
+        if is_digit(c) {
             if group.is_empty() {
                 before = match (run.is_empty(), joint.chars().count()) {
                     (true, _) => '\0',
@@ -162,35 +164,62 @@ fn digit_runs(text: &str) -> Vec<Vec<(char, String)>> {
 }
 
 /// Any whitespace (no-break spaces included), `-`, `.`, `/`, `_`, and their
-/// Unicode look-alikes: hyphens and dashes, the minus sign, fullwidth and
-/// small forms, the fraction and division slashes.
+/// Unicode look-alikes: hyphens and dashes, the minus sign, middle dots and
+/// bullet operators, fullwidth and small forms, the fraction and division
+/// slashes.
 fn is_separator(c: char) -> bool {
+    const LOOK_ALIKES: [char; 17] = [
+        '\u{b7}', '\u{2027}', '\u{2043}', '\u{2044}', '\u{2212}', '\u{2215}', '\u{2219}',
+        '\u{22c5}', '\u{2e3a}', '\u{2e3b}', '\u{30fb}', '\u{fe58}', '\u{fe63}', '\u{ff0d}',
+        '\u{ff0e}', '\u{ff0f}', '\u{ff65}',
+    ];
     c.is_whitespace()
+        || matches!(c, '-' | '.' | '/' | '_')
+        || ('\u{2010}'..='\u{2015}').contains(&c)
+        || LOOK_ALIKES.contains(&c)
+}
+
+/// Ignored inside a number, so it can neither split nor hide one:
+/// non-whitespace control characters, format and bidi controls, zero-width
+/// characters, blank fillers, combining marks, variation selectors and tags.
+/// Visible symbols (`€`, `×`, `→`) and letters still end a number.
+fn is_invisible(c: char) -> bool {
+    (c.is_control() && !c.is_whitespace())
         || matches!(
             c,
-            '-' | '.' | '/' | '_' | '\u{2010}'
-                ..='\u{2015}'
-                    | '\u{2043}'
-                    | '\u{2044}'
-                    | '\u{2212}'
-                    | '\u{2215}'
-                    | '\u{2e3a}'
-                    | '\u{2e3b}'
-                    | '\u{fe58}'
-                    | '\u{fe63}'
-                    | '\u{ff0d}'
-                    | '\u{ff0e}'
-                    | '\u{ff0f}'
+            '\u{ad}'
+                | '\u{300}'..='\u{36f}'
+                | '\u{483}'..='\u{489}'
+                | '\u{61c}'
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{17b4}'
+                | '\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{1ab0}'..='\u{1aff}'
+                | '\u{1dc0}'..='\u{1dff}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{20d0}'..='\u{20ff}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{fe20}'..='\u{fe2f}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff0}'..='\u{fffb}'
+                | '\u{e0000}'..='\u{e0fff}'
         )
 }
 
-/// Ignored inside a number: any non-ASCII character that is neither a
-/// letter or digit, whitespace nor a separator. That covers format and
-/// bidi controls, zero-width characters, combining marks, variation
-/// selectors, tags and symbols such as `·`, so none of them can split a
-/// number; it only ever joins more digits.
-fn is_invisible(c: char) -> bool {
-    !c.is_ascii() && !c.is_alphanumeric() && !c.is_whitespace() && !is_separator(c)
+/// A digit in any script (fullwidth included), but not a superscript,
+/// subscript, fraction or Roman numeral, so `m²` or `½` is no number.
+fn is_digit(c: char) -> bool {
+    c.is_numeric()
+        && !matches!(
+            c,
+            '\u{b2}' | '\u{b3}' | '\u{b9}' | '\u{bc}'..='\u{be}' | '\u{2070}'..='\u{209f}' | '\u{2150}'..='\u{218f}'
+        )
 }
 
 /// The whole run is one plausible date: `YYYY-MM-DD`, `YYYY/MM/DD`,
@@ -223,10 +252,10 @@ fn is_date(run: &[(char, String)]) -> bool {
 fn has_amount(lower: &str) -> bool {
     let currency =
         lower.contains(['€', '$', '£']) || CURRENCY_WORDS.iter().any(|word| has_word(lower, word));
-    (currency && lower.contains(char::is_numeric))
+    (currency && lower.contains(is_digit))
         || runs(lower, char::is_alphanumeric).any(|word| {
             word.strip_suffix('k')
-                .is_some_and(|digits| !digits.is_empty() && digits.chars().all(char::is_numeric))
+                .is_some_and(|digits| !digits.is_empty() && digits.chars().all(is_digit))
         })
 }
 
@@ -409,6 +438,17 @@ mod tests {
             ("06\u{e0020}1234\u{e0020}5678", true),
             ("06·1234·5678", true),
             ("06\u{30fb}1234\u{30fb}5678", true),
+            ("06\u{22c5}1234\u{22c5}5678", true),
+            ("06\u{1f}1234\u{1f}5678", true),
+            ("06\u{7f}1234\u{7f}5678", true),
+            ("06\u{3164}1234\u{3164}5678", true),
+            ("06\u{202e}1234\u{202e}5678", true),
+            // Visible symbols end a number: price ranges and resolutions.
+            ("laptop €1000 - €2000", false),
+            ("prijs €1500 – €2500", false),
+            ("1920×1080 monitor", false),
+            ("2024→2025", false),
+            ("prijs per m² in 2026", false),
             // Two years are a range, not a number; a third group is.
             ("inflatie 2024 - 2025", false),
             ("2024-2025 verkiezingen", false),
@@ -457,5 +497,7 @@ mod tests {
         assert!(is_private("is €２５００ per maand veel?", &[]));
         assert!(is_private("salary of ８０k", &[]));
         assert!(is_private("inflatie 2024 - 2025", &[]));
+        assert!(!is_private("prijs per m² in de stad", &[]));
+        assert!(!is_private("½ liter melk", &[]));
     }
 }

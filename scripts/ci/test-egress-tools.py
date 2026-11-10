@@ -61,7 +61,7 @@ class EgressToolTests(unittest.TestCase):
         # Nested block comments fail closed; unicode and hex char escapes parse.
         self.assertIn("nested block comment: could not be scanned",
                       self.rules(OTHER, '/* /* x */ *//* y */ let y = "Bash";'))
-        for escape in ["'\\u{22}'", "'\\x22'"]:
+        for escape in ["'\\u{22}'", "'\\x22'", "'\\u{0_0_2_2}'"]:
             text = escape + '"\'""/*" let y = "Bash"; /* */'
             self.assertNotEqual(self.rules(OTHER, text), [], text)
             self.assertEqual(self.rules(OTHER, f'let q = {escape}; let s = "ok";'), [], escape)
