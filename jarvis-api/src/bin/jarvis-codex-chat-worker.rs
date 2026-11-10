@@ -510,6 +510,21 @@ mod tests {
         .unwrap()
     }
 
+    /// Settings that would widen the sandbox, the network or the tool set.
+    /// CI guard.
+    fn assert_no_widening_tokens(argv: &[String]) {
+        let joined = argv.join(" ");
+        for forbidden in [
+            "danger-full-access",
+            "workspace-write",
+            "network_access",
+            "--full-auto",
+            "mcp_servers",
+        ] {
+            assert!(!joined.contains(forbidden), "{forbidden} in {joined}");
+        }
+    }
+
     #[test]
     fn exec_argv_is_exactly_the_reviewed_invocation() {
         let argv = exec_args(
@@ -528,7 +543,9 @@ mod tests {
              -c shell_environment_policy.inherit=none -c forced_login_method=\"chatgpt\" \
              -c model_instructions_file=\"/run/jarvis-codex-chat/run-x/instructions.md\" -"
         );
+        assert_no_widening_tokens(&argv);
         let plain = exec_args("gpt-6-luna", None, false);
+        assert_no_widening_tokens(&plain);
         assert_eq!(plain.last().map(String::as_str), Some("-"));
         assert!(!plain.iter().any(|arg| arg.contains("instructions")));
     }
@@ -548,6 +565,8 @@ mod tests {
              -c shell_environment_policy.inherit=none -c forced_login_method=\"chatgpt\" \
              -c model_instructions_file=\"/run/jarvis-codex-chat/run-x/instructions.md\" -"
         );
+        assert_no_widening_tokens(&argv);
+        assert_no_widening_tokens(&exec_args("gpt-6-luna", None, true));
         let plain = exec_args("gpt-6-luna", Some(path), false);
         let changed: Vec<_> = argv
             .iter()
