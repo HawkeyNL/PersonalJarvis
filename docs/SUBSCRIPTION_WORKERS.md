@@ -534,8 +534,8 @@ identifier check (`jarvis_llm::privacy::leaks_identifier`, as for Codex) does
 not flag, and on any line that is not a JSON object with a type. That
 includes the CLI's own `EndConversation`. Claude Code's `WebSearch` tool makes
 its own inner call to the web search backend, and the queries of that call
-are not in the outer stream. The worker checks every string in the outer
-`input` (the query and any `allowed_domains` or `blocked_domains`); the inner
+are not in the outer stream. The worker checks every string and number in
+the outer `input` (the query and any `allowed_domains` or `blocked_domains`); the inner
 call gets only that checked input, never the question or the rest of the run.
 What the inner call then searches for is not visible to the worker.
 Unlike the Codex event allowlist, other event types and content blocks that
@@ -575,8 +575,8 @@ and each string in `action.queries`) is a string that the identifier check
 (`jarvis_llm::privacy::leaks_identifier`: no email address, key, possessive
 account word or long number; a plain date is fine) does not flag. A completed
 search item must carry at least one non-empty query; one without any is
-refused, and so is a turn that completes while a started search item (tracked
-by its `id`) never completed. By owner decision, `open_page` and `find_in_page` actions are
+refused, and so is a turn that completes, or a stream that ends, while a
+started search item (tracked by its `id`) never completed. By owner decision, `open_page` and `find_in_page` actions are
 refused. Codex CLI 0.166.0 has no setting that
 turns them off: `web_search` is `disabled | cached | indexed | live`, and
 those modes only set the hosted tool's `external_web_access` and

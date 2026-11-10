@@ -434,11 +434,13 @@ fn allowed_block(block: &serde_json::Value) -> bool {
         && strings_pass(&block["input"])
 }
 
-/// Every string in `value`, at any depth, passes [`leaks_identifier`].
+/// Every string and number in `value`, at any depth, passes
+/// [`leaks_identifier`].
 fn strings_pass(value: &serde_json::Value) -> bool {
     use serde_json::Value;
     match value {
         Value::String(text) => !leaks_identifier(text),
+        Value::Number(number) => !leaks_identifier(&number.to_string()),
         Value::Array(items) => items.iter().all(strings_pass),
         Value::Object(fields) => fields
             .iter()
@@ -771,6 +773,7 @@ mod tests {
                 "WebSearch",
                 r#"{"query":"rust","blocked_domains":["x.org"],"note":{"n":"0612345678"}}"#,
             ),
+            tool("WebSearch", r#"{"query":"rust","n":612345678}"#),
             tool("WebSearch", r#"{"query":["rust"]}"#),
             tool("WebSearch", "{}"),
             r#"{"type":"assistant","message":{"content":[{"type":"server_tool_use","id":"s1","name":"web_search","input":{"query":"rust"}}]}}"#.into(),

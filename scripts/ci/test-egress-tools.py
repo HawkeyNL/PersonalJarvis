@@ -48,6 +48,17 @@ class EgressToolTests(unittest.TestCase):
         self.assertEqual(self.rules(OTHER, 'r"WebSearch"; "a \\" b"; WebFetch'), [])
         self.assertEqual([line for line, _ in egress.violations(OTHER, 'a\nb\n"x\nBash"')], [3])
 
+    def test_block_comments_c_strings_and_unparsed_quotes(self):
+        for text in ['/* a " b */\nlet x = "Bash";', '/** "\n */\nlet y = "Bash";',
+                     'let c = cr"C:\\"; let y = "Bash";', 'let s = c"x"; let y = "WebFetch";']:
+            self.assertEqual(self.rules(OTHER, text),
+                             ["WebFetch, Bash or mcp__ tool outside a reviewed deny-list"], text)
+        # A quote the tokenizer cannot place fails closed, with its line.
+        self.assertEqual(list(egress.violations(OTHER, 'let a = 1;\nlet b = x"y;')),
+                         [(2, "unparsed quote: string literals could not be scanned")])
+        self.assertEqual(self.rules(WORKER, 'let b = x"y;'),
+                         ["unparsed quote: string literals could not be scanned"])
+
     def test_cli_paths_only_in_reviewed_files(self):
         for text in ['const BIN: &str = "/usr/local/bin/claude";', '"/opt/x/codex"',
                      'format!("{home}/bin/claude")']:

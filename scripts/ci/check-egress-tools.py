@@ -38,12 +38,15 @@ CLI_PATH_FILES = WORKERS | {
 }
 TOOLS = re.compile(r"\b(?:WebFetch|Bash)\b")
 MCP = re.compile(r"mcp__")
-# A line comment, a char literal, or a (byte, raw) string literal.
+# A line or block comment, a char literal, or a (byte, C, raw) string
+# literal. A quote left over after removing these means the source was not
+# understood, and fails the scan rather than hiding later literals.
 TOKENS = re.compile(
     r"//[^\n]*"
+    r"|/\*.*?\*/"
     r"|'(?:[^'\\\n]|\\.)'"
-    r'|(?<![A-Za-z0-9_])b?r(#*)"(.*?)"\1'
-    r'|b?"((?:[^"\\]|\\.)*)"',
+    r'|(?<![A-Za-z0-9_])[bc]?r(#*)"(.*?)"\1'
+    r'|(?<![A-Za-z0-9_])[bc]?"((?:[^"\\]|\\.)*)"',
     re.DOTALL,
 )
 # The Claude Code executor deny-list and its test; the Claude worker's
@@ -68,6 +71,10 @@ def literals(text):
 def violations(name, text):
     line_of = lambda offset: text.count("\n", 0, offset) + 1
     found = set()
+    leftover = TOKENS.sub(lambda match: "\n" * match.group(0).count("\n"), text)
+    if '"' in leftover:
+        found.add((leftover.count("\n", 0, leftover.index('"')) + 1,
+                   "unparsed quote: string literals could not be scanned"))
     if name not in WORKERS:
         found |= {(line_of(match.start()), "claude/codex CLI spawned outside the worker binaries")
                   for match in SPAWN.finditer(text)}

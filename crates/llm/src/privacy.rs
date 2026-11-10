@@ -89,40 +89,60 @@ fn has_email(text: &str) -> bool {
     })
 }
 
-/// 6+ contiguous digits, or digit groups joined by single separators (see
+/// How many separator characters may join two digit groups, of which at
+/// most one may be other than whitespace (`06 - 1234`, not `1234--5678`).
+const MAX_SEPARATOR_RUN: usize = 3;
+
+/// 6+ contiguous digits, or digit groups joined by separators (see
 /// [`digit_runs`]) with 8+ digits or 6+ groups in total (IBAN, card and
-/// phone numbers).
+/// phone numbers). Any decimal digit counts, fullwidth ones included.
 /// With `dates_allowed`, a run that is exactly one date is not private.
 fn has_digit_run(text: &str, dates_allowed: bool) -> bool {
     digit_runs(text).iter().any(|run| {
-        let total: usize = run.iter().map(|(_, group)| group.len()).sum();
-        (run.iter().any(|(_, group)| group.len() >= MIN_DIGIT_RUN)
+        let digits = |group: &String| group.chars().count();
+        let total: usize = run.iter().map(|(_, group)| digits(group)).sum();
+        (run.iter().any(|(_, group)| digits(group) >= MIN_DIGIT_RUN)
             || total >= MIN_SEPARATED_DIGITS
             || run.len() >= MIN_DIGIT_RUN)
             && !(dates_allowed && is_date(run))
     })
 }
 
-/// Maximal runs of ASCII digit groups joined by single separators (see
-/// [`is_separator`]), each group with the separator before it (`'\0'` for
-/// the first).
-fn digit_runs(text: &str) -> Vec<Vec<(char, &str)>> {
+/// Maximal runs of digit groups, each with the separator before it: the
+/// single separator character, `' '` for a longer joint, `'\0'` for the
+/// first. Groups are joined by up to [`MAX_SEPARATOR_RUN`] separators (see
+/// [`is_separator`]) with at most one that is not whitespace. Invisible
+/// characters are dropped first, so they neither join nor split a number.
+fn digit_runs(text: &str) -> Vec<Vec<(char, String)>> {
     let (mut runs, mut run) = (Vec::new(), Vec::new());
-    let (mut start, mut separator) = (None, '\0');
-    for (at, c) in text.char_indices().chain([(text.len(), '\0')]) {
-        if c.is_ascii_digit() {
-            start.get_or_insert(at);
+    let (mut group, mut joint, mut before) = (String::new(), String::new(), '\0');
+    let visible = text.chars().filter(|c| !is_invisible(*c));
+    for c in visible.chain(['\0']) {
+        if c.is_numeric() {
+            if group.is_empty() {
+                before = match (run.is_empty(), joint.chars().count()) {
+                    (true, _) => '\0',
+                    (false, 1) => joint.chars().next().unwrap_or(' '),
+                    (false, _) => ' ',
+                };
+                joint.clear();
+            }
+            group.push(c);
             continue;
         }
-        if let Some(begin) = start.take() {
-            run.push((separator, &text[begin..at]));
-            if is_separator(c) {
-                separator = c;
-                continue;
-            }
+        if !group.is_empty() {
+            run.push((before, std::mem::take(&mut group)));
         }
-        // Any other character, or a second separator, ends the run.
-        separator = '\0';
+        let joins = !run.is_empty()
+            && is_separator(c)
+            && joint.chars().count() < MAX_SEPARATOR_RUN
+            && (c.is_whitespace() || joint.chars().all(char::is_whitespace));
+        if joins {
+            joint.push(c);
+            continue;
+        }
+        // Any other character, or too long a joint, ends the run.
+        joint.clear();
         if !run.is_empty() {
             runs.push(std::mem::take(&mut run));
         }
@@ -130,30 +150,44 @@ fn digit_runs(text: &str) -> Vec<Vec<(char, &str)>> {
     runs
 }
 
-/// Any whitespace (no-break spaces included), `-`, `.`, `/`, `_`, a Unicode
-/// hyphen or dash (U+2010 to U+2015), the minus sign, or an invisible format
-/// character (soft hyphen, zero-width space and joiners, word joiner, BOM).
+/// Any whitespace (no-break spaces included), `-`, `.`, `/`, `_`, and their
+/// Unicode look-alikes: hyphens and dashes, the minus sign, fullwidth and
+/// small forms, the fraction and division slashes.
 fn is_separator(c: char) -> bool {
     c.is_whitespace()
         || matches!(
             c,
-            '-' | '.'
-                | '/'
-                | '_'
-                | '\u{2010}'..='\u{2015}'
-                | '\u{2212}'
-                | '\u{ad}'
-                | '\u{200b}'..='\u{200d}'
-                | '\u{2060}'
-                | '\u{feff}'
+            '-' | '.' | '/' | '_' | '\u{2010}'
+                ..='\u{2015}'
+                    | '\u{2043}'
+                    | '\u{2044}'
+                    | '\u{2212}'
+                    | '\u{2215}'
+                    | '\u{2e3a}'
+                    | '\u{2e3b}'
+                    | '\u{fe58}'
+                    | '\u{fe63}'
+                    | '\u{ff0d}'
+                    | '\u{ff0e}'
+                    | '\u{ff0f}'
         )
+}
+
+/// Invisible format characters: soft hyphen, Mongolian vowel separator,
+/// zero-width space and joiners, word joiner, invisible operators, BOM.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}' | '\u{180e}' | '\u{200b}'..='\u{200d}' | '\u{2060}'..='\u{2064}' | '\u{feff}'
+    )
 }
 
 /// The whole run is one plausible date: `YYYY-MM-DD`, `YYYY/MM/DD`,
 /// `DD-MM-YYYY`, `DD/MM/YYYY` or `DD.MM.YYYY`, with a 1-2 digit day and
-/// month and a year from 1900 to 2099. A digit group joined to it by a
-/// separator makes the run longer, so it is no longer a date.
-fn is_date(run: &[(char, &str)]) -> bool {
+/// month and a year from 1900 to 2099, each joined by one ASCII separator.
+/// A digit group joined to it makes the run longer, so it is no longer a
+/// date.
+fn is_date(run: &[(char, String)]) -> bool {
     let [(_, first), (separator, middle), (second_separator, last)] = run else {
         return false;
     };
@@ -162,6 +196,7 @@ fn is_date(run: &[(char, &str)]) -> bool {
         '-' | '/' | '.' => (last, first),
         _ => return false,
     };
+    // ASCII digits only: `parse` refuses others, so `len` counts digits.
     let number = |digits: &str| digits.parse::<u16>().ok();
     separator == second_separator
         && year.len() == 4
@@ -349,6 +384,15 @@ mod tests {
             ("06\u{2212}1234\u{2212}5678", true),
             ("06\u{200b}1234\u{200b}5678", true),
             ("06\u{ad}1234\u{ad}5678", true),
+            ("06123\u{200b}\u{200b}45678", true),
+            ("06 - 1234 - 5678", true),
+            ("06 \u{2013} 12 34 56 78", true),
+            ("０６１２３４５６７８", true),
+            ("06\u{ff0d}1234\u{ff0d}5678", true),
+            ("4111\u{ff0e}1111\u{ff0e}1111\u{ff0e}1111", true),
+            ("2026 - 11 - 10", true),
+            ("1234--5678", false),
+            ("1234 -- 5678", false),
             // Only `-`, `/` and `.` make a date.
             ("2024_11_08", true),
             ("2024–11–08", true),
@@ -380,7 +424,8 @@ mod tests {
             ("01-01-2100", true),
             ("1/1/2026", false),
             ("10-11-2026 10-11-2026", true),
-            ("10-11-2026  0612", false),
+            ("10-11-2026  0612", true),
+            ("10-11-2026, 0612", false),
         ] {
             assert_eq!(leaks_identifier(text), leaks, "{text}");
         }

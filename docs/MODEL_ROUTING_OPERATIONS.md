@@ -331,14 +331,15 @@ and nothing is stored.
 when it contains:
 
 - an email address;
-- a long number: 6 or more contiguous digits, or digit groups joined by a
-  single separator (any whitespace, including no-break spaces and tabs, `-`,
-  `.`, `/`, `_`, a Unicode hyphen or dash such as `–` or `—`, the minus sign,
-  or an invisible soft hyphen or zero-width character) with 8 or more digits
-  or 6 or more groups in
-  total (`4111 1111 1111 1111`, `06 1234 5678`, `+31 6 12 34 56 78`,
-  `1 2 3 4 5 6`, and the digits of `NL91 ABNA 0417 1643 00`). Dates such as
-  `2024-11-08` count too;
+- a long number: 6 or more contiguous digits, or digit groups joined by up
+  to three separators of which at most one is not whitespace (whitespace,
+  including no-break spaces and tabs, `-`, `.`, `/`, `_`, and their Unicode
+  and fullwidth look-alikes such as `–`, `—` and the minus sign) with 8 or
+  more digits or 6 or more groups in total (`4111 1111 1111 1111`,
+  `06 1234 5678`, `06 - 1234 - 5678`, `+31 6 12 34 56 78`, `1 2 3 4 5 6`, and
+  the digits of `NL91 ABNA 0417 1643 00`). Any decimal digit counts,
+  fullwidth ones included, and invisible characters (soft hyphen, zero-width
+  characters) are ignored. Dates such as `2024-11-08` count too;
 - a currency amount: `€`, `$`, `£`, or the whole word `EUR`, `euro`, `euros`,
   `USD`, `dollar`, `dollars` or `GBP`, with a number in the question; or a
   number with a `k` suffix (`80k`);
@@ -364,7 +365,8 @@ search query the subscription workers see (see
 `SUBSCRIPTION_WORKERS.md`, "Research runs"). It flags only personal
 identifiers: an email address, a key-like token, the possessive rule above,
 and the long-number rule above, except that a run that is exactly one date
-(`YYYY-MM-DD`, `YYYY/MM/DD`, `DD-MM-YYYY`, `DD/MM/YYYY` or `DD.MM.YYYY`, with a
+(`YYYY-MM-DD`, `YYYY/MM/DD`, `DD-MM-YYYY`, `DD/MM/YYYY` or `DD.MM.YYYY`, each
+part joined by exactly one of those ASCII separators, with a
 1-2 digit day from 1 to 31, a month from 1 to 12 and a year from 1900 to 2099)
 is not a number. A date with another digit group joined to it by a separator
 still counts. Amounts, the `k` suffix and held symbols are not checked here: an

@@ -381,7 +381,8 @@ async fn read_events(
             .read_until(b'\n', &mut line)
             .await?;
         if read == 0 {
-            return Ok(Some(events));
+            // A search still open at the end was never checked either.
+            return Ok(open_searches.is_empty().then_some(events));
         }
         total += read;
         if read > MAX_EVENT_LINE_BYTES || total > MAX_EVENT_STREAM_BYTES {
@@ -643,6 +644,9 @@ mod tests {
         let reply = finish(fake_run_as(&[started, ANSWER, DONE], "true", true).await);
         assert!(matches!(reply.state, ClaudeWorkerState::ToolUseRefused));
         assert!(reply.text.is_none());
+        // A search that starts after the turn completed is refused too.
+        let reply = finish(fake_run_as(&[ANSWER, DONE, started], "true", true).await);
+        assert!(matches!(reply.state, ClaudeWorkerState::ToolUseRefused));
         // Started, then completed with a checked query: fine.
         let reply = finish(fake_run_as(&[started, SEARCH, ANSWER, DONE], "true", true).await);
         assert!(matches!(reply.state, ClaudeWorkerState::Completed));
