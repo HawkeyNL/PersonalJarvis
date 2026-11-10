@@ -199,11 +199,7 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
             .set_permissions(fs::Permissions::from_mode(0o600))?;
         system_file = Some(file);
     }
-    let mut command = clean_command();
-    command.args(cli_args(
-        &request,
-        system_file.as_ref().map(|file| file.path()),
-    ));
+    let mut command = official_command(&request, system_file.as_ref().map(|file| file.path()));
     if request.research {
         return Ok(run_research(command, &request.prompt, run_timeout(&request)).await);
     }
@@ -420,9 +416,11 @@ fn stream_event(line: &[u8]) -> StreamEvent {
 }
 
 /// A content block without tool use, or the one allowed search: `WebSearch`
-/// with a string query that [`leaks_identifier`] does not flag: no email
-/// address, key, possessive account word or long number (a plain date is
-/// fine).
+/// with a string query, where no string anywhere in its input (the query,
+/// and domain filters such as `allowed_domains`) is flagged by
+/// [`leaks_identifier`]: no email address, key, possessive account word or
+/// long number (a plain date is fine). The whole input reaches the inner
+/// search call.
 fn allowed_block(block: &serde_json::Value) -> bool {
     let Some(kind) = block.get("type").and_then(serde_json::Value::as_str) else {
         return false;
@@ -432,9 +430,23 @@ fn allowed_block(block: &serde_json::Value) -> bool {
     }
     kind == "tool_use"
         && block["name"] == "WebSearch"
-        && block["input"]["query"]
-            .as_str()
-            .is_some_and(|query| !leaks_identifier(query))
+        && block["input"]["query"].is_string()
+        && strings_pass(&block["input"])
+}
+
+/// Every string and number in `value`, at any depth, passes
+/// [`leaks_identifier`].
+fn strings_pass(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => !leaks_identifier(text),
+        Value::Number(number) => !leaks_identifier(&number.to_string()),
+        Value::Array(items) => items.iter().all(strings_pass),
+        Value::Object(fields) => fields
+            .iter()
+            .all(|(key, field)| !leaks_identifier(key) && strings_pass(field)),
+        _ => true,
+    }
 }
 
 fn parse_cli_reply(bytes: &[u8]) -> ClaudeWorkerReply {
@@ -475,6 +487,18 @@ fn failed(state: ClaudeWorkerState, stage: &str) -> ClaudeWorkerReply {
     ClaudeWorkerReply::failure(state)
 }
 
+/// The reviewed invocation in the clean environment. Only a research run
+/// adds `TZ=UTC`: the CLI may tell the model the local time zone, and that
+/// could reach a search query. Chat and tasks keep their environment.
+fn official_command(request: &ClaudeWorkerRequest, system_prompt: Option<&Path>) -> Command {
+    let mut command = clean_command();
+    command.args(cli_args(request, system_prompt));
+    if request.research {
+        command.env("TZ", "UTC");
+    }
+    command
+}
+
 fn clean_command() -> Command {
     let mut command = Command::new(CLAUDE);
     command
@@ -485,8 +509,6 @@ fn clean_command() -> Command {
         .env("CLAUDE_CONFIG_DIR", format!("{HOME}/.claude"))
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("LANG", "C.UTF-8")
-        // The CLI may tell the model the local time zone: never the host's.
-        .env("TZ", "UTC")
         // Only the root-installed runtime may run; never self-update into HOME.
         .env("DISABLE_UPDATES", "1")
         .env("DISABLE_AUTOUPDATER", "1")
@@ -520,10 +542,8 @@ mod tests {
         assert_eq!(claude_subscription_status(br#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}"#), "connected");
     }
 
-    #[test]
-    fn cli_environment_disables_self_updates() {
-        let command = clean_command();
-        let environment = command
+    fn environment(command: &Command) -> std::collections::BTreeMap<&str, Option<&str>> {
+        command
             .as_std()
             .get_envs()
             .map(|(key, value)| {
@@ -532,8 +552,32 @@ mod tests {
                     value.and_then(|value| value.to_str()),
                 )
             })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(environment.get("TZ"), Some(&Some("UTC")));
+            .collect()
+    }
+
+    #[test]
+    fn only_research_runs_get_a_utc_time_zone() {
+        let clean = clean_command();
+        let clean = environment(&clean);
+        assert!(!clean.contains_key("TZ"));
+        for (research, task) in [
+            (false, None),
+            (false, Some(WorkerTask::MemeDecision)),
+            (false, Some(WorkerTask::MemeStrategyReview)),
+        ] {
+            let command = official_command(&request(research, task), None);
+            assert_eq!(environment(&command), clean);
+        }
+        let command = official_command(&request(true, None), None);
+        let mut research = environment(&command);
+        assert_eq!(research.remove("TZ"), Some(Some("UTC")));
+        assert_eq!(research, clean);
+    }
+
+    #[test]
+    fn cli_environment_disables_self_updates() {
+        let command = clean_command();
+        let environment = environment(&command);
         assert_eq!(environment.get("DISABLE_UPDATES"), Some(&Some("1")));
         assert_eq!(environment.get("DISABLE_AUTOUPDATER"), Some(&Some("1")));
         assert_eq!(
@@ -590,6 +634,28 @@ mod tests {
             "Task",
         ] {
             assert!(!args.contains(forbidden), "{forbidden} in {args}");
+        }
+        // Exact tokens: `--strict-mcp-config` stays allowed.
+        for forbidden in [
+            "--mcp-config",
+            "--plugin-dir",
+            "--chrome",
+            "--resume",
+            "-r",
+            "--continue",
+            "-c",
+            "--include-partial-messages",
+            "--setting-sources",
+            "--session-id",
+            "--fork-session",
+            "--debug-file",
+        ] {
+            assert!(
+                !args
+                    .split(' ')
+                    .any(|arg| arg == forbidden || arg.starts_with(&format!("{forbidden}="))),
+                "{forbidden} in {args}"
+            );
         }
     }
 
@@ -670,6 +736,7 @@ mod tests {
             SEARCH,
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"Links: ..."}]}}"#,
             r#"{"type":"rate_limit_event","rate_limit_info":{}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t4","name":"WebSearch","input":{"query":"rust release","allowed_domains":["rust-lang.org","blog.rust-lang.org"],"blocked_domains":[]}}]}}"#,
             // Prices, dates and symbols are not identifiers.
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"WebSearch","input":{"query":"bitcoin price usd 2026 op 10/11/2026 ASML"}}]}}"#,
             "",
@@ -697,6 +764,16 @@ mod tests {
             tool("WebSearch", r#"{"query":"jan.devries@example.nl"}"#),
             tool("WebSearch", r#"{"query":"NL91ABNA0417164300 rente"}"#),
             tool("WebSearch", r#"{"query":"2026-11-10 06 1234"}"#),
+            // The domain filters reach the inner search call too.
+            tool(
+                "WebSearch",
+                r#"{"query":"rust","allowed_domains":["jan.devries@example.nl"]}"#,
+            ),
+            tool(
+                "WebSearch",
+                r#"{"query":"rust","blocked_domains":["x.org"],"note":{"n":"0612345678"}}"#,
+            ),
+            tool("WebSearch", r#"{"query":"rust","n":612345678}"#),
             tool("WebSearch", r#"{"query":["rust"]}"#),
             tool("WebSearch", "{}"),
             r#"{"type":"assistant","message":{"content":[{"type":"server_tool_use","id":"s1","name":"web_search","input":{"query":"rust"}}]}}"#.into(),

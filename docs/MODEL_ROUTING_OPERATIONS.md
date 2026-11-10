@@ -296,7 +296,9 @@ untrusted: clients must render them only as plain text or as https links the
 owner clicks (the safe Markdown renderer), never load them automatically (no
 link previews, images, prefetch or embeds), so viewing an answer contacts no
 third party. Turning the switch off also stops a research request that is
-about to try its next subscription. Web content is untrusted: the model is told to
+about to try its next subscription. A run that a worker stopped because it
+used another tool or searched for a flagged query is never retried on another
+subscription. Web content is untrusted: the model is told to
 ignore instructions in it, and it cannot trigger any other tool. Core stores
 the answer as `web:<model>` and later chat turns see it only as labelled,
 capped untrusted data (see `SUBSCRIPTION_WORKERS.md`, "Research runs").
@@ -331,12 +333,22 @@ and nothing is stored.
 when it contains:
 
 - an email address;
-- a long number: 6 or more contiguous digits, or digit groups joined by
-  single spaces, `-`, `.` or `/` with 8 or more digits or 6 or more groups in
-  total (`4111 1111 1111 1111`, `06 1234 5678`, `+31 6 12 34 56 78`,
-  `1 2 3 4 5 6`, and the digits of `NL91 ABNA 0417 1643 00`). Dates such as
-  `2024-11-08` count too;
-- a currency amount: `€`, `$`, `£`, or the whole word `EUR`, `euro`, `euros`,
+- a long number: 6 or more contiguous digits, or digit groups joined by up
+  to three separators of which at most one is not whitespace (whitespace,
+  including no-break spaces and tabs, `-`, `.`, `/`, `_`, and their Unicode
+  and fullwidth look-alikes such as `–`, `—` and the minus sign) with 8 or
+  more digits or 6 or more groups in total (`4111 1111 1111 1111`,
+  `06 1234 5678`, `06 - 1234 - 5678`, `+31 6 12 34 56 78`, `1 2 3 4 5 6`, and
+  the digits of `NL91 ABNA 0417 1643 00`). Any numeric character counts,
+  fullwidth and superscript digits included. Invisible characters (control,
+  zero-width and bidi characters, blank fillers, combining marks, variation
+  selectors) are ignored, so they never split a number. A letter, a visible
+  symbol (`€`, `×`, `→`) or other punctuation such as `,` ends a number:
+  this is a heuristic, not a complete detector. Dates such as `2024-11-08`
+  and year ranges such as `2024 - 2025` count too;
+- a currency amount (any digit counts, fullwidth included, but not a
+  superscript, fraction or Roman numeral, so `m²` is no amount): `€`, `$`,
+  `£`, or the whole word `EUR`, `euro`, `euros`,
   `USD`, `dollar`, `dollars` or `GBP`, with a number in the question; or a
   number with a `k` suffix (`80k`);
 - a key-like token: a word starting with `sk-`, `ghp_` or `AKIA`, `-----BEGIN`,
@@ -356,21 +368,23 @@ question that only carries those still searches automatically. Choose `on`
 when that is not acceptable.
 
 **Identifier check.** Every Research question, explicit (with `on` and with
-`auto`) or automatic, must also pass a narrower check, and so must every
-search query the subscription workers see (see
-`SUBSCRIPTION_WORKERS.md`, "Research runs"). It flags only personal
-identifiers: an email address, a key-like token, the possessive rule above,
-and the long-number rule above, except that a run that is exactly one date
-(`YYYY-MM-DD`, `YYYY/MM/DD`, `DD-MM-YYYY`, `DD/MM/YYYY` or `DD.MM.YYYY`, with a
-1-2 digit day from 1 to 31, a month from 1 to 12 and a year from 1900 to 2099)
-is not a number. A date with another digit group joined to it by a separator
-still counts. Amounts, the `k` suffix and held symbols are not checked here: an
-explicit search on a price or a held symbol is the owner's own choice, and an
-automatic question has already passed the gate above. The search queries the
-model writes in an automatic run get only this narrower check, so an amount
-the model adds to a query does not stop the run. A flagged explicit question
-is not searched at all: Core answers with a fixed notice asking the owner to
-rephrase it without personal details, and there is no override.
+`auto`) or automatic, must also pass a narrower check, and so must every search
+query the subscription workers see (see `SUBSCRIPTION_WORKERS.md`, "Research
+runs"). It flags only personal identifiers: an email address, a key-like token,
+the possessive rule above, and the long-number rule above, except that a run
+that is exactly one date (`YYYY-MM-DD`, `YYYY/MM/DD`, `DD-MM-YYYY`,
+`DD/MM/YYYY` or `DD.MM.YYYY`, each part joined by exactly one of those ASCII
+separators, with a 1-2 digit day from 1 to 31, a month from 1 to 12 and a year
+from 1900 to 2099) is not a number, and neither is a run of exactly two years
+from 1900 to 2099 joined by a dash or `/` (`2024-2025`, `1990 – 2000`; not
+`1999 2045` or `2012.2034`). A date with another digit group joined to it by a
+separator still counts. Amounts, the `k` suffix and held symbols are not
+checked here: an explicit search on a price or a held symbol is the owner's own
+choice, and an automatic question has already passed the gate above. The search
+queries the model writes in an automatic run get only this narrower check, so
+an amount the model adds to a query does not stop the run. A flagged explicit
+question is not searched at all: Core answers with a fixed notice asking the
+owner to rephrase it without personal details, and there is no override.
 
 ## Routing, health and spend
 

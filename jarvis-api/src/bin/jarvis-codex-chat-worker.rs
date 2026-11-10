@@ -280,12 +280,7 @@ async fn run_official_client(
         file.flush().await?;
         instructions = Some(path);
     }
-    let mut command = clean_command(CODEX, &workdir);
-    command.args(exec_args(
-        &request.model,
-        instructions.as_deref(),
-        request.research,
-    ));
+    let command = exec_command(&request, &workdir, instructions.as_deref());
     let outcome = run_cli(command, &request.prompt, limit, request.research).await?;
     Ok(finish(outcome))
 }
@@ -376,6 +371,7 @@ async fn read_events(
 ) -> std::io::Result<Option<Events>> {
     let mut reader = tokio::io::BufReader::new(stdout);
     let mut events = Events::default();
+    let mut open_searches = std::collections::HashSet::new();
     let mut total = 0;
     let mut line = Vec::new();
     loop {
@@ -385,7 +381,10 @@ async fn read_events(
             .read_until(b'\n', &mut line)
             .await?;
         if read == 0 {
-            return Ok(Some(events));
+            // A completed turn with a search still open was never fully
+            // checked. A failed turn keeps its errors for classification;
+            // `finish` discards its answer anyway.
+            return Ok((open_searches.is_empty() || !events.completed).then_some(events));
         }
         total += read;
         if read > MAX_EVENT_LINE_BYTES || total > MAX_EVENT_STREAM_BYTES {
@@ -398,7 +397,22 @@ async fn read_events(
         }
         match parse_codex_event(&line, research) {
             CodexEvent::Benign => {}
+            CodexEvent::Search {
+                id,
+                completed: false,
+            } => {
+                open_searches.insert(id);
+            }
+            CodexEvent::Search {
+                id,
+                completed: true,
+            } => {
+                open_searches.remove(&id);
+            }
             CodexEvent::AgentMessage(text) => events.answer = Some(text),
+            // A search that started but never completed was never checked
+            // with its final query.
+            CodexEvent::TurnCompleted if !open_searches.is_empty() => return Ok(None),
             CodexEvent::TurnCompleted => events.completed = true,
             CodexEvent::Error(message) if events.errors.len() < MAX_ERROR_EVENTS => {
                 events.errors.push(message)
@@ -469,9 +483,23 @@ fn clean_command(program: &str, workdir: &Path) -> Command {
         .env("LOGNAME", IDENTITY)
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("LANG", "C.UTF-8")
-        // `codex exec` adds the time zone to the prompt: never the host's.
-        .env("TZ", "UTC")
         .current_dir(workdir);
+    command
+}
+
+/// The reviewed `codex exec` in the clean environment. Only a research run
+/// adds `TZ=UTC`: `codex exec` adds the time zone to the prompt, and that
+/// could reach a search query. Chat keeps its environment.
+fn exec_command(
+    request: &ClaudeWorkerRequest,
+    workdir: &Path,
+    instructions: Option<&Path>,
+) -> Command {
+    let mut command = clean_command(CODEX, workdir);
+    command.args(exec_args(&request.model, instructions, request.research));
+    if request.research {
+        command.env("TZ", "UTC");
+    }
     command
 }
 
@@ -522,6 +550,28 @@ mod tests {
             "mcp_servers",
         ] {
             assert!(!joined.contains(forbidden), "{forbidden} in {joined}");
+        }
+        // Exact tokens: `web_search=...` is a `-c` value, not `--search`.
+        for forbidden in [
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--yolo",
+            "--add-dir",
+            "--search",
+            "--enable",
+            "--disable",
+            "-p",
+            "--profile",
+            "-C",
+            "--cd",
+            "-i",
+            "--image",
+        ] {
+            assert!(
+                !argv
+                    .iter()
+                    .any(|arg| arg == forbidden || arg.starts_with(&format!("{forbidden}="))),
+                "{forbidden} in {joined}"
+            );
         }
     }
 
@@ -591,6 +641,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_search_that_never_completes_is_refused_at_turn_end() {
+        let started = r#"{"type":"item.started","item":{"id":"i0","type":"web_search","query":"","action":{"type":"search"}}}"#;
+        let reply = finish(fake_run_as(&[started, ANSWER, DONE], "true", true).await);
+        assert!(matches!(reply.state, ClaudeWorkerState::ToolUseRefused));
+        assert!(reply.text.is_none());
+        // A search that starts after the turn completed is refused too.
+        let reply = finish(fake_run_as(&[ANSWER, DONE, started], "true", true).await);
+        assert!(matches!(reply.state, ClaudeWorkerState::ToolUseRefused));
+        // A turn that failed with a search open keeps its failure class.
+        let failed = r#"{"type":"turn.failed","error":{"message":"usage limit reached"}}"#;
+        let reply = finish(fake_run_as(&[started, failed], "exit 1", true).await);
+        assert!(matches!(reply.state, ClaudeWorkerState::PlanLimit));
+        assert!(reply.text.is_none());
+        // Started, then completed with a checked query: fine.
+        let reply = finish(fake_run_as(&[started, SEARCH, ANSWER, DONE], "true", true).await);
+        assert!(matches!(reply.state, ClaudeWorkerState::Completed));
+    }
+
+    #[tokio::test]
     async fn research_runs_still_refuse_every_other_tool_and_unknown_events() {
         for event in [
             r#"{"type":"item.started","item":{"id":"i2","type":"command_execution","command":"id","status":"in_progress"}}"#,
@@ -627,7 +696,39 @@ mod tests {
         assert!(!env.contains("API_KEY"), "{env}");
         assert!(!env.contains("canary"), "{env}");
         assert!(env.lines().any(|line| line == "HOME=/var/lib/jarvis-codex"));
-        assert!(env.lines().any(|line| line == "TZ=UTC"));
+        assert!(!env.contains("TZ="), "{env}");
+    }
+
+    #[test]
+    fn only_research_runs_get_a_utc_time_zone() {
+        let environment = |command: &Command| {
+            command
+                .as_std()
+                .get_envs()
+                .map(|(key, value)| (key.to_owned(), value.map(|value| value.to_owned())))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let workdir = Path::new("/run/jarvis-codex-chat/run-x/work");
+        let clean = environment(&clean_command(CODEX, workdir));
+        assert!(!clean.contains_key(std::ffi::OsStr::new("TZ")));
+        let request = |research| ClaudeWorkerRequest {
+            protocol: 1,
+            model: "gpt-6-luna".into(),
+            system: None,
+            prompt: "hi".into(),
+            research,
+            task: None,
+        };
+        assert_eq!(
+            environment(&exec_command(&request(false), workdir, None)),
+            clean
+        );
+        let mut research = environment(&exec_command(&request(true), workdir, None));
+        assert_eq!(
+            research.remove(std::ffi::OsStr::new("TZ")),
+            Some(Some("UTC".into()))
+        );
+        assert_eq!(research, clean);
     }
 
     #[tokio::test]

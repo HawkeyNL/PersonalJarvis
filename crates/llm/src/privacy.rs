@@ -1,5 +1,5 @@
 //! Deterministic privacy checks for text that may leave the Home Node in a
-//! web search: the research question, a search query or a URL. Names and
+//! web search: the research question or a search query. Names and
 //! other free-text personal details are not detectable; the research prompt
 //! asks the model to keep them out of queries.
 
@@ -43,7 +43,7 @@ const PERSONAL_WORDS: [&str; 29] = [
 const CURRENCY_WORDS: [&str; 7] = ["eur", "euro", "euros", "usd", "dollar", "dollars", "gbp"];
 /// A contiguous digit run this long is private (phone, account numbers).
 const MIN_DIGIT_RUN: usize = 6;
-/// Digits split by single separators (`4111 1111`, `06-1234`) are private
+/// Digits split by separators (`4111 1111`, `06-1234`) are private
 /// from this many digits on, or from [`MIN_DIGIT_RUN`] groups on (`1 2 3 4 5 6`).
 const MIN_SEPARATED_DIGITS: usize = 8;
 const KEY_PREFIXES: [&str; 3] = ["sk-", "ghp_", "AKIA"];
@@ -69,8 +69,8 @@ pub fn is_private(question: &str, held_symbols: &[String]) -> bool {
 /// identifier: an email address, a key-like token, a possessive near a money
 /// or account word, or a long number (account, card or phone; a plain date
 /// is not one). Narrower than [`is_private`]: no amounts, `k` suffix or held
-/// symbols, so ordinary price and date searches pass. It gates explicit
-/// Research, every search query a worker sees, and [`url_is_safe`] paths.
+/// symbols, so ordinary price and date searches pass. It gates every
+/// Research question and every search query a worker sees.
 pub fn leaks_identifier(text: &str) -> bool {
     has_email(text)
         || has_key(text)
@@ -89,38 +89,75 @@ fn has_email(text: &str) -> bool {
     })
 }
 
-/// 6+ contiguous digits, or digit groups joined by single ` `, `-`, `.` or
-/// `/` with 8+ digits or 6+ groups in total (IBAN, card and phone numbers).
+/// How many separator characters may join two digit groups, of which at
+/// most one may be other than whitespace (`06 - 1234`, not `1234--5678`).
+const MAX_SEPARATOR_RUN: usize = 3;
+
+/// 6+ contiguous digits, or digit groups joined by separators (see
+/// [`digit_runs`]) with 8+ digits or 6+ groups in total (IBAN, card and
+/// phone numbers). Any numeric character counts, superscripts and fullwidth
+/// digits included. Other punctuation or
+/// a letter ends a number, so `06,1234,5678` passes: this is a heuristic,
+/// not a complete detector.
 /// With `dates_allowed`, a run that is exactly one date is not private.
 fn has_digit_run(text: &str, dates_allowed: bool) -> bool {
     digit_runs(text).iter().any(|run| {
-        let total: usize = run.iter().map(|(_, group)| group.len()).sum();
-        (run.iter().any(|(_, group)| group.len() >= MIN_DIGIT_RUN)
+        let digits = |group: &String| group.chars().count();
+        let total: usize = run.iter().map(|(_, group)| digits(group)).sum();
+        (run.iter().any(|(_, group)| digits(group) >= MIN_DIGIT_RUN)
             || total >= MIN_SEPARATED_DIGITS
             || run.len() >= MIN_DIGIT_RUN)
-            && !(dates_allowed && is_date(run))
+            && !(dates_allowed && (is_date(run) || is_year_range(run)))
     })
 }
 
-/// Maximal runs of ASCII digit groups joined by single ` `, `-`, `.` or `/`,
-/// each group with the separator before it (`'\0'` for the first).
-fn digit_runs(text: &str) -> Vec<Vec<(char, &str)>> {
+/// Two plausible years joined by a dash or `/` and nothing else
+/// (`2024-2025`, `1990 – 2000`, `2024/2025`); not by a space or a dot.
+fn is_year_range(run: &[(String, String)]) -> bool {
+    let year = |digits: &String| {
+        digits.len() == 4
+            && digits
+                .parse::<u16>()
+                .is_ok_and(|year| (1900..=2099).contains(&year))
+    };
+    let joint = |joint: &str| joint.trim().chars().collect::<Vec<_>>();
+    matches!(run, [(_, from), (between, to)]
+        if year(from)
+            && year(to)
+            && matches!(joint(between)[..], ['-' | '/' | '\u{2010}'..='\u{2015}' | '\u{2212}']))
+}
+
+/// Maximal runs of digit groups, each with the separators before it (empty
+/// for the first). Groups are joined by up to [`MAX_SEPARATOR_RUN`] separators (see
+/// [`is_separator`]) with at most one that is not whitespace. Invisible
+/// characters are dropped first, so they neither join nor split a number.
+fn digit_runs(text: &str) -> Vec<Vec<(String, String)>> {
     let (mut runs, mut run) = (Vec::new(), Vec::new());
-    let (mut start, mut separator) = (None, '\0');
-    for (at, c) in text.char_indices().chain([(text.len(), '\0')]) {
-        if c.is_ascii_digit() {
-            start.get_or_insert(at);
+    let (mut group, mut joint, mut before) = (String::new(), String::new(), String::new());
+    let visible = text.chars().filter(|c| !is_invisible(*c));
+    for c in visible.chain(['\0']) {
+        // Any numeric character, superscripts included: only an amount
+        // needs a real digit (see `is_digit`).
+        if c.is_numeric() {
+            if group.is_empty() {
+                before = std::mem::take(&mut joint);
+            }
+            group.push(c);
             continue;
         }
-        if let Some(begin) = start.take() {
-            run.push((separator, &text[begin..at]));
-            if matches!(c, ' ' | '-' | '.' | '/') {
-                separator = c;
-                continue;
-            }
+        if !group.is_empty() {
+            run.push((std::mem::take(&mut before), std::mem::take(&mut group)));
         }
-        // Any other character, or a second separator, ends the run.
-        separator = '\0';
+        let joins = !run.is_empty()
+            && is_separator(c)
+            && joint.chars().count() < MAX_SEPARATOR_RUN
+            && (c.is_whitespace() || joint.chars().all(char::is_whitespace));
+        if joins {
+            joint.push(c);
+            continue;
+        }
+        // Any other character, or too long a joint, ends the run.
+        joint.clear();
         if !run.is_empty() {
             runs.push(std::mem::take(&mut run));
         }
@@ -128,19 +165,88 @@ fn digit_runs(text: &str) -> Vec<Vec<(char, &str)>> {
     runs
 }
 
+/// Any whitespace (no-break spaces included), `-`, `.`, `/`, `_`, and their
+/// Unicode look-alikes: hyphens and dashes, the minus sign, middle dots and
+/// bullet operators, fullwidth and small forms, the fraction and division
+/// slashes.
+fn is_separator(c: char) -> bool {
+    const LOOK_ALIKES: [char; 17] = [
+        '\u{b7}', '\u{2027}', '\u{2043}', '\u{2044}', '\u{2212}', '\u{2215}', '\u{2219}',
+        '\u{22c5}', '\u{2e3a}', '\u{2e3b}', '\u{30fb}', '\u{fe58}', '\u{fe63}', '\u{ff0d}',
+        '\u{ff0e}', '\u{ff0f}', '\u{ff65}',
+    ];
+    c.is_whitespace()
+        || matches!(c, '-' | '.' | '/' | '_')
+        || ('\u{2010}'..='\u{2015}').contains(&c)
+        || LOOK_ALIKES.contains(&c)
+}
+
+/// Ignored inside a number, so it can neither split nor hide one:
+/// non-whitespace control characters, format and bidi controls, zero-width
+/// characters, blank fillers, combining marks, variation selectors and tags.
+/// Visible symbols (`€`, `×`, `→`) and letters still end a number.
+// ponytail: a hand-kept list with a known ceiling (std has no Unicode
+// categories); a script's own marks or a new invisible may still split a
+// number. Use a Unicode data crate if the gate ever has to be exhaustive.
+fn is_invisible(c: char) -> bool {
+    (c.is_control() && !c.is_whitespace())
+        || matches!(
+            c,
+            '\u{ad}'
+                | '\u{300}'..='\u{36f}'
+                | '\u{483}'..='\u{489}'
+                | '\u{61c}'
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{17b4}'
+                | '\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{1ab0}'..='\u{1aff}'
+                | '\u{1dc0}'..='\u{1dff}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{20d0}'..='\u{20ff}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{fe20}'..='\u{fe2f}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff0}'..='\u{fffb}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1d173}'..='\u{1d182}'
+                | '\u{e0000}'..='\u{e0fff}'
+        )
+}
+
+/// A digit in an amount: any script (fullwidth included), but not a
+/// superscript, subscript, fraction or Roman numeral, so `m²` or `½` next to
+/// a currency word is no amount.
+fn is_digit(c: char) -> bool {
+    c.is_numeric()
+        && !matches!(
+            c,
+            '\u{b2}' | '\u{b3}' | '\u{b9}' | '\u{bc}'..='\u{be}' | '\u{2070}'..='\u{209f}' | '\u{2150}'..='\u{218f}'
+        )
+}
+
 /// The whole run is one plausible date: `YYYY-MM-DD`, `YYYY/MM/DD`,
 /// `DD-MM-YYYY`, `DD/MM/YYYY` or `DD.MM.YYYY`, with a 1-2 digit day and
-/// month and a year from 1900 to 2099. A digit group joined to it by a
-/// separator makes the run longer, so it is no longer a date.
-fn is_date(run: &[(char, &str)]) -> bool {
+/// month and a year from 1900 to 2099, each joined by exactly one ASCII
+/// separator. A digit group joined to it makes the run longer, so it is no
+/// longer a date.
+fn is_date(run: &[(String, String)]) -> bool {
     let [(_, first), (separator, middle), (second_separator, last)] = run else {
         return false;
     };
-    let (year, day) = match separator {
-        '-' | '/' if first.len() == 4 => (first, last),
-        '-' | '/' | '.' => (last, first),
+    let (year, day) = match separator.as_str() {
+        "-" | "/" if first.len() == 4 => (first, last),
+        "-" | "/" | "." => (last, first),
         _ => return false,
     };
+    // ASCII digits only: `parse` refuses others, so `len` counts digits.
     let number = |digits: &str| digits.parse::<u16>().ok();
     separator == second_separator
         && year.len() == 4
@@ -156,11 +262,10 @@ fn is_date(run: &[(char, &str)]) -> bool {
 fn has_amount(lower: &str) -> bool {
     let currency =
         lower.contains(['€', '$', '£']) || CURRENCY_WORDS.iter().any(|word| has_word(lower, word));
-    (currency && lower.contains(|c: char| c.is_ascii_digit()))
+    (currency && lower.contains(is_digit))
         || runs(lower, char::is_alphanumeric).any(|word| {
-            word.strip_suffix('k').is_some_and(|digits| {
-                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
-            })
+            word.strip_suffix('k')
+                .is_some_and(|digits| !digits.is_empty() && digits.chars().all(is_digit))
         })
 }
 
@@ -223,46 +328,6 @@ fn has_prefix_word(text: &str, prefix: &str) -> bool {
     })
 }
 
-/// Whether a URL may be opened or searched without carrying personal data:
-/// http(s) only, no user info, no `?` query or `#` fragment, a domain host
-/// (never an IP literal) and a path that [`leaks_identifier`] does not flag.
-pub fn url_is_safe(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    matches!(parsed.scheme(), "http" | "https")
-        && parsed.username().is_empty()
-        && parsed.password().is_none()
-        && parsed.query().is_none()
-        && parsed.fragment().is_none()
-        // `domain()` is `None` for an IPv4 or IPv6 literal.
-        && parsed.domain().is_some()
-        && !leaks_identifier(&percent_decoded(parsed.path()))
-}
-
-/// `%XX` escapes decoded (lossy), so an encoded `@` or digit still counts.
-fn percent_decoded(path: &str) -> String {
-    let mut decoded = Vec::with_capacity(path.len());
-    let mut rest = path.as_bytes();
-    while let Some((&first, tail)) = rest.split_first() {
-        let escaped = tail
-            .get(..2)
-            .filter(|hex| first == b'%' && hex.iter().all(u8::is_ascii_hexdigit))
-            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
-        match escaped {
-            Some(byte) => {
-                decoded.push(byte);
-                rest = &tail[2..];
-            }
-            None => {
-                decoded.push(first);
-                rest = tail;
-            }
-        }
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +384,12 @@ mod tests {
             ("is our mortgage too high", true),
             ("my pension fund returns", true),
             ("my stocks today", true),
+            ("bel 06\u{a0}1234\u{a0}5678", true),
+            ("bel 06\u{202f}12\u{202f}34\u{202f}56\u{202f}78", true),
+            ("4111\u{a0}1111\u{a0}1111\u{a0}1111 kaart", true),
+            ("4111–1111–1111–1111", true),
+            ("4111_1111_1111_1111", true),
+            ("06\t1234\t5678", true),
         ] {
             assert_eq!(is_private(question, &held), private, "{question}");
         }
@@ -350,6 +421,66 @@ mod tests {
             ("NL91 ABNA 0417 1643 00", true),
             ("4111 1111 1111 1111", true),
             ("4111-1111-1111-1111", true),
+            ("06\u{a0}1234\u{a0}5678", true),
+            ("06\u{202f}12\u{202f}34\u{202f}56\u{202f}78", true),
+            ("4111\u{a0}1111\u{a0}1111\u{a0}1111", true),
+            ("4111\u{202f}1111\u{202f}1111\u{202f}1111", true),
+            ("06–1234–5678", true),
+            ("10\u{a0}11\u{a0}2026", true),
+            ("10–11–2026", true),
+            ("4111—1111—1111—1111", true),
+            ("06\u{2011}1234\u{2011}5678", true),
+            ("06\u{2212}1234\u{2212}5678", true),
+            ("06\u{200b}1234\u{200b}5678", true),
+            ("06\u{ad}1234\u{ad}5678", true),
+            ("06123\u{200b}\u{200b}45678", true),
+            ("06 - 1234 - 5678", true),
+            ("06 \u{2013} 12 34 56 78", true),
+            ("０６１２３４５６７８", true),
+            ("06\u{ff0d}1234\u{ff0d}5678", true),
+            ("4111\u{ff0e}1111\u{ff0e}1111\u{ff0e}1111", true),
+            ("2026 - 11 - 10", true),
+            ("1234--5678", false),
+            ("1234 -- 5678", false),
+            ("06\u{200e}1234\u{200e}5678", true),
+            ("06\u{fe0f}1234\u{fe0f}5678", true),
+            ("06\u{301}1234\u{301}5678", true),
+            ("06\u{e0020}1234\u{e0020}5678", true),
+            ("06·1234·5678", true),
+            ("06\u{30fb}1234\u{30fb}5678", true),
+            ("06\u{22c5}1234\u{22c5}5678", true),
+            ("06\u{1f}1234\u{1f}5678", true),
+            ("06\u{7f}1234\u{7f}5678", true),
+            ("06\u{3164}1234\u{3164}5678", true),
+            ("06\u{202e}1234\u{202e}5678", true),
+            // Visible symbols end a number: price ranges and resolutions.
+            ("laptop €1000 - €2000", false),
+            ("prijs €1500 – €2500", false),
+            ("1920×1080 monitor", false),
+            ("2024→2025", false),
+            ("prijs per m² in 2026", false),
+            ("⁰⁶¹²³⁴⁵⁶⁷⁸", true),
+            ("₀₆₁₂₃₄₅₆₇₈", true),
+            ("06\u{2800}1234\u{2800}5678", true),
+            ("06\u{1bca0}1234\u{1bca0}5678", true),
+            ("06\u{1d173}1234\u{1d173}5678", true),
+            // Two years are a range, not a number; a third group is.
+            ("inflatie 2024 - 2025", false),
+            ("2024-2025 verkiezingen", false),
+            ("2024-2025", false),
+            ("1990 – 2000", false),
+            ("2024/2025", false),
+            ("1999 2045", true),
+            ("2012.2034", true),
+            ("06\u{13430}1234\u{13430}5678", true),
+            ("06\u{1d17b}1234\u{1d17b}5678", true),
+            ("2024 - 2025 06", true),
+            ("1234-2025", true),
+            // Only `-`, `/` and `.` make a date.
+            ("2024_11_08", true),
+            ("2024–11–08", true),
+            ("2024\u{a0}11\u{a0}08", true),
+            ("2024\n11\n08", true),
             ("mijn portfolio rendement", true),
             ("my brokerage account", true),
             ("sk-proj-a1b2c3d4e5f6g7h8i9j0k1l2", true),
@@ -376,57 +507,19 @@ mod tests {
             ("01-01-2100", true),
             ("1/1/2026", false),
             ("10-11-2026 10-11-2026", true),
-            ("10-11-2026  0612", false),
+            ("10-11-2026  0612", true),
+            ("10-11-2026, 0612", false),
         ] {
             assert_eq!(leaks_identifier(text), leaks, "{text}");
         }
         // The auto-mode gate still counts dates as long numbers.
         assert!(is_private("nieuws 2026-11-10", &[]));
         assert!(!is_private("1234--5678", &[]));
-    }
-
-    #[test]
-    fn url_gate_table() {
-        for (url, safe) in [
-            ("https://www.rust-lang.org/", true),
-            ("http://example.org/news/rust-release", true),
-            ("https://nl.wikipedia.org/wiki/Hypotheek", true),
-            ("https://example.org", true),
-            ("https://example.org/a%20b", true),
-            ("ftp://example.org/file", false),
-            ("javascript:alert(1)", false),
-            ("file:///etc/passwd", false),
-            ("data:text/plain,hi", false),
-            ("example.org/news", false),
-            ("not a url", false),
-            ("", false),
-            ("https://user@example.org/", false),
-            ("https://user:pw@example.org/", false),
-            ("https://:pw@example.org/", false),
-            ("https://example.org/search?q=weather", false),
-            ("https://example.org/?", false),
-            ("https://example.org/page#section", false),
-            ("https://example.org/#", false),
-            ("http://93.184.215.14/", false),
-            ("http://127.0.0.1/", false),
-            ("http://2130706433/", false),
-            ("http://0x7f.1/", false),
-            ("http://[::1]/", false),
-            ("https://[2001:db8::1]/page", false),
-            ("https://example.org/u/jan.devries@example.nl", false),
-            ("https://example.org/u/jan.devries%40example.nl", false),
-            ("https://example.org/call/0612345678", false),
-            ("https://example.org/call/%30612345678", false),
-            ("https://example.org/my-portfolio/today", false),
-            ("https://example.org/mijn/rekening", false),
-            ("https://example.org/pay/2500-eur", true),
-            ("https://example.org/key/sk-proj-abc", false),
-            ("https://example.org/archive/2024/11/08/rust", true),
-            ("https://example.org/archive/2024/11/08/0612345678", false),
-            ("https://example.org/iban/NL91ABNA0417164300", false),
-            ("https://example.org/%zz/%4", true),
-        ] {
-            assert_eq!(url_is_safe(url), safe, "{url}");
-        }
+        assert!(is_private("is €２５００ per maand veel?", &[]));
+        assert!(is_private("salary of ８０k", &[]));
+        assert!(is_private("inflatie 2024 - 2025", &[]));
+        assert!(!is_private("prijs per m² in de stad", &[]));
+        assert!(!is_private("prijs in euro per m²", &[]));
+        assert!(!is_private("½ liter melk", &[]));
     }
 }

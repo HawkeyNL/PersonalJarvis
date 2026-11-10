@@ -592,6 +592,12 @@ impl LlmProvider for RouterProvider {
                     return Ok(reply);
                 }
                 Err(LlmError::Refused) => return Err(LlmError::Refused),
+                // A worker stopped the run (a tool or a search query it may
+                // not run): the question is never retried on another
+                // subscription, and Core shows the privacy-stop notice.
+                Err(error) if error.usage_failure_category() == "tool_use_refused" => {
+                    return Err(error);
+                }
                 Err(error) => {
                     fallback_count += 1;
                     let failure = error.failure_category();
@@ -1762,6 +1768,80 @@ mod tests {
             ))));
             assert!(router.research(&question()).await.is_err());
             assert_eq!(router.is_healthy("claude-cli"), !cooled, "{status}");
+        }
+    }
+
+    /// A worker refusal ends the research chain at once: no retry on another
+    /// subscription. Any other failure moves on, and the last one decides.
+    #[tokio::test]
+    async fn a_worker_refusal_ends_the_research_chain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Fails(&'static str, u16, &'static str, AtomicUsize);
+        #[async_trait]
+        impl LlmProvider for Fails {
+            fn label(&self) -> &str {
+                self.0
+            }
+            async fn chat(&self, _req: &ChatRequest) -> Result<ChatReply, LlmError> {
+                Err(LlmError::Empty)
+            }
+            async fn research(&self, _req: &ResearchRequest) -> Result<ChatReply, LlmError> {
+                self.3.fetch_add(1, Ordering::SeqCst);
+                Err(LlmError::Api {
+                    status: self.1,
+                    body: self.2.into(),
+                })
+            }
+        }
+        let refused = (502, "Claude run attempted tool use and was refused");
+        let unavailable = (503, "Codex subscription unavailable");
+        let timeout = (504, "Codex worker timed out");
+        for (first, second, expected, second_calls) in [
+            (refused, unavailable, "tool_use_refused", 0),
+            (unavailable, refused, "tool_use_refused", 1),
+            (unavailable, timeout, "timeout", 1),
+        ] {
+            let c = vec![
+                CatalogModel {
+                    backend: "claude-cli".into(),
+                    id: "claude-opus-5".into(),
+                    class: ModelClass::Heavy,
+                },
+                CatalogModel {
+                    backend: "codex-cli".into(),
+                    id: "gpt-6-luna".into(),
+                    class: ModelClass::Heavy,
+                },
+            ];
+            let codex = Arc::new(Fails("codex-cli", second.0, second.1, AtomicUsize::new(0)));
+            let router = RouterProvider::with_policy(
+                vec![
+                    Candidate {
+                        id: "claude-cli".into(),
+                        provider: Arc::new(Fails(
+                            "claude-cli",
+                            first.0,
+                            first.1,
+                            AtomicUsize::new(0),
+                        )),
+                    },
+                    Candidate {
+                        id: "codex-cli".into(),
+                        provider: codex.clone(),
+                    },
+                ],
+                always_available(),
+                c.clone(),
+                allow_catalog(&c),
+            )
+            .with_routing(Arc::new(LiveRouting::new(routing(
+                r#"{"version":1,"research_web_search":"on","tiers":{"hard":{"chain":[
+                    {"provider":"claude-cli","model":"claude-opus-5"},
+                    {"provider":"codex-cli","model":"gpt-6-luna"}]}}}"#,
+            ))));
+            let error = router.research(&question()).await.unwrap_err();
+            assert_eq!(error.usage_failure_category(), expected);
+            assert_eq!(codex.3.load(Ordering::SeqCst), second_calls);
         }
     }
 
