@@ -96,14 +96,9 @@ pub(crate) async fn create(
     Json(input): Json<NewRoadmap>,
 ) -> ApiResult {
     let device = authed.device.id.to_string();
-    bounded(store::create(
-        &state.db,
-        &input,
-        &device,
-        Some(&state.realtime),
-    ))
-    .await
-    .map(snapshot)
+    bounded(store::create(&state.db, &input, &device, &state.realtime))
+        .await
+        .map(snapshot)
 }
 
 pub(crate) async fn get(
@@ -131,7 +126,7 @@ pub(crate) async fn update(
         revision.expected_revision,
         &patch,
         &device,
-        Some(&state.realtime),
+        &state.realtime,
     ))
     .await
     .map(snapshot)
@@ -150,7 +145,7 @@ pub(crate) async fn archive(
         &id.to_string(),
         revision.expected_revision,
         &device,
-        Some(&state.realtime),
+        &state.realtime,
     ))
     .await
     .map(snapshot)
@@ -174,7 +169,7 @@ pub(crate) async fn create_item(
         revision.expected_revision,
         &input,
         &device,
-        Some(&state.realtime),
+        &state.realtime,
     ))
     .await?;
     let mut body = json!(roadmap);
@@ -200,7 +195,7 @@ pub(crate) async fn update_item(
         &patch,
         &device,
         &state.github,
-        Some(&state.realtime),
+        &state.realtime,
     ))
     .await
     .map(snapshot)
@@ -219,7 +214,7 @@ pub(crate) async fn delete_item(
         revision.expected_revision,
         &item.to_string(),
         &device,
-        Some(&state.realtime),
+        &state.realtime,
     ))
     .await
     .map(snapshot)
@@ -261,7 +256,7 @@ pub(crate) async fn accept_proposal(
         &proposal.to_string(),
         &device,
         &state.github,
-        Some(&state.realtime),
+        &state.realtime,
     ))
     .await
     .map(snapshot)

@@ -1960,7 +1960,10 @@ async fn memecoin_strategies_disable_at_once_and_enable_only_with_a_fresh_signat
         },
     )
     .await?;
-    assert!(store::set_active_version(&db, "a-survivor-momentum", config.version, "claude").await?);
+    assert_eq!(
+        store::set_active_version(&db, "a-survivor-momentum", config.version, "claude").await?,
+        Some(false)
+    );
     assert_eq!(
         enable(sign(&third, version)).await?.status(),
         StatusCode::CONFLICT

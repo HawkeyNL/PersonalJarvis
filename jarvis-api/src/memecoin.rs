@@ -102,7 +102,8 @@ const AGENT_APPLY_DEADLINE: StdDuration = StdDuration::from_secs(20);
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 /// Core sends the memecoin realtime events. Apps from 0.1.27 on (app PR
-/// #118) ignore event types they do not know; older apps fail on them.
+/// #118) ignore event types they do not know; older apps fail on them. Kept
+/// as a switch to turn the events off again in one place.
 pub const EMIT_MEME_EVENTS: bool = true;
 
 /// Publish a memecoin event, while [`EMIT_MEME_EVENTS`] allows it.
@@ -2670,7 +2671,11 @@ mod tests {
                 created_at: OffsetDateTime::now_utc(),
             };
             store::insert_strategy_version(db, &version).await?;
-            assert!(store::set_active_version(db, &config.id, config.version, "test").await?);
+            assert!(
+                store::set_active_version(db, &config.id, config.version, "test")
+                    .await?
+                    .is_some()
+            );
             versions[i] = config.version;
         }
         Ok(versions)

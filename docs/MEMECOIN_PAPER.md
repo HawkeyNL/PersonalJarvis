@@ -344,10 +344,11 @@ cost a candidate, never let one through.
 
 Strategy writes are limited to 30 per device and minute. Core sends the
 realtime event `trading.meme.strategy_changed` (`strategy_id`, `version`,
-`enabled`) when a strategy's active version or enabled state changed, and
-`trading.meme.decision` (`id`) for each decision row the strategy agent
-stored. Both are hints to reload the routes above and carry no market data
-or rationale.
+`enabled`) after an owner disable or enable and after a review records a
+version, and `trading.meme.decision` (`id`) for each decision row the
+strategy agent stored, except the `call_started` marker. Both are hints to
+reload the routes above, may repeat a state the app already has, and carry no
+market data or rationale.
 
 ## Resuming
 

@@ -62,7 +62,8 @@ GitHub poller's) Core sends the realtime event
 `roadmap.changed {"id": "…", "revision": N}` to every connected app (see
 `REALTIME_PROTOCOL.md`). It carries only the roadmap id and the new
 revision; the app reloads `GET /v1/roadmaps/{id}`. A refused, stale or empty
-write sends nothing.
+write sends nothing. Two writes close together may arrive out of order, so an
+app ignores a `revision` at or below the one it already has.
 
 ### Items
 

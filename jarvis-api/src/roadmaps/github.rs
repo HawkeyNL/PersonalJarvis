@@ -1024,7 +1024,7 @@ async fn write(
             .github_update(id, found)
             .map_err(|_| "roadmap item vanished")?;
     }
-    match tokio::time::timeout(DB_TIMEOUT, store::commit_github(db, &draft, Some(events))).await {
+    match tokio::time::timeout(DB_TIMEOUT, store::commit_github(db, &draft, events)).await {
         Ok(Ok(())) => Ok(true),
         Ok(Err(RoadmapError::Conflict | RoadmapError::Archived | RoadmapError::NotFound)) => {
             Ok(false)

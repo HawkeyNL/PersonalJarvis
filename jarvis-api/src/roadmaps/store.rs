@@ -62,13 +62,11 @@ fn changes_json(changes: &[Change]) -> Result<Value> {
 }
 
 /// Tell connected apps that roadmap `id` committed `revision`; they reload it.
-fn announce(events: Option<&Hub>, id: &str, revision: u64) {
-    if let Some(events) = events {
-        events.publish_all(Event::RoadmapChanged {
-            id: id.to_owned(),
-            revision,
-        });
-    }
+fn announce(events: &Hub, id: &str, revision: u64) {
+    events.publish_all(Event::RoadmapChanged {
+        id: id.to_owned(),
+        revision,
+    });
 }
 
 /// Roadmaps that are not archived, oldest first; or the newest archived ones.
@@ -124,7 +122,7 @@ pub async fn create(
     db: &Database,
     input: &NewRoadmap,
     device_id: &str,
-    events: Option<&Hub>,
+    events: &Hub,
 ) -> Result<Snapshot> {
     validate_new_roadmap(input)?;
     let id = uuid::Uuid::now_v7().to_string();
@@ -205,7 +203,7 @@ async fn commit(
     draft: &Draft,
     device_id: Option<&str>,
     proposal_id: Option<&str>,
-    events: Option<&Hub>,
+    events: &Hub,
 ) -> Result<()> {
     draft.finish()?;
     let writes = draft.writes();
@@ -281,12 +279,7 @@ async fn commit(
 
 /// Commit the owner's draft (nothing when it changes nothing) and return the
 /// roadmap as stored.
-async fn save(
-    db: &Database,
-    draft: Draft,
-    device_id: &str,
-    events: Option<&Hub>,
-) -> Result<Snapshot> {
+async fn save(db: &Database, draft: Draft, device_id: &str, events: &Hub) -> Result<Snapshot> {
     if !draft.is_empty() {
         commit(db, &draft, Some(device_id), None, events).await?;
     }
@@ -299,7 +292,7 @@ async fn save(
 /// author `github`, at the revision it was loaded at: when the owner changed
 /// the roadmap meanwhile, nothing is written and the answer is
 /// [`RoadmapError::Conflict`].
-pub async fn commit_github(db: &Database, draft: &Draft, events: Option<&Hub>) -> Result<()> {
+pub async fn commit_github(db: &Database, draft: &Draft, events: &Hub) -> Result<()> {
     if draft.is_empty() {
         return Ok(());
     }
@@ -312,7 +305,7 @@ pub async fn update(
     expected: u64,
     patch: &RoadmapPatch,
     device_id: &str,
-    events: Option<&Hub>,
+    events: &Hub,
 ) -> Result<Snapshot> {
     let mut draft = load(db, id, Some(expected)).await?;
     draft.update_roadmap(patch)?;
@@ -325,7 +318,7 @@ pub async fn archive(
     id: &str,
     expected: u64,
     device_id: &str,
-    events: Option<&Hub>,
+    events: &Hub,
 ) -> Result<Snapshot> {
     let mut draft = load(db, id, Some(expected)).await?;
     draft.archive();
@@ -339,7 +332,7 @@ pub async fn create_item(
     expected: u64,
     input: &NewItem,
     device_id: &str,
-    events: Option<&Hub>,
+    events: &Hub,
 ) -> Result<(String, Snapshot)> {
     let mut draft = load(db, id, Some(expected)).await?;
     let item_id = draft.create_item(input)?;
@@ -355,7 +348,7 @@ pub async fn update_item(
     patch: &ItemPatch,
     device_id: &str,
     github: &GithubHandle,
-    events: Option<&Hub>,
+    events: &Hub,
 ) -> Result<Snapshot> {
     let mut draft = load(db, id, Some(expected)).await?;
     let before = draft.items.clone();
@@ -372,7 +365,7 @@ pub async fn delete_item(
     expected: u64,
     item_id: &str,
     device_id: &str,
-    events: Option<&Hub>,
+    events: &Hub,
 ) -> Result<Snapshot> {
     let mut draft = load(db, id, Some(expected)).await?;
     draft.delete_item(item_id)?;
@@ -566,7 +559,7 @@ pub async fn accept_proposal(
     proposal_id: &str,
     device_id: &str,
     github: &GithubHandle,
-    events: Option<&Hub>,
+    events: &Hub,
 ) -> Result<Snapshot> {
     let found: Vec<ProposalRow> = rows(
         db,
@@ -741,7 +734,7 @@ mod tests {
         let db = database().await?;
         let device = uuid::Uuid::now_v7().to_string();
         let hub = Hub::default();
-        let events = Some(&hub);
+        let events = &hub;
         let mut listener = listen(&hub);
 
         let created = create(&db, &plan("Plan"), &device, events).await?;
@@ -955,7 +948,7 @@ mod tests {
         let db = database().await?;
         let device = uuid::Uuid::now_v7().to_string();
         let hub = Hub::default();
-        let events = Some(&hub);
+        let events = &hub;
         let mut listener = listen(&hub);
         let id = create(&db, &plan("Plan"), &device, events)
             .await?
@@ -1024,7 +1017,7 @@ mod tests {
         let db = database().await?;
         let device = uuid::Uuid::now_v7().to_string();
         let hub = Hub::default();
-        let events = Some(&hub);
+        let events = &hub;
         let mut listener = listen(&hub);
         let id = create(&db, &plan("Plan"), &device, events)
             .await?
