@@ -1,5 +1,5 @@
 //! Deterministic privacy checks for text that may leave the Home Node in a
-//! web search: the research question, a search query or a URL. Names and
+//! web search: the research question or a search query. Names and
 //! other free-text personal details are not detectable; the research prompt
 //! asks the model to keep them out of queries.
 
@@ -69,8 +69,8 @@ pub fn is_private(question: &str, held_symbols: &[String]) -> bool {
 /// identifier: an email address, a key-like token, a possessive near a money
 /// or account word, or a long number (account, card or phone; a plain date
 /// is not one). Narrower than [`is_private`]: no amounts, `k` suffix or held
-/// symbols, so ordinary price and date searches pass. It gates explicit
-/// Research, every search query a worker sees, and [`url_is_safe`] paths.
+/// symbols, so ordinary price and date searches pass. It gates every
+/// Research question and every search query a worker sees.
 pub fn leaks_identifier(text: &str) -> bool {
     has_email(text)
         || has_key(text)
@@ -89,8 +89,9 @@ fn has_email(text: &str) -> bool {
     })
 }
 
-/// 6+ contiguous digits, or digit groups joined by single ` `, `-`, `.` or
-/// `/` with 8+ digits or 6+ groups in total (IBAN, card and phone numbers).
+/// 6+ contiguous digits, or digit groups joined by single separators (see
+/// [`digit_runs`]) with 8+ digits or 6+ groups in total (IBAN, card and
+/// phone numbers).
 /// With `dates_allowed`, a run that is exactly one date is not private.
 fn has_digit_run(text: &str, dates_allowed: bool) -> bool {
     digit_runs(text).iter().any(|run| {
@@ -102,8 +103,9 @@ fn has_digit_run(text: &str, dates_allowed: bool) -> bool {
     })
 }
 
-/// Maximal runs of ASCII digit groups joined by single ` `, `-`, `.` or `/`,
-/// each group with the separator before it (`'\0'` for the first).
+/// Maximal runs of ASCII digit groups joined by single separators (any
+/// whitespace, including no-break spaces, `-`, `–`, `.`, `/` or `_`), each
+/// group with the separator before it (`'\0'` for the first).
 fn digit_runs(text: &str) -> Vec<Vec<(char, &str)>> {
     let (mut runs, mut run) = (Vec::new(), Vec::new());
     let (mut start, mut separator) = (None, '\0');
@@ -114,7 +116,7 @@ fn digit_runs(text: &str) -> Vec<Vec<(char, &str)>> {
         }
         if let Some(begin) = start.take() {
             run.push((separator, &text[begin..at]));
-            if matches!(c, ' ' | '-' | '.' | '/') {
+            if c.is_whitespace() || matches!(c, '-' | '–' | '.' | '/' | '_') {
                 separator = c;
                 continue;
             }
@@ -223,46 +225,6 @@ fn has_prefix_word(text: &str, prefix: &str) -> bool {
     })
 }
 
-/// Whether a URL may be opened or searched without carrying personal data:
-/// http(s) only, no user info, no `?` query or `#` fragment, a domain host
-/// (never an IP literal) and a path that [`leaks_identifier`] does not flag.
-pub fn url_is_safe(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    matches!(parsed.scheme(), "http" | "https")
-        && parsed.username().is_empty()
-        && parsed.password().is_none()
-        && parsed.query().is_none()
-        && parsed.fragment().is_none()
-        // `domain()` is `None` for an IPv4 or IPv6 literal.
-        && parsed.domain().is_some()
-        && !leaks_identifier(&percent_decoded(parsed.path()))
-}
-
-/// `%XX` escapes decoded (lossy), so an encoded `@` or digit still counts.
-fn percent_decoded(path: &str) -> String {
-    let mut decoded = Vec::with_capacity(path.len());
-    let mut rest = path.as_bytes();
-    while let Some((&first, tail)) = rest.split_first() {
-        let escaped = tail
-            .get(..2)
-            .filter(|hex| first == b'%' && hex.iter().all(u8::is_ascii_hexdigit))
-            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
-        match escaped {
-            Some(byte) => {
-                decoded.push(byte);
-                rest = &tail[2..];
-            }
-            None => {
-                decoded.push(first);
-                rest = tail;
-            }
-        }
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +281,12 @@ mod tests {
             ("is our mortgage too high", true),
             ("my pension fund returns", true),
             ("my stocks today", true),
+            ("bel 06\u{a0}1234\u{a0}5678", true),
+            ("bel 06\u{202f}12\u{202f}34\u{202f}56\u{202f}78", true),
+            ("4111\u{a0}1111\u{a0}1111\u{a0}1111 kaart", true),
+            ("4111–1111–1111–1111", true),
+            ("4111_1111_1111_1111", true),
+            ("06\t1234\t5678", true),
         ] {
             assert_eq!(is_private(question, &held), private, "{question}");
         }
@@ -350,6 +318,13 @@ mod tests {
             ("NL91 ABNA 0417 1643 00", true),
             ("4111 1111 1111 1111", true),
             ("4111-1111-1111-1111", true),
+            ("06\u{a0}1234\u{a0}5678", true),
+            ("06\u{202f}12\u{202f}34\u{202f}56\u{202f}78", true),
+            ("4111\u{a0}1111\u{a0}1111\u{a0}1111", true),
+            ("4111\u{202f}1111\u{202f}1111\u{202f}1111", true),
+            ("06–1234–5678", true),
+            ("10\u{a0}11\u{a0}2026", true),
+            ("10–11–2026", true),
             ("mijn portfolio rendement", true),
             ("my brokerage account", true),
             ("sk-proj-a1b2c3d4e5f6g7h8i9j0k1l2", true),
@@ -383,50 +358,5 @@ mod tests {
         // The auto-mode gate still counts dates as long numbers.
         assert!(is_private("nieuws 2026-11-10", &[]));
         assert!(!is_private("1234--5678", &[]));
-    }
-
-    #[test]
-    fn url_gate_table() {
-        for (url, safe) in [
-            ("https://www.rust-lang.org/", true),
-            ("http://example.org/news/rust-release", true),
-            ("https://nl.wikipedia.org/wiki/Hypotheek", true),
-            ("https://example.org", true),
-            ("https://example.org/a%20b", true),
-            ("ftp://example.org/file", false),
-            ("javascript:alert(1)", false),
-            ("file:///etc/passwd", false),
-            ("data:text/plain,hi", false),
-            ("example.org/news", false),
-            ("not a url", false),
-            ("", false),
-            ("https://user@example.org/", false),
-            ("https://user:pw@example.org/", false),
-            ("https://:pw@example.org/", false),
-            ("https://example.org/search?q=weather", false),
-            ("https://example.org/?", false),
-            ("https://example.org/page#section", false),
-            ("https://example.org/#", false),
-            ("http://93.184.215.14/", false),
-            ("http://127.0.0.1/", false),
-            ("http://2130706433/", false),
-            ("http://0x7f.1/", false),
-            ("http://[::1]/", false),
-            ("https://[2001:db8::1]/page", false),
-            ("https://example.org/u/jan.devries@example.nl", false),
-            ("https://example.org/u/jan.devries%40example.nl", false),
-            ("https://example.org/call/0612345678", false),
-            ("https://example.org/call/%30612345678", false),
-            ("https://example.org/my-portfolio/today", false),
-            ("https://example.org/mijn/rekening", false),
-            ("https://example.org/pay/2500-eur", true),
-            ("https://example.org/key/sk-proj-abc", false),
-            ("https://example.org/archive/2024/11/08/rust", true),
-            ("https://example.org/archive/2024/11/08/0612345678", false),
-            ("https://example.org/iban/NL91ABNA0417164300", false),
-            ("https://example.org/%zz/%4", true),
-        ] {
-            assert_eq!(url_is_safe(url), safe, "{url}");
-        }
     }
 }
