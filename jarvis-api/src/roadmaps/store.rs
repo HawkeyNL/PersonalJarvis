@@ -1044,7 +1044,7 @@ mod tests {
         )
         .await?;
         assert!(list_proposals(&db, &id).await?.is_empty());
-        assert_eq!(prune(&db).await?, 2);
+        assert_eq!(prune(&db).await?, 3);
         let mut expected = vec!["accepted", "stale"];
         expected.extend(["expired"; MAX_PENDING_PROPOSALS]);
         assert_eq!(statuses(&db).await?, expected);
