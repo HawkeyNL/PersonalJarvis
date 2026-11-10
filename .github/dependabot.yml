@@ -1,4 +1,4 @@
-# Weekly grouped dependency and security update PRs.
+# Weekly grouped dependency update PRs.
 # Core Admin (jarvis-core-admin) is left out until PR CI builds it.
 version: 2
 updates:
