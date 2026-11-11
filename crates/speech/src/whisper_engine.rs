@@ -94,13 +94,10 @@ fn decode(ctx: &WhisperContext, language: &str, samples: &[f32]) -> Result<Strin
         .full(params, samples)
         .map_err(|e| SpeechError::Failed(format!("whisper decode: {e}")))?;
 
-    let segments = state
-        .full_n_segments()
-        .map_err(|e| SpeechError::Failed(format!("whisper segments: {e}")))?;
     let mut text = String::new();
-    for i in 0..segments {
-        let seg = state
-            .full_get_segment_text(i)
+    for segment in state.as_iter() {
+        let seg = segment
+            .to_str()
             .map_err(|e| SpeechError::Failed(format!("whisper text: {e}")))?;
         text.push_str(seg.trim());
         text.push(' ');
