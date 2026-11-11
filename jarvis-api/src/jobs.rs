@@ -43,8 +43,8 @@ pub const MAX_FACTS_BYTES: usize = 64 * 1024;
 const LAST_MINUTE: u16 = 24 * 60 - 1;
 /// Between two passes of the runner.
 const TICK: Duration = Duration::from_secs(60);
-/// Bounds each database call of the runner.
-const DB_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds each database call of the runner and the routes.
+pub(crate) const DB_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds the work of one run.
 const RUN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// Monday 07:00, the default of a new job.
@@ -134,6 +134,7 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
+    /// The wire name, as serde writes it.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -511,9 +512,8 @@ pub struct Work {
     pub token: Option<HeaderValue>,
 }
 
-/// Spawn the runner unless the time zone failed to load. It first marks
-/// runs a previous Core left running as interrupted, then every minute, or
-/// when the owner asks, runs what is due: one run at a time, its row
+/// Spawn the runner unless the time zone failed to load. Every minute, or
+/// when the owner asks, it runs what is due: one run at a time, its row
 /// written before its work starts.
 pub fn start(db: Database, handle: Arc<JobsHandle>, events: Hub, work: Work) {
     let Some(tz) = handle.tz.clone() else {
@@ -529,18 +529,10 @@ pub fn start(db: Database, handle: Arc<JobsHandle>, events: Hub, work: Work) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut recovered = false;
         loop {
             tokio::select! {
                 _ = tick.tick() => {}
                 _ = runner.handle.wake.notified() => {}
-            }
-            // Nothing new runs before the old runs are marked.
-            if !recovered {
-                recovered = runner.recover().await;
-                if !recovered {
-                    continue;
-                }
             }
             runner.pass(OffsetDateTime::now_utc()).await;
         }
@@ -548,16 +540,33 @@ pub fn start(db: Database, handle: Arc<JobsHandle>, events: Hub, work: Work) {
     tracing::info!("scheduled jobs running");
 }
 
-async fn bounded<T>(future: impl std::future::Future<Output = Result<T>>) -> Option<T> {
+/// Why a runner database call did not succeed.
+#[derive(Debug, PartialEq)]
+enum Failed {
+    /// An expected refusal: the job changed or is gone, or the owner ran it
+    /// within the hour.
+    Refused,
+    /// An error or a timeout; worth trying again.
+    Unavailable,
+}
+
+/// A database call of the runner, within [`DB_TIMEOUT`].
+async fn call<T>(
+    future: impl std::future::Future<Output = Result<T>>,
+) -> std::result::Result<T, Failed> {
     match tokio::time::timeout(DB_TIMEOUT, future).await {
-        Ok(Ok(value)) => Some(value),
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error @ (JobError::Conflict | JobError::TooSoon | JobError::NotFound))) => {
+            tracing::debug!(%error, "scheduled jobs: refused");
+            Err(Failed::Refused)
+        }
         Ok(Err(error)) => {
             tracing::warn!(%error, "scheduled jobs: database call failed");
-            None
+            Err(Failed::Unavailable)
         }
         Err(_) => {
             tracing::warn!("scheduled jobs: database call timed out");
-            None
+            Err(Failed::Unavailable)
         }
     }
 }
@@ -571,36 +580,48 @@ struct Runner {
 }
 
 impl Runner {
-    /// Mark the runs a previous Core left running; false when that failed.
+    /// Mark runs still running as interrupted: between passes none is, so
+    /// such a row was left by an earlier Core or its end could not be
+    /// recorded. False when that failed.
     async fn recover(&self) -> bool {
-        let Some(interrupted) = bounded(store::interrupt_running(&self.db)).await else {
+        let Ok(interrupted) = call(store::interrupt_running(&self.db)).await else {
             return false;
         };
         if !interrupted.is_empty() {
-            tracing::warn!(
-                runs = interrupted.len(),
-                "scheduled job runs interrupted by a restart"
-            );
+            tracing::warn!(runs = interrupted.len(), "scheduled job runs interrupted");
         }
         true
     }
 
-    /// The owner's queued run first, then every job's due slot.
+    /// Nothing runs before stale runs are marked. Then the owner's queued
+    /// run, which stays queued while the database fails, then every job's
+    /// due slot.
     async fn pass(&self, now: OffsetDateTime) {
-        if let Some(job_id) = self.handle.queued() {
-            if let Some(Some(job)) = bounded(store::get(&self.db, &job_id)).await {
-                self.run(&job, OffsetDateTime::now_utc(), Trigger::Owner)
-                    .await;
-            }
-            self.handle.clear_queued();
+        if !self.recover().await {
+            return;
         }
-        let Some(jobs) = bounded(store::list(&self.db)).await else {
+        if let Some(job_id) = self.handle.queued() {
+            let settled = match call(store::get(&self.db, &job_id)).await {
+                Ok(Some(job)) => {
+                    self.run(&job, OffsetDateTime::now_utc(), Trigger::Owner)
+                        .await
+                }
+                Ok(None) => true,
+                Err(failed) => failed == Failed::Refused,
+            };
+            if settled {
+                self.handle.clear_queued();
+            }
+        }
+        let Ok(jobs) = call(store::list(&self.db)).await else {
             return;
         };
         for job in jobs {
             match job.due(now, &self.tz) {
                 Due::Nothing => {}
-                Due::Run(slot) => self.run(&job, slot, Trigger::Schedule).await,
+                Due::Run(slot) => {
+                    self.run(&job, slot, Trigger::Schedule).await;
+                }
                 Due::Missed(slot) => {
                     let missed = store::start_run(
                         &self.db,
@@ -609,7 +630,7 @@ impl Runner {
                         Trigger::Schedule,
                         RunStatus::Missed,
                     );
-                    if let Some(run_id) = bounded(missed).await {
+                    if let Ok(run_id) = call(missed).await {
                         self.announce(&job.id, &run_id, RunStatus::Missed);
                     }
                 }
@@ -617,36 +638,26 @@ impl Runner {
         }
     }
 
-    /// Write the row, do the work, record how it ended.
-    async fn run(&self, job: &Job, slot: OffsetDateTime, trigger: Trigger) {
+    /// Write the row, do the work, record how it ended. False when the row
+    /// could not be written for a reason worth retrying.
+    async fn run(&self, job: &Job, slot: OffsetDateTime, trigger: Trigger) -> bool {
         let start = store::start_run(&self.db, job, slot, trigger, RunStatus::Running);
-        let Some(run_id) = bounded(start).await else {
-            return;
+        let run_id = match call(start).await {
+            Ok(run_id) => run_id,
+            Err(failed) => return failed == Failed::Refused,
         };
         let mut finish = tokio::time::timeout(RUN_TIMEOUT, self.work(job))
             .await
             .unwrap_or_else(|_| Finish::failed("timed_out"));
-        let finished = store::finish_run(&self.db, &run_id, &finish);
-        let written = match tokio::time::timeout(DB_TIMEOUT, finished).await {
-            // A result the store refuses still ends the run.
-            Ok(Err(JobError::Invalid(reason))) => {
-                tracing::warn!(reason, "scheduled job result refused");
-                finish = Finish::failed("invalid_result");
-                bounded(store::finish_run(&self.db, &run_id, &finish)).await
-            }
-            Ok(Ok(written)) => Some(written),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "scheduled jobs: database call failed");
-                None
-            }
-            Err(_) => {
-                tracing::warn!("scheduled jobs: database call timed out");
-                None
-            }
-        };
-        if written == Some(true) {
+        if let Err(reason) = finish.check() {
+            // A result the store would refuse still ends the run.
+            tracing::warn!(reason, "scheduled job result refused");
+            finish = Finish::failed("invalid_result");
+        }
+        if call(store::finish_run(&self.db, &run_id, &finish)).await == Ok(true) {
             self.announce(&job.id, &run_id, finish.status);
         }
+        true
     }
 
     async fn work(&self, job: &Job) -> Finish {
@@ -714,6 +725,20 @@ mod tests {
         serde_json::from_value::<NewJob>(body)
             .map_err(|_| JobError::InvalidData)?
             .into_job("j".into(), at("2026-11-11T12:00:00Z"), None)
+    }
+
+    #[test]
+    fn run_status_names_match_the_wire() {
+        for status in [
+            RunStatus::Running,
+            RunStatus::Ok,
+            RunStatus::Partial,
+            RunStatus::Failed,
+            RunStatus::Missed,
+            RunStatus::Interrupted,
+        ] {
+            assert_eq!(serde_json::to_value(status).unwrap(), status.as_str());
+        }
     }
 
     #[test]
@@ -1060,6 +1085,10 @@ mod tests {
             RunStatus::Running,
         )
         .await?;
+        // Started over an hour ago: it does not hold the owner's hour.
+        db.query("UPDATE scheduled_job_runs SET started_at = time::now() - 2h")
+            .await?
+            .check()?;
         assert!(runner.recover().await);
         let status = |id: String| {
             let db = db.clone();
