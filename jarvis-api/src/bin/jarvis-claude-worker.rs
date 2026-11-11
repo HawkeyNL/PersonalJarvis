@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use jarvis_llm::{
     claude_worker_protocol::{
         claude_subscription_status, reviewed_claude_version, ClaudeWorkerReply,
-        ClaudeWorkerRequest, ClaudeWorkerState, MAX_REPLY_BYTES,
+        ClaudeWorkerRequest, ClaudeWorkerState, WorkerImage, MAX_REPLY_BYTES,
     },
     privacy::leaks_identifier,
 };
@@ -30,9 +30,10 @@ const HOME: &str = "/var/lib/jarvis-claude";
 const RUNTIME: &str = "/run/jarvis-claude";
 /// Search, read results, answer: enough turns for a few searches, bounded.
 const RESEARCH_MAX_TURNS: &str = "8";
-/// A research run's whole event stream. Each line, the final result among
-/// them, stays within [`MAX_REPLY_BYTES`] like the single JSON reply.
-const MAX_RESEARCH_STREAM_BYTES: usize = 4 * 1024 * 1024;
+/// A streamed run's whole event stream (research or photos). Each line, the
+/// final result among them, stays within [`MAX_REPLY_BYTES`] like the single
+/// JSON reply.
+const MAX_STREAM_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct CliUsage {
@@ -109,13 +110,6 @@ async fn main() -> Result<()> {
 }
 
 async fn handle(request: ClaudeWorkerRequest) -> Result<ClaudeWorkerReply> {
-    // Photo runs need their own reviewed invocation; until then refuse them.
-    if !request.images.is_empty() {
-        return Ok(failed(
-            ClaudeWorkerState::RuntimeFailure,
-            "photos unsupported",
-        ));
-    }
     if !supported_runtime().await {
         return Ok(failed(
             ClaudeWorkerState::IncompatibleRuntime,
@@ -208,7 +202,14 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
     }
     let mut command = official_command(&request, system_file.as_ref().map(|file| file.path()));
     if request.research {
-        return Ok(run_research(command, &request.prompt, run_timeout(&request)).await);
+        let prompt = request.prompt.as_bytes();
+        return Ok(run_stream(command, prompt, run_timeout(&request), true).await);
+    }
+    if !request.images.is_empty() {
+        let Some(message) = photo_message(&request) else {
+            return Ok(failed(ClaudeWorkerState::RuntimeFailure, "photo check"));
+        };
+        return Ok(run_stream(command, &message, run_timeout(&request), false).await);
     }
     command
         .stdin(std::process::Stdio::piped())
@@ -262,7 +263,38 @@ async fn run_official_client(request: ClaudeWorkerRequest) -> Result<ClaudeWorke
 /// searches (its request cannot be a research run), so it runs with no tool.
 /// A research run streams its events (`stream-json`, which `-p` allows only
 /// with `--verbose`), so the worker sees every tool call and search query.
+///
+/// A chat run with photos streams too: its one user message, the prompt plus
+/// the photos as image blocks, goes in as `stream-json` on stdin, never as a
+/// file or an argument. It keeps the tool-free flags of ordinary chat, and its
+/// event stream is checked like research, with no tool allowed at all.
 fn cli_args(request: &ClaudeWorkerRequest, system_prompt: Option<&Path>) -> Vec<OsString> {
+    if !request.images.is_empty() {
+        let mut args: Vec<OsString> = [
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            &request.model,
+            "--restricted",
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--tools",
+            "",
+            "--disallowedTools",
+            "mcp__*",
+            "--disable-slash-commands",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        if let Some(path) = system_prompt {
+            args.extend([OsString::from("--system-prompt-file"), path.into()]);
+        }
+        return args;
+    }
     let research = request.research;
     let tools = if research { "WebSearch" } else { "" };
     let format = if research { "stream-json" } else { "json" };
@@ -302,12 +334,40 @@ fn cli_args(request: &ClaudeWorkerRequest, system_prompt: Option<&Path>) -> Vec<
     args
 }
 
-/// A research run: the reviewed invocation with its event stream inspected
-/// line by line. A tool call other than `WebSearch`, a search query the
-/// identifier check flags, or a line the worker cannot read stops the whole
-/// process group and discards the run. The event arrives after the CLI
-/// produced it, so this detects and discards; it cannot prevent.
-async fn run_research(mut command: Command, prompt: &str, limit: Duration) -> ClaudeWorkerReply {
+/// The one user message of a photo run, as a `stream-json` input line: the
+/// prompt as a text block, then each photo as a base64 image block, oldest
+/// first. Each photo is decoded, re-checked and encoded again here, so only
+/// a whole bounded JPEG reaches the CLI. `None` if any photo fails.
+fn photo_message(request: &ClaudeWorkerRequest) -> Option<Vec<u8>> {
+    let mut content = vec![serde_json::json!({"type": "text", "text": request.prompt})];
+    for image in &request.images {
+        let checked = WorkerImage::jpeg(&image.decoded()?);
+        content.push(serde_json::json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": checked.media_type, "data": checked.data},
+        }));
+    }
+    let message = serde_json::json!({
+        "type": "user",
+        "message": {"role": "user", "content": content},
+    });
+    let mut line = serde_json::to_vec(&message).ok()?;
+    line.push(b'\n');
+    Some(line)
+}
+
+/// A streamed run (research, or chat with photos): the reviewed invocation
+/// with its event stream inspected line by line. Any tool call (in research:
+/// any but a `WebSearch` whose query passes the identifier check) or a line
+/// the worker cannot read stops the whole process group and discards the
+/// run. The event arrives after the CLI produced it, so this detects and
+/// discards; it cannot prevent.
+async fn run_stream(
+    mut command: Command,
+    input: &[u8],
+    limit: Duration,
+    allow_search: bool,
+) -> ClaudeWorkerReply {
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -327,9 +387,9 @@ async fn run_research(mut command: Command, prompt: &str, limit: Duration) -> Cl
         return failed(ClaudeWorkerState::RuntimeFailure, "spawn");
     };
     let run = async {
-        stdin.write_all(prompt.as_bytes()).await?;
+        stdin.write_all(input).await?;
         drop(stdin);
-        let Some(result) = read_research_stream(stdout).await? else {
+        let Some(result) = read_stream(stdout, allow_search).await? else {
             return Ok(None);
         };
         Ok::<_, std::io::Error>(Some((child.wait().await?, result)))
@@ -340,7 +400,7 @@ async fn run_research(mut command: Command, prompt: &str, limit: Duration) -> Cl
         other => {
             stop_group(&mut child, group).await;
             return match other {
-                Ok(Ok(_)) => failed(ClaudeWorkerState::ToolUseRefused, "research event refused"),
+                Ok(Ok(_)) => failed(ClaudeWorkerState::ToolUseRefused, "stream event refused"),
                 Ok(Err(_)) => failed(ClaudeWorkerState::RuntimeFailure, "event stream"),
                 Err(_) => failed(ClaudeWorkerState::RuntimeFailure, "run timeout"),
             };
@@ -354,8 +414,9 @@ async fn run_research(mut command: Command, prompt: &str, limit: Duration) -> Cl
 
 /// Read the event stream to its end: `Ok(None)` as soon as one line is
 /// refused, otherwise the reply from the last `result` event, if any.
-async fn read_research_stream(
+async fn read_stream(
     stdout: impl AsyncRead + Unpin,
+    allow_search: bool,
 ) -> std::io::Result<Option<Option<ClaudeWorkerReply>>> {
     let mut reader = tokio::io::BufReader::new(stdout);
     let mut line = Vec::new();
@@ -371,12 +432,12 @@ async fn read_research_stream(
             return Ok(Some(result));
         }
         total += read;
-        if read > MAX_REPLY_BYTES || total > MAX_RESEARCH_STREAM_BYTES {
+        if read > MAX_REPLY_BYTES || total > MAX_STREAM_BYTES {
             return Err(std::io::Error::other(
                 "Claude event stream exceeded its bound",
             ));
         }
-        match stream_event(line.strip_suffix(b"\n").unwrap_or(&line)) {
+        match stream_event(line.strip_suffix(b"\n").unwrap_or(&line), allow_search) {
             StreamEvent::Benign => {}
             StreamEvent::Result(reply) => result = Some(reply),
             StreamEvent::Refused => return Ok(None),
@@ -398,11 +459,12 @@ enum StreamEvent {
 /// blocks (`{"type":"tool_use","name":"WebSearch","input":{"query":...}}`),
 /// `{"type":"user",...}` carrying tool results, and a final
 /// `{"type":"result",...}` with the same fields as `--output-format json`.
-/// Any tool-use block (`tool_use`, `server_tool_use`, `mcp_tool_use`) other
-/// than a `WebSearch` whose query passes the identifier check is refused, as
-/// is a line that is not a JSON object with a type or an assistant message
-/// without a content list. Other event types carry no tool call and pass.
-fn stream_event(line: &[u8]) -> StreamEvent {
+/// Any tool-use block (`tool_use`, `server_tool_use`, `mcp_tool_use`) is
+/// refused, except, when `allow_search`, a `WebSearch` whose query passes the
+/// identifier check; so is a line that is not a JSON object with a type or an
+/// assistant message without a content list. Other event types carry no tool
+/// call and pass.
+fn stream_event(line: &[u8], allow_search: bool) -> StreamEvent {
     use serde_json::Value;
     let Ok(event) = serde_json::from_slice::<Value>(line) else {
         return if line.trim_ascii().is_empty() {
@@ -414,7 +476,13 @@ fn stream_event(line: &[u8]) -> StreamEvent {
     match event.get("type").and_then(Value::as_str) {
         Some("result") => StreamEvent::Result(parse_cli_reply(line)),
         Some("assistant") => match event["message"]["content"].as_array() {
-            Some(blocks) if blocks.iter().all(allowed_block) => StreamEvent::Benign,
+            Some(blocks)
+                if blocks
+                    .iter()
+                    .all(|block| allowed_block(block, allow_search)) =>
+            {
+                StreamEvent::Benign
+            }
             _ => StreamEvent::Refused,
         },
         Some(_) => StreamEvent::Benign,
@@ -422,20 +490,22 @@ fn stream_event(line: &[u8]) -> StreamEvent {
     }
 }
 
-/// A content block without tool use, or the one allowed search: `WebSearch`
+/// A content block without tool use, or (only if `allow_search`) the one
+/// allowed search: `WebSearch`
 /// with a string query, where no string anywhere in its input (the query,
 /// and domain filters such as `allowed_domains`) is flagged by
 /// [`leaks_identifier`]: no email address, key, possessive account word or
 /// long number (a plain date is fine). The whole input reaches the inner
 /// search call.
-fn allowed_block(block: &serde_json::Value) -> bool {
+fn allowed_block(block: &serde_json::Value, allow_search: bool) -> bool {
     let Some(kind) = block.get("type").and_then(serde_json::Value::as_str) else {
         return false;
     };
     if !kind.ends_with("tool_use") {
         return true;
     }
-    kind == "tool_use"
+    allow_search
+        && kind == "tool_use"
         && block["name"] == "WebSearch"
         && block["input"]["query"].is_string()
         && strings_pass(&block["input"])
@@ -755,7 +825,7 @@ mod tests {
             "",
         ] {
             assert!(
-                matches!(stream_event(benign.as_bytes()), StreamEvent::Benign),
+                matches!(stream_event(benign.as_bytes(), true), StreamEvent::Benign),
                 "{benign}"
             );
         }
@@ -800,11 +870,11 @@ mod tests {
             "not json".into(),
         ] {
             assert!(
-                matches!(stream_event(refused.as_bytes()), StreamEvent::Refused),
+                matches!(stream_event(refused.as_bytes(), true), StreamEvent::Refused),
                 "{refused}"
             );
         }
-        let StreamEvent::Result(reply) = stream_event(RESULT.as_bytes()) else {
+        let StreamEvent::Result(reply) = stream_event(RESULT.as_bytes(), true) else {
             panic!("the result event is the reply");
         };
         assert!(matches!(reply.state, ClaudeWorkerState::Completed));
@@ -820,6 +890,189 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", script]);
         command
+    }
+
+    async fn run_research(command: Command, prompt: &str, limit: Duration) -> ClaudeWorkerReply {
+        run_stream(command, prompt.as_bytes(), limit, true).await
+    }
+
+    fn jpeg(marker: u8) -> Vec<u8> {
+        vec![0xFF, 0xD8, 0xFF, 0xE0, marker, 0xFF, 0xD9]
+    }
+
+    fn photo_request() -> ClaudeWorkerRequest {
+        ClaudeWorkerRequest {
+            prompt: "User: [photo 1] [photo 2]\nWhat is this?\nJarvis:".into(),
+            images: vec![WorkerImage::jpeg(&jpeg(1)), WorkerImage::jpeg(&jpeg(2))],
+            ..request(false, None)
+        }
+    }
+
+    #[test]
+    fn photo_argv_is_exactly_the_reviewed_streaming_invocation() {
+        let prompt = Path::new("/run/jarvis-claude/.tmpX");
+        let request = photo_request();
+        assert!(request.valid());
+        assert_eq!(
+            task_argv(&request, Some(prompt)),
+            "-p --input-format stream-json --output-format stream-json --verbose \
+             --model claude-opus-5 --restricted --strict-mcp-config --no-session-persistence \
+             --tools  --disallowedTools mcp__* --disable-slash-commands \
+             --system-prompt-file /run/jarvis-claude/.tmpX"
+        );
+        let args = cli_args(&request, None);
+        assert_eq!(args[12], OsString::from(""));
+        assert_eq!(
+            args.last(),
+            Some(&OsString::from("--disable-slash-commands"))
+        );
+        for joined in [task_argv(&request, None), task_argv(&request, Some(prompt))] {
+            assert_no_widening_tokens(&joined);
+            for forbidden in [
+                "WebSearch",
+                "WebFetch",
+                "Bash",
+                "--allowedTools",
+                "--max-turns",
+                "--replay-user-messages",
+                "--bare",
+                "default",
+            ] {
+                assert!(!joined.contains(forbidden), "{forbidden}");
+            }
+            // Nothing of the photos or the prompt is in the argv.
+            assert!(!joined.contains(&request.images[0].data));
+            assert!(!joined.contains("What is this"));
+        }
+        // The same request without photos keeps the reviewed chat argv.
+        let text = ClaudeWorkerRequest {
+            images: Vec::new(),
+            ..photo_request()
+        };
+        assert_eq!(task_argv(&text, None), argv(false, None));
+        // A photo run gets the chat environment: no time zone.
+        assert_eq!(
+            environment(&official_command(&request, None)),
+            environment(&clean_command())
+        );
+    }
+
+    #[test]
+    fn the_photo_message_is_one_user_line_with_rechecked_image_blocks() {
+        let request = photo_request();
+        let line = photo_message(&request).unwrap();
+        assert_eq!(line.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert!(line.ends_with(b"\n"));
+        let image = |marker| {
+            serde_json::json!({"type": "image", "source": {"type": "base64",
+                "media_type": "image/jpeg", "data": WorkerImage::jpeg(&jpeg(marker)).data}})
+        };
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "text", "text": request.prompt},
+                image(1),
+                image(2),
+            ]}})
+        );
+        // A photo that fails the re-check stops the run before the CLI.
+        let mut broken = photo_request();
+        broken.images[1].data = WorkerImage::jpeg(&jpeg(2)[..5]).data;
+        assert!(photo_message(&broken).is_none());
+    }
+
+    #[tokio::test]
+    async fn photo_stdin_is_exactly_the_message_then_end_of_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("stdin");
+        let message = photo_message(&photo_request()).unwrap();
+        let reply = run_stream(
+            shell(&format!(
+                "cat > {}; printf '%s\\n' '{RESULT}'",
+                seen.display()
+            )),
+            &message,
+            Duration::from_secs(10),
+            false,
+        )
+        .await;
+        assert!(matches!(reply.state, ClaudeWorkerState::Completed));
+        assert_eq!(std::fs::read(&seen).unwrap(), message);
+    }
+
+    /// A fake photo run that prints these stream lines, then runs `tail`.
+    async fn fake_photo_run(lines: &[&str], tail: &str) -> ClaudeWorkerReply {
+        let echoes = lines
+            .iter()
+            .map(|line| format!("printf '%s\\n' '{line}'"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let message = photo_message(&photo_request()).unwrap();
+        run_stream(
+            shell(&format!("cat >/dev/null; {echoes}; {tail}")),
+            &message,
+            Duration::from_secs(10),
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn photo_runs_refuse_every_tool_even_a_search() {
+        let text = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"A red square."}]}}"#;
+        let reply = fake_photo_run(&[text, RESULT], "true").await;
+        assert!(matches!(reply.state, ClaudeWorkerState::Completed));
+        let bash = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"id"}}]}}"#;
+        let read = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"Read","input":{"file_path":"/etc/passwd"}}]}}"#;
+        let server = r#"{"type":"assistant","message":{"content":[{"type":"server_tool_use","id":"s1","name":"web_search","input":{"query":"x"}}]}}"#;
+        for line in [SEARCH, bash, read, server, "not json"] {
+            let reply = fake_photo_run(&[text, line, RESULT], "true").await;
+            assert!(
+                matches!(reply.state, ClaudeWorkerState::ToolUseRefused),
+                "{line}"
+            );
+            assert!(reply.text.is_none(), "{line}");
+        }
+        // No result event, or a failed exit: nothing is returned.
+        let reply = fake_photo_run(&[text], "true").await;
+        assert!(matches!(reply.state, ClaudeWorkerState::RuntimeFailure));
+        assert!(reply.text.is_none());
+        let reply = fake_photo_run(&[text, RESULT], "exit 1").await;
+        assert!(matches!(reply.state, ClaudeWorkerState::RuntimeFailure));
+        assert!(reply.text.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_tool_in_a_photo_run_stops_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let message = photo_message(&photo_request()).unwrap();
+        let started = std::time::Instant::now();
+        let reply = run_stream(
+            shell(&format!(
+                "cat >/dev/null; sleep 30 & echo $! > {}; printf '%s\\n' '{SEARCH}' '{RESULT}'; wait",
+                pid_file.display()
+            )),
+            &message,
+            Duration::from_secs(10),
+            false,
+        )
+        .await;
+        assert!(matches!(reply.state, ClaudeWorkerState::ToolUseRefused));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+        }) {
+            assert!(std::time::Instant::now() < deadline, "child {pid} survived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// A fake CLI that prints these stream lines, then runs `tail`.
@@ -894,7 +1147,7 @@ mod tests {
         };
         let reply = fake_research(&[SEARCH], &system_lines(2)).await;
         assert!(matches!(reply.state, ClaudeWorkerState::Completed));
-        let over = MAX_RESEARCH_STREAM_BYTES / (MAX_REPLY_BYTES / 2) + 1;
+        let over = MAX_STREAM_BYTES / (MAX_REPLY_BYTES / 2) + 1;
         let reply = fake_research(&[SEARCH], &system_lines(over)).await;
         assert!(matches!(reply.state, ClaudeWorkerState::RuntimeFailure));
         assert!(reply.text.is_none());
