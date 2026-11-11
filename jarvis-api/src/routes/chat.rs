@@ -800,7 +800,9 @@ async fn auto_research_answer(
     brain: &dyn llm::LlmProvider,
     question: &str,
 ) -> Option<(llm::ChatReply, String)> {
-    let reply = research_reply(routing, brain, question).await;
+    let mut reply = research_reply(routing, brain, question).await;
+    // A web page may inject a trailing marker; strip it like any answer.
+    research_advised(&mut reply.text, llm::RoutingMode::Research, None);
     reply.backend.is_some().then(|| {
         let model = stored_model(llm::RoutingMode::Research, &reply);
         (reply, model)
