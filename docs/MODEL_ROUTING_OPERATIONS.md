@@ -311,13 +311,29 @@ leaves the Home Node without the owner's click. It does so only for a runs-API
 answer (never `POST /v1/assistant/chat`) when all of these hold; otherwise the
 answer carries the usual `research_offer`:
 
-- the intent classifier advised research and a research run can start now
-  (a capable, owner-enabled subscription in the hard chain; the question is at
-  most 2000 characters);
+- research was advised and a research run can start now (a capable,
+  owner-enabled subscription in the hard chain; the question is at most 2000
+  characters). Research is advised when the intent classifier says so, or when
+  the chat model ends its answer with a final line that is exactly
+  `[[web_search]]` (below);
 - the privacy gate passes (below);
 - no other automatic run is in flight, and fewer than 10 automatic runs
   started in the last hour and 40 in the last day. Explicit Research runs do
   not count. The counters live in memory and reset when Core restarts.
+
+**Model-requested search.** With `"auto"` and a research run possible, the
+runtime facts of a runs-API answer tell the chat model that web search is
+automatic: when a good answer needs current or external facts it does not
+have, it answers briefly and ends its reply with a final line that is exactly
+`[[web_search]]`. The model can only ask; the search still sends the owner's
+latest question, never the model's text, and every check above still applies.
+This works without an intent classifier and with a pinned brain. Core removes
+such a trailing marker line (surrounding whitespace allowed) from every chat
+answer, whatever the routing, so it is never stored, streamed or shown; a reply that
+was only the marker is stored as a fixed sentence. A marker anywhere else is
+ordinary text and asks for nothing. An explicit Research answer never asks
+for another search. With `"on"` or `"off"` the runtime facts do not mention
+the marker.
 
 The automatic run sends exactly what an explicit Research request sends (the
 question and the fixed instruction), stores the answer as `web:<model>`,
