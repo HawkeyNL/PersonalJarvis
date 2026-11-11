@@ -1,8 +1,8 @@
 use super::*;
-use blake2::{Blake2b512, Digest};
+use blake2::{Blake2b512, Digest as _};
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 
 // Deliberately synthetic, test-only signing material. Never production keys.
 fn signing_key() -> SigningKey {
