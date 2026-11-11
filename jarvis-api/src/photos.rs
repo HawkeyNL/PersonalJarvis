@@ -45,6 +45,8 @@ pub const MAX_PHOTO_BYTES: usize = 1024 * 1024;
 pub const MAX_SIDE: u32 = 1600;
 /// Unsaved photos are deleted this long after their upload.
 pub const RETENTION_DAYS: i64 = 90;
+/// The most photos one message carries; also enforced by the schema.
+pub const MAX_ATTACHMENTS: usize = 4;
 /// PATCH bodies are tiny JSON objects.
 pub const PATCH_BODY_LIMIT: usize = 1024;
 
@@ -347,6 +349,25 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|_| PhotoError::Internal)
+}
+
+/// Remove the files of deleted photo rows, after their rows are gone. Used
+/// when a conversation is deleted; the orphan sweep is the backstop.
+pub(crate) async fn remove_files(store: &PhotoStore, ids: Vec<Uuid>) {
+    let Ok(dir) = store.dir() else {
+        return;
+    };
+    let count = ids.len();
+    let failed = blocking(move || {
+        ids.into_iter()
+            .filter(|id| remove_file(&dir, *id).is_err())
+            .count()
+    })
+    .await
+    .unwrap_or(count);
+    if failed > 0 {
+        tracing::warn!(failed, "photo files left for the orphan sweep");
+    }
 }
 
 fn database_error<E>(_: E) -> PhotoError {

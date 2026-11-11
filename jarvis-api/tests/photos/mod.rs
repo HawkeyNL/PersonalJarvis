@@ -314,3 +314,220 @@ async fn photo_routes_are_owner_scoped_bounded_and_inert() -> Result<(), Box<dyn
     assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn photos_join_a_message_atomically_and_leave_with_its_conversation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("photos_runs_{}", Uuid::now_v7().simple()))
+        .use_db("fixture")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let owner = jarvis_identity::first_user_or_create(&db, "fixture owner").await?;
+    let (device, token) = realtime::device_token(&db, owner.id).await;
+    let other_owner = jarvis_identity::create_user(&db, "other fixture owner").await?;
+    let (other_device, other_token) = realtime::device_token(&db, other_owner.id).await;
+    let root = tempfile::tempdir()?;
+    let dir = root.path().join("photos");
+    let mut fixture = state(db.clone(), None).await;
+    fixture.photos = Arc::new(PhotoStore::open(&dir));
+    let hub = fixture.realtime.clone();
+    let app = build_router(fixture);
+    let mut display = hub.subscribe(owner.id, device).unwrap();
+    let mut other_display = hub.subscribe(other_owner.id, other_device).unwrap();
+    for display in [&mut display, &mut other_display] {
+        assert!(matches!(
+            display.receiver.recv().await.unwrap().event,
+            jarvis_client_core::realtime::Event::ConnectionReady { .. }
+        ));
+    }
+
+    let first = upload(&app, &token).await;
+    let second = upload(&app, &token).await;
+    let foreign = upload(&app, &other_token).await;
+    let pending = |id: Uuid| {
+        let db = db.clone();
+        async move {
+            let rows: Vec<bool> = db
+                .query("SELECT VALUE conversation_id = NONE FROM chat_photos WHERE record::id(id) = $id")
+                .bind(json!({"id": id.to_string()}))
+                .await
+                .unwrap()
+                .take(0)
+                .unwrap();
+            rows == [true]
+        }
+    };
+    let counts = || {
+        let db = db.clone();
+        async move {
+            let mut response = db
+                .query("RETURN [count(SELECT * FROM conversations), count(SELECT * FROM chat_messages WHERE role = 'user'), count(SELECT * FROM assistant_runs)]")
+                .await
+                .unwrap();
+            response.take::<Vec<u64>>(0).unwrap()
+        }
+    };
+    let run = |attachments: Vec<Uuid>, content: &str| {
+        json!({"request_id": Uuid::now_v7(), "messages": [{"role": "user", "content": content}],
+            "attachments": attachments})
+    };
+
+    // Another owner's photo rolls the whole submission back.
+    let (status, body) = realtime::post(
+        &app,
+        &token,
+        "/v1/assistant/runs",
+        run(vec![first, foreign], "Look"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "no such photo");
+    assert!(pending(first).await && pending(foreign).await);
+    assert_eq!(counts().await, [0, 0, 0]);
+    // Photos never go to web research or the legacy endpoint.
+    let mut research = run(vec![first], "Look");
+    research["mode"] = json!("research");
+    let (status, _) = realtime::post(&app, &token, "/v1/assistant/runs", research).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mut legacy = run(vec![first], "Look");
+    legacy.as_object_mut().unwrap().remove("request_id");
+    let (status, _) = realtime::post(&app, &token, "/v1/assistant/chat", legacy).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(counts().await, [0, 0, 0]);
+
+    // Photos alone are a message; a retry is the same run.
+    let request = run(vec![second, first], "");
+    let (status, submitted) =
+        realtime::post(&app, &token, "/v1/assistant/runs", request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{submitted}");
+    let (status, retried) = realtime::post(&app, &token, "/v1/assistant/runs", request).await;
+    assert_eq!(status, StatusCode::OK, "{retried}");
+    assert_eq!(submitted["run_id"], retried["run_id"]);
+    assert!(!pending(first).await && !pending(second).await);
+    // A photo already sent cannot join another message.
+    let (status, _) = realtime::post(
+        &app,
+        &token,
+        "/v1/assistant/runs",
+        run(vec![first], "Again"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(counts().await, [1, 1, 1]);
+
+    // Live displays get the ids, never the bytes; the other owner gets nothing.
+    let created = loop {
+        let envelope =
+            tokio::time::timeout(std::time::Duration::from_secs(5), display.receiver.recv())
+                .await?
+                .unwrap();
+        if let jarvis_client_core::realtime::Event::MessageCreated { message, .. } = &envelope.event
+        {
+            break message.clone();
+        }
+    };
+    assert_eq!(created.attachments, [second, first]);
+    assert_eq!(created.content, "");
+    assert!(other_display.receiver.try_recv().is_err());
+
+    let conversation = submitted["conversation_id"].as_str().unwrap().to_string();
+    let run_path = format!(
+        "/v1/assistant/runs/{}",
+        submitted["run_id"].as_str().unwrap()
+    );
+    for _ in 0..100 {
+        let response = send(&app, &token, "GET", &run_path, "", vec![]).await;
+        if json_body(response).await["state"] != "running" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // A photo about to expire unsent is not claimed.
+    let late = upload(&app, &token).await;
+    db.query("UPDATE chat_photos SET created_at = time::now() - 23h30m WHERE record::id(id) = $id")
+        .bind(json!({"id": late.to_string()}))
+        .await?
+        .check()?;
+    let (status, _) =
+        realtime::post(&app, &token, "/v1/assistant/runs", run(vec![late], "Late")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(pending(late).await);
+    // A continued conversation takes photos too.
+    let third = upload(&app, &token).await;
+    let mut more = run(vec![third], "And this one");
+    more["conversation_id"] = json!(submitted["conversation_id"]);
+    let mut status = StatusCode::CONFLICT;
+    for _ in 0..100 {
+        (status, _) = realtime::post(&app, &token, "/v1/assistant/runs", more.clone()).await;
+        if status != StatusCode::CONFLICT {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(status, StatusCode::OK);
+    assert!(!pending(third).await);
+    let path = format!("/v1/conversations/{conversation}");
+    let response = send(&app, &token, "GET", &path, "", vec![]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let history = json_body(response).await;
+    assert_eq!(history["title"], "Photo");
+    assert_eq!(
+        history["messages"][0]["attachments"],
+        json!([second.to_string(), first.to_string()])
+    );
+    let mut listed: Vec<String> = history["photos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            assert!(p["expires_at"].is_string());
+            p["id"].as_str().unwrap().to_string()
+        })
+        .collect();
+    listed.sort();
+    let mut want = vec![first.to_string(), second.to_string(), third.to_string()];
+    want.sort();
+    assert_eq!(listed, want);
+    let response = send(&app, &other_token, "GET", &path, "", vec![]).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Deleting the conversation deletes its photos, kept ones too.
+    let response = send(
+        &app,
+        &token,
+        "PATCH",
+        &format!("/v1/photos/{first}"),
+        "application/json",
+        br#"{"saved":true}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // The finished run releases the conversation a moment after it is stored.
+    let mut deleted = StatusCode::CONFLICT;
+    for _ in 0..100 {
+        deleted = send(&app, &token, "DELETE", &path, "", vec![])
+            .await
+            .status();
+        if deleted != StatusCode::CONFLICT {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(deleted, StatusCode::OK);
+    for id in [first, second, third] {
+        assert!(!dir.join(format!("{id}.jpg")).exists());
+        let response = send(&app, &token, "GET", &format!("/v1/photos/{id}"), "", vec![]).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    // The other owner's pending photo is untouched.
+    assert!(pending(foreign).await);
+    assert!(dir.join(format!("{foreign}.jpg")).exists());
+    Ok(())
+}
