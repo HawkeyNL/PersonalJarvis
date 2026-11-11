@@ -173,5 +173,7 @@ of at most 2000; anything else is refused as a whole. Then, and when the
 worker is busy, down or out of plan, or there is nothing to order, Core
 writes its own: alerts with a fixed version first, then by severity, up to
 20, each with a templated reason, and a templated summary
-(`summary_source: "deterministic"`). A failed run has neither. The answer is
-display only and never feeds a later call.
+(`summary_source: "deterministic"`). An answer without priorities while
+alerts are open is refused too. A failed run has neither. The answer is
+display only and never feeds a later call: `summary` and `reason` are plain
+text, which apps never render as Markdown or HTML.
