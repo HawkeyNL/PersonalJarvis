@@ -13,17 +13,15 @@ pub(super) async fn run(work: &Work) -> Finish {
     };
     let repos = work.github.repos();
     let mut facts = github::dependency_facts(token, repos).await;
-    record(&mut facts, repos.len())
+    record(&mut facts)
 }
 
-/// `ok` when every repository was read, `partial` when some were or some
-/// alerts were (with the first failure's code), `failed` when nothing was.
-fn record(facts: &mut DependencyFacts, repos: usize) -> Finish {
+/// `ok` when every repository was read, `partial` when some repository's
+/// alerts were (with the first failure's code), `failed` when none were.
+fn record(facts: &mut DependencyFacts) -> Finish {
     let (status, error_code) = match facts.errors.first() {
         None => (RunStatus::Ok, None),
-        Some(error) if facts.errors.len() < repos || !facts.alerts.is_empty() => {
-            (RunStatus::Partial, Some(error.error_code))
-        }
+        Some(error) if facts.alerts_read > 0 => (RunStatus::Partial, Some(error.error_code)),
         Some(error) => (RunStatus::Failed, Some(error.error_code)),
     };
     Finish {
@@ -57,15 +55,20 @@ mod tests {
             repo: repo.into(),
             error_code: "token_needs_dependabot_alerts_read",
         };
-        let mut facts = DependencyFacts::default();
-        let ok = record(&mut facts, 2);
+        let mut facts = DependencyFacts {
+            alerts_read: 2,
+            ..DependencyFacts::default()
+        };
+        let ok = record(&mut facts);
         assert_eq!((ok.status, ok.error_code), (RunStatus::Ok, None));
         assert_eq!(
             ok.facts.as_deref(),
             Some(r#"{"alerts":[],"pull_requests":[],"errors":[],"truncated":false}"#)
         );
+        // One repository failed: the other's alerts were read.
         facts.errors.push(failed("a/b"));
-        let partial = record(&mut facts, 2);
+        facts.alerts_read = 1;
+        let partial = record(&mut facts);
         assert_eq!(
             (partial.status, partial.error_code),
             (
@@ -73,7 +76,11 @@ mod tests {
                 Some("token_needs_dependabot_alerts_read")
             )
         );
+        // Alerts read (none open) but its pull request list failed: partial.
+        facts.errors[0].error_code = "github_access_refused";
+        assert_eq!(record(&mut facts).status, RunStatus::Partial);
         facts.errors.push(failed("a/c"));
-        assert_eq!(record(&mut facts, 2).status, RunStatus::Failed);
+        facts.alerts_read = 0;
+        assert_eq!(record(&mut facts).status, RunStatus::Failed);
     }
 }

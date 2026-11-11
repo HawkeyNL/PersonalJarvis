@@ -145,14 +145,15 @@ or pull request text:
 - `truncated`: a page was full, an alert was left out, or the facts were
   cut to 64 KiB (least severe alerts first, then pull requests).
 
-A run is `ok` when every repository was read, `partial` when some were (a
-repository whose pull request list fails keeps its alerts) and `failed`
-when nothing was; `error_code` is the first repository's code:
+A run is `ok` when every repository was read, `partial` when some
+repository's alerts were (a repository whose pull request list fails keeps
+its alerts) and `failed` when none were; `error_code` is the first
+repository's code:
 
 | Code | Means |
 | --- | --- |
 | `token_needs_dependabot_alerts_read` | GitHub refused the alerts (403 or 404): give the token the "Dependabot alerts: Read-only" permission for the repository and enable Dependabot alerts in its settings |
-| `github_access_refused` | GitHub refused the pull request list (a repository without issues has none) |
+| `github_access_refused` | GitHub refused the pull request list; the repository's alerts are kept (a 404 or 410 on the list counts as no pull requests, without a code) |
 | `github_token_refused` | GitHub refused the token (401) |
 | `github_rate_limited` | GitHub's rate limit |
 | `github_answer_too_large` | An answer over 1 MiB |

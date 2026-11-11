@@ -970,6 +970,9 @@ pub struct DependencyFacts {
     /// Some alerts or pull requests were left out: a full page, or the size
     /// bound of [`DependencyFacts::fit`].
     pub truncated: bool,
+    /// Repositories whose alerts were read, also when none was open.
+    #[serde(skip)]
+    pub alerts_read: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -1251,6 +1254,7 @@ async fn read_dependency_facts(poller: &mut Poller, repos: &[String]) -> Depende
     for (i, repo) in repos.iter().enumerate() {
         let read = match poller.dependabot_alerts(repo).await {
             Ok((alerts, truncated)) => {
+                facts.alerts_read += 1;
                 facts.alerts.extend(alerts);
                 facts.truncated |= truncated;
                 poller
