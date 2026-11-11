@@ -54,7 +54,9 @@ Public events:
   [Automatic web search](#automatic-web-search).
 - `assistant.delta` with run identity and public assistant text only
 - `assistant.completed` with the canonical persisted assistant message and,
-  only when the intent classifier advised research and an owner-started
+  only when research was advised (by the intent classifier, or by the model's
+  `[[web_search]]` line, see
+  [Automatic web search](#automatic-web-search)) and an owner-started
   research run could start now, `research_offer: {"question": "..."}`: the
   owner's own latest question, trimmed. It is advisory and not stored. Core
   never searches on it; an app may show a button whose click sends exactly
@@ -87,9 +89,10 @@ may extend a runs-API answer by itself; `POST /v1/assistant/chat` never does.
 After the answer's `assistant.completed` (without `research_offer`), Core
 publishes `assistant.started` with `web_search: true`, runs Research on the
 same latest question, stores the answer as `web:<model>` and publishes
-`assistant.completed`. It only does so when the classifier advised research,
-a research run can start, the privacy gate passes, no automatic run is in
-flight and the rate cap allows; otherwise the answer carries the usual
+`assistant.completed`. It only does so when research was advised (the
+classifier said so, or the answer ended with a final line that is exactly
+`[[web_search]]`), a research run can start, the privacy gate passes, no
+automatic run is in flight and the rate cap allows; otherwise the answer carries the usual
 `research_offer`. The run claims no voice ownership, so it is not spoken, and
 it does not hold the conversation's run reservation: a new owner message may
 run beside it, and the web answer is then stored after that message.
@@ -153,6 +156,12 @@ branch is **not** a routine production update candidate: the separate reviewed
 schema-migration deployment procedure is required before any future release.
 
 ## Streaming and recovery
+
+Core removes a trailing `[[web_search]]` line from every chat answer before
+it is stored or published. While deltas stream, trailing whitespace and a last
+line that could still become that marker wait for more text; what is held back
+when the stream ends is never sent as a delta, and the completed message
+carries the final text.
 
 The provider-neutral `chat_stream` interface defaults to a final-only result.
 OpenAI-compatible backends decode bounded SSE and emit only `delta.content`.

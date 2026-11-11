@@ -373,7 +373,8 @@ pub(super) async fn execute_chat(
 
     // Built only on the paths that send it, after the early refusals.
     if requested_mode != llm::RoutingMode::Research {
-        chat.system = Some(super::runtime_facts::system_prompt(&state).await);
+        chat.system =
+            Some(super::runtime_facts::system_prompt(&state, user_already_published).await);
     }
 
     let llm_started = Instant::now();
@@ -396,16 +397,25 @@ pub(super) async fn execute_chat(
         let hub = state.realtime.clone();
         let run = run.clone();
         let user = authed.user.id;
+        let hold = std::sync::Mutex::new(crate::auto_research::MarkerHold::default());
         state
             .llm
             .chat_stream(
                 &chat,
                 std::sync::Arc::new(move |text| {
+                    let Ok(mut hold) = hold.lock() else {
+                        return;
+                    };
+                    let ready = hold.push(text).to_owned();
+                    drop(hold);
+                    if ready.is_empty() {
+                        return;
+                    }
                     hub.publish(
                         user,
                         Event::AssistantDelta {
                             run: run.clone(),
-                            text: text.to_string(),
+                            text: ready,
                         },
                     );
                 }),
@@ -427,6 +437,7 @@ pub(super) async fn execute_chat(
     }
     match reply {
         Ok(mut reply) => {
+            let research_advised = research_advised(&mut reply.text, requested_mode, intent_kind);
             let input_bytes = chat
                 .messages
                 .iter()
@@ -457,12 +468,7 @@ pub(super) async fn execute_chat(
                 // Only a runs-API run (its user message was persisted first)
                 // may search by itself; the legacy endpoint never does.
                 let auto = if user_already_published {
-                    crate::auto_research::start(
-                        &state,
-                        intent_kind == Some(crate::intent::WorkKind::Research),
-                        &new_msg,
-                    )
-                    .await
+                    crate::auto_research::start(&state, research_advised, &new_msg).await
                 } else {
                     None
                 };
@@ -470,7 +476,7 @@ pub(super) async fn execute_chat(
                     None
                 } else {
                     crate::intent::research_offer(
-                        intent_kind,
+                        research_advised.then_some(crate::intent::WorkKind::Research),
                         || state.llm.can_research(),
                         &new_msg,
                     )
@@ -553,6 +559,26 @@ pub(super) async fn execute_chat(
             ))
         }
     }
+}
+
+/// Stored when a reply was nothing but the web search marker.
+const MARKER_ONLY_REPLY: &str = "I can't answer this reliably without a web search.";
+
+/// Whether a web search is advised after this reply: the classifier said
+/// research, or an ordinary answer ended with the web search marker. The
+/// marker is taken off `reply` in every case, whatever the routing, so it is
+/// never stored, published or shown.
+fn research_advised(
+    reply: &mut String,
+    requested_mode: llm::RoutingMode,
+    intent_kind: Option<crate::intent::WorkKind>,
+) -> bool {
+    let taken = crate::auto_research::take_marker(reply);
+    if taken && reply.is_empty() {
+        *reply = MARKER_ONLY_REPLY.into();
+    }
+    let marked = taken && requested_mode != llm::RoutingMode::Research;
+    intent_kind == Some(crate::intent::WorkKind::Research) || marked
 }
 
 const RESEARCH_OFF: &str = "Research is off. The owner can turn on web search with \
@@ -1200,7 +1226,7 @@ pub(crate) async fn assistant_orchestrate(
     if task.len() > validation::MAX_TASK_LEN {
         return Err(bad_request("task too long"));
     }
-    let system = super::runtime_facts::system_prompt(&state).await;
+    let system = super::runtime_facts::system_prompt(&state, false).await;
     let result = orchestrator::plan_and_execute(&state.llm, task, &system).await;
     if let Err(error) = &result {
         record_failure(&state, None, error, Default::default()).await;
@@ -1439,6 +1465,42 @@ mod tests {
         let reply = research_reply(&on, &brain, "nieuws?").await;
         assert_eq!(reply.text, RESEARCH_EMPTY);
         assert_eq!(reply.model, "claude-opus-5");
+    }
+
+    #[test]
+    fn a_trailing_marker_or_the_classifier_advises_research() {
+        use crate::intent::WorkKind;
+        use llm::RoutingMode::{Auto, Deep, Research};
+        let advised = |text: &str, mode, kind| {
+            let mut text = text.to_owned();
+            (research_advised(&mut text, mode, kind), text)
+        };
+        let marked = "Short answer.\n[[web_search]]";
+        assert_eq!(advised(marked, Auto, None), (true, "Short answer.".into()));
+        assert_eq!(advised(marked, Deep, None), (true, "Short answer.".into()));
+        assert_eq!(
+            advised("[[web_search]]\n", Auto, None),
+            (true, MARKER_ONLY_REPLY.into())
+        );
+        // A Research answer never asks again, but loses the marker too.
+        assert_eq!(
+            advised(marked, Research, None),
+            (false, "Short answer.".into())
+        );
+        assert_eq!(
+            advised("[[web_search]]", Research, None),
+            (false, MARKER_ONLY_REPLY.into())
+        );
+        assert_eq!(
+            advised("Answer.", Auto, Some(WorkKind::Research)),
+            (true, "Answer.".into())
+        );
+        assert_eq!(
+            advised("Answer.", Auto, Some(WorkKind::Conversation)),
+            (false, "Answer.".into())
+        );
+        let mid = "Say [[web_search]]\nlater.";
+        assert_eq!(advised(mid, Auto, None), (false, mid.into()));
     }
 
     #[test]
