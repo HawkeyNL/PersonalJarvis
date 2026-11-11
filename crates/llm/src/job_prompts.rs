@@ -3,7 +3,9 @@
 //! text is exactly the matching constant here, so any change to this text must
 //! ship the worker binary and Core in the same release.
 
-/// The weekly review of open Dependabot alerts and pull requests.
+/// The weekly review of open Dependabot alerts and pull requests. Core
+/// accepts reasons up to 300 and a summary up to 2000 characters: headroom
+/// over the limits asked for here, on purpose.
 pub const DEPENDENCY_REVIEW_SYSTEM_PROMPT: &str =
     "You decide which open dependency security alerts and dependency update pull \
 requests of a software project the owner should handle first. Nothing you \

@@ -266,6 +266,9 @@ fn parse(text_: &str, seen: &DependencyFacts) -> Result<(Vec<Priority>, String),
     if answer.priorities.len() > MAX_PRIORITIES {
         return Err("too many priorities");
     }
+    if answer.priorities.is_empty() && !seen.alerts.is_empty() {
+        return Err("no priorities for open alerts");
+    }
     let mut priorities = answer.priorities;
     priorities.sort_by_key(|priority| priority.rank);
     let known = |reference: &str| {
@@ -494,7 +497,7 @@ mod tests {
     async fn an_answer_that_breaks_a_rule_falls_back_to_core_order() {
         let ok = json!({"ref": "a1", "rank": 1, "reason": "Fix it."});
         let many: Vec<Value> = (1..=21)
-            .map(|rank| json!({"ref": format!("a{}", (rank - 1) % 4 + 1), "rank": rank, "reason": "r"}))
+            .map(|rank| json!({"ref": format!("a{rank}"), "rank": rank, "reason": "r"}))
             .collect();
         for reply in [
             format!("Here you go: {}", answer(json!([ok]), "Done.")),
@@ -526,6 +529,7 @@ mod tests {
             answer(json!([ok]), ""),
             answer(json!([ok]), &"s".repeat(2001)),
             answer(json!([ok]), "Hidden\u{202E}text"),
+            answer(json!([]), "Nothing to do."),
             answer(json!(many), "Done."),
             "not json".to_owned(),
         ] {
@@ -598,19 +602,33 @@ mod tests {
             "Open Dependabot alerts: 4 (1 critical, 1 high, 1 medium, 1 low), 3 with a fixed \
              version. Open Dependabot pull requests: 1. Repositories not read: 1."
         );
+        // The fallback always passes the store's rules, also with the
+        // longest values the facts can hold.
+        let fits = |priorities: Vec<Priority>, summary: String| {
+            Finish {
+                summary: Some((summary, SummarySource::Deterministic)),
+                priorities,
+                ..Finish::failed("x")
+            }
+            .check()
+        };
+        assert_eq!(fits(priorities, summary), Ok(()));
+        facts.alerts[0].patched = Some("9".repeat(64));
+        facts.pull_requests[0].number = u64::MAX;
+        facts
+            .alerts
+            .extend((5..=30).map(|n| alert(n, Severity::Low, Some("1.0.0"))));
+        facts.truncated = true;
+        let (priorities, (summary, _)) = fallback(&facts);
+        assert_eq!(priorities.len(), MAX_PRIORITIES);
+        assert_eq!(fits(priorities, summary), Ok(()));
         // Nothing to order: no call.
         let empty = DependencyFacts::default();
         let (priorities, (summary, _)) = review(&brain, &empty).await;
         assert!(priorities.is_empty());
         assert!(summary.starts_with("Open Dependabot alerts: 0 "));
         assert_eq!(brain.inputs.lock().unwrap().len(), 1);
-        // The fallback always passes the store's rules.
-        let finish = Finish {
-            summary: Some((summary, SummarySource::Deterministic)),
-            priorities,
-            ..Finish::failed("x")
-        };
-        assert!(finish.check().is_ok());
+        assert_eq!(fits(priorities, summary), Ok(()));
     }
 
     #[tokio::test]

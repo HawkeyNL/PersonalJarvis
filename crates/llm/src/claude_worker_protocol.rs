@@ -11,7 +11,7 @@ pub const MAX_REPLY_BYTES: usize = 256 * 1024;
 pub const MAX_SYSTEM_BYTES: usize = 12 * 1024;
 /// Longest research prompt a worker accepts (the bounded question in UTF-8).
 pub const MAX_RESEARCH_PROMPT_BYTES: usize = 4 * crate::types::MAX_RESEARCH_QUESTION_CHARS;
-/// Longest task input: one numbers-only JSON object.
+/// Longest task input: one JSON object of data.
 pub const MAX_TASK_PROMPT_BYTES: usize = 16 * 1024;
 
 /// The reviewed CLI contract is Claude Code 2.1.248+ within its 2.1 line.
