@@ -354,7 +354,7 @@ pub(crate) mod tests {
         assert_eq!(client, server);
     }
 
-    /// Known answers (RFC 2202 / RFC 4231 test case 2), so a hash or HMAC
+    /// Known answers (RFC 2202 cases 2 and 6, RFC 4231 case 2), so a hash or HMAC
     /// dependency upgrade cannot silently change the wire signatures.
     #[test]
     fn hmac_signatures_match_rfc_vectors() {
@@ -373,6 +373,13 @@ pub(crate) mod tests {
             hmac_sha256_signature(key, data),
             "W9zBRr9gdU5qBCQmCJV1x1oAPwidJzmDnexYuWTsOEM%3D"
         );
+        // RFC 2202 case 6: a key longer than one block is hashed first, the
+        // path every live session token takes (K is ~256 bytes).
+        assert!(lst_signature_matches(
+            &[0xaa; 80],
+            "Test Using Larger Than Block-Size Key - Hash Key First",
+            "aa4ae5e15272d00e95705637ce8a3b55ed402112"
+        ));
     }
 
     #[test]
