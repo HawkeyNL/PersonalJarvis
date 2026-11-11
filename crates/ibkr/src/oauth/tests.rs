@@ -134,7 +134,7 @@ impl Fake {
                 .unwrap()
                 .to_str_radix(16);
             let lst = crypto::live_session_token(&challenge_back, &b, &p, SECRET).unwrap();
-            let mut mac = <hmac::Hmac<sha1::Sha1> as hmac::Mac>::new_from_slice(&lst).unwrap();
+            let mut mac = <hmac::Hmac<sha1::Sha1> as hmac::KeyInit>::new_from_slice(&lst).unwrap();
             hmac::Mac::update(&mut mac, CONSUMER_KEY.as_bytes());
             let mut lst_signature = hex::encode(hmac::Mac::finalize(mac).into_bytes());
             if *self.bad_lst_signature.lock().unwrap() {

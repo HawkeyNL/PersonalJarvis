@@ -3,7 +3,7 @@
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use der::{asn1::UintRef, Reader as _};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use num_bigint::BigUint;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::{rngs::OsRng, RngCore};
@@ -352,6 +352,27 @@ pub(crate) mod tests {
         let client = live_session_token(&big_b.to_str_radix(16), &a, &p, b"s").unwrap();
         let server = live_session_token(&big_a.to_str_radix(16), &b, &p, b"s").unwrap();
         assert_eq!(client, server);
+    }
+
+    /// Known answers (RFC 2202 / RFC 4231 test case 2), so a hash or HMAC
+    /// dependency upgrade cannot silently change the wire signatures.
+    #[test]
+    fn hmac_signatures_match_rfc_vectors() {
+        let (key, data) = (b"Jefe", "what do ya want for nothing?");
+        assert!(lst_signature_matches(
+            key,
+            data,
+            "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"
+        ));
+        assert!(!lst_signature_matches(
+            key,
+            data,
+            "effcdf6ae5eb2fa2d27416d5f184df9c259a7c78"
+        ));
+        assert_eq!(
+            hmac_sha256_signature(key, data),
+            "W9zBRr9gdU5qBCQmCJV1x1oAPwidJzmDnexYuWTsOEM%3D"
+        );
     }
 
     #[test]

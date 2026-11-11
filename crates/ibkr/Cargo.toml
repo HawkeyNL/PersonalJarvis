@@ -16,7 +16,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 tokio = { workspace = true }
 rust_decimal.workspace = true
 rand.workspace = true
-sha2.workspace = true
+sha2 = "0.11"
 hex.workspace = true
 zeroize = "1"
 # OAuth 1.0a: ring signs the LST request (RSA-SHA256), num-bigint does the
@@ -24,8 +24,8 @@ zeroize = "1"
 ring = "0.17"
 num-bigint = "0.4"
 der = { version = "0.7", features = ["alloc"] }
-hmac = "0.12"
-sha1 = "0.10"
+hmac = "0.13"
+sha1 = "0.11"
 base64 = "0.22"
 percent-encoding = "2"
 # Local read broker (jarvis-ibkr-broker): peer uid lookup, audit logging.
