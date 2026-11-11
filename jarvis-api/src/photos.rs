@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use axum::{
-    body::Bytes,
+    body::Body,
     extract::{Path as UrlPath, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -58,10 +58,15 @@ const QUALITY: u8 = 82;
 const FALLBACK_QUALITY: u8 = 65;
 const UPLOADS_PER_MIN: u32 = 30;
 const READS_PER_MIN: u32 = 240;
-const UPLOADS_PER_DAY: i64 = 50;
+const WRITES_PER_MIN: u32 = 60;
+const UPLOADS_PER_DAY: u32 = 50;
+/// Uploads whose body may be in memory at once, across all devices.
+const UPLOADS_IN_FLIGHT: usize = 2;
+const PENDING_HOURS: i64 = 24;
 const MAX_OWNER_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 const PRUNE_BATCH: usize = 500;
-const SWEEP_MAX_ENTRIES: usize = 10_000;
+/// Most orphan candidates handled per pass; the whole directory is scanned.
+const SWEEP_MAX_CANDIDATES: usize = 10_000;
 const ORPHAN_MIN_AGE: Duration = Duration::from_secs(60 * 60);
 const TMP_PREFIX: &str = ".tmp-";
 
@@ -172,6 +177,10 @@ pub fn sanitize(input: &[u8]) -> Result<Sanitized, PhotoError> {
     if u64::from(width) * u64::from(height) > MAX_PIXELS {
         return Err(PhotoError::TooLarge);
     }
+    // The decoders do not count their output buffer against `max_alloc`.
+    if decoder.total_bytes() > MAX_DECODE_ALLOC {
+        return Err(PhotoError::TooLarge);
+    }
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     // An animated image yields its first frame.
     let mut image = DynamicImage::from_decoder(decoder).map_err(decode_error)?;
@@ -217,6 +226,7 @@ fn flatten_on_white(image: DynamicImage) -> RgbImage {
 /// and the rest of Core runs normally.
 pub struct PhotoStore {
     dir: Option<PathBuf>,
+    uploads: Arc<Semaphore>,
     decode: Arc<Semaphore>,
 }
 
@@ -225,6 +235,7 @@ impl Default for PhotoStore {
     fn default() -> Self {
         Self {
             dir: None,
+            uploads: Arc::new(Semaphore::new(UPLOADS_IN_FLIGHT)),
             decode: Arc::new(Semaphore::new(1)),
         }
     }
@@ -305,12 +316,15 @@ fn write_file(dir: &Path, id: Uuid, jpeg: &[u8]) -> io::Result<()> {
 fn read_file(dir: &Path, id: Uuid) -> Result<Vec<u8>, PhotoError> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(file_path(dir, id))
         .map_err(|error| match error.kind() {
             io::ErrorKind::NotFound => PhotoError::NotFound,
             _ => PhotoError::Internal,
         })?;
+    if !file.metadata().is_ok_and(|meta| meta.file_type().is_file()) {
+        return Err(PhotoError::Internal);
+    }
     let mut bytes = Vec::new();
     file.take(MAX_PHOTO_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
@@ -374,7 +388,7 @@ async fn owns(state: &AppState, user: Uuid, id: Uuid) -> Result<bool, PhotoError
 
 #[derive(Deserialize)]
 struct Usage {
-    uploads: i64,
+    uploads: u32,
     bytes: i64,
 }
 
@@ -393,7 +407,17 @@ async fn check_caps(state: &AppState, user: Uuid) -> Result<(), PhotoError> {
         .take(0)
         .map_err(database_error)?;
     let usage = usage.ok_or(PhotoError::Internal)?;
-    if usage.uploads >= UPLOADS_PER_DAY {
+    // Rows only count photos that still exist; the in-memory counter also
+    // counts deleted ones, so upload-and-delete cannot reset the day.
+    // ponytail: the counter resets on restart; a ledger table if that matters.
+    let day = Duration::from_secs(24 * 60 * 60);
+    if usage.uploads >= UPLOADS_PER_DAY
+        || !state.rate_limiter.check_reserved(
+            &format!("photo-day:user:{user}"),
+            UPLOADS_PER_DAY,
+            day,
+        )
+    {
         return Err(PhotoError::DailyLimit);
     }
     if usage.bytes.saturating_add(MAX_PHOTO_BYTES as i64) > MAX_OWNER_BYTES {
@@ -407,18 +431,29 @@ async fn check_caps(state: &AppState, user: Uuid) -> Result<(), PhotoError> {
 pub(crate) async fn upload(
     auth: Authed,
     State(state): State<AppState>,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<serde_json::Value>, PhotoError> {
     if !allow_authenticated_device(&state, auth.device.id, "photo", UPLOADS_PER_MIN) {
         return Err(PhotoError::RateLimited);
     }
     let dir = state.photos.dir()?;
+    // ponytail: caps are checked before the insert, so uploads racing each
+    // other can pass a cap by a few photos; the in-flight slots bound it.
+    check_caps(&state, auth.user.id).await?;
+    // The body is read only after every cheap check, and only by a bounded
+    // number of uploads at once, each holding at most 15 MiB.
+    let _slot = state
+        .photos
+        .uploads
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| PhotoError::Busy)?;
+    let body = axum::body::to_bytes(body, MAX_UPLOAD_BYTES)
+        .await
+        .map_err(|_| PhotoError::TooLarge)?;
     if sniff(&body).is_none() {
         return Err(PhotoError::Unsupported);
     }
-    // ponytail: caps are checked before the insert, so uploads racing each
-    // other can pass a cap by a few photos; the per-device rate bounds it.
-    check_caps(&state, auth.user.id).await?;
     let decode = state.photos.decode.clone();
     // The permit moves into the blocking task, so even after a timeout no
     // second decode starts until the first one has really finished.
@@ -502,16 +537,23 @@ pub(crate) struct PatchReq {
 #[derive(Deserialize)]
 struct Kept {
     saved: bool,
+    pending: bool,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
 }
 
-/// When an unsaved photo expires; `None` once the owner keeps it.
-pub(crate) fn expires_at(saved: bool, created_at: OffsetDateTime) -> Option<String> {
-    if saved {
+/// When a photo expires: 24 hours after upload while no message carries
+/// it (kept or not), 90 days after upload once sent, never once sent and
+/// kept.
+pub(crate) fn expires_at(saved: bool, pending: bool, created_at: OffsetDateTime) -> Option<String> {
+    let after = if pending {
+        time::Duration::hours(PENDING_HOURS)
+    } else if saved {
         return None;
-    }
-    (created_at + time::Duration::days(RETENTION_DAYS))
+    } else {
+        time::Duration::days(RETENTION_DAYS)
+    };
+    (created_at + after)
         .format(&time::format_description::well_known::Rfc3339)
         .ok()
 }
@@ -523,12 +565,15 @@ pub(crate) async fn update(
     UrlPath(id): UrlPath<Uuid>,
     Json(req): Json<PatchReq>,
 ) -> Result<Json<serde_json::Value>, PhotoError> {
+    if !allow_authenticated_device(&state, auth.device.id, "photo-write", WRITES_PER_MIN) {
+        return Err(PhotoError::RateLimited);
+    }
     state.photos.dir()?;
     let rows: Vec<Kept> = state
         .db
         .query(
             "UPDATE chat_photos SET saved = $saved WHERE record::id(id) = $id AND user_id = $user \
-             RETURN saved, created_at",
+             RETURN saved, conversation_id = NONE AS pending, created_at",
         )
         .bind(json!({"id": id.to_string(), "user": auth.user.id.to_string(), "saved": req.saved}))
         .await
@@ -539,7 +584,7 @@ pub(crate) async fn update(
     Ok(Json(json!({
         "id": id,
         "saved": kept.saved,
-        "expires_at": expires_at(kept.saved, kept.created_at),
+        "expires_at": expires_at(kept.saved, kept.pending, kept.created_at),
     })))
 }
 
@@ -549,6 +594,9 @@ pub(crate) async fn delete(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<Uuid>,
 ) -> Result<StatusCode, PhotoError> {
+    if !allow_authenticated_device(&state, auth.device.id, "photo-write", WRITES_PER_MIN) {
+        return Err(PhotoError::RateLimited);
+    }
     let dir = state.photos.dir()?;
     if !owns(&state, auth.user.id, id).await? {
         return Err(PhotoError::NotFound);
@@ -567,6 +615,12 @@ pub(crate) async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Unsaved photos 90 days after upload, and photos no message carries 24
+/// hours after upload. Sending only claims photos younger than 23 hours, so
+/// a pass never removes a photo that is being sent.
+const EXPIRED: &str = "(saved = false AND created_at < time::now() - 90d) \
+    OR (conversation_id = NONE AND created_at < time::now() - 24h)";
+
 /// What one retention pass removed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Pruned {
@@ -580,11 +634,9 @@ pub struct Pruned {
 pub async fn prune(db: &jarvis_store::Database, store: &PhotoStore) -> Result<Pruned, PhotoError> {
     let dir = store.dir()?;
     let expired: Vec<String> = db
-        .query(
-            "SELECT VALUE record::id(id) FROM chat_photos \
-             WHERE (saved = false AND created_at < time::now() - 90d) \
-             OR (conversation_id = NONE AND created_at < time::now() - 24h) LIMIT $limit",
-        )
+        .query(format!(
+            "SELECT VALUE record::id(id) FROM chat_photos WHERE {EXPIRED} LIMIT $limit"
+        ))
         .bind(json!({"limit": PRUNE_BATCH}))
         .await
         .map_err(database_error)?
@@ -604,12 +656,15 @@ pub async fn prune(db: &jarvis_store::Database, store: &PhotoStore) -> Result<Pr
     })
     .await?;
     if !unlinked.is_empty() {
-        db.query("DELETE chat_photos WHERE record::id(id) IN $ids")
-            .bind(json!({"ids": unlinked}))
-            .await
-            .map_err(database_error)?
-            .check()
-            .map_err(database_error)?;
+        // The condition again: a photo kept meanwhile keeps its row.
+        db.query(format!(
+            "DELETE chat_photos WHERE record::id(id) IN $ids AND ({EXPIRED})"
+        ))
+        .bind(json!({"ids": unlinked}))
+        .await
+        .map_err(database_error)?
+        .check()
+        .map_err(database_error)?;
     }
     let orphans = sweep_orphans(db, dir).await?;
     Ok(Pruned {
@@ -676,10 +731,10 @@ fn list_old_entries(dir: &Path) -> Result<Vec<Entry>, PhotoError> {
         .checked_sub(ORPHAN_MIN_AGE)
         .ok_or(PhotoError::Internal)?;
     let mut entries = Vec::new();
-    for entry in fs::read_dir(dir)
-        .map_err(|_| PhotoError::Internal)?
-        .take(SWEEP_MAX_ENTRIES)
-    {
+    for entry in fs::read_dir(dir).map_err(|_| PhotoError::Internal)? {
+        if entries.len() >= SWEEP_MAX_CANDIDATES {
+            break;
+        }
         let Ok(entry) = entry else { continue };
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.file_type().is_file() || meta.modified().map_or(true, |m| m > cutoff) {
@@ -874,7 +929,7 @@ mod tests {
 
     /// A PNG that only claims a size: valid signature and IHDR, then a
     /// tiny IDAT. A decoder that trusted the header would allocate for it.
-    fn png_header(width: u32, height: u32) -> Vec<u8> {
+    fn png_header(width: u32, height: u32, bit_depth: u8) -> Vec<u8> {
         let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
         let mut chunk = |kind: &[u8], data: &[u8]| {
             out.extend((data.len() as u32).to_be_bytes());
@@ -885,7 +940,7 @@ mod tests {
         };
         let mut ihdr = width.to_be_bytes().to_vec();
         ihdr.extend(height.to_be_bytes());
-        ihdr.extend([8, 6, 0, 0, 0]);
+        ihdr.extend([bit_depth, 6, 0, 0, 0]);
         chunk(b"IHDR", &ihdr);
         chunk(b"IDAT", &[0x78, 0x9C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]);
         chunk(b"IEND", &[]);
@@ -894,13 +949,24 @@ mod tests {
 
     #[test]
     fn decompression_bombs_are_refused_from_the_header() {
-        for (width, height) in [(20_000, 20_000), (10_001, 1), (7_000, 7_000)] {
+        for (width, height, depth) in [
+            (20_000, 20_000, 8),
+            (10_001, 1, 8),
+            (7_000, 7_000, 8),
+            // Under 40 MP, but 16-bit RGBA needs 280 MB of pixels.
+            (7_000, 5_000, 16),
+        ] {
             assert_eq!(
-                sanitize(&png_header(width, height)).unwrap_err(),
+                sanitize(&png_header(width, height, depth)).unwrap_err(),
                 PhotoError::TooLarge,
-                "{width}x{height}"
+                "{width}x{height}x{depth}"
             );
         }
+        // The same size in 8 bits passes the limits and fails on its data.
+        assert_eq!(
+            sanitize(&png_header(7_000, 5_000, 8)).unwrap_err(),
+            PhotoError::Invalid
+        );
     }
 
     #[test]
@@ -972,6 +1038,12 @@ mod tests {
         assert_eq!(read_file(&dir, id).unwrap_err(), PhotoError::NotFound);
         // Removing a missing file is fine.
         remove_file(&dir, id).unwrap();
+        // A FIFO in place of a photo neither blocks nor reads.
+        let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_file(&dir, id).unwrap_err(), PhotoError::Internal);
+        fs::remove_file(&path).unwrap();
         // A symlink in place of a photo is never followed.
         std::os::unix::fs::symlink(root.path().join("elsewhere"), &path).unwrap();
         assert_eq!(read_file(&dir, id).unwrap_err(), PhotoError::Internal);
@@ -981,10 +1053,17 @@ mod tests {
     fn expiry_is_ninety_days_after_upload_unless_saved() {
         let at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         assert_eq!(
-            expires_at(false, at).as_deref(),
+            expires_at(false, false, at).as_deref(),
             Some("2024-02-12T22:13:20Z")
         );
-        assert_eq!(expires_at(true, at), None);
+        assert_eq!(expires_at(true, false, at), None);
+        // Unsent photos go after a day, kept or not.
+        for saved in [false, true] {
+            assert_eq!(
+                expires_at(saved, true, at).as_deref(),
+                Some("2023-11-15T22:13:20Z")
+            );
+        }
     }
 
     #[tokio::test]
