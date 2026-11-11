@@ -97,6 +97,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         memecoin: Default::default(),
         auto_research: Default::default(),
         github: Default::default(),
+        jobs: Default::default(),
     }
 }
 
@@ -2339,5 +2340,216 @@ async fn roadmap_sync_and_link_allowlist_routes() -> Result<(), Box<dyn std::err
     let kept = update(3, json!([pr("x/y", 1), pr("a/b", 3)])).await?;
     assert_eq!(kept.status(), StatusCode::OK);
     assert_eq!(json_body(kept).await["roadmap"]["revision"], 4);
+    Ok(())
+}
+
+const JOB_ROUTES: [(&str, &str); 7] = [
+    ("GET", "/v1/jobs"),
+    ("POST", "/v1/jobs"),
+    (
+        "PATCH",
+        "/v1/jobs/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b?expected_revision=1",
+    ),
+    (
+        "DELETE",
+        "/v1/jobs/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b?expected_revision=1",
+    ),
+    ("POST", "/v1/jobs/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/run"),
+    (
+        "GET",
+        "/v1/jobs/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/runs?limit=5",
+    ),
+    ("GET", "/v1/jobs/runs/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c"),
+];
+
+#[tokio::test]
+async fn job_routes_refuse_missing_or_invalid_sessions() {
+    // An unconnected database cannot authenticate any token.
+    let app = build_router(state(jarvis_store::Database::init(), None).await);
+    for (method, path) in JOB_ROUTES {
+        for authorization in [None, Some("Bearer not-a-session")] {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(value) = authorization {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    request
+                        .body(Body::from(r#"{"kind":"dependency_review"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn job_routes_validate_and_guard_revisions() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let app = build_router(state(db, None).await);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let call = |method: &str, path: &str, body: Option<String>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if body.is_some() {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        app.clone().oneshot(
+            request
+                .body(body.map_or_else(Body::empty, Body::from))
+                .unwrap(),
+        )
+    };
+
+    // The test state has no time zone: jobs are stored but do not run.
+    let listed = json_body(call("GET", "/v1/jobs", None).await?).await;
+    assert_eq!(listed["status"], "not_configured");
+    assert_eq!(listed["time_zone"], "Europe/Amsterdam");
+    assert_eq!(listed["jobs"], json!([]));
+    for bad in [
+        json!({"kind": "research"}),
+        json!({"kind": "dependency_review", "prompt": "summarize my mail"}),
+        json!({"kind": "dependency_review", "cadence": "daily", "weekday": 1}),
+        json!({"kind": "dependency_review", "at_minute": 1440}),
+        json!({"kind": "dependency_review", "params": {"roadmap_id": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"}}),
+    ] {
+        let status = call("POST", "/v1/jobs", Some(bad.to_string()))
+            .await?
+            .status();
+        assert!(status.is_client_error(), "{bad} {status}");
+    }
+    let created = call(
+        "POST",
+        "/v1/jobs",
+        Some(json!({"kind": "dependency_review"}).to_string()),
+    )
+    .await?;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = json_body(created).await;
+    assert_eq!(
+        (
+            &created["cadence"],
+            &created["weekday"],
+            &created["at_minute"],
+            &created["enabled"],
+            &created["revision"],
+            &created["next_run_at"],
+        ),
+        (
+            &json!("weekly"),
+            &json!(1),
+            &json!(420),
+            &json!(true),
+            &json!(1),
+            &Value::Null
+        )
+    );
+    let id = created["id"].as_str().ok_or("id")?.to_owned();
+    let again = call(
+        "POST",
+        "/v1/jobs",
+        Some(json!({"kind": "dependency_review"}).to_string()),
+    )
+    .await?;
+    assert_eq!(again.status(), StatusCode::CONFLICT);
+
+    let patch = |revision: u64, body: Value| {
+        call(
+            "PATCH",
+            &format!("/v1/jobs/{id}?expected_revision={revision}"),
+            Some(body.to_string()),
+        )
+    };
+    let daily = patch(1, json!({"cadence": "daily", "at_minute": 360})).await?;
+    assert_eq!(daily.status(), StatusCode::OK);
+    let daily = json_body(daily).await;
+    assert_eq!(
+        (&daily["revision"], &daily["weekday"]),
+        (&json!(2), &Value::Null)
+    );
+    assert_eq!(
+        patch(1, json!({"enabled": false})).await?.status(),
+        StatusCode::CONFLICT
+    );
+    for bad in [
+        json!({"weekday": 3}),
+        json!({"kind": "dependency_review"}),
+        json!({"params": {"roadmap_id": "plan"}}),
+    ] {
+        let status = patch(2, bad.clone()).await?.status();
+        assert!(status.is_client_error(), "{bad} {status}");
+    }
+    let too_large = patch(2, json!({"params": {"roadmap_id": "r".repeat(8 * 1024)}})).await?;
+    assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // Running needs the runner; nothing ran.
+    let run = call("POST", &format!("/v1/jobs/{id}/run"), None).await?;
+    assert_eq!(run.status(), StatusCode::CONFLICT);
+    let runs = json_body(call("GET", &format!("/v1/jobs/{id}/runs"), None).await?).await;
+    assert_eq!(runs["runs"], json!([]));
+    assert_eq!(
+        call("GET", &format!("/v1/jobs/{id}/runs?limit=51"), None)
+            .await?
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let unknown = uuid::Uuid::now_v7();
+    assert_eq!(
+        call("GET", &format!("/v1/jobs/{unknown}/runs"), None)
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call("GET", &format!("/v1/jobs/runs/{unknown}"), None)
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    assert_eq!(
+        call(
+            "DELETE",
+            &format!("/v1/jobs/{id}?expected_revision=1"),
+            None
+        )
+        .await?
+        .status(),
+        StatusCode::CONFLICT
+    );
+    let deleted = call(
+        "DELETE",
+        &format!("/v1/jobs/{id}?expected_revision=2"),
+        None,
+    )
+    .await?;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let listed = json_body(call("GET", "/v1/jobs", None).await?).await;
+    assert_eq!(listed["jobs"], json!([]));
     Ok(())
 }

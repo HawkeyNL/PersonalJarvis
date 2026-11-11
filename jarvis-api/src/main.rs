@@ -649,6 +649,7 @@ async fn main() -> anyhow::Result<()> {
         )),
         auto_research: Default::default(),
         github,
+        jobs: Arc::new(jarvis_api::jobs::JobsHandle::new()),
     };
 
     jarvis_api::refresh_usage_snapshot(&state).await;
@@ -699,6 +700,9 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!(reason, "GitHub roadmap sync disabled");
         }
     }
+    // Scheduled jobs (docs/SCHEDULED_JOBS.md); off when the time zone
+    // database cannot be read.
+    jarvis_api::jobs::start(state.db.clone(), state.jobs.clone(), state.realtime.clone());
     if config.memecoin_paper_enabled {
         if let Err(reason) = start_memecoin_paper(&config, &state).await {
             tracing::error!(%reason, "memecoin paper trader disabled");
