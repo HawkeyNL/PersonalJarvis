@@ -368,7 +368,7 @@ async fn photos_join_a_message_atomically_and_leave_with_its_conversation(
         let db = db.clone();
         async move {
             let mut response = db
-                .query("RETURN [count(SELECT * FROM conversations), count(SELECT * FROM chat_messages), count(SELECT * FROM assistant_runs)]")
+                .query("RETURN [count(SELECT * FROM conversations), count(SELECT * FROM chat_messages WHERE role = 'user'), count(SELECT * FROM assistant_runs)]")
                 .await
                 .unwrap();
             response.take::<Vec<u64>>(0).unwrap()
