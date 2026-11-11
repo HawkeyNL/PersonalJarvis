@@ -370,6 +370,29 @@ pub(crate) async fn remove_files(store: &PhotoStore, ids: Vec<Uuid>) {
     }
 }
 
+/// The stored photos with these ids, for the model, read in one blocking
+/// task. The caller passes only ids it already checked against the owner
+/// and the conversation. A photo that cannot be read (gone, not a JPEG) is
+/// left out; storage that is off reads nothing.
+pub(crate) async fn read_for_model(
+    store: &PhotoStore,
+    ids: Vec<Uuid>,
+) -> std::collections::HashMap<Uuid, jarvis_llm::ImageData> {
+    let Ok(dir) = store.dir() else {
+        return Default::default();
+    };
+    blocking(move || {
+        ids.into_iter()
+            .filter_map(|id| {
+                let bytes = read_file(&dir, id).ok()?;
+                Some((id, jarvis_llm::ImageData::jpeg(bytes)?))
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
 fn database_error<E>(_: E) -> PhotoError {
     PhotoError::Internal
 }

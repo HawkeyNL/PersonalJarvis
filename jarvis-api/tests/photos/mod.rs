@@ -531,3 +531,195 @@ async fn photos_join_a_message_atomically_and_leave_with_its_conversation(
     assert!(dir.join(format!("{foreign}.jpg")).exists());
     Ok(())
 }
+
+/// Records every chat request it gets; answers with photo markers, or as a
+/// router without a vision worker would when `no_vision` is set. Research
+/// must never be reached.
+#[derive(Default)]
+struct SeesPhotos {
+    seen: std::sync::Mutex<Vec<jarvis_llm::ChatRequest>>,
+    no_vision: std::sync::atomic::AtomicBool,
+    research: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl jarvis_llm::LlmProvider for SeesPhotos {
+    fn label(&self) -> &str {
+        "sees-photos"
+    }
+    fn can_research(&self) -> bool {
+        true
+    }
+    async fn chat(
+        &self,
+        req: &jarvis_llm::ChatRequest,
+    ) -> Result<jarvis_llm::ChatReply, jarvis_llm::LlmError> {
+        self.seen.lock().unwrap().push(req.clone());
+        if req.has_images() && self.no_vision.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(jarvis_llm::LlmError::NotConfigured(
+                "no vision-capable subscription worker".into(),
+            ));
+        }
+        Ok(jarvis_llm::ChatReply {
+            text: "Here it is:\n[[photo:2]]\n[[photo:7]]".into(),
+            model: "fixture-model".into(),
+            backend: Some("claude-cli".into()),
+            requested_route: None,
+            actual_provider: None,
+            fallback_count: 0,
+            stop_reason: Some("end_turn".into()),
+            usage: None,
+        })
+    }
+    async fn research(
+        &self,
+        _: &jarvis_llm::ResearchRequest,
+    ) -> Result<jarvis_llm::ChatReply, jarvis_llm::LlmError> {
+        self.research
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(jarvis_llm::LlmError::Empty)
+    }
+}
+
+/// The next completed answer on a display, and whether it offered research.
+async fn completed(
+    display: &mut jarvis_api::realtime::Subscription,
+) -> (jarvis_client_core::realtime::CanonicalMessage, bool) {
+    loop {
+        let envelope =
+            tokio::time::timeout(std::time::Duration::from_secs(10), display.receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        if let jarvis_client_core::realtime::Event::AssistantCompleted {
+            message,
+            research_offer,
+            ..
+        } = &envelope.event
+        {
+            return (message.clone(), research_offer.is_some());
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn the_model_sees_this_runs_photos_and_can_show_one_back(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jarvis_client_core::realtime::Event;
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("photos_model_{}", Uuid::now_v7().simple()))
+        .use_db("fixture")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let owner = jarvis_identity::first_user_or_create(&db, "fixture owner").await?;
+    let (device, token) = realtime::device_token(&db, owner.id).await;
+    let other_owner = jarvis_identity::create_user(&db, "other fixture owner").await?;
+    let (other_device, _) = realtime::device_token(&db, other_owner.id).await;
+    let root = tempfile::tempdir()?;
+    let dir = root.path().join("photos");
+    let brain = Arc::new(SeesPhotos::default());
+    let mut fixture = state(db.clone(), None).await;
+    fixture.photos = Arc::new(PhotoStore::open(&dir));
+    fixture.llm = brain.clone();
+    let hub = fixture.realtime.clone();
+    let app = build_router(fixture);
+    let mut display = hub.subscribe(owner.id, device).unwrap();
+    let mut other_display = hub.subscribe(other_owner.id, other_device).unwrap();
+    for display in [&mut display, &mut other_display] {
+        assert!(matches!(
+            display.receiver.recv().await.unwrap().event,
+            Event::ConnectionReady { .. }
+        ));
+    }
+
+    let first = upload(&app, &token).await;
+    let second = upload(&app, &token).await;
+    let request = json!({"request_id": Uuid::now_v7(), "attachments": [first, second],
+        "messages": [{"role": "user", "content": ""}]});
+    let (status, submitted) = realtime::post(&app, &token, "/v1/assistant/runs", request).await;
+    assert_eq!(status, StatusCode::OK, "{submitted}");
+    let (message, offered) = completed(&mut display).await;
+    // Only a label of this run attaches; every marker leaves the text.
+    assert_eq!(message.content, "Here it is:");
+    assert_eq!(message.attachments, [second]);
+    assert!(!offered);
+    {
+        let seen = brain.seen.lock().unwrap();
+        let request = seen.last().unwrap();
+        let turn = request.messages.last().unwrap();
+        assert_eq!(turn.content, "[photo 1] [photo 2]");
+        let stored: Vec<Vec<u8>> = [first, second]
+            .iter()
+            .map(|id| std::fs::read(dir.join(format!("{id}.jpg"))).unwrap())
+            .collect();
+        let sent: Vec<&[u8]> = turn.images.iter().map(|image| image.bytes()).collect();
+        assert_eq!(sent, stored.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        assert!(request
+            .system
+            .as_deref()
+            .unwrap()
+            .ends_with("put a line that is exactly [[photo:N]]."));
+    }
+    assert!(other_display.receiver.try_recv().is_err());
+
+    // With no worker that can read photos, a fixed answer is stored and no
+    // other backend, web search or offer follows.
+    brain
+        .no_vision
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut follow = json!({"request_id": Uuid::now_v7(),
+        "messages": [{"role": "user", "content": "What colour is it?"}]});
+    follow["conversation_id"] = submitted["conversation_id"].clone();
+    let mut status = StatusCode::CONFLICT;
+    for _ in 0..100 {
+        (status, _) = realtime::post(&app, &token, "/v1/assistant/runs", follow.clone()).await;
+        if status != StatusCode::CONFLICT {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(status, StatusCode::OK);
+    let (message, offered) = completed(&mut display).await;
+    assert!(message
+        .content
+        .starts_with("I can't look at photos right now"));
+    assert!(message.attachments.is_empty());
+    assert!(!offered);
+    {
+        let seen = brain.seen.lock().unwrap();
+        let request = seen.last().unwrap();
+        // The earlier photos are still in the window, labelled again.
+        let contents: Vec<&str> = request
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                "[photo 1] [photo 2]",
+                "[photo shown]\nHere it is:",
+                "What colour is it?"
+            ]
+        );
+        assert_eq!(request.messages[0].images.len(), 2);
+    }
+    assert_eq!(brain.research.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let path = format!(
+        "/v1/conversations/{}",
+        submitted["conversation_id"].as_str().unwrap()
+    );
+    let history = json_body(send(&app, &token, "GET", &path, "", vec![]).await).await;
+    assert_eq!(
+        history["messages"][1]["attachments"],
+        json!([second.to_string()])
+    );
+    assert!(other_display.receiver.try_recv().is_err());
+    Ok(())
+}

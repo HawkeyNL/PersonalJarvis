@@ -280,18 +280,27 @@ pub(super) async fn execute_chat(
     let user_already_published = persisted_user_message.is_some();
     let user_message = match persisted_user_message {
         Some(message) => message,
-        None => append_message(&state.db, conv_id, authed.user.id, "user", &new_msg, None)
-            .await
-            .map_err(|_| internal_error())?,
-    };
-    let canonical_history = if user_already_published {
-        Some(
-            super::chat_context::load(&state.db, authed.user.id, &user_message)
-                .await
-                .map_err(|_| internal_error())?,
+        None => append_message(
+            &state.db,
+            conv_id,
+            authed.user.id,
+            "user",
+            &new_msg,
+            None,
+            &[],
         )
+        .await
+        .map_err(|_| internal_error())?,
+    };
+    // Only the runs API carries photos: their labels for this run.
+    let (canonical_history, photo_labels) = if user_already_published {
+        let (messages, labels) =
+            super::chat_context::load(&state.db, &state.photos, authed.user.id, &user_message)
+                .await
+                .map_err(|_| internal_error())?;
+        (Some(messages), labels)
     } else {
-        None
+        (None, Vec::new())
     };
     if let Some(run) = &realtime_run {
         if !user_already_published {
@@ -398,9 +407,15 @@ pub(super) async fn execute_chat(
 
     // Built only on the paths that send it, after the early refusals.
     if requested_mode != llm::RoutingMode::Research {
-        chat.system =
-            Some(super::runtime_facts::system_prompt(&state, user_already_published).await);
+        let mut system = super::runtime_facts::system_prompt(&state, user_already_published).await;
+        if !photo_labels.is_empty() {
+            add_photo_sentence(&mut system);
+        }
+        chat.system = Some(system);
     }
+    // Photos in the model input, new or from recent turns: no web search
+    // follows and none is offered.
+    let image_turn = photo_turn || chat.has_images();
 
     let llm_started = Instant::now();
     let request_id = realtime_run
@@ -463,10 +478,27 @@ pub(super) async fn execute_chat(
     match reply {
         Ok(mut reply) => {
             let research_advised = research_advised(&mut reply.text, requested_mode, intent_kind);
+            // A web answer never shows a photo; a chat answer only one of
+            // this run's photos.
+            let labels: &[(u8, Uuid)] = if requested_mode == llm::RoutingMode::Research {
+                &[]
+            } else {
+                &photo_labels
+            };
+            let shown = take_photo_markers(&mut reply.text, labels);
+            if reply.text.trim().is_empty() && shown.is_empty() {
+                reply.text = PHOTO_NOT_FOUND_REPLY.into();
+            }
             let input_bytes = chat
                 .messages
                 .iter()
-                .map(|m| m.content.len().saturating_add(32))
+                .map(|m| {
+                    let images = m.images.iter().map(|image| image.bytes().len() / 4);
+                    m.content
+                        .len()
+                        .saturating_add(32)
+                        .saturating_add(images.sum())
+                })
                 .sum::<usize>()
                 .saturating_add(chat.system.as_ref().map_or(0, String::len));
             let status = estimate_missing_usage(&mut reply, input_bytes, chat.max_tokens);
@@ -486,6 +518,7 @@ pub(super) async fn execute_chat(
                 "assistant",
                 &reply.text,
                 Some(stored_model(requested_mode, &reply).as_str()),
+                &shown,
             )
             .await
             .map_err(|_| internal_error())?;
@@ -493,12 +526,12 @@ pub(super) async fn execute_chat(
                 // Only a runs-API run (its user message was persisted first)
                 // may search by itself; the legacy endpoint never does. A
                 // turn with photos never leads to a web search.
-                let auto = if user_already_published && !photo_turn {
+                let auto = if user_already_published && !image_turn {
                     crate::auto_research::start(&state, research_advised, &new_msg).await
                 } else {
                     None
                 };
-                let research_offer = if auto.is_some() || photo_turn {
+                let research_offer = if auto.is_some() || image_turn {
                     None
                 } else {
                     crate::intent::research_offer(
@@ -546,12 +579,28 @@ pub(super) async fn execute_chat(
                 "intent_kind": intent_kind.map(crate::intent::WorkKind::as_str),
             })))
         }
-        Err(llm::LlmError::Refused) => {
-            let text = "Sorry, I can't answer that.";
-            let message =
-                append_message(&state.db, conv_id, authed.user.id, "assistant", text, None)
-                    .await
-                    .map_err(|_| internal_error())?;
+        // A refusal, or photos with no subscription worker to read them: a
+        // fixed answer is stored; the owner's photo stays with the message.
+        Err(error)
+            if matches!(error, llm::LlmError::Refused)
+                || (chat.has_images() && matches!(error, llm::LlmError::NotConfigured(_))) =>
+        {
+            let (text, stop_reason) = if matches!(error, llm::LlmError::Refused) {
+                ("Sorry, I can't answer that.", "refusal")
+            } else {
+                (NO_VISION_REPLY, "vision_unavailable")
+            };
+            let message = append_message(
+                &state.db,
+                conv_id,
+                authed.user.id,
+                "assistant",
+                text,
+                None,
+                &[],
+            )
+            .await
+            .map_err(|_| internal_error())?;
             if let Some(run) = &realtime_run {
                 state.realtime.publish(
                     authed.user.id,
@@ -565,7 +614,7 @@ pub(super) async fn execute_chat(
             Ok(Json(json!({
                 "reply": text,
                 "model": Value::Null,
-                "stop_reason": "refusal",
+                "stop_reason": stop_reason,
                 "conversation_id": conv_id,
                 "conversation_title": conv_title,
                 "new_topic": new_topic,
@@ -585,6 +634,82 @@ pub(super) async fn execute_chat(
             ))
         }
     }
+}
+
+/// Stored when photos were in the input but neither subscription worker
+/// could take them. No other backend is tried.
+const NO_VISION_REPLY: &str = "I can't look at photos right now: photos only go to \
+your Claude or Codex subscription worker, and neither is available. Your photo is kept \
+with your message.";
+/// Stored when a reply was nothing but photo markers that matched no photo.
+const PHOTO_NOT_FOUND_REPLY: &str = "I can't show that photo.";
+const PHOTO_SENTENCE: &str = "The owner attached photos labelled [photo N]. To show one \
+of them back, put a line that is exactly [[photo:N]].";
+
+/// Tell the model how to show a photo back, if the worker's system cap
+/// leaves room; the labels in the turns stand on their own otherwise.
+fn add_photo_sentence(system: &mut String) {
+    if system.len() + 2 + PHOTO_SENTENCE.len() <= llm::claude_worker_protocol::MAX_SYSTEM_BYTES {
+        system.push_str("\n\n");
+        system.push_str(PHOTO_SENTENCE);
+    }
+}
+
+/// Take every `[[photo:N]]` off a reply, so none is ever stored or shown.
+/// A line that is exactly one marker naming a label of this run shows that
+/// photo (each once, at most four); any other marker, inline or with an
+/// unknown number, is only removed.
+fn take_photo_markers(text: &mut String, labels: &[(u8, Uuid)]) -> Vec<Uuid> {
+    if !text.contains(PHOTO_MARKER) {
+        return Vec::new();
+    }
+    let mut shown = Vec::new();
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        match photo_marker(line.trim()) {
+            Some((number, "")) => {
+                let label = labels.iter().find(|(label, _)| u32::from(*label) == number);
+                if let Some((_, id)) = label {
+                    if !shown.contains(id) && shown.len() < crate::photos::MAX_ATTACHMENTS {
+                        shown.push(*id);
+                    }
+                }
+            }
+            _ => kept.push(without_inline_markers(line)),
+        }
+    }
+    *text = kept.join("\n").trim_matches('\n').to_string();
+    shown
+}
+
+const PHOTO_MARKER: &str = "[[photo:";
+
+/// `[[photo:N]]` at the start of `text`: N (1 to 3 digits) and the rest.
+fn photo_marker(text: &str) -> Option<(u32, &str)> {
+    let rest = text.strip_prefix(PHOTO_MARKER)?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let rest_after = rest[digits..].strip_prefix("]]")?;
+    (1..=3)
+        .contains(&digits)
+        .then(|| rest[..digits].parse().ok().map(|n| (n, rest_after)))
+        .flatten()
+}
+
+fn without_inline_markers(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find(PHOTO_MARKER) {
+        out.push_str(&rest[..start]);
+        match photo_marker(&rest[start..]) {
+            Some((_, after)) => rest = after,
+            None => {
+                out.push_str(PHOTO_MARKER);
+                rest = &rest[start + PHOTO_MARKER.len()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Stored when a reply was nothing but the web search marker.
@@ -829,6 +954,10 @@ async fn auto_research_answer(
     let mut reply = research_reply(routing, brain, question).await;
     // A web page may inject a trailing marker; strip it like any answer.
     research_advised(&mut reply.text, llm::RoutingMode::Research, None);
+    take_photo_markers(&mut reply.text, &[]);
+    if reply.text.trim().is_empty() {
+        reply.text = RESEARCH_EMPTY.into();
+    }
     reply.backend.is_some().then(|| {
         let model = stored_model(llm::RoutingMode::Research, &reply);
         (reply, model)
@@ -1015,15 +1144,23 @@ async fn append_message(
     role: &str,
     content: &str,
     model: Option<&str>,
+    attachments: &[Uuid],
 ) -> Result<CanonicalMessage, ()> {
     let id = Uuid::now_v7();
     let at = OffsetDateTime::now_utc();
-    let res = db.query(
+    // Without photos the statement is exactly the old one.
+    let attachments_field = if attachments.is_empty() {
+        ""
+    } else {
+        ", attachments = $attachments"
+    };
+    let res = db.query(format!(
         "BEGIN TRANSACTION; CREATE chat_messages SET id = $id, conversation_id = $conversation_id, \
-         user_id = $user_id, role = $role, content = $content, model = $model, created_at = <datetime>$at; \
+         user_id = $user_id, role = $role, content = $content, model = $model, created_at = <datetime>$at{attachments_field}; \
          UPDATE conversations SET updated_at = time::now() WHERE record::id(id) = $conversation_id AND user_id = $user_id; COMMIT TRANSACTION;",
-    ).bind(json!({"id": id.to_string(), "at": at.format(&time::format_description::well_known::Rfc3339).map_err(|_| ())?, "conversation_id": conv_id.to_string(),
-        "user_id": user_id.to_string(), "role": role, "content": content, "model": model})).await;
+    )).bind(json!({"id": id.to_string(), "at": at.format(&time::format_description::well_known::Rfc3339).map_err(|_| ())?, "conversation_id": conv_id.to_string(),
+        "user_id": user_id.to_string(), "role": role, "content": content, "model": model,
+        "attachments": attachments.iter().map(Uuid::to_string).collect::<Vec<_>>()})).await;
     res.map_err(|_| ())?.check().map_err(|_| ())?;
     Ok(CanonicalMessage {
         id,
@@ -1036,7 +1173,7 @@ async fn append_message(
         content: content.to_string(),
         model: model.map(str::to_string),
         created_at: at,
-        attachments: Vec::new(),
+        attachments: attachments.to_vec(),
     })
 }
 
@@ -1330,6 +1467,55 @@ pub(crate) async fn assistant_orchestrate(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn photo_markers_show_only_this_runs_photos_and_never_stay_in_the_text() {
+        let ids: Vec<Uuid> = (1..=5).map(Uuid::from_u128).collect();
+        let labels: Vec<(u8, Uuid)> = (1..=4).map(|n| (n as u8, ids[n - 1])).collect();
+        let take = |text: &str| {
+            let mut text = text.to_string();
+            let shown = take_photo_markers(&mut text, &labels);
+            (text, shown)
+        };
+        assert_eq!(
+            take("Here it is:\n[[photo:2]]\nA red square."),
+            ("Here it is:\nA red square.".to_string(), vec![ids[1]])
+        );
+        // Unknown numbers, inline markers and near misses never attach.
+        assert_eq!(
+            take("[[photo:9]]\nSee [[photo:1]] above.\n  [[photo:3]]  \n[[photo:]]\n[[photo:1]] x"),
+            ("See  above.\n[[photo:]]\n x".to_string(), vec![ids[2]])
+        );
+        // Each photo once, in reply order, at most four.
+        let (text, shown) =
+            take("[[photo:4]]\n[[photo:4]]\n[[photo:1]]\n[[photo:2]]\n[[photo:3]]\nDone.");
+        assert_eq!(text, "Done.");
+        assert_eq!(shown, [ids[3], ids[0], ids[1], ids[2]]);
+        // Without labels (a web answer, or no photos) markers only vanish.
+        let mut web = "Answer\n[[photo:1]]\nSources:".to_string();
+        assert!(take_photo_markers(&mut web, &[]).is_empty());
+        assert_eq!(web, "Answer\nSources:");
+        // Text without markers is untouched, whitespace included.
+        let mut plain = "  Line one\r\nLine two\n".to_string();
+        assert!(take_photo_markers(&mut plain, &labels).is_empty());
+        assert_eq!(plain, "  Line one\r\nLine two\n");
+        assert_eq!(take("[[photo:0004]]").1, Vec::<Uuid>::new());
+    }
+
+    #[test]
+    fn the_photo_sentence_respects_the_worker_system_cap() {
+        let max = llm::claude_worker_protocol::MAX_SYSTEM_BYTES;
+        let mut system = "persona".to_string();
+        add_photo_sentence(&mut system);
+        assert!(system.ends_with(PHOTO_SENTENCE));
+        let full = "p".repeat(max - PHOTO_SENTENCE.len() - 1);
+        let mut unchanged = full.clone();
+        add_photo_sentence(&mut unchanged);
+        assert_eq!(unchanged, full);
+        let mut fits = "p".repeat(max - PHOTO_SENTENCE.len() - 2);
+        add_photo_sentence(&mut fits);
+        assert_eq!(fits.len(), max);
+    }
 
     /// Records what research received; ordinary chat must never be used.
     #[derive(Default)]
