@@ -690,6 +690,18 @@ async fn main() -> anyhow::Result<()> {
             config.ibkr_broker_socket.clone().into(),
         );
     }
+    // Scheduled jobs (docs/SCHEDULED_JOBS.md); off when the time zone
+    // database cannot be read. The dependency review reads GitHub with the
+    // poller's token and allowlist.
+    jarvis_api::jobs::start(
+        state.db.clone(),
+        state.jobs.clone(),
+        state.realtime.clone(),
+        jarvis_api::jobs::Work {
+            github: state.github.clone(),
+            token: github_token.clone(),
+        },
+    );
     if let Some(token) = github_token {
         if let Err(reason) = jarvis_api::roadmaps::github::start(
             state.db.clone(),
@@ -700,9 +712,6 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!(reason, "GitHub roadmap sync disabled");
         }
     }
-    // Scheduled jobs (docs/SCHEDULED_JOBS.md); off when the time zone
-    // database cannot be read.
-    jarvis_api::jobs::start(state.db.clone(), state.jobs.clone(), state.realtime.clone());
     if config.memecoin_paper_enabled {
         if let Err(reason) = start_memecoin_paper(&config, &state).await {
             tracing::error!(%reason, "memecoin paper trader disabled");

@@ -8,6 +8,7 @@
 //! forward by the gap (02:30 becomes 03:30); a minute that occurs twice on a
 //! fall-back day runs once, at its first occurrence.
 
+mod dependency_review;
 pub mod store;
 
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,7 @@ use std::time::Duration;
 
 use jiff::tz::TimeZone;
 use jiff::{civil, Timestamp};
+use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::sync::Notify;
@@ -23,6 +25,7 @@ use jarvis_client_core::realtime::Event;
 use jarvis_store::Database;
 
 use crate::realtime::Hub;
+use crate::roadmaps::github::GithubHandle;
 use store::Finish;
 
 /// The zone every schedule is in.
@@ -500,10 +503,19 @@ impl JobsHandle {
     }
 }
 
+/// What runs need besides the database.
+pub struct Work {
+    /// The GitHub poller's allowlist; the dependency review reads only
+    /// those repositories.
+    pub github: Arc<GithubHandle>,
+    /// The poller's read-only token; none when it is not configured.
+    pub token: Option<HeaderValue>,
+}
+
 /// Spawn the runner unless the time zone failed to load. Every minute, or
 /// when the owner asks, it runs what is due: one run at a time, its row
 /// written before its work starts.
-pub fn start(db: Database, handle: Arc<JobsHandle>, events: Hub) {
+pub fn start(db: Database, handle: Arc<JobsHandle>, events: Hub, work: Work) {
     let Some(tz) = handle.tz.clone() else {
         return;
     };
@@ -512,6 +524,7 @@ pub fn start(db: Database, handle: Arc<JobsHandle>, events: Hub) {
         handle,
         events,
         tz,
+        work,
     };
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(TICK);
@@ -563,6 +576,7 @@ struct Runner {
     handle: Arc<JobsHandle>,
     events: Hub,
     tz: TimeZone,
+    work: Work,
 }
 
 impl Runner {
@@ -648,8 +662,7 @@ impl Runner {
 
     async fn work(&self, job: &Job) -> Finish {
         match job.kind {
-            // Its facts source comes next; until then it cannot run.
-            Kind::DependencyReview => Finish::failed("not_configured"),
+            Kind::DependencyReview => dependency_review::run(&self.work).await,
         }
     }
 
@@ -1055,6 +1068,10 @@ mod tests {
             handle: handle.clone(),
             events: hub.clone(),
             tz: tz(),
+            work: Work {
+                github: Arc::default(),
+                token: None,
+            },
         };
         let input = serde_json::json!({"kind": "dependency_review", "cadence": "daily"});
         let job = store::create(&db, serde_json::from_value(input)?, None).await?;
@@ -1086,7 +1103,7 @@ mod tests {
         );
 
         // A day after the job was made, its newest slot runs once. Without
-        // its facts source the run fails, and is announced.
+        // a GitHub token the run fails, and is announced.
         let now = job.updated_at + time::Duration::hours(26);
         let slot = job.latest_slot(now, &tz()).ok_or("slot")?;
         runner.pass(now).await;
