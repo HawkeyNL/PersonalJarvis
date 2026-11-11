@@ -199,7 +199,23 @@ async fn photo_routes_are_owner_scoped_bounded_and_inert() -> Result<(), Box<dyn
     assert_eq!(response.status(), StatusCode::OK);
     let kept = json_body(response).await;
     assert_eq!(kept["saved"], true);
-    assert_eq!(kept["expires_at"], Value::Null);
+    // Not sent yet: it still goes a day after upload.
+    let day_after = kept["expires_at"].as_str().unwrap().to_string();
+    // Once sent, a kept photo never expires.
+    db.query("UPDATE chat_photos SET conversation_id = 'c' WHERE record::id(id) = $id")
+        .bind(json!({"id": id.to_string()}))
+        .await?
+        .check()?;
+    let response = send(
+        &app,
+        &token,
+        "PATCH",
+        &path,
+        "application/json",
+        br#"{"saved":true}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(json_body(response).await["expires_at"], Value::Null);
     let response = send(
         &app,
         &token,
@@ -211,7 +227,7 @@ async fn photo_routes_are_owner_scoped_bounded_and_inert() -> Result<(), Box<dyn
     .await;
     let unkept = json_body(response).await;
     assert_eq!(unkept["saved"], false);
-    assert!(unkept["expires_at"].is_string());
+    assert!(unkept["expires_at"].as_str().unwrap() > day_after.as_str());
     for body in [
         br#"{"saved":true,"user_id":"x"}"#.to_vec(),
         br#"{"saved":"yes"}"#.to_vec(),
