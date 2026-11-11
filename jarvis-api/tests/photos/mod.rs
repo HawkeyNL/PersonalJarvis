@@ -449,6 +449,30 @@ async fn photos_join_a_message_atomically_and_leave_with_its_conversation(
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    // A photo about to expire unsent is not claimed.
+    let late = upload(&app, &token).await;
+    db.query("UPDATE chat_photos SET created_at = time::now() - 23h30m WHERE record::id(id) = $id")
+        .bind(json!({"id": late.to_string()}))
+        .await?
+        .check()?;
+    let (status, _) =
+        realtime::post(&app, &token, "/v1/assistant/runs", run(vec![late], "Late")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(pending(late).await);
+    // A continued conversation takes photos too.
+    let third = upload(&app, &token).await;
+    let mut more = run(vec![third], "And this one");
+    more["conversation_id"] = json!(submitted["conversation_id"]);
+    let mut status = StatusCode::CONFLICT;
+    for _ in 0..100 {
+        (status, _) = realtime::post(&app, &token, "/v1/assistant/runs", more.clone()).await;
+        if status != StatusCode::CONFLICT {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(status, StatusCode::OK);
+    assert!(!pending(third).await);
     let path = format!("/v1/conversations/{conversation}");
     let response = send(&app, &token, "GET", &path, "", vec![]).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -468,7 +492,7 @@ async fn photos_join_a_message_atomically_and_leave_with_its_conversation(
         })
         .collect();
     listed.sort();
-    let mut want = vec![first.to_string(), second.to_string()];
+    let mut want = vec![first.to_string(), second.to_string(), third.to_string()];
     want.sort();
     assert_eq!(listed, want);
     let response = send(&app, &other_token, "GET", &path, "", vec![]).await;
@@ -497,7 +521,7 @@ async fn photos_join_a_message_atomically_and_leave_with_its_conversation(
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert_eq!(deleted, StatusCode::OK);
-    for id in [first, second] {
+    for id in [first, second, third] {
         assert!(!dir.join(format!("{id}.jpg")).exists());
         let response = send(&app, &token, "GET", &format!("/v1/photos/{id}"), "", vec![]).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);

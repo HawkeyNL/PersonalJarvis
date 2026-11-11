@@ -74,11 +74,12 @@ async fn load(state: &AppState, user: Uuid, id: Uuid) -> Result<Option<Stored>, 
     result.take(0).map_err(|_| unavailable())
 }
 
-/// Whether every id is one of the caller's photos that no message carries.
+/// Whether every id is one of the caller's photos that no message carries
+/// and that may still be sent.
 async fn pending_photos(state: &AppState, user: Uuid, ids: &[String]) -> Result<bool, ApiError> {
     let found: Vec<String> = state
         .db
-        .query("SELECT VALUE record::id(id) FROM chat_photos WHERE record::id(id) IN $ids AND user_id = $user AND conversation_id = NONE")
+        .query("SELECT VALUE record::id(id) FROM chat_photos WHERE record::id(id) IN $ids AND user_id = $user AND conversation_id = NONE AND created_at > time::now() - 23h")
         .bind(json!({"ids": ids, "user": user.to_string()}))
         .await
         .map_err(|_| unavailable())?
@@ -217,13 +218,19 @@ pub(crate) async fn submit(
     let attachments: Vec<String> = message.attachments.iter().map(Uuid::to_string).collect();
     // Photos join the message in the same transaction: only the caller's
     // own photos that no message carries yet, all of them or the whole
-    // submission rolls back. A text-only message keeps the old statements.
+    // submission rolls back. The conversation must still exist then, or the
+    // photos would belong to nothing; and a photo about to expire unsent is
+    // not claimed while retention may be removing it. A text-only message
+    // keeps the old statements.
     let (attach, attachments_field) = if attachments.is_empty() {
         ("", "")
     } else {
         (
-            "LET $attached = (UPDATE chat_photos SET conversation_id = $conversation \
-             WHERE record::id(id) IN $attachments AND user_id = $user AND conversation_id = NONE RETURN AFTER); \
+            "IF $fresh = false AND array::len((SELECT VALUE id FROM conversations \
+             WHERE record::id(id) = $conversation AND user_id = $user)) != 1 { THROW 'conversation unavailable'; }; \
+             LET $attached = (UPDATE chat_photos SET conversation_id = $conversation \
+             WHERE record::id(id) IN $attachments AND user_id = $user AND conversation_id = NONE \
+             AND created_at > time::now() - 23h RETURN AFTER); \
              IF array::len($attached) != array::len($attachments) { THROW 'photo unavailable'; }; ",
             ", attachments = $attachments",
         )

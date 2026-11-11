@@ -1166,7 +1166,7 @@ pub(crate) async fn get_conversation(
         .into_iter()
         .map(|photo| {
             json!({ "id": photo.id, "saved": photo.saved,
-                "expires_at": crate::photos::expires_at(photo.saved, photo.created_at) })
+                "expires_at": crate::photos::expires_at(photo.saved, false, photo.created_at) })
         })
         .collect();
     Ok(Json(
