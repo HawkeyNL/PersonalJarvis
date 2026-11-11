@@ -73,8 +73,8 @@ Public events:
 
 The trading, roadmap and job events are hints to reload over REST and carry
 only ids, versions, statuses and flags, never market data or model text.
-They go to every connected owner. Apps before 0.1.27 close the socket on an event type they do
-not know; 0.1.27 and later ignore it.
+They go to every connected owner. Apps before 0.1.27 close the socket on an
+event type they do not know; 0.1.27 and later ignore it.
 
 There are no arbitrary tool payloads, hidden reasoning fields, provider response
 objects, authorization headers, system prompts or private scratchpads in these

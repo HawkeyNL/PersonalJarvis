@@ -20,7 +20,8 @@ use crate::memecoin::agent::Brain;
 use crate::roadmaps::github::{self, DependencyAlert, DependencyFacts, Severity};
 use crate::roadmaps::store::Proposal;
 use crate::roadmaps::{
-    Link, LinkKind, NewItem, ProposalOp, RoadmapError, Snapshot, MAX_ITEM_TITLE, MAX_PROPOSAL_OPS,
+    Link, LinkKind, NewItem, ProposalOp, RoadmapError, Snapshot, MAX_ITEMS, MAX_ITEM_TITLE,
+    MAX_PROPOSAL_OPS,
 };
 
 /// Read the facts with the GitHub poller's token and allowlist (without
@@ -64,13 +65,25 @@ async fn propose(
 ) -> Result<Option<String>, &'static str> {
     let snapshot = bounded(crate::roadmaps::store::get(db, roadmap_id))
         .await
-        .map_err(|_| "roadmap_proposal_failed")?
+        .map_err(proposal_error)?
         .filter(|snapshot| snapshot.roadmap.archived_at.is_none())
         .ok_or("roadmap_unavailable")?;
     let pending = bounded(crate::roadmaps::store::list_proposals(db, roadmap_id))
         .await
-        .map_err(|_| "roadmap_proposal_failed")?;
+        .map_err(proposal_error)?;
     submit(db, &snapshot, &pending, facts).await
+}
+
+fn proposal_error(error: RoadmapError) -> &'static str {
+    match error {
+        RoadmapError::Stale | RoadmapError::Conflict => "roadmap_changed",
+        RoadmapError::Limit(_) => "roadmap_limit",
+        RoadmapError::NotFound | RoadmapError::Archived => "roadmap_unavailable",
+        error => {
+            tracing::warn!(%error, "dependency review: roadmap proposal failed");
+            "roadmap_proposal_failed"
+        }
+    }
 }
 
 /// Record the proposal on `snapshot`'s revision; a roadmap that changed
@@ -92,16 +105,7 @@ async fn submit(
         &ops,
         Some("Upgrades with a fixed version, from the scheduled dependency review."),
     );
-    match bounded(created).await {
-        Ok(id) => Ok(Some(id)),
-        Err(RoadmapError::Stale | RoadmapError::Conflict) => Err("roadmap_changed"),
-        Err(RoadmapError::Limit(_)) => Err("roadmap_limit"),
-        Err(RoadmapError::NotFound | RoadmapError::Archived) => Err("roadmap_unavailable"),
-        Err(error) => {
-            tracing::warn!(%error, "dependency review: roadmap proposal failed");
-            Err("roadmap_proposal_failed")
-        }
-    }
+    bounded(created).await.map(Some).map_err(proposal_error)
 }
 
 fn link_key(link: &Link) -> Option<(String, u64)> {
@@ -111,7 +115,8 @@ fn link_key(link: &Link) -> Option<(String, u64)> {
 /// One new item per fixable alert, most severe first: "Upgrade {package} to
 /// {version} ({repo})", linked to its Dependabot pull request when there is
 /// one. An upgrade whose title or pull request is already on the roadmap or
-/// in a pending proposal (or earlier in this one) is left out; at most 20.
+/// in a pending proposal (or earlier in this one) is left out; at most 20,
+/// and no more than the roadmap has room for.
 fn proposal_ops(
     snapshot: &Snapshot,
     pending: &[Proposal],
@@ -135,8 +140,14 @@ fn proposal_ops(
         titles.insert(title.to_lowercase());
         links.extend(item_links.iter().filter_map(link_key));
     }
+    let room = MAX_ITEMS
+        .saturating_sub(snapshot.items.len())
+        .min(MAX_PROPOSAL_OPS);
     let mut ops = Vec::new();
     for alert in &facts.alerts {
+        if ops.len() == room {
+            break;
+        }
         let Some(version) = &alert.patched else {
             continue;
         };
@@ -173,9 +184,6 @@ fn proposal_ops(
                 ..NewItem::default()
             },
         });
-        if ops.len() == MAX_PROPOSAL_OPS {
-            break;
-        }
     }
     ops
 }
@@ -756,7 +764,7 @@ mod tests {
         // Already on the roadmap by title (any case) or by pull request, or
         // in a pending proposal: left out.
         let on_roadmap = snapshot(vec![
-            item_on("upgrade CRATE-3 to 2.0.0 (owner/repo)"),
+            item("upgrade CRATE-3 to 2.0.0 (owner/repo)", Vec::new()),
             item("Ship crate-1", vec![pr_link("owner/repo", 234)]),
         ]);
         let pending = Proposal {
@@ -773,21 +781,27 @@ mod tests {
         many.alerts = (1..=30)
             .map(|n| alert(n, Severity::High, Some("1.0.0")))
             .collect();
-        many.alerts.push(alert(1, Severity::Low, Some("1.0.0")));
+        many.alerts
+            .insert(1, alert(1, Severity::Low, Some("1.0.0")));
         let ops = proposal_ops(&snapshot(Vec::new()), &[], &many);
-        assert_eq!(ops.len(), MAX_PROPOSAL_OPS);
+        let titles = titles(&ops);
+        assert_eq!(titles.len(), MAX_PROPOSAL_OPS);
+        assert_eq!(titles[1], "Upgrade crate-2 to 1.0.0 (Owner/Repo)");
         assert_eq!(
-            titles(&ops).iter().collect::<BTreeSet<_>>().len(),
+            titles.iter().collect::<BTreeSet<_>>().len(),
             MAX_PROPOSAL_OPS
         );
+        // No more than the roadmap has room for.
+        let full = snapshot(
+            (0..crate::roadmaps::MAX_ITEMS - 2)
+                .map(|n| item(&format!("Item {n}"), Vec::new()))
+                .collect(),
+        );
+        assert_eq!(proposal_ops(&full, &[], &many).len(), 2);
         // A title over the roadmap's bound is left out.
         let mut long = facts.clone();
         long.alerts[0].package = "p".repeat(190);
         assert_eq!(proposal_ops(&snapshot(Vec::new()), &[], &long).len(), 2);
-    }
-
-    fn item_on(title: &str) -> crate::roadmaps::Item {
-        item(title, Vec::new())
     }
 
     async fn database() -> Result<Database, Box<dyn std::error::Error>> {
