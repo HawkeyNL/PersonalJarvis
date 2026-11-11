@@ -13,6 +13,16 @@ pub const MAX_SYSTEM_BYTES: usize = 12 * 1024;
 pub const MAX_RESEARCH_PROMPT_BYTES: usize = 4 * crate::types::MAX_RESEARCH_QUESTION_CHARS;
 /// Longest task input: one JSON object of data.
 pub const MAX_TASK_PROMPT_BYTES: usize = 16 * 1024;
+/// Most photos one chat request carries.
+pub const MAX_IMAGES: usize = 4;
+/// Largest decoded photo: Core's sanitizer never stores a bigger one.
+pub const MAX_IMAGE_BYTES: usize = 1024 * 1024;
+/// Largest request line with photos. A request without photos keeps
+/// [`MAX_REQUEST_BYTES`].
+pub const MAX_IMAGE_REQUEST_BYTES: usize = 6 * 1024 * 1024;
+const _: () = assert!(
+    MAX_IMAGE_REQUEST_BYTES > MAX_REQUEST_BYTES + MAX_IMAGES * (MAX_IMAGE_BYTES * 4 / 3 + 64)
+);
 
 /// The reviewed CLI contract is Claude Code 2.1.248+ within its 2.1 line.
 /// `--restricted` first appeared in 2.1.248. A later minor/major line needs
@@ -69,6 +79,60 @@ pub struct ClaudeWorkerRequest {
     /// shape; a worker that predates the field refuses it as unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<WorkerTask>,
+    /// The owner's photos for an ordinary chat run, oldest first: `[photo N]`
+    /// in the prompt is the Nth. Never on a research run or a task. Omitted
+    /// when empty, so a request without photos keeps its exact shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<WorkerImage>,
+}
+
+/// One photo on the wire: a base64 JPEG. Debug never prints the data.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerImage {
+    pub media_type: String,
+    pub data: String,
+}
+
+impl WorkerImage {
+    pub fn jpeg(bytes: &[u8]) -> Self {
+        use base64::Engine;
+        Self {
+            media_type: "image/jpeg".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    /// The decoded photo, only when it is a whole, bounded JPEG: the worker
+    /// re-checks what Core sent.
+    pub fn decoded(&self) -> Option<Vec<u8>> {
+        use base64::Engine;
+        if self.media_type != "image/jpeg" || self.data.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 {
+            return None;
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.data)
+            .ok()?;
+        (bytes.len() <= MAX_IMAGE_BYTES
+            && bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+            && bytes.ends_with(&[0xFF, 0xD9]))
+        .then_some(bytes)
+    }
+}
+
+impl std::fmt::Debug for WorkerImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "<{} base64 {} bytes>",
+            if self.media_type == "image/jpeg" {
+                "jpeg"
+            } else {
+                "other"
+            },
+            self.data.len()
+        )
+    }
 }
 
 /// The fixed-prompt tasks the Claude worker runs. Each one shares the single
@@ -122,6 +186,21 @@ impl ClaudeWorkerRequest {
                 .as_deref()
                 .is_none_or(|value| value.len() <= MAX_SYSTEM_BYTES)
             && valid_worker_model(&self.model)
+            // Photos only on an ordinary chat run, each a bounded JPEG.
+            && (self.images.is_empty()
+                || (!self.research
+                    && self.task.is_none()
+                    && self.images.len() <= MAX_IMAGES
+                    && self.images.iter().all(|image| image.decoded().is_some())))
+    }
+
+    /// The largest request line a worker reads for this request.
+    pub fn max_line_bytes(&self) -> usize {
+        if self.images.is_empty() {
+            MAX_REQUEST_BYTES
+        } else {
+            MAX_IMAGE_REQUEST_BYTES
+        }
     }
 }
 
@@ -197,6 +276,7 @@ mod tests {
             prompt: "hello".into(),
             research: false,
             task: None,
+            images: Vec::new(),
         };
         assert!(request.valid());
         assert!(!serde_json::to_string(&request)
@@ -209,6 +289,7 @@ mod tests {
             prompt: "x".repeat(MAX_RESEARCH_PROMPT_BYTES),
             research: true,
             task: None,
+            images: Vec::new(),
         };
         assert!(research.valid());
         assert!(!ClaudeWorkerRequest {
@@ -229,6 +310,7 @@ mod tests {
                 prompt: "hello".into(),
                 research: true,
                 task: None,
+                images: Vec::new(),
             }
             .valid());
         }
@@ -244,6 +326,7 @@ mod tests {
             prompt: "hello".into(),
             research: false,
             task: None,
+            images: Vec::new(),
         }
         .valid());
     }
@@ -256,6 +339,7 @@ mod tests {
             prompt,
             research: false,
             task: Some(task),
+            images: Vec::new(),
         }
     }
 
@@ -315,8 +399,94 @@ mod tests {
         // What an older Core sends still parses, as an ordinary request.
         let old = r#"{"protocol":1,"model":"m","system":null,"prompt":"hi"}"#;
         let request = serde_json::from_str::<ClaudeWorkerRequest>(old).unwrap();
-        assert!(request.task.is_none() && request.valid());
+        assert!(request.task.is_none() && request.images.is_empty() && request.valid());
         assert_eq!(serde_json::to_string(&request).unwrap(), old);
+        assert_eq!(request.max_line_bytes(), MAX_REQUEST_BYTES);
+    }
+
+    /// A tiny whole JPEG: start and end markers around a marker byte.
+    fn jpeg(marker: u8) -> Vec<u8> {
+        vec![0xFF, 0xD8, 0xFF, 0xE0, marker, 0xFF, 0xD9]
+    }
+
+    fn photo_request(images: Vec<WorkerImage>) -> ClaudeWorkerRequest {
+        ClaudeWorkerRequest {
+            protocol: 1,
+            model: "claude-sonnet-5".into(),
+            system: Some("You are Jarvis.".into()),
+            prompt: "User: [photo 1]\nWhat is this?\nJarvis:".into(),
+            research: false,
+            task: None,
+            images,
+        }
+    }
+
+    #[test]
+    fn photos_ride_only_on_chat_runs_as_bounded_jpegs() {
+        let four = (0..4)
+            .map(|n| WorkerImage::jpeg(&jpeg(n)))
+            .collect::<Vec<_>>();
+        let request = photo_request(four.clone());
+        assert!(request.valid());
+        assert_eq!(request.max_line_bytes(), MAX_IMAGE_REQUEST_BYTES);
+        assert_eq!(four[2].decoded(), Some(jpeg(2)));
+
+        let mut five = four.clone();
+        five.push(WorkerImage::jpeg(&jpeg(4)));
+        assert!(!photo_request(five).valid());
+        // Never with a web search or a typed task.
+        assert!(!ClaudeWorkerRequest {
+            research: true,
+            system: Some(crate::types::RESEARCH_SYSTEM_PROMPT.into()),
+            prompt: "question".into(),
+            ..photo_request(four.clone())
+        }
+        .valid());
+        let task = WorkerTask::MemeDecision;
+        assert!(!ClaudeWorkerRequest {
+            task: Some(task),
+            system: Some(task.system_prompt().into()),
+            prompt: "{}".into(),
+            ..photo_request(four.clone())
+        }
+        .valid());
+
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xD9];
+        let mut largest = jpeg(0);
+        largest.splice(4..5, vec![0; MAX_IMAGE_BYTES - largest.len() + 1]);
+        assert_eq!(largest.len(), MAX_IMAGE_BYTES);
+        assert!(photo_request(vec![WorkerImage::jpeg(&largest)]).valid());
+        let mut oversized = largest.clone();
+        oversized.insert(4, 0);
+        let mut wrong_type = WorkerImage::jpeg(&jpeg(0));
+        wrong_type.media_type = "image/png".into();
+        for bad in [
+            WorkerImage::jpeg(&png),
+            WorkerImage::jpeg(&jpeg(0)[..5]),
+            WorkerImage::jpeg(&oversized),
+            WorkerImage::jpeg(&[]),
+            wrong_type,
+            WorkerImage {
+                media_type: "image/jpeg".into(),
+                data: "not base64!".into(),
+            },
+        ] {
+            assert!(bad.decoded().is_none(), "{bad:?}");
+            assert!(!photo_request(vec![bad]).valid());
+        }
+    }
+
+    #[test]
+    fn photo_data_is_never_printed_and_unknown_photo_fields_are_refused() {
+        let image = WorkerImage::jpeg(&jpeg(7));
+        let printed = format!("{:?}", photo_request(vec![image.clone()]));
+        assert!(printed.contains("<jpeg base64 12 bytes>"), "{printed}");
+        assert!(!printed.contains(&image.data), "{printed}");
+        let wire = serde_json::to_value(photo_request(vec![image])).unwrap();
+        assert_eq!(wire["images"][0]["media_type"], "image/jpeg");
+        let mut extra = wire.clone();
+        extra["images"][0]["url"] = "https://example.org/x.jpg".into();
+        assert!(serde_json::from_value::<ClaudeWorkerRequest>(extra).is_err());
     }
 
     #[test]

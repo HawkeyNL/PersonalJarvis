@@ -96,8 +96,9 @@ async fn main() -> Result<()> {
             let reply = match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request(&mut stream))
                 .await
             {
-                // Typed tasks are Claude-only; this worker refuses them.
-                Ok(Ok(request)) if request.task.is_none() => {
+                // Typed tasks are Claude-only; this worker refuses them. Photo
+                // runs need their own reviewed invocation; refused until then.
+                Ok(Ok(request)) if request.task.is_none() && request.images.is_empty() => {
                     match background_slot(&request, &research_permits) {
                         Some(_research_permit) => {
                             let deadline = reply_deadline(&request);
@@ -718,6 +719,7 @@ mod tests {
             prompt: "hi".into(),
             research,
             task: None,
+            images: Vec::new(),
         };
         assert_eq!(
             environment(&exec_command(&request(false), workdir, None)),

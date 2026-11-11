@@ -81,6 +81,14 @@ pub fn is_metered_backend(backend_id: &str) -> bool {
         || (backend_id == "ollama" && OLLAMA_REMOTE.load(Ordering::Relaxed))
 }
 
+/// The only backends that may receive photos: the owner's own subscription
+/// workers. A paid API, Ollama or any other backend never sees an image.
+pub(crate) fn is_vision_backend(backend_id: &str) -> bool {
+    matches!(backend_id, "claude-cli" | "codex-cli")
+}
+
+const NO_VISION: &str = "no vision-capable subscription worker";
+
 /// What a model is good for — mirrors `jarvis_registry::ModelClass` so the router
 /// can pick per task without depending on the registry crate (ADR-028 fase 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,8 +485,14 @@ impl LlmProvider for RouterProvider {
         req: &ChatRequest,
         sink: crate::TextDeltaSink,
     ) -> Result<ChatReply, LlmError> {
+        let images = req.has_images();
         for (candidate, pinned) in self.plan(req.tier, req.model.is_none(), req.provider.as_deref())
         {
+            // Photos go to a subscription worker or nowhere: a pinned
+            // non-vision brain ends the run, it never falls back.
+            if images && !is_vision_backend(&candidate.id) {
+                continue;
+            }
             if self.paid_api_now_refuses(&candidate.id) {
                 continue;
             }
@@ -503,17 +517,28 @@ impl LlmProvider for RouterProvider {
             }
             return result;
         }
-        Err(LlmError::NotConfigured(
-            "no owner-enabled capable brain".into(),
-        ))
+        Err(LlmError::NotConfigured(if images {
+            NO_VISION.into()
+        } else {
+            "no owner-enabled capable brain".into()
+        }))
     }
 
     async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
-        let plan = self.plan(req.tier, req.model.is_none(), req.provider.as_deref());
+        let images = req.has_images();
+        let plan: Vec<_> = self
+            .plan(req.tier, req.model.is_none(), req.provider.as_deref())
+            .into_iter()
+            // Photos go to a subscription worker or nowhere: a pinned
+            // non-vision brain ends the run, it never falls back.
+            .filter(|(candidate, _)| !images || is_vision_backend(&candidate.id))
+            .collect();
         if plan.is_empty() {
-            return Err(LlmError::NotConfigured(
-                "no capable brain for this tier".into(),
-            ));
+            return Err(LlmError::NotConfigured(if images {
+                NO_VISION.into()
+            } else {
+                "no capable brain for this tier".into()
+            }));
         }
         let mut last = None;
         let mut fallback_count = 0u32;
@@ -559,7 +584,16 @@ impl LlmProvider for RouterProvider {
                 }
             }
         }
-        Err(last.unwrap_or_else(|| LlmError::NotConfigured("no brain answered".into())))
+        Err(last.unwrap_or_else(|| {
+            LlmError::NotConfigured(
+                if images {
+                    NO_VISION
+                } else {
+                    "no brain answered"
+                }
+                .into(),
+            )
+        }))
     }
 
     /// Research runs only when the owner turned it on, and only on the
@@ -1998,5 +2032,203 @@ mod tests {
         ] {
             assert!(!is_loopback_url(url), "{url}");
         }
+    }
+
+    /// Each attempt: the backend and how many photos it was handed.
+    type Seen = Arc<Mutex<Vec<(&'static str, usize)>>>;
+
+    /// Records how many photos each backend was handed; `failing` ones error.
+    struct SeesImages {
+        id: &'static str,
+        seen: Seen,
+        ok: bool,
+    }
+    #[async_trait]
+    impl LlmProvider for SeesImages {
+        fn label(&self) -> &str {
+            self.id
+        }
+        async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
+            let images = req.messages.iter().map(|m| m.images.len()).sum();
+            self.seen.lock().unwrap().push((self.id, images));
+            if !self.ok {
+                return Err(LlmError::Api {
+                    status: 503,
+                    body: String::new(),
+                });
+            }
+            Fixed {
+                label: self.id.into(),
+                ok: true,
+            }
+            .chat(req)
+            .await
+        }
+    }
+
+    const VISION_FLEET: [&str; 6] = [
+        "ollama",
+        "anthropic-api",
+        "openai-api",
+        "zai-api",
+        "claude-cli",
+        "codex-cli",
+    ];
+
+    fn vision_router(
+        ids: &[&'static str],
+        raw_routing: &str,
+        failing: &[&str],
+    ) -> (RouterProvider, Seen) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let candidates = ids
+            .iter()
+            .map(|&id| Candidate {
+                id: id.into(),
+                provider: Arc::new(SeesImages {
+                    id,
+                    seen: seen.clone(),
+                    ok: !failing.contains(&id),
+                }),
+            })
+            .collect();
+        let mut policy = allow_catalog(&catalog());
+        policy
+            .models
+            .extend(ids.iter().map(|id| crate::ModelAccessEntry {
+                provider: id.to_string(),
+                model: "vision-test".into(),
+                enabled: true,
+                source: "test".into(),
+                route: None,
+            }));
+        let router = RouterProvider::with_policy(candidates, always_available(), catalog(), policy)
+            .with_routing(Arc::new(LiveRouting::new(routing(raw_routing))));
+        (router, seen)
+    }
+
+    /// Every backend of the fleet, paid APIs and Ollama first.
+    const EVERYONE_FIRST_PAID: &str = r#"{"version":1,"tiers":{"default":{"chain":[
+        {"provider":"anthropic-api","model":"vision-test"},
+        {"provider":"ollama","model":"vision-test"},
+        {"provider":"openai-api","model":"vision-test"},
+        {"provider":"zai-api","model":"vision-test"},
+        {"provider":"claude-cli","model":"vision-test"},
+        {"provider":"codex-cli","model":"vision-test"}]}}}"#;
+
+    fn photo_request(provider: Option<&str>) -> ChatRequest {
+        let photo = crate::ImageData::jpeg(vec![0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+        ChatRequest {
+            messages: vec![ChatMessage {
+                images: vec![photo.clone(), photo],
+                ..ChatMessage::user("[photo 1] [photo 2]\nWhat is this?")
+            }],
+            provider: provider.map(str::to_string),
+            // A model each pinned backend accepts, so only the photo guard
+            // can stop the attempt.
+            model: provider.map(|provider| {
+                match provider {
+                    "claude-cli" => "claude-haiku-4-5",
+                    "ollama" => "llama3.2",
+                    _ => "vision-test",
+                }
+                .to_string()
+            }),
+            ..ask(Tier::Default, None)
+        }
+    }
+
+    #[tokio::test]
+    async fn photos_reach_only_the_subscription_workers_in_chain_order() {
+        let (router, seen) = vision_router(&VISION_FLEET, EVERYONE_FIRST_PAID, &[]);
+        let reply = router.chat(&photo_request(None)).await.unwrap();
+        assert_eq!(reply.text, "claude-cli");
+        assert_eq!(*seen.lock().unwrap(), [("claude-cli", 2)]);
+
+        // A failing Claude worker falls through to Codex, never to a paid API.
+        let (router, seen) = vision_router(&VISION_FLEET, EVERYONE_FIRST_PAID, &["claude-cli"]);
+        let reply = router.chat(&photo_request(None)).await.unwrap();
+        assert_eq!(reply.text, "codex-cli");
+        assert_eq!(*seen.lock().unwrap(), [("claude-cli", 2), ("codex-cli", 2)]);
+
+        // Both failing: the error, and still no other backend was asked.
+        let (router, seen) = vision_router(
+            &VISION_FLEET,
+            EVERYONE_FIRST_PAID,
+            &["claude-cli", "codex-cli"],
+        );
+        assert!(router.chat(&photo_request(None)).await.is_err());
+        assert_eq!(*seen.lock().unwrap(), [("claude-cli", 2), ("codex-cli", 2)]);
+
+        // The same request without photos still follows the owner's chain.
+        let (router, _) = vision_router(&VISION_FLEET, EVERYONE_FIRST_PAID, &[]);
+        let text = ask(Tier::Default, None);
+        assert_eq!(router.chat(&text).await.unwrap().text, "anthropic-api");
+    }
+
+    #[tokio::test]
+    async fn photos_without_a_vision_worker_are_not_configured_and_reach_nobody() {
+        let paid_only = ["ollama", "anthropic-api", "openai-api", "zai-api"];
+        let (router, seen) = vision_router(&paid_only, EVERYONE_FIRST_PAID, &[]);
+        let error = router.chat(&photo_request(None)).await.unwrap_err();
+        assert!(
+            matches!(&error, LlmError::NotConfigured(why) if why == NO_VISION),
+            "{error:?}"
+        );
+        let sink: crate::TextDeltaSink = Arc::new(|_| {});
+        let error = router
+            .chat_stream(&photo_request(None), sink)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, LlmError::NotConfigured(why) if why == NO_VISION),
+            "{error:?}"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pinned_non_vision_brain_never_falls_back_for_photos() {
+        for pinned in ["anthropic-api", "openai-api", "ollama", "zai-api"] {
+            let (router, seen) = vision_router(&VISION_FLEET, EVERYONE_FIRST_PAID, &[]);
+            let error = router.chat(&photo_request(Some(pinned))).await.unwrap_err();
+            assert!(
+                matches!(&error, LlmError::NotConfigured(why) if why == NO_VISION),
+                "{pinned}: {error:?}"
+            );
+            let sink: crate::TextDeltaSink = Arc::new(|_| {});
+            assert!(router
+                .chat_stream(&photo_request(Some(pinned)), sink)
+                .await
+                .is_err());
+            assert!(seen.lock().unwrap().is_empty(), "{pinned}");
+            // Without photos the same pin is answered by that backend.
+            let mut text = photo_request(Some(pinned));
+            text.messages[0].images.clear();
+            assert_eq!(router.chat(&text).await.unwrap().text, pinned);
+        }
+        // A pinned subscription worker gets the photos.
+        for pinned in ["claude-cli", "codex-cli"] {
+            let (router, seen) = vision_router(&VISION_FLEET, EVERYONE_FIRST_PAID, &[]);
+            let sink: crate::TextDeltaSink = Arc::new(|_| {});
+            let reply = router
+                .chat_stream(&photo_request(Some(pinned)), sink)
+                .await
+                .unwrap();
+            assert_eq!(reply.text, pinned);
+            assert_eq!(*seen.lock().unwrap(), [(pinned, 2)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_photo_runs_skip_to_the_first_vision_worker() {
+        let (router, seen) = vision_router(&VISION_FLEET, EVERYONE_FIRST_PAID, &[]);
+        let sink: crate::TextDeltaSink = Arc::new(|_| {});
+        let reply = router
+            .chat_stream(&photo_request(None), sink)
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "claude-cli");
+        assert_eq!(*seen.lock().unwrap(), [("claude-cli", 2)]);
     }
 }
