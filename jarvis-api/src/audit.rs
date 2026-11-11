@@ -172,7 +172,8 @@ pub async fn prune_security_audit(db: &jarvis_store::Database) -> Result<usize, 
 /// no new one arrives, then apply retention to audit rows, to the expired
 /// login challenges and pairing requests that anonymous callers can create,
 /// to the paper trader's candidate decisions and gate snapshots, to roadmap
-/// history and decided or expired roadmap proposals, and to job runs.
+/// history and decided or expired roadmap proposals, to job runs and to chat
+/// photos.
 pub async fn run_audit_maintenance(state: &AppState) {
     flush_dropped_audit(state).await;
     match tokio::time::timeout(
@@ -229,6 +230,23 @@ pub async fn run_audit_maintenance(state: &AppState) {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => tracing::warn!(%error, "job run retention failed"),
         Err(_) => tracing::warn!("job run retention timed out"),
+    }
+    if state.photos.is_available() {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            crate::photos::prune(&state.db, &state.photos),
+        )
+        .await
+        {
+            Ok(Ok(pruned)) if pruned != crate::photos::Pruned::default() => tracing::info!(
+                expired = pruned.expired,
+                orphans = pruned.orphans,
+                "photo retention"
+            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "photo retention failed"),
+            Err(_) => tracing::warn!("photo retention timed out"),
+        }
     }
 }
 

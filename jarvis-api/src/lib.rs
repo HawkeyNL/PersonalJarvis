@@ -43,6 +43,7 @@ pub mod model_control;
 pub mod notify;
 mod peer;
 mod persona;
+pub mod photos;
 mod rate_limit;
 pub mod realtime;
 pub mod roadmaps;
@@ -295,6 +296,17 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/coding/sessions/{id}/{mode}",
             post(coding_start_or_resume),
+        )
+        .route(
+            "/v1/photos",
+            post(photos::upload).layer(DefaultBodyLimit::max(photos::MAX_UPLOAD_BYTES)),
+        )
+        .route(
+            "/v1/photos/{id}",
+            get(photos::download)
+                .patch(photos::update)
+                .delete(photos::delete)
+                .layer(DefaultBodyLimit::max(photos::PATCH_BODY_LIMIT)),
         )
         .route("/v1/conversations", get(list_conversations))
         .route(

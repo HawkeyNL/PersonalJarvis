@@ -240,4 +240,7 @@ pub struct AppState {
     pub github: Arc<crate::roadmaps::github::GithubHandle>,
     /// The scheduled jobs runner; off when its time zone cannot be loaded.
     pub jobs: Arc<crate::jobs::JobsHandle>,
+    /// Chat photo files and the single decode slot; unavailable (503) when
+    /// the directory failed its startup checks.
+    pub photos: Arc<crate::photos::PhotoStore>,
 }
