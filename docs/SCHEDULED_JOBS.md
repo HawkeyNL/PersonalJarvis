@@ -120,11 +120,13 @@ every connected app (see `REALTIME_PROTOCOL.md`); the app reloads
 
 The `dependency_review` job reads what Dependabot knows about the
 repositories in `JARVIS_GITHUB_REPOS`, with the roadmap poller's read-only
-token, client and limits (see `ROADMAPS.md`): per repository one page of
+token, client and limits (see `ROADMAPS.md`): per repository one page of 30
 open Dependabot alerts (`GET /repos/{repo}/dependabot/alerts?state=open`)
-and one page of open pull requests by `dependabot[bot]` (the issues list),
-30 each, at most 1 MiB per answer, no redirect to another host. Without the
-token or the allowlist the run fails with `not_configured`.
+and one page of 15 open pull requests by `dependabot[bot]` (the issues
+list), at most 1 MiB per answer, no redirect to another host. A refused
+token or a rate limit stops the reads; the repositories left get the same
+code. Without the token or the allowlist the run fails with
+`not_configured`.
 
 Its `facts` keep only ids, names, versions and severities, never advisory
 or pull request text:
@@ -135,20 +137,22 @@ or pull request text:
   `critical`), `ghsa`, `cve`, `vulnerable` (the vulnerable range),
   `patched` (the first fixed version) and `pr` (the `ref` of an open
   Dependabot pull request for the same package). A value outside a strict
-  character set is left out, and so is an alert whose package name is.
+  character set is left out, and so is an alert whose package name or
+  ecosystem is; `vulnerable` holds only comparisons and versions.
 - `pull_requests`: `ref` (`p1`, …), `repo`, `number` and, from the title,
   `package`, `from` and `to`, or `group` and `updates`.
 - `errors`: `{repo, error_code}` for each repository that could not be read.
-- `truncated`: a page was full, or the facts were cut to 64 KiB (least
-  severe alerts first, then pull requests).
+- `truncated`: a page was full, an alert was left out, or the facts were
+  cut to 64 KiB (least severe alerts first, then pull requests).
 
-A run is `ok` when every repository was read, `partial` when some were and
-`failed` when none was; `error_code` is the first repository's code:
+A run is `ok` when every repository was read, `partial` when some were (a
+repository whose pull request list fails keeps its alerts) and `failed`
+when nothing was; `error_code` is the first repository's code:
 
 | Code | Means |
 | --- | --- |
 | `token_needs_dependabot_alerts_read` | GitHub refused the alerts (403 or 404): give the token the "Dependabot alerts: Read-only" permission for the repository and enable Dependabot alerts in its settings |
-| `github_access_refused` | GitHub refused the pull request list |
+| `github_access_refused` | GitHub refused the pull request list (a repository without issues has none) |
 | `github_token_refused` | GitHub refused the token (401) |
 | `github_rate_limited` | GitHub's rate limit |
 | `github_answer_too_large` | An answer over 1 MiB |

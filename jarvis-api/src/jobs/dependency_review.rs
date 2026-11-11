@@ -16,12 +16,14 @@ pub(super) async fn run(work: &Work) -> Finish {
     record(&mut facts, repos.len())
 }
 
-/// `ok` when every repository was read, `partial` when some were (with the
-/// first failure's code), `failed` when none was.
+/// `ok` when every repository was read, `partial` when some were or some
+/// alerts were (with the first failure's code), `failed` when nothing was.
 fn record(facts: &mut DependencyFacts, repos: usize) -> Finish {
     let (status, error_code) = match facts.errors.first() {
         None => (RunStatus::Ok, None),
-        Some(error) if facts.errors.len() < repos => (RunStatus::Partial, Some(error.error_code)),
+        Some(error) if facts.errors.len() < repos || !facts.alerts.is_empty() => {
+            (RunStatus::Partial, Some(error.error_code))
+        }
         Some(error) => (RunStatus::Failed, Some(error.error_code)),
     };
     Finish {
