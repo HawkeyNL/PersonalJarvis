@@ -114,7 +114,7 @@ impl LlmProvider for Fake {
     }
 }
 
-async fn device_token(db: &jarvis_store::Database, owner: Uuid) -> (Uuid, String) {
+pub(crate) async fn device_token(db: &jarvis_store::Database, owner: Uuid) -> (Uuid, String) {
     let key = SigningKey::from_bytes(&rand::random());
     let (device, _) = jarvis_identity::register_device(
         db,

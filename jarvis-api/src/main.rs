@@ -544,6 +544,15 @@ async fn main() -> anyhow::Result<()> {
         budget_cents,
     );
 
+    // Chat photos live beside Core's other state. A directory that fails its
+    // checks turns the photo routes off (503); Core keeps running.
+    let photos = Arc::new(
+        tokio::task::spawn_blocking(|| {
+            jarvis_api::photos::PhotoStore::open(std::path::Path::new("/var/lib/jarvis/photos"))
+        })
+        .await?,
+    );
+
     // Off by default. A configuration problem leaves the trading routes
     // answering "not configured"; Core keeps running.
     let ibkr_broker = if config.ibkr_portfolio_sync_enabled {
@@ -650,6 +659,7 @@ async fn main() -> anyhow::Result<()> {
         auto_research: Default::default(),
         github,
         jobs: Arc::new(jarvis_api::jobs::JobsHandle::new()),
+        photos,
     };
 
     jarvis_api::refresh_usage_snapshot(&state).await;
