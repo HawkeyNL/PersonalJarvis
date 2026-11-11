@@ -175,3 +175,24 @@ writes its own: alerts with a fixed version first, then by severity, up to
 20, each with a templated reason, and a templated summary
 (`summary_source: "deterministic"`). A failed run has neither. The answer is
 display only and never feeds a later call.
+
+With `params.roadmap_id`, a run that read anything also proposes the
+upgrades to that roadmap, as one roadmap proposal per run (see
+`ROADMAPS.md`; the owner accepts or rejects it, nothing changes on its
+own). It is made by Core, not the model: one new item per alert with a
+fixed version, most severe first, titled `Upgrade {package} to {version}
+({repo})` and linked to the alert's Dependabot pull request when there is
+one, so the GitHub poller moves it when that pull request merges. An
+upgrade whose title (in any case) or pull request is already on the
+roadmap or in a pending proposal is left out, and so is one whose title
+would be over 200 characters; at most 20 items. When nothing is left, no
+proposal is made. A proposal that fails makes the run `partial` with one of
+these codes (unless it already had one):
+
+| Code | Means |
+| --- | --- |
+| `roadmap_unavailable` | The roadmap is gone or archived |
+| `roadmap_changed` | The roadmap changed while the run read it; the next run proposes again |
+| `roadmap_limit` | The roadmap holds its maximum of items or pending proposals |
+| `roadmap_proposal_failed` | Anything else |
+
