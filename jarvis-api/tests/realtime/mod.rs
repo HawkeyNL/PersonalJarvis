@@ -143,7 +143,12 @@ pub(crate) async fn device_token(db: &jarvis_store::Database, owner: Uuid) -> (U
     (device.id, login.token)
 }
 
-async fn post(app: &axum::Router, token: &str, path: &str, body: Value) -> (StatusCode, Value) {
+pub(crate) async fn post(
+    app: &axum::Router,
+    token: &str,
+    path: &str,
+    body: Value,
+) -> (StatusCode, Value) {
     let response = app
         .clone()
         .oneshot(

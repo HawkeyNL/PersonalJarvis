@@ -24,6 +24,12 @@ fn unavailable() -> ApiError {
         Json(json!({"error":"chat persistence unavailable"})),
     )
 }
+fn no_such_photo() -> ApiError {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error":"no such photo"})),
+    )
+}
 fn conflict() -> ApiError {
     (
         StatusCode::CONFLICT,
@@ -66,6 +72,19 @@ async fn load(state: &AppState, user: Uuid, id: Uuid) -> Result<Option<Stored>, 
     let mut result = state.db.query("SELECT record::id(id) AS id, request_id, conversation_id, payload_hash, epoch, state FROM assistant_runs WHERE record::id(id) = $id AND user_id = $user LIMIT 1")
         .bind(json!({"id":id.to_string(), "user":user.to_string()})).await.map_err(|_| unavailable())?;
     result.take(0).map_err(|_| unavailable())
+}
+
+/// Whether every id is one of the caller's photos that no message carries.
+async fn pending_photos(state: &AppState, user: Uuid, ids: &[String]) -> Result<bool, ApiError> {
+    let found: Vec<String> = state
+        .db
+        .query("SELECT VALUE record::id(id) FROM chat_photos WHERE record::id(id) IN $ids AND user_id = $user AND conversation_id = NONE")
+        .bind(json!({"ids": ids, "user": user.to_string()}))
+        .await
+        .map_err(|_| unavailable())?
+        .take(0)
+        .map_err(|_| unavailable())?;
+    Ok(found.len() == ids.len())
 }
 
 fn response(stored: &Stored, epoch: Uuid, active: bool) -> Json<Value> {
@@ -193,19 +212,35 @@ pub(crate) async fn submit(
         content: req.chat.new_user_content().ok_or_else(conflict)?.to_owned(),
         model: None,
         created_at: OffsetDateTime::now_utc(),
+        attachments: req.chat.attachments.clone(),
+    };
+    let attachments: Vec<String> = message.attachments.iter().map(Uuid::to_string).collect();
+    // Photos join the message in the same transaction: only the caller's
+    // own photos that no message carries yet, all of them or the whole
+    // submission rolls back. A text-only message keeps the old statements.
+    let (attach, attachments_field) = if attachments.is_empty() {
+        ("", "")
+    } else {
+        (
+            "LET $attached = (UPDATE chat_photos SET conversation_id = $conversation \
+             WHERE record::id(id) IN $attachments AND user_id = $user AND conversation_id = NONE RETURN AFTER); \
+             IF array::len($attached) != array::len($attachments) { THROW 'photo unavailable'; }; ",
+            ", attachments = $attachments",
+        )
     };
     let at = message
         .created_at
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|_| unavailable())?;
-    let result = state.db.query(
+    let result = state.db.query(format!(
         "BEGIN TRANSACTION; \
          CREATE assistant_runs SET id = $id, user_id = $user, device_id = $device, request_id = $request, conversation_id = $conversation, payload_hash = $hash, epoch = $epoch, state = 'running', created_at = time::now(), updated_at = time::now(); \
-         IF $fresh { CREATE conversations SET id = $conversation, user_id = $user, title = $title, created_at = time::now(), updated_at = time::now(); }; \
-         CREATE chat_messages SET id = $message, user_id = $user, conversation_id = $conversation, role = 'user', content = $content, created_at = <datetime>$at; \
+         IF $fresh {{ CREATE conversations SET id = $conversation, user_id = $user, title = $title, created_at = time::now(), updated_at = time::now(); }}; \
+         {attach}\
+         CREATE chat_messages SET id = $message, user_id = $user, conversation_id = $conversation, role = 'user', content = $content, created_at = <datetime>$at{attachments_field}; \
          UPDATE conversations SET updated_at = <datetime>$at WHERE record::id(id) = $conversation AND user_id = $user; \
          COMMIT TRANSACTION;"
-    ).bind(json!({"id":id.to_string(), "user":auth.user.id.to_string(), "device":auth.device.id.to_string(), "request":req.request_id.to_string(), "conversation":conversation.to_string(), "hash":hash, "epoch":epoch.to_string(), "fresh":fresh, "title":title, "message":message.id.to_string(), "content":message.content, "at":at})).await.map_err(|_| unavailable())?;
+    )).bind(json!({"id":id.to_string(), "user":auth.user.id.to_string(), "device":auth.device.id.to_string(), "request":req.request_id.to_string(), "conversation":conversation.to_string(), "hash":hash, "epoch":epoch.to_string(), "fresh":fresh, "title":title, "message":message.id.to_string(), "content":message.content, "at":at, "attachments":attachments})).await.map_err(|_| unavailable())?;
     if result.check().is_err() {
         // A concurrent retry may have won the durable unique-index race.
         if let Some(stored) = load(&state, auth.user.id, id).await? {
@@ -220,6 +255,9 @@ pub(crate) async fn submit(
                     ),
                 ));
             }
+        }
+        if !attachments.is_empty() && !pending_photos(&state, auth.user.id, &attachments).await? {
+            return Err(no_such_photo());
         }
         return Err(conflict());
     }

@@ -46,15 +46,21 @@ pub(crate) struct ChatReq {
     /// Absent starts a fresh conversation; present continues the owned one.
     #[serde(default)]
     pub(super) conversation_id: Option<Uuid>,
+    /// The caller's uploaded, not yet sent photos this message carries. Only
+    /// the runs API accepts them. Absent when empty, so the request hash of
+    /// a text-only message is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) attachments: Vec<Uuid>,
 }
 
 impl ChatReq {
+    /// The new user turn's text; empty only when it carries photos.
     pub(super) fn new_user_content(&self) -> Option<&str> {
         self.messages
             .last()
             .filter(|m| m.role == "user")
             .map(|m| m.content.trim())
-            .filter(|text| !text.is_empty())
+            .filter(|text| !text.is_empty() || !self.attachments.is_empty())
     }
     pub(super) fn validate_run(&self) -> Result<String, (StatusCode, Json<Value>)> {
         if self.messages.len() > validation::MAX_CHAT_TURNS
@@ -66,12 +72,27 @@ impl ChatReq {
         {
             return Err(bad_request("chat payload too large"));
         }
-        let last = self
-            .messages
-            .last()
-            .filter(|m| m.role == "user" && !m.content.trim().is_empty())
+        if self.attachments.len() > crate::photos::MAX_ATTACHMENTS {
+            return Err(bad_request("too many photos"));
+        }
+        if (1..self.attachments.len()).any(|i| self.attachments[..i].contains(&self.attachments[i]))
+        {
+            return Err(bad_request("duplicate photo"));
+        }
+        // Photos never go to web research.
+        if !self.attachments.is_empty()
+            && self.mode.as_deref().map(llm::RoutingMode::parse) == Some(llm::RoutingMode::Research)
+        {
+            return Err(bad_request("photos cannot be sent to web research"));
+        }
+        let text = self
+            .new_user_content()
             .ok_or_else(|| bad_request("last message must be a nonempty user message"))?;
-        Ok(derive_title(&last.content))
+        Ok(if text.is_empty() {
+            "Photo".to_string()
+        } else {
+            derive_title(text)
+        })
     }
 }
 
@@ -82,6 +103,9 @@ pub(crate) async fn assistant_chat(
     State(state): State<AppState>,
     Json(mut req): Json<ChatReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !req.attachments.is_empty() {
+        return Err(bad_request("photos need the runs API"));
+    }
     let title = req.validate_run()?;
     let fresh = req.conversation_id.is_none();
     let conversation = match req.conversation_id {
@@ -207,7 +231,8 @@ pub(super) async fn execute_chat(
             })
         })
         .collect();
-    if history.is_empty() {
+    let photo_turn = !req.attachments.is_empty();
+    if history.is_empty() && !photo_turn {
         return Err(bad_request("messages is required"));
     }
     // The last user turn is the new message to store and (maybe) reclassify.
@@ -217,7 +242,7 @@ pub(super) async fn execute_chat(
         .rev()
         .find(|t| !matches!(t.role.as_str(), "assistant" | "jarvis"))
         .map(|t| t.content.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() || photo_turn)
         .ok_or_else(|| bad_request("a user message is required"))?;
 
     // Which conversation does this belong to? Append to the current one unless
@@ -466,13 +491,14 @@ pub(super) async fn execute_chat(
             .map_err(|_| internal_error())?;
             if let Some(run) = &realtime_run {
                 // Only a runs-API run (its user message was persisted first)
-                // may search by itself; the legacy endpoint never does.
-                let auto = if user_already_published {
+                // may search by itself; the legacy endpoint never does. A
+                // turn with photos never leads to a web search.
+                let auto = if user_already_published && !photo_turn {
                     crate::auto_research::start(&state, research_advised, &new_msg).await
                 } else {
                     None
                 };
-                let research_offer = if auto.is_some() {
+                let research_offer = if auto.is_some() || photo_turn {
                     None
                 } else {
                     crate::intent::research_offer(
@@ -1010,6 +1036,7 @@ async fn append_message(
         content: content.to_string(),
         model: model.map(str::to_string),
         created_at: at,
+        attachments: Vec::new(),
     })
 }
 
@@ -1057,6 +1084,7 @@ async fn append_to_live_conversation(
             content: content.to_string(),
             model: Some(model.to_string()),
             created_at: at,
+            attachments: Vec::new(),
         };
         (message, title)
     }))
@@ -1109,19 +1137,40 @@ pub(crate) async fn get_conversation(
         model: Option<String>,
         #[serde(with = "time::serde::rfc3339")]
         created_at: OffsetDateTime,
+        #[serde(default)]
+        attachments: Option<Vec<String>>,
+    }
+    #[derive(Deserialize)]
+    struct PhotoRow {
+        id: String,
+        saved: bool,
+        #[serde(with = "time::serde::rfc3339")]
+        created_at: OffsetDateTime,
     }
     let mut response = state.db.query(
-        "SELECT record::id(id) AS id, role, content, model, created_at FROM chat_messages WHERE conversation_id = $id AND user_id = $user ORDER BY created_at ASC",
+        "SELECT record::id(id) AS id, role, content, model, created_at, attachments FROM chat_messages WHERE conversation_id = $id AND user_id = $user ORDER BY created_at ASC; \
+         SELECT record::id(id) AS id, saved, created_at FROM chat_photos WHERE conversation_id = $id AND user_id = $user ORDER BY created_at ASC",
     ).bind(json!({"id": id.to_string(), "user":authed.user.id.to_string()})).await.map_err(|_| internal_error())?;
     let rows: Vec<MessageRow> = response.take(0).map_err(|_| internal_error())?;
+    let photos: Vec<PhotoRow> = response.take(1).map_err(|_| internal_error())?;
     let messages: Vec<Value> = rows
         .into_iter()
         .map(|row| {
-            json!({ "id":row.id, "role": row.role, "content": row.content, "model": row.model, "at": row.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() })
+            json!({ "id":row.id, "role": row.role, "content": row.content, "model": row.model, "at": row.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                "attachments": row.attachments.unwrap_or_default() })
+        })
+        .collect();
+    // The conversation's photos that still exist; a message id missing here
+    // is a deleted or expired photo.
+    let photos: Vec<Value> = photos
+        .into_iter()
+        .map(|photo| {
+            json!({ "id": photo.id, "saved": photo.saved,
+                "expires_at": crate::photos::expires_at(photo.saved, photo.created_at) })
         })
         .collect();
     Ok(Json(
-        json!({ "id": id, "title": title, "messages": messages,
+        json!({ "id": id, "title": title, "messages": messages, "photos": photos,
             "assistant_running": state.realtime.run_active(authed.user.id, id) }),
     ))
 }
@@ -1161,7 +1210,9 @@ pub(crate) async fn conversation_brain_set(
     Ok(Json(json!({"status":"updated"})))
 }
 
-/// Delete a conversation and its messages (ON DELETE CASCADE) — owner-only.
+/// Delete a conversation with its messages and its photos, kept ones too —
+/// owner-only. Photo files are removed after the commit; the orphan sweep is
+/// the backstop.
 pub(crate) async fn delete_conversation(
     authed: Authed,
     State(state): State<AppState>,
@@ -1173,15 +1224,23 @@ pub(crate) async fn delete_conversation(
     ))?;
     let mut response = state.db.query(
         "BEGIN TRANSACTION; DELETE chat_messages WHERE conversation_id = $id AND user_id = $user_id; \
+         SELECT VALUE record::id(id) FROM chat_photos WHERE conversation_id = $id AND user_id = $user_id; \
+         DELETE chat_photos WHERE conversation_id = $id AND user_id = $user_id; \
          DELETE conversations WHERE record::id(id) = $id AND user_id = $user_id RETURN $id AS id; COMMIT TRANSACTION;",
     ).bind(json!({"id": id.to_string(), "user_id": authed.user.id.to_string()})).await.map_err(|_| internal_error())?;
-    let deleted: Option<Value> = response.take(1).map_err(|_| internal_error())?;
+    let photos: Vec<String> = response.take(1).map_err(|_| internal_error())?;
+    let deleted: Option<Value> = response.take(3).map_err(|_| internal_error())?;
     if deleted.is_none() {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such conversation" })),
         ));
     }
+    let photos = photos
+        .iter()
+        .filter_map(|photo| Uuid::try_parse(photo).ok())
+        .collect();
+    crate::photos::remove_files(&state.photos, photos).await;
     state.realtime.publish(
         authed.user.id,
         Event::ConversationDeleted {
@@ -1559,5 +1618,43 @@ mod tests {
         .unwrap();
         let kept = serde_json::to_value(&req).unwrap();
         assert!(kept.get("system").is_none(), "{kept}");
+    }
+
+    #[test]
+    fn photo_attachments_are_bounded_and_keep_text_requests_unchanged() {
+        let req = |body: Value| serde_json::from_value::<ChatReq>(body).unwrap();
+        let photo = |n: u128| Uuid::from_u128(n).to_string();
+        // A text-only request serializes (and so hashes) exactly as before.
+        let text = req(json!({"messages": [{"role": "user", "content": "hi"}]}));
+        assert!(serde_json::to_value(&text)
+            .unwrap()
+            .get("attachments")
+            .is_none());
+        assert_eq!(text.validate_run().unwrap(), "hi");
+        // Photos alone are a message, titled "Photo".
+        let only = req(json!({"messages": [{"role": "user", "content": "  "}],
+            "attachments": [photo(1)]}));
+        assert_eq!(only.validate_run().unwrap(), "Photo");
+        assert_eq!(only.new_user_content(), Some(""));
+        let empty = req(json!({"messages": [{"role": "user", "content": "  "}]}));
+        assert!(empty.validate_run().is_err());
+        assert_eq!(empty.new_user_content(), None);
+        for (attachments, mode) in [
+            (vec![photo(1), photo(2), photo(3), photo(4), photo(5)], None),
+            (vec![photo(1), photo(2), photo(1)], None),
+            (vec![photo(1)], Some("research")),
+        ] {
+            let bad = req(json!({"messages": [{"role": "user", "content": "look"}],
+                "attachments": attachments, "mode": mode}));
+            assert!(bad.validate_run().is_err());
+        }
+        let four = req(json!({"messages": [{"role": "user", "content": "look"}],
+            "attachments": [photo(1), photo(2), photo(3), photo(4)], "mode": "deep"}));
+        assert_eq!(four.validate_run().unwrap(), "look");
+        assert!(serde_json::from_value::<ChatReq>(json!({
+            "messages": [{"role": "user", "content": "look"}],
+            "attachments": ["../../etc/passwd"],
+        }))
+        .is_err());
     }
 }

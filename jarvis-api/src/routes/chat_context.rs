@@ -108,6 +108,7 @@ mod tests {
             content: "Next question".into(),
             model: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
+            attachments: Vec::new(),
         }
     }
     fn row(role: &str, content: &str) -> Row {
