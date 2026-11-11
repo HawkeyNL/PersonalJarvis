@@ -89,8 +89,8 @@ can still be edited.
 
 The owner may run a job now (also a disabled one) at most once an hour, and
 one at a time; an interrupted run counts. A request stays queued while the
-database is unavailable. Its row has `trigger: "owner"` and the time asked as its
-`slot_at`; it does not change `last_slot_at`.
+database is unavailable. Its row has `trigger: "owner"` and the time it
+started as its `slot_at`; it does not change `last_slot_at`.
 
 ## Runs
 
@@ -177,3 +177,28 @@ writes its own: alerts with a fixed version first, then by severity, up to
 alerts are open is refused too. A failed run has neither. The answer is
 display only and never feeds a later call: `summary` and `reason` are plain
 text, which apps never render as Markdown or HTML.
+
+With `params.roadmap_id`, a run that read anything also proposes the
+upgrades to that roadmap, as one roadmap proposal per run (see
+`ROADMAPS.md`; the owner accepts or rejects it, nothing changes on its
+own). It is made by Core, not the model: one new item per alert with a
+fixed version, most severe first, titled `Upgrade {package} to {version}
+({repo})` and linked to the alert's single-package Dependabot pull request
+when there is one, so the GitHub poller moves it when that pull request
+merges. An upgrade whose title (in any case) or pull request is already on
+the roadmap, in a pending proposal or earlier in this one is left out (so a
+second alert for the same pull request adds nothing), and so is one whose
+title would be over 200 characters; at most 20 items, and no more than the
+roadmap has room for. When nothing is left, no proposal is made. A pending
+proposal that went stale still counts until the owner accepts it (409,
+marked stale), rejects it or it expires; the next run proposes again. A
+proposal that fails makes the run `partial` with one of these codes (unless
+it already had one):
+
+| Code | Means |
+| --- | --- |
+| `roadmap_unavailable` | The roadmap is gone or archived |
+| `roadmap_changed` | The roadmap changed while the run read it; the next run proposes again |
+| `roadmap_limit` | The roadmap holds its maximum of items or pending proposals |
+| `roadmap_proposal_failed` | Anything else |
+

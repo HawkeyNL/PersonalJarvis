@@ -1,24 +1,33 @@
 //! The `dependency_review` job: what Dependabot knows about the allowlisted
-//! repositories, put in order by one Claude call or, failing that, by Core
-//! (see `docs/SCHEDULED_JOBS.md`).
+//! repositories, put in order by one Claude call or, failing that, by Core,
+//! and optionally proposed to a roadmap (see `docs/SCHEDULED_JOBS.md`).
 
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 
 use serde::Deserialize;
 
 use jarvis_llm::claude_worker_protocol::{WorkerTask, MAX_TASK_PROMPT_BYTES};
 
+use jarvis_store::Database;
+
 use super::store::Finish;
 use super::{
-    Priority, RunStatus, SummarySource, Work, MAX_FACTS_BYTES, MAX_PRIORITIES, MAX_REASON,
-    MAX_SUMMARY,
+    Job, Priority, RunStatus, SummarySource, Work, DB_TIMEOUT, MAX_FACTS_BYTES, MAX_PRIORITIES,
+    MAX_REASON, MAX_SUMMARY,
 };
 use crate::memecoin::agent::Brain;
 use crate::roadmaps::github::{self, DependencyAlert, DependencyFacts, Severity};
+use crate::roadmaps::store::Proposal;
+use crate::roadmaps::{
+    Link, LinkKind, NewItem, ProposalOp, RoadmapError, Snapshot, MAX_ITEMS, MAX_ITEM_TITLE,
+    MAX_PROPOSAL_OPS,
+};
 
 /// Read the facts with the GitHub poller's token and allowlist (without
-/// either, the run fails as `not_configured`), then put them in order.
-pub(super) async fn run(work: &Work) -> Finish {
+/// either, the run fails as `not_configured`), put them in order and, when
+/// the job names a roadmap, propose the upgrades to it.
+pub(super) async fn run(work: &Work, db: &Database, job: &Job) -> Finish {
     let Some(token) = work.token.clone().filter(|_| work.github.configured()) else {
         return Finish::failed("not_configured");
     };
@@ -29,8 +38,154 @@ pub(super) async fn run(work: &Work) -> Finish {
         let (priorities, summary) = review(work.brain.as_ref(), &facts).await;
         finish.priorities = priorities;
         finish.summary = Some(summary);
+        if let Some(roadmap_id) = &job.params.roadmap_id {
+            if let Err(error_code) = propose(db, roadmap_id, &facts).await {
+                finish.status = RunStatus::Partial;
+                finish.error_code.get_or_insert(error_code);
+            }
+        }
     }
     finish
+}
+
+async fn bounded<T>(
+    future: impl std::future::Future<Output = Result<T, RoadmapError>>,
+) -> Result<T, RoadmapError> {
+    tokio::time::timeout(DB_TIMEOUT, future)
+        .await
+        .unwrap_or(Err(RoadmapError::Invalid("timed out")))
+}
+
+/// Propose one item per fixable alert to the roadmap, at most one proposal
+/// per run; `Ok(None)` when every upgrade is already on it or proposed.
+async fn propose(
+    db: &Database,
+    roadmap_id: &str,
+    facts: &DependencyFacts,
+) -> Result<Option<String>, &'static str> {
+    let snapshot = bounded(crate::roadmaps::store::get(db, roadmap_id))
+        .await
+        .map_err(proposal_error)?
+        .filter(|snapshot| snapshot.roadmap.archived_at.is_none())
+        .ok_or("roadmap_unavailable")?;
+    let pending = bounded(crate::roadmaps::store::list_proposals(db, roadmap_id))
+        .await
+        .map_err(proposal_error)?;
+    submit(db, &snapshot, &pending, facts).await
+}
+
+fn proposal_error(error: RoadmapError) -> &'static str {
+    match error {
+        RoadmapError::Stale | RoadmapError::Conflict => "roadmap_changed",
+        RoadmapError::Limit(_) => "roadmap_limit",
+        RoadmapError::NotFound | RoadmapError::Archived => "roadmap_unavailable",
+        error => {
+            tracing::warn!(%error, "dependency review: roadmap proposal failed");
+            "roadmap_proposal_failed"
+        }
+    }
+}
+
+/// Record the proposal on `snapshot`'s revision; a roadmap that changed
+/// since is refused (the next run proposes again).
+async fn submit(
+    db: &Database,
+    snapshot: &Snapshot,
+    pending: &[Proposal],
+    facts: &DependencyFacts,
+) -> Result<Option<String>, &'static str> {
+    let ops = proposal_ops(snapshot, pending, facts);
+    if ops.is_empty() {
+        return Ok(None);
+    }
+    let created = crate::roadmaps::store::create_proposal(
+        db,
+        &snapshot.roadmap.id,
+        snapshot.roadmap.revision,
+        &ops,
+        Some("Upgrades with a fixed version, from the scheduled dependency review."),
+    );
+    bounded(created).await.map(Some).map_err(proposal_error)
+}
+
+fn link_key(link: &Link) -> Option<(String, u64)> {
+    Some((link.repo.as_deref()?.to_ascii_lowercase(), link.number?))
+}
+
+/// One new item per fixable alert, most severe first: "Upgrade {package} to
+/// {version} ({repo})", linked to its Dependabot pull request when there is
+/// one. An upgrade whose title or pull request is already on the roadmap or
+/// in a pending proposal (or earlier in this one) is left out; at most 20,
+/// and no more than the roadmap has room for.
+fn proposal_ops(
+    snapshot: &Snapshot,
+    pending: &[Proposal],
+    facts: &DependencyFacts,
+) -> Vec<ProposalOp> {
+    let proposed = pending
+        .iter()
+        .flat_map(|proposal| &proposal.ops)
+        .filter_map(|op| match op {
+            ProposalOp::CreateItem { item } => Some((&item.title, &item.links)),
+            ProposalOp::UpdateItem { .. } => None,
+        });
+    let mut titles = BTreeSet::new();
+    let mut links = BTreeSet::new();
+    for (title, item_links) in snapshot
+        .items
+        .iter()
+        .map(|item| (&item.title, &item.links))
+        .chain(proposed)
+    {
+        titles.insert(title.to_lowercase());
+        links.extend(item_links.iter().filter_map(link_key));
+    }
+    let room = MAX_ITEMS
+        .saturating_sub(snapshot.items.len())
+        .min(MAX_PROPOSAL_OPS);
+    let mut ops = Vec::new();
+    for alert in &facts.alerts {
+        if ops.len() == room {
+            break;
+        }
+        let Some(version) = &alert.patched else {
+            continue;
+        };
+        let title = format!("Upgrade {} to {version} ({})", alert.package, alert.repo);
+        let link = alert
+            .pr
+            .as_deref()
+            .and_then(|reference| {
+                facts
+                    .pull_requests
+                    .iter()
+                    .find(|pull| pull.reference == reference)
+            })
+            .map(|pull| Link {
+                kind: LinkKind::Pr,
+                repo: Some(pull.repo.clone()),
+                number: Some(pull.number),
+                tag: None,
+                url: None,
+                state: None,
+            });
+        let key = link.as_ref().and_then(link_key);
+        if title.chars().count() > MAX_ITEM_TITLE
+            || !titles.insert(title.to_lowercase())
+            || key.as_ref().is_some_and(|key| links.contains(key))
+        {
+            continue;
+        }
+        links.extend(key);
+        ops.push(ProposalOp::CreateItem {
+            item: NewItem {
+                title,
+                links: link.into_iter().collect(),
+                ..NewItem::default()
+            },
+        });
+    }
+    ops
 }
 
 /// `ok` when every repository was read, `partial` when some repository's
@@ -491,7 +646,15 @@ mod tests {
             token: None,
             brain: Arc::new(FakeBrain::new(None)),
         };
-        assert_eq!(run(&work).await, Finish::failed("not_configured"));
+        let job =
+            serde_json::from_value::<super::super::NewJob>(json!({"kind": "dependency_review"}))
+                .unwrap()
+                .into_job("j".into(), time::OffsetDateTime::now_utc(), None)
+                .unwrap();
+        assert_eq!(
+            run(&work, &Database::init(), &job).await,
+            Finish::failed("not_configured")
+        );
     }
 
     #[test]
@@ -527,5 +690,186 @@ mod tests {
         facts.errors.push(failed("a/c"));
         facts.alerts_read = 0;
         assert_eq!(record(&mut facts).status, RunStatus::Failed);
+    }
+
+    fn snapshot(items: Vec<crate::roadmaps::Item>) -> Snapshot {
+        let now = time::OffsetDateTime::now_utc();
+        Snapshot {
+            roadmap: crate::roadmaps::Roadmap {
+                id: uuid::Uuid::now_v7().to_string(),
+                title: "Plan".into(),
+                description: None,
+                phases: Vec::new(),
+                revision: 3,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+            },
+            items,
+        }
+    }
+
+    fn item(title: &str, links: Vec<Link>) -> crate::roadmaps::Item {
+        crate::roadmaps::Item {
+            id: uuid::Uuid::now_v7().to_string(),
+            title: title.into(),
+            status: crate::roadmaps::Status::Planned,
+            auto_status: None,
+            phase: None,
+            position: 0,
+            notes: None,
+            depends_on: Vec::new(),
+            links,
+            updated_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn pr_link(repo: &str, number: u64) -> Link {
+        Link {
+            kind: LinkKind::Pr,
+            repo: Some(repo.into()),
+            number: Some(number),
+            tag: None,
+            url: None,
+            state: None,
+        }
+    }
+
+    fn titles(ops: &[ProposalOp]) -> Vec<&str> {
+        ops.iter()
+            .map(|op| match op {
+                ProposalOp::CreateItem { item } => item.title.as_str(),
+                ProposalOp::UpdateItem { .. } => panic!("an update"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn proposals_hold_fixable_upgrades_once_and_at_most_twenty() {
+        let facts = facts();
+        let ops = proposal_ops(&snapshot(Vec::new()), &[], &facts);
+        assert_eq!(
+            titles(&ops),
+            [
+                "Upgrade crate-1 to 1.0.1 (Owner/Repo)",
+                "Upgrade crate-3 to 2.0.0 (Owner/Repo)",
+                "Upgrade crate-4 to 0.3.1 (Owner/Repo)",
+            ]
+        );
+        // Linked to the Dependabot pull request when there is one.
+        let ProposalOp::CreateItem { item: first } = &ops[0] else {
+            panic!("a create");
+        };
+        assert_eq!(first.links, [pr_link("Owner/Repo", 234)]);
+        // Already on the roadmap by title (any case) or by pull request, or
+        // in a pending proposal: left out.
+        let on_roadmap = snapshot(vec![
+            item("upgrade CRATE-3 to 2.0.0 (owner/repo)", Vec::new()),
+            item("Ship crate-1", vec![pr_link("owner/repo", 234)]),
+        ]);
+        let pending = Proposal {
+            id: uuid::Uuid::now_v7().to_string(),
+            base_revision: 3,
+            ops: vec![ops[2].clone()],
+            rationale: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            expires_at: time::OffsetDateTime::now_utc(),
+        };
+        assert!(proposal_ops(&on_roadmap, &[pending], &facts).is_empty());
+        // Twenty at most, and the same upgrade twice only once.
+        let mut many = facts.clone();
+        many.alerts = (1..=30)
+            .map(|n| alert(n, Severity::High, Some("1.0.0")))
+            .collect();
+        many.alerts
+            .insert(1, alert(1, Severity::Low, Some("1.0.0")));
+        let ops = proposal_ops(&snapshot(Vec::new()), &[], &many);
+        let titles = titles(&ops);
+        assert_eq!(titles.len(), MAX_PROPOSAL_OPS);
+        assert_eq!(titles[1], "Upgrade crate-2 to 1.0.0 (Owner/Repo)");
+        assert_eq!(
+            titles.iter().collect::<BTreeSet<_>>().len(),
+            MAX_PROPOSAL_OPS
+        );
+        // No more than the roadmap has room for.
+        let full = snapshot(
+            (0..crate::roadmaps::MAX_ITEMS - 2)
+                .map(|n| item(&format!("Item {n}"), Vec::new()))
+                .collect(),
+        );
+        assert_eq!(proposal_ops(&full, &[], &many).len(), 2);
+        // A title over the roadmap's bound is left out.
+        let mut long = facts.clone();
+        long.alerts[0].package = "p".repeat(190);
+        assert_eq!(proposal_ops(&snapshot(Vec::new()), &[], &long).len(), 2);
+    }
+
+    async fn database() -> Result<Database, Box<dyn std::error::Error>> {
+        use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
+        let db = Surreal::new::<Ws>(std::env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+        db.signin(Root {
+            username: &std::env::var("JARVIS_SURREAL_TEST_USER")?,
+            password: &std::env::var("JARVIS_SURREAL_TEST_PASS")?,
+        })
+        .await?;
+        db.use_ns(format!("jobs_{}", uuid::Uuid::now_v7().simple()))
+            .use_db("core")
+            .await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+        Ok(db)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn a_run_proposes_once_dedupes_and_refuses_a_changed_roadmap(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::roadmaps::{store, NewRoadmap, RoadmapPatch};
+        let db = database().await?;
+        let hub = crate::realtime::Hub::default();
+        let device = uuid::Uuid::now_v7().to_string();
+        let plan = NewRoadmap {
+            title: "Plan".into(),
+            description: None,
+            phases: Vec::new(),
+        };
+        let roadmap = store::create(&db, &plan, &device, &hub).await?;
+        let id = roadmap.roadmap.id.clone();
+
+        // A roadmap that changed since it was read refuses the proposal.
+        let stale = store::get(&db, &id).await?.ok_or("roadmap")?;
+        store::update(
+            &db,
+            &id,
+            1,
+            &RoadmapPatch {
+                title: Some("Plan B".into()),
+                ..RoadmapPatch::default()
+            },
+            &device,
+            &hub,
+        )
+        .await?;
+        assert_eq!(
+            submit(&db, &stale, &[], &facts()).await,
+            Err("roadmap_changed")
+        );
+        assert!(store::list_proposals(&db, &id).await?.is_empty());
+
+        // One proposal; the next run finds it pending and proposes nothing.
+        let proposal = propose(&db, &id, &facts()).await?.ok_or("proposal")?;
+        let pending = store::list_proposals(&db, &id).await?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, proposal);
+        assert_eq!(pending[0].ops.len(), 3);
+        assert_eq!(propose(&db, &id, &facts()).await, Ok(None));
+        // Accepted, the items dedupe the next run as well.
+        store::accept_proposal(&db, &id, &proposal, &device, &Default::default(), &hub).await?;
+        assert_eq!(propose(&db, &id, &facts()).await, Ok(None));
+        let unknown = uuid::Uuid::now_v7().to_string();
+        assert_eq!(
+            propose(&db, &unknown, &facts()).await,
+            Err("roadmap_unavailable")
+        );
+        Ok(())
     }
 }

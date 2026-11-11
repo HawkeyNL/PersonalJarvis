@@ -664,7 +664,7 @@ impl Runner {
 
     async fn work(&self, job: &Job) -> Finish {
         match job.kind {
-            Kind::DependencyReview => dependency_review::run(&self.work).await,
+            Kind::DependencyReview => dependency_review::run(&self.work, &self.db, job).await,
         }
     }
 
