@@ -84,7 +84,7 @@ Line numbers come from `76668a7`.
 ### 2.1 Schema files and migration runner
 
 - **Schema files:** `schema/surreal/0001_baseline.surql` …
-  `0019_scheduled_jobs.surql`, 800 lines, 46 tables.
+  `0020_chat_photos.surql`, 830 lines, 47 tables.
 - **Statement shape:**
   - Every file is one `BEGIN TRANSACTION; … COMMIT TRANSACTION;` block.
   - Tables are all `SCHEMAFULL PERMISSIONS NONE`.
@@ -117,7 +117,11 @@ Line numbers come from `76668a7`.
   - Since `0019_scheduled_jobs.surql`: a typed field inside an `object`
     field (`params.roadmap_id`) and a composite `UNIQUE` index on a string
     and a `datetime` (`job_id, slot_at`). Tested on 2.6.5 only.
-- **`id` fields:** 43 tables declare `DEFINE FIELD id ON <t> TYPE string`.
+  - Since `0020_chat_photos.surql`: a bounded optional array
+    (`option<array<string, 4>>`) added with `IF NOT EXISTS` to an existing
+    table (`chat_messages.attachments`), with `array::distinct` and a regex
+    on its elements through `OVERWRITE attachments.*`. Tested on 2.6.5 only.
+- **`id` fields:** 44 tables declare `DEFINE FIELD id ON <t> TYPE string`.
   - Records are created as `CREATE <t> SET id = $id, …` with a string UUID.
   - Lookups use `WHERE record::id(id) = $id`.
 - **Runner:** `crates/store/src/lib.rs:82-337`.
@@ -451,7 +455,7 @@ tagged otherwise.
    - Compare names and kinds after normalising the output; the format
      differs between majors [unverified].
    - `schema_version:baseline.version` must equal the current version
-     (19 since `0019_scheduled_jobs.surql`).
+     (20 since `0020_chat_photos.surql`).
 3. **Content checksums per table:**
    - Run `SELECT * FROM <t> ORDER BY id` on both sides with `--json`.
    - Normalise with jq: sort keys, canonical datetimes in UTC RFC 3339,
