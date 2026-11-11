@@ -765,19 +765,21 @@ home. `codex login status` prints its status line to stderr, possibly after
 `WARNING:` lines, and exits 1 when logged out (verified with codex-cli
 0.160.0); the worker and the accounts CLI read both streams line by line.
 
-## Typed Claude tasks (memecoin paper decisions)
+## Typed Claude tasks (memecoin paper decisions, dependency review)
 
-The Claude worker also accepts a `task` field: `meme_decision` or
-`meme_strategy_review`. Core sends one only through
+The Claude worker also accepts a `task` field: `meme_decision`,
+`meme_strategy_review` or `dependency_review` (the scheduled job, see
+`SCHEDULED_JOBS.md`). Core sends one only through
 `ClaudeCliProvider::meme_task`, which talks to the Claude worker directly and
 never through the router, so a failure is an error for the caller and never a
 fallback to a paid API or another provider. Decisions use the provider's
-default model, strategy reviews its hard model.
+default model, strategy and dependency reviews its hard model.
 
 The worker refuses a task request unless:
 
 - the system text is exactly that task's fixed prompt
-  (`crates/llm/src/meme_prompts.rs`): no persona, runtime facts or other text;
+  (`crates/llm/src/meme_prompts.rs`, `crates/llm/src/job_prompts.rs`): no
+  persona, runtime facts or other text;
 - the prompt is one JSON object of at most 16 KiB;
 - `research` is false.
 
@@ -786,11 +788,13 @@ A task runs the same reviewed invocation as ordinary chat (`--tools ""`, no
 stops after 90 seconds (reply deadline 95 seconds; Core waits 100 seconds). It
 shares the one background slot with research, so a busy slot refuses the task
 (`runtime_failure`), never queues it, and chat always keeps its own slot. The
-fixed prompts tell the model that the input is numbers-only data with opaque
-ids, that instructions in it are never followed, and that the output is one
-JSON object. The model's output is still untrusted: the memecoin paper
-trader validates every reply as a whole and drops an invalid one (see
-`docs/MEMECOIN_PAPER.md`). The rationale a reply carries is display only: Core
+fixed prompts tell the model that the input is data with opaque ids (numbers
+only for the memecoin tasks; ids, names, versions and severities for the
+dependency review), that instructions in it are never followed, and that the
+output is one JSON object. The model's output is still untrusted: the
+memecoin paper trader validates every reply as a whole and drops an invalid
+one (see `docs/MEMECOIN_PAPER.md`), and so does the dependency review, which
+then falls back to Core's own order (see `SCHEDULED_JOBS.md`). The rationale a reply carries is display only: Core
 stores it for the owner and never feeds it into a later task input, prompt or
 chat context, so model text cannot steer a later call.
 

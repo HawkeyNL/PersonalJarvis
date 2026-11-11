@@ -26,7 +26,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 18);
+    assert_eq!(version.unwrap().version, 19);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
@@ -47,7 +47,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_eleven.unwrap().version, 18);
+    assert_eq!(from_eleven.unwrap().version, 19);
     db.use_db("from_twelve").await?;
     apply_through_twelve(&db).await?;
     // A v12 pairing row has none of the new optional fields and stays valid.
@@ -59,7 +59,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_twelve_version: Option<SchemaVersion> = from_twelve.take(0)?;
-    assert_eq!(from_twelve_version.unwrap().version, 18);
+    assert_eq!(from_twelve_version.unwrap().version, 19);
     let legacy_has_no_ip: Vec<bool> = from_twelve.take(1)?;
     assert_eq!(legacy_has_no_ip, [true]);
     // The database bounds the new fields even if Core validation regressed.
@@ -88,7 +88,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
-    assert_eq!(migrated_version.unwrap().version, 18);
+    assert_eq!(migrated_version.unwrap().version, 19);
     let legacy: Vec<String> = migrated.take(1)?;
     assert_eq!(legacy, ["password-set"]);
     db.query("CREATE account_actions SET id = 'reset', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
@@ -134,7 +134,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_thirteen.unwrap().version, 18);
+    assert_eq!(from_thirteen.unwrap().version, 19);
     // The paper tables enforce their shape even if Core validation regressed.
     let (mint, other) = (
         "So11111111111111111111111111111111111111112",
@@ -187,7 +187,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_fourteen.unwrap().version, 18);
+    assert_eq!(from_fourteen.unwrap().version, 19);
     // The IBKR read model enforces its shape even if Core validation regressed.
     let position = |id: &str, extra: &str| {
         format!("CREATE ibkr_positions SET id = '{id}', conid = {id}, symbol = 'VWCE', asset_class = 'STK', currency = 'EUR', quantity = '12.5', avg_cost = '101.25', last_price = '120', market_value = '1500', unrealized_pnl = '-3.5'{extra};")
@@ -232,7 +232,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_fifteen_version: Option<SchemaVersion> = from_fifteen.take(0)?;
-    assert_eq!(from_fifteen_version.unwrap().version, 18);
+    assert_eq!(from_fifteen_version.unwrap().version, 19);
     let legacy_has_no_anchor: Vec<bool> = from_fifteen.take(1)?;
     assert_eq!(legacy_has_no_anchor, [true]);
     db.query(session(
@@ -269,7 +269,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_sixteen_version: Option<SchemaVersion> = from_sixteen.take(0)?;
-    assert_eq!(from_sixteen_version.unwrap().version, 18);
+    assert_eq!(from_sixteen_version.unwrap().version, 19);
     let legacy_has_no_lineage: Vec<bool> = from_sixteen.take(1)?;
     assert_eq!(legacy_has_no_lineage, [true]);
     // Legacy rows still pass every rule when they are written again.
@@ -371,7 +371,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_seventeen_version: Option<SchemaVersion> = from_seventeen.take(0)?;
-    assert_eq!(from_seventeen_version.unwrap().version, 18);
+    assert_eq!(from_seventeen_version.unwrap().version, 19);
     let kept: Vec<String> = from_seventeen.take(1)?;
     assert_eq!(kept, ["momentum-a"]);
     // The roadmap tables enforce their shape even if Core validation regressed.
@@ -495,6 +495,107 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         ),
         proposal(x, ", status = 'accepted', decided_at = time::now()"),
         proposal(x, "").replace("time::now() + 14d", "time::now() - 1d"),
+    ] {
+        assert!(db.query(&bad).await?.check().is_err(), "{bad}");
+    }
+    db.use_db("from_eighteen").await?;
+    apply_through_eighteen(&db).await?;
+    db.query(roadmap(r, "")).await?.check()?;
+    apply_baseline_schema(&db).await?;
+    let mut from_eighteen = db
+        .query("SELECT version FROM schema_version:baseline; SELECT VALUE record::id(id) FROM roadmaps;")
+        .await?
+        .check()?;
+    let from_eighteen_version: Option<SchemaVersion> = from_eighteen.take(0)?;
+    assert_eq!(from_eighteen_version.unwrap().version, 19);
+    let kept: Vec<String> = from_eighteen.take(1)?;
+    assert_eq!(kept, [r]);
+    // The job tables enforce their shape even if Core validation regressed.
+    let job = |id: &str, extra: &str| {
+        format!("CREATE scheduled_jobs SET id = '{id}', kind = 'dependency_review', cadence = 'weekly', weekday = 1, at_minute = 420, enabled = true, revision = 1, params = {{}}, created_at = time::now(), updated_at = time::now(){extra};")
+    };
+    // Each case breaks exactly one rule.
+    for bad in [
+        job(x, "").replace("'dependency_review'", "'research'"),
+        job(x, ", cadence = 'daily'"),
+        job(x, "").replace("'weekly'", "'monthly'"),
+        job(x, "").replace("weekday = 1", "weekday = NONE"),
+        job(x, "").replace("weekday = 1", "weekday = 8"),
+        job(x, "").replace("at_minute = 420", "at_minute = 1440"),
+        job(x, "").replace("revision = 1", "revision = 0"),
+        job(x, ", params = { roadmap_id: 'plan' }"),
+    ] {
+        assert!(db.query(&bad).await?.check().is_err(), "{bad}");
+    }
+    db.query(job(
+        r,
+        &format!(", params = {{ roadmap_id: '{d}' }}, last_slot_at = time::now()"),
+    ))
+    .await?
+    .check()?;
+    let run = |id: &str, extra: &str| {
+        format!("CREATE scheduled_job_runs SET id = '{id}', job_id = '{r}', kind = 'dependency_review', slot_at = d'2026-11-09T06:00:00Z', trigger = 'schedule', status = 'ok', priorities = [], started_at = time::now(), finished_at = time::now(){extra};")
+    };
+    db.query(run(r, ", slot_at = d'2026-11-16T06:00:00Z', error_code = 'repo_failed', facts = '{\"alerts\":[]}', summary = 'Line one\nline two', summary_source = 'claude', priorities = [{ ref: 'a1', rank: 1, reason: 'Fix first.' }, { ref: 'p12', rank: 2, reason: 'Merge.' }]"))
+        .await?
+        .check()?;
+    db.query(run(
+        i,
+        ", status = 'running', finished_at = NONE, trigger = 'owner', slot_at = time::now()",
+    ))
+    .await?
+    .check()?;
+    db.query(run(
+        d,
+        ", slot_at = d'2026-11-02T06:00:00Z', status = 'missed'",
+    ))
+    .await?
+    .check()?;
+    for bad in [
+        // A second job of the same kind.
+        job(x, ""),
+        run(x, "").replace("'dependency_review'", "'research'"),
+        run(x, "").replace(&format!("job_id = '{r}'"), "job_id = 'job'"),
+        // The same slot of the same job twice.
+        run(x, ", slot_at = d'2026-11-16T06:00:00Z'"),
+        run(x, ", trigger = 'cron'"),
+        run(x, ", status = 'done'"),
+        run(x, ", status = 'running'"),
+        run(x, ", finished_at = NONE"),
+        run(x, ", error_code = 'Bad code'"),
+        run(x, &format!(", error_code = '{}'", "e".repeat(49))),
+        run(x, ", facts = 'x'"),
+        run(x, &format!(", facts = '\"{}\"'", "é".repeat(32768))),
+        run(x, ", summary = '', summary_source = 'claude'"),
+        run(
+            x,
+            &format!(
+                ", summary = '{}', summary_source = 'claude'",
+                "s".repeat(2001)
+            ),
+        ),
+        run(x, ", summary = 'Done.'"),
+        run(x, ", summary_source = 'claude'"),
+        run(x, ", summary = 'Done.', summary_source = 'model'"),
+        run(x, ", priorities = [{ ref: 'x1', rank: 1, reason: 'r' }]"),
+        run(x, ", priorities = [{ ref: 'a0', rank: 1, reason: 'r' }]"),
+        run(x, ", priorities = [{ ref: 'a1', rank: 0, reason: 'r' }]"),
+        run(x, ", priorities = [{ ref: 'a1', rank: 21, reason: 'r' }]"),
+        run(x, ", priorities = [{ ref: 'a1', rank: 1, reason: '' }]"),
+        run(
+            x,
+            &format!(
+                ", priorities = [{{ ref: 'a1', rank: 1, reason: '{}' }}]",
+                "r".repeat(301)
+            ),
+        ),
+        run(
+            x,
+            &format!(
+                ", priorities = [{}]",
+                ["{ ref: 'a1', rank: 1, reason: 'r' }"; 21].join(", ")
+            ),
+        ),
     ] {
         assert!(db.query(&bad).await?.check().is_err(), "{bad}");
     }

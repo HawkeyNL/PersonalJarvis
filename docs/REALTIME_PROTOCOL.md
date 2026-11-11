@@ -67,11 +67,14 @@ Public events:
   `MEMECOIN_PAPER.md`
 - `roadmap.changed` with the roadmap `id` and its new `revision`, after every
   committed roadmap write; see `ROADMAPS.md`
+- `jobs.run_finished` with the `job_id`, `run_id` and the run's `status`,
+  after a scheduled job's run ends or a slot is recorded as missed; see
+  `SCHEDULED_JOBS.md`
 
-The trading and roadmap events are hints to reload over REST and carry only
-ids, versions and flags, never market data or model text. They go to every
-connected owner. Apps before 0.1.27 close the socket on an event type they do
-not know; 0.1.27 and later ignore it.
+The trading, roadmap and job events are hints to reload over REST and carry
+only ids, versions, statuses and flags, never market data or model text.
+They go to every connected owner. Apps before 0.1.27 close the socket on an
+event type they do not know; 0.1.27 and later ignore it.
 
 There are no arbitrary tool payloads, hidden reasoning fields, provider response
 objects, authorization headers, system prompts or private scratchpads in these

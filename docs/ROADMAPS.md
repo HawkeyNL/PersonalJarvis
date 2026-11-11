@@ -248,7 +248,8 @@ rate limit the sync waits for the limit.
    - Repository access: *Only select repositories*, the ones in the
      allowlist.
    - Repository permissions, all **Read-only**: Metadata, Contents, Pull
-     requests, Issues. Nothing else, and no account permissions.
+     requests, Issues, and Dependabot alerts for the scheduled dependency
+     review (`SCHEDULED_JOBS.md`). Nothing else, and no account permissions.
 2. Store it on the Home Node as a systemd credential, root-only:
 
    ```bash

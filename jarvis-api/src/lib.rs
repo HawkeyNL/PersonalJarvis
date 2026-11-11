@@ -33,6 +33,7 @@ mod error;
 mod extract;
 pub mod ibkr;
 pub mod intent;
+pub mod jobs;
 #[cfg(unix)]
 pub mod local_devices;
 mod mcp;
@@ -253,6 +254,24 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::roadmaps::reject_proposal)
                 .layer(DefaultBodyLimit::max(routes::roadmaps::BODY_LIMIT)),
         )
+        .route(
+            "/v1/jobs",
+            get(routes::jobs::list)
+                .post(routes::jobs::create)
+                .layer(DefaultBodyLimit::max(routes::jobs::BODY_LIMIT)),
+        )
+        .route(
+            "/v1/jobs/{id}",
+            patch(routes::jobs::update)
+                .delete(routes::jobs::delete)
+                .layer(DefaultBodyLimit::max(routes::jobs::BODY_LIMIT)),
+        )
+        .route(
+            "/v1/jobs/{id}/run",
+            post(routes::jobs::run_now).layer(DefaultBodyLimit::max(routes::jobs::BODY_LIMIT)),
+        )
+        .route("/v1/jobs/{id}/runs", get(routes::jobs::runs))
+        .route("/v1/jobs/runs/{run_id}", get(routes::jobs::run))
         .route("/v1/assistant/chat", post(assistant_chat))
         .route("/v1/assistant/runs", post(routes::runs::submit))
         .route("/v1/assistant/runs/{id}", get(routes::runs::status))

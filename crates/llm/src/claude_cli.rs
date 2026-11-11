@@ -73,7 +73,7 @@ impl ClaudeCliProvider {
     fn task_request(&self, task: WorkerTask, input: &serde_json::Value) -> ClaudeWorkerRequest {
         let model = match task {
             WorkerTask::MemeDecision => &self.model_default,
-            WorkerTask::MemeStrategyReview => &self.model_hard,
+            WorkerTask::MemeStrategyReview | WorkerTask::DependencyReview => &self.model_hard,
         };
         ClaudeWorkerRequest {
             protocol: 1,
@@ -372,6 +372,9 @@ mod tests {
         let review = provider().task_request(WorkerTask::MemeStrategyReview, &input);
         assert_eq!(review.model, "claude-opus-5");
         assert!(decision.valid() && review.valid());
+        let dependencies = provider().task_request(WorkerTask::DependencyReview, &input);
+        assert_eq!(dependencies.model, "claude-opus-5");
+        assert!(dependencies.valid());
         // A non-object input never leaves Core.
         let list = provider().task_request(WorkerTask::MemeDecision, &serde_json::json!([1]));
         assert!(!list.valid());

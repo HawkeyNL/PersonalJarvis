@@ -649,6 +649,7 @@ async fn main() -> anyhow::Result<()> {
         )),
         auto_research: Default::default(),
         github,
+        jobs: Arc::new(jarvis_api::jobs::JobsHandle::new()),
     };
 
     jarvis_api::refresh_usage_snapshot(&state).await;
@@ -689,6 +690,26 @@ async fn main() -> anyhow::Result<()> {
             config.ibkr_broker_socket.clone().into(),
         );
     }
+    // Scheduled jobs (docs/SCHEDULED_JOBS.md); off when the time zone
+    // database cannot be read. The dependency review reads GitHub with the
+    // poller's token and allowlist.
+    jarvis_api::jobs::start(
+        state.db.clone(),
+        state.jobs.clone(),
+        state.realtime.clone(),
+        jarvis_api::jobs::Work {
+            github: state.github.clone(),
+            token: github_token.clone(),
+            // One typed task per run, straight to the Claude subscription
+            // worker, never through the router or a paid API.
+            brain: Arc::new(jarvis_llm::ClaudeCliProvider::new(
+                &config.llm_claude_cli_bin,
+                &config.llm_model,
+                &config.llm_model_hard,
+                &config.llm_model_cheap,
+            )),
+        },
+    );
     if let Some(token) = github_token {
         if let Err(reason) = jarvis_api::roadmaps::github::start(
             state.db.clone(),

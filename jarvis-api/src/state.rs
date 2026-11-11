@@ -238,4 +238,6 @@ pub struct AppState {
     pub auto_research: Arc<crate::auto_research::AutoResearch>,
     /// GitHub poller for roadmap links and its repo allowlist; off by default.
     pub github: Arc<crate::roadmaps::github::GithubHandle>,
+    /// The scheduled jobs runner; off when its time zone cannot be loaded.
+    pub jobs: Arc<crate::jobs::JobsHandle>,
 }
