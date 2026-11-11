@@ -1,5 +1,5 @@
 //! Subscription-backed Codex chat (for example GPT-6 Luna through a ChatGPT
-//! plan) through the local text-only worker. Core never executes the official
+//! plan) through the local tool-free worker. Core never executes the official
 //! CLI or reads its credential store, and this backend is never metered.
 
 use async_trait::async_trait;
