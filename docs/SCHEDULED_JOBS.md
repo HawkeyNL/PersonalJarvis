@@ -191,8 +191,9 @@ second alert for the same pull request adds nothing), and so is one whose
 title would be over 200 characters; at most 20 items, and no more than the
 roadmap has room for. When nothing is left, no proposal is made. A pending
 proposal that went stale still counts until the owner accepts it (409,
-marked stale), rejects it or it expires; the next run proposes again. A proposal that fails makes the run `partial` with one of
-these codes (unless it already had one):
+marked stale), rejects it or it expires; the next run proposes again. A
+proposal that fails makes the run `partial` with one of these codes (unless
+it already had one):
 
 | Code | Means |
 | --- | --- |
