@@ -16,12 +16,11 @@ use uuid::Uuid;
 
 use crate::error::bad_request;
 use crate::jobs::store::{self, OWNER_RUN_HOURS};
-use crate::jobs::{Job, JobError, JobPatch, NewJob, Params, MAX_RUNS, TIME_ZONE};
+use crate::jobs::{Job, JobError, JobPatch, NewJob, Params, DB_TIMEOUT, MAX_RUNS, TIME_ZONE};
 use crate::{AppState, Authed};
 
 /// Request bodies of the job routes.
 pub(crate) const BODY_LIMIT: usize = 4 * 1024;
-const DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const DEFAULT_RUNS: usize = 20;
 
 type Failure = (StatusCode, Json<Value>);
@@ -80,7 +79,11 @@ fn job(state: &AppState, job: Job) -> Value {
 
 /// A job may only point at a roadmap that exists and is not archived.
 async fn check_roadmap(state: &AppState, params: Option<&Params>) -> Result<(), Failure> {
-    let Some(id) = params.and_then(|params| params.roadmap_id.as_deref()) else {
+    // A malformed id is refused by the job's own validation.
+    let Some(id) = params
+        .and_then(|params| params.roadmap_id.as_deref())
+        .filter(|id| Uuid::parse_str(id).is_ok())
+    else {
         return Ok(());
     };
     match tokio::time::timeout(DB_TIMEOUT, crate::roadmaps::store::get(&state.db, id)).await {

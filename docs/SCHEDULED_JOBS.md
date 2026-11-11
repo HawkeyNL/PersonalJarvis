@@ -77,9 +77,10 @@ run) which slots are due and runs them one at a time: the owner's queued run
 first, then each job's due slot. It writes the run row (`running`) before the
 work starts, in one transaction with the slot it handles, and only while the
 job is still enabled and at the revision it read, so an owner change in
-between wins. A run's work is bounded by 15 minutes (`timed_out`). When Core
-starts, it marks runs still `running` from before as `interrupted`, and runs
-nothing until that succeeded.
+between wins. A run's work is bounded by 15 minutes (`timed_out`). Each check
+first marks runs still `running` as `interrupted` (no run is between two
+checks, so such a run was left by an earlier Core or its end could not be
+recorded), and runs nothing until that succeeded.
 
 The schedule needs the Europe/Amsterdam zone from the system time zone
 database (`/usr/share/zoneinfo`). When it cannot be read, Core logs it, the
@@ -87,7 +88,8 @@ runner stays off and `GET /v1/jobs` reports `status: "not_configured"`; jobs
 can still be edited.
 
 The owner may run a job now (also a disabled one) at most once an hour, and
-one at a time. Its row has `trigger: "owner"` and the time asked as its
+one at a time; an interrupted run counts. A request stays queued while the
+database is unavailable. Its row has `trigger: "owner"` and the time asked as its
 `slot_at`; it does not change `last_slot_at`.
 
 ## Runs

@@ -16,9 +16,8 @@ use time::OffsetDateTime;
 use jarvis_store::Database;
 
 use super::{
-    check, Job, JobError, JobPatch, NewJob, Priority, Result, Run, RunStatus, SummarySource,
-    Trigger, MAX_FACTS_BYTES, MAX_PRIORITIES, MAX_REASON, MAX_RUNS, MAX_SUMMARY,
-    RUN_RETENTION_DAYS,
+    Job, JobError, JobPatch, NewJob, Priority, Result, Run, RunStatus, SummarySource, Trigger,
+    MAX_FACTS_BYTES, MAX_PRIORITIES, MAX_REASON, MAX_RUNS, MAX_SUMMARY, RUN_RETENTION_DAYS,
 };
 
 /// An owner may start a job at most once per this many hours.
@@ -270,6 +269,44 @@ pub struct Finish {
 }
 
 impl Finish {
+    /// The rules the schema holds a finished run to.
+    pub fn check(&self) -> std::result::Result<(), &'static str> {
+        fn ok(valid: bool, message: &'static str) -> std::result::Result<(), &'static str> {
+            if valid {
+                Ok(())
+            } else {
+                Err(message)
+            }
+        }
+        ok(
+            !matches!(self.status, RunStatus::Running | RunStatus::Missed),
+            "not a final run state",
+        )?;
+        ok(
+            self.facts
+                .as_ref()
+                .is_none_or(|facts| (2..=MAX_FACTS_BYTES).contains(&facts.len())),
+            "facts must be 2 bytes to 64 KiB",
+        )?;
+        ok(
+            self.summary.as_ref().is_none_or(|(summary, _)| {
+                !summary.trim().is_empty() && summary.chars().count() <= MAX_SUMMARY
+            }),
+            "summary must be 1 to 2000 characters",
+        )?;
+        ok(
+            self.priorities.len() <= MAX_PRIORITIES
+                && self.priorities.iter().all(|priority| {
+                    valid_ref(&priority.reference)
+                        && (1..=MAX_PRIORITIES).contains(&usize::from(priority.rank))
+                        && !priority.reason.trim().is_empty()
+                        && priority.reason.chars().count() <= MAX_REASON
+                }),
+            "priorities must be at most 20 valid entries",
+        )?;
+        Ok(())
+    }
+
     pub fn failed(error_code: &'static str) -> Self {
         Self {
             status: RunStatus::Failed,
@@ -284,33 +321,7 @@ impl Finish {
 /// Record how a running run ended; a run that is no longer running (Core
 /// restarted and marked it interrupted) stays as it is.
 pub async fn finish_run(db: &Database, run_id: &str, finish: &Finish) -> Result<bool> {
-    check(
-        !matches!(finish.status, RunStatus::Running | RunStatus::Missed),
-        "not a final run state",
-    )?;
-    check(
-        finish
-            .facts
-            .as_ref()
-            .is_none_or(|facts| (2..=MAX_FACTS_BYTES).contains(&facts.len())),
-        "facts must be 2 bytes to 64 KiB",
-    )?;
-    check(
-        finish.summary.as_ref().is_none_or(|(summary, _)| {
-            !summary.trim().is_empty() && summary.chars().count() <= MAX_SUMMARY
-        }),
-        "summary must be 1 to 2000 characters",
-    )?;
-    check(
-        finish.priorities.len() <= MAX_PRIORITIES
-            && finish.priorities.iter().all(|priority| {
-                valid_ref(&priority.reference)
-                    && (1..=MAX_PRIORITIES).contains(&usize::from(priority.rank))
-                    && !priority.reason.trim().is_empty()
-                    && priority.reason.chars().count() <= MAX_REASON
-            }),
-        "priorities must be at most 20 valid entries",
-    )?;
+    finish.check().map_err(JobError::Invalid)?;
     let (summary, source) = match &finish.summary {
         Some((summary, source)) => (Some(summary.as_str()), Some(*source)),
         None => (None, None),
