@@ -7,15 +7,9 @@ guard fails or the date passes, re-review the advisory instead of extending it.
 
 | Advisory | Crate | Expires | Guard |
 |---|---|---|---|
-| RUSTSEC-2026-0235 | rkyv 0.7 | 2026-12-31 | date |
 | RUSTSEC-2026-0381 | webpki-roots 0.26.11 | 2026-12-31 | date, allowed versions |
 | RUSTSEC-2026-0453 | surrealdb 2.x (affinitypool) | 2026-12-07 | date, `affinitypool` absent, surrealdb lines unchanged |
 | RUSTSEC-2026-0454 | surrealdb-core (reblessive 0.4.3) | 2026-12-07 | date, surrealdb lines unchanged |
-
-## RUSTSEC-2026-0235 (rkyv 0.7)
-
-Locked through an optional dependency of `rust_decimal`, but compiled for no
-target or feature set.
 
 ## RUSTSEC-2026-0381 (webpki-roots 0.26.11)
 
