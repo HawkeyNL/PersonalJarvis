@@ -78,6 +78,7 @@ pub struct ClaudeWorkerRequest {
 pub enum WorkerTask {
     MemeDecision,
     MemeStrategyReview,
+    DependencyReview,
 }
 
 impl WorkerTask {
@@ -86,6 +87,7 @@ impl WorkerTask {
         match self {
             Self::MemeDecision => crate::meme_prompts::MEME_DECISION_SYSTEM_PROMPT,
             Self::MemeStrategyReview => crate::meme_prompts::MEME_STRATEGY_REVIEW_SYSTEM_PROMPT,
+            Self::DependencyReview => crate::job_prompts::DEPENDENCY_REVIEW_SYSTEM_PROMPT,
         }
     }
 }
@@ -259,7 +261,11 @@ mod tests {
 
     #[test]
     fn task_requests_carry_only_their_fixed_prompt_and_a_bounded_json_object() {
-        for task in [WorkerTask::MemeDecision, WorkerTask::MemeStrategyReview] {
+        for task in [
+            WorkerTask::MemeDecision,
+            WorkerTask::MemeStrategyReview,
+            WorkerTask::DependencyReview,
+        ] {
             let ok = task_request(task, r#"{"c1":{"liq_usd":1200.5}}"#.into());
             assert!(ok.valid());
             let wire = serde_json::to_value(&ok).unwrap();
@@ -294,6 +300,11 @@ mod tests {
         let mut swapped = task_request(WorkerTask::MemeDecision, "{}".into());
         swapped.system = Some(WorkerTask::MemeStrategyReview.system_prompt().into());
         assert!(!swapped.valid());
+        let mut swapped = task_request(WorkerTask::DependencyReview, "{}".into());
+        swapped.system = Some(WorkerTask::MemeStrategyReview.system_prompt().into());
+        assert!(!swapped.valid());
+        let wire = serde_json::to_value(task_request(WorkerTask::DependencyReview, "{}".into()));
+        assert_eq!(wire.unwrap()["task"], "dependency_review");
         // Unknown task names are refused at the wire.
         let unknown = r#"{"protocol":1,"model":"m","system":null,"prompt":"{}","task":"shell"}"#;
         assert!(serde_json::from_str::<ClaudeWorkerRequest>(unknown).is_err());

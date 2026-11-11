@@ -159,3 +159,19 @@ repository's code:
 | `github_answer_too_large` | An answer over 1 MiB |
 | `github_redirect_refused` | A redirect to another host |
 | `github_unavailable` | Anything else: unreachable, timed out, an error answer |
+
+Then the run puts the facts in order with one call to the Claude
+subscription worker, the typed task `dependency_review` (see
+`SUBSCRIPTION_WORKERS.md`): its fixed prompt, no tools, the hard model,
+sharing the worker's one background slot with research and the memecoin
+tasks, never the router or a paid API. The task's input is the facts cut to
+16 KiB, least severe alerts first, and is data only. Its answer must be
+exactly `{"priorities": [{"ref", "rank", "reason"}], "summary"}`: at most 20
+priorities ranked 1, 2, 3 … without gaps, each `ref` one the call was given
+and at most once, one-line reasons of at most 300 characters and a summary
+of at most 2000; anything else is refused as a whole. Then, and when the
+worker is busy, down or out of plan, or there is nothing to order, Core
+writes its own: alerts with a fixed version first, then by severity, up to
+20, each with a templated reason, and a templated summary
+(`summary_source: "deterministic"`). A failed run has neither. The answer is
+display only and never feeds a later call.

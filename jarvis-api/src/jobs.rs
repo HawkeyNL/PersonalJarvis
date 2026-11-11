@@ -510,6 +510,8 @@ pub struct Work {
     pub github: Arc<GithubHandle>,
     /// The poller's read-only token; none when it is not configured.
     pub token: Option<HeaderValue>,
+    /// The Claude subscription worker for typed tasks, never the router.
+    pub brain: Arc<dyn crate::memecoin::agent::Brain>,
 }
 
 /// Spawn the runner unless the time zone failed to load. Every minute, or
@@ -1071,6 +1073,7 @@ mod tests {
             work: Work {
                 github: Arc::default(),
                 token: None,
+                brain: Arc::new(jarvis_llm::ClaudeCliProvider::new("unused", "m", "m", "m")),
             },
         };
         let input = serde_json::json!({"kind": "dependency_review", "cadence": "daily"});

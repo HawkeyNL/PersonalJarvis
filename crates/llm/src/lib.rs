@@ -13,6 +13,7 @@ mod codex_cli;
 mod fallback;
 mod huggingface;
 mod huggingface_catalog;
+mod job_prompts;
 mod live_policy;
 mod meme_prompts;
 mod model_policy;
