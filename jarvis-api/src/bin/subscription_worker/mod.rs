@@ -217,10 +217,13 @@ mod slot_tests {
         let research = request(true, None);
         let decision = request(false, Some(WorkerTask::MemeDecision));
         let review = request(false, Some(WorkerTask::MemeStrategyReview));
+        let dependencies = request(false, Some(WorkerTask::DependencyReview));
         for (first, second) in [
             (&research, &decision),
             (&decision, &research),
             (&decision, &review),
+            (&dependencies, &review),
+            (&research, &dependencies),
             (&research, &research),
         ] {
             let slots = Arc::new(Semaphore::new(MAX_PARALLEL_BACKGROUND_RUNS));

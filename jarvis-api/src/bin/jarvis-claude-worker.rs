@@ -564,6 +564,7 @@ mod tests {
             (false, None),
             (false, Some(WorkerTask::MemeDecision)),
             (false, Some(WorkerTask::MemeStrategyReview)),
+            (false, Some(WorkerTask::DependencyReview)),
         ] {
             let command = official_command(&request(research, task), None);
             assert_eq!(environment(&command), clean);
@@ -697,7 +698,11 @@ mod tests {
     #[test]
     fn task_runs_use_the_reviewed_tool_free_invocation_and_the_requested_model() {
         let prompt = Path::new("/run/jarvis-claude/.tmpX");
-        for task in [WorkerTask::MemeDecision, WorkerTask::MemeStrategyReview] {
+        for task in [
+            WorkerTask::MemeDecision,
+            WorkerTask::MemeStrategyReview,
+            WorkerTask::DependencyReview,
+        ] {
             let mut request = request(false, Some(task));
             request.model = "claude-sonnet-5".into();
             let args = cli_args(&request, Some(prompt));

@@ -984,6 +984,18 @@ pub enum Severity {
     Critical,
 }
 
+impl Severity {
+    /// The wire name, as serde writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DependencyAlert {
     #[serde(rename = "ref")]
