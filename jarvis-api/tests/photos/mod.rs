@@ -371,7 +371,7 @@ async fn photos_join_a_message_atomically_and_leave_with_its_conversation(
                 .query("RETURN [count(SELECT * FROM conversations), count(SELECT * FROM chat_messages), count(SELECT * FROM assistant_runs)]")
                 .await
                 .unwrap();
-            response.take::<Option<Vec<u64>>>(0).unwrap().unwrap()
+            response.take::<Vec<u64>>(0).unwrap()
         }
     };
     let run = |attachments: Vec<Uuid>, content: &str| {
