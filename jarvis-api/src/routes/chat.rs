@@ -859,25 +859,9 @@ fn is_https_source(line: &str) -> bool {
 fn titled_link_url(candidate: &str) -> Option<&str> {
     let (title, rest) = candidate.strip_prefix('[')?.split_once("](")?;
     let plain = (1..=120).contains(&title.chars().count())
-        && !title.chars().any(|ch| {
-            matches!(ch, '[' | ']' | '(' | ')') || ch.is_control() || invisible_format(ch)
-        });
+        && crate::validation::no_hidden_chars(title)
+        && !title.contains(['[', ']', '(', ')']);
     plain.then(|| rest.strip_suffix(')')).flatten()
-}
-
-/// Bidi controls, zero-width, line/paragraph separators and other
-/// invisible format characters: a title could hide or reorder text with them.
-fn invisible_format(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{00AD}'
-            | '\u{061C}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
-    )
 }
 
 /// Missing usage on a backend reply must not turn a metered success into an
@@ -1864,6 +1848,20 @@ mod tests {
             "- [{}](https://example.org/)",
             "é".repeat(120)
         )));
+        // The same hidden characters as every other owner-visible label.
+        for hidden in [
+            '\u{034F}',
+            '\u{115F}',
+            '\u{180E}',
+            '\u{3164}',
+            '\u{FE0F}',
+            '\u{FFF9}',
+            '\u{E0041}',
+        ] {
+            assert!(!is_https_source(&format!(
+                "- [A{hidden}B](https://example.org/)"
+            )));
+        }
         assert_eq!(
             https_sources_only("Antwoord\nBronnen:\nhttps://example.nl/\nftp://x"),
             "Antwoord\nBronnen:\nhttps://example.nl/"
