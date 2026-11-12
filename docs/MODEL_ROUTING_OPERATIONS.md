@@ -418,6 +418,19 @@ in-process cooldown, so Core falls back only to another enabled provider that
 still meets the task floor instead of retrying a known-bad credential on every
 request.
 
+**Photos.** A request whose input carries chat photos goes only to the
+owner's subscription workers, `claude-cli` and `codex-cli`, in the owner's
+chain order (`codex-cli` still only through a routed chain or a pin). The
+router skips every other backend for it: paid APIs, Ollama and anything
+else never see an image. A run (streamed, one attempt) uses the first of
+them that is usable; a failed attempt ends the run and is never retried
+elsewhere. A brain pinned to another backend, or no usable subscription
+worker, ends the request with "no vision-capable subscription worker"; Core
+then stores a fixed answer and keeps the photo. A failed photo attempt puts
+the worker in cooldown only for a revoked login or a full plan, so text chat
+is not moved to another backend because of a photo. The same chat without
+photos routes as before.
+
 Metered execution is accounted per backend/model. Local Ollama and the local
 subscription CLI are distinct from paid API backends. Unknown remote prices are
 explicitly marked unknown and are conservatively charged for accounting; they
