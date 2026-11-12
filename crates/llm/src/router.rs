@@ -323,6 +323,16 @@ impl RouterProvider {
             );
     }
 
+    /// A failed photo run (an unreadable photo, a refused event) says
+    /// nothing about text chat on the same subscription, like a failed
+    /// research run: only a revoked login or a full plan cools it down, so
+    /// text chat is never pushed onto a paid API by a photo.
+    fn record_chat_failure(&self, backend: &str, failure: ProviderFailure, images: bool) {
+        if !images || Self::research_failure_affects_chat(failure) {
+            self.record_failure(backend, failure);
+        }
+    }
+
     fn record_success(&self, backend: &str) {
         self.health
             .lock()
@@ -513,7 +523,9 @@ impl LlmProvider for RouterProvider {
             let result = candidate.provider.chat_stream(&attempt, sink).await;
             match &result {
                 Ok(_) => self.record_success(&candidate.id),
-                Err(error) => self.record_failure(&candidate.id, error.failure_category()),
+                Err(error) => {
+                    self.record_chat_failure(&candidate.id, error.failure_category(), images)
+                }
             }
             return result;
         }
@@ -573,7 +585,7 @@ impl LlmProvider for RouterProvider {
                 Err(LlmError::Refused) => return Err(LlmError::Refused),
                 Err(e) => {
                     let failure = e.failure_category();
-                    self.record_failure(&candidate.id, failure);
+                    self.record_chat_failure(&candidate.id, failure, images);
                     tracing::warn!(
                         backend = %candidate.id,
                         failure = ?failure,
@@ -2218,6 +2230,25 @@ mod tests {
             assert_eq!(reply.text, pinned);
             assert_eq!(*seen.lock().unwrap(), [(pinned, 2)]);
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_photo_run_does_not_cool_down_text_chat() {
+        let (router, seen) = vision_router(&VISION_FLEET, EVERYONE_FIRST_PAID, &["claude-cli"]);
+        let sink: crate::TextDeltaSink = Arc::new(|_| {});
+        assert!(router
+            .chat_stream(&photo_request(Some("claude-cli")), sink)
+            .await
+            .is_err());
+        assert!(router.chat(&photo_request(None)).await.is_ok());
+        assert!(router.is_healthy("claude-cli"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [("claude-cli", 2), ("claude-cli", 2), ("codex-cli", 2)]
+        );
+        // A full plan still applies to text chat too.
+        router.record_chat_failure("codex-cli", ProviderFailure::RateLimited, true);
+        assert!(!router.is_healthy("codex-cli"));
     }
 
     #[tokio::test]
