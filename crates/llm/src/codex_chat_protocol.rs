@@ -1,4 +1,4 @@
-//! Contract of the text-only Codex chat worker. It speaks the same finite
+//! Contract of the tool-free Codex chat worker. It speaks the same finite
 //! request/reply protocol as the Claude worker (`claude_worker_protocol`);
 //! only the socket, the identity and the reviewed official runtime differ.
 

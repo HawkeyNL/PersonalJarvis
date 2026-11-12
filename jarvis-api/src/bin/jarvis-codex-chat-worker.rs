@@ -1,4 +1,4 @@
-//! Finite, text-only Codex chat worker for subscription models (for example
+//! Finite, tool-free Codex chat worker for subscription models (for example
 //! GPT-6 Luna through a ChatGPT plan). The official CLI runs as the jarvis-codex
 //! identity with its one ChatGPT login, with every tool off, in an empty private
 //! directory, never inside Core and never with an API key. The unit keeps the
@@ -10,7 +10,9 @@ use std::{path::Path, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use jarvis_llm::{
-    claude_worker_protocol::{ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState},
+    claude_worker_protocol::{
+        ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState, WorkerImage,
+    },
     codex_chat_protocol::{
         classify_codex_failure, codex_subscription_status, parse_codex_event,
         reviewed_codex_version, CodexEvent, REVIEWED_VERSION_ENV,
@@ -96,9 +98,8 @@ async fn main() -> Result<()> {
             let reply = match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request(&mut stream))
                 .await
             {
-                // Typed tasks are Claude-only; this worker refuses them. Photo
-                // runs need their own reviewed invocation; refused until then.
-                Ok(Ok(request)) if request.task.is_none() && request.images.is_empty() => {
+                // Typed tasks are Claude-only; this worker refuses them.
+                Ok(Ok(request)) if request.task.is_none() => {
                     match background_slot(&request, &research_permits) {
                         Some(_research_permit) => {
                             let deadline = reply_deadline(&request);
@@ -281,9 +282,58 @@ async fn run_official_client(
         file.flush().await?;
         instructions = Some(path);
     }
-    let command = exec_command(&request, &workdir, instructions.as_deref());
+    // Photos (only on chat runs) beside the instructions, outside the
+    // workdir; each re-checked first. They go with the run directory.
+    let Some(photos) = write_photos(run.path(), &request.images).await? else {
+        return Ok(ClaudeWorkerReply::failure(
+            ClaudeWorkerState::RuntimeFailure,
+        ));
+    };
+    let command = exec_command(&request, &workdir, instructions.as_deref(), &photos);
     let outcome = run_cli(command, &request.prompt, limit, request.research).await?;
     Ok(finish(outcome))
+}
+
+/// Write each photo as `img-N.jpg` (N from 1, oldest first, so it matches
+/// `[photo N]` in the prompt), 0600 and new, into the private run directory.
+/// `None` when a photo fails its re-check (a whole JPEG of at most 1 MiB).
+async fn write_photos(
+    run: &Path,
+    images: &[WorkerImage],
+) -> Result<Option<Vec<std::path::PathBuf>>> {
+    let mut paths = Vec::with_capacity(images.len());
+    for (index, image) in images.iter().enumerate() {
+        let Some(jpeg) = image.decoded() else {
+            return Ok(None);
+        };
+        let path = run.join(format!("img-{}.jpg", index + 1));
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .await?;
+        file.write_all(&jpeg).await?;
+        file.flush().await?;
+        paths.push(path);
+    }
+    Ok(Some(paths))
+}
+
+/// The reviewed argv plus, for a run with photos, exactly one argument
+/// before the final `-`: `--image=<run>/img-1.jpg,<run>/img-2.jpg`. The
+/// run directory comes from the worker, never from Core.
+fn with_photos(mut args: Vec<String>, photos: &[std::path::PathBuf]) -> Vec<String> {
+    if !photos.is_empty() {
+        let list = photos
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let last = args.len() - 1;
+        args.insert(last, format!("--image={list}"));
+    }
+    args
 }
 
 /// What the event stream reported. The answer comes only from a completed
@@ -495,9 +545,13 @@ fn exec_command(
     request: &ClaudeWorkerRequest,
     workdir: &Path,
     instructions: Option<&Path>,
+    photos: &[std::path::PathBuf],
 ) -> Command {
     let mut command = clean_command(CODEX, workdir);
-    command.args(exec_args(&request.model, instructions, request.research));
+    command.args(with_photos(
+        exec_args(&request.model, instructions, request.research),
+        photos,
+    ));
     if request.research {
         command.env("TZ", "UTC");
     }
@@ -628,6 +682,100 @@ mod tests {
         assert_eq!(argv.len(), plain.len());
     }
 
+    #[test]
+    fn photo_argv_adds_exactly_one_image_list_before_the_prompt_marker() {
+        let path = Path::new("/run/jarvis-codex-chat/run-x/instructions.md");
+        let plain = exec_args("gpt-6-luna", Some(path), false);
+        assert_eq!(with_photos(plain.clone(), &[]), plain);
+        let photos = [1, 2]
+            .map(|n| std::path::PathBuf::from(format!("/run/jarvis-codex-chat/run-x/img-{n}.jpg")));
+        let argv = with_photos(plain.clone(), &photos);
+        assert_eq!(argv.len(), plain.len() + 1);
+        assert_eq!(
+            argv[argv.len() - 2],
+            "--image=/run/jarvis-codex-chat/run-x/img-1.jpg,/run/jarvis-codex-chat/run-x/img-2.jpg"
+        );
+        assert_eq!(argv.last().map(String::as_str), Some("-"));
+        // Everything else is the reviewed chat argv, view_image still off.
+        let rest: Vec<String> = argv
+            .iter()
+            .filter(|arg| !arg.starts_with("--image="))
+            .cloned()
+            .collect();
+        assert_eq!(rest, plain);
+        assert_no_widening_tokens(&rest);
+        assert!(rest.iter().any(|arg| arg == "tools.view_image=false"));
+        // The CLI gets the same environment as a text run.
+        let workdir = Path::new("/run/jarvis-codex-chat/run-x/work");
+        let request = ClaudeWorkerRequest {
+            protocol: 1,
+            model: "gpt-6-luna".into(),
+            system: None,
+            prompt: "hi".into(),
+            research: false,
+            task: None,
+            images: Vec::new(),
+        };
+        let command = exec_command(&request, workdir, None, &photos);
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(args[args.len() - 2], argv[argv.len() - 2].as_str());
+        let clean = clean_command(CODEX, workdir);
+        assert!(command.as_std().get_envs().eq(clean.as_std().get_envs()));
+    }
+
+    fn jpeg(marker: u8) -> Vec<u8> {
+        vec![0xFF, 0xD8, 0xFF, 0xE0, marker, 0xFF, 0xD9]
+    }
+
+    #[tokio::test]
+    async fn photos_are_private_files_for_the_run_only_and_gone_after_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let run = tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(parent.path())
+            .unwrap();
+        let images = [1, 2].map(|n| WorkerImage::jpeg(&jpeg(n)));
+        let photos = write_photos(run.path(), &images).await.unwrap().unwrap();
+        assert_eq!(
+            photos,
+            [1, 2].map(|n| run.path().join(format!("img-{n}.jpg")))
+        );
+        for (n, photo) in (1..).zip(&photos) {
+            let meta = std::fs::metadata(photo).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::read(photo).unwrap(), jpeg(n));
+        }
+        // Never over an existing file.
+        assert!(write_photos(run.path(), &images).await.is_err());
+
+        // During the run the CLI reads them; the prompt still arrives on stdin.
+        let check = photos
+            .iter()
+            .map(|photo| format!("[ \"$(stat -c %a {})\" = 600 ]", photo.display()))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let outcome = run_cli(
+            shell(&format!(
+                "p=$(cat); [ \"$p\" = 'hi' ] && {check} && echo '{ANSWER}' && echo '{DONE}'"
+            )),
+            "hi",
+            Duration::from_secs(10),
+            false,
+        )
+        .await
+        .unwrap();
+        let reply = finish(outcome);
+        assert!(matches!(reply.state, ClaudeWorkerState::Completed));
+        drop(run);
+        assert!(photos.iter().all(|photo| !photo.exists()));
+
+        // A photo that fails its re-check stops the run before the CLI.
+        let other = tempfile::tempdir_in(parent.path()).unwrap();
+        let broken = [WorkerImage::jpeg(&jpeg(1)[..5])];
+        assert!(write_photos(other.path(), &broken).await.unwrap().is_none());
+    }
+
     const SEARCH: &str = r#"{"type":"item.completed","item":{"id":"i0","type":"web_search","query":"q","action":{"type":"search","query":"q"}}}"#;
 
     #[tokio::test]
@@ -722,10 +870,10 @@ mod tests {
             images: Vec::new(),
         };
         assert_eq!(
-            environment(&exec_command(&request(false), workdir, None)),
+            environment(&exec_command(&request(false), workdir, None, &[])),
             clean
         );
-        let mut research = environment(&exec_command(&request(true), workdir, None));
+        let mut research = environment(&exec_command(&request(true), workdir, None, &[]));
         assert_eq!(
             research.remove(std::ffi::OsStr::new("TZ")),
             Some(Some("UTC".into()))
