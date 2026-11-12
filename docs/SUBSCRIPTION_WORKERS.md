@@ -530,9 +530,9 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   [--system-prompt-file <private 0600 file>]
 ```
 
-The prompt and the photos go to stdin as one `stream-json` user message (a
-text block, then one base64 image block per photo), after which stdin is
-closed. Photos are never written to disk and never appear in the arguments.
+The prompt and the photos go to stdin as one `stream-json` user message (the
+prompt as a text block, then per photo a `[photo N]` text block and a base64
+image block), after which stdin is closed. Photos are never written to disk and never appear in the arguments.
 The event stream is read like a research run's, but with no tool allowed at
 all: any tool-use block, a web search included, or a line that is not a typed
 JSON object kills the CLI's process group and returns `tool_use_refused`. The
