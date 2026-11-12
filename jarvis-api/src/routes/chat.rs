@@ -294,10 +294,18 @@ pub(super) async fn execute_chat(
     };
     // Only the runs API carries photos: their labels for this run.
     let (canonical_history, photo_labels) = if user_already_published {
-        let (messages, labels) =
-            super::chat_context::load(&state.db, &state.photos, authed.user.id, &user_message)
-                .await
-                .map_err(|_| internal_error())?;
+        // A web search never sees photos, so none are read for one.
+        let research =
+            req.mode.as_deref().map(llm::RoutingMode::parse) == Some(llm::RoutingMode::Research);
+        let (messages, labels) = super::chat_context::load(
+            &state.db,
+            &state.photos,
+            authed.user.id,
+            &user_message,
+            !research,
+        )
+        .await
+        .map_err(|_| internal_error())?;
         (Some(messages), labels)
     } else {
         (None, Vec::new())
@@ -485,8 +493,9 @@ pub(super) async fn execute_chat(
             } else {
                 &photo_labels
             };
+            let had_markers = reply.text.contains(PHOTO_MARKER);
             let shown = take_photo_markers(&mut reply.text, labels);
-            if reply.text.trim().is_empty() && shown.is_empty() {
+            if had_markers && reply.text.trim().is_empty() && shown.is_empty() {
                 reply.text = PHOTO_NOT_FOUND_REPLY.into();
             }
             let input_bytes = chat
@@ -696,6 +705,20 @@ fn photo_marker(text: &str) -> Option<(u32, &str)> {
 }
 
 fn without_inline_markers(line: &str) -> String {
+    // Removing one marker can join the text around it into a new one.
+    let mut line = remove_markers_once(line);
+    while photo_marker_inside(&line) {
+        line = remove_markers_once(&line);
+    }
+    line
+}
+
+fn photo_marker_inside(text: &str) -> bool {
+    text.match_indices(PHOTO_MARKER)
+        .any(|(start, _)| photo_marker(&text[start..]).is_some())
+}
+
+fn remove_markers_once(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(start) = rest.find(PHOTO_MARKER) {
@@ -1515,6 +1538,11 @@ mod tests {
         assert!(take_photo_markers(&mut plain, &labels).is_empty());
         assert_eq!(plain, "  Line one\r\nLine two\n");
         assert_eq!(take("[[photo:0004]]").1, Vec::<Uuid>::new());
+        // Removing a marker cannot leave a new one behind.
+        assert_eq!(
+            take("x [[pho[[photo:1]]to:2]] y [[[[photo:3]]photo:4]]]]"),
+            ("x  y ]]".to_string(), Vec::new())
+        );
     }
 
     #[test]

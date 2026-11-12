@@ -45,11 +45,12 @@ impl ChatMessage {
 pub struct ImageData(Arc<[u8]>);
 
 impl ImageData {
-    /// `None` unless the bytes start like a JPEG.
+    /// `None` unless the bytes are a whole JPEG: its start and end markers.
+    /// The worker checks the same, so a truncated photo is left out here
+    /// instead of failing the whole run there.
     pub fn jpeg(bytes: impl Into<Arc<[u8]>>) -> Option<Self> {
         let bytes = bytes.into();
-        bytes
-            .starts_with(&[0xFF, 0xD8, 0xFF])
+        (bytes.starts_with(&[0xFF, 0xD8, 0xFF]) && bytes.ends_with(&[0xFF, 0xD9]))
             .then_some(Self(bytes))
     }
 
@@ -467,6 +468,7 @@ mod tests {
     #[test]
     fn image_data_is_jpeg_only_and_never_printed() {
         assert!(ImageData::jpeg(vec![0x89, b'P', b'N', b'G']).is_none());
+        assert!(ImageData::jpeg(vec![0xFF, 0xD8, 0xFF, 0xE0, 0x42]).is_none());
         let image = ImageData::jpeg(vec![0xFF, 0xD8, 0xFF, 0xE0, 0x42, 0xFF, 0xD9]).unwrap();
         let message = ChatMessage {
             images: vec![image],
