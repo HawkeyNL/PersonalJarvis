@@ -336,8 +336,9 @@ fn cli_args(request: &ClaudeWorkerRequest, system_prompt: Option<&Path>) -> Vec<
 
 /// The one user message of a photo run, as a `stream-json` input line: the
 /// prompt as a text block, then for each photo, oldest first, a `[photo N]`
-/// text block and the photo as a base64 image block. Each photo is decoded, re-checked and encoded again here, so only
-/// a whole bounded JPEG reaches the CLI. `None` if any photo fails.
+/// text block and the photo as a base64 image block. Each photo is decoded,
+/// re-checked and encoded again here, so only a whole bounded JPEG reaches
+/// the CLI. `None` if any photo fails.
 fn photo_message(request: &ClaudeWorkerRequest) -> Option<Vec<u8>> {
     let mut content = vec![serde_json::json!({"type": "text", "text": request.prompt})];
     for (number, image) in (1..).zip(&request.images) {
