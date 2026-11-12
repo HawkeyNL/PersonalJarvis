@@ -720,8 +720,8 @@ async fn the_model_sees_this_runs_photos_and_can_show_one_back(
         assert_eq!(
             contents,
             [
-                "[photo 1] [photo 2]",
-                "[photo shown]\nHere it is:",
+                "[photo 1] [photo 2]\n[just now]",
+                "[photo shown]\n[just now] Here it is:",
                 "What colour is it?"
             ]
         );
