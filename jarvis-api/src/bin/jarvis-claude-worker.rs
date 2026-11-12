@@ -335,13 +335,16 @@ fn cli_args(request: &ClaudeWorkerRequest, system_prompt: Option<&Path>) -> Vec<
 }
 
 /// The one user message of a photo run, as a `stream-json` input line: the
-/// prompt as a text block, then each photo as a base64 image block, oldest
-/// first. Each photo is decoded, re-checked and encoded again here, so only
+/// prompt as a text block, then for each photo, oldest first, a `[photo N]`
+/// text block and the photo as a base64 image block. Each photo is decoded, re-checked and encoded again here, so only
 /// a whole bounded JPEG reaches the CLI. `None` if any photo fails.
 fn photo_message(request: &ClaudeWorkerRequest) -> Option<Vec<u8>> {
     let mut content = vec![serde_json::json!({"type": "text", "text": request.prompt})];
-    for image in &request.images {
+    for (number, image) in (1..).zip(&request.images) {
         let checked = WorkerImage::jpeg(&image.decoded()?);
+        // The label right before its photo, so the pairing never depends on
+        // which turns the bounded prompt kept.
+        content.push(serde_json::json!({"type": "text", "text": format!("[photo {number}]")}));
         content.push(serde_json::json!({
             "type": "image",
             "source": {"type": "base64", "media_type": checked.media_type, "data": checked.data},
@@ -386,9 +389,14 @@ async fn run_stream(
     ) else {
         return failed(ClaudeWorkerState::RuntimeFailure, "spawn");
     };
+    // Feed stdin in the background: a photo message is megabytes, and the
+    // CLI may print before it has read it all. A CLI that stops reading
+    // early decides the run through its events and exit status.
+    let input = input.to_vec();
+    tokio::spawn(async move {
+        let _ = stdin.write_all(&input).await;
+    });
     let run = async {
-        stdin.write_all(input).await?;
-        drop(stdin);
         let Some(result) = read_stream(stdout, allow_search).await? else {
             return Ok(None);
         };
@@ -971,7 +979,9 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&line).unwrap(),
             serde_json::json!({"type": "user", "message": {"role": "user", "content": [
                 {"type": "text", "text": request.prompt},
+                {"type": "text", "text": "[photo 1]"},
                 image(1),
+                {"type": "text", "text": "[photo 2]"},
                 image(2),
             ]}})
         );
@@ -998,6 +1008,24 @@ mod tests {
         .await;
         assert!(matches!(reply.state, ClaudeWorkerState::Completed));
         assert_eq!(std::fs::read(&seen).unwrap(), message);
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_prints_before_reading_its_input_does_not_stall() {
+        // More than a pipe buffer out before any of a large input is read.
+        let started = std::time::Instant::now();
+        let reply = run_stream(
+            shell(&format!(
+                "head -c 200000 /dev/zero | tr '\\0' ' '; echo; cat >/dev/null; \
+                 printf '%s\\n' '{RESULT}'"
+            )),
+            &vec![b'x'; 4 * 1024 * 1024],
+            Duration::from_secs(10),
+            false,
+        )
+        .await;
+        assert!(matches!(reply.state, ClaudeWorkerState::Completed));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     /// A fake photo run that prints these stream lines, then runs `tail`.
