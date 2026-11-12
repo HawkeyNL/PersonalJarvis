@@ -211,6 +211,82 @@ Request-id payload matching remains exact, even if a retry carries different
 client history. Tests include a stale client supplying an invented assistant
 turn: the fake provider receives the canonical stored answer instead.
 
+## Chat photos
+
+Photos are additive to protocol 1: no new event type and no new port. All
+routes need an authenticated device session; nothing is public and Caddy is
+unchanged.
+
+**Upload and storage.** `POST /v1/photos` takes the raw image bytes (body up
+to 15 MiB). The type comes from the magic bytes only, never from
+`Content-Type`: JPEG, PNG and WebP are accepted, everything else (HEIC, GIF,
+SVG, …) is refused with 415. Core checks the dimensions before decoding
+(at most 10,000 px per side and 40 MP), decodes one photo at a time with an
+allocation cap and a 20-second limit, and always re-encodes: at most 1600 px
+on the long side, alpha flattened on white, a fresh JPEG of at most 1 MiB.
+Nothing of the original survives (no EXIF, GPS, XMP or ICC data). Limits: 30
+uploads per device per minute, 50 per owner per rolling 24 hours, 2 GiB per
+owner in all. The reply is `{id, width, height, bytes}`.
+
+Files live in `/var/lib/jarvis/photos/<uuid>.jpg` (0600), written to a
+temporary file in the same directory, flushed and renamed. Paths are built
+only from parsed UUIDs. At startup Core requires that directory to be a real
+directory (not a symlink) owned by its own user with mode 0700; otherwise
+every photo route answers 503 and the rest of Core runs normally.
+
+**Owner routes.** `GET /v1/photos/{id}` returns the JPEG with
+`Cache-Control: private, no-store`, `nosniff`, `Content-Disposition: inline`
+and `Content-Security-Policy: default-src 'none'`. `PATCH /v1/photos/{id}`
+takes exactly `{"saved": bool}` and returns `{id, saved, expires_at}`
+(`null` when kept). `DELETE /v1/photos/{id}` removes the file and the row
+(204). Another owner's photo, a missing one and a malformed id all answer
+404.
+
+**Sending.** `POST /v1/assistant/runs` takes an optional `attachments` list:
+up to four of the caller's own uploaded, not yet sent photo ids, without
+duplicates. The list is omitted from the request hash when empty, so text-only
+retries hash as before. Empty text is allowed with photos (a new conversation
+is then titled "Photo"). The photos are claimed in the same transaction as the
+user message; a foreign, missing, already sent or about-to-expire photo rolls
+the whole submission back (404 `no such photo`). `mode: "research"` with
+photos and the legacy `POST /v1/assistant/chat` with photos answer 400.
+
+**Events and history.** `message.created` and `assistant.completed` carry
+`attachments` (photo ids only, never bytes) on the canonical message; the field
+is absent when empty. `GET /v1/conversations/{id}` lists each message's
+`attachments` and a top-level `photos: [{id, saved, expires_at}]` of the
+conversation's photos that still exist. An id a message lists but `photos`
+does not is a deleted or expired photo: clients show a placeholder. Deleting a
+conversation deletes its photos, kept ones included.
+
+**What the model sees.** Photos go only to the owner's Claude or Codex
+subscription worker (see `MODEL_ROUTING_OPERATIONS.md`). The run context
+attaches the photos of the newest three user turns, at most four, newest
+first. Every photo in the text gets a label, oldest first: `[photo N]` for an
+attached one, `[photo, not shown again]` for one outside that window and
+`[photo no longer available]` for a deleted or unreadable one. A photo-only
+turn therefore always has text. An assistant turn that showed a photo carries
+`[photo shown]`. A run with labels gets one extra system sentence telling the
+model that a line that is exactly `[[photo:N]]` shows photo N again. Core
+takes every such marker off the answer before it is stored: a whole-line
+marker with a label of this run adds that photo to the answer's
+`attachments` (each once, at most four); unknown numbers and inline markers
+are only removed. A run with photos in its input starts no automatic web
+search and offers none. Photos never reach web research, the intent
+classifier, memory, notifications or logs. When no subscription worker can
+take the photos, Core stores a fixed answer saying so; no other backend is
+tried and the photo stays with the message.
+
+**Retention.** The hourly maintenance pass (at most 120 seconds) deletes
+photos that were never sent 24 hours after upload, and unkept photos 90 days
+after upload; a kept photo stays until the owner deletes it or its
+conversation. Sending only claims photos younger than 23 hours, so a pass
+never removes a photo that is being sent. Each pass handles at most 500
+photos, removes the file before the row, then sweeps files without a row and
+leftover temporary files older than an hour (at most 10,000 directory entries
+per pass). It logs counts only. Photos are not part of backups; see
+`BACKUP_AND_RESTORE.md`.
+
 ## Voice
 
 The originating authenticated device claims voice for its run. Explicit HTTP
