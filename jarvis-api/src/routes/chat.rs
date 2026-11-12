@@ -855,16 +855,29 @@ fn is_https_source(line: &str) -> bool {
 
 /// The URL of a whole `[Title](url)` line. The title is plain text the apps
 /// show as is: 1 to 120 characters, no brackets, parentheses, line breaks,
-/// control or bidi characters.
+/// control, bidi or other invisible format characters.
 fn titled_link_url(candidate: &str) -> Option<&str> {
     let (title, rest) = candidate.strip_prefix('[')?.split_once("](")?;
     let plain = (1..=120).contains(&title.chars().count())
         && !title.chars().any(|ch| {
-            matches!(ch, '[' | ']' | '(' | ')')
-                || ch.is_control()
-                || matches!(ch, '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+            matches!(ch, '[' | ']' | '(' | ')') || ch.is_control() || invisible_format(ch)
         });
     plain.then(|| rest.strip_suffix(')')).flatten()
+}
+
+/// Bidi controls, zero-width, line/paragraph separators and other
+/// invisible format characters: a title could hide or reorder text with them.
+fn invisible_format(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 /// Missing usage on a backend reply must not turn a metered success into an
@@ -1835,6 +1848,9 @@ mod tests {
                       - [Two](https://example.org/a) [Three](https://example.org/b)\n\
                       - [Nested [x]](https://example.org/)\n\
                       - [Tab\there](https://example.org/)\n\
+                      - [Zero\u{200B}width](https://example.org/)\n\
+                      - [Line\u{2028}sep](https://example.org/)\n\
+                      - [Soft\u{AD}hyphen](https://example.org/)\n\
                       - [Unclosed](https://example.org/";
         assert_eq!(
             https_sources_only(titled),
