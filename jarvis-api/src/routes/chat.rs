@@ -840,9 +840,10 @@ fn https_sources_only(text: &str) -> String {
 }
 
 /// A Sources line that is one https URL with a host and no user info,
-/// optionally as a `-` or `*` list item.
+/// bare or as `[Title](url)`, optionally as a `-` or `*` list item.
 fn is_https_source(line: &str) -> bool {
     let candidate = line.trim().trim_start_matches(['-', '*']).trim_start();
+    let candidate = titled_link_url(candidate).unwrap_or(candidate);
     !candidate.contains(char::is_whitespace)
         && url::Url::parse(candidate).is_ok_and(|url| {
             url.scheme() == "https"
@@ -850,6 +851,33 @@ fn is_https_source(line: &str) -> bool {
                 && url.username().is_empty()
                 && url.password().is_none()
         })
+}
+
+/// The URL of a whole `[Title](url)` line. The title is plain text the apps
+/// show as is: 1 to 120 characters, no brackets, parentheses, line breaks,
+/// control, bidi or other invisible format characters.
+fn titled_link_url(candidate: &str) -> Option<&str> {
+    let (title, rest) = candidate.strip_prefix('[')?.split_once("](")?;
+    let plain = (1..=120).contains(&title.chars().count())
+        && !title.chars().any(|ch| {
+            matches!(ch, '[' | ']' | '(' | ')') || ch.is_control() || invisible_format(ch)
+        });
+    plain.then(|| rest.strip_suffix(')')).flatten()
+}
+
+/// Bidi controls, zero-width, line/paragraph separators and other
+/// invisible format characters: a title could hide or reorder text with them.
+fn invisible_format(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 /// Missing usage on a backend reply must not turn a metered success into an
@@ -1807,6 +1835,35 @@ mod tests {
              https://example.org/a\n- https://example.org/b?x=1"
         );
         assert_eq!(https_sources_only("No list here.\n"), "No list here.\n");
+        // Titled links pass under the same URL rule; the title is plain.
+        let titled = "Answer\nSources:\n\
+                      - [Rust 1.97 released](https://blog.rust-lang.org/2026/rust-1.97)\n\
+                      [Foo (bar) - Wiki](https://en.example.org/wiki/Foo)\n\
+                      * [A](https://en.example.org/wiki/Foo_(bar))\n\
+                      - [Plain title](http://plain.example/)\n\
+                      - [Who](https://user:pw@evil.example/)\n\
+                      - [](https://empty.example/)\n\
+                      - [Spaced](https://example.org/a b)\n\
+                      - [Click \u{202E}evil](https://example.org/)\n\
+                      - [Two](https://example.org/a) [Three](https://example.org/b)\n\
+                      - [Nested [x]](https://example.org/)\n\
+                      - [Tab\there](https://example.org/)\n\
+                      - [Zero\u{200B}width](https://example.org/)\n\
+                      - [Line\u{2028}sep](https://example.org/)\n\
+                      - [Soft\u{AD}hyphen](https://example.org/)\n\
+                      - [Unclosed](https://example.org/";
+        assert_eq!(
+            https_sources_only(titled),
+            "Answer\nSources:\n\
+             - [Rust 1.97 released](https://blog.rust-lang.org/2026/rust-1.97)\n\
+             * [A](https://en.example.org/wiki/Foo_(bar))"
+        );
+        let long = format!("- [{}](https://example.org/)", "t".repeat(121));
+        assert!(!is_https_source(&long));
+        assert!(is_https_source(&format!(
+            "- [{}](https://example.org/)",
+            "é".repeat(120)
+        )));
         assert_eq!(
             https_sources_only("Antwoord\nBronnen:\nhttps://example.nl/\nftp://x"),
             "Antwoord\nBronnen:\nhttps://example.nl/"
