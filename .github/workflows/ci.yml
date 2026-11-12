@@ -135,8 +135,6 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Check dependency-exception expiry
-        # RUSTSEC-2026-0235 (rkyv 0.7) is locked through rust_decimal's
-        # optional dependency but compiled for no target or feature set.
         # RUSTSEC-2026-0381 is ignored only for webpki-roots 0.26.11, a shim
         # (via surrealdb's tokio-tungstenite) that re-exports webpki-roots 1.x.
         # The guard allows only that shim and patched 1.x; it also fails when

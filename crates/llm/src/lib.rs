@@ -48,8 +48,8 @@ pub use routing::{
 };
 pub use stream::TextDeltaSink;
 pub use types::{
-    classify_task, ChatMessage, ChatReply, ChatRequest, LlmError, ProviderFailure, ResearchRequest,
-    Role, RoutingMode, TaskRequirements, Tier, Usage, MAX_RESEARCH_QUESTION_CHARS,
+    classify_task, ChatMessage, ChatReply, ChatRequest, ImageData, LlmError, ProviderFailure,
+    ResearchRequest, Role, RoutingMode, TaskRequirements, Tier, Usage, MAX_RESEARCH_QUESTION_CHARS,
     RESEARCH_SYSTEM_PROMPT, USAGE_FAILURE_CATEGORIES,
 };
 

@@ -1,5 +1,7 @@
 //! Provider-neutral request/reply types for the brain.
 
+use std::{fmt, sync::Arc};
+
 use serde::Serialize;
 
 /// Who authored a conversation turn. The `system` prompt is carried separately
@@ -15,6 +17,9 @@ pub enum Role {
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    /// Photos of this turn, oldest first. Only the subscription workers ever
+    /// receive them; the router refuses every other backend.
+    pub images: Vec<ImageData>,
 }
 
 impl ChatMessage {
@@ -22,13 +27,41 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content: text.into(),
+            images: Vec::new(),
         }
     }
     pub fn assistant(text: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
             content: text.into(),
+            images: Vec::new(),
         }
+    }
+}
+
+/// One sanitized photo: JPEG bytes only. Debug shows the size, never the
+/// bytes, so a logged request cannot leak a photo.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ImageData(Arc<[u8]>);
+
+impl ImageData {
+    /// `None` unless the bytes are a whole JPEG: its start and end markers.
+    /// The worker checks the same, so a truncated photo is left out here
+    /// instead of failing the whole run there.
+    pub fn jpeg(bytes: impl Into<Arc<[u8]>>) -> Option<Self> {
+        let bytes = bytes.into();
+        (bytes.starts_with(&[0xFF, 0xD8, 0xFF]) && bytes.ends_with(&[0xFF, 0xD9]))
+            .then_some(Self(bytes))
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ImageData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<jpeg {} bytes>", self.0.len())
     }
 }
 
@@ -214,6 +247,16 @@ pub struct ChatRequest {
     /// The owner's pinned provider for `model`. When set, the router tries
     /// exactly this provider and never falls back to another one.
     pub provider: Option<String>,
+}
+
+impl ChatRequest {
+    /// Whether any turn carries a photo: then only a vision-capable
+    /// subscription worker may receive the request.
+    pub fn has_images(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|message| !message.images.is_empty())
+    }
 }
 
 /// Longest research question, in characters, that leaves the host.
@@ -419,6 +462,38 @@ mod tests {
         };
         assert_eq!(error.failure_category(), ProviderFailure::Authentication);
         assert!(!error.to_string().contains("recognizable-test-secret"));
+    }
+
+    #[test]
+    fn image_data_is_jpeg_only_and_never_printed() {
+        assert!(ImageData::jpeg(vec![0x89, b'P', b'N', b'G']).is_none());
+        assert!(ImageData::jpeg(vec![0xFF, 0xD8, 0xFF, 0xE0, 0x42]).is_none());
+        let image = ImageData::jpeg(vec![0xFF, 0xD8, 0xFF, 0xE0, 0x42, 0xFF, 0xD9]).unwrap();
+        let message = ChatMessage {
+            images: vec![image],
+            ..ChatMessage::user("look")
+        };
+        let printed = format!("{message:?}");
+        assert!(printed.contains("<jpeg 7 bytes>"), "{printed}");
+        assert!(
+            !printed.contains("255") && !printed.contains("66"),
+            "{printed}"
+        );
+        let request = ChatRequest {
+            system: None,
+            messages: vec![ChatMessage::assistant("hi"), message],
+            tier: Tier::Default,
+            mode: RoutingMode::Auto,
+            max_tokens: 16,
+            model: None,
+            provider: None,
+        };
+        assert!(request.has_images());
+        assert!(!ChatRequest {
+            messages: vec![ChatMessage::user("x"), ChatMessage::assistant("y")],
+            ..request
+        }
+        .has_images());
     }
 
     #[test]

@@ -109,6 +109,13 @@ async fn main() -> Result<()> {
 }
 
 async fn handle(request: ClaudeWorkerRequest) -> Result<ClaudeWorkerReply> {
+    // Photo runs need their own reviewed invocation; until then refuse them.
+    if !request.images.is_empty() {
+        return Ok(failed(
+            ClaudeWorkerState::RuntimeFailure,
+            "photos unsupported",
+        ));
+    }
     if !supported_runtime().await {
         return Ok(failed(
             ClaudeWorkerState::IncompatibleRuntime,
@@ -607,6 +614,7 @@ mod tests {
             prompt: "{}".into(),
             research,
             task,
+            images: Vec::new(),
         }
     }
 
