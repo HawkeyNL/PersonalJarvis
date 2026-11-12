@@ -594,7 +594,7 @@ async fn one_prompt_two_authenticated_sockets_one_canonical_answer(
     assert_eq!(
         contexts.lock().unwrap().last().unwrap(),
         &vec![
-            "One question".to_owned(),
+            "[just now] One question".to_owned(),
             canonical.content.clone(),
             "Next question".to_owned()
         ]

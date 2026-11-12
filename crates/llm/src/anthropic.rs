@@ -93,8 +93,10 @@ impl LlmProvider for AnthropicProvider {
             "messages": messages,
         });
         if let Some(system) = &req.system {
-            // Cache the (stable) system prompt so repeat calls bill it at the
-            // cheap cache-read rate instead of re-processing it every turn.
+            // Cache the system prompt so repeat calls bill it at the cheap
+            // cache-read rate instead of re-processing it every turn. Its
+            // runtime facts give the time to the hour only, so the clock
+            // changes it at most once an hour.
             body["system"] = json!([{
                 "type": "text",
                 "text": system,
