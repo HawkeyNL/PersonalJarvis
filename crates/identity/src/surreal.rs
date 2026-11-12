@@ -1030,12 +1030,16 @@ pub async fn authenticate(db: &Database, token: &str) -> Result<Authenticated, I
     if !session_is_live(&session, OffsetDateTime::now_utc()) {
         return Err(IdentityError::AuthFailed);
     }
-    let _updated: Option<serde_json::Value> = one(
+    // Best effort: concurrent requests of one session race on this row, and
+    // the loser of that write conflict was outdone by a fresher touch. A
+    // failed touch must not turn a valid session into a 401; a broken
+    // database still fails the reads below.
+    let _ = one::<serde_json::Value, _>(
         db,
         "UPDATE sessions SET last_used_at = time::now() WHERE record::id(id) = $id RETURN NONE",
         json!({ "id": session.id.to_string() }),
     )
-    .await?;
+    .await;
     let user = get_user(db, session.user_id)
         .await?
         .ok_or(IdentityError::AuthFailed)?;
