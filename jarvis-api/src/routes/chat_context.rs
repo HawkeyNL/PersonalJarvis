@@ -61,28 +61,59 @@ fn wrap_web_result(content: &str) -> String {
 }
 
 /// The stored conversation as model input, with the photos of the newest
-/// turns attached and every photo labelled in the text.
+/// turns attached (only `with_photos`; a web search never gets them) and
+/// every photo labelled in the text.
 pub(super) async fn load(
     db: &jarvis_store::Database,
     photos: &crate::photos::PhotoStore,
     user: Uuid,
     newest: &CanonicalMessage,
+    with_photos: bool,
 ) -> Result<(Vec<ChatMessage>, PhotoLabels), ()> {
     let mut response = db.query(
         "SELECT record::id(id) AS id, role, content, model, attachments, created_at FROM chat_messages \
          WHERE conversation_id = $conversation AND user_id = $user \
-         ORDER BY created_at DESC, id DESC LIMIT $limit; \
-         SELECT VALUE record::id(id) FROM chat_photos WHERE conversation_id = $conversation AND user_id = $user"
+         ORDER BY created_at DESC, id DESC LIMIT $limit"
     ).bind(json!({"conversation": newest.conversation_id.to_string(), "user": user.to_string(), "limit": MAX_CONTEXT_ROWS}))
         .await.map_err(|_| ())?;
     let rows: Vec<Row> = response.take(0).map_err(|_| ())?;
-    let live: Vec<String> = response.take(1).map_err(|_| ())?;
-    let live: HashSet<Uuid> = live.iter().filter_map(|id| id.parse().ok()).collect();
     let (mut messages, attachments) = bounded(rows, newest)?;
-    let shown = photo_window(&messages, &attachments, &live);
+    let live = live_photos(db, user, newest.conversation_id, &attachments).await?;
+    let shown = if with_photos {
+        photo_window(&messages, &attachments, &live)
+    } else {
+        Vec::new()
+    };
     let images = crate::photos::read_for_model(photos, shown.clone()).await;
     let labels = label_photos(&mut messages, &attachments, &live, &shown, &images);
     Ok((messages, labels))
+}
+
+/// Which of these turns' photos still exist: the owner's, in this
+/// conversation. No query without photos.
+async fn live_photos(
+    db: &jarvis_store::Database,
+    user: Uuid,
+    conversation: Uuid,
+    attachments: &[Vec<Uuid>],
+) -> Result<HashSet<Uuid>, ()> {
+    let ids: Vec<String> = attachments.iter().flatten().map(Uuid::to_string).collect();
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let live: Vec<String> = db
+        .query(
+            "SELECT VALUE record::id(id) FROM chat_photos WHERE record::id(id) IN $ids \
+             AND conversation_id = $conversation AND user_id = $user",
+        )
+        .bind(
+            json!({"ids": ids, "conversation": conversation.to_string(), "user": user.to_string()}),
+        )
+        .await
+        .map_err(|_| ())?
+        .take(0)
+        .map_err(|_| ())?;
+    Ok(live.iter().filter_map(|id| id.parse().ok()).collect())
 }
 
 /// The photos the model sees, oldest first: those of the newest
