@@ -226,7 +226,9 @@ allocation cap and a 20-second limit, and always re-encodes: at most 1600 px
 on the long side, alpha flattened on white, a fresh JPEG of at most 1 MiB.
 Nothing of the original survives (no EXIF, GPS, XMP or ICC data). Limits: 30
 uploads per device per minute, 50 per owner per rolling 24 hours, 2 GiB per
-owner in all. The reply is `{id, width, height, bytes}`.
+owner in all. Only accepted photos count toward the daily limit. Two
+uploads are read at a time; others wait up to 30 seconds for a turn, and a
+body must arrive within 60 seconds. The reply is `{id, width, height, bytes}`.
 
 Files live in `/var/lib/jarvis/photos/<uuid>.jpg` (0600), written to a
 temporary file in the same directory, flushed and renamed. Paths are built
@@ -239,8 +241,8 @@ every photo route answers 503 and the rest of Core runs normally.
 and `Content-Security-Policy: default-src 'none'`. `PATCH /v1/photos/{id}`
 takes exactly `{"saved": bool}` and returns `{id, saved, expires_at}`
 (`null` when kept). `DELETE /v1/photos/{id}` removes the file and the row
-(204). Another owner's photo, a missing one and a malformed id all answer
-404.
+(204). Another owner's photo and a missing one answer 404; a malformed id
+answers 400.
 
 **Sending.** `POST /v1/assistant/runs` takes an optional `attachments` list:
 up to four of the caller's own uploaded, not yet sent photo ids, without

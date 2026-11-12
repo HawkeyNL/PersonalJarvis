@@ -1030,12 +1030,16 @@ pub async fn authenticate(db: &Database, token: &str) -> Result<Authenticated, I
     if !session_is_live(&session, OffsetDateTime::now_utc()) {
         return Err(IdentityError::AuthFailed);
     }
-    let _updated: Option<serde_json::Value> = one(
+    // Best effort: concurrent requests of one session race on this row, and
+    // the loser of that write conflict was outdone by a fresher touch. A
+    // failed touch must not turn a valid session into a 401; a broken
+    // database still fails the reads below.
+    let _ = one::<serde_json::Value, _>(
         db,
         "UPDATE sessions SET last_used_at = time::now() WHERE record::id(id) = $id RETURN NONE",
         json!({ "id": session.id.to_string() }),
     )
-    .await?;
+    .await;
     let user = get_user(db, session.user_id)
         .await?
         .ok_or(IdentityError::AuthFailed)?;
@@ -1471,7 +1475,25 @@ mod tests {
             (Ok(result), Err(_)) | (Err(_), Ok(result)) => result,
             _ => panic!("exactly one concurrent login must succeed"),
         };
-        assert_eq!(authenticate(&db, &result.token).await?.user.id, owner.id);
+        let authed = authenticate(&db, &result.token).await?;
+        assert_eq!(authed.user.id, owner.id);
+        // A request refreshes its session's idle clock, and parallel requests
+        // of one session all pass even though their refreshes race.
+        let touched: Vec<serde_json::Value> = db
+            .query("SELECT VALUE last_used_at FROM sessions WHERE record::id(id) = $id")
+            .bind(json!({ "id": authed.session_id.to_string() }))
+            .await?
+            .take(0)?;
+        assert!(matches!(touched.as_slice(), [value] if !value.is_null()));
+        let parallel = tokio::join!(
+            authenticate(&db, &result.token),
+            authenticate(&db, &result.token),
+            authenticate(&db, &result.token),
+            authenticate(&db, &result.token),
+        );
+        for outcome in [parallel.0, parallel.1, parallel.2, parallel.3] {
+            assert_eq!(outcome?.session_id, authed.session_id);
+        }
         assert!(login(&db, device.id, challenge.id, &signature)
             .await
             .is_err());
