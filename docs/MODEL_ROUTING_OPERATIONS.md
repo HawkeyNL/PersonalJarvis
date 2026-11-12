@@ -327,7 +327,7 @@ automatic: when a good answer needs current or external facts it does not
 have, it answers briefly and ends its reply with a final line that is exactly
 `[[web_search]]`. The model can only ask; the search still sends the owner's
 latest question, never the model's text, and every check above still applies.
-The same runtime facts give the current time and say that current facts
+The same runtime facts give the current time to the hour and say that current facts
 (prices, news, weather, schedules, status) in messages or web results over an
 hour old are stale: the model asks for a new search instead of pointing to the
 earlier answer.

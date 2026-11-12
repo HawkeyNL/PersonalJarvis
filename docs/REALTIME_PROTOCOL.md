@@ -202,11 +202,12 @@ not a device's supplied replica, as model context. The submitted final user turn
 is committed first and must match the newest database row before inference.
 The context retains up to 32 latest complete messages within 128,000 UTF-8 bytes,
 ordered chronologically; it never summarizes through another model call or
-truncates an individual message. Every earlier message carries its age
-relative to now (`[just now]`, `[3 min ago]`, `[19 h ago]`, `[2 days ago]`;
-for a web answer the age is in its label), so the model can tell old current
-facts from fresh ones; the new user turn carries none. The age counts toward
-the byte limit. Missing/mismatched persistence fails before
+truncates an individual message. Every earlier user message carries its age
+relative to now (`[just now]`, `[3 min ago]`, `[19 h ago]`, `[2 days ago]`)
+and a web answer has it in its label, so the model can tell old current facts
+from fresh ones. The new user turn and plain assistant answers carry none, so
+the model has no own text to copy the prefix from. The age counts toward the
+byte limit. Missing/mismatched persistence fails before
 provider invocation. Legacy synchronous request-context behavior is retained.
 The system text is always the server persona plus a small block of live
 runtime facts (see `SUBSCRIPTION_WORKERS.md`, "Runtime facts in the system

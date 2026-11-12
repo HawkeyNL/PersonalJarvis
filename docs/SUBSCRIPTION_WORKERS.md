@@ -196,11 +196,13 @@ or a metered API) and contains exactly:
 
 - the Core version;
 - whether paid APIs are on or off;
-- the current time to the minute in the owner's zone (`Europe/Amsterdam`, or
-  UTC when the zone database is missing), and that an age such as `[3 h ago]`
-  on an earlier message is Core metadata the model must never repeat;
 - whether web search is available (only through an owner-started Research
   run) and that the chat itself has no tools, MCP servers or web access;
+- the current time to the hour in the owner's zone (`Europe/Amsterdam`, or
+  UTC when the zone database is missing; to the hour so the system text and
+  its provider cache change at most hourly), and that an age such as
+  `[3 h ago]` on an earlier owner message is Core metadata that also dates
+  the reply after it and must never be repeated;
 - that current facts (prices, news, weather, schedules, status) over an hour
   old may be outdated and must be flagged as such; with automatic web search
   they are stale and the model asks for a new search instead;
