@@ -26,6 +26,9 @@ mod realtime;
 #[path = "account/mod.rs"]
 mod account;
 
+#[path = "photos/mod.rs"]
+mod photos;
+
 async fn json_body(response: axum::response::Response) -> Value {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -98,6 +101,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         auto_research: Default::default(),
         github: Default::default(),
         jobs: Default::default(),
+        photos: Default::default(),
     }
 }
 

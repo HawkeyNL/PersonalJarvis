@@ -46,15 +46,21 @@ pub(crate) struct ChatReq {
     /// Absent starts a fresh conversation; present continues the owned one.
     #[serde(default)]
     pub(super) conversation_id: Option<Uuid>,
+    /// The caller's uploaded, not yet sent photos this message carries. Only
+    /// the runs API accepts them. Absent when empty, so the request hash of
+    /// a text-only message is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) attachments: Vec<Uuid>,
 }
 
 impl ChatReq {
+    /// The new user turn's text; empty only when it carries photos.
     pub(super) fn new_user_content(&self) -> Option<&str> {
         self.messages
             .last()
             .filter(|m| m.role == "user")
             .map(|m| m.content.trim())
-            .filter(|text| !text.is_empty())
+            .filter(|text| !text.is_empty() || !self.attachments.is_empty())
     }
     pub(super) fn validate_run(&self) -> Result<String, (StatusCode, Json<Value>)> {
         if self.messages.len() > validation::MAX_CHAT_TURNS
@@ -66,12 +72,27 @@ impl ChatReq {
         {
             return Err(bad_request("chat payload too large"));
         }
-        let last = self
-            .messages
-            .last()
-            .filter(|m| m.role == "user" && !m.content.trim().is_empty())
+        if self.attachments.len() > crate::photos::MAX_ATTACHMENTS {
+            return Err(bad_request("too many photos"));
+        }
+        if (1..self.attachments.len()).any(|i| self.attachments[..i].contains(&self.attachments[i]))
+        {
+            return Err(bad_request("duplicate photo"));
+        }
+        // Photos never go to web research.
+        if !self.attachments.is_empty()
+            && self.mode.as_deref().map(llm::RoutingMode::parse) == Some(llm::RoutingMode::Research)
+        {
+            return Err(bad_request("photos cannot be sent to web research"));
+        }
+        let text = self
+            .new_user_content()
             .ok_or_else(|| bad_request("last message must be a nonempty user message"))?;
-        Ok(derive_title(&last.content))
+        Ok(if text.is_empty() {
+            "Photo".to_string()
+        } else {
+            derive_title(text)
+        })
     }
 }
 
@@ -82,6 +103,9 @@ pub(crate) async fn assistant_chat(
     State(state): State<AppState>,
     Json(mut req): Json<ChatReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !req.attachments.is_empty() {
+        return Err(bad_request("photos need the runs API"));
+    }
     let title = req.validate_run()?;
     let fresh = req.conversation_id.is_none();
     let conversation = match req.conversation_id {
@@ -207,7 +231,8 @@ pub(super) async fn execute_chat(
             })
         })
         .collect();
-    if history.is_empty() {
+    let photo_turn = !req.attachments.is_empty();
+    if history.is_empty() && !photo_turn {
         return Err(bad_request("messages is required"));
     }
     // The last user turn is the new message to store and (maybe) reclassify.
@@ -217,7 +242,7 @@ pub(super) async fn execute_chat(
         .rev()
         .find(|t| !matches!(t.role.as_str(), "assistant" | "jarvis"))
         .map(|t| t.content.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() || photo_turn)
         .ok_or_else(|| bad_request("a user message is required"))?;
 
     // Which conversation does this belong to? Append to the current one unless
@@ -255,18 +280,35 @@ pub(super) async fn execute_chat(
     let user_already_published = persisted_user_message.is_some();
     let user_message = match persisted_user_message {
         Some(message) => message,
-        None => append_message(&state.db, conv_id, authed.user.id, "user", &new_msg, None)
-            .await
-            .map_err(|_| internal_error())?,
-    };
-    let canonical_history = if user_already_published {
-        Some(
-            super::chat_context::load(&state.db, authed.user.id, &user_message)
-                .await
-                .map_err(|_| internal_error())?,
+        None => append_message(
+            &state.db,
+            conv_id,
+            authed.user.id,
+            "user",
+            &new_msg,
+            None,
+            &[],
         )
+        .await
+        .map_err(|_| internal_error())?,
+    };
+    // Only the runs API carries photos: their labels for this run.
+    let (canonical_history, photo_labels) = if user_already_published {
+        // A web search never sees photos, so none are read for one.
+        let research =
+            req.mode.as_deref().map(llm::RoutingMode::parse) == Some(llm::RoutingMode::Research);
+        let (messages, labels) = super::chat_context::load(
+            &state.db,
+            &state.photos,
+            authed.user.id,
+            &user_message,
+            !research,
+        )
+        .await
+        .map_err(|_| internal_error())?;
+        (Some(messages), labels)
     } else {
-        None
+        (None, Vec::new())
     };
     if let Some(run) = &realtime_run {
         if !user_already_published {
@@ -373,9 +415,15 @@ pub(super) async fn execute_chat(
 
     // Built only on the paths that send it, after the early refusals.
     if requested_mode != llm::RoutingMode::Research {
-        chat.system =
-            Some(super::runtime_facts::system_prompt(&state, user_already_published).await);
+        let mut system = super::runtime_facts::system_prompt(&state, user_already_published).await;
+        if !photo_labels.is_empty() {
+            add_photo_sentence(&mut system);
+        }
+        chat.system = Some(system);
     }
+    // Photos in the model input, new or from recent turns: no web search
+    // follows and none is offered.
+    let image_turn = photo_turn || chat.has_images();
 
     let llm_started = Instant::now();
     let request_id = realtime_run
@@ -438,10 +486,28 @@ pub(super) async fn execute_chat(
     match reply {
         Ok(mut reply) => {
             let research_advised = research_advised(&mut reply.text, requested_mode, intent_kind);
+            // A web answer never shows a photo; a chat answer only one of
+            // this run's photos.
+            let labels: &[(u8, Uuid)] = if requested_mode == llm::RoutingMode::Research {
+                &[]
+            } else {
+                &photo_labels
+            };
+            let had_markers = reply.text.contains(PHOTO_MARKER);
+            let shown = take_photo_markers(&mut reply.text, labels);
+            if had_markers && reply.text.trim().is_empty() && shown.is_empty() {
+                reply.text = PHOTO_NOT_FOUND_REPLY.into();
+            }
             let input_bytes = chat
                 .messages
                 .iter()
-                .map(|m| m.content.len().saturating_add(32))
+                .map(|m| {
+                    let images = m.images.iter().map(|image| image.bytes().len() / 4);
+                    m.content
+                        .len()
+                        .saturating_add(32)
+                        .saturating_add(images.sum())
+                })
                 .sum::<usize>()
                 .saturating_add(chat.system.as_ref().map_or(0, String::len));
             let status = estimate_missing_usage(&mut reply, input_bytes, chat.max_tokens);
@@ -461,18 +527,20 @@ pub(super) async fn execute_chat(
                 "assistant",
                 &reply.text,
                 Some(stored_model(requested_mode, &reply).as_str()),
+                &shown,
             )
             .await
             .map_err(|_| internal_error())?;
             if let Some(run) = &realtime_run {
                 // Only a runs-API run (its user message was persisted first)
-                // may search by itself; the legacy endpoint never does.
-                let auto = if user_already_published {
+                // may search by itself; the legacy endpoint never does. A
+                // turn with photos never leads to a web search.
+                let auto = if user_already_published && !image_turn {
                     crate::auto_research::start(&state, research_advised, &new_msg).await
                 } else {
                     None
                 };
-                let research_offer = if auto.is_some() {
+                let research_offer = if auto.is_some() || image_turn {
                     None
                 } else {
                     crate::intent::research_offer(
@@ -520,12 +588,28 @@ pub(super) async fn execute_chat(
                 "intent_kind": intent_kind.map(crate::intent::WorkKind::as_str),
             })))
         }
-        Err(llm::LlmError::Refused) => {
-            let text = "Sorry, I can't answer that.";
-            let message =
-                append_message(&state.db, conv_id, authed.user.id, "assistant", text, None)
-                    .await
-                    .map_err(|_| internal_error())?;
+        // A refusal, or photos with no subscription worker to read them: a
+        // fixed answer is stored; the owner's photo stays with the message.
+        Err(error)
+            if matches!(error, llm::LlmError::Refused)
+                || (chat.has_images() && matches!(error, llm::LlmError::NotConfigured(_))) =>
+        {
+            let (text, stop_reason) = if matches!(error, llm::LlmError::Refused) {
+                ("Sorry, I can't answer that.", "refusal")
+            } else {
+                (NO_VISION_REPLY, "vision_unavailable")
+            };
+            let message = append_message(
+                &state.db,
+                conv_id,
+                authed.user.id,
+                "assistant",
+                text,
+                None,
+                &[],
+            )
+            .await
+            .map_err(|_| internal_error())?;
             if let Some(run) = &realtime_run {
                 state.realtime.publish(
                     authed.user.id,
@@ -539,7 +623,7 @@ pub(super) async fn execute_chat(
             Ok(Json(json!({
                 "reply": text,
                 "model": Value::Null,
-                "stop_reason": "refusal",
+                "stop_reason": stop_reason,
                 "conversation_id": conv_id,
                 "conversation_title": conv_title,
                 "new_topic": new_topic,
@@ -559,6 +643,96 @@ pub(super) async fn execute_chat(
             ))
         }
     }
+}
+
+/// Stored when photos were in the input but neither subscription worker
+/// could take them. No other backend is tried.
+const NO_VISION_REPLY: &str = "I can't look at photos right now: photos only go to \
+your Claude or Codex subscription worker, and neither is available. Your photo is kept \
+with your message.";
+/// Stored when a reply was nothing but photo markers that matched no photo.
+const PHOTO_NOT_FOUND_REPLY: &str = "I can't show that photo.";
+const PHOTO_SENTENCE: &str = "The owner attached photos labelled [photo N]. To show one \
+of them back, put a line that is exactly [[photo:N]].";
+
+/// Tell the model how to show a photo back, if the worker's system cap
+/// leaves room; the labels in the turns stand on their own otherwise.
+fn add_photo_sentence(system: &mut String) {
+    if system.len() + 2 + PHOTO_SENTENCE.len() <= llm::claude_worker_protocol::MAX_SYSTEM_BYTES {
+        system.push_str("\n\n");
+        system.push_str(PHOTO_SENTENCE);
+    }
+}
+
+/// Take every `[[photo:N]]` off a reply, so none is ever stored or shown.
+/// A line that is exactly one marker naming a label of this run shows that
+/// photo (each once, at most four); any other marker, inline or with an
+/// unknown number, is only removed.
+fn take_photo_markers(text: &mut String, labels: &[(u8, Uuid)]) -> Vec<Uuid> {
+    if !text.contains(PHOTO_MARKER) {
+        return Vec::new();
+    }
+    let mut shown = Vec::new();
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        match photo_marker(line.trim()) {
+            Some((number, "")) => {
+                let label = labels.iter().find(|(label, _)| u32::from(*label) == number);
+                if let Some((_, id)) = label {
+                    if !shown.contains(id) && shown.len() < crate::photos::MAX_ATTACHMENTS {
+                        shown.push(*id);
+                    }
+                }
+            }
+            _ => kept.push(without_inline_markers(line)),
+        }
+    }
+    *text = kept.join("\n").trim_matches('\n').to_string();
+    shown
+}
+
+const PHOTO_MARKER: &str = "[[photo:";
+
+/// `[[photo:N]]` at the start of `text`: N (1 to 3 digits) and the rest.
+fn photo_marker(text: &str) -> Option<(u32, &str)> {
+    let rest = text.strip_prefix(PHOTO_MARKER)?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let rest_after = rest[digits..].strip_prefix("]]")?;
+    (1..=3)
+        .contains(&digits)
+        .then(|| rest[..digits].parse().ok().map(|n| (n, rest_after)))
+        .flatten()
+}
+
+fn without_inline_markers(line: &str) -> String {
+    // Removing one marker can join the text around it into a new one.
+    let mut line = remove_markers_once(line);
+    while photo_marker_inside(&line) {
+        line = remove_markers_once(&line);
+    }
+    line
+}
+
+fn photo_marker_inside(text: &str) -> bool {
+    text.match_indices(PHOTO_MARKER)
+        .any(|(start, _)| photo_marker(&text[start..]).is_some())
+}
+
+fn remove_markers_once(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find(PHOTO_MARKER) {
+        out.push_str(&rest[..start]);
+        match photo_marker(&rest[start..]) {
+            Some((_, after)) => rest = after,
+            None => {
+                out.push_str(PHOTO_MARKER);
+                rest = &rest[start + PHOTO_MARKER.len()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Stored when a reply was nothing but the web search marker.
@@ -666,9 +840,10 @@ fn https_sources_only(text: &str) -> String {
 }
 
 /// A Sources line that is one https URL with a host and no user info,
-/// optionally as a `-` or `*` list item.
+/// bare or as `[Title](url)`, optionally as a `-` or `*` list item.
 fn is_https_source(line: &str) -> bool {
     let candidate = line.trim().trim_start_matches(['-', '*']).trim_start();
+    let candidate = titled_link_url(candidate).unwrap_or(candidate);
     !candidate.contains(char::is_whitespace)
         && url::Url::parse(candidate).is_ok_and(|url| {
             url.scheme() == "https"
@@ -676,6 +851,17 @@ fn is_https_source(line: &str) -> bool {
                 && url.username().is_empty()
                 && url.password().is_none()
         })
+}
+
+/// The URL of a whole `[Title](url)` line. The title is plain text the apps
+/// show as is: 1 to 120 characters, no brackets, parentheses, line breaks,
+/// control, bidi or other invisible format characters.
+fn titled_link_url(candidate: &str) -> Option<&str> {
+    let (title, rest) = candidate.strip_prefix('[')?.split_once("](")?;
+    let plain = (1..=120).contains(&title.chars().count())
+        && crate::validation::no_hidden_chars(title)
+        && !title.contains(['[', ']', '(', ')']);
+    plain.then(|| rest.strip_suffix(')')).flatten()
 }
 
 /// Missing usage on a backend reply must not turn a metered success into an
@@ -803,6 +989,10 @@ async fn auto_research_answer(
     let mut reply = research_reply(routing, brain, question).await;
     // A web page may inject a trailing marker; strip it like any answer.
     research_advised(&mut reply.text, llm::RoutingMode::Research, None);
+    take_photo_markers(&mut reply.text, &[]);
+    if reply.text.trim().is_empty() {
+        reply.text = RESEARCH_EMPTY.into();
+    }
     reply.backend.is_some().then(|| {
         let model = stored_model(llm::RoutingMode::Research, &reply);
         (reply, model)
@@ -989,15 +1179,23 @@ async fn append_message(
     role: &str,
     content: &str,
     model: Option<&str>,
+    attachments: &[Uuid],
 ) -> Result<CanonicalMessage, ()> {
     let id = Uuid::now_v7();
     let at = OffsetDateTime::now_utc();
-    let res = db.query(
+    // Without photos the statement is exactly the old one.
+    let attachments_field = if attachments.is_empty() {
+        ""
+    } else {
+        ", attachments = $attachments"
+    };
+    let res = db.query(format!(
         "BEGIN TRANSACTION; CREATE chat_messages SET id = $id, conversation_id = $conversation_id, \
-         user_id = $user_id, role = $role, content = $content, model = $model, created_at = <datetime>$at; \
+         user_id = $user_id, role = $role, content = $content, model = $model, created_at = <datetime>$at{attachments_field}; \
          UPDATE conversations SET updated_at = time::now() WHERE record::id(id) = $conversation_id AND user_id = $user_id; COMMIT TRANSACTION;",
-    ).bind(json!({"id": id.to_string(), "at": at.format(&time::format_description::well_known::Rfc3339).map_err(|_| ())?, "conversation_id": conv_id.to_string(),
-        "user_id": user_id.to_string(), "role": role, "content": content, "model": model})).await;
+    )).bind(json!({"id": id.to_string(), "at": at.format(&time::format_description::well_known::Rfc3339).map_err(|_| ())?, "conversation_id": conv_id.to_string(),
+        "user_id": user_id.to_string(), "role": role, "content": content, "model": model,
+        "attachments": attachments.iter().map(Uuid::to_string).collect::<Vec<_>>()})).await;
     res.map_err(|_| ())?.check().map_err(|_| ())?;
     Ok(CanonicalMessage {
         id,
@@ -1010,6 +1208,7 @@ async fn append_message(
         content: content.to_string(),
         model: model.map(str::to_string),
         created_at: at,
+        attachments: attachments.to_vec(),
     })
 }
 
@@ -1057,6 +1256,7 @@ async fn append_to_live_conversation(
             content: content.to_string(),
             model: Some(model.to_string()),
             created_at: at,
+            attachments: Vec::new(),
         };
         (message, title)
     }))
@@ -1109,19 +1309,40 @@ pub(crate) async fn get_conversation(
         model: Option<String>,
         #[serde(with = "time::serde::rfc3339")]
         created_at: OffsetDateTime,
+        #[serde(default)]
+        attachments: Option<Vec<String>>,
+    }
+    #[derive(Deserialize)]
+    struct PhotoRow {
+        id: String,
+        saved: bool,
+        #[serde(with = "time::serde::rfc3339")]
+        created_at: OffsetDateTime,
     }
     let mut response = state.db.query(
-        "SELECT record::id(id) AS id, role, content, model, created_at FROM chat_messages WHERE conversation_id = $id AND user_id = $user ORDER BY created_at ASC",
+        "SELECT record::id(id) AS id, role, content, model, created_at, attachments FROM chat_messages WHERE conversation_id = $id AND user_id = $user ORDER BY created_at ASC; \
+         SELECT record::id(id) AS id, saved, created_at FROM chat_photos WHERE conversation_id = $id AND user_id = $user ORDER BY created_at ASC",
     ).bind(json!({"id": id.to_string(), "user":authed.user.id.to_string()})).await.map_err(|_| internal_error())?;
     let rows: Vec<MessageRow> = response.take(0).map_err(|_| internal_error())?;
+    let photos: Vec<PhotoRow> = response.take(1).map_err(|_| internal_error())?;
     let messages: Vec<Value> = rows
         .into_iter()
         .map(|row| {
-            json!({ "id":row.id, "role": row.role, "content": row.content, "model": row.model, "at": row.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default() })
+            json!({ "id":row.id, "role": row.role, "content": row.content, "model": row.model, "at": row.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                "attachments": row.attachments.unwrap_or_default() })
+        })
+        .collect();
+    // The conversation's photos that still exist; a message id missing here
+    // is a deleted or expired photo.
+    let photos: Vec<Value> = photos
+        .into_iter()
+        .map(|photo| {
+            json!({ "id": photo.id, "saved": photo.saved,
+                "expires_at": crate::photos::expires_at(photo.saved, false, photo.created_at) })
         })
         .collect();
     Ok(Json(
-        json!({ "id": id, "title": title, "messages": messages,
+        json!({ "id": id, "title": title, "messages": messages, "photos": photos,
             "assistant_running": state.realtime.run_active(authed.user.id, id) }),
     ))
 }
@@ -1161,7 +1382,9 @@ pub(crate) async fn conversation_brain_set(
     Ok(Json(json!({"status":"updated"})))
 }
 
-/// Delete a conversation and its messages (ON DELETE CASCADE) — owner-only.
+/// Delete a conversation with its messages and its photos, kept ones too —
+/// owner-only. Photo files are removed after the commit; the orphan sweep is
+/// the backstop.
 pub(crate) async fn delete_conversation(
     authed: Authed,
     State(state): State<AppState>,
@@ -1173,15 +1396,23 @@ pub(crate) async fn delete_conversation(
     ))?;
     let mut response = state.db.query(
         "BEGIN TRANSACTION; DELETE chat_messages WHERE conversation_id = $id AND user_id = $user_id; \
+         SELECT VALUE record::id(id) FROM chat_photos WHERE conversation_id = $id AND user_id = $user_id; \
+         DELETE chat_photos WHERE conversation_id = $id AND user_id = $user_id; \
          DELETE conversations WHERE record::id(id) = $id AND user_id = $user_id RETURN $id AS id; COMMIT TRANSACTION;",
     ).bind(json!({"id": id.to_string(), "user_id": authed.user.id.to_string()})).await.map_err(|_| internal_error())?;
-    let deleted: Option<Value> = response.take(1).map_err(|_| internal_error())?;
+    let photos: Vec<String> = response.take(1).map_err(|_| internal_error())?;
+    let deleted: Option<Value> = response.take(3).map_err(|_| internal_error())?;
     if deleted.is_none() {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such conversation" })),
         ));
     }
+    let photos = photos
+        .iter()
+        .filter_map(|photo| Uuid::try_parse(photo).ok())
+        .collect();
+    crate::photos::remove_files(&state.photos, photos).await;
     state.realtime.publish(
         authed.user.id,
         Event::ConversationDeleted {
@@ -1271,6 +1502,60 @@ pub(crate) async fn assistant_orchestrate(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn photo_markers_show_only_this_runs_photos_and_never_stay_in_the_text() {
+        let ids: Vec<Uuid> = (1..=5).map(Uuid::from_u128).collect();
+        let labels: Vec<(u8, Uuid)> = (1..=4).map(|n| (n as u8, ids[n - 1])).collect();
+        let take = |text: &str| {
+            let mut text = text.to_string();
+            let shown = take_photo_markers(&mut text, &labels);
+            (text, shown)
+        };
+        assert_eq!(
+            take("Here it is:\n[[photo:2]]\nA red square."),
+            ("Here it is:\nA red square.".to_string(), vec![ids[1]])
+        );
+        // Unknown numbers, inline markers and near misses never attach.
+        assert_eq!(
+            take("[[photo:9]]\nSee [[photo:1]] above.\n  [[photo:3]]  \n[[photo:]]\n[[photo:1]] x"),
+            ("See  above.\n[[photo:]]\n x".to_string(), vec![ids[2]])
+        );
+        // Each photo once, in reply order, at most four.
+        let (text, shown) =
+            take("[[photo:4]]\n[[photo:4]]\n[[photo:1]]\n[[photo:2]]\n[[photo:3]]\nDone.");
+        assert_eq!(text, "Done.");
+        assert_eq!(shown, [ids[3], ids[0], ids[1], ids[2]]);
+        // Without labels (a web answer, or no photos) markers only vanish.
+        let mut web = "Answer\n[[photo:1]]\nSources:".to_string();
+        assert!(take_photo_markers(&mut web, &[]).is_empty());
+        assert_eq!(web, "Answer\nSources:");
+        // Text without markers is untouched, whitespace included.
+        let mut plain = "  Line one\r\nLine two\n".to_string();
+        assert!(take_photo_markers(&mut plain, &labels).is_empty());
+        assert_eq!(plain, "  Line one\r\nLine two\n");
+        assert_eq!(take("[[photo:0004]]").1, Vec::<Uuid>::new());
+        // Removing a marker cannot leave a new one behind.
+        assert_eq!(
+            take("x [[pho[[photo:1]]to:2]] y [[[[photo:3]]photo:4]]]]"),
+            ("x  y ]]".to_string(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn the_photo_sentence_respects_the_worker_system_cap() {
+        let max = llm::claude_worker_protocol::MAX_SYSTEM_BYTES;
+        let mut system = "persona".to_string();
+        add_photo_sentence(&mut system);
+        assert!(system.ends_with(PHOTO_SENTENCE));
+        let full = "p".repeat(max - PHOTO_SENTENCE.len() - 1);
+        let mut unchanged = full.clone();
+        add_photo_sentence(&mut unchanged);
+        assert_eq!(unchanged, full);
+        let mut fits = "p".repeat(max - PHOTO_SENTENCE.len() - 2);
+        add_photo_sentence(&mut fits);
+        assert_eq!(fits.len(), max);
+    }
 
     /// Records what research received; ordinary chat must never be used.
     #[derive(Default)]
@@ -1534,6 +1819,49 @@ mod tests {
              https://example.org/a\n- https://example.org/b?x=1"
         );
         assert_eq!(https_sources_only("No list here.\n"), "No list here.\n");
+        // Titled links pass under the same URL rule; the title is plain.
+        let titled = "Answer\nSources:\n\
+                      - [Rust 1.97 released](https://blog.rust-lang.org/2026/rust-1.97)\n\
+                      [Foo (bar) - Wiki](https://en.example.org/wiki/Foo)\n\
+                      * [A](https://en.example.org/wiki/Foo_(bar))\n\
+                      - [Plain title](http://plain.example/)\n\
+                      - [Who](https://user:pw@evil.example/)\n\
+                      - [](https://empty.example/)\n\
+                      - [Spaced](https://example.org/a b)\n\
+                      - [Click \u{202E}evil](https://example.org/)\n\
+                      - [Two](https://example.org/a) [Three](https://example.org/b)\n\
+                      - [Nested [x]](https://example.org/)\n\
+                      - [Tab\there](https://example.org/)\n\
+                      - [Zero\u{200B}width](https://example.org/)\n\
+                      - [Line\u{2028}sep](https://example.org/)\n\
+                      - [Soft\u{AD}hyphen](https://example.org/)\n\
+                      - [Unclosed](https://example.org/";
+        assert_eq!(
+            https_sources_only(titled),
+            "Answer\nSources:\n\
+             - [Rust 1.97 released](https://blog.rust-lang.org/2026/rust-1.97)\n\
+             * [A](https://en.example.org/wiki/Foo_(bar))"
+        );
+        let long = format!("- [{}](https://example.org/)", "t".repeat(121));
+        assert!(!is_https_source(&long));
+        assert!(is_https_source(&format!(
+            "- [{}](https://example.org/)",
+            "é".repeat(120)
+        )));
+        // The same hidden characters as every other owner-visible label.
+        for hidden in [
+            '\u{034F}',
+            '\u{115F}',
+            '\u{180E}',
+            '\u{3164}',
+            '\u{FE0F}',
+            '\u{FFF9}',
+            '\u{E0041}',
+        ] {
+            assert!(!is_https_source(&format!(
+                "- [A{hidden}B](https://example.org/)"
+            )));
+        }
         assert_eq!(
             https_sources_only("Antwoord\nBronnen:\nhttps://example.nl/\nftp://x"),
             "Antwoord\nBronnen:\nhttps://example.nl/"
@@ -1559,5 +1887,43 @@ mod tests {
         .unwrap();
         let kept = serde_json::to_value(&req).unwrap();
         assert!(kept.get("system").is_none(), "{kept}");
+    }
+
+    #[test]
+    fn photo_attachments_are_bounded_and_keep_text_requests_unchanged() {
+        let req = |body: Value| serde_json::from_value::<ChatReq>(body).unwrap();
+        let photo = |n: u128| Uuid::from_u128(n).to_string();
+        // A text-only request serializes (and so hashes) exactly as before.
+        let text = req(json!({"messages": [{"role": "user", "content": "hi"}]}));
+        assert!(serde_json::to_value(&text)
+            .unwrap()
+            .get("attachments")
+            .is_none());
+        assert_eq!(text.validate_run().unwrap(), "hi");
+        // Photos alone are a message, titled "Photo".
+        let only = req(json!({"messages": [{"role": "user", "content": "  "}],
+            "attachments": [photo(1)]}));
+        assert_eq!(only.validate_run().unwrap(), "Photo");
+        assert_eq!(only.new_user_content(), Some(""));
+        let empty = req(json!({"messages": [{"role": "user", "content": "  "}]}));
+        assert!(empty.validate_run().is_err());
+        assert_eq!(empty.new_user_content(), None);
+        for (attachments, mode) in [
+            (vec![photo(1), photo(2), photo(3), photo(4), photo(5)], None),
+            (vec![photo(1), photo(2), photo(1)], None),
+            (vec![photo(1)], Some("research")),
+        ] {
+            let bad = req(json!({"messages": [{"role": "user", "content": "look"}],
+                "attachments": attachments, "mode": mode}));
+            assert!(bad.validate_run().is_err());
+        }
+        let four = req(json!({"messages": [{"role": "user", "content": "look"}],
+            "attachments": [photo(1), photo(2), photo(3), photo(4)], "mode": "deep"}));
+        assert_eq!(four.validate_run().unwrap(), "look");
+        assert!(serde_json::from_value::<ChatReq>(json!({
+            "messages": [{"role": "user", "content": "look"}],
+            "attachments": ["../../etc/passwd"],
+        }))
+        .is_err());
     }
 }

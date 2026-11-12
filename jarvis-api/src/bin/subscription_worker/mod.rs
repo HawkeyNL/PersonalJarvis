@@ -15,10 +15,10 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use jarvis_llm::claude_worker_protocol::{
-    ClaudeWorkerReply, ClaudeWorkerRequest, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
+    ClaudeWorkerReply, ClaudeWorkerRequest, MAX_IMAGE_REQUEST_BYTES, MAX_REPLY_BYTES,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     process::Child,
     sync::{OwnedSemaphorePermit, Semaphore},
@@ -68,18 +68,19 @@ pub fn background_slot(
     slots.clone().try_acquire_owned().ok().map(Some)
 }
 
-/// One bounded, newline-terminated, valid request from Core.
-pub async fn read_request(stream: &mut UnixStream) -> Result<ClaudeWorkerRequest> {
+/// One bounded, newline-terminated, valid request from Core. Only a request
+/// with photos may be larger than [`MAX_REQUEST_BYTES`].
+pub async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> Result<ClaudeWorkerRequest> {
     let mut bytes = Vec::new();
     stream
-        .take((MAX_REQUEST_BYTES + 1) as u64)
+        .take((MAX_IMAGE_REQUEST_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .await?;
-    if bytes.len() > MAX_REQUEST_BYTES || !bytes.ends_with(b"\n") {
+    if bytes.len() > MAX_IMAGE_REQUEST_BYTES || !bytes.ends_with(b"\n") {
         bail!("invalid bounded subscription worker request");
     }
     let request: ClaudeWorkerRequest = serde_json::from_slice(&bytes)?;
-    if !request.valid() {
+    if bytes.len() > request.max_line_bytes() || !request.valid() {
         bail!("invalid subscription worker request shape");
     }
     Ok(request)
@@ -194,6 +195,58 @@ mod slot_tests {
             prompt: "{}".into(),
             research,
             task,
+            images: Vec::new(),
+        }
+    }
+
+    async fn read(line: &[u8]) -> Result<ClaudeWorkerRequest> {
+        read_request(&mut &line[..]).await
+    }
+
+    /// The request as one line, padded with JSON whitespace.
+    fn encode(request: &ClaudeWorkerRequest, padding: usize) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(request).unwrap();
+        bytes.extend(std::iter::repeat_n(b' ', padding));
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[tokio::test]
+    async fn only_requests_with_photos_may_exceed_the_text_bound() {
+        use jarvis_llm::claude_worker_protocol::{WorkerImage, MAX_IMAGE_BYTES, MAX_REQUEST_BYTES};
+        let text = request(false, None);
+        assert!(read(&encode(&text, 0)).await.is_ok());
+        // A text line over 64 KiB is refused, though the read bound is larger.
+        assert!(read(&encode(&text, MAX_REQUEST_BYTES)).await.is_err());
+
+        // Four photos at the cap fit the photo bound, and nothing beyond it.
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF];
+        jpeg.resize(MAX_IMAGE_BYTES - 2, 0);
+        jpeg.extend([0xFF, 0xD9]);
+        let photos = vec![WorkerImage::jpeg(&jpeg); 4];
+        let with_photos = |research: bool, task: Option<WorkerTask>| ClaudeWorkerRequest {
+            system: if research {
+                Some(jarvis_llm::RESEARCH_SYSTEM_PROMPT.into())
+            } else {
+                task.map(|task| task.system_prompt().into())
+            },
+            images: photos.clone(),
+            ..request(research, task)
+        };
+        let line = encode(&with_photos(false, None), 0);
+        assert!(line.len() > MAX_REQUEST_BYTES);
+        assert_eq!(read(&line).await.unwrap().images.len(), 4);
+        assert!(
+            read(&encode(&with_photos(false, None), MAX_IMAGE_REQUEST_BYTES))
+                .await
+                .is_err()
+        );
+        // Never on a research run or a task, which are fine without photos.
+        for (research, task) in [(true, None), (false, Some(WorkerTask::MemeDecision))] {
+            let mut request = with_photos(research, task);
+            assert!(read(&encode(&request, 0)).await.is_err());
+            request.images.clear();
+            assert!(read(&encode(&request, 0)).await.is_ok());
         }
     }
 

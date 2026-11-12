@@ -51,7 +51,8 @@ accept an initiation event, the operation fails before invoking the official
 client.
 
 Claude's worker receives only a bounded recent conversation and system text
-over `/run/jarvis-claude.sock`. The root-owned socket grants access only to the
+(and, for an ordinary chat run, at most four chat photos; see
+[Photo runs](#photo-runs)) over `/run/jarvis-claude.sock`. The root-owned socket grants access only to the
 `jarvis` group, and the worker checks the peer UID. The worker executes the
 official CLI as `jarvis-claude` with a clean environment, no inherited
 `ANTHROPIC_API_KEY`, restricted mode, built-in and MCP tools denied, no session persistence and no access to Core's
@@ -111,9 +112,9 @@ sudo jarvis accounts test codex
 sudo jarvis accounts disconnect codex
 ```
 
-`codex` is the one ChatGPT login under `jarvis-codex`. The text-only Codex
+`codex` is the one ChatGPT login under `jarvis-codex`. The tool-free Codex
 chat worker uses it today; the coding path shares it once it is re-reviewed and
-enabled (see [Codex chat worker](#codex-chat-worker-text-only-off-by-default)).
+enabled (see [Codex chat worker](#codex-chat-worker-tool-free-off-by-default)).
 Earlier releases had a separate `codex-chat` login under `jarvis-codex-chat`;
 see [Retired jarvis-codex-chat identity](#retired-jarvis-codex-chat-identity).
 
@@ -311,7 +312,7 @@ Owner steps:
 3. Install the runtime from Core Admin (or the command above).
 4. Review that exact version for the chat worker and set
    `JARVIS_CODEX_REVIEWED_VERSION` (see
-   [Codex chat worker](#codex-chat-worker-text-only-off-by-default)); the
+   [Codex chat worker](#codex-chat-worker-tool-free-off-by-default)); the
    installer never changes the reviewed version.
 5. `sudo jarvis accounts connect codex` (the one Codex login), or Connect in
    Core Admin.
@@ -400,7 +401,7 @@ telemetry with no metered-API entry. Real account login and Home Node behavior
 have not been established by mock/fixture tests. The private `Jarvis.md`
 persona remains owner-managed and is not changed by this foundation.
 
-## Codex chat worker (text only, off by default)
+## Codex chat worker (tool-free, off by default)
 
 The `codex-cli` provider lets the owner route chat to Codex models through
 the ChatGPT subscription, for example GPT-6 Luna. It is a chat brain only: it
@@ -478,7 +479,7 @@ core dump and processes of the same UID cannot ptrace it or read its memory.
 processes of the same UID out of its view. `codex` disconnect disables the chat
 socket and stops the worker before it logs out.
 
-**Hard requirement before the coding path is enabled.** The text-only chat
+**Hard requirement before the coding path is enabled.** The tool-free chat
 worker and the coding path share the one `jarvis-codex` ChatGPT login. Before
 the Codex broker or App Server is ever enabled, this shared-token design must
 be re-reviewed, covering at least:
@@ -499,6 +500,63 @@ enforce it: `jarvis-codex-chat.socket` and `.service` declare
 `Conflicts=jarvis-codex.service jarvis-codex-broker.service`, so starting one
 side stops the other, and `verify-home-node.sh` fails when the chat worker and
 a coding unit are enabled or running together.
+
+## Photo runs
+
+An ordinary chat request may carry the owner's chat photos (see
+`REALTIME_PROTOCOL.md`, "Chat photos"). Only the two subscription workers
+receive them; the router never hands a request with photos to another
+backend.
+
+**Protocol.** The request gains an optional `images` list of
+`{"media_type": "image/jpeg", "data": "<base64>"}`, left out when empty, so a
+request without photos keeps its exact wire shape. A request is valid with
+photos only when it is not a research run and not a typed task, carries at
+most four, and each one decodes to a whole JPEG (starts `FF D8 FF`, ends
+`FF D9`) of at most 1 MiB; an unknown photo field is refused. A request line
+without photos keeps the 64 KiB bound on both sides; only a line with photos
+may be up to 6 MiB. The prompt names the photos `[photo 1]`, `[photo 2]`, …
+in the order they are sent. Each worker decodes and checks every photo again
+before the CLI sees it. Photo runs are ordinary chat runs: the chat slot, the
+120-second run limit and the usual reply bounds apply. Photo bytes are never
+logged; the protocol types print only their size.
+
+**Claude.** A run with photos uses its own invocation:
+
+```text
+claude -p --input-format stream-json --output-format stream-json --verbose
+  --model <model> --restricted --strict-mcp-config --no-session-persistence
+  --tools "" --disallowedTools mcp__* --disable-slash-commands
+  [--system-prompt-file <private 0600 file>]
+```
+
+The prompt and the photos go to stdin as one `stream-json` user message (the
+prompt as a text block, then per photo a `[photo N]` text block and a base64
+image block), after which stdin is closed. Photos are never written to disk and never appear in the arguments.
+The event stream is read like a research run's, but with no tool allowed at
+all: any tool-use block, a web search included, or a line that is not a typed
+JSON object kills the CLI's process group and returns `tool_use_refused`. The
+answer comes from the final `result` event only; the stream is capped at
+4 MiB and each line at 256 KiB. A run without photos keeps the reviewed chat
+invocation unchanged.
+
+**Codex.** The worker writes each photo as `img-N.jpg` (0600, never over an
+existing file) into the run's private 0700 directory, beside the instructions
+file and outside the working directory; the directory is removed with
+everything in it when the run ends. The reviewed `codex exec` arguments gain
+exactly one argument before the final `-`:
+`--image=<run>/img-1.jpg,<run>/img-2.jpg`. `tools.view_image` stays off, the
+prompt stays on stdin and the event allowlist is unchanged, so an unknown
+event type still stops the run.
+
+**Not yet verified on a real CLI.** Neither invocation has run against the
+real CLIs on the Home Node: whether Claude Code accepts image blocks in
+`stream-json` input under `--restricted --tools ""`, and how the reviewed
+Codex CLI parses `--image=a,b` and which events it emits for an image turn.
+Both fail closed: an error or an unexpected event ends the run without an
+answer, and nothing falls back to a paid API. Reviewing a Codex CLI version
+for `JARVIS_CODEX_REVIEWED_VERSION` includes checking `--image` and the
+image-turn events.
 
 ## Research runs (owner opt-in)
 
@@ -602,7 +660,8 @@ reaches a Codex prompt; `TZ=UTC` only fixes the date. Newer
 codex-rs releases also have a standalone search path in which the CLI itself
 POSTs the query to an OpenAI search endpoint from the host. Both, and the
 `web_search` event and item names above, must be re-checked against the exact
-CLI version before `JARVIS_CODEX_REVIEWED_VERSION` is bumped.
+CLI version before `JARVIS_CODEX_REVIEWED_VERSION` is bumped, as must
+`--image` and the events of an image turn (see [Photo runs](#photo-runs)).
 
 **Bounds.** A research run stops after 300 seconds and its reply deadline is
 305 seconds (Core waits 310 seconds). Ordinary runs keep 120 seconds and a

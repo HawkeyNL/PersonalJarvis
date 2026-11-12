@@ -43,6 +43,7 @@ pub mod model_control;
 pub mod notify;
 mod peer;
 mod persona;
+pub mod photos;
 mod rate_limit;
 pub mod realtime;
 pub mod roadmaps;
@@ -296,6 +297,15 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/coding/sessions/{id}/{mode}",
             post(coding_start_or_resume),
         )
+        // The upload handler reads its own body, bounded, after its checks.
+        .route("/v1/photos", post(photos::upload))
+        .route(
+            "/v1/photos/{id}",
+            get(photos::download)
+                .patch(photos::update)
+                .delete(photos::delete)
+                .layer(DefaultBodyLimit::max(photos::PATCH_BODY_LIMIT)),
+        )
         .route("/v1/conversations", get(list_conversations))
         .route(
             "/v1/conversations/{id}",
@@ -338,8 +348,13 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http().make_span_with(
             |request: &axum::http::Request<axum::body::Body>| {
                 // Do not log URL queries or Authorization headers, including for
-                // rejected attempts to place a token in a WebSocket URL.
-                tracing::info_span!("http", method = %request.method(), path = request.uri().path())
+                // rejected attempts to place a token in a WebSocket URL. A
+                // routed request logs its route template, not the ids in it.
+                let path = request
+                    .extensions()
+                    .get::<axum::extract::MatchedPath>()
+                    .map_or_else(|| request.uri().path(), |path| path.as_str());
+                tracing::info_span!("http", method = %request.method(), path)
             },
         ))
 }

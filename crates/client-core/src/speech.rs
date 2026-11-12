@@ -245,6 +245,7 @@ mod tests {
                 content: content.into(),
                 model: None,
                 created_at: time::OffsetDateTime::UNIX_EPOCH,
+                attachments: Vec::new(),
             },
             research_offer: None,
         }

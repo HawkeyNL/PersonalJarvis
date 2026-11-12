@@ -38,6 +38,10 @@ pub struct CanonicalMessage {
     pub model: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Ids of the chat photos this message carries; never the image bytes.
+    /// Absent when empty, so text-only messages keep their old shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,6 +380,7 @@ mod tests {
                 content: "hi".into(),
                 model: None,
                 created_at: OffsetDateTime::UNIX_EPOCH,
+                attachments: Vec::new(),
             },
             research_offer: None,
         };
@@ -395,5 +400,37 @@ mod tests {
             "weather in Utrecht?"
         );
         assert_eq!(serde_json::from_value::<Event>(new).unwrap(), completed);
+    }
+
+    #[test]
+    fn message_attachments_are_ids_and_optional_on_the_wire() {
+        let id = Uuid::nil();
+        let photo = Uuid::from_u128(7);
+        let mut created = Event::MessageCreated {
+            request_id: id,
+            message: CanonicalMessage {
+                id,
+                conversation_id: id,
+                role: MessageRole::User,
+                content: String::new(),
+                model: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                attachments: Vec::new(),
+            },
+        };
+        // Text-only messages keep the old shape; old payloads still decode.
+        let old = serde_json::to_value(&created).unwrap();
+        assert!(old["payload"]["message"].get("attachments").is_none());
+        assert_eq!(serde_json::from_value::<Event>(old).unwrap(), created);
+
+        if let Event::MessageCreated { message, .. } = &mut created {
+            message.attachments = vec![photo];
+        }
+        let new = serde_json::to_value(&created).unwrap();
+        assert_eq!(
+            new["payload"]["message"]["attachments"],
+            serde_json::json!([photo.to_string()])
+        );
+        assert_eq!(serde_json::from_value::<Event>(new).unwrap(), created);
     }
 }

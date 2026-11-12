@@ -8,8 +8,8 @@ use tokio::{io::AsyncReadExt, io::AsyncWriteExt, net::UnixStream};
 
 use crate::{
     claude_worker_protocol::{
-        ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState, WorkerTask, MAX_REPLY_BYTES,
-        MAX_REQUEST_BYTES, SOCKET,
+        ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState, WorkerImage, WorkerTask,
+        MAX_REPLY_BYTES, SOCKET,
     },
     types::{
         ChatMessage, ChatReply, ChatRequest, LlmError, ResearchRequest, Role, Tier, Usage,
@@ -82,6 +82,7 @@ impl ClaudeCliProvider {
             prompt: input.to_string(),
             research: false,
             task: Some(task),
+            images: Vec::new(),
         }
     }
 }
@@ -126,15 +127,8 @@ impl SubscriptionWorker {
         model: String,
         req: &ChatRequest,
     ) -> Result<ChatReply, LlmError> {
-        let request = ClaudeWorkerRequest {
-            protocol: 1,
-            model,
-            system: req.system.clone(),
-            prompt: build_bounded_prompt(&req.messages),
-            research: false,
-            task: None,
-        };
-        self.send(request, WORKER_TIMEOUT).await
+        self.send(chat_worker_request(model, req), WORKER_TIMEOUT)
+            .await
     }
 
     /// A research run: the bounded question and the fixed research prompt,
@@ -161,7 +155,7 @@ impl SubscriptionWorker {
         }
         let model = request.model.clone();
         let payload = serde_json::to_vec(&request).map_err(|_| self.failure())?;
-        if payload.len() + 1 > MAX_REQUEST_BYTES {
+        if payload.len() + 1 > request.max_line_bytes() {
             return Err(self.failure());
         }
         let reply = tokio::time::timeout(timeout, async {
@@ -257,6 +251,25 @@ impl SubscriptionWorker {
     }
 }
 
+/// An ordinary chat run. The turns already say `[photo N]`; the photos go
+/// along oldest first, so the Nth photo is `[photo N]`.
+fn chat_worker_request(model: String, req: &ChatRequest) -> ClaudeWorkerRequest {
+    ClaudeWorkerRequest {
+        protocol: 1,
+        model,
+        system: req.system.clone(),
+        prompt: build_bounded_prompt(&req.messages),
+        research: false,
+        task: None,
+        images: req
+            .messages
+            .iter()
+            .flat_map(|message| &message.images)
+            .map(|image| WorkerImage::jpeg(image.bytes()))
+            .collect(),
+    }
+}
+
 fn research_worker_request(model: String, req: &ResearchRequest) -> ClaudeWorkerRequest {
     ClaudeWorkerRequest {
         protocol: 1,
@@ -265,6 +278,7 @@ fn research_worker_request(model: String, req: &ResearchRequest) -> ClaudeWorker
         prompt: req.question().to_owned(),
         research: true,
         task: None,
+        images: Vec::new(),
     }
 }
 
@@ -305,6 +319,7 @@ fn build_bounded_prompt(messages: &[ChatMessage]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude_worker_protocol::MAX_IMAGE_BYTES;
 
     #[test]
     fn context_compiler_is_bounded_and_recent() {
@@ -339,6 +354,114 @@ mod tests {
                 "research": true,
             })
         );
+    }
+
+    #[test]
+    fn chat_requests_carry_the_photos_oldest_first_and_keep_their_text_shape() {
+        let photo = |marker: u8| {
+            crate::ImageData::jpeg(vec![0xFF, 0xD8, 0xFF, 0xE0, marker, 0xFF, 0xD9]).unwrap()
+        };
+        let with = |text: &str, images: Vec<crate::ImageData>| ChatMessage {
+            images,
+            ..ChatMessage::user(text)
+        };
+        let request = ChatRequest {
+            system: Some("You are Jarvis.".into()),
+            messages: vec![
+                with("[photo 1]\nWhat is this?", vec![photo(1)]),
+                ChatMessage::assistant("A cat."),
+                with("[photo 2] [photo 3]\nAnd these?", vec![photo(2), photo(3)]),
+            ],
+            tier: Tier::Default,
+            mode: crate::RoutingMode::Auto,
+            max_tokens: 16,
+            model: None,
+            provider: None,
+        };
+        let worker = chat_worker_request("claude-sonnet-5".into(), &request);
+        assert!(worker.valid());
+        let decoded: Vec<_> = worker.images.iter().map(|i| i.decoded().unwrap()).collect();
+        assert_eq!(
+            decoded,
+            [1, 2, 3].map(|marker| photo(marker).bytes().to_vec())
+        );
+        assert_eq!(worker.prompt, build_bounded_prompt(&request.messages));
+
+        // Without photos the wire shape is exactly the old one.
+        let text = ChatRequest {
+            messages: vec![ChatMessage::user("hi")],
+            ..request
+        };
+        assert_eq!(
+            serde_json::to_value(chat_worker_request("m".into(), &text)).unwrap(),
+            serde_json::json!({
+                "protocol": 1,
+                "model": "m",
+                "system": "You are Jarvis.",
+                "prompt": "User: hi\nJarvis:",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn photo_requests_reach_the_worker_and_text_requests_keep_the_small_bound() {
+        let reply = ClaudeWorkerReply {
+            text: Some("A cat.".into()),
+            ..ClaudeWorkerReply::failure(ClaudeWorkerState::Completed)
+        };
+        let (worker, server) = fake_worker(reply).await;
+        // Four photos near the 1 MiB cap: far over the text bound.
+        let mut big = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        big.resize(MAX_IMAGE_BYTES - 2, 0x42);
+        big.extend([0xFF, 0xD9]);
+        let image = crate::ImageData::jpeg(big).unwrap();
+        let request = ChatRequest {
+            system: None,
+            messages: vec![ChatMessage {
+                images: vec![image; 4],
+                ..ChatMessage::user("[photo 1] [photo 2] [photo 3] [photo 4]")
+            }],
+            tier: Tier::Default,
+            mode: crate::RoutingMode::Auto,
+            max_tokens: 16,
+            model: None,
+            provider: None,
+        };
+        let answer = worker.chat("claude-sonnet-5".into(), &request).await;
+        assert_eq!(answer.unwrap().text, "A cat.");
+        let (wire, again) = server.await.unwrap();
+        assert_eq!(wire["images"].as_array().map(Vec::len), Some(4));
+        assert!(!again);
+
+        // A text request over 64 KiB never leaves Core, whatever its shape.
+        let escaped = ClaudeWorkerRequest {
+            protocol: 1,
+            model: "m".into(),
+            system: None,
+            prompt: "\u{1}".repeat(40 * 1024),
+            research: false,
+            task: None,
+            images: Vec::new(),
+        };
+        assert!(escaped.valid());
+        let dir = std::env::temp_dir().join(format!("jarvis-bound-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("worker.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let quiet = SubscriptionWorker {
+            socket: path.to_str().unwrap().to_owned().leak(),
+            backend: "claude-cli",
+            name: "Claude",
+        };
+        let error = quiet.send(escaped, WORKER_TIMEOUT).await;
+        assert!(matches!(error, Err(LlmError::Api { status: 503, .. })));
+        let connected = tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
+        assert!(
+            connected.is_err(),
+            "an oversized text request reached the worker"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

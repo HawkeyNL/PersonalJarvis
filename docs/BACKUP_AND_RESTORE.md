@@ -29,7 +29,18 @@ Not included, by design:
 - Signing keys (updater, Android, Apple). Keep separate offline copies.
 - Core release binaries. Reinstall verified releases instead of restoring binaries.
 - `/var/lib/jarvis/agents` and worker state. Both are reconstructable.
+- Chat photos (`/var/lib/jarvis/photos`). See below.
 - Data of other services on this machine.
+
+**Chat photos are not backed up.** The archive holds the photo rows (ids,
+sizes, dates, kept flag) but not the files. That is deliberate: archives are
+kept for weeks, so a photo the owner deleted would otherwise live on in them,
+and the photo store may grow to 2 GiB per owner. The cost: a disk failure loses
+the photos. After a restore onto a new disk, each photo whose file is gone
+answers 404 and messages show a placeholder; its row stays until it expires
+or is deleted. Core does not encrypt photo files itself: only full-disk
+encryption, if the Home Node has it, protects them at rest. Deleting a photo
+unlinks its file, which on an SSD does not overwrite the blocks.
 
 ## What a run checks
 
