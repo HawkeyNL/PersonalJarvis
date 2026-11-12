@@ -81,7 +81,8 @@ pub enum PhotoError {
     Invalid,
     /// Too many pixels, too wide or tall, or still over 1 MiB as JPEG.
     TooLarge,
-    /// Another decode held the slot for too long, or a decode timed out.
+    /// No upload slot within the wait, the body arrived too slowly, or a
+    /// decode waited or ran too long.
     Busy,
     /// The photo directory failed its startup checks.
     Unavailable,
@@ -469,8 +470,9 @@ pub(crate) async fn upload(
         return Err(PhotoError::RateLimited);
     }
     let dir = state.photos.dir()?;
-    // ponytail: caps are checked before the insert, so uploads racing each
-    // other can pass a cap by a few photos; the in-flight slots bound it.
+    // ponytail: caps are checked before queueing, so queued uploads can pass
+    // the byte cap by about their number x 1 MiB; the day is bounded by
+    // count_upload. A ledger table if that ever matters.
     check_caps(&state, auth.user.id).await?;
     // The body is read only after every cheap check, and only by a bounded
     // number of uploads at once, each holding at most 15 MiB. A client that
