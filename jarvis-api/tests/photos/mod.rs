@@ -270,6 +270,23 @@ async fn photo_routes_are_owner_scoped_bounded_and_inert() -> Result<(), Box<dyn
     let response = send(&app, &token, "DELETE", &path, "", vec![]).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
+    // Photos picked together upload together: more than the two read at a
+    // time wait for a turn instead of being refused as busy.
+    let post = || {
+        send(
+            &app,
+            &other_token,
+            "POST",
+            "/v1/photos",
+            "image/png",
+            noisy_png(256, 256),
+        )
+    };
+    let together = tokio::join!(post(), post(), post(), post());
+    for response in [together.0, together.1, together.2, together.3] {
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     // Fifty uploads per owner per rolling day; the other owner is not affected.
     db.query(
         "FOR $i IN array::repeat(0, 49) { CREATE chat_photos SET id = <string>rand::uuid::v4(), user_id = $user, \

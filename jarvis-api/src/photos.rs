@@ -54,6 +54,8 @@ const MAX_DIMENSION: u32 = 10_000;
 const MAX_PIXELS: u64 = 40_000_000;
 const MAX_DECODE_ALLOC: u64 = 192 * 1024 * 1024;
 const DECODE_TIMEOUT: Duration = Duration::from_secs(20);
+const SLOT_WAIT: Duration = Duration::from_secs(30);
+const BODY_TIMEOUT: Duration = Duration::from_secs(60);
 const QUALITY: u8 = 82;
 const FALLBACK_QUALITY: u8 = 65;
 const UPLOADS_PER_MIN: u32 = 30;
@@ -430,23 +432,30 @@ async fn check_caps(state: &AppState, user: Uuid) -> Result<(), PhotoError> {
         .take(0)
         .map_err(database_error)?;
     let usage = usage.ok_or(PhotoError::Internal)?;
-    // Rows only count photos that still exist; the in-memory counter also
-    // counts deleted ones, so upload-and-delete cannot reset the day.
-    // ponytail: the counter resets on restart; a ledger table if that matters.
-    let day = Duration::from_secs(24 * 60 * 60);
-    if usage.uploads >= UPLOADS_PER_DAY
-        || !state.rate_limiter.check_reserved(
-            &format!("photo-day:user:{user}"),
-            UPLOADS_PER_DAY,
-            day,
-        )
-    {
+    if usage.uploads >= UPLOADS_PER_DAY {
         return Err(PhotoError::DailyLimit);
     }
     if usage.bytes.saturating_add(MAX_PHOTO_BYTES as i64) > MAX_OWNER_BYTES {
         return Err(PhotoError::StorageFull);
     }
     Ok(())
+}
+
+/// Counts one accepted upload against the day. Rows only count photos that
+/// still exist; this counter also counts deleted ones, so upload-and-delete
+/// cannot reset the day. Only called once a photo passed sanitizing, so a
+/// refused or busy attempt costs nothing.
+/// ponytail: the counter resets on restart; a ledger table if that matters.
+fn count_upload(state: &AppState, user: Uuid) -> Result<(), PhotoError> {
+    let day = Duration::from_secs(24 * 60 * 60);
+    if state
+        .rate_limiter
+        .check_reserved(&format!("photo-day:user:{user}"), UPLOADS_PER_DAY, day)
+    {
+        Ok(())
+    } else {
+        Err(PhotoError::DailyLimit)
+    }
 }
 
 /// POST /v1/photos: a raw image body. Sanitize, store, then record it as an
@@ -464,15 +473,16 @@ pub(crate) async fn upload(
     // other can pass a cap by a few photos; the in-flight slots bound it.
     check_caps(&state, auth.user.id).await?;
     // The body is read only after every cheap check, and only by a bounded
-    // number of uploads at once, each holding at most 15 MiB.
-    let _slot = state
-        .photos
-        .uploads
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| PhotoError::Busy)?;
-    let body = axum::body::to_bytes(body, MAX_UPLOAD_BYTES)
+    // number of uploads at once, each holding at most 15 MiB. A client that
+    // picks several photos sends them together, so wait briefly for a slot;
+    // a slow sender cannot hold one for longer than BODY_TIMEOUT.
+    let _slot = tokio::time::timeout(SLOT_WAIT, state.photos.uploads.clone().acquire_owned())
         .await
+        .map_err(|_| PhotoError::Busy)?
+        .map_err(|_| PhotoError::Internal)?;
+    let body = tokio::time::timeout(BODY_TIMEOUT, axum::body::to_bytes(body, MAX_UPLOAD_BYTES))
+        .await
+        .map_err(|_| PhotoError::Busy)?
         .map_err(|_| PhotoError::TooLarge)?;
     if sniff(&body).is_none() {
         return Err(PhotoError::Unsupported);
@@ -493,6 +503,7 @@ pub(crate) async fn upload(
     })
     .await
     .map_err(|_| PhotoError::Busy)??;
+    count_upload(&state, auth.user.id)?;
     let id = Uuid::new_v4();
     let Sanitized {
         jpeg,
