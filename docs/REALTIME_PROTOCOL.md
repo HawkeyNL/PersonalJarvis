@@ -273,9 +273,11 @@ marker with a label of this run adds that photo to the answer's
 `attachments` (each once, at most four); unknown numbers and inline markers
 are only removed. A run with photos in its input starts no automatic web
 search and offers none. Photos never reach web research, the intent
-classifier, memory, notifications or logs. When no subscription worker can
-take the photos, Core stores a fixed answer saying so; no other backend is
-tried and the photo stays with the message.
+classifier, memory, notifications or logs. When no subscription worker is
+usable (none enabled, or the conversation is pinned to another brain), Core
+stores a fixed answer saying so. When the worker it tried fails, the run
+fails like any other (`assistant.failed`). In neither case is another
+backend tried, and the photo stays with the message.
 
 **Retention.** The hourly maintenance pass (at most 120 seconds) deletes
 photos that were never sent 24 hours after upload, and unkept photos 90 days
