@@ -137,13 +137,17 @@ async fn first_activation_requires_local_network_code_and_password_atomically(
     );
     let pending = jarvis_identity::pending_pairing_requests(&db, owner.id).await?;
     assert_eq!(pending.len(), 1);
-    // Only the persisted request is announced, once, without its details.
+    // Only the persisted request is announced, once, naming the device and
+    // its key (the owner's choice, docs/NOTIFICATIONS.md).
     let push = tokio::time::timeout(std::time::Duration::from_secs(5), publishes.recv())
         .await?
         .ok_or("no notification")?;
     assert!(push.contains("click: jarvis://approvals/pairing\r\n"));
+    let key = &pending[0].candidate_fingerprint;
+    assert!(push.contains("\r\n\r\nreplacement · macOS"), "{push}");
     assert!(
-        !push.contains("replacement") && !push.contains(&pending[0].candidate_fingerprint[..16])
+        push.contains(&format!("Key {} {}", &key[..4], &key[4..8])),
+        "{push}"
     );
     assert_no_push(&mut publishes).await;
     assert_eq!(pending[0].status, "pending");
