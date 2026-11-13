@@ -354,7 +354,8 @@ fn plain(text: &str) -> String {
         .chars()
         .map(|c| match c {
             '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
-            '\u{3002}' | '\u{FF61}' | '\u{FE52}' | '\u{2024}' | '\u{0701}' | '\u{0702}' => '.',
+            '\u{3002}' | '\u{FF61}' | '\u{FE52}' | '\u{2024}' | '\u{0701}' | '\u{0702}'
+            | '\u{00B7}' | '\u{30FB}' | '\u{2027}' => '.',
             c => c,
         })
         .flat_map(char::to_lowercase)
@@ -363,13 +364,25 @@ fn plain(text: &str) -> String {
     for dot in ["[.]", "(.)", "{.}", "[dot]", "(dot)", " dot "] {
         text = text.replace(dot, ".");
     }
+    // `example . com`; `news. Keep` has no space before its dot and stays.
+    while text.contains(" . ") {
+        text = text.replace(" . ", ".");
+    }
     text
 }
 
 /// One word of [`plain`] text that is a domain (a Unicode-letter top level
-/// of two or more letters), a dotted-quad IP address or a host with a port.
+/// of two or more letters), an IP address or a host with a port.
 fn site_word(word: &str) -> bool {
     let word = word.trim_start_matches(|c: char| !c.is_alphanumeric());
+    // IPv6: hex groups with `::` or more colons than a time of day has.
+    let hex = word
+        .find(|c: char| !(c.is_ascii_hexdigit() || c == ':'))
+        .map_or(word, |end| &word[..end]);
+    let colons = hex.matches(':').count();
+    if colons >= 2 && (hex.contains("::") || colons >= 3) {
+        return true;
+    }
     let end = word
         .find(|c: char| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_')))
         .unwrap_or(word.len());
@@ -673,6 +686,15 @@ mod tests {
             "93.184.216.34",
             "example dot com",
             "example DOT com",
+            "example (dot) com",
+            "example [.] com",
+            "example . com",
+            "example\u{00B7}com",
+            "example\u{30FB}com",
+            "example\u{2027}com",
+            "2001:db8::1",
+            "fe80:0:0:0:0:0:0:1",
+            "at [2001:db8::1]:443",
         ] {
             assert!(names_a_site(&params(instruction)), "{instruction}");
         }
@@ -687,6 +709,8 @@ mod tests {
             "Connect the dots on chip supply, e.g. in Asia.",
             "Version 2.0.1 changes",
             "The 10:30 briefing",
+            "Results at 10:30:00 today",
+            "Chips in Asia. Keep it short.",
         ] {
             assert!(!names_a_site(&params(instruction)), "{instruction}");
         }

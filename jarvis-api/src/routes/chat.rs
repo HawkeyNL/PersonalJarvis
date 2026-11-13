@@ -578,20 +578,32 @@ pub(super) async fn execute_chat(
             )
             .await;
             // The job exists and was pushed: the note follows even when the
-            // answer could not be stored, so the owner is always told.
+            // answer could not be stored, but never into a conversation the
+            // owner deleted meanwhile (the push already told them).
             if let Some(job) = &own_job {
                 let note = crate::job_markers::note(job, state.jobs.time_zone());
-                let posted = post_job_message(
-                    &state,
-                    authed.user.id,
-                    Some(conv_id),
-                    &conv_title,
-                    &note,
-                    JOB_NOTE_MODEL,
+                let posted = tokio::time::timeout(
+                    crate::jobs::DB_TIMEOUT,
+                    append_to_live_conversation(
+                        &state.db,
+                        conv_id,
+                        authed.user.id,
+                        &note,
+                        JOB_NOTE_MODEL,
+                    ),
                 )
                 .await;
-                if posted.is_err() {
-                    tracing::warn!("note on a job of Jarvis's own not stored");
+                match posted {
+                    Ok(Ok(Some((_, title)))) => state.realtime.publish(
+                        authed.user.id,
+                        Event::ConversationUpdated(ConversationMetadata {
+                            id: conv_id,
+                            title,
+                            updated_at: OffsetDateTime::now_utc(),
+                        }),
+                    ),
+                    Ok(Ok(None)) => tracing::info!("conversation gone; job note not stored"),
+                    _ => tracing::warn!("note on a job of Jarvis's own not stored"),
                 }
             }
             let message = message.map_err(|_| internal_error())?;

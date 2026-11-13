@@ -160,14 +160,16 @@ params flat (`title`, `instruction`, `text`, `threshold_percent`, `notify`),
   Research and automatic web search are on (what its runs need) and never on
   a turn with photos (in this run or the recent turns the model sees). Its
   title and instruction may not name a link, a domain (also written with
-  `[.]`, `(.)`, ` dot ` or fullwidth dots), an IP address or a host and port
+  `[.]`, `(.)`, ` dot `, ` . `, middle or fullwidth dots), an IP address
+  (v4 or v6) or a host and port
   (it searches without the owner's click, from text web content may have
   steered), and the privacy gate runs before it is stored, failing closed;
   it counts towards Jarvis's own 3 and expires after 30 days. When the write
   times out, Core looks the job up and goes on if it was made. Core then
   writes the audit row, pushes to the owner (see `NOTIFICATIONS.md`) and
   posts a fixed note after the answer (also when the answer itself could
-  not be stored), under the model `job`: `I set up
+  not be stored, never into a conversation the owner deleted meanwhile),
+  under the model `job`: `I set up
   a research job for myself: Rust releases — weekly on Monday at 08:00. It
   expires on 13 December 2026; you can pause or delete it in Jobs.` The
   apps see the job in `GET /v1/jobs`.
