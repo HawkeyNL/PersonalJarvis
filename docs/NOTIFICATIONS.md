@@ -15,6 +15,7 @@ until `JARVIS_NOTIFY_NTFY_URL` is set.
 | A scheduled research job (`prompt`) has a result, unless the job turned `notify` off | Jarvis | A scheduled job has a result — open Jarvis | default | `jarvis://jobs` |
 | A scheduled reminder is due | Jarvis reminder | The reminder's title, cleaned like a device name and capped at 60 characters | default | `jarvis://jobs` |
 | A scheduled disk check finds disks at or above its threshold | Jarvis | `Disk data at 91%` (every full disk, comma-separated) | default | `jarvis://jobs` |
+| Jarvis made a research job for itself from a chat answer | Jarvis added a research job | `Rust releases — weekly on Monday at 08:00`: the job's title, cleaned like a reminder's, and its schedule | default | `jarvis://jobs` |
 
 Scheduled job pushes (docs/SCHEDULED_JOBS.md) go to ntfy and to every app
 push target of the job's owner. A research result carries no content; a
@@ -25,7 +26,9 @@ dropped and at most 60 characters; a disk push names the disk by label
 Research results and disk pushes are sent at most once per 60 s like any
 other kind. Reminders skip that window and each job's reminder has its own
 collapse id, so two reminders in the same minute both arrive and neither
-replaces the other.
+replaces the other. The same holds for the push about a job Jarvis made for
+itself, so the owner hears of every one; its title is model text, cleaned
+like a reminder's and checked by the privacy gate before the job was made.
 
 Approval pushes name the device behind the request: its name, platform and
 model, the IP address it connected from and the first 16 hex characters of

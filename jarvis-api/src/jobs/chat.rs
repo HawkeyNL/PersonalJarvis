@@ -115,7 +115,7 @@ async fn post(
 /// Whether a research run may search: Research on and a worker that can run
 /// it. A job Jarvis made for itself also needs automatic web search on, the
 /// switch that governs searches the owner did not ask for.
-fn research_on(state: &AppState, origin: Origin) -> bool {
+pub(crate) fn research_on(state: &AppState, origin: Origin) -> bool {
     let routing = state.model_routing.snapshot();
     state.llm.can_research()
         && routing.research_allowed()

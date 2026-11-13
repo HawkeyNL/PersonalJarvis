@@ -72,6 +72,16 @@ pub struct ResearchOffer {
     pub question: String,
 }
 
+/// A scheduled job the answer proposed (docs/SCHEDULED_JOBS.md). Advisory
+/// and not stored: only the owner's confirmation creates it, by sending
+/// `body` (a checked `POST /v1/jobs` body) as is or edited. `id` lets the app
+/// show each proposal once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobProposal {
+    pub id: Uuid,
+    pub body: serde_json::Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum Event {
@@ -108,6 +118,10 @@ pub enum Event {
         /// click sends a new explicit Research run. Absent for older Cores.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         research_offer: Option<ResearchOffer>,
+        /// Up to 3 jobs the answer proposed for the owner to confirm. Absent
+        /// when there are none and from older Cores.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        job_proposals: Vec<JobProposal>,
     },
     #[serde(rename = "assistant.failed")]
     AssistantFailed {
@@ -383,10 +397,12 @@ mod tests {
                 attachments: Vec::new(),
             },
             research_offer: None,
+            job_proposals: Vec::new(),
         };
         // Without an offer the payload keeps the old shape, so old payloads decode.
         let old = serde_json::to_value(&completed).unwrap();
         assert!(old["payload"].get("research_offer").is_none());
+        assert!(old["payload"].get("job_proposals").is_none());
         assert_eq!(serde_json::from_value::<Event>(old).unwrap(), completed);
 
         if let Event::AssistantCompleted { research_offer, .. } = &mut completed {
@@ -400,6 +416,23 @@ mod tests {
             "weather in Utrecht?"
         );
         assert_eq!(serde_json::from_value::<Event>(new).unwrap(), completed);
+
+        if let Event::AssistantCompleted { job_proposals, .. } = &mut completed {
+            job_proposals.push(JobProposal {
+                id: Uuid::from_u128(9),
+                body: serde_json::json!({"kind": "disk_check", "cadence": "daily"}),
+            });
+        }
+        let proposed = serde_json::to_value(&completed).unwrap();
+        assert_eq!(
+            proposed["payload"]["job_proposals"],
+            serde_json::json!([{"id": "00000000-0000-0000-0000-000000000009",
+                "body": {"kind": "disk_check", "cadence": "daily"}}])
+        );
+        assert_eq!(
+            serde_json::from_value::<Event>(proposed).unwrap(),
+            completed
+        );
     }
 
     #[test]

@@ -77,6 +77,14 @@ pub enum JobResult {
     Reminder { job: Uuid, title: String },
     /// The Home Node disks at or above the job's threshold, with their use.
     Disk(Vec<(&'static str, u8)>),
+    /// Jarvis made a research job for itself: its title, cleaned like a
+    /// reminder's, and Core's description of its schedule. Like a reminder,
+    /// each stands on its own.
+    Created {
+        job: Uuid,
+        title: String,
+        schedule: String,
+    },
 }
 
 /// The device behind an approval push, as Core stored it. Untrusted: a new
@@ -100,6 +108,7 @@ impl NotifyEvent {
             Self::JobResult(JobResult::Prompt) => "job",
             Self::JobResult(JobResult::Reminder { .. }) => "reminder",
             Self::JobResult(JobResult::Disk(_)) => "disk",
+            Self::JobResult(JobResult::Created { .. }) => "job_created",
         }
     }
 
@@ -107,6 +116,7 @@ impl NotifyEvent {
     fn collapse_id(&self) -> String {
         match self {
             Self::JobResult(JobResult::Reminder { job, .. }) => format!("reminder-{job}"),
+            Self::JobResult(JobResult::Created { job, .. }) => format!("job-created-{job}"),
             other => other.kind().to_string(),
         }
     }
@@ -183,6 +193,16 @@ impl NotifyEvent {
                     .collect::<Vec<_>>()
                     .join(", "),
             ),
+            Self::JobResult(JobResult::Created {
+                title, schedule, ..
+            }) => (
+                "Jarvis added a research job",
+                format!(
+                    "{} — {}",
+                    clean(&unspoofable(title), MAX_REMINDER_CHARS, "Research"),
+                    clean(schedule, MAX_REMINDER_CHARS, "")
+                ),
+            ),
         }
     }
 
@@ -198,7 +218,7 @@ impl NotifyEvent {
             Self::BudgetNinetyPercent => "moneybag",
             Self::PairingRequested(_) | Self::PairingAgain => "key",
             Self::UnlockRequested(_) => "lock",
-            Self::JobResult(JobResult::Prompt) => "mag",
+            Self::JobResult(JobResult::Prompt | JobResult::Created { .. }) => "mag",
             Self::JobResult(JobResult::Reminder { .. }) => "bell",
             Self::JobResult(JobResult::Disk(_)) => "floppy_disk",
         }
@@ -383,10 +403,11 @@ impl Notifier {
             return;
         };
         let now = Instant::now();
-        // A reminder is its job's whole point; the jobs' own limits bound it.
+        // A reminder is its job's whole point, and the owner always hears of
+        // a job Jarvis made; the jobs' own limits bound both.
         if !matches!(
             job.event,
-            NotifyEvent::JobResult(JobResult::Reminder { .. })
+            NotifyEvent::JobResult(JobResult::Reminder { .. } | JobResult::Created { .. })
         ) {
             let mut last = inner
                 .last_sent
@@ -644,7 +665,26 @@ mod tests {
         assert_eq!(disk.alert().1, "Disk system at 85%, Disk data at 91%");
         assert_eq!(disk.collapse_id(), "disk");
         assert_eq!(disk.click(), "jarvis://jobs");
-        for event in [reminder, disk, NotifyEvent::JobResult(JobResult::Prompt)] {
+        let created = NotifyEvent::JobResult(JobResult::Created {
+            job,
+            title: "Rust\u{202E} releases: https://x".into(),
+            schedule: "weekly on Monday at 08:00".into(),
+        });
+        assert_eq!(
+            created.alert(),
+            (
+                "Jarvis added a research job",
+                "Rust releases httpsx — weekly on Monday at 08:00".to_string()
+            )
+        );
+        assert_eq!(created.collapse_id(), format!("job-created-{job}"));
+        assert_eq!(created.click(), "jarvis://jobs");
+        for event in [
+            reminder,
+            disk,
+            created,
+            NotifyEvent::JobResult(JobResult::Prompt),
+        ] {
             assert!(event.alert().0.is_ascii());
         }
     }
@@ -959,6 +999,18 @@ mod tests {
             receiver.try_recv().map(|job| job.event),
             Ok(NotifyEvent::BudgetNinetyPercent)
         );
+        // Each job Jarvis made for itself is pushed.
+        let created = |n| {
+            NotifyEvent::JobResult(JobResult::Created {
+                job: Uuid::from_u128(n),
+                title: "Rust".into(),
+                schedule: "daily at 07:00".into(),
+            })
+        };
+        notifier.notify(created(1));
+        notifier.notify(created(2));
+        assert_eq!(receiver.try_recv().map(|job| job.event), Ok(created(1)));
+        assert_eq!(receiver.try_recv().map(|job| job.event), Ok(created(2)));
         assert!(receiver.try_recv().is_err());
     }
 
