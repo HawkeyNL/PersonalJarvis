@@ -8,6 +8,7 @@
 //! forward by the gap (02:30 becomes 03:30); a minute that occurs twice on a
 //! fall-back day runs once, at its first occurrence.
 
+mod chat;
 mod dependency_review;
 pub mod store;
 
@@ -47,6 +48,9 @@ const TICK: Duration = Duration::from_secs(60);
 pub(crate) const DB_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds the work of one run.
 const RUN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Between the end of one run that used the Claude worker (a search or a
+/// dependency review) and the start of the next.
+const SEARCH_GAP: Duration = Duration::from_secs(30);
 /// Monday 07:00, the default of a new job.
 const DEFAULT_WEEKDAY: u8 = 1;
 const DEFAULT_AT_MINUTE: u16 = 7 * 60;
@@ -132,10 +136,9 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Whether the runner runs jobs of this kind yet. The others are stored
-    /// and edited, but no slot of theirs runs and no row is written.
-    pub fn runnable(self) -> bool {
-        matches!(self, Self::DependencyReview)
+    /// Whether a run takes the Claude subscription worker's background slot.
+    fn uses_worker(self) -> bool {
+        matches!(self, Self::Prompt | Self::DependencyReview)
     }
 }
 
@@ -205,6 +208,8 @@ impl RunStatus {
 pub enum SummarySource {
     Claude,
     Deterministic,
+    /// A research answer from a web search.
+    Web,
 }
 
 /// Typed parameters; unknown fields are refused, and so is a field the
@@ -879,11 +884,9 @@ impl Job {
     /// down leave no row. Slots at or before `last_slot_at` are handled;
     /// without it (a change made while the zone was unavailable), slots at
     /// or before the last change (`updated_at`) never run. Nothing is owed
-    /// for a kind the runner does not run yet, a job that reached its
-    /// `max_runs` or one that expired.
+    /// for a job that reached its `max_runs` or one that expired.
     pub fn due(&self, now: OffsetDateTime, tz: &TimeZone) -> Due {
         if !self.enabled
-            || !self.kind.runnable()
             || self.max_runs.is_some_and(|max| self.run_count >= max)
             || self.expires_at.is_some_and(|at| at <= now)
         {
@@ -988,6 +991,7 @@ impl JobsHandle {
 }
 
 /// What runs need besides the database.
+#[derive(Clone)]
 pub struct Work {
     /// The GitHub poller's allowlist; the dependency review reads only
     /// those repositories.
@@ -996,6 +1000,10 @@ pub struct Work {
     pub token: Option<HeaderValue>,
     /// The Claude subscription worker for typed tasks, never the router.
     pub brain: Arc<dyn crate::memecoin::agent::Brain>,
+    /// What the chat-made kinds use: the Research path, the job's
+    /// conversation, pushes and the holdings for the privacy gate. Without
+    /// it their runs fail with `not_configured`.
+    pub app: Option<crate::AppState>,
 }
 
 /// Spawn the runner unless the time zone failed to load. Every minute, or
@@ -1011,6 +1019,7 @@ pub fn start(db: Database, handle: Arc<JobsHandle>, events: Hub, work: Work) {
         events,
         tz,
         work,
+        searched_at: Mutex::new(None),
     };
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(TICK);
@@ -1063,6 +1072,8 @@ struct Runner {
     events: Hub,
     tz: TimeZone,
     work: Work,
+    /// When the last run that used the Claude worker ended.
+    searched_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl Runner {
@@ -1081,32 +1092,53 @@ impl Runner {
 
     /// Nothing runs before stale runs are marked. Then the owner's queued
     /// run, which stays queued while the database fails, then every job's
-    /// due slot. A job of a kind that does not run yet is skipped: its
-    /// queued run is dropped and its slots are never due.
+    /// due slot. Jobs Jarvis made for itself that expired are deleted first.
     async fn pass(&self, now: OffsetDateTime) {
         if !self.recover().await {
             return;
         }
+        if let Ok(expired) = call(store::delete_expired(&self.db)).await {
+            if !expired.is_empty() {
+                tracing::info!(jobs = expired.len(), "expired scheduled jobs deleted");
+            }
+            for job_id in &expired {
+                self.audit("jobs.expired_deleted", job_id).await;
+            }
+        }
         if let Some(job_id) = self.handle.queued() {
             let settled = match call(store::get(&self.db, &job_id)).await {
-                Ok(Some(job)) if job.kind.runnable() => {
+                Ok(Some(job)) => {
                     self.run(&job, OffsetDateTime::now_utc(), Trigger::Owner)
                         .await
                 }
-                Ok(_) => true,
+                Ok(None) => true,
                 Err(failed) => failed == Failed::Refused,
             };
             if settled {
                 self.handle.clear_queued();
             }
         }
-        let Ok(jobs) = call(store::list(&self.db)).await else {
+        let Ok(mut jobs) = call(store::list(&self.db)).await else {
             return;
         };
+        // The quick kinds first, so a reminder is not late behind searches,
+        // and at most one worker job (a search or a dependency review) per
+        // pass, [`SEARCH_GAP`] after the last:
+        // the next pass (at once after a long run) checks the quick kinds
+        // again, and the Claude worker's one background slot stays free for
+        // the owner's own work in between.
+        jobs.sort_by_key(|job| job.kind.uses_worker());
+        let mut searched = false;
         for job in jobs {
             match job.due(now, &self.tz) {
                 Due::Nothing => {}
                 Due::Run(slot) => {
+                    if job.kind.uses_worker() {
+                        if searched || !self.search_gap_passed() {
+                            continue;
+                        }
+                        searched = true;
+                    }
                     self.run(&job, slot, Trigger::Schedule).await;
                 }
                 Due::Missed(slot) => {
@@ -1126,20 +1158,48 @@ impl Runner {
     }
 
     /// Write the row, do the work, record how it ended. False when the row
-    /// could not be written for a reason worth retrying.
+    /// could not be written for a reason worth retrying. A chat-made job's
+    /// failures in a row are counted; the third pauses it.
     async fn run(&self, job: &Job, slot: OffsetDateTime, trigger: Trigger) -> bool {
         let start = store::start_run(&self.db, job, slot, trigger, RunStatus::Running);
         let run_id = match call(start).await {
             Ok(run_id) => run_id,
             Err(failed) => return failed == Failed::Refused,
         };
-        let mut finish = tokio::time::timeout(RUN_TIMEOUT, self.work(job))
-            .await
-            .unwrap_or_else(|_| Finish::failed("timed_out"));
+        // Its own task, so a panic fails the run instead of the runner.
+        let mut task = tokio::spawn(work(
+            self.work.clone(),
+            self.db.clone(),
+            self.tz.clone(),
+            job.clone(),
+        ));
+        let mut finish = match tokio::time::timeout(RUN_TIMEOUT, &mut task).await {
+            Ok(Ok(finish)) => finish,
+            Ok(Err(_)) => Finish::failed("internal"),
+            Err(_) => {
+                task.abort();
+                Finish::failed("timed_out")
+            }
+        };
+        if job.kind.uses_worker() {
+            if let Ok(mut at) = self.searched_at.lock() {
+                *at = Some(std::time::Instant::now());
+            }
+        }
         if let Err(reason) = finish.check() {
             // A result the store would refuse still ends the run.
             tracing::warn!(reason, "scheduled job result refused");
             finish = Finish::failed("invalid_result");
+        }
+        // The streak first, so a client that sees the run ended sees it too.
+        if let Some(failed) = finish
+            .streak()
+            .filter(|_| job.kind != Kind::DependencyReview)
+        {
+            if call(store::record_outcome(&self.db, &job.id, failed)).await == Ok(true) {
+                tracing::warn!("scheduled job paused after failed runs");
+                self.audit("jobs.paused", &job.id).await;
+            }
         }
         if call(store::finish_run(&self.db, &run_id, &finish)).await == Ok(true) {
             self.announce(&job.id, &run_id, finish.status);
@@ -1147,11 +1207,17 @@ impl Runner {
         true
     }
 
-    async fn work(&self, job: &Job) -> Finish {
-        match job.kind {
-            Kind::DependencyReview => dependency_review::run(&self.work, &self.db, job).await,
-            // Never reached: `pass` does not run these kinds yet.
-            Kind::Prompt | Kind::Reminder | Kind::DiskCheck => Finish::failed("not_supported"),
+    fn search_gap_passed(&self) -> bool {
+        self.searched_at
+            .lock()
+            .map(|at| at.is_none_or(|at| at.elapsed() >= SEARCH_GAP))
+            .unwrap_or(true)
+    }
+
+    /// A security audit row without a device: Core did it by itself.
+    async fn audit(&self, event: &str, job_id: &str) {
+        if let Some(app) = &self.work.app {
+            crate::audit::record_security_event(app, None, event, "ok", Some(job_id)).await;
         }
     }
 
@@ -1162,6 +1228,16 @@ impl Runner {
             run_id: run_id.to_owned(),
             status: status.as_str().to_owned(),
         });
+    }
+}
+
+async fn work(work: Work, db: Database, tz: TimeZone, job: Job) -> Finish {
+    match (job.kind, work.app.as_ref()) {
+        (Kind::DependencyReview, _) => dependency_review::run(&work, &db, &job).await,
+        (Kind::Prompt, Some(app)) => chat::prompt(app, &job, &tz).await,
+        (Kind::Reminder, Some(app)) => chat::reminder(app, &job).await,
+        (Kind::DiskCheck, Some(app)) => chat::disk_check(app, &job).await,
+        (_, None) => Finish::failed("not_configured"),
     }
 }
 
@@ -1957,12 +2033,6 @@ mod tests {
             once.latest_slot(at("2027-10-25T00:00:00Z"), &tz),
             Some(slot)
         );
-        assert_eq!(
-            once.due(slot, &tz),
-            Due::Nothing,
-            "not a kind that runs yet"
-        );
-        once.kind = Kind::DependencyReview;
         assert_eq!(once.due(slot, &tz), Due::Run(slot));
         assert_eq!(once.due(at("2027-01-01T00:00:00Z"), &tz), Due::Missed(slot));
         assert!(once.ends_with(RunStatus::Running) && once.ends_with(RunStatus::Missed));
@@ -1980,24 +2050,14 @@ mod tests {
     }
 
     #[test]
-    fn the_runner_skips_kinds_it_does_not_run_yet_and_expired_jobs() {
+    fn expired_jobs_are_never_due() {
         let tz = tz();
         let today = at("2026-11-11T06:00:00Z");
-        let daily = job(Cadence::Daily, None, 420);
+        let daily = Job {
+            kind: Kind::Prompt,
+            ..job(Cadence::Daily, None, 420)
+        };
         assert_eq!(daily.due(today, &tz), Due::Run(today));
-        for kind in [Kind::Prompt, Kind::Reminder, Kind::DiskCheck] {
-            assert!(!kind.runnable());
-            let skipped = Job {
-                kind,
-                ..daily.clone()
-            };
-            assert_eq!(skipped.due(today, &tz), Due::Nothing);
-            assert_eq!(
-                skipped.due(today + time::Duration::days(2), &tz),
-                Due::Nothing
-            );
-        }
-        assert!(Kind::DependencyReview.runnable());
         let expired = Job {
             expires_at: Some(today),
             ..daily.clone()
@@ -2050,7 +2110,9 @@ mod tests {
                 github: Arc::default(),
                 token: None,
                 brain: Arc::new(jarvis_llm::ClaudeCliProvider::new("unused", "m", "m", "m")),
+                app: None,
             },
+            searched_at: Mutex::new(None),
         };
         let input = serde_json::json!({"kind": "dependency_review", "cadence": "daily"});
         let job = store::create(&db, serde_json::from_value(input)?, None).await?;

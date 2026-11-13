@@ -14,16 +14,18 @@ A job's kind is a closed list, each with typed parameters:
 | `reminder` | Posts the owner's fixed text and pushes the title | `title`, `text?` |
 | `disk_check` | Notes when a Home Node disk is fuller than the threshold | `threshold_percent?` (50 to 99, default 80) |
 
-Core runs only `dependency_review` for now: jobs of the other kinds are
-stored and edited, but the runner skips them (no slot of theirs is due, no
-row is written) and `POST /v1/jobs/{id}/run` answers 409. Their runners
-follow.
-
 There is at most one `dependency_review` and at most 10 jobs of the other
 kinds made by the owner. Jarvis may keep up to 3 `prompt` jobs of its own
 apart from those; Core makes them itself (never through the API), and each
 expires 30 days after it was made: it no longer runs or counts towards the
-3 (deleting expired jobs follows with the runners). Nothing is seeded.
+3, and the runner deletes it with its runs on its next check. Nothing is
+seeded.
+
+Each create, change and delete through the API writes a security audit row
+(`jobs.created`, `jobs.updated`, `jobs.deleted`, `jobs.run_requested`) with
+the device and the job id, never the job's text. Core writes rows without a
+device when it pauses a job (`jobs.paused`) or deletes an expired one
+(`jobs.expired_deleted`).
 
 ## API
 
@@ -71,8 +73,8 @@ kind that does not run yet, or the runner is off).
   `instruction` and `text` 1 to 500, each on one line without hidden
   characters. A `prompt` instruction leaves the Home Node in a web search,
   so it may not carry personal or financial details or a symbol the owner
-  holds (the research privacy gate); when the holdings cannot be read the
-  answer is 503.
+  holds (the research privacy gate), and neither may its title, which can
+  leave in a push; when the holdings cannot be read the answer is 503.
 
 These are Core's, never the client's (a body that names one is refused):
 
@@ -101,7 +103,7 @@ Examples:
 Errors are `{"error": "…"}`: 400 for invalid input (the message says which
 rule), 404 for an unknown job or run, 409 for a revision conflict, a second
 `dependency_review`, no room for another job, a run request while the runner
-is off or for a kind that does not run yet, 413 for a body over 4 KiB, 422
+is off, 413 for a body over 4 KiB, 422
 for a body that does not parse (an unknown field), 429 for a run request
 within an hour of the last one or while one is queued or running, 503 when
 the database or the holdings cannot be read.
@@ -145,9 +147,31 @@ run) which slots are due and runs them one at a time: the owner's queued run
 first, then each job's due slot. It writes the run row (`running`) before the
 work starts, in one transaction with the slot it handles, and only while the
 job is still enabled and at the revision it read, so an owner change in
-between wins. A run's work is bounded by 15 minutes (`timed_out`). Jobs of a
-kind that does not run yet, that reached `max_runs` or that expired are
-skipped. Each check
+between wins. A run's work is bounded by 15 minutes (`timed_out`). Jobs that
+reached `max_runs` or expired are skipped; expired jobs of Jarvis's are
+deleted, with their runs, at the start of each check.
+
+Due jobs run one at a time, each in its own task (a crash fails that run
+with `internal`, the runner goes on). Reminders and disk checks run before
+research and dependency reviews, and a check runs at most one of those (both
+use the Claude worker), 30 seconds or more after the last one ended; the next check (at once after a
+long run) looks at the quick kinds again first. So a reminder is not held up
+by searches, and the Claude worker's one background slot is free for the
+owner's own Research in between. A research slot that waited still runs
+once, for its newest slot only.
+
+A run posts and pushes nothing when the owner deleted its job while it
+ran.
+
+A failed run of an enabled chat-made job (`prompt`, `reminder`,
+`disk_check`) counts towards a streak (`failure_count`) only when the fault
+is the job's own: `private_instruction` or `timed_out`. A success ends the
+streak; other failures (Research off or down, the holdings or the database
+unavailable) still record a failed run and a notice but leave the streak as
+it is. The
+third failed run in a row disables the job with `paused_reason:
+"paused_after_failures"` at the next revision; the owner enables it again
+(which clears both). A `dependency_review` has no streak. Each check
 first marks runs still `running` as `interrupted` (no run is between two
 checks, so such a run was left by an earlier Core or its end could not be
 recorded), and runs nothing until that succeeded.
@@ -185,6 +209,55 @@ After every run that ends, and every `missed` row, Core sends the realtime
 event `jobs.run_finished {"job_id": "…", "run_id": "…", "status": "…"}` to
 every connected app (see `REALTIME_PROTOCOL.md`); the app reloads
 `GET /v1/jobs/runs/{run_id}`.
+
+## Chat-made kinds
+
+A run of these kinds can only write one assistant message to the job's own
+conversation and send one push; it has no tools, memory, portfolio or
+other access. The conversation is made on the first run that writes,
+titled after the job, and kept in `conversation_id`; when the owner deletes
+it, the next run makes a new one. Every message is announced with
+`conversation.updated`.
+
+A `prompt` run checks the privacy gate again first (title and instruction,
+against the holdings at that moment; it fails closed with
+`holdings_unavailable` when they cannot be read) and needs Research on (a
+job Jarvis made for itself also needs automatic web search on), then runs
+one web search
+through the fixed Research path: the hard-tier subscription worker with
+web search only, never a paid API, metered with `routing_mode` `job`. The
+question is the instruction after `(Scheduled run, Monday 7 December
+2026.) `. The search is bounded by 5 minutes; its usage is recorded after
+it. The answer goes to the
+conversation as `web:<model>`, so later chats treat it as untrusted web
+data; the run's `summary` is its first 2000 characters (`summary_source:
+"web"`) and its `facts` are `{conversation_id, message_id, sources}` (up to
+20 https links from the answer). With `params.notify` (the default) the
+owner gets a push without content. A failed run leaves a short fixed notice
+in the conversation and has one of these codes; it is not retried before
+its next slot:
+
+| Code | Means |
+| --- | --- |
+| `private_instruction` | The title or instruction may hold personal or financial details or a held symbol |
+| `holdings_unavailable` | The holdings could not be read for the privacy gate |
+| `not_configured` | Research is off or no subscription worker can run it |
+| `research_unavailable` | The search did not run or was stopped |
+| `timed_out` | The search took over 5 minutes |
+| `conversation_unavailable` | The answer could not be stored |
+
+A `reminder` run involves no model: it posts `params.text` (or the title)
+to the conversation and pushes the title (summary: the text,
+`deterministic`).
+
+A `disk_check` run reads the Home Node disks the Health page reports
+(`system` and `data`, by label, never a path) and changes nothing on the
+host. Only when a disk is at or above `params.threshold_percent` does it
+post `Disk data is at 91% (threshold 80%).` and send one push naming every
+full disk (`Disk data at 91%`). The disks are read off Core's async threads
+within 2 seconds.
+Its `facts` hold the threshold and each disk's `used_percent`; with no
+disk readable it fails with `disk_unavailable`.
 
 ## Dependency review
 

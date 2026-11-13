@@ -999,6 +999,91 @@ async fn auto_research_answer(
     })
 }
 
+/// A scheduled `prompt` job's search (docs/SCHEDULED_JOBS.md): the
+/// automatic search's path within `limit`, metered as `job` after it. The
+/// answer and the model it is stored under (`web:<model>`), `Ok(None)` when
+/// no search ran, `Err` when it took too long.
+pub(crate) async fn job_research(
+    state: &AppState,
+    request_id: Uuid,
+    question: &str,
+    limit: std::time::Duration,
+) -> Result<Option<(String, String)>, tokio::time::error::Elapsed> {
+    let started = Instant::now();
+    let answer = tokio::time::timeout(
+        limit,
+        auto_research_answer(
+            &state.model_routing.snapshot(),
+            state.llm.as_ref(),
+            question,
+        ),
+    )
+    .await?;
+    let Some((mut reply, model)) = answer else {
+        return Ok(None);
+    };
+    let status = estimate_missing_usage(&mut reply, question.len(), state.llm_max_tokens);
+    record_usage_with_metadata(
+        state,
+        &reply,
+        jarvis_usage::UsageMetadata {
+            request_id: request_id.to_string(),
+            routing_mode: "job".into(),
+            quality_tier: "hard".into(),
+            latency_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+            status: status.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    Ok(Some((reply.text, model)))
+}
+
+/// Post an assistant message to a job's conversation, made anew (titled
+/// `title`) when it has none or the owner deleted it, and tell the apps.
+/// Returns the conversation and message ids. Each database call is bounded
+/// by the jobs' database timeout.
+pub(crate) async fn post_job_message(
+    state: &AppState,
+    user: Uuid,
+    conversation: Option<Uuid>,
+    title: &str,
+    content: &str,
+    model: &str,
+) -> Result<(Uuid, Uuid), ()> {
+    let limit = crate::jobs::DB_TIMEOUT;
+    let append = |id: Uuid| async move {
+        tokio::time::timeout(
+            limit,
+            append_to_live_conversation(&state.db, id, user, content, model),
+        )
+        .await
+        .map_err(|_| ())?
+        .map(|found| found.map(|found| (id, found)))
+    };
+    let mut posted = match conversation {
+        Some(id) => append(id).await?,
+        None => None,
+    };
+    if posted.is_none() {
+        let title = clean_title(title);
+        let id = tokio::time::timeout(limit, create_conversation(&state.db, user, &title))
+            .await
+            .map_err(|_| ())??;
+        posted = append(id).await?;
+    }
+    let (id, (message, title)) = posted.ok_or(())?;
+    state.realtime.publish(
+        user,
+        Event::ConversationUpdated(ConversationMetadata {
+            id,
+            title,
+            updated_at: OffsetDateTime::now_utc(),
+        }),
+    );
+    Ok((id, message.id))
+}
+
 /// The answer to an explicit Research request. Off, too long, carrying a
 /// personal identifier ([`llm::privacy::leaks_identifier`]) or unavailable is
 /// a clear, fixed answer, never a silent paid-API or non-search answer. There

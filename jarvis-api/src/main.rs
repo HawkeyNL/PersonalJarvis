@@ -718,6 +718,7 @@ async fn main() -> anyhow::Result<()> {
                 &config.llm_model_hard,
                 &config.llm_model_cheap,
             )),
+            app: Some(state.clone()),
         },
     );
     if let Some(token) = github_token {

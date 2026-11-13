@@ -44,7 +44,7 @@ const ACTIVE_STATES: [&str; 8] = [
     "maintenance",
     "refreshing",
 ];
-const DISKS: [(&str, &str); 2] = [("system", "/"), ("data", "/var/lib/jarvis")];
+pub(crate) const DISKS: [(&str, &str); 2] = [("system", "/"), ("data", "/var/lib/jarvis")];
 
 static CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
 
@@ -177,7 +177,7 @@ fn unknown_disk(label: &str) -> Value {
 
 /// `df`-style figures for the filesystem holding `path`; the path itself is
 /// never reported.
-fn disk_value(label: &str, path: &Path) -> Value {
+pub(crate) fn disk_value(label: &str, path: &Path) -> Value {
     let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
         return unknown_disk(label);
     };

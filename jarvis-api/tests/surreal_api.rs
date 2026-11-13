@@ -2634,3 +2634,118 @@ async fn job_routes_validate_and_guard_revisions() -> Result<(), Box<dyn std::er
     assert_eq!(deleted.status(), StatusCode::OK);
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn job_runs_write_to_their_own_conversation() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Surreal::new::<Ws>(&env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let mut app_state = state(db.clone(), None).await;
+    app_state.jobs = Arc::new(jarvis_api::jobs::JobsHandle::new());
+    assert!(app_state.jobs.configured(), "Europe/Amsterdam zone");
+    jarvis_api::jobs::start(
+        db,
+        app_state.jobs.clone(),
+        app_state.realtime.clone(),
+        jarvis_api::jobs::Work {
+            github: Arc::default(),
+            token: None,
+            brain: Arc::new(jarvis_llm::ClaudeCliProvider::new("unused", "m", "m", "m")),
+            app: Some(app_state.clone()),
+        },
+    );
+    let app = build_router(app_state);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let call = |method: &str, path: &str, body: Option<String>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if body.is_some() {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        app.clone().oneshot(
+            request
+                .body(body.map_or_else(Body::empty, Body::from))
+                .unwrap(),
+        )
+    };
+    // Run a job now and wait for its run to end.
+    let run = |body: Value| async move {
+        let created = json_body(call("POST", "/v1/jobs", Some(body.to_string())).await?).await;
+        let id = created["id"].as_str().ok_or("id")?.to_owned();
+        let queued = call("POST", &format!("/v1/jobs/{id}/run"), None).await?;
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        for _ in 0..100 {
+            let runs = json_body(call("GET", &format!("/v1/jobs/{id}/runs"), None).await?).await;
+            if runs["runs"][0]["status"]
+                .as_str()
+                .is_some_and(|s| s != "running")
+            {
+                let job = json_body(call("GET", "/v1/jobs", None).await?).await["jobs"]
+                    .as_array()
+                    .and_then(|jobs| jobs.iter().find(|job| job["id"] == id.as_str()).cloned())
+                    .ok_or("job")?;
+                return Ok::<_, Box<dyn std::error::Error>>((job, runs["runs"][0].clone()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Err("the run did not end".into())
+    };
+
+    // A reminder posts its fixed text to a conversation of its own.
+    let (reminder, ran) = run(json!({
+        "kind": "reminder", "params": {"title": "Call the bank", "text": "Ask about the card."}
+    }))
+    .await?;
+    assert_eq!(
+        (&ran["status"], &ran["summary"], &ran["summary_source"]),
+        (
+            &json!("ok"),
+            &json!("Ask about the card."),
+            &json!("deterministic")
+        )
+    );
+    let conversation = reminder["conversation_id"].as_str().ok_or("conversation")?;
+    let posted =
+        json_body(call("GET", &format!("/v1/conversations/{conversation}"), None).await?).await;
+    assert_eq!(posted["title"], "Call the bank");
+    assert_eq!(posted["messages"][0]["content"], "Ask about the card.");
+    assert_eq!(posted["messages"][0]["role"], "assistant");
+    assert_eq!(posted["messages"][0]["model"], "job");
+
+    // Without Research a prompt fails as not configured and says so in its
+    // conversation; that is not the job's own fault, so no pause streak.
+    let (prompt, ran) = run(json!({
+        "kind": "prompt", "params": {"title": "AI news", "instruction": "Summarize the AI news"}
+    }))
+    .await?;
+    assert_eq!(
+        (&ran["status"], &ran["error_code"]),
+        (&json!("failed"), &json!("not_configured"))
+    );
+    assert_eq!(
+        (&prompt["failure_count"], &prompt["enabled"]),
+        (&json!(0), &json!(true))
+    );
+    let conversation = prompt["conversation_id"].as_str().ok_or("conversation")?;
+    let notice =
+        json_body(call("GET", &format!("/v1/conversations/{conversation}"), None).await?).await;
+    assert!(notice["messages"][0]["content"]
+        .as_str()
+        .is_some_and(|text| text.contains("Research is off")));
+
+    // A disk check reads the disks and ends, posting only above its
+    // threshold.
+    let (_, ran) = run(json!({"kind": "disk_check", "params": {"threshold_percent": 99}})).await?;
+    assert_eq!(ran["status"], "ok");
+    Ok(())
+}

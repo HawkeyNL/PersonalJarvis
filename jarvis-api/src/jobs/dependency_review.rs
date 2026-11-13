@@ -645,6 +645,7 @@ mod tests {
             github: Arc::default(),
             token: None,
             brain: Arc::new(FakeBrain::new(None)),
+            app: None,
         };
         let job =
             serde_json::from_value::<super::super::NewJob>(json!({"kind": "dependency_review"}))
