@@ -26,7 +26,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 20);
+    assert_eq!(version.unwrap().version, 21);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
@@ -47,7 +47,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_eleven.unwrap().version, 20);
+    assert_eq!(from_eleven.unwrap().version, 21);
     db.use_db("from_twelve").await?;
     apply_through_twelve(&db).await?;
     // A v12 pairing row has none of the new optional fields and stays valid.
@@ -59,7 +59,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_twelve_version: Option<SchemaVersion> = from_twelve.take(0)?;
-    assert_eq!(from_twelve_version.unwrap().version, 20);
+    assert_eq!(from_twelve_version.unwrap().version, 21);
     let legacy_has_no_ip: Vec<bool> = from_twelve.take(1)?;
     assert_eq!(legacy_has_no_ip, [true]);
     // The database bounds the new fields even if Core validation regressed.
@@ -88,7 +88,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
-    assert_eq!(migrated_version.unwrap().version, 20);
+    assert_eq!(migrated_version.unwrap().version, 21);
     let legacy: Vec<String> = migrated.take(1)?;
     assert_eq!(legacy, ["password-set"]);
     db.query("CREATE account_actions SET id = 'reset', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
@@ -134,7 +134,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_thirteen.unwrap().version, 20);
+    assert_eq!(from_thirteen.unwrap().version, 21);
     // The paper tables enforce their shape even if Core validation regressed.
     let (mint, other) = (
         "So11111111111111111111111111111111111111112",
@@ -187,7 +187,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_fourteen.unwrap().version, 20);
+    assert_eq!(from_fourteen.unwrap().version, 21);
     // The IBKR read model enforces its shape even if Core validation regressed.
     let position = |id: &str, extra: &str| {
         format!("CREATE ibkr_positions SET id = '{id}', conid = {id}, symbol = 'VWCE', asset_class = 'STK', currency = 'EUR', quantity = '12.5', avg_cost = '101.25', last_price = '120', market_value = '1500', unrealized_pnl = '-3.5'{extra};")
@@ -232,7 +232,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_fifteen_version: Option<SchemaVersion> = from_fifteen.take(0)?;
-    assert_eq!(from_fifteen_version.unwrap().version, 20);
+    assert_eq!(from_fifteen_version.unwrap().version, 21);
     let legacy_has_no_anchor: Vec<bool> = from_fifteen.take(1)?;
     assert_eq!(legacy_has_no_anchor, [true]);
     db.query(session(
@@ -269,7 +269,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_sixteen_version: Option<SchemaVersion> = from_sixteen.take(0)?;
-    assert_eq!(from_sixteen_version.unwrap().version, 20);
+    assert_eq!(from_sixteen_version.unwrap().version, 21);
     let legacy_has_no_lineage: Vec<bool> = from_sixteen.take(1)?;
     assert_eq!(legacy_has_no_lineage, [true]);
     // Legacy rows still pass every rule when they are written again.
@@ -371,7 +371,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_seventeen_version: Option<SchemaVersion> = from_seventeen.take(0)?;
-    assert_eq!(from_seventeen_version.unwrap().version, 20);
+    assert_eq!(from_seventeen_version.unwrap().version, 21);
     let kept: Vec<String> = from_seventeen.take(1)?;
     assert_eq!(kept, ["momentum-a"]);
     // The roadmap tables enforce their shape even if Core validation regressed.
@@ -507,7 +507,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_eighteen_version: Option<SchemaVersion> = from_eighteen.take(0)?;
-    assert_eq!(from_eighteen_version.unwrap().version, 20);
+    assert_eq!(from_eighteen_version.unwrap().version, 21);
     let kept: Vec<String> = from_eighteen.take(1)?;
     assert_eq!(kept, [r]);
     // The job tables enforce their shape even if Core validation regressed.
@@ -552,8 +552,6 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     .await?
     .check()?;
     for bad in [
-        // A second job of the same kind.
-        job(x, ""),
         run(x, "").replace("'dependency_review'", "'research'"),
         run(x, "").replace(&format!("job_id = '{r}'"), "job_id = 'job'"),
         // The same slot of the same job twice.
@@ -612,7 +610,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_nineteen_version: Option<SchemaVersion> = from_nineteen.take(0)?;
-    assert_eq!(from_nineteen_version.unwrap().version, 20);
+    assert_eq!(from_nineteen_version.unwrap().version, 21);
     let legacy_has_no_attachments: Vec<bool> = from_nineteen.take(1)?;
     assert_eq!(legacy_has_no_attachments, [true]);
     db.query(message(i, &format!(", attachments = ['{r}', '{d}']")))
@@ -652,6 +650,79 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     ] {
         assert!(db.query(&bad).await?.check().is_err(), "{bad}");
     }
+    db.use_db("from_twenty").await?;
+    apply_through_twenty(&db).await?;
+    db.query(job(r, "")).await?.check()?;
+    apply_baseline_schema(&db).await?;
+    let mut from_twenty = db
+        .query("SELECT version FROM schema_version:baseline; SELECT VALUE origin = NONE AND every = NONE AND run_count = NONE AND params.title = NONE FROM scheduled_jobs;")
+        .await?
+        .check()?;
+    let from_twenty_version: Option<SchemaVersion> = from_twenty.take(0)?;
+    assert_eq!(from_twenty_version.unwrap().version, 21);
+    // A job stored before 0021 keeps its shape, stays valid when written and
+    // may now have a second of its kind.
+    let legacy: Vec<bool> = from_twenty.take(1)?;
+    assert_eq!(legacy, [true]);
+    db.query("UPDATE scheduled_jobs SET at_minute = 0;")
+        .await?
+        .check()?;
+    db.query(job(i, "")).await?.check()?;
+    let new_job = |id: &str, extra: &str| {
+        format!("CREATE scheduled_jobs SET id = '{id}', kind = 'prompt', cadence = 'monthly', month_day = 31, every = 6, start_date = '2026-11-13', max_runs = 2, run_count = 0, origin = 'owner', owner_id = '{d}', at_minute = 540, enabled = true, revision = 1, params = {{ title: 'News', instruction: 'Summarize the AI news', notify: true }}, failure_count = 0, created_at = time::now(), updated_at = time::now(){extra};")
+    };
+    let fresh_id = || uuid::Uuid::now_v7().to_string();
+    for good in [
+        new_job(&fresh_id(), ""),
+        new_job(&fresh_id(), ", kind = 'reminder', cadence = 'once', month_day = NONE, every = NONE, max_runs = NONE, params = { title: 'Call', text: 'Call the bank.' }"),
+        new_job(&fresh_id(), ", kind = 'disk_check', cadence = 'daily', month_day = NONE, every = 1, start_date = NONE, max_runs = NONE, params = { threshold_percent: 80 }"),
+        new_job(&fresh_id(), &format!(", origin = 'jarvis', expires_at = time::now() + 30d, conversation_id = '{r}'")),
+        new_job(&fresh_id(), ", enabled = false, failure_count = 3, paused_reason = 'paused_after_failures'"),
+    ] {
+        db.query(&good).await?.check()?;
+    }
+    db.query(run(
+        &fresh_id(),
+        ", kind = 'prompt', summary = 'Answer.', summary_source = 'web'",
+    ))
+    .await?
+    .check()?;
+    // Each case breaks exactly one rule.
+    for bad in [
+        new_job(x, ", kind = 'shell'"),
+        new_job(x, ", month_day = NONE"),
+        new_job(x, ", month_day = 0"),
+        new_job(x, ", month_day = 32"),
+        new_job(x, ", cadence = 'daily'"),
+        new_job(x, ", every = 0"),
+        new_job(x, ", every = 366"),
+        new_job(x, ", start_date = NONE"),
+        new_job(x, ", start_date = '13-11-2026'"),
+        new_job(x, ", cadence = 'once', month_day = NONE, every = 1"),
+        new_job(x, ", cadence = 'once', month_day = NONE, max_runs = NONE"),
+        new_job(x, ", cadence = 'once', month_day = NONE, every = 1, max_runs = NONE, start_date = NONE"),
+        new_job(x, ", max_runs = 0"),
+        new_job(x, ", max_runs = 101"),
+        new_job(x, ", run_count = -1"),
+        new_job(x, ", origin = 'system'"),
+        new_job(x, ", origin = 'jarvis'"),
+        new_job(x, ", origin = 'jarvis', expires_at = time::now() + 30d, kind = 'reminder', params = { title: 'Call' }"),
+        new_job(x, ", owner_id = 'owner'"),
+        new_job(x, ", conversation_id = 'chat'"),
+        new_job(x, ", failure_count = -1"),
+        new_job(x, ", paused_reason = 'paused_after_failures'"),
+        new_job(x, ", enabled = false, paused_reason = 'tired'"),
+        new_job(x, ", params = { title: '', instruction: 'Search' }"),
+        new_job(x, &format!(", params = {{ title: '{}', instruction: 'Search' }}", "t".repeat(61))),
+        new_job(x, &format!(", params = {{ title: 'News', instruction: '{}' }}", "i".repeat(501))),
+        new_job(x, ", params = { title: 'Call', text: '' }"),
+        new_job(x, ", params = { threshold_percent: 49 }"),
+        new_job(x, ", params = { threshold_percent: 100 }"),
+        run(x, ", kind = 'shell', slot_at = d'2026-11-23T06:00:00Z'"),
+        run(x, ", slot_at = d'2026-11-23T06:00:00Z', summary = 'Answer.', summary_source = 'search'"),
+    ] {
+        assert!(db.query(&bad).await?.check().is_err(), "{bad}");
+    }
     // A fresh database goes straight to the current schema.
     db.use_db("fresh").await?;
     apply_baseline_schema(&db).await?;
@@ -660,7 +731,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(fresh.unwrap().version, 20);
+    assert_eq!(fresh.unwrap().version, 21);
     db.query(photo(r, "")).await?.check()?;
     db.query("UPDATE schema_version:baseline SET version = 99;")
         .await?
