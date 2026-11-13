@@ -1082,14 +1082,18 @@ async fn jobs_from_chat_markers_only_on_ordinary_runs_api_answers(
     assert_eq!(own.owner_id, Some(owner.id.hyphenated().to_string()));
     assert!(own.expires_at.is_some());
     // The note follows the answer in the conversation.
-    let contents: Vec<String> = db
+    let rows: Vec<Value> = db
         .query(
-            "SELECT VALUE content FROM chat_messages WHERE conversation_id = $conversation \
+            "SELECT content, created_at FROM chat_messages WHERE conversation_id = $conversation \
              ORDER BY created_at",
         )
         .bind(json!({"conversation": conversation.to_string()}))
         .await?
         .take(0)?;
+    let contents: Vec<String> = rows
+        .iter()
+        .map(|row| row["content"].as_str().unwrap_or_default().to_owned())
+        .collect();
     assert_eq!(contents.len(), 4, "{contents:?}");
     assert_eq!(contents[1], "Plain answer.");
     assert!(contents[2].starts_with(
