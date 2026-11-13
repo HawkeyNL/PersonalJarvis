@@ -43,6 +43,8 @@ const MIN_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_TOKEN_BYTES: usize = 256;
 const MAX_TOPIC_LEN: usize = 64;
 
+/// Fixed ASCII (an ntfy header) with the cue a collapsed preview still shows.
+const PAIRING_TITLE: &str = "New device wants to pair - verify in Jarvis";
 /// Longest device name shown in a push, in characters.
 const MAX_NAME_CHARS: usize = 40;
 /// Longest platform and model shown in a push, in characters.
@@ -54,6 +56,9 @@ pub enum NotifyEvent {
     BudgetNinetyPercent,
     /// A new device pairing request awaits approval in the app.
     PairingRequested(DeviceInfo),
+    /// Another pairing request arrived inside the coalescing window; fixed
+    /// text, so it cannot leave stale device details on the phone.
+    PairingAgain,
     /// A signed-in device asks another device to approve its unlock.
     UnlockRequested(DeviceInfo),
 }
@@ -74,7 +79,7 @@ impl NotifyEvent {
     fn kind(&self) -> &'static str {
         match self {
             Self::BudgetNinetyPercent => "budget",
-            Self::PairingRequested(_) => "pairing",
+            Self::PairingRequested(_) | Self::PairingAgain => "pairing",
             Self::UnlockRequested(_) => "unlock",
         }
     }
@@ -85,20 +90,23 @@ impl NotifyEvent {
     fn alert(&self) -> (&'static str, String) {
         match self {
             Self::BudgetNinetyPercent => ("Jarvis", "Budget reached 90% this month".to_string()),
+            // Trusted fields first; the device-chosen name and model come
+            // quoted and labelled, so they cannot pose as the IP or the key.
             Self::PairingRequested(device) => {
-                let mut body = format!("{} · {}", device_name(device), platform(device));
-                if let Some(model) = device.model.as_deref() {
-                    let model = clean(model, MAX_PLATFORM_CHARS, "");
-                    if !model.is_empty() {
-                        let _ = write!(body, " {model}");
-                    }
-                }
+                let mut body = String::new();
                 if let Some(ip) = device
                     .ip
                     .as_deref()
                     .and_then(|ip| ip.parse::<IpAddr>().ok())
                 {
-                    let _ = write!(body, " · IP {ip}");
+                    let _ = write!(body, "IP {ip} · ");
+                }
+                let _ = write!(body, "{} · {}", platform(device), named(device));
+                if let Some(model) = device.model.as_deref() {
+                    let model = clean(&unspoofable(model), MAX_PLATFORM_CHARS, "");
+                    if !model.is_empty() {
+                        let _ = write!(body, " ({model})");
+                    }
                 }
                 match device
                     .fingerprint
@@ -119,14 +127,18 @@ impl NotifyEvent {
                         body.push_str("\nCompare the key fingerprint in Jarvis before approving.")
                     }
                 }
-                ("New device wants to pair", body)
+                (PAIRING_TITLE, body)
             }
+            Self::PairingAgain => (
+                PAIRING_TITLE,
+                "Another device also asks to pair — check every request in Jarvis.".to_string(),
+            ),
             Self::UnlockRequested(device) => (
                 "Device asks to unlock Jarvis",
                 format!(
-                    "{} · {}. Open Jarvis to approve or deny.",
-                    device_name(device),
-                    platform(device)
+                    "{} device {}. Open Jarvis to approve or deny.",
+                    platform(device),
+                    named(device)
                 ),
             ),
         }
@@ -135,14 +147,14 @@ impl NotifyEvent {
     fn priority(&self) -> &'static str {
         match self {
             Self::BudgetNinetyPercent => "default",
-            Self::PairingRequested(_) | Self::UnlockRequested(_) => "high",
+            Self::PairingRequested(_) | Self::PairingAgain | Self::UnlockRequested(_) => "high",
         }
     }
 
     fn tags(&self) -> &'static str {
         match self {
             Self::BudgetNinetyPercent => "moneybag",
-            Self::PairingRequested(_) => "key",
+            Self::PairingRequested(_) | Self::PairingAgain => "key",
             Self::UnlockRequested(_) => "lock",
         }
     }
@@ -151,14 +163,32 @@ impl NotifyEvent {
     fn click(&self) -> &'static str {
         match self {
             Self::BudgetNinetyPercent => "jarvis://health/usage",
-            Self::PairingRequested(_) => "jarvis://approvals/pairing",
+            Self::PairingRequested(_) | Self::PairingAgain => "jarvis://approvals/pairing",
             Self::UnlockRequested(_) => "jarvis://approvals/unlock",
         }
     }
 }
 
-fn device_name(device: &DeviceInfo) -> String {
-    clean(&device.name, MAX_NAME_CHARS, "Unknown device")
+/// The device-chosen name in fixed quotes, or `without a name`.
+fn named(device: &DeviceInfo) -> String {
+    match clean(&unspoofable(&device.name), MAX_NAME_CHARS, "") {
+        name if name.is_empty() => "without a name".to_string(),
+        name => format!("named “{name}”"),
+    }
+}
+
+/// Device text that cannot fake a field or a link: separators and quotes
+/// become `-`; `/` and `:` (which ntfy turns into links) are dropped.
+fn unspoofable(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !matches!(c, '/' | ':' | '／' | '：' | '∕'))
+        .map(|c| match c {
+            '·' | '•' | '∙' | '⋅' | '・' | '"' | '\'' | '`' | '“' | '”' | '‘' | '’' | '„' | '‟'
+            | '«' | '»' | '‹' | '›' | '「' | '」' | '＂' | '＇' => '-',
+            c => c,
+        })
+        .collect()
 }
 
 fn platform(device: &DeviceInfo) -> String {
@@ -168,7 +198,7 @@ fn platform(device: &DeviceInfo) -> String {
         "android" => "Android".to_string(),
         "windows" => "Windows".to_string(),
         "linux" => "Linux".to_string(),
-        other => clean(other, MAX_PLATFORM_CHARS, "unknown platform"),
+        other => clean(&unspoofable(other), MAX_PLATFORM_CHARS, "Unknown"),
     }
 }
 
@@ -227,11 +257,14 @@ pub struct Notifier {
     inner: Option<Arc<Inner>>,
 }
 
+type WindowKey = (&'static str, Option<Uuid>);
+
 struct Inner {
     queue: mpsc::Sender<Job>,
     /// Per kind and requesting device, so one device's request never hides
-    /// another's.
-    last_sent: Mutex<HashMap<(&'static str, Option<Uuid>), Instant>>,
+    /// another's: the window start, and whether its one `PairingAgain` went
+    /// out.
+    last_sent: Mutex<HashMap<WindowKey, (Instant, bool)>>,
     /// (year, month) in UTC of the last budget notification, matching the
     /// calendar month `jarvis_usage::month_total_eur` sums over.
     budget_month: Mutex<Option<(i32, u8)>>,
@@ -283,9 +316,10 @@ impl Notifier {
         });
     }
 
-    /// The first event in a window wins: a later pairing request within
-    /// `MIN_INTERVAL` sends nothing, and the app lists every pending request.
-    fn enqueue(&self, job: Job) {
+    /// The first event in a window wins. The first later pairing request in
+    /// the window sends one `PairingAgain` (fixed text, same collapse id);
+    /// anything after that sends nothing until the window ends.
+    fn enqueue(&self, mut job: Job) {
         let kind = job.event.kind();
         let key = (kind, job.audience.and_then(|audience| audience.except));
         let Some(inner) = &self.inner else {
@@ -297,13 +331,18 @@ impl Notifier {
                 .last_sent
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            if last
-                .get(&key)
-                .is_some_and(|at| now.duration_since(*at) < MIN_INTERVAL)
-            {
-                return;
+            match last.get_mut(&key) {
+                Some((at, again)) if now.duration_since(*at) < MIN_INTERVAL => {
+                    if *again || !matches!(job.event, NotifyEvent::PairingRequested(_)) {
+                        return;
+                    }
+                    *again = true;
+                    job.event = NotifyEvent::PairingAgain;
+                }
+                _ => {
+                    last.insert(key, (now, false));
+                }
             }
-            last.insert(key, now);
         }
         if inner.queue.try_send(job).is_err() {
             let dropped = inner.dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -611,7 +650,7 @@ mod tests {
         assert!(request.starts_with("POST /jarvis-test HTTP/1.1\r\n"));
         for header in [
             "authorization: Bearer tk_fixture\r\n",
-            "title: New device wants to pair\r\n",
+            "title: New device wants to pair - verify in Jarvis\r\n",
             "priority: high\r\n",
             "tags: key\r\n",
             "click: jarvis://approvals/pairing\r\n",
@@ -619,7 +658,7 @@ mod tests {
             assert!(request.contains(header), "missing {header:?}");
         }
         assert!(request.ends_with(
-            "\r\n\r\nGus’s iPad · iOS iPad14,1 · IP 192.0.2.7\n\
+            "\r\n\r\nIP 192.0.2.7 · iOS · named “Gus-s iPad” (iPad14,1)\n\
              Key a1b2 c3d4 e5f6 0718… Compare the full fingerprint in Jarvis before approving."
         ));
         nothing_more(&mut requests).await;
@@ -643,7 +682,9 @@ mod tests {
         ] {
             assert!(request.contains(header), "missing {header:?}");
         }
-        assert!(request.ends_with("\r\n\r\nWork laptop · Linux. Open Jarvis to approve or deny."));
+        assert!(request.ends_with(
+            "\r\n\r\nLinux device named “Work laptop”. Open Jarvis to approve or deny."
+        ));
     }
 
     #[tokio::test]
@@ -658,16 +699,22 @@ mod tests {
         let (head, body) = request.split_once("\r\n\r\n").unwrap();
         assert!(head.contains("title: Device asks to unlock Jarvis\r\n"));
         assert!(!head.to_ascii_lowercase().contains("evil"));
+        assert!(!head.contains("Fake"));
         assert_eq!(
             body,
-            "x Title: Fake X-Evil: 1 · iOS. Open Jarvis to approve or deny."
+            "iOS device named “x Title Fake X-Evil 1”. Open Jarvis to approve or deny."
         );
     }
 
     #[test]
     fn device_text_is_cleaned_capped_and_falls_back() {
         // Titles go out as ntfy HTTP headers: fixed ASCII only.
-        for event in [NotifyEvent::BudgetNinetyPercent, pairing(), unlock()] {
+        for event in [
+            NotifyEvent::BudgetNinetyPercent,
+            pairing(),
+            NotifyEvent::PairingAgain,
+            unlock(),
+        ] {
             let (title, body) = event.alert();
             assert!(title.is_ascii() && HeaderValue::from_str(title).is_ok());
             assert!(!body.is_empty());
@@ -696,7 +743,7 @@ mod tests {
         let (_, body) = NotifyEvent::PairingRequested(DeviceInfo::default()).alert();
         assert_eq!(
             body,
-            "Unknown device · unknown platform\n\
+            "Unknown · without a name\n\
              Compare the key fingerprint in Jarvis before approving."
         );
         let (_, body) = NotifyEvent::PairingRequested(DeviceInfo {
@@ -709,7 +756,7 @@ mod tests {
         .alert();
         assert_eq!(
             body,
-            "Phone · plan9\nCompare the key fingerprint in Jarvis before approving."
+            "plan9 · named “Phone”\nCompare the key fingerprint in Jarvis before approving."
         );
         let (_, body) = NotifyEvent::UnlockRequested(DeviceInfo {
             name: format!("{}\u{202e}", "n".repeat(60)),
@@ -720,9 +767,9 @@ mod tests {
         assert_eq!(
             body,
             format!(
-                "{}… · {}…. Open Jarvis to approve or deny.",
-                "n".repeat(39),
-                "p".repeat(31)
+                "{}… device named “{}…”. Open Jarvis to approve or deny.",
+                "p".repeat(31),
+                "n".repeat(39)
             )
         );
     }
@@ -756,6 +803,33 @@ mod tests {
         assert_eq!(receiver.try_recv().map(|job| job.event), Ok(pairing()));
     }
 
+    #[test]
+    fn a_device_name_cannot_pose_as_the_ip_or_the_key() {
+        let (_, body) = NotifyEvent::PairingRequested(DeviceInfo {
+            name: "A · IP 1.2.3.4\nKey a1b2 c3d4 “x” http://e".into(),
+            platform: "ios".into(),
+            model: Some("M · IP 5.6.7.8".into()),
+            ip: Some("192.0.2.7".into()),
+            fingerprint: Some("0123456789abcdef".repeat(4)),
+        })
+        .alert();
+        assert_eq!(
+            body,
+            "IP 192.0.2.7 · iOS · named “A - IP 1.2.3.4 Key a1b2 c3d4 -x- httpe” (M - IP 5.6.7.8)\n\
+             Key 0123 4567 89ab cdef… Compare the full fingerprint in Jarvis before approving."
+        );
+        let (_, body) = NotifyEvent::UnlockRequested(DeviceInfo {
+            name: "“Phone” · iOS".into(),
+            platform: "linux".into(),
+            ..DeviceInfo::default()
+        })
+        .alert();
+        assert_eq!(
+            body,
+            "Linux device named “-Phone- - iOS”. Open Jarvis to approve or deny."
+        );
+    }
+
     #[tokio::test]
     async fn repeats_within_the_window_are_coalesced() {
         let (queue, mut receiver) = mpsc::channel(8);
@@ -765,6 +839,18 @@ mod tests {
         }
         notifier.notify(NotifyEvent::BudgetNinetyPercent);
         assert_eq!(receiver.try_recv().map(|job| job.event), Ok(pairing()));
+        // One fixed-text follow-up per window, never the later device's text.
+        assert_eq!(
+            receiver.try_recv().map(|job| job.event),
+            Ok(NotifyEvent::PairingAgain)
+        );
+        assert_eq!(
+            NotifyEvent::PairingAgain.alert(),
+            (
+                "New device wants to pair - verify in Jarvis",
+                "Another device also asks to pair — check every request in Jarvis.".to_string()
+            )
+        );
         assert_eq!(
             receiver.try_recv().map(|job| job.event),
             Ok(NotifyEvent::BudgetNinetyPercent)

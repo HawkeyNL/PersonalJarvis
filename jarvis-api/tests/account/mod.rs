@@ -144,7 +144,7 @@ async fn first_activation_requires_local_network_code_and_password_atomically(
         .ok_or("no notification")?;
     assert!(push.contains("click: jarvis://approvals/pairing\r\n"));
     let key = &pending[0].candidate_fingerprint;
-    assert!(push.contains("\r\n\r\nreplacement · macOS"), "{push}");
+    assert!(push.contains("macOS · named “replacement”"), "{push}");
     assert!(
         push.contains(&format!("Key {} {}", &key[..4], &key[4..8])),
         "{push}"

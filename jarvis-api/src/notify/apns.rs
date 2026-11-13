@@ -389,7 +389,7 @@ fn request(
         "link": event.click(),
     });
     let expiration = match event {
-        NotifyEvent::PairingRequested(_) => PAIRING_EXPIRATION_SECS,
+        NotifyEvent::PairingRequested(_) | NotifyEvent::PairingAgain => PAIRING_EXPIRATION_SECS,
         _ => UNLOCK_EXPIRATION_SECS,
     };
     client
@@ -582,7 +582,7 @@ mod tests {
                 "aps": {
                     "alert": {
                         "title": "Device asks to unlock Jarvis",
-                        "body": "Gus’s MacBook · macOS. Open Jarvis to approve or deny.",
+                        "body": "macOS device named “Gus-s MacBook”. Open Jarvis to approve or deny.",
                     },
                     "sound": "default",
                     "thread-id": "unlock",
@@ -607,17 +607,25 @@ mod tests {
         assert!(request.body().unwrap().as_bytes().unwrap().len() < 4096);
         let body = payload(&request);
         assert_eq!(body["aps"]["thread-id"], "pairing");
-        assert_eq!(body["aps"]["alert"]["title"], "New device wants to pair");
+        assert_eq!(
+            body["aps"]["alert"]["title"],
+            "New device wants to pair - verify in Jarvis"
+        );
         assert_eq!(body["link"], "jarvis://approvals/pairing");
         let text = body["aps"]["alert"]["body"].as_str().unwrap();
         assert!(
-            text.starts_with(&format!("{}… · iOS ", "𝕏".repeat(39))),
+            text.starts_with(&format!(
+                "IP 2001:db8::1 · iOS · named “{}…” ({}…)\nKey 0123 4567 89ab cdef… ",
+                "𝕏".repeat(39),
+                "m".repeat(31)
+            )),
             "{text}"
         );
-        assert!(
-            text.contains(" · IP 2001:db8::1\nKey 0123 4567 89ab cdef… "),
-            "{text}"
-        );
+        // The fixed follow-up for a coalesced request lives as long.
+        let again = build(&NotifyEvent::PairingAgain);
+        assert_eq!(again.headers()["apns-expiration"], "1300");
+        assert_eq!(again.headers()["apns-collapse-id"], "pairing");
+        assert_eq!(payload(&again)["aps"]["thread-id"], "pairing");
     }
 
     #[test]

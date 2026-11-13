@@ -9,8 +9,9 @@ until `JARVIS_NOTIFY_NTFY_URL` is set.
 | Event | Title | Message | Priority | Tap opens |
 |---|---|---|---|---|
 | Monthly LLM spend reaches 90% of the hard budget (`JARVIS_LLM_MONTHLY_BUDGET_EUR`), once per calendar month (UTC) | Jarvis | Budget reached 90% this month | default | `jarvis://health/usage` |
-| A new device pairing request was created with a verified account password | New device wants to pair | `Gus’s iPad · iOS iPad14,1 · IP 192.0.2.7`<br>`Key a1b2 c3d4 e5f6 0718… Compare the full fingerprint in Jarvis before approving.` | high | `jarvis://approvals/pairing` |
-| A signed-in device asks another device to approve its unlock | Device asks to unlock Jarvis | `Work laptop · Linux. Open Jarvis to approve or deny.` | high | `jarvis://approvals/unlock` |
+| A new device pairing request was created with a verified account password | New device wants to pair - verify in Jarvis | `IP 192.0.2.7 · iOS · named “Gus-s iPad” (iPad14,1)`<br>`Key a1b2 c3d4 e5f6 0718… Compare the full fingerprint in Jarvis before approving.` | high | `jarvis://approvals/pairing` |
+| Another pairing request within 60 s of the first (once per window) | New device wants to pair - verify in Jarvis | Another device also asks to pair — check every request in Jarvis. | high | `jarvis://approvals/pairing` |
+| A signed-in device asks another device to approve its unlock | Device asks to unlock Jarvis | `Linux device named “Work laptop”. Open Jarvis to approve or deny.` | high | `jarvis://approvals/unlock` |
 
 Approval pushes name the device behind the request: its name, platform and
 model, the IP address it connected from and the first 16 hex characters of
@@ -27,9 +28,13 @@ fingerprint in the app before approving.
 The device chooses its own name, so Core treats every device field as
 untrusted: control, bidi and other hidden characters are dropped, whitespace
 (line breaks included) collapses to one space, the name is capped at 40
-characters and platform and model at 32 (cut with `…`), and an empty value
-reads `Unknown device` or `unknown platform`. An IP or fingerprint that does
-not parse is left out. Titles are fixed ASCII, because ntfy takes the title
+characters and platform and model at 32 (cut with `…`). The trusted fields
+(IP, platform, key) come first; the name follows in fixed quotes after
+`named` and the model in parentheses. In name and model, separators (`·`)
+and quote characters become `-` and `/` and `:` are dropped, so they can
+neither pose as the IP or key field nor become a link in ntfy. An empty name
+reads `without a name`, an empty platform `Unknown`; an IP or fingerprint
+that does not parse is left out. Titles are fixed ASCII, because ntfy takes the title
 as an HTTP header; device text only goes into the request body (ntfy) or the
 JSON payload (APNs).
 
@@ -39,10 +44,11 @@ Behaviour in Core:
   and logs a count). One worker publishes with a 5 s timeout per request and
   up to 3 attempts with backoff; 4xx answers other than 429 are not retried.
 - The same event kind is sent at most once per 60 s; for unlock requests
-  that holds per requesting device. The first event in a window wins: a
-  second pairing request within 60 s sends no push of its own, and its
-  details appear only in the app, which lists every pending request. No
-  "and N more" count: that would mean holding the first push back.
+  that holds per requesting device. The first event in a window wins. The
+  first further pairing request in that window sends one extra push with
+  fixed text and no device details ("Another device also asks to pair");
+  on iOS it replaces the first (same collapse id). Anything after that sends
+  nothing until the window ends; the app lists every pending request.
 - The budget marker is kept in memory. At startup a month that is already at
   or above 90% counts as notified, so restarts do not repeat the push.
 - Logs name the event kind and HTTP status only, never the token or topic.
@@ -159,8 +165,8 @@ journalctl -u jarvis-core --since -5min | grep 'owner notifications'
 ```
 
 Expect `owner notifications enabled`. Test by starting a pairing request from
-a new device: the phone shows "New device wants to pair" with that device's
-name.
+a new device: the phone shows "New device wants to pair - verify in Jarvis"
+with that device's name.
 
 ## App push to the iOS app (APNs)
 
