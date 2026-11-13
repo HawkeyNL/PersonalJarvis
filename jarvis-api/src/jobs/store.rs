@@ -139,23 +139,45 @@ fn room(existing: &[Job], job: &Job) -> Result<()> {
     Ok(())
 }
 
-async fn insert(db: &Database, job: Job) -> Result<Job> {
-    // ponytail: a caller's timeout drops this future and the lock with it
-    // while a CREATE may still commit; it takes a database stalled past the
-    // timeout. Hold the lock outside the timeout if that ever matters.
-    let _creating = CREATE.lock().await;
-    // Every row, unlike `list`, so none can drop out of the count.
-    let existing = rows(
+/// Every row, unlike `list`, so none can drop out of a count.
+async fn all(db: &Database) -> Result<Vec<Job>> {
+    rows(
         db,
         &format!("SELECT {JOB_FIELDS} FROM scheduled_jobs"),
         json!({}),
     )
-    .await?;
-    room(&existing, &job)?;
-    run(
-        db,
-        &format!(
-            "CREATE scheduled_jobs SET id = $id, kind = $kind, cadence = $cadence, \
+    .await
+}
+
+/// Write `job` if there is room. The lock is the first gate; [`write`]
+/// holds the same rules in its transaction.
+async fn insert(db: &Database, job: Job) -> Result<Job> {
+    let _creating = CREATE.lock().await;
+    room(&all(db).await?, &job)?;
+    write(db, &job).await?;
+    get(db, &job.id).await?.ok_or(JobError::InvalidData)
+}
+
+/// Create the row in one transaction with the room rules, so they also hold
+/// when a caller's timeout released the lock while an earlier write was
+/// still in flight.
+async fn write(db: &Database, job: &Job) -> Result<()> {
+    let limit = match job.origin {
+        Origin::Owner => MAX_OWNER_JOBS,
+        Origin::Jarvis => MAX_JARVIS_JOBS,
+    };
+    let response = db
+        .query(format!(
+            "BEGIN TRANSACTION; \
+             IF $kind = 'dependency_review' AND array::len((SELECT VALUE id \
+               FROM scheduled_jobs WHERE kind = 'dependency_review')) > 0 \
+               {{ THROW 'job exists'; }}; \
+             IF $kind != 'dependency_review' AND array::len((SELECT VALUE id \
+               FROM scheduled_jobs WHERE kind != 'dependency_review' \
+               AND (origin ?? 'owner') = $origin \
+               AND (expires_at = NONE OR expires_at > time::now()))) >= $limit \
+               {{ THROW 'no room'; }}; \
+             CREATE scheduled_jobs SET id = $id, kind = $kind, cadence = $cadence, \
                weekday = $weekday, month_day = $month_day, every = $every, \
                start_date = $start_date, max_runs = $max_runs, at_minute = $at_minute, \
                enabled = $enabled, revision = 1, params = $params, {SET_LAST_SLOT}, \
@@ -163,9 +185,10 @@ async fn insert(db: &Database, job: Job) -> Result<Job> {
                conversation_id = $conversation_id, \
                expires_at = IF $expires_at = NONE THEN NONE ELSE <datetime>$expires_at END, \
                failure_count = 0, created_at = time::now(), updated_at = time::now() \
-             RETURN NONE"
-        ),
-        json!({
+               RETURN NONE; \
+             COMMIT TRANSACTION;"
+        ))
+        .bind(json!({
             "id": job.id,
             "kind": job.kind,
             "cadence": job.cadence,
@@ -182,10 +205,16 @@ async fn insert(db: &Database, job: Job) -> Result<Job> {
             "owner_id": job.owner_id,
             "conversation_id": job.conversation_id,
             "expires_at": slot(job.expires_at)?,
-        }),
-    )
-    .await?;
-    get(db, &job.id).await?.ok_or(JobError::InvalidData)
+            "limit": limit,
+        }))
+        .await?;
+    let Err(error) = response.check() else {
+        return Ok(());
+    };
+    // Explain the refusal from the current state; anything else is a
+    // database error.
+    room(&all(db).await?, job)?;
+    Err(error.into())
 }
 
 /// Change a job at revision `expected`; a change that changes nothing writes
@@ -912,6 +941,102 @@ mod tests {
         .await?;
         assert_eq!(prune(&db).await?, 2);
         assert!(list_runs(&db, &job.id, 10).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn the_write_itself_holds_the_room_rules(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = database().await?;
+        let now = OffsetDateTime::now_utc();
+        let fresh = || uuid::Uuid::now_v7().to_string();
+        // Past the lock and the first check, the transaction still refuses.
+        write(&db, &new_job().into_job(fresh(), now, None)?).await?;
+        assert!(matches!(
+            write(&db, &new_job().into_job(fresh(), now, None)?).await,
+            Err(JobError::Exists)
+        ));
+        for _ in 0..MAX_OWNER_JOBS {
+            write(&db, &prompt().into_job(fresh(), now, None)?).await?;
+        }
+        assert!(matches!(
+            write(&db, &prompt().into_job(fresh(), now, None)?).await,
+            Err(JobError::Full(_))
+        ));
+        for _ in 0..MAX_JARVIS_JOBS {
+            write(&db, &prompt().into_jarvis_job(fresh(), now, None)?).await?;
+        }
+        assert!(matches!(
+            write(&db, &prompt().into_jarvis_job(fresh(), now, None)?).await,
+            Err(JobError::Full(_))
+        ));
+        assert_eq!(all(&db).await?.len(), 1 + MAX_OWNER_JOBS + MAX_JARVIS_JOBS);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn a_job_from_before_0021_reads_with_defaults(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = database().await?;
+        // A row as 0019 wrote it: 0021 adds no value to it.
+        let id = uuid::Uuid::now_v7().to_string();
+        run(
+            &db,
+            "CREATE scheduled_jobs SET id = $id, kind = 'dependency_review', \
+               cadence = 'weekly', weekday = 1, at_minute = 420, enabled = true, \
+               revision = 1, params = {}, created_at = time::now(), \
+               updated_at = time::now()",
+            json!({"id": id}),
+        )
+        .await?;
+        let legacy = list(&db).await?.into_iter().next().ok_or("legacy job")?;
+        assert_eq!(
+            (
+                legacy.id.as_str(),
+                legacy.every,
+                legacy.run_count,
+                legacy.origin,
+                legacy.failure_count
+            ),
+            (id.as_str(), 1, 0, Origin::Owner, 0)
+        );
+        assert_eq!(
+            (
+                legacy.month_day,
+                legacy.start_date.as_deref(),
+                legacy.max_runs,
+                legacy.owner_id.as_deref(),
+                legacy.expires_at,
+                legacy.paused_reason
+            ),
+            (None, None, None, None, None, None)
+        );
+        // It still takes a run and an owner change.
+        start_run(
+            &db,
+            &legacy,
+            slot("2026-11-09T06:00:00Z"),
+            Trigger::Schedule,
+            RunStatus::Running,
+        )
+        .await?;
+        let daily = update(
+            &db,
+            &id,
+            1,
+            &JobPatch {
+                cadence: Some(Cadence::Daily),
+                ..JobPatch::default()
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(
+            (daily.revision, daily.run_count, daily.weekday),
+            (2, 0, None)
+        );
         Ok(())
     }
 

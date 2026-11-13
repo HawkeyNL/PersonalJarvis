@@ -314,6 +314,8 @@ pub struct NewJob {
 }
 
 /// Absent fields stay; `start_date` and `max_runs` are cleared with null.
+/// New `params` replace the stored ones but keep the stored `notify` and
+/// `threshold_percent` when they leave them out.
 /// Only a weekly job has a weekday and only a monthly one a month day: a job
 /// that becomes weekly keeps its weekday or gets Monday, one that becomes
 /// monthly keeps its day or gets the 1st. `every` falls back to 1 when the
@@ -701,7 +703,16 @@ impl Job {
         .checked(self.kind, today(now, tz).ok_or(JobError::InvalidData)?)?;
         let at_minute = patch.at_minute.unwrap_or(self.at_minute);
         validate_at_minute(at_minute)?;
-        let params = patch.params.clone().unwrap_or_else(|| self.params.clone());
+        // New params keep the stored `notify` and threshold they leave out.
+        let params = patch.params.clone().map_or_else(
+            || self.params.clone(),
+            |mut params| {
+                params.notify = params.notify.or(self.params.notify);
+                params.threshold_percent =
+                    params.threshold_percent.or(self.params.threshold_percent);
+                params
+            },
+        );
         let mut new = Job {
             cadence,
             weekday: schedule.weekday,
@@ -1771,6 +1782,32 @@ mod tests {
                 "{bad}"
             );
         }
+        // New params keep the stored notify and threshold they leave out.
+        let mut quiet = stored.clone();
+        quiet.params.notify = Some(false);
+        let (renamed, _) = quiet
+            .patched(
+                &patch(serde_json::json!({"params": {"title": "New", "instruction": "Search"}})),
+                now(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(renamed.params.notify, Some(false));
+        let (loud, _) = quiet
+            .patched(
+                &patch(serde_json::json!({"params": {"title": "N", "instruction": "S", "notify": true}})),
+                now(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(loud.params.notify, Some(true));
+        let disk =
+            new_job(serde_json::json!({"kind": "disk_check", "params": {"threshold_percent": 90}}))
+                .unwrap();
+        let (kept, _) = disk
+            .patched(&patch(serde_json::json!({"params": {}})), now(), None)
+            .unwrap();
+        assert_eq!(kept.params.threshold_percent, Some(90));
         // Enabling clears a pause; a disabled one-time job in the past may
         // be edited but not enabled again.
         let mut paused = stored.clone();
