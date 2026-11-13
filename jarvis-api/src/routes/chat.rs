@@ -494,16 +494,30 @@ pub(super) async fn execute_chat(
             let honoured = realtime_run.is_some()
                 && user_already_published
                 && requested_mode != llm::RoutingMode::Research;
-            let job_proposals = if honoured {
-                crate::job_markers::proposals(&state, &markers.jobs).await
+            let own_lines: &[String] = if honoured && !image_turn {
+                &markers.job_self
             } else {
-                Vec::new()
+                &[]
             };
-            let own_job = if honoured && !image_turn {
-                crate::job_markers::create_own(&state, authed.user.id, &markers.job_self).await
+            // One holdings read for the turn's privacy gates.
+            let held = if honoured && (!markers.jobs.is_empty() || !own_lines.is_empty()) {
+                crate::auto_research::held_symbols(&state).await
             } else {
                 None
             };
+            let job_proposals = if honoured {
+                crate::job_markers::proposals(&state, &markers.jobs, held.as_deref()).await
+            } else {
+                Vec::new()
+            };
+            let own_job = crate::job_markers::create_own(
+                &state,
+                authed.user.id,
+                authed.device.id,
+                own_lines,
+                held.as_deref(),
+            )
+            .await;
             if markers.any_job && reply.text.trim().is_empty() {
                 reply.text = if requested_mode == llm::RoutingMode::Research {
                     RESEARCH_EMPTY
@@ -562,25 +576,25 @@ pub(super) async fn execute_chat(
                 Some(stored_model(requested_mode, &reply).as_str()),
                 &shown,
             )
-            .await
-            .map_err(|_| internal_error())?;
+            .await;
+            // The job exists and was pushed: the note follows even when the
+            // answer could not be stored, so the owner is always told.
             if let Some(job) = &own_job {
                 let note = crate::job_markers::note(job, state.jobs.time_zone());
-                let posted = tokio::time::timeout(
-                    crate::jobs::DB_TIMEOUT,
-                    append_to_live_conversation(
-                        &state.db,
-                        conv_id,
-                        authed.user.id,
-                        &note,
-                        JOB_NOTE_MODEL,
-                    ),
+                let posted = post_job_message(
+                    &state,
+                    authed.user.id,
+                    Some(conv_id),
+                    &conv_title,
+                    &note,
+                    JOB_NOTE_MODEL,
                 )
                 .await;
-                if !matches!(posted, Ok(Ok(Some(_)))) {
+                if posted.is_err() {
                     tracing::warn!("note on a job of Jarvis's own not stored");
                 }
             }
+            let message = message.map_err(|_| internal_error())?;
             if let Some(run) = &realtime_run {
                 // Only a runs-API run (its user message was persisted first)
                 // may search by itself; the legacy endpoint never does. A

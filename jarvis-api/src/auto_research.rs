@@ -23,20 +23,10 @@ const HOUR: Duration = Duration::from_secs(60 * 60);
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const HOLDINGS_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The final line a chat reply carries to ask for an automatic web search.
+/// The final line a chat reply carries to ask for an automatic web search;
+/// `job_markers::take` takes it off. A marker anywhere else is ordinary text
+/// and asks for nothing.
 pub(crate) const WEB_SEARCH_MARKER: &str = "[[web_search]]";
-
-/// Removes a last line that is exactly [`WEB_SEARCH_MARKER`] (surrounding
-/// whitespace allowed) and the whitespace before it; true when it did. A
-/// marker anywhere else is ordinary text and asks for nothing.
-pub(crate) fn take_marker(text: &mut String) -> bool {
-    let (keep, line) = last_line(text);
-    if line != WEB_SEARCH_MARKER {
-        return false;
-    }
-    text.truncate(keep);
-    true
-}
 
 /// The end of the text before the last non-blank line, and that line trimmed.
 pub(crate) fn last_line(text: &str) -> (usize, &str) {
@@ -46,9 +36,10 @@ pub(crate) fn last_line(text: &str) -> (usize, &str) {
 }
 
 /// Most text [`MarkerHold`] holds back: room for every marker an answer may
-/// carry at its longest (3 jobs, one of Jarvis's own, the web search). Trailing
-/// `[[` lines beyond it are sent and only the completed message drops them.
-const MAX_HOLD_BYTES: usize = 5 * crate::routes::jobs::BODY_LIMIT;
+/// carry at its longest (3 jobs, one of Jarvis's own, the web search).
+/// `job_markers::take` takes no marker beyond it, so what it takes off was
+/// never streamed.
+pub(crate) const MAX_HOLD_BYTES: usize = 5 * crate::routes::jobs::BODY_LIMIT;
 
 /// Streams reply deltas without trailing markers (this one and the job
 /// markers): trailing whitespace and the trailing lines that start with `[[`,
@@ -269,7 +260,7 @@ mod tests {
     fn only_a_trailing_marker_line_is_taken() {
         let take = |text: &str| {
             let mut text = text.to_owned();
-            let marked = take_marker(&mut text);
+            let marked = crate::job_markers::take(&mut text).web_search;
             (marked, text)
         };
         assert_eq!(

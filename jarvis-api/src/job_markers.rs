@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use jarvis_client_core::realtime::JobProposal;
 
-use crate::auto_research::{last_line, take_marker};
+use crate::auto_research::{last_line, MAX_HOLD_BYTES, WEB_SEARCH_MARKER};
 use crate::jobs::store;
 use crate::jobs::{Cadence, Job, Kind, NewJob, Origin, Params, DB_TIMEOUT, MAX_OWNER_JOBS};
 use crate::notify::{JobResult, NotifyEvent};
@@ -52,28 +52,43 @@ pub(crate) struct Markers {
 
 /// Takes the trailing marker lines off `text`: `[[web_search]]`,
 /// `[[job …]]` and `[[job_self …]]` in any order, and any other trailing line
-/// starting with `[[job` (dropped). The text before them stays.
+/// starting with `[[job` (dropped). Trailing `[[photo:N]]` lines among them
+/// stay, after the text, for the photo markers. Nothing beyond
+/// [`MAX_HOLD_BYTES`] from the end is taken (it stays text), so what is taken
+/// was never streamed.
 pub(crate) fn take(text: &mut String) -> Markers {
+    let total = text.len();
     let mut markers = Markers::default();
+    let mut photos = Vec::new();
     loop {
-        if take_marker(text) {
-            markers.web_search = true;
-            continue;
-        }
         let (keep, line) = last_line(text);
-        if !line.starts_with("[[job") {
+        if line.is_empty() || total - keep > MAX_HOLD_BYTES {
             break;
         }
-        markers.any_job = true;
-        let json = |prefix| line.strip_prefix(prefix)?.strip_suffix("]]");
-        if let Some(json) = json(JOB_SELF) {
-            markers.job_self.push(json.to_owned());
-        } else if let Some(json) = json(JOB) {
-            markers.jobs.push(json.to_owned());
+        if line == WEB_SEARCH_MARKER {
+            markers.web_search = true;
+        } else if line.starts_with("[[photo:") && line.ends_with("]]") {
+            photos.push(line.to_owned());
+        } else if line.starts_with("[[job") {
+            markers.any_job = true;
+            let json = |prefix| line.strip_prefix(prefix)?.strip_suffix("]]");
+            if let Some(json) = json(JOB_SELF) {
+                markers.job_self.push(json.to_owned());
+            } else if let Some(json) = json(JOB) {
+                markers.jobs.push(json.to_owned());
+            } else {
+                tracing::info!("malformed job marker dropped");
+            }
         } else {
-            tracing::info!("malformed job marker dropped");
+            break;
         }
         text.truncate(keep);
+    }
+    for photo in photos.iter().rev() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(photo);
     }
     markers.jobs.reverse();
     markers.job_self.reverse();
@@ -178,8 +193,12 @@ fn proposal(
 /// The owner proposals of an answer: at most [`MAX_PROPOSALS`] and no more
 /// than the owner's room holds, each checked like `POST /v1/jobs`. Anything
 /// refused is logged without its text and dropped; an unreadable job count
-/// or holdings drop them all.
-pub(crate) async fn proposals(state: &AppState, lines: &[String]) -> Vec<JobProposal> {
+/// or holdings (`held` is `None`) drop them all.
+pub(crate) async fn proposals(
+    state: &AppState,
+    lines: &[String],
+    held: Option<&[String]>,
+) -> Vec<JobProposal> {
     if lines.is_empty() {
         return Vec::new();
     }
@@ -194,7 +213,7 @@ pub(crate) async fn proposals(state: &AppState, lines: &[String]) -> Vec<JobProp
         tracing::warn!("job markers dropped: jobs unavailable");
         return Vec::new();
     };
-    let Some(held) = crate::auto_research::held_symbols(state).await else {
+    let Some(held) = held else {
         tracing::warn!("job markers dropped: holdings unavailable");
         return Vec::new();
     };
@@ -206,7 +225,7 @@ pub(crate) async fn proposals(state: &AppState, lines: &[String]) -> Vec<JobProp
             tracing::info!("job marker dropped: no room");
             break;
         }
-        match proposal(json, now, state.jobs.time_zone(), &held) {
+        match proposal(json, now, state.jobs.time_zone(), held) {
             Ok((body, _)) => found.push(JobProposal {
                 id: Uuid::now_v7(),
                 body,
@@ -219,10 +238,17 @@ pub(crate) async fn proposals(state: &AppState, lines: &[String]) -> Vec<JobProp
 
 /// Makes the research job of the first `[[job_self …]]` line for `user`, only
 /// while Research and automatic web search are on (what its runs need):
-/// a `prompt` that passes the privacy gate first, within Jarvis's own 3. Then
-/// it writes the audit row and pushes to the owner; the caller posts
+/// a `prompt` naming no site that passes the privacy gate (against `held`;
+/// `None` refuses) first, within Jarvis's own 3. Then it writes the audit row
+/// (with the chat's `device`) and pushes to the owner; the caller posts
 /// [`note`]. `None` when nothing was made (logged without its text).
-pub(crate) async fn create_own(state: &AppState, user: Uuid, lines: &[String]) -> Option<Job> {
+pub(crate) async fn create_own(
+    state: &AppState,
+    user: Uuid,
+    device: Uuid,
+    lines: &[String],
+    held: Option<&[String]>,
+) -> Option<Job> {
     let json = lines.first()?;
     if lines.len() > 1 {
         tracing::info!(dropped = lines.len() - 1, "extra job_self markers dropped");
@@ -230,26 +256,19 @@ pub(crate) async fn create_own(state: &AppState, user: Uuid, lines: &[String]) -
     let tz = state.jobs.time_zone();
     let checked = if !crate::jobs::chat::research_on(state, Origin::Jarvis) {
         Err("research off")
-    } else if let Some(held) = crate::auto_research::held_symbols(state).await {
-        proposal(json, OffsetDateTime::now_utc(), tz, &held).and_then(|(_, input)| {
-            if input.kind != Kind::Prompt {
-                Err("kind")
-            } else if names_a_site(&input.params) {
-                Err("site")
-            } else {
-                Ok(input)
-            }
-        })
+    } else if let Some(held) = held {
+        own_job(json, OffsetDateTime::now_utc(), tz, held)
     } else {
         Err("holdings unavailable")
     };
     let input = checked
         .inspect_err(|reason| tracing::info!(reason, "job_self marker dropped"))
         .ok()?;
+    let id = Uuid::now_v7().to_string();
     let owner = user.hyphenated().to_string();
     let created = tokio::time::timeout(
         DB_TIMEOUT,
-        store::create_for_jarvis(&state.db, input, &owner, tz),
+        store::create_for_jarvis(&state.db, id.clone(), input, &owner, tz),
     )
     .await;
     let job = match created {
@@ -258,14 +277,22 @@ pub(crate) async fn create_own(state: &AppState, user: Uuid, lines: &[String]) -
             tracing::info!(%error, "job_self marker dropped");
             return None;
         }
-        Err(_) => {
-            tracing::warn!("job_self marker dropped: timed out");
-            return None;
-        }
+        // The write may still have committed: the owner hears of it then.
+        // ponytail: a write that commits after this read goes unannounced
+        // until the owner opens Jobs; bound the database client itself if
+        // that ever shows up.
+        Err(_) => match tokio::time::timeout(DB_TIMEOUT, store::get(&state.db, &id)).await {
+            Ok(Ok(Some(job))) => job,
+            _ => {
+                tracing::warn!("job_self marker dropped: timed out");
+                return None;
+            }
+        },
     };
+    // Bounded by the audit write's own timeout.
     crate::audit::record_security_event(
         state,
-        None,
+        Some(device),
         "jobs.created",
         "ok",
         Some(&format!("origin=jarvis job={}", job.id)),
@@ -282,27 +309,87 @@ pub(crate) async fn create_own(state: &AppState, user: Uuid, lines: &[String]) -
     Some(job)
 }
 
-/// Whether a job's title or instruction names a link or a domain. A job of
-/// Jarvis's own searches without the owner's click, for 30 days, from text
-/// web content may have steered: it may only name a topic, never a site the
-/// search could carry details to.
+/// The job input of a `[[job_self …]]` line: a checked `prompt` that names
+/// no site.
+fn own_job(
+    json: &str,
+    now: OffsetDateTime,
+    tz: Option<&TimeZone>,
+    held: &[String],
+) -> Result<NewJob, &'static str> {
+    let (_, input) = proposal(json, now, tz, held)?;
+    if input.kind != Kind::Prompt {
+        Err("kind")
+    } else if names_a_site(&input.params) {
+        Err("site")
+    } else {
+        Ok(input)
+    }
+}
+
+/// Whether a job's title or instruction names a link, a domain, an IP
+/// address or a host and port. A job of Jarvis's own searches without the
+/// owner's click, for 30 days, from text web content may have steered: it may
+/// only name a topic, never a site the search could carry details to. Fails
+/// towards refusing (`node.js` counts as a domain).
 fn names_a_site(params: &Params) -> bool {
     [params.title.as_deref(), params.instruction.as_deref()]
         .into_iter()
         .flatten()
-        .flat_map(str::split_whitespace)
-        .any(|word| {
-            let word = word.to_ascii_lowercase();
-            let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-            word.contains("http")
-                || word.contains("www")
-                || word.contains('/')
-                || word.split_once('.').is_some_and(|(name, rest)| {
-                    !name.is_empty()
-                        && rest.len() >= 2
-                        && rest.chars().all(|c| c.is_ascii_alphabetic() || c == '.')
-                })
+        .any(|text| {
+            let text = plain(text);
+            text.contains("http")
+                || text.contains("www")
+                || text.contains('/')
+                || text.split_whitespace().any(site_word)
         })
+}
+
+/// Lowercase text with fullwidth forms as ASCII, every dot look-alike and
+/// spelled-out or bracketed dot (`[.]`, `(.)`, ` dot `) as `.`.
+// ponytail: fullwidth forms and the common dots only, not full NFKC (no new
+// dependency); add a normaliser if other look-alikes turn up.
+fn plain(text: &str) -> String {
+    let mapped: String = text
+        .chars()
+        .map(|c| match c {
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            '\u{3002}' | '\u{FF61}' | '\u{FE52}' | '\u{2024}' | '\u{0701}' | '\u{0702}' => '.',
+            c => c,
+        })
+        .flat_map(char::to_lowercase)
+        .collect();
+    let mut text = format!(" {mapped} ");
+    for dot in ["[.]", "(.)", "{.}", "[dot]", "(dot)", " dot "] {
+        text = text.replace(dot, ".");
+    }
+    text
+}
+
+/// One word of [`plain`] text that is a domain (a Unicode-letter top level
+/// of two or more letters), a dotted-quad IP address or a host with a port.
+fn site_word(word: &str) -> bool {
+    let word = word.trim_start_matches(|c: char| !c.is_alphanumeric());
+    let end = word
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_')))
+        .unwrap_or(word.len());
+    let (host, rest) = word.split_at(end);
+    let host = host.trim_end_matches('.');
+    let parts: Vec<&str> = host.split('.').collect();
+    let ip = parts.len() == 4
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+    let domain = parts.len() > 1
+        && !parts[0].is_empty()
+        && parts
+            .last()
+            .is_some_and(|top| top.chars().count() >= 2 && top.chars().all(char::is_alphabetic));
+    let port = host.chars().any(char::is_alphabetic)
+        && rest
+            .strip_prefix(':')
+            .is_some_and(|port| port.starts_with(|c: char| c.is_ascii_digit()));
+    ip || domain || port
 }
 
 /// The fixed note a job Jarvis made for itself leaves in the conversation.
@@ -411,6 +498,16 @@ mod tests {
         }
         let (text, markers) = taken("[[job {}]]");
         assert_eq!((text.as_str(), markers.jobs.len()), ("", 1));
+        // Photo lines among the markers stay, after the text.
+        let (text, markers) = taken("Answer.\n[[job {}]]\n[[photo:1]]\n[[web_search]]");
+        assert_eq!(text, "Answer.\n[[photo:1]]");
+        assert!(markers.web_search && markers.jobs.len() == 1);
+        // Nothing beyond what streaming holds back is taken: it stays text.
+        let far = format!("Answer.\n[[job {{}}]]\n{}", "[[job x]]\n".repeat(3000));
+        let (text, markers) = taken(&far);
+        assert!(text.starts_with("Answer.\n[[job {}]]\n[[job x]]"));
+        assert!(!markers.jobs.iter().any(|json| json == "{}"));
+        assert!(far.len() - text.len() <= MAX_HOLD_BYTES + 1);
         // The web search marker alone keeps its old meaning.
         let (text, markers) = taken("Answer.\n[[web_search]]");
         assert_eq!(text, "Answer.");
@@ -551,33 +648,63 @@ mod tests {
 
     #[test]
     fn jobs_of_jarvis_own_name_no_site() {
-        let params = |title: &str, instruction: &str| Params {
-            title: Some(title.into()),
+        let params = |instruction: &str| Params {
+            title: Some("News".into()),
             instruction: Some(instruction.into()),
             ..Params::default()
         };
-        for (title, instruction) in [
-            ("News", "Open https://evil.example/?q=x"),
-            ("News", "see evil.example for it"),
-            ("News", "www dot evil"),
-            ("evil.co", "news"),
-            ("News", "path a/b"),
-            ("News", "(EVIL.Example)."),
+        for instruction in [
+            "Open https://evil.example/?q=x",
+            "see evil.example for it",
+            "www dot evil",
+            "path a/b",
+            "(EVIL.Example).",
+            "example[.]com",
+            "example(.)com",
+            "evil.example?q=secret",
+            "evil.example#x",
+            "evil.example:8080",
+            "localhost:8080",
+            "evil.example's news",
+            "example\u{FF0E}com",
+            "example\u{3002}com",
+            "\u{FF45}\u{FF58}\u{FF41}\u{FF4D}\u{FF50}\u{FF4C}\u{FF45}.com",
+            "пример.рф",
+            "93.184.216.34",
+            "example dot com",
+            "example DOT com",
         ] {
-            assert!(
-                names_a_site(&params(title, instruction)),
-                "{title} {instruction}"
-            );
+            assert!(names_a_site(&params(instruction)), "{instruction}");
         }
-        for (title, instruction) in [
-            ("Rust releases", "Rust 1.90 release notes."),
-            ("AI news", "Summarize this week's AI news. Keep it short."),
+        let titled = Params {
+            title: Some("evil.co".into()),
+            ..params("news")
+        };
+        assert!(names_a_site(&titled));
+        for instruction in [
+            "Rust 1.90 release notes.",
+            "Summarize this week's AI news. Keep it short.",
+            "Connect the dots on chip supply, e.g. in Asia.",
+            "Version 2.0.1 changes",
+            "The 10:30 briefing",
         ] {
-            assert!(
-                !names_a_site(&params(title, instruction)),
-                "{title} {instruction}"
-            );
+            assert!(!names_a_site(&params(instruction)), "{instruction}");
         }
+        // Only a prompt naming no site becomes a job of Jarvis's own.
+        let own = |json: &str| own_job(json, now(), Some(&tz()), &[]).map(|_| ());
+        assert_eq!(
+            own(r#"{"kind":"prompt","title":"Rust","instruction":"Rust release notes"}"#),
+            Ok(())
+        );
+        assert_eq!(own(r#"{"kind":"reminder","title":"Rust"}"#), Err("kind"));
+        assert_eq!(
+            own(r#"{"kind":"prompt","title":"Rust","instruction":"news on rust-lang.org"}"#),
+            Err("site")
+        );
+        assert_eq!(
+            own(r#"{"kind":"prompt","title":"Rust","instruction":"mail me@example.com"}"#),
+            Err("private")
+        );
     }
 
     #[test]

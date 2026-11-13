@@ -96,19 +96,17 @@ pub async fn create(db: &Database, input: NewJob, tz: Option<&TimeZone>) -> Resu
 
 /// Create a `prompt` job Jarvis makes for itself, for the owner `owner_id`:
 /// at most [`MAX_JARVIS_JOBS`] that have not expired, apart from the
-/// owner's, each expiring after [`super::JARVIS_JOB_DAYS`].
+/// owner's, each expiring after [`super::JARVIS_JOB_DAYS`]. The caller
+/// picks the `id`, so it can look the job up when its call timed out.
 pub async fn create_for_jarvis(
     db: &Database,
+    id: String,
     mut input: NewJob,
     owner_id: &str,
     tz: Option<&TimeZone>,
 ) -> Result<Job> {
     input.owner_id = Some(owner_id.to_owned());
-    let job = input.into_jarvis_job(
-        uuid::Uuid::now_v7().to_string(),
-        OffsetDateTime::now_utc(),
-        tz,
-    )?;
+    let job = input.into_jarvis_job(id, OffsetDateTime::now_utc(), tz)?;
     insert(db, job).await
 }
 
@@ -1187,18 +1185,39 @@ mod tests {
         ));
         // Jarvis has its own room, for prompts only.
         for _ in 0..MAX_JARVIS_JOBS {
-            let own = create_for_jarvis(&db, prompt(), &owner, None).await?;
+            let own = create_for_jarvis(
+                &db,
+                uuid::Uuid::now_v7().to_string(),
+                prompt(),
+                &owner,
+                None,
+            )
+            .await?;
             assert_eq!(own.origin, Origin::Jarvis);
             assert!(own.expires_at.is_some_and(|at| at > own.created_at));
         }
         assert!(matches!(
-            create_for_jarvis(&db, prompt(), &owner, None).await,
+            create_for_jarvis(
+                &db,
+                uuid::Uuid::now_v7().to_string(),
+                prompt(),
+                &owner,
+                None
+            )
+            .await,
             Err(JobError::Full(_))
         ));
         let reminder =
             serde_json::from_value(json!({"kind": "reminder", "params": {"title": "Call"}}))?;
         assert!(matches!(
-            create_for_jarvis(&db, reminder, &owner, None).await,
+            create_for_jarvis(
+                &db,
+                uuid::Uuid::now_v7().to_string(),
+                reminder,
+                &owner,
+                None
+            )
+            .await,
             Err(JobError::Invalid(_))
         ));
 
@@ -1353,8 +1372,22 @@ mod tests {
         assert_eq!(pointed.revision, resumed.revision);
 
         // An expired job of Jarvis's goes with its runs; others stay.
-        let own = create_for_jarvis(&db, prompt(), &owner, None).await?;
-        let expired = create_for_jarvis(&db, prompt(), &owner, None).await?;
+        let own = create_for_jarvis(
+            &db,
+            uuid::Uuid::now_v7().to_string(),
+            prompt(),
+            &owner,
+            None,
+        )
+        .await?;
+        let expired = create_for_jarvis(
+            &db,
+            uuid::Uuid::now_v7().to_string(),
+            prompt(),
+            &owner,
+            None,
+        )
+        .await?;
         start_run(
             &db,
             &expired,

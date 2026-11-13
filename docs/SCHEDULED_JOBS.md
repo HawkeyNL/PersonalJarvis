@@ -26,8 +26,9 @@ Each create, change and delete through the API writes a security audit row
 (`jobs.created`, `jobs.updated`, `jobs.deleted`, `jobs.run_requested`) with
 the device and the job id, never the job's text. Core writes rows without a
 device when it pauses a job (`jobs.paused`) or deletes an expired one
-(`jobs.expired_deleted`), and a `jobs.created` row without a device, with
-`origin=jarvis job=<id>`, when Jarvis makes a job for itself.
+(`jobs.expired_deleted`). When Jarvis makes a job for itself, the
+`jobs.created` row names the device of the chat and `origin=jarvis
+job=<id>`.
 
 ## API
 
@@ -121,7 +122,11 @@ An ordinary chat answer through the runs API may end with marker lines,
 which Core takes off every answer before it is stored or streamed, valid or
 not (an invalid one is dropped and logged without its text, never shown).
 Only trailing lines count, after the last line of ordinary text, in any
-order with `[[web_search]]`; a marker anywhere else is ordinary text.
+order with `[[web_search]]` (trailing `[[photo:N]]` lines among them stay,
+after the text); a marker anywhere else is ordinary text, and so is a
+marker more than 20 KiB from the end (what streaming holds back), so a
+marker Core takes off was never streamed. Any other trailing line starting
+with `[[job` (such as `[[jobs]]`) is dropped too.
 Markers are honoured only on such answers: never on the legacy
 `POST /v1/assistant/chat`, an explicit Research answer, an automatic web
 search's answer or a job run's output, which only lose them. The JSON is
@@ -153,12 +158,16 @@ params flat (`title`, `instruction`, `text`, `threshold_percent`, `notify`),
 - `[[job_self …]]`: a research job Jarvis makes for itself, without
   confirmation. Only the first such line counts, only a `prompt`, only while
   Research and automatic web search are on (what its runs need) and never on
-  a turn with photos. Its title and instruction may not name a link or a
-  domain (it searches without the owner's click, from text web content may
-  have steered), and the privacy gate runs before it is stored, failing
-  closed; it counts towards Jarvis's own 3 and expires after 30 days. Core
-  then writes the audit row, pushes to the owner (see `NOTIFICATIONS.md`)
-  and posts a fixed note after the answer, under the model `job`: `I set up
+  a turn with photos (in this run or the recent turns the model sees). Its
+  title and instruction may not name a link, a domain (also written with
+  `[.]`, `(.)`, ` dot ` or fullwidth dots), an IP address or a host and port
+  (it searches without the owner's click, from text web content may have
+  steered), and the privacy gate runs before it is stored, failing closed;
+  it counts towards Jarvis's own 3 and expires after 30 days. When the write
+  times out, Core looks the job up and goes on if it was made. Core then
+  writes the audit row, pushes to the owner (see `NOTIFICATIONS.md`) and
+  posts a fixed note after the answer (also when the answer itself could
+  not be stored), under the model `job`: `I set up
   a research job for myself: Rust releases — weekly on Monday at 08:00. It
   expires on 13 December 2026; you can pause or delete it in Jobs.` The
   apps see the job in `GET /v1/jobs`.

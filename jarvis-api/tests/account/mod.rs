@@ -158,7 +158,7 @@ async fn first_activation_requires_local_network_code_and_password_atomically(
 
 /// Loopback ntfy stand-in: a notifier publishing to it, and every request
 /// it receives (read up to its content-length).
-async fn ntfy_mock() -> Result<
+pub(crate) async fn ntfy_mock() -> Result<
     (
         jarvis_api::notify::Notifier,
         tokio::sync::mpsc::UnboundedReceiver<String>,

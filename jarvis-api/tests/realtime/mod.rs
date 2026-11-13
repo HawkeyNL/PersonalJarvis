@@ -1020,6 +1020,8 @@ async fn jobs_from_chat_markers_only_on_ordinary_runs_api_answers(
         )?),
         unavailable_reason: None,
     }));
+    let (notifier, mut pushes) = crate::account::ntfy_mock().await?;
+    fixture.notifier = notifier;
     let hub = fixture.realtime.clone();
     let mut display = hub.subscribe(owner.id, device).unwrap();
     let app = build_router(fixture);
@@ -1034,16 +1036,21 @@ async fn jobs_from_chat_markers_only_on_ordinary_runs_api_answers(
     assert_eq!(status, StatusCode::OK, "{run}");
     let conversation: Uuid = serde_json::from_value(run["conversation_id"].clone())?;
     let mut automatic = None;
+    let mut announced = false;
     loop {
         let envelope = tokio::time::timeout(Duration::from_secs(5), display.receiver.recv())
             .await?
             .unwrap();
         match &envelope.event {
+            // The note is announced as soon as it is stored, before the
+            // answer completes.
+            Event::ConversationUpdated(updated) if updated.id == conversation => announced = true,
             Event::AssistantCompleted {
                 message,
                 job_proposals,
                 ..
             } if automatic.is_none() => {
+                assert!(announced, "the note is announced");
                 // Every marker is gone; the valid owner proposal is offered,
                 // the invalid one dropped, and the web search still follows.
                 assert_eq!(message.content, "Plain answer.");
@@ -1105,6 +1112,16 @@ async fn jobs_from_chat_markers_only_on_ordinary_runs_api_answers(
         .await?
         .take(0)?;
     assert_eq!(audited, vec![format!("origin=jarvis job={}", own.id)]);
+    let device_audited: Vec<Option<String>> = db
+        .query("SELECT VALUE device_id FROM security_audit WHERE event = 'jobs.created'")
+        .await?
+        .take(0)?;
+    assert_eq!(device_audited, vec![Some(device.to_string())]);
+    let push = tokio::time::timeout(Duration::from_secs(5), pushes.recv())
+        .await?
+        .unwrap();
+    assert!(push.contains("Jarvis added a research job"), "{push}");
+    assert!(push.contains("Rust releases"), "{push}");
 
     // The legacy endpoint and an explicit Research answer only lose the markers.
     let (status, legacy) = post(
@@ -1142,5 +1159,123 @@ async fn jobs_from_chat_markers_only_on_ordinary_runs_api_answers(
         }
     }
     assert_eq!(jarvis_api::jobs::store::list(&db).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* server"]
+async fn jobs_of_jarvis_own_are_refused_without_auto_search_at_the_limit_and_with_photos(
+) -> Result<(), Box<dyn std::error::Error>> {
+    for scenario in ["research_on", "limit", "photo", "photo_in_history"] {
+        let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+        db.signin(Root {
+            username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+            password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+        })
+        .await?;
+        db.use_ns(format!("realtime_{}", Uuid::now_v7().simple()))
+            .use_db("fixture")
+            .await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+        let owner = jarvis_identity::first_user_or_create(&db, "fixture").await?;
+        let (device, token) = device_token(&db, owner.id).await;
+        let root = tempfile::tempdir()?;
+        let mut fixture = state(db.clone(), None).await;
+        fixture.llm = Arc::new(JobFake);
+        fixture.photos = Arc::new(jarvis_api::photos::PhotoStore::open(&root.path().join("p")));
+        let switch = if scenario == "research_on" {
+            "on"
+        } else {
+            "auto"
+        };
+        fixture.model_routing =
+            Arc::new(jarvis_llm::LiveRouting::new(jarvis_llm::RoutingSnapshot {
+                routing: Some(jarvis_llm::ModelRouting::parse(
+                    format!(r#"{{"version":1,"research_web_search":"{switch}"}}"#).as_bytes(),
+                )?),
+                unavailable_reason: None,
+            }));
+        let (notifier, mut pushes) = crate::account::ntfy_mock().await?;
+        fixture.notifier = notifier;
+        let hub = fixture.realtime.clone();
+        let mut display = hub.subscribe(owner.id, device).unwrap();
+        let app = build_router(fixture);
+        let owner_id = owner.id.hyphenated().to_string();
+        let mut before = 0;
+        if scenario == "limit" {
+            for _ in 0..3 {
+                let input = serde_json::from_value(json!({"kind": "prompt",
+                    "params": {"title": "Own", "instruction": "Rust release notes"}}))?;
+                jarvis_api::jobs::store::create_for_jarvis(
+                    &db,
+                    Uuid::now_v7().to_string(),
+                    input,
+                    &owner_id,
+                    None,
+                )
+                .await?;
+            }
+            before = 3;
+        }
+        let mut conversation = None;
+        let turns = if scenario == "photo_in_history" { 2 } else { 1 };
+        for turn in 0..turns {
+            let attachments = if scenario.starts_with("photo") && turn == 0 {
+                vec![crate::photos::upload(&app, &token).await]
+            } else {
+                Vec::new()
+            };
+            let mut request = json!({"request_id": Uuid::now_v7(), "attachments": attachments,
+                "messages": [{"role": "user", "content": "nieuws over Rust"}]});
+            if let Some(id) = conversation {
+                request["conversation_id"] = json!(id);
+            }
+            // The previous run may still hold the conversation briefly.
+            let (mut status, mut run) = (StatusCode::CONFLICT, Value::Null);
+            for _ in 0..100 {
+                (status, run) = post(&app, &token, "/v1/assistant/runs", request.clone()).await;
+                if status != StatusCode::CONFLICT {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(status, StatusCode::OK, "{scenario}: {run}");
+            let id: Uuid = serde_json::from_value(run["conversation_id"].clone())?;
+            conversation = Some(id);
+            loop {
+                let envelope =
+                    tokio::time::timeout(Duration::from_secs(10), display.receiver.recv())
+                        .await?
+                        .unwrap();
+                match &envelope.event {
+                    Event::AssistantCompleted {
+                        message,
+                        job_proposals,
+                        ..
+                    } if message.content == "Plain answer." => {
+                        // Owner proposals still go out.
+                        assert_eq!(job_proposals.len(), 1, "{scenario}");
+                        break;
+                    }
+                    Event::AssistantFailed { .. } => panic!("{scenario}: {envelope:?}"),
+                    _ => {}
+                }
+            }
+        }
+        let jobs = jarvis_api::jobs::store::list(&db).await?;
+        assert_eq!(jobs.len(), before, "{scenario}: {jobs:?}");
+        let notes: Vec<String> = db
+            .query("SELECT VALUE content FROM chat_messages WHERE model = 'job'")
+            .await?
+            .take(0)?;
+        assert!(notes.is_empty(), "{scenario}: {notes:?}");
+        let audited: Vec<String> = db
+            .query("SELECT VALUE event FROM security_audit WHERE event = 'jobs.created'")
+            .await?
+            .take(0)?;
+        assert!(audited.is_empty(), "{scenario}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(pushes.try_recv().is_err(), "{scenario}: no push");
+    }
     Ok(())
 }
