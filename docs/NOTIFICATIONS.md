@@ -14,7 +14,7 @@ until `JARVIS_NOTIFY_NTFY_URL` is set.
 | A signed-in device asks another device to approve its unlock | Device asks to unlock Jarvis | `Linux device named “Work laptop”. Open Jarvis to approve or deny.` | high | `jarvis://approvals/unlock` |
 | A scheduled research job (`prompt`) has a result, unless the job turned `notify` off | Jarvis | A scheduled job has a result — open Jarvis | default | `jarvis://jobs` |
 | A scheduled reminder is due | Jarvis reminder | The reminder's title, cleaned like a device name and capped at 60 characters | default | `jarvis://jobs` |
-| A scheduled disk check finds a disk at or above its threshold | Jarvis | `Disk data at 91%` | default | `jarvis://jobs` |
+| A scheduled disk check finds disks at or above its threshold | Jarvis | `Disk data at 91%` (every full disk, comma-separated) | default | `jarvis://jobs` |
 
 Scheduled job pushes (docs/SCHEDULED_JOBS.md) go to ntfy and to every app
 push target of the job's owner. A research result carries no content; a
@@ -22,7 +22,10 @@ reminder carries the title the owner gave it (the owner's choice), with
 hidden characters dropped, separators and quotes replaced, `/` and `:`
 dropped and at most 60 characters; a disk push names the disk by label
 (`system` or `data`), never a path. Their APNs pushes expire after an hour.
-Each of the three is sent at most once per 60 s like any other kind.
+Research results and disk pushes are sent at most once per 60 s like any
+other kind. Reminders skip that window and each job's reminder has its own
+collapse id, so two reminders in the same minute both arrive and neither
+replaces the other.
 
 Approval pushes name the device behind the request: its name, platform and
 model, the IP address it connected from and the first 16 hex characters of

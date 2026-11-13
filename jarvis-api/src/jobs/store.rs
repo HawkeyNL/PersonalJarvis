@@ -317,16 +317,17 @@ pub async fn set_conversation(db: &Database, job_id: &str, conversation_id: &str
     Ok(())
 }
 
-/// Count a failed run, or end the streak. The [`MAX_FAILURES`]th failed run
-/// in a row disables the job at the next revision, with the reason
-/// `paused_after_failures`; true then.
+/// Count a failed run of an enabled job, or end the streak. The
+/// [`MAX_FAILURES`]th failed run in a row disables the job at the next
+/// revision, with the reason `paused_after_failures`; true then. The owner's
+/// runs of a disabled job leave its streak as it is.
 pub async fn record_outcome(db: &Database, job_id: &str, failed: bool) -> Result<bool> {
     let mut response = run(
         db,
         "BEGIN TRANSACTION; \
          UPDATE scheduled_jobs \
            SET failure_count = IF $failed THEN (failure_count ?? 0) + 1 ELSE 0 END \
-           WHERE record::id(id) = $id RETURN NONE; \
+           WHERE record::id(id) = $id AND enabled = true RETURN NONE; \
          UPDATE scheduled_jobs SET enabled = false, \
            paused_reason = 'paused_after_failures', revision = revision + 1 \
            WHERE record::id(id) = $id AND failure_count >= $max AND enabled = true \
@@ -351,8 +352,10 @@ pub async fn delete_expired(db: &Database) -> Result<Vec<String>> {
         "BEGIN TRANSACTION; \
          LET $ids = (SELECT VALUE record::id(id) FROM scheduled_jobs \
            WHERE origin = 'jarvis' AND expires_at != NONE AND expires_at <= time::now()); \
-         DELETE scheduled_jobs WHERE record::id(id) IN $ids RETURN NONE; \
-         DELETE scheduled_job_runs WHERE job_id IN $ids RETURN NONE; \
+         IF array::len($ids) > 0 { \
+           DELETE scheduled_jobs WHERE record::id(id) IN $ids RETURN NONE; \
+           DELETE scheduled_job_runs WHERE job_id IN $ids RETURN NONE; \
+         }; \
          RETURN $ids; \
          COMMIT TRANSACTION;",
         json!({}),

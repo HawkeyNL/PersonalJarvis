@@ -149,8 +149,11 @@ between wins. A run's work is bounded by 15 minutes (`timed_out`). Jobs that
 reached `max_runs` or expired are skipped; expired jobs of Jarvis's are
 deleted, with their runs, at the start of each check.
 
-A run of a chat-made kind (`prompt`, `reminder`, `disk_check`) that fails
-counts towards a streak (`failure_count`); one that succeeds ends it. The
+Due jobs run one at a time, reminders and disk checks before research and
+dependency reviews, so a quick job is not held up by searches.
+
+A run of an enabled chat-made job (`prompt`, `reminder`, `disk_check`) that
+fails counts towards a streak (`failure_count`); one that succeeds ends it. The
 third failed run in a row disables the job with `paused_reason:
 "paused_after_failures"` at the next revision; the owner enables it again
 (which clears both). A `dependency_review` has no streak. Each check
@@ -203,7 +206,9 @@ it, the next run makes a new one. Every message is announced with
 
 A `prompt` run checks the privacy gate again first (title and instruction,
 against the holdings at that moment; it fails closed with
-`holdings_unavailable` when they cannot be read), then runs one web search
+`holdings_unavailable` when they cannot be read) and needs Research on (a
+job Jarvis made for itself also needs automatic web search on), then runs
+one web search
 through the fixed Research path: the hard-tier subscription worker with
 web search only, never a paid API, metered with `routing_mode` `job`. The
 question is the instruction after `(Scheduled run, Monday 7 December
@@ -232,7 +237,9 @@ to the conversation and pushes the title (summary: the text,
 A `disk_check` run reads the Home Node disks the Health page reports
 (`system` and `data`, by label, never a path) and changes nothing on the
 host. Only when a disk is at or above `params.threshold_percent` does it
-post `Disk data is at 91% (threshold 80%).` and push `Disk data at 91%`.
+post `Disk data is at 91% (threshold 80%).` and send one push naming every
+full disk (`Disk data at 91%`). The disks are read off Core's async threads
+within 2 seconds.
 Its `facts` hold the threshold and each disk's `used_percent`; with no
 disk readable it fails with `disk_unavailable`.
 

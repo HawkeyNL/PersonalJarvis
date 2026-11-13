@@ -403,7 +403,7 @@ fn request(
         .header("apns-priority", "10")
         .header("apns-expiration", (now + expiration).to_string())
         .header("apns-topic", topic)
-        .header("apns-collapse-id", event.kind())
+        .header("apns-collapse-id", event.collapse_id())
         .body(body.to_string())
 }
 

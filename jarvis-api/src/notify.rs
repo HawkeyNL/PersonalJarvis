@@ -72,10 +72,11 @@ pub enum NotifyEvent {
 pub enum JobResult {
     /// A research run ended; content-free, the answer stays in Jarvis.
     Prompt,
-    /// A reminder with the owner's title, cleaned like a device name.
-    Reminder(String),
-    /// A Home Node disk at or above the job's threshold.
-    Disk { label: &'static str, percent: u8 },
+    /// A reminder with the owner's title, cleaned like a device name. Each
+    /// job's pushes stand on their own: no window, no shared collapse id.
+    Reminder { job: Uuid, title: String },
+    /// The Home Node disks at or above the job's threshold, with their use.
+    Disk(Vec<(&'static str, u8)>),
 }
 
 /// The device behind an approval push, as Core stored it. Untrusted: a new
@@ -97,8 +98,16 @@ impl NotifyEvent {
             Self::PairingRequested(_) | Self::PairingAgain => "pairing",
             Self::UnlockRequested(_) => "unlock",
             Self::JobResult(JobResult::Prompt) => "job",
-            Self::JobResult(JobResult::Reminder(_)) => "reminder",
-            Self::JobResult(JobResult::Disk { .. }) => "disk",
+            Self::JobResult(JobResult::Reminder { .. }) => "reminder",
+            Self::JobResult(JobResult::Disk(_)) => "disk",
+        }
+    }
+
+    /// What a later push replaces on the phone: the kind, or one reminder.
+    fn collapse_id(&self) -> String {
+        match self {
+            Self::JobResult(JobResult::Reminder { job, .. }) => format!("reminder-{job}"),
+            other => other.kind().to_string(),
         }
     }
 
@@ -163,13 +172,17 @@ impl NotifyEvent {
                 "Jarvis",
                 "A scheduled job has a result — open Jarvis".to_string(),
             ),
-            Self::JobResult(JobResult::Reminder(title)) => (
+            Self::JobResult(JobResult::Reminder { title, .. }) => (
                 "Jarvis reminder",
                 clean(&unspoofable(title), MAX_REMINDER_CHARS, "Reminder"),
             ),
-            Self::JobResult(JobResult::Disk { label, percent }) => {
-                ("Jarvis", format!("Disk {label} at {percent}%"))
-            }
+            Self::JobResult(JobResult::Disk(full)) => (
+                "Jarvis",
+                full.iter()
+                    .map(|(label, percent)| format!("Disk {label} at {percent}%"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
         }
     }
 
@@ -186,8 +199,8 @@ impl NotifyEvent {
             Self::PairingRequested(_) | Self::PairingAgain => "key",
             Self::UnlockRequested(_) => "lock",
             Self::JobResult(JobResult::Prompt) => "mag",
-            Self::JobResult(JobResult::Reminder(_)) => "bell",
-            Self::JobResult(JobResult::Disk { .. }) => "floppy_disk",
+            Self::JobResult(JobResult::Reminder { .. }) => "bell",
+            Self::JobResult(JobResult::Disk(_)) => "floppy_disk",
         }
     }
 
@@ -370,7 +383,11 @@ impl Notifier {
             return;
         };
         let now = Instant::now();
-        {
+        // A reminder is its job's whole point; the jobs' own limits bound it.
+        if !matches!(
+            job.event,
+            NotifyEvent::JobResult(JobResult::Reminder { .. })
+        ) {
             let mut last = inner
                 .last_sent
                 .lock()
@@ -601,25 +618,31 @@ mod tests {
             (title, body.as_str()),
             ("Jarvis", "A scheduled job has a result — open Jarvis")
         );
-        let reminder = NotifyEvent::JobResult(JobResult::Reminder(format!(
-            "Call\u{202E} the\nbank: https://x \"now\" {}",
-            "a".repeat(80)
-        )));
+        let job = Uuid::now_v7();
+        let reminder = NotifyEvent::JobResult(JobResult::Reminder {
+            job,
+            title: format!(
+                "Call\u{202E} the\nbank: https://x \"now\" {}",
+                "a".repeat(80)
+            ),
+        });
+        assert_eq!(reminder.collapse_id(), format!("reminder-{job}"));
         let (title, body) = reminder.alert();
         assert_eq!(title, "Jarvis reminder");
         assert!(body.starts_with("Call the bank httpsx -now- aaa"), "{body}");
         assert_eq!(body.chars().count(), MAX_REMINDER_CHARS);
         assert_eq!(
-            NotifyEvent::JobResult(JobResult::Reminder(" ".into()))
-                .alert()
-                .1,
+            NotifyEvent::JobResult(JobResult::Reminder {
+                job,
+                title: " ".into()
+            })
+            .alert()
+            .1,
             "Reminder"
         );
-        let disk = NotifyEvent::JobResult(JobResult::Disk {
-            label: "data",
-            percent: 91,
-        });
-        assert_eq!(disk.alert().1, "Disk data at 91%");
+        let disk = NotifyEvent::JobResult(JobResult::Disk(vec![("system", 85), ("data", 91)]));
+        assert_eq!(disk.alert().1, "Disk system at 85%, Disk data at 91%");
+        assert_eq!(disk.collapse_id(), "disk");
         assert_eq!(disk.click(), "jarvis://jobs");
         for event in [reminder, disk, NotifyEvent::JobResult(JobResult::Prompt)] {
             assert!(event.alert().0.is_ascii());

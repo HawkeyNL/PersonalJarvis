@@ -1101,9 +1101,11 @@ impl Runner {
                 self.handle.clear_queued();
             }
         }
-        let Ok(jobs) = call(store::list(&self.db)).await else {
+        let Ok(mut jobs) = call(store::list(&self.db)).await else {
             return;
         };
+        // The quick kinds first, so a reminder is not late behind searches.
+        jobs.sort_by_key(|job| matches!(job.kind, Kind::Prompt | Kind::DependencyReview));
         for job in jobs {
             match job.due(now, &self.tz) {
                 Due::Nothing => {}

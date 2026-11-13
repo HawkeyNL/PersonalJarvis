@@ -15,10 +15,12 @@ use uuid::Uuid;
 use jarvis_llm::privacy::is_private;
 
 use super::store::{self, Finish};
-use super::{Job, RunStatus, SummarySource, MAX_SUMMARY};
+use super::{Job, Origin, RunStatus, SummarySource, MAX_SUMMARY};
 use crate::notify::{JobResult, NotifyEvent};
 use crate::AppState;
 
+/// Bounds reading the disks.
+const DISK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bounds one research run.
 const RESEARCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Most source links kept in a run's facts, and the longest one.
@@ -103,6 +105,16 @@ async fn post(
     Some((conversation, message))
 }
 
+/// Whether a research run may search: Research on and a worker that can run
+/// it. A job Jarvis made for itself also needs automatic web search on, the
+/// switch that governs searches the owner did not ask for.
+fn research_on(state: &AppState, origin: Origin) -> bool {
+    let routing = state.model_routing.snapshot();
+    state.llm.can_research()
+        && routing.research_allowed()
+        && (origin == Origin::Owner || routing.research_auto())
+}
+
 /// `Monday 7 December 2026` in the zone.
 fn run_date(now: OffsetDateTime, tz: &TimeZone) -> String {
     super::to_timestamp(now)
@@ -149,7 +161,7 @@ pub(super) async fn prompt(state: &AppState, job: &Job, tz: &TimeZone) -> Finish
     };
     let code = if is_private(instruction, &held) || is_private(&to.title, &held) {
         "private_instruction"
-    } else if !state.llm.can_research() || !state.model_routing.snapshot().research_allowed() {
+    } else if !research_on(state, job.origin) {
         "not_configured"
     } else {
         let question = format!(
@@ -194,8 +206,12 @@ pub(super) async fn reminder(state: &AppState, job: &Job) -> Finish {
     let Some((conversation, message)) = post(state, job, &to, &text, NOTICE_MODEL).await else {
         return Finish::failed("conversation_unavailable");
     };
+    let job_id = job.id.parse().unwrap_or_default();
     state.notifier.notify_user(
-        NotifyEvent::JobResult(JobResult::Reminder(to.title.clone())),
+        NotifyEvent::JobResult(JobResult::Reminder {
+            job: job_id,
+            title: to.title.clone(),
+        }),
         to.user,
     );
     finished(
@@ -211,13 +227,20 @@ pub(super) async fn disk_check(state: &AppState, job: &Job) -> Finish {
         return Finish::failed("not_configured");
     };
     let threshold = job.params.threshold_percent.unwrap_or(80);
-    let disks: Vec<(&'static str, f64)> = crate::routes::services::DISKS
-        .iter()
-        .filter_map(|(label, path)| {
+    // statvfs blocks; a hung mount must not hold a runtime thread.
+    let read = tokio::task::spawn_blocking(|| {
+        crate::routes::services::DISKS.map(|(label, path)| {
             let disk = crate::routes::services::disk_value(label, Path::new(path));
-            Some((*label, disk["used_percent"].as_f64()?))
+            (label, disk["used_percent"].as_f64())
         })
-        .collect();
+    });
+    let disks: Vec<(&'static str, f64)> = match tokio::time::timeout(DISK_TIMEOUT, read).await {
+        Ok(Ok(disks)) => disks
+            .into_iter()
+            .filter_map(|(label, used)| Some((label, used?)))
+            .collect(),
+        _ => Vec::new(),
+    };
     if disks.is_empty() {
         return Finish::failed("disk_unavailable");
     }
@@ -248,15 +271,9 @@ pub(super) async fn disk_check(state: &AppState, job: &Job) -> Finish {
     if post(state, job, &to, &text, NOTICE_MODEL).await.is_none() {
         return Finish::failed("conversation_unavailable");
     }
-    for (label, percent) in &full {
-        state.notifier.notify_user(
-            NotifyEvent::JobResult(JobResult::Disk {
-                label,
-                percent: *percent,
-            }),
-            to.user,
-        );
-    }
+    state
+        .notifier
+        .notify_user(NotifyEvent::JobResult(JobResult::Disk(full)), to.user);
     finished(facts, Some((text, SummarySource::Deterministic)))
 }
 
