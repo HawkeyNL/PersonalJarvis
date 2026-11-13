@@ -1,9 +1,9 @@
-//! Content-free approval pushes straight to the Jarvis iOS app through APNs
-//! with token-based (.p8) authentication (docs/NOTIFICATIONS.md).
+//! Approval pushes straight to the Jarvis iOS app through APNs with
+//! token-based (.p8) authentication (docs/NOTIFICATIONS.md).
 //!
-//! A push says only "Approval waiting"; the app fetches the request over the
-//! authenticated API and approval still needs the device signature. Tokens
-//! and device ids never reach the log.
+//! A push names the requesting device (the owner's choice); the app fetches
+//! the request over the authenticated API and approval still needs the device
+//! signature. Tokens and device ids never reach the log.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,8 +27,10 @@ const MAX_TARGETS: usize = 8;
 /// often than every 20 (`TooManyProviderTokenUpdates`).
 const JWT_LIFETIME_SECS: u64 = 45 * 60;
 const MIN_REFRESH_SECS: u64 = 20 * 60;
-/// An approval request expires after two minutes; a later push is useless.
-const EXPIRATION_SECS: u64 = 120;
+/// A push after its request expired is useless: pairing requests live five
+/// minutes, unlock requests two.
+const PAIRING_EXPIRATION_SECS: u64 = 5 * 60;
+const UNLOCK_EXPIRATION_SECS: u64 = 2 * 60;
 const MAX_KEY_BYTES: usize = 1024;
 
 pub struct Config {
@@ -240,7 +242,12 @@ impl Apns {
 
     /// Push `event` to the audience's active devices in the configured
     /// environment, skipping the requesting device, within the time budget.
-    pub(super) async fn send(&mut self, event: NotifyEvent, audience: Audience, backoff: Duration) {
+    pub(super) async fn send(
+        &mut self,
+        event: &NotifyEvent,
+        audience: Audience,
+        backoff: Duration,
+    ) {
         if tokio::time::timeout(self.budget, self.send_unbounded(event, audience, backoff))
             .await
             .is_err()
@@ -252,7 +259,7 @@ impl Apns {
         }
     }
 
-    async fn send_unbounded(&mut self, event: NotifyEvent, audience: Audience, backoff: Duration) {
+    async fn send_unbounded(&mut self, event: &NotifyEvent, audience: Audience, backoff: Duration) {
         let targets = match jarvis_identity::apns_targets(
             &self.db,
             audience.user,
@@ -273,7 +280,7 @@ impl Apns {
         }
     }
 
-    async fn deliver(&mut self, event: NotifyEvent, target: &str, backoff: Duration) {
+    async fn deliver(&mut self, event: &NotifyEvent, target: &str, backoff: Duration) {
         let mut delay = backoff;
         for attempt in 1..=MAX_ATTEMPTS {
             let outcome = match self.provider_token() {
@@ -316,7 +323,7 @@ impl Apns {
         }
     }
 
-    async fn post(&self, token: &HeaderValue, event: NotifyEvent, target: &str) -> Outcome {
+    async fn post(&self, token: &HeaderValue, event: &NotifyEvent, target: &str) -> Outcome {
         let response = request(
             &self.client,
             &self.base_url,
@@ -360,28 +367,38 @@ impl Apns {
     }
 }
 
-/// One alert push with a static body. `link` is the deep link the app opens
-/// when the notification is tapped; it names the approval kind only.
+/// One alert push with the event's title and body, grouped per kind on the
+/// phone. `link` is the deep link the app opens when the notification is
+/// tapped; it names the approval kind only.
 fn request(
     client: &reqwest::Client,
     base_url: &str,
     topic: &str,
     token: &HeaderValue,
-    event: NotifyEvent,
+    event: &NotifyEvent,
     target: &str,
     now: u64,
 ) -> reqwest::RequestBuilder {
+    let (title, body) = event.alert();
     let body = json!({
-        "aps": { "alert": { "title": "Jarvis", "body": "Approval waiting" }, "sound": "default" },
+        "aps": {
+            "alert": { "title": title, "body": body },
+            "sound": "default",
+            "thread-id": event.kind(),
+        },
         "link": event.click(),
     });
+    let expiration = match event {
+        NotifyEvent::PairingRequested(_) => PAIRING_EXPIRATION_SECS,
+        _ => UNLOCK_EXPIRATION_SECS,
+    };
     client
         .post(format!("{base_url}/3/device/{target}"))
         .header(AUTHORIZATION, token.clone())
         .header(CONTENT_TYPE, "application/json")
         .header("apns-push-type", "alert")
         .header("apns-priority", "10")
-        .header("apns-expiration", (now + EXPIRATION_SECS).to_string())
+        .header("apns-expiration", (now + expiration).to_string())
         .header("apns-topic", topic)
         .header("apns-collapse-id", event.kind())
         .body(body.to_string())
@@ -390,6 +407,7 @@ fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notify::DeviceInfo;
     use ring::{
         rand::SystemRandom,
         signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
@@ -515,25 +533,37 @@ mod tests {
         );
     }
 
-    #[test]
-    fn request_is_a_content_free_expiring_alert() {
-        let client = reqwest::Client::new();
-        let token = HeaderValue::from_static("bearer fixture");
-        let target = "ab".repeat(32);
-        let request = request(
-            &client,
+    fn build(event: &NotifyEvent) -> reqwest::Request {
+        request(
+            &reqwest::Client::new(),
             "https://api.sandbox.push.apple.com",
             "com.example.jarvis",
-            &token,
-            NotifyEvent::UnlockRequested,
-            &target,
+            &HeaderValue::from_static("bearer fixture"),
+            event,
+            &"ab".repeat(32),
             1_000,
         )
         .build()
-        .unwrap();
+        .unwrap()
+    }
+
+    fn payload(request: &reqwest::Request) -> serde_json::Value {
+        serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn unlock_request_is_an_expiring_alert_naming_the_device() {
+        let request = build(&NotifyEvent::UnlockRequested(DeviceInfo {
+            name: "Gus’s MacBook".into(),
+            platform: "macos".into(),
+            ..DeviceInfo::default()
+        }));
         assert_eq!(
             request.url().as_str(),
-            format!("https://api.sandbox.push.apple.com/3/device/{target}")
+            format!(
+                "https://api.sandbox.push.apple.com/3/device/{}",
+                "ab".repeat(32)
+            )
         );
         let headers = request.headers();
         for (name, value) in [
@@ -546,14 +576,47 @@ mod tests {
         ] {
             assert_eq!(headers[name], value, "{name}");
         }
-        let body: serde_json::Value =
-            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(
-            body,
+            payload(&request),
             json!({
-                "aps": { "alert": { "title": "Jarvis", "body": "Approval waiting" }, "sound": "default" },
+                "aps": {
+                    "alert": {
+                        "title": "Device asks to unlock Jarvis",
+                        "body": "Gus’s MacBook · macOS. Open Jarvis to approve or deny.",
+                    },
+                    "sound": "default",
+                    "thread-id": "unlock",
+                },
                 "link": "jarvis://approvals/unlock",
             })
+        );
+    }
+
+    #[test]
+    fn pairing_push_lives_as_long_as_the_request_and_stays_small() {
+        let request = build(&NotifyEvent::PairingRequested(DeviceInfo {
+            name: "\u{202e}𝕏".repeat(500),
+            platform: "ios".into(),
+            model: Some("m".repeat(500)),
+            ip: Some("2001:db8::1".into()),
+            fingerprint: Some("0123456789abcdef".repeat(4)),
+        }));
+        let headers = request.headers();
+        assert_eq!(headers["apns-expiration"], "1300");
+        assert_eq!(headers["apns-collapse-id"], "pairing");
+        assert!(request.body().unwrap().as_bytes().unwrap().len() < 4096);
+        let body = payload(&request);
+        assert_eq!(body["aps"]["thread-id"], "pairing");
+        assert_eq!(body["aps"]["alert"]["title"], "New device wants to pair");
+        assert_eq!(body["link"], "jarvis://approvals/pairing");
+        let text = body["aps"]["alert"]["body"].as_str().unwrap();
+        assert!(
+            text.starts_with(&format!("{}… · iOS ", "𝕏".repeat(39))),
+            "{text}"
+        );
+        assert!(
+            text.contains(" · IP 2001:db8::1\nKey 0123 4567 89ab cdef… "),
+            "{text}"
         );
     }
 
@@ -694,7 +757,7 @@ mod tests {
         ));
         let target = "0b".repeat(32);
         apns.deliver(
-            NotifyEvent::UnlockRequested,
+            &NotifyEvent::UnlockRequested(DeviceInfo::default()),
             &target,
             Duration::from_millis(10),
         )
@@ -724,7 +787,7 @@ mod tests {
         let minted = unix_now() - MIN_REFRESH_SECS + 60;
         apns.token = Some((HeaderValue::from_static("bearer recent"), minted));
         apns.deliver(
-            NotifyEvent::UnlockRequested,
+            &NotifyEvent::UnlockRequested(DeviceInfo::default()),
             &"0b".repeat(32),
             Duration::from_millis(10),
         )
@@ -757,7 +820,7 @@ mod tests {
             except: None,
         };
         apns.send(
-            NotifyEvent::UnlockRequested,
+            &NotifyEvent::UnlockRequested(DeviceInfo::default()),
             audience,
             Duration::from_millis(10),
         )
@@ -792,7 +855,7 @@ mod tests {
             except: None,
         };
         apns.send(
-            NotifyEvent::UnlockRequested,
+            &NotifyEvent::UnlockRequested(DeviceInfo::default()),
             audience,
             Duration::from_millis(10),
         )

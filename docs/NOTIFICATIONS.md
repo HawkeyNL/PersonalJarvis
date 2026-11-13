@@ -1,21 +1,37 @@
 # Owner notifications
 
-Core can push a short, generic notification to the owner's phone through a
+Core can push a short notification to the owner's phone through a
 self-hosted [ntfy](https://docs.ntfy.sh/) server on the Home Node. It is off
 until `JARVIS_NOTIFY_NTFY_URL` is set.
 
 ## What is sent
 
-| Event | Message | Priority | Tap opens |
-|---|---|---|---|
-| Monthly LLM spend reaches 90% of the hard budget (`JARVIS_LLM_MONTHLY_BUDGET_EUR`), once per calendar month (UTC) | Budget reached 90% this month | default | `jarvis://health/usage` |
-| A new device pairing request was created with a verified account password | New device wants to pair — open Jarvis to review | high | `jarvis://approvals/pairing` |
-| A signed-in device asks another device to approve its unlock | Approval waiting — open Jarvis | high | `jarvis://approvals/unlock` |
+| Event | Title | Message | Priority | Tap opens |
+|---|---|---|---|---|
+| Monthly LLM spend reaches 90% of the hard budget (`JARVIS_LLM_MONTHLY_BUDGET_EUR`), once per calendar month (UTC) | Jarvis | Budget reached 90% this month | default | `jarvis://health/usage` |
+| A new device pairing request was created with a verified account password | New device wants to pair | `Gus’s iPad · iOS iPad14,1 · IP 192.0.2.7`<br>`Key a1b2 c3d4 e5f6 0718… Compare the full fingerprint in Jarvis before approving.` | high | `jarvis://approvals/pairing` |
+| A signed-in device asks another device to approve its unlock | Device asks to unlock Jarvis | `Work laptop · Linux. Open Jarvis to approve or deny.` | high | `jarvis://approvals/unlock` |
 
-Every push has the title `Jarvis` and nothing else: no amounts, IP addresses,
-device names or key fingerprints. The app shows the details after the owner
-signs in, and approval always goes through the app's signed flow, never
-through a notification action.
+Approval pushes name the device behind the request: its name, platform and
+model, the IP address it connected from and the first 16 hex characters of
+its key fingerprint (pairing), or the requesting device's stored name and
+platform (unlock). This was the owner's choice (2026-11-13); earlier pushes
+carried no device details. The text is kept by the self-hosted ntfy server
+(see "What leaves the Home Node" below), passes Apple's push service in a
+Jarvis app push (APNs), and shows on the lock screen unless the phone hides
+previews. The budget push carries no amount. Approval always goes
+through the app's signed flow, never through a notification action; the
+fingerprint start in a push is a hint, and the owner compares the full
+fingerprint in the app before approving.
+
+The device chooses its own name, so Core treats every device field as
+untrusted: control, bidi and other hidden characters are dropped, whitespace
+(line breaks included) collapses to one space, the name is capped at 40
+characters and platform and model at 32 (cut with `…`), and an empty value
+reads `Unknown device` or `unknown platform`. An IP or fingerprint that does
+not parse is left out. Titles are fixed ASCII, because ntfy takes the title
+as an HTTP header; device text only goes into the request body (ntfy) or the
+JSON payload (APNs).
 
 Behaviour in Core:
 
@@ -23,7 +39,10 @@ Behaviour in Core:
   and logs a count). One worker publishes with a 5 s timeout per request and
   up to 3 attempts with backoff; 4xx answers other than 429 are not retried.
 - The same event kind is sent at most once per 60 s; for unlock requests
-  that holds per requesting device.
+  that holds per requesting device. The first event in a window wins: a
+  second pairing request within 60 s sends no push of its own, and its
+  details appear only in the app, which lists every pending request. No
+  "and N more" count: that would mean holding the first push back.
 - The budget marker is kept in memory. At startup a month that is already at
   or above 90% counts as notified, so restarts do not repeat the push.
 - Logs name the event kind and HTTP status only, never the token or topic.
@@ -140,7 +159,8 @@ journalctl -u jarvis-core --since -5min | grep 'owner notifications'
 ```
 
 Expect `owner notifications enabled`. Test by starting a pairing request from
-a new device: the phone shows "New device wants to pair".
+a new device: the phone shows "New device wants to pair" with that device's
+name.
 
 ## App push to the iOS app (APNs)
 
@@ -148,16 +168,18 @@ Approval events (pairing and unlock requests) can also go straight to the
 Jarvis iOS app through Apple's push service, independent of ntfy. Android
 keeps using ntfy.
 
-- Every push reads `Jarvis` / `Approval waiting` and carries only the
-  approval's deep link. The app fetches the details over the authenticated
-  API, and approving still needs the device signature behind Face ID /
-  Touch ID; a notification has no actions.
+- Every push carries the same title and text as the ntfy message (see
+  "What is sent") and the approval's deep link. The app fetches the full
+  request over the authenticated API, and approving still needs the device
+  signature behind Face ID / Touch ID; a notification has no actions.
 - It goes to the owner's active devices that turned on **Approval
   notifications** in the app, never to the device that asked, at most 8
   devices per event, within 30 s. The same coalescing (see above),
   queue, 5 s timeout and retries as ntfy apply. Headers: `apns-push-type:
-  alert`, `apns-priority: 10`, `apns-expiration` two minutes ahead (the
-  approval expires by then) and an `apns-collapse-id` per kind.
+  alert`, `apns-priority: 10`, `apns-expiration` as long as the request
+  lives (five minutes for pairing, two for unlock) and an `apns-collapse-id`
+  per kind, so a newer push of the same kind replaces the older one. The
+  payload's `thread-id` is the kind too, so iOS groups them.
 - A device registers its token with `PUT /v1/devices/self/push`
   (`{"apns_token": "<hex>", "apns_env": "sandbox"|"production"}`) and
   removes it with `DELETE`. Both only touch the calling device, at most 6
@@ -168,7 +190,8 @@ keeps using ntfy.
 - Logs name the event kind and APNs status only, never a token or device id.
 - What leaves the Home Node: an HTTP/2 request to Apple
   (`api.sandbox.push.apple.com` or `api.push.apple.com`) with the device
-  token, app id and the static text. Apple sees that and the timing.
+  token, app id and the push text, including the device details above.
+  Apple sees that and the timing.
 - A missing or invalid setting is logged at startup (`app push disabled`)
   and leaves app push off; Core keeps running.
 
@@ -246,8 +269,8 @@ This needs a paid Apple Developer account; a free account cannot use push.
    Expect `app push enabled`.
 8. **Phone.** In Jarvis, turn on Settings → **Approval notifications** and
    allow notifications when iOS asks. Test by requesting
-   an unlock from another signed-in device: the iPhone shows "Approval
-   waiting".
+   an unlock from another signed-in device: the iPhone shows "Device asks to
+   unlock Jarvis".
 
 To stop app push, remove the `JARVIS_APNS_*` lines from `core.env`, delete
 `/etc/jarvis/secrets/apns.env` and restart Core. Stored tokens stay unused;

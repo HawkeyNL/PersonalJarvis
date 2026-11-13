@@ -43,13 +43,16 @@ pub fn printable_ascii(value: &str, max_len: usize) -> bool {
 /// ponytail: explicit denylist of the invisible/bidi code points, not the
 /// whole Unicode `Cf` category; switch to a category table if one is needed.
 pub fn no_hidden_chars(value: &str) -> bool {
-    !value.chars().any(|c| {
-        c.is_control()
-            || matches!(c, '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}'
-                | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{2069}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
-                | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}')
-    })
+    !value.chars().any(is_hidden_char)
+}
+
+/// One character [`no_hidden_chars`] refuses.
+pub fn is_hidden_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}'
+            | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}')
 }
 
 pub fn bounded_text(value: &str, max_len: usize) -> bool {
