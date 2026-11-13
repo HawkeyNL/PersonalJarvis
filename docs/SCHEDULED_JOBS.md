@@ -1,13 +1,28 @@
 # Scheduled jobs
 
 Core runs some work by itself on a schedule the owner sets in the app: a
-job runs daily or weekly at a wall-clock minute in Europe/Amsterdam. Jobs
-and their runs live in schema 0019 (`scheduled_jobs`, `scheduled_job_runs`)
-and are served through `/v1/jobs`.
+job runs once, daily, weekly or monthly at a wall-clock minute in
+Europe/Amsterdam. Jobs and their runs live in schemas 0019 and 0021
+(`scheduled_jobs`, `scheduled_job_runs`) and are served through `/v1/jobs`.
 
-A job's kind is a closed list. There is no free-text job: the owner picks a
-kind and its typed parameters, never a prompt. The only kind is
-`dependency_review`. There is at most one job per kind; nothing is seeded.
+A job's kind is a closed list, each with typed parameters:
+
+| Kind | Does | Params |
+| --- | --- | --- |
+| `dependency_review` | Reads Dependabot alerts and pull requests (below) | `roadmap_id?` |
+| `prompt` | A scheduled research run: a web search for the instruction | `title`, `instruction`, `notify?` (default true) |
+| `reminder` | Posts the owner's fixed text and pushes the title | `title`, `text?` |
+| `disk_check` | Notes when a Home Node disk is fuller than the threshold | `threshold_percent?` (50 to 99, default 80) |
+
+Core runs only `dependency_review` for now: jobs of the other kinds are
+stored and edited, but the runner skips them (no slot of theirs is due, no
+row is written) and `POST /v1/jobs/{id}/run` answers 409. Their runners
+follow.
+
+There is at most one `dependency_review` and at most 10 jobs of the other
+kinds made by the owner. Jarvis may keep up to 3 `prompt` jobs of its own
+apart from those; Core makes them itself (never through the API), and each
+expires 30 days after it was made. Nothing is seeded.
 
 ## API
 
@@ -18,31 +33,77 @@ refused. Each database call is bounded by 10 seconds (503 when it fails).
 | Method | Path | Does |
 | --- | --- | --- |
 | GET | `/v1/jobs` | `status` (`ok` or `not_configured`), `time_zone` and the `jobs` |
-| POST | `/v1/jobs` | Create: `{kind, cadence?, weekday?, at_minute?, enabled?, params?}` |
-| PATCH | `/v1/jobs/{id}?expected_revision=N` | Change `cadence`, `weekday`, `at_minute`, `enabled` or `params` |
+| POST | `/v1/jobs` | Create: `{kind, cadence?, weekday?, month_day?, every?, start_date?, max_runs?, at_minute?, enabled?, params?}` |
+| PATCH | `/v1/jobs/{id}?expected_revision=N` | Change any of those but `kind` |
 | DELETE | `/v1/jobs/{id}?expected_revision=N` | Delete the job and its runs |
 | POST | `/v1/jobs/{id}/run` | Run it now (202), at most once an hour |
 | GET | `/v1/jobs/{id}/runs?limit=1..50` | The newest runs (default 20), newest first, without facts |
 | GET | `/v1/jobs/runs/{run_id}` | One run with its `facts` |
 
-A job has `id`, `kind`, `cadence`, `weekday`, `at_minute`, `enabled`,
-`revision`, `params`, `last_slot_at`, `created_at`, `updated_at` and
-`next_run_at` (its next slot; null while it is disabled or the runner is
-off).
+A job has `id`, `kind`, `cadence`, `weekday`, `month_day`, `every`,
+`start_date`, `max_runs`, `at_minute`, `enabled`, `revision`, `params`,
+`last_slot_at`, `run_count`, `origin`, `owner_id`, `conversation_id`,
+`expires_at`, `failure_count`, `paused_reason`, `created_at`, `updated_at`
+and `next_run_at` (its next slot; null while it is disabled or the runner
+is off).
 
-- `cadence`: `weekly` (default) or `daily`.
-- `weekday`: 1 (Monday, default) to 7 (Sunday) for a weekly job; a daily job
-  has none. A job that becomes weekly keeps its weekday or gets Monday.
+- `cadence`: `weekly` (default), `daily`, `monthly` or `once`.
+- `weekday`: 1 (Monday, default) to 7 (Sunday) for a weekly job; other jobs
+  have none. A job that becomes weekly keeps its weekday or gets Monday.
+- `month_day`: 1 (default) to 31 for a monthly job; a shorter month runs on
+  its last day (31 runs on 28 or 29 February). Other jobs have none.
+- `every`: every this many days (1 to 365), weeks (1 to 104) or months (1 to
+  24); default 1, always 1 for a one-time job. It falls back to 1 when the
+  cadence changes.
+- `start_date`: `YYYY-MM-DD` in Europe/Amsterdam, at most two years ahead.
+  A one-time job runs on it and needs it; a repeating job runs from it on,
+  and `every` counts from it (from the first slot on or after it). With
+  `every` above 1 and no start date, Core uses today. Null clears it.
+- `max_runs`: 1 to 100; after this many scheduled runs since the schedule
+  last changed the job disables itself. A one-time job has none. Null
+  clears it.
 - `at_minute`: minutes after midnight in Europe/Amsterdam, 0 to 1439
   (default 420, 07:00).
-- `enabled`: default true.
-- `params.roadmap_id`: optional; a roadmap that exists and is not archived.
+- `enabled`: default true. An enabled one-time job must be in the future.
+- `params`: the kind's fields only (table above). `roadmap_id` is a roadmap
+  that exists and is not archived. `title` is 1 to 60 characters,
+  `instruction` and `text` 1 to 500, each on one line without hidden
+  characters. A `prompt` instruction leaves the Home Node in a web search,
+  so it may not carry personal or financial details or a symbol the owner
+  holds (the research privacy gate); when the holdings cannot be read the
+  answer is 503.
+
+These are Core's, never the client's (a body that names one is refused):
+
+- `origin`: `owner`, or `jarvis` for a job Jarvis made for itself.
+- `owner_id`: the owner's user id; `conversation_id`: the conversation the
+  job's results go to.
+- `expires_at`: when a job of Jarvis's goes away; null for the owner's.
+- `run_count`: scheduled runs since the schedule last changed.
+- `failure_count` and `paused_reason` (`paused_after_failures`): failed runs
+  in a row, and why Core disabled the job. Enabling the job clears both.
+
+Examples:
+
+```json
+{"kind": "prompt", "cadence": "weekly", "weekday": 1, "at_minute": 480,
+ "params": {"title": "AI news", "instruction": "Summarize this week's AI news"}}
+{"kind": "reminder", "cadence": "once", "start_date": "2026-12-01", "at_minute": 540,
+ "params": {"title": "Call the bank", "text": "Ask about the new card."}}
+{"kind": "disk_check", "cadence": "daily", "at_minute": 360,
+ "params": {"threshold_percent": 85}}
+{"kind": "prompt", "cadence": "monthly", "month_day": 1, "every": 6,
+ "start_date": "2027-01-01", "max_runs": 2,
+ "params": {"title": "Energy prices", "instruction": "Dutch energy price outlook", "notify": false}}
+```
 
 Errors are `{"error": "…"}`: 400 for invalid input (the message says which
 rule), 404 for an unknown job or run, 409 for a revision conflict, a second
-job of the same kind or a run request while the runner is off, 413 for a
-body over 4 KiB, 429 for a run request within an hour of the last one or
-while one is queued or running.
+`dependency_review`, no room for another job, a run request while the runner
+is off or for a kind that does not run yet, 413 for a body over 4 KiB, 422
+for a body that does not parse (an unknown field), 429 for a run request
+within an hour of the last one or while one is queued or running, 503 when
+the database or the holdings cannot be read.
 
 Every change raises the job's `revision` by one; every write names the
 revision it was made on (`expected_revision`, required), and when the job has
@@ -61,8 +122,14 @@ daylight saving time:
 
 Each slot is handled once: a run row is unique per job and slot, and the job
 keeps the newest slot handled (`last_slot_at`). Creating a job, or changing
-its cadence, weekday, time or `enabled`, sets it to the newest slot under the
-new schedule, so no slot before the change runs.
+its schedule (cadence, weekday, month day, `every`, start date, `max_runs`,
+time or `enabled`), sets it to the newest slot under the new schedule, so no
+slot before the change runs, and sets `run_count` back to 0.
+
+A one-time job disables itself after its slot, whether it ran or was
+missed; a job with `max_runs` after the scheduled run that reaches it
+(missed slots and the owner's runs do not count). Core then raises the
+revision, so an app editing the old one reloads.
 
 When Core was down at a slot:
 
@@ -77,7 +144,9 @@ run) which slots are due and runs them one at a time: the owner's queued run
 first, then each job's due slot. It writes the run row (`running`) before the
 work starts, in one transaction with the slot it handles, and only while the
 job is still enabled and at the revision it read, so an owner change in
-between wins. A run's work is bounded by 15 minutes (`timed_out`). Each check
+between wins. A run's work is bounded by 15 minutes (`timed_out`). Jobs of a
+kind that does not run yet, that reached `max_runs` or that expired are
+skipped. Each check
 first marks runs still `running` as `interrupted` (no run is between two
 checks, so such a run was left by an earlier Core or its end could not be
 recorded), and runs nothing until that succeeded.

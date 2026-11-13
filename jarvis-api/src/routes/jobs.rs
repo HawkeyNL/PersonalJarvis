@@ -1,7 +1,8 @@
 //! Scheduled jobs for the owner (see `docs/SCHEDULED_JOBS.md`). Every write
 //! names the revision it builds on (`?expected_revision=N`) and gets 409 when
 //! the job has moved on. Bodies are capped by the router; each database call
-//! is bounded by [`DB_TIMEOUT`].
+//! is bounded by [`DB_TIMEOUT`]. Who made a job, its conversation, expiry and
+//! failure streak are Core's: a body that names them is refused.
 
 use axum::{
     extract::{Path, Query, State},
@@ -13,6 +14,8 @@ use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+use jarvis_llm::privacy::is_private;
 
 use crate::error::bad_request;
 use crate::jobs::store::{self, OWNER_RUN_HOURS};
@@ -48,6 +51,7 @@ async fn bounded<T>(
             StatusCode::CONFLICT,
             "a job of this kind already exists",
         )),
+        Ok(Err(JobError::Full(message))) => Err(error(StatusCode::CONFLICT, message)),
         Ok(Err(JobError::TooSoon)) => Err(error(
             StatusCode::TOO_MANY_REQUESTS,
             "a job runs on request at most once an hour",
@@ -99,6 +103,25 @@ async fn check_roadmap(state: &AppState, params: Option<&Params>) -> Result<(), 
     }
 }
 
+/// A prompt's instruction leaves the Home Node in a web search, so it must
+/// not carry personal or financial details or a held symbol. Fails closed
+/// when the holdings cannot be read.
+async fn check_private(state: &AppState, params: Option<&Params>) -> Result<(), Failure> {
+    let Some(instruction) = params.and_then(|params| params.instruction.as_deref()) else {
+        return Ok(());
+    };
+    let Some(held) = crate::auto_research::held_symbols(state).await else {
+        tracing::warn!("job privacy check: holdings unavailable");
+        return Err(unavailable());
+    };
+    if is_private(instruction, &held) {
+        return Err(bad_request(
+            "params.instruction may hold personal or financial details; leave them out",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RevisionQuery {
@@ -126,11 +149,13 @@ pub(crate) async fn list(_authed: Authed, State(state): State<AppState>) -> ApiR
 }
 
 pub(crate) async fn create(
-    _authed: Authed,
+    authed: Authed,
     State(state): State<AppState>,
-    Json(input): Json<NewJob>,
+    Json(mut input): Json<NewJob>,
 ) -> ApiResult {
     check_roadmap(&state, Some(&input.params)).await?;
+    check_private(&state, Some(&input.params)).await?;
+    input.owner_id = Some(authed.user.id.hyphenated().to_string());
     let created = bounded(store::create(&state.db, input, state.jobs.time_zone())).await?;
     Ok(Json(job(&state, created)))
 }
@@ -143,6 +168,7 @@ pub(crate) async fn update(
     Json(patch): Json<JobPatch>,
 ) -> ApiResult {
     check_roadmap(&state, patch.params.as_ref()).await?;
+    check_private(&state, patch.params.as_ref()).await?;
     let updated = bounded(store::update(
         &state.db,
         &id.to_string(),
@@ -184,8 +210,14 @@ pub(crate) async fn run_now(
         ));
     }
     let id = id.to_string();
-    if bounded(store::get(&state.db, &id)).await?.is_none() {
+    let Some(found) = bounded(store::get(&state.db, &id)).await? else {
         return Err(error(StatusCode::NOT_FOUND, "not found"));
+    };
+    if !found.kind.runnable() {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "jobs of this kind do not run yet",
+        ));
     }
     let last = bounded(store::last_owner_run(&state.db, &id)).await?;
     let interval = time::Duration::hours(OWNER_RUN_HOURS.into());

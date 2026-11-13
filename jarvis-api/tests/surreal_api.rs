@@ -2555,5 +2555,82 @@ async fn job_routes_validate_and_guard_revisions() -> Result<(), Box<dyn std::er
     assert_eq!(deleted.status(), StatusCode::OK);
     let listed = json_body(call("GET", "/v1/jobs", None).await?).await;
     assert_eq!(listed["jobs"], json!([]));
+
+    // The chat-made kinds: typed params, an instruction that may not carry
+    // private details, Core's own fields refused, and no runs yet.
+    let params = json!({"title": "AI news", "instruction": "Summarize the AI news"});
+    for bad in [
+        json!({"kind": "prompt", "params": {"title": "T", "instruction": "What is my portfolio worth?"}}),
+        json!({"kind": "prompt", "origin": "jarvis", "params": params}),
+        json!({"kind": "prompt", "owner_id": uuid::Uuid::nil(), "params": params}),
+        json!({"kind": "prompt", "conversation_id": uuid::Uuid::nil(), "params": params}),
+        json!({"kind": "prompt", "expires_at": "2026-12-01T00:00:00Z", "params": params}),
+        json!({"kind": "prompt", "cadence": "monthly", "every": 25, "params": params}),
+        json!({"kind": "reminder", "params": params}),
+    ] {
+        let status = call("POST", "/v1/jobs", Some(bad.to_string()))
+            .await?
+            .status();
+        assert!(status.is_client_error(), "{bad} {status}");
+    }
+    let created = call(
+        "POST",
+        "/v1/jobs",
+        Some(
+            json!({
+                "kind": "prompt", "cadence": "monthly", "month_day": 31, "every": 6,
+                "max_runs": 2, "params": params,
+            })
+            .to_string(),
+        ),
+    )
+    .await?;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = json_body(created).await;
+    assert_eq!(
+        (
+            &created["origin"],
+            &created["every"],
+            &created["month_day"],
+            &created["max_runs"],
+            &created["run_count"],
+            &created["params"]["notify"],
+            &created["conversation_id"],
+        ),
+        (
+            &json!("owner"),
+            &json!(6),
+            &json!(31),
+            &json!(2),
+            &json!(0),
+            &json!(true),
+            &Value::Null
+        )
+    );
+    assert!(created["owner_id"].is_string() && created["start_date"].is_string());
+    let id = created["id"].as_str().ok_or("id")?.to_owned();
+    let run = call("POST", &format!("/v1/jobs/{id}/run"), None).await?;
+    assert_eq!(run.status(), StatusCode::CONFLICT);
+    for bad in [
+        json!({"params": {"title": "T", "instruction": "Is my salary fair?"}}),
+        json!({"origin": "jarvis"}),
+        json!({"failure_count": 0}),
+    ] {
+        let status = call(
+            "PATCH",
+            &format!("/v1/jobs/{id}?expected_revision=1"),
+            Some(bad.to_string()),
+        )
+        .await?
+        .status();
+        assert!(status.is_client_error(), "{bad} {status}");
+    }
+    let deleted = call(
+        "DELETE",
+        &format!("/v1/jobs/{id}?expected_revision=1"),
+        None,
+    )
+    .await?;
+    assert_eq!(deleted.status(), StatusCode::OK);
     Ok(())
 }

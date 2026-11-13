@@ -1,10 +1,10 @@
-//! Scheduled jobs (schema 0019): work Core runs by itself on a daily or
-//! weekly schedule, and a record of every run (see `docs/SCHEDULED_JOBS.md`).
+//! Scheduled jobs (schemas 0019 and 0021): work Core runs by itself on a
+//! schedule, and a record of every run (see `docs/SCHEDULED_JOBS.md`).
 //!
-//! A job's kind is a closed list; there are no free-text jobs. This module
-//! holds the types, input validation, the slot math and the runner: a job's
-//! slots are wall-clock minutes in [`TIME_ZONE`], so they follow daylight
-//! saving time. A minute that does not exist on a spring-forward day moves
+//! A job's kind is a closed list with typed parameters. This module holds
+//! the types, input validation, the slot math and the runner: a job's slots
+//! are wall-clock minutes in [`TIME_ZONE`], so they follow daylight saving
+//! time. A minute that does not exist on a spring-forward day moves
 //! forward by the gap (02:30 becomes 03:30); a minute that occurs twice on a
 //! fall-back day runs once, at its first occurrence.
 
@@ -50,6 +50,21 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// Monday 07:00, the default of a new job.
 const DEFAULT_WEEKDAY: u8 = 1;
 const DEFAULT_AT_MINUTE: u16 = 7 * 60;
+/// The first of the month, the default of a monthly job.
+const DEFAULT_MONTH_DAY: u8 = 1;
+/// Jobs of the owner's chat-made kinds (`prompt`, `reminder`, `disk_check`).
+pub const MAX_OWNER_JOBS: usize = 10;
+/// Jobs Jarvis made for itself, apart from the owner's.
+pub const MAX_JARVIS_JOBS: usize = 3;
+/// A job Jarvis made for itself is deleted this long after it was made.
+pub const JARVIS_JOB_DAYS: i64 = 30;
+pub const MAX_TITLE: usize = 60;
+pub const MAX_INSTRUCTION: usize = 500;
+pub const MAX_TEXT: usize = 500;
+pub const MAX_RUN_LIMIT: u16 = 100;
+/// `start_date` is at most this many days ahead.
+const MAX_START_DAYS: i64 = 2 * 366;
+const DEFAULT_THRESHOLD_PERCENT: u8 = 80;
 
 /// The zone of every schedule, from the system time zone database; `None`
 /// when it cannot be loaded, and the runner stays off.
@@ -71,6 +86,8 @@ pub enum JobError {
     Conflict,
     /// A job of this kind already exists.
     Exists,
+    /// No room for another job of this origin; the message says which.
+    Full(&'static str),
     /// The owner ran the job less than an hour ago.
     TooSoon,
 }
@@ -84,6 +101,7 @@ impl std::fmt::Display for JobError {
             Self::NotFound => f.write_str("not found"),
             Self::Conflict => f.write_str("job revision conflict"),
             Self::Exists => f.write_str("a job of this kind already exists"),
+            Self::Full(message) => f.write_str(message),
             Self::TooSoon => f.write_str("a job runs on request at most once an hour"),
         }
     }
@@ -103,13 +121,46 @@ type Result<T> = std::result::Result<T, JobError>;
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     DependencyReview,
+    /// A scheduled research run: a web search for `params.instruction`.
+    Prompt,
+    /// The owner's fixed text at a set time.
+    Reminder,
+    /// A note when a Home Node disk is fuller than a threshold.
+    DiskCheck,
+}
+
+impl Kind {
+    /// Whether the runner runs jobs of this kind yet. The others are stored
+    /// and edited, but no slot of theirs runs and no row is written.
+    pub fn runnable(self) -> bool {
+        matches!(self, Self::DependencyReview)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Cadence {
+    /// Once, on `start_date`.
+    Once,
     Daily,
     Weekly,
+    /// On `month_day`, or a shorter month's last day.
+    Monthly,
+}
+
+/// Who made a job. Only Core sets it; Jarvis makes jobs through
+/// [`store::create_for_jarvis`], never through the API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    Owner,
+    Jarvis,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PausedReason {
+    PausedAfterFailures,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,13 +205,29 @@ pub enum SummarySource {
     Deterministic,
 }
 
-/// Typed parameters; unknown fields are refused.
+/// Typed parameters; unknown fields are refused, and so is a field the
+/// job's kind does not take.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Params {
-    /// The roadmap a run proposes its items to.
+    /// `dependency_review`: the roadmap a run proposes its items to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roadmap_id: Option<String>,
+    /// `prompt`, `reminder`: one line, 1 to 60 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// `prompt`: what to research, 1 to 500 characters on one line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+    /// `reminder`: optional text, 1 to 500 characters on one line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// `prompt`: push when a run ends (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<bool>,
+    /// `disk_check`: 50 to 99 (default 80).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_percent: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -171,6 +238,19 @@ pub struct Job {
     /// ISO weekday (Monday = 1) of a weekly job.
     #[serde(default)]
     pub weekday: Option<u8>,
+    /// Day of the month (1 to 31) of a monthly job.
+    #[serde(default)]
+    pub month_day: Option<u8>,
+    /// Every this many days, weeks or months; 1 for a one-time job.
+    pub every: u16,
+    /// `YYYY-MM-DD` in [`TIME_ZONE`]: the day of a one-time job, or the
+    /// first day a repeating job may run, from which `every` counts.
+    #[serde(default)]
+    pub start_date: Option<String>,
+    /// Disabled after this many scheduled runs since the last schedule
+    /// change.
+    #[serde(default)]
+    pub max_runs: Option<u16>,
     /// Minutes after midnight in [`TIME_ZONE`].
     pub at_minute: u16,
     pub enabled: bool,
@@ -180,6 +260,22 @@ pub struct Job {
     /// The newest slot the runner handled; none since a schedule change.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub last_slot_at: Option<OffsetDateTime>,
+    /// Scheduled runs since the last schedule change.
+    pub run_count: u16,
+    pub origin: Origin,
+    #[serde(default)]
+    pub owner_id: Option<String>,
+    /// The conversation the job's results go to.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    /// When a job Jarvis made for itself goes away.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+    /// Failed runs in a row.
+    pub failure_count: u16,
+    /// Why Core disabled the job; cleared when the owner enables it.
+    #[serde(default)]
+    pub paused_reason: Option<PausedReason>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -187,6 +283,7 @@ pub struct Job {
 }
 
 /// A new job; absent fields default to weekly on Monday at 07:00, enabled.
+/// Who made it and where it reports are set by Core, never by the client.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewJob {
@@ -196,15 +293,29 @@ pub struct NewJob {
     #[serde(default)]
     pub weekday: Option<u8>,
     #[serde(default)]
+    pub month_day: Option<u8>,
+    #[serde(default)]
+    pub every: Option<u16>,
+    #[serde(default)]
+    pub start_date: Option<String>,
+    #[serde(default)]
+    pub max_runs: Option<u16>,
+    #[serde(default)]
     pub at_minute: Option<u16>,
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
     pub params: Params,
+    /// The owner's user id, from the session.
+    #[serde(skip)]
+    pub owner_id: Option<String>,
 }
 
-/// Absent fields stay. A daily job has no weekday; a job that becomes weekly
-/// keeps its weekday or gets Monday.
+/// Absent fields stay; `start_date` and `max_runs` are cleared with null.
+/// Only a weekly job has a weekday and only a monthly one a month day: a job
+/// that becomes weekly keeps its weekday or gets Monday, one that becomes
+/// monthly keeps its day or gets the 1st. `every` falls back to 1 when the
+/// cadence changes; a one-time job has no `max_runs`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobPatch {
@@ -213,11 +324,28 @@ pub struct JobPatch {
     #[serde(default)]
     pub weekday: Option<u8>,
     #[serde(default)]
+    pub month_day: Option<u8>,
+    #[serde(default)]
+    pub every: Option<u16>,
+    #[serde(default, deserialize_with = "present")]
+    pub start_date: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    pub max_runs: Option<Option<u16>>,
+    #[serde(default)]
     pub at_minute: Option<u16>,
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
     pub params: Option<Params>,
+}
+
+/// A field that is present, even as null (`Some(None)`); absent is `None`.
+fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// One entry of a run's priority list; `ref` names an entry of its facts.
@@ -262,59 +390,266 @@ fn check(ok: bool, message: &'static str) -> Result<()> {
 }
 
 /// The weekday a schedule stores: a weekly job has one (`fallback` when none
-/// is given), a daily job none.
+/// is given), other jobs none.
 fn weekday_for(cadence: Cadence, given: Option<u8>, fallback: u8) -> Result<Option<u8>> {
-    match cadence {
-        Cadence::Daily => {
-            check(given.is_none(), "a daily job has no weekday")?;
-            Ok(None)
-        }
-        Cadence::Weekly => {
-            let weekday = given.unwrap_or(fallback);
-            check(
-                (1..=7).contains(&weekday),
-                "weekday must be 1 (Monday) to 7 (Sunday)",
-            )?;
-            Ok(Some(weekday))
-        }
+    if cadence != Cadence::Weekly {
+        check(given.is_none(), "only a weekly job has a weekday")?;
+        return Ok(None);
     }
+    let weekday = given.unwrap_or(fallback);
+    check(
+        (1..=7).contains(&weekday),
+        "weekday must be 1 (Monday) to 7 (Sunday)",
+    )?;
+    Ok(Some(weekday))
+}
+
+/// The month day a schedule stores: a monthly job has one (`fallback` when
+/// none is given), other jobs none.
+fn month_day_for(cadence: Cadence, given: Option<u8>, fallback: u8) -> Result<Option<u8>> {
+    if cadence != Cadence::Monthly {
+        check(given.is_none(), "only a monthly job has a month_day")?;
+        return Ok(None);
+    }
+    let day = given.unwrap_or(fallback);
+    check((1..=31).contains(&day), "month_day must be 1 to 31")?;
+    Ok(Some(day))
+}
+
+/// The fields of a schedule that depend on each other.
+struct Schedule {
+    cadence: Cadence,
+    weekday: Option<u8>,
+    month_day: Option<u8>,
+    every: u16,
+    start_date: Option<String>,
+    max_runs: Option<u16>,
+}
+
+impl Schedule {
+    /// Check the fields together. A repeating job with `every` above 1 and
+    /// no `start_date` counts from `today`. A `dependency_review` keeps the
+    /// schedules it had before 0021: daily or weekly, nothing more.
+    fn checked(mut self, kind: Kind, today: civil::Date) -> Result<Self> {
+        check(
+            kind != Kind::DependencyReview
+                || (matches!(self.cadence, Cadence::Daily | Cadence::Weekly)
+                    && self.every == 1
+                    && self.start_date.is_none()
+                    && self.max_runs.is_none()),
+            "a dependency review runs daily or weekly",
+        )?;
+        let most = match self.cadence {
+            Cadence::Once => 1,
+            Cadence::Daily => 365,
+            Cadence::Weekly => 104,
+            Cadence::Monthly => 24,
+        };
+        check(
+            (1..=most).contains(&self.every),
+            "every must be 1 to 365 days, 104 weeks or 24 months, and 1 for a one-time job",
+        )?;
+        check(
+            self.max_runs
+                .is_none_or(|max| (1..=MAX_RUN_LIMIT).contains(&max)),
+            "max_runs must be 1 to 100",
+        )?;
+        check(
+            self.cadence != Cadence::Once || self.max_runs.is_none(),
+            "a one-time job has no max_runs",
+        )?;
+        if let Some(date) = &self.start_date {
+            let latest = today.checked_add(jiff::Span::new().days(MAX_START_DAYS));
+            check(
+                parse_date(date)
+                    .is_some_and(|date| date.year() >= 2000 && latest.is_ok_and(|l| date <= l)),
+                "start_date must be a date (YYYY-MM-DD) at most two years ahead",
+            )?;
+        }
+        check(
+            self.cadence != Cadence::Once || self.start_date.is_some(),
+            "a one-time job needs a start_date",
+        )?;
+        if self.every > 1 && self.start_date.is_none() {
+            self.start_date = Some(today.to_string());
+        }
+        Ok(self)
+    }
+}
+
+/// A `YYYY-MM-DD` date, exactly as written.
+fn parse_date(value: &str) -> Option<civil::Date> {
+    value
+        .parse::<civil::Date>()
+        .ok()
+        .filter(|date| date.to_string() == value)
+}
+
+/// The date at `now` in the zone (in UTC without it).
+fn today(now: OffsetDateTime, tz: Option<&TimeZone>) -> Option<civil::Date> {
+    let now = to_timestamp(now)?;
+    Some(tz.unwrap_or(&TimeZone::UTC).to_datetime(now).date())
 }
 
 fn validate_at_minute(at_minute: u16) -> Result<()> {
     check(at_minute <= LAST_MINUTE, "at_minute must be 0 to 1439")
 }
 
-fn validate_params(params: &Params) -> Result<()> {
+/// A title, instruction or text: not blank, at most `max` characters, one
+/// line without hidden characters.
+fn line(value: Option<&str>, max: usize) -> bool {
+    value.is_none_or(|value| {
+        !value.trim().is_empty()
+            && value.chars().count() <= max
+            && crate::validation::no_hidden_chars(value)
+    })
+}
+
+/// The parameters as stored: checked for the kind, defaults filled in.
+fn params_for(kind: Kind, mut params: Params) -> Result<Params> {
+    let Params {
+        roadmap_id,
+        title,
+        instruction,
+        text,
+        notify,
+        threshold_percent,
+    } = &params;
+    let only = match kind {
+        Kind::DependencyReview => {
+            title.is_none()
+                && instruction.is_none()
+                && text.is_none()
+                && notify.is_none()
+                && threshold_percent.is_none()
+        }
+        Kind::Prompt => roadmap_id.is_none() && text.is_none() && threshold_percent.is_none(),
+        Kind::Reminder => {
+            roadmap_id.is_none()
+                && instruction.is_none()
+                && notify.is_none()
+                && threshold_percent.is_none()
+        }
+        Kind::DiskCheck => {
+            roadmap_id.is_none()
+                && title.is_none()
+                && instruction.is_none()
+                && text.is_none()
+                && notify.is_none()
+        }
+    };
+    check(only, "params has a field this kind of job does not take")?;
     check(
-        params.roadmap_id.as_deref().is_none_or(|id| {
+        roadmap_id.as_deref().is_none_or(|id| {
             uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id)
         }),
         "params.roadmap_id must be a roadmap id",
-    )
+    )?;
+    check(
+        line(title.as_deref(), MAX_TITLE),
+        "params.title must be 1 to 60 characters on one line",
+    )?;
+    check(
+        line(instruction.as_deref(), MAX_INSTRUCTION)
+            && instruction
+                .as_deref()
+                .is_none_or(|i| jarvis_llm::ResearchRequest::new(i).is_some()),
+        "params.instruction must be 1 to 500 characters on one line",
+    )?;
+    check(
+        line(text.as_deref(), MAX_TEXT),
+        "params.text must be 1 to 500 characters on one line",
+    )?;
+    check(
+        threshold_percent.is_none_or(|percent| (50..=99).contains(&percent)),
+        "params.threshold_percent must be 50 to 99",
+    )?;
+    match kind {
+        Kind::DependencyReview => {}
+        Kind::Prompt => {
+            check(
+                title.is_some() && instruction.is_some(),
+                "a prompt job needs params.title and params.instruction",
+            )?;
+            params.notify.get_or_insert(true);
+        }
+        Kind::Reminder => check(title.is_some(), "a reminder needs params.title")?,
+        Kind::DiskCheck => {
+            params
+                .threshold_percent
+                .get_or_insert(DEFAULT_THRESHOLD_PERCENT);
+        }
+    }
+    Ok(params)
 }
 
 impl NewJob {
-    /// The job this input creates, at revision 1. With the zone, its newest
-    /// slot at `now` counts as handled, so only later slots run.
+    /// The owner's job this input creates, at revision 1. With the zone, its
+    /// newest slot at `now` counts as handled, so only later slots run.
     pub fn into_job(self, id: String, now: OffsetDateTime, tz: Option<&TimeZone>) -> Result<Job> {
+        self.build(id, now, tz, Origin::Owner)
+    }
+
+    /// A job Jarvis makes for itself: only `prompt`, expiring after
+    /// [`JARVIS_JOB_DAYS`].
+    fn into_jarvis_job(
+        self,
+        id: String,
+        now: OffsetDateTime,
+        tz: Option<&TimeZone>,
+    ) -> Result<Job> {
+        check(
+            self.kind == Kind::Prompt,
+            "Jarvis makes only prompt jobs of its own",
+        )?;
+        self.build(id, now, tz, Origin::Jarvis)
+    }
+
+    fn build(
+        self,
+        id: String,
+        now: OffsetDateTime,
+        tz: Option<&TimeZone>,
+        origin: Origin,
+    ) -> Result<Job> {
         let cadence = self.cadence.unwrap_or(Cadence::Weekly);
-        let weekday = weekday_for(cadence, self.weekday, DEFAULT_WEEKDAY)?;
+        let schedule = Schedule {
+            cadence,
+            weekday: weekday_for(cadence, self.weekday, DEFAULT_WEEKDAY)?,
+            month_day: month_day_for(cadence, self.month_day, DEFAULT_MONTH_DAY)?,
+            every: self.every.unwrap_or(1),
+            start_date: self.start_date,
+            max_runs: self.max_runs,
+        }
+        .checked(self.kind, today(now, tz).ok_or(JobError::InvalidData)?)?;
         let at_minute = self.at_minute.unwrap_or(DEFAULT_AT_MINUTE);
         validate_at_minute(at_minute)?;
-        validate_params(&self.params)?;
         let mut job = Job {
             id,
             kind: self.kind,
             cadence,
-            weekday,
+            weekday: schedule.weekday,
+            month_day: schedule.month_day,
+            every: schedule.every,
+            start_date: schedule.start_date,
+            max_runs: schedule.max_runs,
             at_minute,
             enabled: self.enabled.unwrap_or(true),
             revision: 1,
-            params: self.params,
+            params: params_for(self.kind, self.params)?,
             last_slot_at: None,
+            run_count: 0,
+            origin,
+            owner_id: self.owner_id,
+            conversation_id: None,
+            expires_at: (origin == Origin::Jarvis)
+                .then(|| now + time::Duration::days(JARVIS_JOB_DAYS)),
+            failure_count: 0,
+            paused_reason: None,
             created_at: now,
             updated_at: now,
         };
+        job.check_once_ahead(now, tz)?;
         job.last_slot_at = tz.and_then(|tz| job.latest_slot(now, tz));
         Ok(job)
     }
@@ -322,9 +657,11 @@ impl NewJob {
 
 impl Job {
     /// The job with `patch` applied, and whether its schedule (cadence,
-    /// weekday, time or enabled) changed. A change sets `last_slot_at` to the
-    /// newest slot at `now` under the new schedule (none without the zone),
-    /// so no slot before the change runs.
+    /// weekday, month day, `every`, start date, run limit, time or enabled)
+    /// changed. A change sets `last_slot_at` to the newest slot at `now`
+    /// under the new schedule (none without the zone), so no slot before the
+    /// change runs, and starts the run count again. Enabling a job clears
+    /// its failure streak and pause.
     pub fn patched(
         &self,
         patch: &JobPatch,
@@ -332,40 +669,136 @@ impl Job {
         tz: Option<&TimeZone>,
     ) -> Result<(Job, bool)> {
         let cadence = patch.cadence.unwrap_or(self.cadence);
-        let weekday = weekday_for(
+        let schedule = Schedule {
             cadence,
-            patch.weekday,
-            self.weekday.unwrap_or(DEFAULT_WEEKDAY),
-        )?;
+            weekday: weekday_for(
+                cadence,
+                patch.weekday,
+                self.weekday.unwrap_or(DEFAULT_WEEKDAY),
+            )?,
+            month_day: month_day_for(
+                cadence,
+                patch.month_day,
+                self.month_day.unwrap_or(DEFAULT_MONTH_DAY),
+            )?,
+            every: patch.every.unwrap_or(if cadence == self.cadence {
+                self.every
+            } else {
+                1
+            }),
+            start_date: patch
+                .start_date
+                .clone()
+                .unwrap_or_else(|| self.start_date.clone()),
+            max_runs: patch.max_runs.unwrap_or(if cadence == Cadence::Once {
+                None
+            } else {
+                self.max_runs
+            }),
+        }
+        .checked(self.kind, today(now, tz).ok_or(JobError::InvalidData)?)?;
         let at_minute = patch.at_minute.unwrap_or(self.at_minute);
         validate_at_minute(at_minute)?;
         let params = patch.params.clone().unwrap_or_else(|| self.params.clone());
-        validate_params(&params)?;
         let mut new = Job {
             cadence,
-            weekday,
+            weekday: schedule.weekday,
+            month_day: schedule.month_day,
+            every: schedule.every,
+            start_date: schedule.start_date,
+            max_runs: schedule.max_runs,
             at_minute,
             enabled: patch.enabled.unwrap_or(self.enabled),
-            params,
+            params: params_for(self.kind, params)?,
             ..self.clone()
         };
-        let rescheduled = (new.cadence, new.weekday, new.at_minute, new.enabled)
-            != (self.cadence, self.weekday, self.at_minute, self.enabled);
+        let schedule = |job: &Job| {
+            (
+                job.cadence,
+                job.weekday,
+                job.month_day,
+                job.every,
+                job.start_date.clone(),
+                job.max_runs,
+                job.at_minute,
+                job.enabled,
+            )
+        };
+        let rescheduled = schedule(&new) != schedule(self);
         if rescheduled {
+            new.check_once_ahead(now, tz)?;
             new.last_slot_at = tz.and_then(|tz| new.latest_slot(now, tz));
+            new.run_count = 0;
+        }
+        if new.enabled && !self.enabled {
+            new.failure_count = 0;
+            new.paused_reason = None;
         }
         Ok((new, rescheduled))
     }
 
-    /// The job's slot on `date`, if it has one that day.
-    fn slot_on(&self, date: civil::Date, tz: &TimeZone) -> Option<Timestamp> {
-        let iso_weekday = u8::try_from(date.weekday().to_monday_one_offset()).ok();
-        if self
-            .weekday
-            .is_some_and(|weekday| Some(weekday) != iso_weekday)
-        {
-            return None;
+    /// An enabled one-time job must be ahead of `now`, or it would never run.
+    fn check_once_ahead(&self, now: OffsetDateTime, tz: Option<&TimeZone>) -> Result<()> {
+        if !self.enabled || self.cadence != Cadence::Once {
+            return Ok(());
         }
+        let start = self.start_date.as_deref().and_then(parse_date);
+        let ahead = match (tz, start) {
+            (Some(tz), Some(date)) => to_timestamp(now)
+                .is_some_and(|now| self.slot_on(date, tz).is_some_and(|slot| slot > now)),
+            (None, Some(date)) => today(now, None).is_some_and(|today| date >= today),
+            (_, None) => false,
+        };
+        check(ahead, "a one-time job must be in the future")
+    }
+
+    /// Whether the job runs on `date` (from its `start_date`, if any).
+    fn runs_on(&self, date: civil::Date, start: Option<civil::Date>) -> bool {
+        if start.is_some_and(|start| date < start) {
+            return false;
+        }
+        let every = i32::from(self.every.max(1));
+        let days_since = |start: civil::Date| date.since(start).map_or(-1, |span| span.get_days());
+        match self.cadence {
+            Cadence::Once => Some(date) == start,
+            Cadence::Daily => start.is_none_or(|start| days_since(start) % every == 0),
+            Cadence::Weekly => {
+                let iso_weekday = u8::try_from(date.weekday().to_monday_one_offset()).ok();
+                iso_weekday.is_some()
+                    && iso_weekday == self.weekday
+                    && start.is_none_or(|start| (days_since(start) / 7) % every == 0)
+            }
+            Cadence::Monthly => {
+                let Some(day) = self.month_day else {
+                    return false;
+                };
+                let clamped = |of: civil::Date| {
+                    i8::try_from(day).map_or(of.days_in_month(), |day| day.min(of.days_in_month()))
+                };
+                date.day() == clamped(date)
+                    && start.is_none_or(|start| {
+                        // `every` counts from the month of the first slot.
+                        let first = month_index(start) + i32::from(clamped(start) < start.day());
+                        (month_index(date) - first).rem_euclid(every) == 0
+                    })
+            }
+        }
+    }
+
+    /// The most days between two slots: how far the slot search looks.
+    fn period_days(&self) -> i32 {
+        let every = i32::from(self.every.max(1));
+        match self.cadence {
+            Cadence::Once => 0,
+            Cadence::Daily => every,
+            Cadence::Weekly => 7 * every,
+            // A shorter month moves a slot by at most three days.
+            Cadence::Monthly => 32 * every,
+        }
+    }
+
+    /// The job's slot on `date`, at its minute.
+    fn slot_on(&self, date: civil::Date, tz: &TimeZone) -> Option<Timestamp> {
         let minute = i8::try_from(self.at_minute % 60).ok()?;
         let hour = i8::try_from(self.at_minute / 60).ok()?;
         let time = civil::Time::new(hour, minute, 0, 0).ok()?;
@@ -373,14 +806,24 @@ impl Job {
     }
 
     /// The newest slot at or before `now`.
+    // ponytail: walks the days back one by one, at most one period (768 days
+    // for every 24 months); compute the date directly if that ever shows up.
     pub fn latest_slot(&self, now: OffsetDateTime, tz: &TimeZone) -> Option<OffsetDateTime> {
         let now = to_timestamp(now)?;
+        let start = self.start_date.as_deref().and_then(parse_date);
         let mut date = tz.to_datetime(now).date();
-        // A weekly slot is at most a week back; one more day covers a slot
-        // later today than now.
-        for _ in 0..=7 {
-            if let Some(slot) = self.slot_on(date, tz).filter(|slot| *slot <= now) {
-                return from_timestamp(slot);
+        if self.cadence == Cadence::Once {
+            date = date.min(start?);
+        }
+        // One more day covers a slot later today than now.
+        for _ in 0..=self.period_days() {
+            if start.is_some_and(|start| date < start) {
+                return None;
+            }
+            if self.runs_on(date, start) {
+                if let Some(slot) = self.slot_on(date, tz).filter(|slot| *slot <= now) {
+                    return from_timestamp(slot);
+                }
             }
             date = date.yesterday().ok()?;
         }
@@ -390,14 +833,31 @@ impl Job {
     /// The first slot after `now`.
     pub fn next_slot(&self, now: OffsetDateTime, tz: &TimeZone) -> Option<OffsetDateTime> {
         let now = to_timestamp(now)?;
+        let start = self.start_date.as_deref().and_then(parse_date);
         let mut date = tz.to_datetime(now).date();
-        for _ in 0..=7 {
-            if let Some(slot) = self.slot_on(date, tz).filter(|slot| *slot > now) {
-                return from_timestamp(slot);
+        if let Some(start) = start {
+            date = date.max(start);
+        }
+        for _ in 0..=self.period_days() {
+            if self.runs_on(date, start) {
+                if let Some(slot) = self.slot_on(date, tz).filter(|slot| *slot > now) {
+                    return from_timestamp(slot);
+                }
             }
             date = date.tomorrow().ok()?;
         }
         None
+    }
+
+    /// Whether the next scheduled run is the job's last: a one-time job's,
+    /// or the one that reaches `max_runs`. A `missed` slot ends a one-time
+    /// job too, but does not count as a run.
+    pub fn ends_with(&self, status: RunStatus) -> bool {
+        self.cadence == Cadence::Once
+            || (status == RunStatus::Running
+                && self
+                    .max_runs
+                    .is_some_and(|max| self.run_count.saturating_add(1) >= max))
     }
 
     /// What the runner owes this job at `now`: nothing, a run for the newest
@@ -405,9 +865,15 @@ impl Job {
     /// Only the newest slot counts: older slots that passed while Core was
     /// down leave no row. Slots at or before `last_slot_at` are handled;
     /// without it (a change made while the zone was unavailable), slots at
-    /// or before the last change (`updated_at`) never run.
+    /// or before the last change (`updated_at`) never run. Nothing is owed
+    /// for a kind the runner does not run yet, a job that reached its
+    /// `max_runs` or one that expired.
     pub fn due(&self, now: OffsetDateTime, tz: &TimeZone) -> Due {
-        if !self.enabled {
+        if !self.enabled
+            || !self.kind.runnable()
+            || self.max_runs.is_some_and(|max| self.run_count >= max)
+            || self.expires_at.is_some_and(|at| at <= now)
+        {
             return Due::Nothing;
         }
         let Some(slot) = self.latest_slot(now, tz) else {
@@ -421,6 +887,11 @@ impl Job {
             Due::Missed(slot)
         }
     }
+}
+
+/// Months since year 0, for counting `every` months.
+fn month_index(date: civil::Date) -> i32 {
+    i32::from(date.year()) * 12 + i32::from(date.month()) - 1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -597,18 +1068,19 @@ impl Runner {
 
     /// Nothing runs before stale runs are marked. Then the owner's queued
     /// run, which stays queued while the database fails, then every job's
-    /// due slot.
+    /// due slot. A job of a kind that does not run yet is skipped: its
+    /// queued run is dropped and its slots are never due.
     async fn pass(&self, now: OffsetDateTime) {
         if !self.recover().await {
             return;
         }
         if let Some(job_id) = self.handle.queued() {
             let settled = match call(store::get(&self.db, &job_id)).await {
-                Ok(Some(job)) => {
+                Ok(Some(job)) if job.kind.runnable() => {
                     self.run(&job, OffsetDateTime::now_utc(), Trigger::Owner)
                         .await
                 }
-                Ok(None) => true,
+                Ok(_) => true,
                 Err(failed) => failed == Failed::Refused,
             };
             if settled {
@@ -665,6 +1137,8 @@ impl Runner {
     async fn work(&self, job: &Job) -> Finish {
         match job.kind {
             Kind::DependencyReview => dependency_review::run(&self.work, &self.db, job).await,
+            // Never reached: `pass` does not run these kinds yet.
+            Kind::Prompt | Kind::Reminder | Kind::DiskCheck => Finish::failed("not_supported"),
         }
     }
 
@@ -708,11 +1182,22 @@ mod tests {
             kind: Kind::DependencyReview,
             cadence,
             weekday,
+            month_day: None,
+            every: 1,
+            start_date: None,
+            max_runs: None,
             at_minute,
             enabled: true,
             revision: 1,
             params: Params::default(),
             last_slot_at: None,
+            run_count: 0,
+            origin: Origin::Owner,
+            owner_id: None,
+            conversation_id: None,
+            expires_at: None,
+            failure_count: 0,
+            paused_reason: None,
             created_at: created,
             updated_at: created,
         }
@@ -819,6 +1304,7 @@ mod tests {
                 &JobPatch {
                     params: Some(Params {
                         roadmap_id: Some("0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into()),
+                        ..Params::default()
                     }),
                     ..JobPatch::default()
                 },
@@ -1027,6 +1513,457 @@ mod tests {
             }
             assert_eq!(slots, 365, "{at_minute}");
         }
+    }
+
+    fn prompt(extra: serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "kind": "prompt",
+            "params": {"title": "AI news", "instruction": "Summarize this week's AI news"},
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body
+    }
+
+    #[test]
+    fn new_kinds_take_only_their_params_within_bounds() {
+        let job = new_job(prompt(serde_json::json!({}))).unwrap();
+        assert_eq!((job.kind, job.params.notify), (Kind::Prompt, Some(true)));
+        assert_eq!(
+            (job.origin, job.expires_at, job.run_count),
+            (Origin::Owner, None, 0)
+        );
+        let quiet = new_job(prompt(serde_json::json!({
+            "params": {"title": "T", "instruction": "i".repeat(500), "notify": false}
+        })))
+        .unwrap();
+        assert_eq!(quiet.params.notify, Some(false));
+        let reminder = new_job(serde_json::json!({
+            "kind": "reminder", "params": {"title": "Call the bank", "text": "Before 17:00."}
+        }))
+        .unwrap();
+        assert_eq!(reminder.params.text.as_deref(), Some("Before 17:00."));
+        let disk = new_job(serde_json::json!({"kind": "disk_check"})).unwrap();
+        assert_eq!(disk.params.threshold_percent, Some(80));
+        let title = |title: &str| serde_json::json!({"title": title, "instruction": "Search"});
+        for bad in [
+            serde_json::json!({"kind": "prompt"}),
+            prompt(serde_json::json!({"params": {"title": "T"}})),
+            prompt(serde_json::json!({"params": {"instruction": "Search"}})),
+            prompt(serde_json::json!({"params": title("")})),
+            prompt(serde_json::json!({"params": title("  ")})),
+            prompt(serde_json::json!({"params": title(&"t".repeat(61))})),
+            prompt(serde_json::json!({"params": title("Two\nlines")})),
+            prompt(serde_json::json!({"params": title("Hidden\u{200B}")})),
+            prompt(serde_json::json!({"params": {"title": "T", "instruction": "i".repeat(501)}})),
+            prompt(serde_json::json!({"params": {"title": "T", "instruction": " "}})),
+            prompt(serde_json::json!({"params": {"title": "T", "instruction": "a\u{202E}b"}})),
+            prompt(serde_json::json!({"params": {"title": "T", "instruction": "S", "text": "x"}})),
+            prompt(
+                serde_json::json!({"params": {"title": "T", "instruction": "S", "prompt": "x"}}),
+            ),
+            prompt(serde_json::json!({"params": {
+                "title": "T", "instruction": "S", "roadmap_id": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+            }})),
+            serde_json::json!({"kind": "reminder"}),
+            serde_json::json!({"kind": "reminder", "params": {"title": "T", "text": ""}}),
+            serde_json::json!({"kind": "reminder", "params": {"title": "T", "text": "t".repeat(501)}}),
+            serde_json::json!({"kind": "reminder", "params": {"title": "T", "instruction": "S"}}),
+            serde_json::json!({"kind": "reminder", "params": {"title": "T", "notify": false}}),
+            serde_json::json!({"kind": "disk_check", "params": {"threshold_percent": 49}}),
+            serde_json::json!({"kind": "disk_check", "params": {"threshold_percent": 100}}),
+            serde_json::json!({"kind": "disk_check", "params": {"title": "Disk"}}),
+            serde_json::json!({"kind": "dependency_review", "params": {"title": "Deps"}}),
+            serde_json::json!({"kind": "dependency_review", "params": {"notify": true}}),
+        ] {
+            assert!(new_job(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn schedules_are_checked_together() {
+        let monthly = new_job(prompt(serde_json::json!({"cadence": "monthly"}))).unwrap();
+        assert_eq!((monthly.month_day, monthly.weekday), (Some(1), None));
+        // Every N counts from today unless a start date is given.
+        let every = new_job(prompt(
+            serde_json::json!({"cadence": "monthly", "every": 6}),
+        ))
+        .unwrap();
+        assert_eq!(every.start_date.as_deref(), Some("2026-11-11"));
+        let once = new_job(prompt(
+            serde_json::json!({"cadence": "once", "start_date": "2026-12-01", "at_minute": 540}),
+        ))
+        .unwrap();
+        assert_eq!((once.every, once.max_runs), (1, None));
+        for good in [
+            serde_json::json!({"cadence": "daily", "every": 365}),
+            serde_json::json!({"cadence": "weekly", "every": 104, "weekday": 7}),
+            serde_json::json!({"cadence": "monthly", "every": 24, "month_day": 31}),
+            serde_json::json!({"cadence": "daily", "max_runs": 100}),
+            serde_json::json!({"cadence": "daily", "start_date": "2028-11-11"}),
+        ] {
+            assert!(new_job(prompt(good.clone())).is_ok(), "{good}");
+        }
+        for bad in [
+            serde_json::json!({"cadence": "daily", "every": 0}),
+            serde_json::json!({"cadence": "daily", "every": 366}),
+            serde_json::json!({"cadence": "weekly", "every": 105}),
+            serde_json::json!({"cadence": "monthly", "every": 25}),
+            serde_json::json!({"cadence": "monthly", "month_day": 0}),
+            serde_json::json!({"cadence": "monthly", "month_day": 32}),
+            serde_json::json!({"cadence": "weekly", "month_day": 1}),
+            serde_json::json!({"cadence": "monthly", "weekday": 1}),
+            serde_json::json!({"cadence": "once"}),
+            serde_json::json!({"cadence": "once", "weekday": 1, "start_date": "2026-12-01"}),
+            serde_json::json!({"cadence": "once", "every": 2, "start_date": "2026-12-01"}),
+            serde_json::json!({"cadence": "once", "max_runs": 1, "start_date": "2026-12-01"}),
+            serde_json::json!({"cadence": "once", "start_date": "2026-11-10"}),
+            serde_json::json!({"cadence": "daily", "max_runs": 0}),
+            serde_json::json!({"cadence": "daily", "max_runs": 101}),
+            serde_json::json!({"cadence": "daily", "start_date": "2026-1-5"}),
+            serde_json::json!({"cadence": "daily", "start_date": "2026-02-30"}),
+            serde_json::json!({"cadence": "daily", "start_date": "2026-11-13T00:00:00"}),
+            serde_json::json!({"cadence": "daily", "start_date": "1999-12-31"}),
+            serde_json::json!({"cadence": "daily", "start_date": "2028-11-13"}),
+            serde_json::json!({"cadence": "hourly"}),
+        ] {
+            assert!(new_job(prompt(bad.clone())).is_err(), "{bad}");
+        }
+        // A dependency review keeps its daily and weekly schedules.
+        for bad in [
+            serde_json::json!({"kind": "dependency_review", "cadence": "weekly", "every": 2}),
+            serde_json::json!({"kind": "dependency_review", "max_runs": 2}),
+            serde_json::json!({"kind": "dependency_review", "start_date": "2026-12-01"}),
+            serde_json::json!({"kind": "dependency_review", "cadence": "once", "start_date": "2026-12-01"}),
+        ] {
+            assert!(new_job(bad.clone()).is_err(), "{bad}");
+        }
+        // With the zone, a one-time job must be ahead of now to the minute.
+        let at = |start_date: &str, at_minute: u16| {
+            serde_json::from_value::<NewJob>(prompt(serde_json::json!({
+                "cadence": "once", "start_date": start_date, "at_minute": at_minute
+            })))
+            .unwrap()
+            .into_job("j".into(), now(), Some(&tz()))
+        };
+        assert!(at("2026-11-11", 780).is_err());
+        assert!(at("2026-11-11", 781).is_ok());
+        let disabled = serde_json::from_value::<NewJob>(prompt(serde_json::json!({
+            "cadence": "once", "start_date": "2026-11-01", "enabled": false
+        })))
+        .unwrap()
+        .into_job("j".into(), now(), Some(&tz()));
+        assert!(disabled.is_ok());
+    }
+
+    #[test]
+    fn server_set_fields_are_refused_and_jarvis_jobs_are_prompts_that_expire() {
+        for field in [
+            "origin",
+            "owner_id",
+            "conversation_id",
+            "expires_at",
+            "run_count",
+            "failure_count",
+            "paused_reason",
+            "revision",
+            "last_slot_at",
+            "id",
+        ] {
+            let mut body = prompt(serde_json::json!({}));
+            body[field] = serde_json::json!("jarvis");
+            assert!(serde_json::from_value::<NewJob>(body).is_err(), "{field}");
+            assert!(
+                serde_json::from_value::<JobPatch>(serde_json::json!({ field: "jarvis" })).is_err(),
+                "{field}"
+            );
+        }
+        let input = || serde_json::from_value::<NewJob>(prompt(serde_json::json!({}))).unwrap();
+        let jarvis = input().into_jarvis_job("j".into(), now(), None).unwrap();
+        assert_eq!(jarvis.origin, Origin::Jarvis);
+        assert_eq!(jarvis.expires_at, Some(at("2026-12-11T12:00:00Z")));
+        let reminder = serde_json::from_value::<NewJob>(
+            serde_json::json!({"kind": "reminder", "params": {"title": "T"}}),
+        )
+        .unwrap();
+        assert!(reminder.into_jarvis_job("j".into(), now(), None).is_err());
+        // The API shape survives a round trip.
+        let wire = serde_json::to_value(&jarvis).unwrap();
+        assert_eq!(wire["origin"], "jarvis");
+        assert_eq!(wire["every"], 1);
+        assert_eq!(wire["params"]["notify"], true);
+        assert!(wire["params"].get("roadmap_id").is_none());
+        assert_eq!(serde_json::from_value::<Job>(wire).unwrap(), jarvis);
+    }
+
+    #[test]
+    fn patches_check_the_merged_schedule_and_reset_the_count() {
+        let mut stored =
+            new_job(prompt(serde_json::json!({"cadence": "daily", "every": 3}))).unwrap();
+        stored.run_count = 2;
+        let patch = |body: serde_json::Value| serde_json::from_value::<JobPatch>(body).unwrap();
+        // A new cadence drops `every`; a new time keeps it.
+        let (weekly, rescheduled) = stored
+            .patched(
+                &patch(serde_json::json!({"cadence": "weekly"})),
+                now(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            (weekly.every, weekly.weekday, weekly.run_count),
+            (1, Some(1), 0)
+        );
+        assert!(rescheduled);
+        let (later, _) = stored
+            .patched(&patch(serde_json::json!({"at_minute": 600})), now(), None)
+            .unwrap();
+        assert_eq!(
+            (later.every, later.start_date.as_deref()),
+            (3, Some("2026-11-11"))
+        );
+        // Null clears the run limit and the start date; absent keeps them.
+        let (mut limited, _) = stored
+            .patched(&patch(serde_json::json!({"max_runs": 2})), now(), None)
+            .unwrap();
+        limited.run_count = 1;
+        let (unlimited, _) = limited
+            .patched(
+                &patch(serde_json::json!({"max_runs": null, "every": 1, "start_date": null})),
+                now(),
+                None,
+            )
+            .unwrap();
+        assert_eq!((unlimited.max_runs, unlimited.start_date), (None, None));
+        let (kept, rescheduled) = limited
+            .patched(
+                &patch(serde_json::json!({"params": {"title": "New", "instruction": "Search"}})),
+                now(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            (kept.max_runs, kept.run_count, rescheduled),
+            (Some(2), 1, false)
+        );
+        // A one-time job drops the run limit and needs its date.
+        let (once, _) = limited
+            .patched(
+                &patch(serde_json::json!({"cadence": "once", "start_date": "2026-12-01"})),
+                now(),
+                None,
+            )
+            .unwrap();
+        assert_eq!((once.every, once.max_runs), (1, None));
+        for bad in [
+            serde_json::json!({"cadence": "once", "start_date": null}),
+            serde_json::json!({"cadence": "once", "start_date": "2026-12-01", "max_runs": 2}),
+            serde_json::json!({"month_day": 3}),
+            serde_json::json!({"every": 366}),
+            serde_json::json!({"params": {"title": "T"}}),
+            serde_json::json!({"params": {"title": "T", "instruction": "S", "threshold_percent": 80}}),
+        ] {
+            assert!(
+                stored.patched(&patch(bad.clone()), now(), None).is_err(),
+                "{bad}"
+            );
+        }
+        // Enabling clears a pause; a disabled one-time job in the past may
+        // be edited but not enabled again.
+        let mut paused = stored.clone();
+        paused.enabled = false;
+        paused.failure_count = 3;
+        paused.paused_reason = Some(PausedReason::PausedAfterFailures);
+        let (resumed, _) = paused
+            .patched(&patch(serde_json::json!({"enabled": true})), now(), None)
+            .unwrap();
+        assert_eq!((resumed.failure_count, resumed.paused_reason), (0, None));
+        let mut done = once.clone();
+        done.enabled = false;
+        done.start_date = Some("2026-11-01".into());
+        assert!(done
+            .patched(
+                &patch(serde_json::json!({"params": {"title": "New", "instruction": "Search"}})),
+                now(),
+                Some(&tz())
+            )
+            .is_ok());
+        assert!(done
+            .patched(
+                &patch(serde_json::json!({"enabled": true})),
+                now(),
+                Some(&tz())
+            )
+            .is_err());
+    }
+
+    /// The local dates of a job's slots from `from`, `count` of them.
+    fn slot_dates(job: &Job, from: &str, count: usize) -> Vec<String> {
+        let tz = tz();
+        let mut now = at(from);
+        let mut dates = Vec::new();
+        for _ in 0..count {
+            let Some(slot) = job.next_slot(now, &tz) else {
+                break;
+            };
+            // Each slot is also the newest one at its own time.
+            assert_eq!(job.latest_slot(slot, &tz), Some(slot));
+            dates.push(tz.to_datetime(to_timestamp(slot).unwrap()).to_string());
+            now = slot;
+        }
+        dates
+    }
+
+    #[test]
+    fn monthly_slots_clamp_to_the_month_end() {
+        let mut last = job(Cadence::Monthly, None, 600);
+        last.month_day = Some(31);
+        assert_eq!(
+            slot_dates(&last, "2027-12-01T00:00:00Z", 4),
+            [
+                "2027-12-31T10:00:00",
+                "2028-01-31T10:00:00",
+                "2028-02-29T10:00:00",
+                "2028-03-31T10:00:00"
+            ]
+        );
+        last.month_day = Some(30);
+        assert_eq!(
+            slot_dates(&last, "2027-01-31T00:00:00Z", 2),
+            ["2027-02-28T10:00:00", "2027-03-30T10:00:00"]
+        );
+        // Between two slots the newest is last month's.
+        assert_eq!(
+            last.latest_slot(at("2027-03-15T00:00:00Z"), &tz()),
+            Some(at("2027-02-28T09:00:00Z"))
+        );
+        // On the spring-forward day 02:30 runs at 03:30.
+        let mut spring = job(Cadence::Monthly, None, 150);
+        spring.month_day = Some(29);
+        assert_eq!(
+            spring.next_slot(at("2026-03-01T00:00:00Z"), &tz()),
+            Some(at("2026-03-29T01:30:00Z"))
+        );
+    }
+
+    #[test]
+    fn every_n_counts_from_the_start_date() {
+        let mut half_year = job(Cadence::Monthly, None, 540);
+        half_year.month_day = Some(13);
+        half_year.every = 6;
+        half_year.start_date = Some("2026-11-13".into());
+        assert_eq!(
+            slot_dates(&half_year, "2026-01-01T00:00:00Z", 3),
+            [
+                "2026-11-13T09:00:00",
+                "2027-05-13T09:00:00",
+                "2027-11-13T09:00:00"
+            ]
+        );
+        // A month day before the start date counts from the next month.
+        half_year.start_date = Some("2026-11-20".into());
+        assert_eq!(
+            slot_dates(&half_year, "2026-11-01T00:00:00Z", 2),
+            ["2026-12-13T09:00:00", "2027-06-13T09:00:00"]
+        );
+        assert_eq!(
+            half_year.latest_slot(at("2027-06-01T00:00:00Z"), &tz()),
+            Some(at("2026-12-13T08:00:00Z"))
+        );
+        assert_eq!(
+            half_year.latest_slot(at("2026-12-01T00:00:00Z"), &tz()),
+            None
+        );
+        let mut three_days = job(Cadence::Daily, None, 420);
+        three_days.every = 3;
+        three_days.start_date = Some("2026-03-28".into());
+        // Across the spring-forward night.
+        assert_eq!(
+            slot_dates(&three_days, "2026-03-01T00:00:00Z", 3),
+            [
+                "2026-03-28T07:00:00",
+                "2026-03-31T07:00:00",
+                "2026-04-03T07:00:00"
+            ]
+        );
+        let mut fortnight = job(Cadence::Weekly, Some(5), 1439);
+        fortnight.every = 2;
+        // Wednesday: the first Friday is two days later.
+        fortnight.start_date = Some("2026-10-21".into());
+        assert_eq!(
+            slot_dates(&fortnight, "2026-10-01T00:00:00Z", 3),
+            [
+                "2026-10-23T23:59:00",
+                "2026-11-06T23:59:00",
+                "2026-11-20T23:59:00"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_one_time_job_runs_once_and_a_run_limit_ends_a_job() {
+        let tz = tz();
+        let mut once = Job {
+            kind: Kind::Reminder,
+            ..job(Cadence::Once, None, 150)
+        };
+        once.start_date = Some("2026-10-25".into());
+        // Fall back: 02:30 occurs twice and runs once, at the first.
+        let slot = at("2026-10-25T00:30:00Z");
+        assert_eq!(once.next_slot(at("2026-01-01T00:00:00Z"), &tz), Some(slot));
+        assert_eq!(once.next_slot(slot, &tz), None);
+        assert_eq!(once.latest_slot(at("2026-10-25T00:29:00Z"), &tz), None);
+        assert_eq!(
+            once.latest_slot(at("2027-10-25T00:00:00Z"), &tz),
+            Some(slot)
+        );
+        assert_eq!(
+            once.due(slot, &tz),
+            Due::Nothing,
+            "not a kind that runs yet"
+        );
+        once.kind = Kind::DependencyReview;
+        assert_eq!(once.due(slot, &tz), Due::Run(slot));
+        assert_eq!(once.due(at("2027-01-01T00:00:00Z"), &tz), Due::Missed(slot));
+        assert!(once.ends_with(RunStatus::Running) && once.ends_with(RunStatus::Missed));
+        // Two runs: the second ends the job, a missed slot does not count.
+        let mut twice = job(Cadence::Daily, None, 420);
+        twice.max_runs = Some(2);
+        assert!(!twice.ends_with(RunStatus::Running));
+        twice.run_count = 1;
+        assert!(twice.ends_with(RunStatus::Running) && !twice.ends_with(RunStatus::Missed));
+        let today = at("2026-11-11T06:00:00Z");
+        assert_eq!(twice.due(today, &tz), Due::Run(today));
+        twice.run_count = 2;
+        assert_eq!(twice.due(today, &tz), Due::Nothing);
+        assert!(!job(Cadence::Daily, None, 420).ends_with(RunStatus::Running));
+    }
+
+    #[test]
+    fn the_runner_skips_kinds_it_does_not_run_yet_and_expired_jobs() {
+        let tz = tz();
+        let today = at("2026-11-11T06:00:00Z");
+        let daily = job(Cadence::Daily, None, 420);
+        assert_eq!(daily.due(today, &tz), Due::Run(today));
+        for kind in [Kind::Prompt, Kind::Reminder, Kind::DiskCheck] {
+            assert!(!kind.runnable());
+            let skipped = Job {
+                kind,
+                ..daily.clone()
+            };
+            assert_eq!(skipped.due(today, &tz), Due::Nothing);
+            assert_eq!(
+                skipped.due(today + time::Duration::days(2), &tz),
+                Due::Nothing
+            );
+        }
+        assert!(Kind::DependencyReview.runnable());
+        let expired = Job {
+            expires_at: Some(today),
+            ..daily.clone()
+        };
+        assert_eq!(expired.due(today, &tz), Due::Nothing);
     }
 
     async fn database() -> std::result::Result<Database, Box<dyn std::error::Error>> {
