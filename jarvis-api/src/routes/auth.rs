@@ -390,9 +390,18 @@ pub(crate) async fn pairing_create(
     // Only a password-verified request may reach the owner's phone; an
     // unauthenticated caller must not be able to trigger pushes.
     if password_verified {
-        state
-            .notifier
-            .notify_approval(crate::notify::NotifyEvent::PairingRequested, user.id, None);
+        let device = crate::notify::DeviceInfo {
+            name: pairing.candidate_name.clone(),
+            platform: pairing.candidate_platform.clone(),
+            model: pairing.details.model.clone(),
+            ip: pairing.details.ip.clone(),
+            fingerprint: Some(pairing.candidate_fingerprint.clone()),
+        };
+        state.notifier.notify_approval(
+            crate::notify::NotifyEvent::PairingRequested(device),
+            user.id,
+            None,
+        );
     }
     // A password-verified request is rare and always worth a row; one without
     // a password check (legacy owner) is budgeted like other anonymous events.
@@ -777,8 +786,13 @@ pub(crate) async fn unlock_request(
         .map_err(internal)?;
     // Enqueue only: a full queue or an unreachable ntfy never delays or fails
     // the request.
+    let device = crate::notify::DeviceInfo {
+        name: authed.device.name.clone(),
+        platform: authed.device.platform.clone(),
+        ..Default::default()
+    };
     state.notifier.notify_approval(
-        crate::notify::NotifyEvent::UnlockRequested,
+        crate::notify::NotifyEvent::UnlockRequested(device),
         authed.user.id,
         Some(authed.device.id),
     );
