@@ -140,8 +140,18 @@ fn room(existing: &[Job], job: &Job) -> Result<()> {
 }
 
 async fn insert(db: &Database, job: Job) -> Result<Job> {
+    // ponytail: a caller's timeout drops this future and the lock with it
+    // while a CREATE may still commit; it takes a database stalled past the
+    // timeout. Hold the lock outside the timeout if that ever matters.
     let _creating = CREATE.lock().await;
-    room(&list(db).await?, &job)?;
+    // Every row, unlike `list`, so none can drop out of the count.
+    let existing = rows(
+        db,
+        &format!("SELECT {JOB_FIELDS} FROM scheduled_jobs"),
+        json!({}),
+    )
+    .await?;
+    room(&existing, &job)?;
     run(
         db,
         &format!(

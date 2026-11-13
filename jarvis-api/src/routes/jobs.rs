@@ -67,14 +67,16 @@ async fn bounded<T>(
     }
 }
 
-/// The job with `next_run_at`: its next slot, or null while it is disabled
-/// or the runner is off.
+/// The job with `next_run_at`: its next slot, or null while it is disabled,
+/// expired or of a kind that does not run yet, or the runner is off.
 fn job(state: &AppState, job: Job) -> Value {
+    let now = OffsetDateTime::now_utc();
     let next = state
         .jobs
         .time_zone()
-        .filter(|_| job.enabled)
-        .and_then(|tz| job.next_slot(OffsetDateTime::now_utc(), tz))
+        .filter(|_| job.enabled && job.kind.runnable())
+        .filter(|_| job.expires_at.is_none_or(|at| at > now))
+        .and_then(|tz| job.next_slot(now, tz))
         .and_then(|at| at.format(&Rfc3339).ok());
     let mut body = json!(job);
     body["next_run_at"] = json!(next);

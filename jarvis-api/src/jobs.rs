@@ -56,7 +56,9 @@ const DEFAULT_MONTH_DAY: u8 = 1;
 pub const MAX_OWNER_JOBS: usize = 10;
 /// Jobs Jarvis made for itself, apart from the owner's.
 pub const MAX_JARVIS_JOBS: usize = 3;
-/// A job Jarvis made for itself is deleted this long after it was made.
+/// A job Jarvis made for itself expires this long after it was made: the
+/// runner skips it and it leaves Jarvis's room (deletion follows with the
+/// runners).
 pub const JARVIS_JOB_DAYS: i64 = 30;
 pub const MAX_TITLE: usize = 60;
 pub const MAX_INSTRUCTION: usize = 500;

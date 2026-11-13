@@ -12,8 +12,9 @@ DEFINE FIELD OVERWRITE kind ON scheduled_jobs TYPE string ASSERT $value IN ['dep
 -- last day.
 DEFINE FIELD OVERWRITE cadence ON scheduled_jobs TYPE string ASSERT $value IN ['once', 'daily', 'weekly', 'monthly'] AND ($value = 'weekly') = (weekday != NONE) AND ($value = 'monthly') = (month_day != NONE) AND ($value != 'once' OR (start_date != NONE AND (every = NONE OR every = 1) AND max_runs = NONE));
 DEFINE FIELD IF NOT EXISTS month_day ON scheduled_jobs TYPE option<int> ASSERT $value = NONE OR ($value >= 1 AND $value <= 31);
--- Every this many days, weeks or months; NONE (rows before 0021) is 1.
-DEFINE FIELD IF NOT EXISTS every ON scheduled_jobs TYPE option<int> ASSERT $value = NONE OR ($value >= 1 AND $value <= 365);
+-- Every this many days, weeks or months, counted from `start_date`; NONE
+-- (rows before 0021) is 1.
+DEFINE FIELD IF NOT EXISTS every ON scheduled_jobs TYPE option<int> ASSERT $value = NONE OR ($value >= 1 AND $value <= 365 AND ($value = 1 OR start_date != NONE));
 -- A civil date in Europe/Amsterdam: the day of a one-time job, or the first
 -- day a repeating job may run, from which `every` counts.
 DEFINE FIELD IF NOT EXISTS start_date ON scheduled_jobs TYPE option<string> ASSERT $value = NONE OR $value = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;

@@ -22,7 +22,8 @@ follow.
 There is at most one `dependency_review` and at most 10 jobs of the other
 kinds made by the owner. Jarvis may keep up to 3 `prompt` jobs of its own
 apart from those; Core makes them itself (never through the API), and each
-expires 30 days after it was made. Nothing is seeded.
+expires 30 days after it was made: it no longer runs or counts towards the
+3 (deleting expired jobs follows with the runners). Nothing is seeded.
 
 ## API
 
@@ -44,8 +45,8 @@ A job has `id`, `kind`, `cadence`, `weekday`, `month_day`, `every`,
 `start_date`, `max_runs`, `at_minute`, `enabled`, `revision`, `params`,
 `last_slot_at`, `run_count`, `origin`, `owner_id`, `conversation_id`,
 `expires_at`, `failure_count`, `paused_reason`, `created_at`, `updated_at`
-and `next_run_at` (its next slot; null while it is disabled or the runner
-is off).
+and `next_run_at` (its next slot; null while it is disabled, expired or of a
+kind that does not run yet, or the runner is off).
 
 - `cadence`: `weekly` (default), `daily`, `monthly` or `once`.
 - `weekday`: 1 (Monday, default) to 7 (Sunday) for a weekly job; other jobs

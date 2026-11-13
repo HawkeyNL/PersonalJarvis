@@ -675,7 +675,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     for good in [
         new_job(&fresh_id(), ""),
         new_job(&fresh_id(), ", kind = 'reminder', cadence = 'once', month_day = NONE, every = NONE, max_runs = NONE, params = { title: 'Call', text: 'Call the bank.' }"),
-        new_job(&fresh_id(), ", kind = 'disk_check', cadence = 'daily', month_day = NONE, every = 365, start_date = NONE, max_runs = NONE, params = { threshold_percent: 80 }"),
+        new_job(&fresh_id(), ", kind = 'disk_check', cadence = 'daily', month_day = NONE, every = 1, start_date = NONE, max_runs = NONE, params = { threshold_percent: 80 }"),
         new_job(&fresh_id(), &format!(", origin = 'jarvis', expires_at = time::now() + 30d, conversation_id = '{r}'")),
         new_job(&fresh_id(), ", enabled = false, failure_count = 3, paused_reason = 'paused_after_failures'"),
     ] {
@@ -696,6 +696,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         new_job(x, ", cadence = 'daily'"),
         new_job(x, ", every = 0"),
         new_job(x, ", every = 366"),
+        new_job(x, ", start_date = NONE"),
         new_job(x, ", start_date = '13-11-2026'"),
         new_job(x, ", cadence = 'once', month_day = NONE, every = 1"),
         new_job(x, ", cadence = 'once', month_day = NONE, max_runs = NONE"),
