@@ -67,14 +67,14 @@ async fn bounded<T>(
     }
 }
 
-/// The job with `next_run_at`: its next slot, or null while it is disabled,
-/// expired or of a kind that does not run yet, or the runner is off.
+/// The job with `next_run_at`: its next slot, or null while it is disabled
+/// or expired, or the runner is off.
 fn job(state: &AppState, job: Job) -> Value {
     let now = OffsetDateTime::now_utc();
     let next = state
         .jobs
         .time_zone()
-        .filter(|_| job.enabled && job.kind.runnable())
+        .filter(|_| job.enabled)
         .filter(|_| job.expires_at.is_none_or(|at| at > now))
         .and_then(|tz| job.next_slot(now, tz))
         .and_then(|at| at.format(&Rfc3339).ok());
@@ -105,23 +105,38 @@ async fn check_roadmap(state: &AppState, params: Option<&Params>) -> Result<(), 
     }
 }
 
-/// A prompt's instruction leaves the Home Node in a web search, so it must
-/// not carry personal or financial details or a held symbol. Fails closed
-/// when the holdings cannot be read.
+/// A prompt's instruction leaves the Home Node in a web search and its title
+/// may, so neither may carry personal or financial details or a held
+/// symbol. Fails closed when the holdings cannot be read.
 async fn check_private(state: &AppState, params: Option<&Params>) -> Result<(), Failure> {
-    let Some(instruction) = params.and_then(|params| params.instruction.as_deref()) else {
+    let Some((instruction, params)) =
+        params.and_then(|params| Some((params.instruction.as_deref()?, params)))
+    else {
         return Ok(());
     };
     let Some(held) = crate::auto_research::held_symbols(state).await else {
         tracing::warn!("job privacy check: holdings unavailable");
         return Err(unavailable());
     };
-    if is_private(instruction, &held) {
+    if is_private(instruction, &held)
+        || params
+            .title
+            .as_deref()
+            .is_some_and(|title| is_private(title, &held))
+    {
         return Err(bad_request(
-            "params.instruction may hold personal or financial details; leave them out",
+            "params.title or params.instruction may hold personal or financial details; \
+             leave them out",
         ));
     }
     Ok(())
+}
+
+/// One security audit row per owner change: the device and the job id,
+/// never the job's text.
+async fn audit(state: &AppState, authed: &Authed, event: &str, job_id: &str) {
+    crate::audit::record_security_event(state, Some(authed.device.id), event, "ok", Some(job_id))
+        .await;
 }
 
 #[derive(Deserialize)]
@@ -159,11 +174,12 @@ pub(crate) async fn create(
     check_private(&state, Some(&input.params)).await?;
     input.owner_id = Some(authed.user.id.hyphenated().to_string());
     let created = bounded(store::create(&state.db, input, state.jobs.time_zone())).await?;
+    audit(&state, &authed, "jobs.created", &created.id).await;
     Ok(Json(job(&state, created)))
 }
 
 pub(crate) async fn update(
-    _authed: Authed,
+    authed: Authed,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(revision): Query<RevisionQuery>,
@@ -179,22 +195,22 @@ pub(crate) async fn update(
         state.jobs.time_zone(),
     ))
     .await?;
+    if updated.revision != revision.expected_revision {
+        audit(&state, &authed, "jobs.updated", &updated.id).await;
+    }
     Ok(Json(job(&state, updated)))
 }
 
 /// Delete the job and its runs.
 pub(crate) async fn delete(
-    _authed: Authed,
+    authed: Authed,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(revision): Query<RevisionQuery>,
 ) -> ApiResult {
-    bounded(store::delete(
-        &state.db,
-        &id.to_string(),
-        revision.expected_revision,
-    ))
-    .await?;
+    let id = id.to_string();
+    bounded(store::delete(&state.db, &id, revision.expected_revision)).await?;
+    audit(&state, &authed, "jobs.deleted", &id).await;
     Ok(Json(json!({ "deleted": true })))
 }
 
@@ -212,14 +228,8 @@ pub(crate) async fn run_now(
         ));
     }
     let id = id.to_string();
-    let Some(found) = bounded(store::get(&state.db, &id)).await? else {
+    if bounded(store::get(&state.db, &id)).await?.is_none() {
         return Err(error(StatusCode::NOT_FOUND, "not found"));
-    };
-    if !found.kind.runnable() {
-        return Err(error(
-            StatusCode::CONFLICT,
-            "jobs of this kind do not run yet",
-        ));
     }
     let last = bounded(store::last_owner_run(&state.db, &id)).await?;
     let interval = time::Duration::hours(OWNER_RUN_HOURS.into());

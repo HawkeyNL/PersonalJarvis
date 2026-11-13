@@ -999,6 +999,73 @@ async fn auto_research_answer(
     })
 }
 
+/// A scheduled `prompt` job's search (docs/SCHEDULED_JOBS.md): the
+/// automatic search's path, metered as `job`. The answer and the model it is
+/// stored under (`web:<model>`), or `None` when no search ran.
+pub(crate) async fn job_research(
+    state: &AppState,
+    request_id: Uuid,
+    question: &str,
+) -> Option<(String, String)> {
+    let started = Instant::now();
+    let (mut reply, model) = auto_research_answer(
+        &state.model_routing.snapshot(),
+        state.llm.as_ref(),
+        question,
+    )
+    .await?;
+    let status = estimate_missing_usage(&mut reply, question.len(), state.llm_max_tokens);
+    record_usage_with_metadata(
+        state,
+        &reply,
+        jarvis_usage::UsageMetadata {
+            request_id: request_id.to_string(),
+            routing_mode: "job".into(),
+            quality_tier: "hard".into(),
+            latency_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+            status: status.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    Some((reply.text, model))
+}
+
+/// Post an assistant message to a job's conversation, made anew (titled
+/// `title`) when it has none or the owner deleted it, and tell the apps.
+/// Returns the conversation and message ids.
+pub(crate) async fn post_job_message(
+    state: &AppState,
+    user: Uuid,
+    conversation: Option<Uuid>,
+    title: &str,
+    content: &str,
+    model: &str,
+) -> Result<(Uuid, Uuid), ()> {
+    let mut posted = match conversation {
+        Some(id) => append_to_live_conversation(&state.db, id, user, content, model)
+            .await?
+            .map(|found| (id, found)),
+        None => None,
+    };
+    if posted.is_none() {
+        let id = create_conversation(&state.db, user, &clean_title(title)).await?;
+        posted = append_to_live_conversation(&state.db, id, user, content, model)
+            .await?
+            .map(|found| (id, found));
+    }
+    let (id, (message, title)) = posted.ok_or(())?;
+    state.realtime.publish(
+        user,
+        Event::ConversationUpdated(ConversationMetadata {
+            id,
+            title,
+            updated_at: OffsetDateTime::now_utc(),
+        }),
+    );
+    Ok((id, message.id))
+}
+
 /// The answer to an explicit Research request. Off, too long, carrying a
 /// personal identifier ([`llm::privacy::leaks_identifier`]) or unavailable is
 /// a clear, fixed answer, never a silent paid-API or non-search answer. There

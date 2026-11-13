@@ -31,6 +31,8 @@ const MIN_REFRESH_SECS: u64 = 20 * 60;
 /// minutes, unlock requests two.
 const PAIRING_EXPIRATION_SECS: u64 = 5 * 60;
 const UNLOCK_EXPIRATION_SECS: u64 = 2 * 60;
+/// A job's push is still worth showing an hour late.
+const JOB_EXPIRATION_SECS: u64 = 60 * 60;
 const MAX_KEY_BYTES: usize = 1024;
 
 pub struct Config {
@@ -390,6 +392,7 @@ fn request(
     });
     let expiration = match event {
         NotifyEvent::PairingRequested(_) | NotifyEvent::PairingAgain => PAIRING_EXPIRATION_SECS,
+        NotifyEvent::JobResult(_) => JOB_EXPIRATION_SECS,
         _ => UNLOCK_EXPIRATION_SECS,
     };
     client

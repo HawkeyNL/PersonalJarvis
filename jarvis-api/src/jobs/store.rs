@@ -23,6 +23,8 @@ use super::{
 
 /// An owner may start a job at most once per this many hours.
 pub const OWNER_RUN_HOURS: u32 = 1;
+/// Failed runs in a row that pause a chat-made job.
+pub const MAX_FAILURES: u16 = 3;
 /// Rows deleted per statement and statements per sweep.
 const PRUNE_BATCH: usize = 5_000;
 const PRUNE_MAX_BATCHES: usize = 20;
@@ -300,6 +302,67 @@ pub async fn delete(db: &Database, id: &str, expected: u64) -> Result<()> {
         Some(job) if job.revision != expected => Err(JobError::Conflict),
         Some(_) => Err(error.into()),
     }
+}
+
+/// Point the job at the conversation its runs write to. Core's own field:
+/// the revision stays.
+pub async fn set_conversation(db: &Database, job_id: &str, conversation_id: &str) -> Result<()> {
+    run(
+        db,
+        "UPDATE scheduled_jobs SET conversation_id = $conversation_id \
+         WHERE record::id(id) = $id RETURN NONE",
+        json!({"id": job_id, "conversation_id": conversation_id}),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Count a failed run, or end the streak. The [`MAX_FAILURES`]th failed run
+/// in a row disables the job at the next revision, with the reason
+/// `paused_after_failures`; true then.
+pub async fn record_outcome(db: &Database, job_id: &str, failed: bool) -> Result<bool> {
+    let mut response = run(
+        db,
+        "BEGIN TRANSACTION; \
+         UPDATE scheduled_jobs \
+           SET failure_count = IF $failed THEN (failure_count ?? 0) + 1 ELSE 0 END \
+           WHERE record::id(id) = $id RETURN NONE; \
+         UPDATE scheduled_jobs SET enabled = false, \
+           paused_reason = 'paused_after_failures', revision = revision + 1 \
+           WHERE record::id(id) = $id AND failure_count >= $max AND enabled = true \
+           RETURN VALUE record::id(id); \
+         COMMIT TRANSACTION;",
+        json!({"id": job_id, "failed": failed, "max": MAX_FAILURES}),
+    )
+    .await?;
+    let last = response
+        .num_statements()
+        .checked_sub(1)
+        .ok_or(JobError::InvalidData)?;
+    let paused: Vec<String> = response.take(last)?;
+    Ok(!paused.is_empty())
+}
+
+/// Delete the jobs Jarvis made for itself that expired, with their runs.
+/// Returns their ids.
+pub async fn delete_expired(db: &Database) -> Result<Vec<String>> {
+    let mut response = run(
+        db,
+        "BEGIN TRANSACTION; \
+         LET $ids = (SELECT VALUE record::id(id) FROM scheduled_jobs \
+           WHERE origin = 'jarvis' AND expires_at != NONE AND expires_at <= time::now()); \
+         DELETE scheduled_jobs WHERE record::id(id) IN $ids RETURN NONE; \
+         DELETE scheduled_job_runs WHERE job_id IN $ids RETURN NONE; \
+         RETURN $ids; \
+         COMMIT TRANSACTION;",
+        json!({}),
+    )
+    .await?;
+    let last = response
+        .num_statements()
+        .checked_sub(1)
+        .ok_or(JobError::InvalidData)?;
+    Ok(response.take(last)?)
 }
 
 /// Write the row of a run before it starts, or a `missed` row, and return
@@ -1172,6 +1235,100 @@ mod tests {
             (missed.enabled, missed.run_count, missed.revision),
             (false, 0, 2)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn failures_pause_and_expired_jobs_of_jarvis_go(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = database().await?;
+        let owner = uuid::Uuid::now_v7().to_string();
+        let job = create(&db, prompt(), None).await?;
+        // Two failures, a success, then two more failures: no pause yet.
+        for failed in [true, true, false, true, true] {
+            assert!(!record_outcome(&db, &job.id, failed).await?);
+        }
+        let streak = get(&db, &job.id).await?.ok_or("job")?;
+        assert_eq!((streak.failure_count, streak.enabled), (2, true));
+        // The third in a row pauses it at the next revision.
+        assert!(record_outcome(&db, &job.id, true).await?);
+        let paused = get(&db, &job.id).await?.ok_or("job")?;
+        assert_eq!(
+            (
+                paused.failure_count,
+                paused.enabled,
+                paused.paused_reason,
+                paused.revision
+            ),
+            (
+                3,
+                false,
+                Some(super::super::PausedReason::PausedAfterFailures),
+                2
+            )
+        );
+        assert!(!record_outcome(&db, &job.id, true).await?);
+        // Enabling it again clears the streak and the reason.
+        let resumed = update(
+            &db,
+            &job.id,
+            2,
+            &JobPatch {
+                enabled: Some(true),
+                ..JobPatch::default()
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(
+            (
+                resumed.failure_count,
+                resumed.paused_reason,
+                resumed.enabled
+            ),
+            (0, None, true)
+        );
+        let conversation = uuid::Uuid::now_v7().to_string();
+        set_conversation(&db, &job.id, &conversation).await?;
+        let pointed = get(&db, &job.id).await?.ok_or("job")?;
+        assert_eq!(
+            pointed.conversation_id.as_deref(),
+            Some(conversation.as_str())
+        );
+        assert_eq!(pointed.revision, resumed.revision);
+
+        // An expired job of Jarvis's goes with its runs; others stay.
+        let own = create_for_jarvis(&db, prompt(), &owner, None).await?;
+        let expired = create_for_jarvis(&db, prompt(), &owner, None).await?;
+        start_run(
+            &db,
+            &expired,
+            slot("2026-11-09T06:00:00Z"),
+            Trigger::Schedule,
+            RunStatus::Missed,
+        )
+        .await?;
+        run(
+            &db,
+            "UPDATE scheduled_jobs SET expires_at = time::now() - 1s WHERE record::id(id) = $id",
+            json!({"id": expired.id}),
+        )
+        .await?;
+        assert_eq!(
+            delete_expired(&db).await?,
+            std::slice::from_ref(&expired.id)
+        );
+        assert!(get(&db, &expired.id).await?.is_none());
+        assert!(get(&db, &own.id).await?.is_some() && get(&db, &job.id).await?.is_some());
+        let runs: Vec<String> = rows(
+            &db,
+            "SELECT VALUE record::id(id) FROM scheduled_job_runs WHERE job_id = $id",
+            json!({"id": expired.id}),
+        )
+        .await?;
+        assert!(runs.is_empty());
+        assert!(delete_expired(&db).await?.is_empty());
         Ok(())
     }
 }

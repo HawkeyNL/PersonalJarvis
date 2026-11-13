@@ -49,6 +49,8 @@ const PAIRING_TITLE: &str = "New device wants to pair - verify in Jarvis";
 const MAX_NAME_CHARS: usize = 40;
 /// Longest platform and model shown in a push, in characters.
 const MAX_PLATFORM_CHARS: usize = 32;
+/// Longest reminder title shown in a push, in characters.
+const MAX_REMINDER_CHARS: usize = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NotifyEvent {
@@ -61,6 +63,19 @@ pub enum NotifyEvent {
     PairingAgain,
     /// A signed-in device asks another device to approve its unlock.
     UnlockRequested(DeviceInfo),
+    /// A scheduled job has something for the owner.
+    JobResult(JobResult),
+}
+
+/// What a scheduled job's push says (docs/SCHEDULED_JOBS.md).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobResult {
+    /// A research run ended; content-free, the answer stays in Jarvis.
+    Prompt,
+    /// A reminder with the owner's title, cleaned like a device name.
+    Reminder(String),
+    /// A Home Node disk at or above the job's threshold.
+    Disk { label: &'static str, percent: u8 },
 }
 
 /// The device behind an approval push, as Core stored it. Untrusted: a new
@@ -81,6 +96,9 @@ impl NotifyEvent {
             Self::BudgetNinetyPercent => "budget",
             Self::PairingRequested(_) | Self::PairingAgain => "pairing",
             Self::UnlockRequested(_) => "unlock",
+            Self::JobResult(JobResult::Prompt) => "job",
+            Self::JobResult(JobResult::Reminder(_)) => "reminder",
+            Self::JobResult(JobResult::Disk { .. }) => "disk",
         }
     }
 
@@ -141,12 +159,23 @@ impl NotifyEvent {
                     named(device)
                 ),
             ),
+            Self::JobResult(JobResult::Prompt) => (
+                "Jarvis",
+                "A scheduled job has a result — open Jarvis".to_string(),
+            ),
+            Self::JobResult(JobResult::Reminder(title)) => (
+                "Jarvis reminder",
+                clean(&unspoofable(title), MAX_REMINDER_CHARS, "Reminder"),
+            ),
+            Self::JobResult(JobResult::Disk { label, percent }) => {
+                ("Jarvis", format!("Disk {label} at {percent}%"))
+            }
         }
     }
 
     fn priority(&self) -> &'static str {
         match self {
-            Self::BudgetNinetyPercent => "default",
+            Self::BudgetNinetyPercent | Self::JobResult(_) => "default",
             Self::PairingRequested(_) | Self::PairingAgain | Self::UnlockRequested(_) => "high",
         }
     }
@@ -156,6 +185,9 @@ impl NotifyEvent {
             Self::BudgetNinetyPercent => "moneybag",
             Self::PairingRequested(_) | Self::PairingAgain => "key",
             Self::UnlockRequested(_) => "lock",
+            Self::JobResult(JobResult::Prompt) => "mag",
+            Self::JobResult(JobResult::Reminder(_)) => "bell",
+            Self::JobResult(JobResult::Disk { .. }) => "floppy_disk",
         }
     }
 
@@ -165,6 +197,7 @@ impl NotifyEvent {
             Self::BudgetNinetyPercent => "jarvis://health/usage",
             Self::PairingRequested(_) | Self::PairingAgain => "jarvis://approvals/pairing",
             Self::UnlockRequested(_) => "jarvis://approvals/unlock",
+            Self::JobResult(_) => "jarvis://jobs",
         }
     }
 }
@@ -307,6 +340,14 @@ impl Notifier {
         self.enqueue(Job {
             event,
             audience: None,
+        });
+    }
+
+    /// Like `notify`, and also push to all of `user`'s app push targets.
+    pub fn notify_user(&self, event: NotifyEvent, user: Uuid) {
+        self.enqueue(Job {
+            event,
+            audience: Some(Audience { user, except: None }),
         });
     }
 
@@ -552,6 +593,38 @@ fn parse_token(raw: &[u8]) -> Result<HeaderValue, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_pushes_say_little_and_clean_the_title() {
+        let (title, body) = NotifyEvent::JobResult(JobResult::Prompt).alert();
+        assert_eq!(
+            (title, body.as_str()),
+            ("Jarvis", "A scheduled job has a result — open Jarvis")
+        );
+        let reminder = NotifyEvent::JobResult(JobResult::Reminder(format!(
+            "Call\u{202E} the\nbank: https://x \"now\" {}",
+            "a".repeat(80)
+        )));
+        let (title, body) = reminder.alert();
+        assert_eq!(title, "Jarvis reminder");
+        assert!(body.starts_with("Call the bank httpsx -now- aaa"), "{body}");
+        assert_eq!(body.chars().count(), MAX_REMINDER_CHARS);
+        assert_eq!(
+            NotifyEvent::JobResult(JobResult::Reminder(" ".into()))
+                .alert()
+                .1,
+            "Reminder"
+        );
+        let disk = NotifyEvent::JobResult(JobResult::Disk {
+            label: "data",
+            percent: 91,
+        });
+        assert_eq!(disk.alert().1, "Disk data at 91%");
+        assert_eq!(disk.click(), "jarvis://jobs");
+        for event in [reminder, disk, NotifyEvent::JobResult(JobResult::Prompt)] {
+            assert!(event.alert().0.is_ascii());
+        }
+    }
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
