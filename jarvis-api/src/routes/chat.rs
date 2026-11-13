@@ -485,7 +485,40 @@ pub(super) async fn execute_chat(
     }
     match reply {
         Ok(mut reply) => {
-            let research_advised = research_advised(&mut reply.text, requested_mode, intent_kind);
+            let (research_advised, markers) =
+                research_advised(&mut reply.text, requested_mode, intent_kind);
+            // Only an ordinary runs-API answer may propose or make jobs; a
+            // research answer and the legacy endpoint only lose the markers.
+            // A job of Jarvis's own searches the web without the owner's
+            // click, so a turn with photos never makes one.
+            let honoured = realtime_run.is_some()
+                && user_already_published
+                && requested_mode != llm::RoutingMode::Research;
+            let job_proposals = if honoured {
+                crate::job_markers::proposals(&state, &markers.jobs).await
+            } else {
+                Vec::new()
+            };
+            let own_job = if honoured && !image_turn {
+                crate::job_markers::create_own(&state, authed.user.id, &markers.job_self).await
+            } else {
+                None
+            };
+            if markers.any_job && reply.text.trim().is_empty() {
+                reply.text = if requested_mode == llm::RoutingMode::Research {
+                    RESEARCH_EMPTY
+                } else if !job_proposals.is_empty() {
+                    JOB_PROPOSED_REPLY
+                } else if own_job.is_some() {
+                    OWN_JOB_REPLY
+                } else {
+                    JOB_REFUSED_REPLY
+                }
+                .into();
+            } else if honoured && !markers.jobs.is_empty() && job_proposals.is_empty() {
+                // The owner asked for a job and no card follows: say so.
+                reply.text = format!("{}\n\n{JOB_REFUSED_REPLY}", reply.text.trim_end());
+            }
             // A web answer never shows a photo; a chat answer only one of
             // this run's photos.
             let labels: &[(u8, Uuid)] = if requested_mode == llm::RoutingMode::Research {
@@ -531,6 +564,23 @@ pub(super) async fn execute_chat(
             )
             .await
             .map_err(|_| internal_error())?;
+            if let Some(job) = &own_job {
+                let note = crate::job_markers::note(job, state.jobs.time_zone());
+                let posted = tokio::time::timeout(
+                    crate::jobs::DB_TIMEOUT,
+                    append_to_live_conversation(
+                        &state.db,
+                        conv_id,
+                        authed.user.id,
+                        &note,
+                        JOB_NOTE_MODEL,
+                    ),
+                )
+                .await;
+                if !matches!(posted, Ok(Ok(Some(_)))) {
+                    tracing::warn!("note on a job of Jarvis's own not stored");
+                }
+            }
             if let Some(run) = &realtime_run {
                 // Only a runs-API run (its user message was persisted first)
                 // may search by itself; the legacy endpoint never does. A
@@ -555,6 +605,7 @@ pub(super) async fn execute_chat(
                         run: run.clone(),
                         message,
                         research_offer,
+                        job_proposals,
                     },
                 );
                 state.realtime.publish(
@@ -617,6 +668,7 @@ pub(super) async fn execute_chat(
                         run: run.clone(),
                         message,
                         research_offer: None,
+                        job_proposals: Vec::new(),
                     },
                 );
             }
@@ -737,22 +789,33 @@ fn remove_markers_once(line: &str) -> String {
 
 /// Stored when a reply was nothing but the web search marker.
 const MARKER_ONLY_REPLY: &str = "I can't answer this reliably without a web search.";
+/// Stored when a reply was nothing but job markers.
+const JOB_PROPOSED_REPLY: &str = "Here is a scheduled job for you to confirm.";
+const OWN_JOB_REPLY: &str = "I will follow this up myself.";
+const JOB_REFUSED_REPLY: &str = "I could not set up that job.";
+/// The model the note on a job of Jarvis's own is stored under, like a
+/// job's fixed messages.
+const JOB_NOTE_MODEL: &str = "job";
 
 /// Whether a web search is advised after this reply: the classifier said
-/// research, or an ordinary answer ended with the web search marker. The
-/// marker is taken off `reply` in every case, whatever the routing, so it is
-/// never stored, published or shown.
+/// research, or an ordinary answer ended with the web search marker; and the
+/// reply's trailing job markers. Every trailing marker is taken off `reply`
+/// in every case, whatever the routing, so none is ever stored, published
+/// or shown.
 fn research_advised(
     reply: &mut String,
     requested_mode: llm::RoutingMode,
     intent_kind: Option<crate::intent::WorkKind>,
-) -> bool {
-    let taken = crate::auto_research::take_marker(reply);
-    if taken && reply.is_empty() {
+) -> (bool, crate::job_markers::Markers) {
+    let markers = crate::job_markers::take(reply);
+    if markers.web_search && reply.is_empty() {
         *reply = MARKER_ONLY_REPLY.into();
     }
-    let marked = taken && requested_mode != llm::RoutingMode::Research;
-    intent_kind == Some(crate::intent::WorkKind::Research) || marked
+    let marked = markers.web_search && requested_mode != llm::RoutingMode::Research;
+    (
+        intent_kind == Some(crate::intent::WorkKind::Research) || marked,
+        markers,
+    )
 }
 
 const RESEARCH_OFF: &str = "Research is off. The owner can turn on web search with \
@@ -950,6 +1013,7 @@ async fn auto_research_run(
                     run: run.clone(),
                     message,
                     research_offer: None,
+                    job_proposals: Vec::new(),
                 },
             );
             state.realtime.publish(
@@ -987,7 +1051,8 @@ async fn auto_research_answer(
     question: &str,
 ) -> Option<(llm::ChatReply, String)> {
     let mut reply = research_reply(routing, brain, question).await;
-    // A web page may inject a trailing marker; strip it like any answer.
+    // A web page may inject trailing markers; strip them like any answer's.
+    // A job's answer comes here too and is never read for markers.
     research_advised(&mut reply.text, llm::RoutingMode::Research, None);
     take_photo_markers(&mut reply.text, &[]);
     if reply.text.trim().is_empty() {
@@ -1839,13 +1904,55 @@ mod tests {
         assert_eq!(reply.model, "claude-opus-5");
     }
 
+    #[tokio::test]
+    async fn web_and_job_answers_lose_job_markers_without_honouring_them() {
+        let brain = Recorder {
+            answer: Some("Web answer\n[[job_self {\"kind\":\"prompt\"}]]\n[[job {}]]"),
+            ..Default::default()
+        };
+        let on = routing(r#"{"version":1,"research_web_search":"auto"}"#);
+        let (reply, _) = auto_research_answer(&on, &brain, "nieuws?").await.unwrap();
+        assert_eq!(reply.text, "Web answer");
+        let only = Recorder {
+            answer: Some("[[job {}]]"),
+            ..Default::default()
+        };
+        let (reply, _) = auto_research_answer(&on, &only, "nieuws?").await.unwrap();
+        assert_eq!(reply.text, RESEARCH_EMPTY);
+    }
+
+    #[test]
+    fn job_markers_and_the_web_search_marker_come_off_in_any_order() {
+        use llm::RoutingMode::{Auto, Research};
+        for text in [
+            "Answer.\n[[job {}]]\n[[web_search]]",
+            "Answer.\n[[web_search]]\n[[job {}]]",
+            "Answer.\n[[job {}]]\n\n[[web_search]]\n[[job_self {}]]\n",
+        ] {
+            let mut text = text.to_owned();
+            let (advised, markers) = research_advised(&mut text, Auto, None);
+            assert!(advised && markers.web_search, "{text}");
+            assert_eq!(text, "Answer.");
+            assert_eq!(markers.jobs, ["{}"]);
+        }
+        // Only job markers: the caller stores a fixed text instead.
+        let mut text = "[[job {}]]".to_owned();
+        let (advised, markers) = research_advised(&mut text, Auto, None);
+        assert!(!advised && markers.any_job && text.is_empty());
+        // A research answer loses them too and never asks for a search.
+        let mut text = "Web.\n[[job_self {}]]\n[[web_search]]".to_owned();
+        let (advised, markers) = research_advised(&mut text, Research, None);
+        assert!(!advised);
+        assert_eq!((text.as_str(), markers.job_self.len()), ("Web.", 1));
+    }
+
     #[test]
     fn a_trailing_marker_or_the_classifier_advises_research() {
         use crate::intent::WorkKind;
         use llm::RoutingMode::{Auto, Deep, Research};
         let advised = |text: &str, mode, kind| {
             let mut text = text.to_owned();
-            (research_advised(&mut text, mode, kind), text)
+            (research_advised(&mut text, mode, kind).0, text)
         };
         let marked = "Short answer.\n[[web_search]]";
         assert_eq!(advised(marked, Auto, None), (true, "Short answer.".into()));

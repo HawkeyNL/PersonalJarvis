@@ -248,6 +248,7 @@ mod tests {
                 attachments: Vec::new(),
             },
             research_offer: None,
+            job_proposals: Vec::new(),
         }
     }
     fn enabled_gate(run: &RunIdentity) -> VoiceGate {

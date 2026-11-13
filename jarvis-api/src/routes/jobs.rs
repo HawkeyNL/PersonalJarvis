@@ -109,27 +109,32 @@ async fn check_roadmap(state: &AppState, params: Option<&Params>) -> Result<(), 
 /// may, so neither may carry personal or financial details or a held
 /// symbol. Fails closed when the holdings cannot be read.
 async fn check_private(state: &AppState, params: Option<&Params>) -> Result<(), Failure> {
-    let Some((instruction, params)) =
-        params.and_then(|params| Some((params.instruction.as_deref()?, params)))
-    else {
+    let Some(params) = params.filter(|params| params.instruction.is_some()) else {
         return Ok(());
     };
     let Some(held) = crate::auto_research::held_symbols(state).await else {
         tracing::warn!("job privacy check: holdings unavailable");
         return Err(unavailable());
     };
-    if is_private(instruction, &held)
-        || params
-            .title
-            .as_deref()
-            .is_some_and(|title| is_private(title, &held))
-    {
+    if is_private_job(params, &held) {
         return Err(bad_request(
             "params.title or params.instruction may hold personal or financial details; \
              leave them out",
         ));
     }
     Ok(())
+}
+
+/// Whether a prompt's instruction or title may hold personal or financial
+/// details or a symbol in `held`; jobs without an instruction never do.
+pub(crate) fn is_private_job(params: &Params, held: &[String]) -> bool {
+    params.instruction.as_deref().is_some_and(|instruction| {
+        is_private(instruction, held)
+            || params
+                .title
+                .as_deref()
+                .is_some_and(|title| is_private(title, held))
+    })
 }
 
 /// One security audit row per owner change: the device and the job id,

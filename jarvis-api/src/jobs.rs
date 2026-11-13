@@ -8,7 +8,7 @@
 //! forward by the gap (02:30 becomes 03:30); a minute that occurs twice on a
 //! fall-back day runs once, at its first occurrence.
 
-mod chat;
+pub(crate) mod chat;
 mod dependency_review;
 pub mod store;
 

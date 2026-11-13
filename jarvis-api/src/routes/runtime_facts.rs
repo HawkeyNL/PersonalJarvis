@@ -17,11 +17,12 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
 use crate::auto_research::WEB_SEARCH_MARKER;
 use crate::ibkr::store;
-use crate::jobs::TIME_ZONE;
+use crate::jobs::{Origin, MAX_JARVIS_JOBS, MAX_OWNER_JOBS, TIME_ZONE};
 use crate::AppState;
 
-/// Hard cap for the whole block (preface included).
-const MAX_BYTES: usize = 2 * 1024 + 256;
+/// Hard cap for the whole block (preface included): 2304 bytes, plus 1024
+/// for the job lines, so they take no room from the others.
+const MAX_BYTES: usize = 3 * 1024 + 256;
 /// One owner-configured value (a model id, an agent name) cannot crowd out
 /// the other lines.
 const MAX_LINE_BYTES: usize = 400;
@@ -70,6 +71,12 @@ pub(super) struct Facts<'a> {
     /// [`WEB_SEARCH_MARKER`]: a runs-API answer, `research_web_search` is
     /// `auto` and a research run could start now.
     pub auto_search: bool,
+    /// The owner's and Jarvis's jobs in use, when this answer may propose
+    /// jobs (a runs-API answer, the count read).
+    pub jobs: Option<(usize, usize)>,
+    /// Whether this answer may make a research job of Jarvis's own: also
+    /// Research and automatic web search on, what its runs need.
+    pub own_jobs: bool,
     /// `None` when no agent bundle is loaded.
     pub agents: Option<Vec<String>>,
     pub ibkr: Ibkr,
@@ -85,6 +92,12 @@ pub(super) async fn system_prompt(state: &AppState, runs_api: bool) -> String {
     let routing = state.model_routing.snapshot();
     let allows = |provider: &str, model: &str| state.model_policy.allows(provider, model);
     let research = state.llm.can_research();
+    let jobs = if runs_api {
+        let used = tokio::time::timeout(DB_TIMEOUT, crate::jobs::store::used(&state.db)).await;
+        used.ok().and_then(Result::ok)
+    } else {
+        None
+    };
     let facts = Facts {
         version: env!("CARGO_PKG_VERSION"),
         now: OffsetDateTime::now_utc(),
@@ -95,6 +108,8 @@ pub(super) async fn system_prompt(state: &AppState, runs_api: bool) -> String {
         codex_worker,
         research,
         auto_search: runs_api && research && routing.research_auto(),
+        jobs,
+        own_jobs: runs_api && crate::jobs::chat::research_on(state, Origin::Jarvis),
         agents: state.agent_registry.as_deref().map(|loader| {
             let snapshot = loader.snapshot();
             snapshot
@@ -282,6 +297,31 @@ fn lines(facts: &Facts) -> Vec<String> {
             )
         },
     ];
+    if let Some((owner, own)) = facts.jobs {
+        lines.push(format!(
+            "Scheduled jobs: when the owner asks for one, end your reply with up to 3 lines \
+             like [[job {{\"kind\":\"reminder\",\"title\":\"Water the plants\",\
+             \"cadence\":\"weekly\",\"weekday\":\"saturday\",\"time\":\"09:00\"}}]], \
+             JSON on one line. The owner confirms each in the app, so never say it is set up. \
+             {owner} of {MAX_OWNER_JOBS} jobs used."
+        ));
+        lines.push(
+            "Job fields: kind prompt (title, instruction: a web search, no personal details), \
+             reminder (title, text) or disk_check (threshold_percent 50-99); cadence once \
+             (needs start_date), daily, weekly (weekday name), monthly (month_day); optional \
+             every, start_date YYYY-MM-DD, time HH:MM, max_runs, notify."
+                .into(),
+        );
+        if facts.own_jobs {
+            lines.push(format!(
+                "Own research jobs: only for research you yourself want to follow up later, \
+                 one line [[job_self {{...}}]] (kind prompt, same fields) creates it without \
+                 asking; it expires in 30 days and Core tells the owner, so never say it is set \
+                 up. Never for jobs the owner asked for, no links or sites. {own} of \
+                 {MAX_JARVIS_JOBS} own research jobs used."
+            ));
+        }
+    }
     lines.push(format!(
         "Current time, to the hour: {hour} ({}). An age like [3 h ago] on an earlier owner \
          message is Core metadata and also dates the reply after it: never repeat it.",
@@ -450,6 +490,8 @@ mod tests {
             codex_worker: false,
             research: true,
             auto_search: false,
+            jobs: None,
+            own_jobs: false,
             agents: Some(vec!["Research".into(), "Trading".into()]),
             ibkr,
         }
@@ -575,6 +617,70 @@ mod tests {
             assert!(manual.contains("over an hour old may be outdated: say so if you use them.\n"));
             assert!(!manual.contains("are stale"));
         }
+    }
+
+    #[test]
+    fn job_lines_follow_web_search_only_when_jobs_can_be_proposed() {
+        let routing = routing(PaidApi::Allowed);
+        let full = || Facts {
+            auto_search: true,
+            jobs: Some((4, 1)),
+            own_jobs: true,
+            ..facts(&routing, synced())
+        };
+        let block = render(&full(), MAX_BYTES);
+        for expected in [
+            "Never claim Jarvis has no web access.\nScheduled jobs: when the owner asks for one, \
+             end your reply with up to 3 lines like [[job {\"kind\":\"reminder\",\"title\":\
+             \"Water the plants\",\"cadence\":\"weekly\",\"weekday\":\"saturday\",\
+             \"time\":\"09:00\"}]], JSON on one line.",
+            "never say it is set up. 4 of 10 jobs used.\nJob fields: kind prompt",
+            "max_runs, notify.\nOwn research jobs: only for research you yourself want",
+            "it expires in 30 days and Core tells the owner, so never say it is set up. Never \
+             for jobs the owner asked for, no links or sites. 1 of 3 own research jobs used.\n\
+             Current time",
+        ] {
+            assert!(block.contains(expected), "missing {expected:?} in {block}");
+        }
+        // Every other line still fits, the position lists included, with the
+        // room they had before the job lines, even with two-digit counts.
+        let job_lines: usize = render(
+            &Facts {
+                jobs: Some((10, 10)),
+                ..full()
+            },
+            MAX_BYTES,
+        )
+        .lines()
+        .filter(|line| {
+            ["Scheduled jobs:", "Job fields:", "Own research jobs:"]
+                .iter()
+                .any(|head| line.starts_with(head))
+        })
+        .map(|line| line.len() + 1)
+        .sum();
+        assert!(job_lines <= MAX_BYTES - (2 * 1024 + 256), "{job_lines}");
+        assert!(block.len() <= MAX_BYTES);
+        assert!(block.ends_with("\nNon-EUR positions, not tracked (1): FIXUSD."));
+        for line in block.lines() {
+            assert!(!line.ends_with('…'), "{line}");
+        }
+        let owner_only = render(
+            &Facts {
+                own_jobs: false,
+                ..full()
+            },
+            MAX_BYTES,
+        );
+        assert!(owner_only.contains("[[job {") && !owner_only.contains("job_self"));
+        let none = render(
+            &Facts {
+                jobs: None,
+                ..full()
+            },
+            MAX_BYTES,
+        );
+        assert!(!none.contains("[[job"));
     }
 
     #[test]

@@ -39,16 +39,22 @@ pub(crate) fn take_marker(text: &mut String) -> bool {
 }
 
 /// The end of the text before the last non-blank line, and that line trimmed.
-fn last_line(text: &str) -> (usize, &str) {
+pub(crate) fn last_line(text: &str) -> (usize, &str) {
     let body = text.trim_end();
     let start = body.rfind('\n').map_or(0, |at| at + 1);
     (body[..start].trim_end().len(), body[start..].trim_start())
 }
 
-/// Streams reply deltas without a trailing marker: trailing whitespace and a
-/// last line that could still become the marker wait for more text. What is
-/// held back when the stream ends is never sent; the completed message
-/// carries the final text.
+/// Most text [`MarkerHold`] holds back: room for every marker an answer may
+/// carry at its longest (3 jobs, one of Jarvis's own, the web search). Trailing
+/// `[[` lines beyond it are sent and only the completed message drops them.
+const MAX_HOLD_BYTES: usize = 5 * crate::routes::jobs::BODY_LIMIT;
+
+/// Streams reply deltas without trailing markers (this one and the job
+/// markers): trailing whitespace and the trailing lines that start with `[[`,
+/// or could, wait for more text, up to [`MAX_HOLD_BYTES`]. What is held back
+/// when the stream ends is never sent; the completed message carries the
+/// final text.
 #[derive(Default)]
 pub(crate) struct MarkerHold {
     text: String,
@@ -59,13 +65,16 @@ impl MarkerHold {
     /// The part of the reply that is now safe to send.
     pub(crate) fn push(&mut self, delta: &str) -> &str {
         self.text.push_str(delta);
-        let (keep, line) = last_line(&self.text);
-        let end = if !line.is_empty() && WEB_SEARCH_MARKER.starts_with(line) {
-            keep
-        } else {
-            self.text.trim_end().len()
+        let mut end = self.text.trim_end().len();
+        loop {
+            let (keep, line) = last_line(&self.text[..end]);
+            let marker = line.starts_with("[[") || "[[".starts_with(line);
+            if line.is_empty() || !marker || self.text.len() - keep > MAX_HOLD_BYTES {
+                break;
+            }
+            end = keep;
         }
-        .max(self.sent);
+        let end = end.max(self.sent);
         let ready = &self.text[self.sent..end];
         self.sent = end;
         ready
@@ -313,5 +322,25 @@ mod tests {
         );
         // Multi-byte text is split on character boundaries only.
         assert_eq!(stream(&["Café ", "\u{e9}t\u{e9}\n", "[["]), "Café été");
+        // Every trailing line that starts with `[[` waits: the job markers too.
+        assert_eq!(
+            stream(&[
+                "Answer.\n",
+                "[[job {\"kind\":",
+                "\"disk_check\"}]]\n[[web_search]]\n",
+                "[",
+                "[job_self {}]]\n"
+            ]),
+            "Answer."
+        );
+        assert_eq!(
+            stream(&["A\n[[x]]\n", "[[y]]\n", "B"]),
+            "A\n[[x]]\n[[y]]\nB"
+        );
+        // Bounded: beyond the cap the oldest held lines are sent.
+        let links = format!("A\n{}", "[[link]]\n".repeat(4000));
+        let sent = stream(&[&links]);
+        assert!(sent.len() < links.trim_end().len());
+        assert!(sent.len() + MAX_HOLD_BYTES >= links.trim_end().len());
     }
 }

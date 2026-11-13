@@ -112,15 +112,29 @@ pub async fn create_for_jarvis(
     insert(db, job).await
 }
 
+/// The owner's and Jarvis's jobs that count towards their room now.
+pub async fn used(db: &Database) -> Result<(usize, usize)> {
+    let existing = all(db).await?;
+    let now = OffsetDateTime::now_utc();
+    Ok((
+        in_room(&existing, Origin::Owner, now),
+        in_room(&existing, Origin::Jarvis, now),
+    ))
+}
+
+/// Jobs of `origin` in its room at `at`: not a `dependency_review`, not
+/// expired.
+fn in_room(existing: &[Job], origin: Origin, at: OffsetDateTime) -> usize {
+    existing
+        .iter()
+        .filter(|known| known.kind != Kind::DependencyReview && known.origin == origin)
+        .filter(|known| known.expires_at.is_none_or(|expires| expires > at))
+        .count()
+}
+
 /// Whether `existing` leaves room for `job`.
 fn room(existing: &[Job], job: &Job) -> Result<()> {
-    let count = |origin: Origin| {
-        existing
-            .iter()
-            .filter(|known| known.kind != Kind::DependencyReview && known.origin == origin)
-            .filter(|known| known.expires_at.is_none_or(|at| at > job.created_at))
-            .count()
-    };
+    let count = |origin: Origin| in_room(existing, origin, job.created_at);
     match (job.kind, job.origin) {
         (Kind::DependencyReview, _) => {
             if existing

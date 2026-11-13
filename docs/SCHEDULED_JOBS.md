@@ -16,7 +16,8 @@ A job's kind is a closed list, each with typed parameters:
 
 There is at most one `dependency_review` and at most 10 jobs of the other
 kinds made by the owner. Jarvis may keep up to 3 `prompt` jobs of its own
-apart from those; Core makes them itself (never through the API), and each
+apart from those; Core makes them itself from a chat answer (never through
+the API, see [From chat](#from-chat)), and each
 expires 30 days after it was made: it no longer runs or counts towards the
 3, and the runner deletes it with its runs on its next check. Nothing is
 seeded.
@@ -25,7 +26,8 @@ Each create, change and delete through the API writes a security audit row
 (`jobs.created`, `jobs.updated`, `jobs.deleted`, `jobs.run_requested`) with
 the device and the job id, never the job's text. Core writes rows without a
 device when it pauses a job (`jobs.paused`) or deletes an expired one
-(`jobs.expired_deleted`).
+(`jobs.expired_deleted`), and a `jobs.created` row without a device, with
+`origin=jarvis job=<id>`, when Jarvis makes a job for itself.
 
 ## API
 
@@ -112,6 +114,60 @@ Every change raises the job's `revision` by one; every write names the
 revision it was made on (`expected_revision`, required), and when the job has
 moved on, nothing is written and the answer is 409. A change that changes
 nothing keeps the revision.
+
+## From chat
+
+An ordinary chat answer through the runs API may end with marker lines,
+which Core takes off every answer before it is stored or streamed, valid or
+not (an invalid one is dropped and logged without its text, never shown).
+Only trailing lines count, after the last line of ordinary text, in any
+order with `[[web_search]]`; a marker anywhere else is ordinary text.
+Markers are honoured only on such answers: never on the legacy
+`POST /v1/assistant/chat`, an explicit Research answer, an automatic web
+search's answer or a job run's output, which only lose them. The JSON is
+model output that web text in the conversation may have steered, so it is
+one line of at most 4 KiB without hidden characters, parsed strictly
+(unknown fields refused) and checked exactly like a `POST /v1/jobs` body.
+
+```
+[[job {"kind":"reminder","title":"Call the bank","text":"Ask about the card","cadence":"once","start_date":"2026-12-01","time":"09:00"}]]
+[[job {"kind":"prompt","title":"AI news","instruction":"Summarize this week's AI news","cadence":"weekly","weekday":"friday","time":"08:30"}]]
+[[job_self {"kind":"prompt","title":"Rust releases","instruction":"Rust release notes","cadence":"weekly","weekday":"monday","time":"08:00"}]]
+```
+
+The fields are `kind` (`prompt`, `reminder` or `disk_check`), the kind's
+params flat (`title`, `instruction`, `text`, `threshold_percent`, `notify`),
+`cadence`, `weekday` as an English name (any case), `month_day`, `every`,
+`start_date`, `time` as `HH:MM` and `max_runs`.
+
+- `[[job …]]`: a proposal for the owner, at most 3 per answer and no more
+  than the owner's 10 leave room for. Each that passes the checks, the
+  privacy gate included (title and instruction; when the holdings or the
+  job count cannot be read, every proposal is dropped), goes out in the answer's
+  `assistant.completed` as `job_proposals: [{"id", "body"}]` (see
+  `REALTIME_PROTOCOL.md`): `body` is the exact `POST /v1/jobs` body (the
+  weekday a number, the time `at_minute`). Nothing is stored; only the
+  owner's confirmation in the app, a `POST /v1/jobs` with that body or an
+  edited one, makes the job. When every proposal was dropped, Core adds
+  `I could not set up that job.` to the answer.
+- `[[job_self …]]`: a research job Jarvis makes for itself, without
+  confirmation. Only the first such line counts, only a `prompt`, only while
+  Research and automatic web search are on (what its runs need) and never on
+  a turn with photos. Its title and instruction may not name a link or a
+  domain (it searches without the owner's click, from text web content may
+  have steered), and the privacy gate runs before it is stored, failing
+  closed; it counts towards Jarvis's own 3 and expires after 30 days. Core
+  then writes the audit row, pushes to the owner (see `NOTIFICATIONS.md`)
+  and posts a fixed note after the answer, under the model `job`: `I set up
+  a research job for myself: Rust releases — weekly on Monday at 08:00. It
+  expires on 13 December 2026; you can pause or delete it in Jobs.` The
+  apps see the job in `GET /v1/jobs`.
+
+An answer that was nothing but job markers is stored as a fixed sentence.
+The note is announced with `conversation.updated`, like a job's messages.
+The runtime facts of a runs-API answer explain the markers, with how many of
+the owner's 10 jobs and Jarvis's own 3 are in use; the `[[job_self …]]` part
+only while such a job could be made.
 
 ## Schedule
 

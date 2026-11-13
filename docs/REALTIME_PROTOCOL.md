@@ -62,6 +62,12 @@ Public events:
   never searches on it; an app may show a button whose click sends exactly
   that question as a new run with `"mode": "research"`. Older apps ignore it.
   It is absent when Core starts an automatic web search instead.
+  An ordinary runs-API answer may also carry `job_proposals`: up to 3
+  `{"id": "<uuid>", "body": {…}}`, scheduled jobs the answer proposed (see
+  "From chat" in `SCHEDULED_JOBS.md`). Each `body` is a checked
+  `POST /v1/jobs` body; only the owner's confirmation sends it, and `id`
+  only lets the app show each proposal once. Advisory and not stored;
+  absent when there are none, so older apps keep working.
 - `assistant.failed` with a fixed safe reason code
 - `voice.owner_changed`, `voice.started`, `voice.stopped`, `voice.failed`
 - `trading.meme.strategy_changed` with `strategy_id`, `version` and `enabled`,
@@ -157,10 +163,11 @@ schema-migration deployment procedure is required before any future release.
 
 ## Streaming and recovery
 
-Core removes a trailing `[[web_search]]` line from every chat answer before
-it is stored or published. While deltas stream, trailing whitespace and a last
-line that could still become that marker wait for more text; what is held back
-when the stream ends is never sent as a delta, and the completed message
+Core removes the trailing `[[web_search]]`, `[[job …]]` and
+`[[job_self …]]` lines from every chat answer before it is stored or
+published. While deltas stream, trailing whitespace and the trailing lines
+that start with `[[` (or could) wait for more text, up to 20 KiB; what is held
+back when the stream ends is never sent as a delta, and the completed message
 carries the final text.
 
 The provider-neutral `chat_stream` interface defaults to a final-only result.
