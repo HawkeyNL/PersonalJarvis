@@ -1000,20 +1000,28 @@ async fn auto_research_answer(
 }
 
 /// A scheduled `prompt` job's search (docs/SCHEDULED_JOBS.md): the
-/// automatic search's path, metered as `job`. The answer and the model it is
-/// stored under (`web:<model>`), or `None` when no search ran.
+/// automatic search's path within `limit`, metered as `job` after it. The
+/// answer and the model it is stored under (`web:<model>`), `Ok(None)` when
+/// no search ran, `Err` when it took too long.
 pub(crate) async fn job_research(
     state: &AppState,
     request_id: Uuid,
     question: &str,
-) -> Option<(String, String)> {
+    limit: std::time::Duration,
+) -> Result<Option<(String, String)>, tokio::time::error::Elapsed> {
     let started = Instant::now();
-    let (mut reply, model) = auto_research_answer(
-        &state.model_routing.snapshot(),
-        state.llm.as_ref(),
-        question,
+    let answer = tokio::time::timeout(
+        limit,
+        auto_research_answer(
+            &state.model_routing.snapshot(),
+            state.llm.as_ref(),
+            question,
+        ),
     )
     .await?;
+    let Some((mut reply, model)) = answer else {
+        return Ok(None);
+    };
     let status = estimate_missing_usage(&mut reply, question.len(), state.llm_max_tokens);
     record_usage_with_metadata(
         state,
@@ -1028,12 +1036,13 @@ pub(crate) async fn job_research(
         },
     )
     .await;
-    Some((reply.text, model))
+    Ok(Some((reply.text, model)))
 }
 
 /// Post an assistant message to a job's conversation, made anew (titled
 /// `title`) when it has none or the owner deleted it, and tell the apps.
-/// Returns the conversation and message ids.
+/// Returns the conversation and message ids. Each database call is bounded
+/// by the jobs' database timeout.
 pub(crate) async fn post_job_message(
     state: &AppState,
     user: Uuid,
@@ -1042,17 +1051,26 @@ pub(crate) async fn post_job_message(
     content: &str,
     model: &str,
 ) -> Result<(Uuid, Uuid), ()> {
+    let limit = crate::jobs::DB_TIMEOUT;
+    let append = |id: Uuid| async move {
+        tokio::time::timeout(
+            limit,
+            append_to_live_conversation(&state.db, id, user, content, model),
+        )
+        .await
+        .map_err(|_| ())?
+        .map(|found| found.map(|found| (id, found)))
+    };
     let mut posted = match conversation {
-        Some(id) => append_to_live_conversation(&state.db, id, user, content, model)
-            .await?
-            .map(|found| (id, found)),
+        Some(id) => append(id).await?,
         None => None,
     };
     if posted.is_none() {
-        let id = create_conversation(&state.db, user, &clean_title(title)).await?;
-        posted = append_to_live_conversation(&state.db, id, user, content, model)
-            .await?
-            .map(|found| (id, found));
+        let title = clean_title(title);
+        let id = tokio::time::timeout(limit, create_conversation(&state.db, user, &title))
+            .await
+            .map_err(|_| ())??;
+        posted = append(id).await?;
     }
     let (id, (message, title)) = posted.ok_or(())?;
     state.realtime.publish(

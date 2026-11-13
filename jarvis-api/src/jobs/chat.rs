@@ -78,6 +78,13 @@ async fn post(
     content: &str,
     model: &str,
 ) -> Option<(Uuid, Uuid)> {
+    // The owner may have deleted the job while it ran: then nothing is
+    // posted or pushed.
+    let current = tokio::time::timeout(super::DB_TIMEOUT, store::get(&state.db, &job.id)).await;
+    if !matches!(current, Ok(Ok(Some(_)))) {
+        tracing::info!("scheduled job gone or unreadable; nothing posted");
+        return None;
+    }
     let posted = crate::routes::chat::post_job_message(
         state,
         to.user,
@@ -168,8 +175,9 @@ pub(super) async fn prompt(state: &AppState, job: &Job, tz: &TimeZone) -> Finish
             "(Scheduled run, {}.) {instruction}",
             run_date(OffsetDateTime::now_utc(), tz)
         );
-        let search = crate::routes::chat::job_research(state, Uuid::now_v7(), &question);
-        match tokio::time::timeout(RESEARCH_TIMEOUT, search).await {
+        let search =
+            crate::routes::chat::job_research(state, Uuid::now_v7(), &question, RESEARCH_TIMEOUT);
+        match search.await {
             Ok(Some((answer, model))) => {
                 let Some((conversation, message)) = post(state, job, &to, &answer, &model).await
                 else {
@@ -228,6 +236,8 @@ pub(super) async fn disk_check(state: &AppState, job: &Job) -> Finish {
     };
     let threshold = job.params.threshold_percent.unwrap_or(80);
     // statvfs blocks; a hung mount must not hold a runtime thread.
+    // ponytail: on a timeout the blocking thread stays stuck in statvfs until
+    // the mount answers, one per run; bounded by the jobs' own schedules.
     let read = tokio::task::spawn_blocking(|| {
         crate::routes::services::DISKS.map(|(label, path)| {
             let disk = crate::routes::services::disk_value(label, Path::new(path));

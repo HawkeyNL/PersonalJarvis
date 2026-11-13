@@ -2723,7 +2723,7 @@ async fn job_runs_write_to_their_own_conversation() -> Result<(), Box<dyn std::e
     assert_eq!(posted["messages"][0]["model"], "job");
 
     // Without Research a prompt fails as not configured and says so in its
-    // conversation; the failure counts towards a pause.
+    // conversation; that is not the job's own fault, so no pause streak.
     let (prompt, ran) = run(json!({
         "kind": "prompt", "params": {"title": "AI news", "instruction": "Summarize the AI news"}
     }))
@@ -2734,7 +2734,7 @@ async fn job_runs_write_to_their_own_conversation() -> Result<(), Box<dyn std::e
     );
     assert_eq!(
         (&prompt["failure_count"], &prompt["enabled"]),
-        (&json!(1), &json!(true))
+        (&json!(0), &json!(true))
     );
     let conversation = prompt["conversation_id"].as_str().ok_or("conversation")?;
     let notice =

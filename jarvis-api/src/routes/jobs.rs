@@ -217,7 +217,7 @@ pub(crate) async fn delete(
 /// Run the job now (202), at most once an hour; the run is announced with
 /// `jobs.run_finished` like a scheduled one.
 pub(crate) async fn run_now(
-    _authed: Authed,
+    authed: Authed,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<Value>), Failure> {
@@ -243,6 +243,7 @@ pub(crate) async fn run_now(
         .jobs
         .request_run(&id)
         .map_err(|message| error(StatusCode::TOO_MANY_REQUESTS, message))?;
+    audit(&state, &authed, "jobs.run_requested", &id).await;
     Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true }))))
 }
 

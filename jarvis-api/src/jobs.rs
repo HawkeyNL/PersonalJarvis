@@ -48,6 +48,8 @@ const TICK: Duration = Duration::from_secs(60);
 pub(crate) const DB_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds the work of one run.
 const RUN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Between the end of one scheduled research run and the start of the next.
+const SEARCH_GAP: Duration = Duration::from_secs(30);
 /// Monday 07:00, the default of a new job.
 const DEFAULT_WEEKDAY: u8 = 1;
 const DEFAULT_AT_MINUTE: u16 = 7 * 60;
@@ -981,6 +983,7 @@ impl JobsHandle {
 }
 
 /// What runs need besides the database.
+#[derive(Clone)]
 pub struct Work {
     /// The GitHub poller's allowlist; the dependency review reads only
     /// those repositories.
@@ -1008,6 +1011,7 @@ pub fn start(db: Database, handle: Arc<JobsHandle>, events: Hub, work: Work) {
         events,
         tz,
         work,
+        searched_at: Mutex::new(None),
     };
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(TICK);
@@ -1060,6 +1064,8 @@ struct Runner {
     events: Hub,
     tz: TimeZone,
     work: Work,
+    /// When the last research run ended.
+    searched_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl Runner {
@@ -1087,6 +1093,9 @@ impl Runner {
             if !expired.is_empty() {
                 tracing::info!(jobs = expired.len(), "expired scheduled jobs deleted");
             }
+            for job_id in &expired {
+                self.audit("jobs.expired_deleted", job_id).await;
+            }
         }
         if let Some(job_id) = self.handle.queued() {
             let settled = match call(store::get(&self.db, &job_id)).await {
@@ -1104,12 +1113,23 @@ impl Runner {
         let Ok(mut jobs) = call(store::list(&self.db)).await else {
             return;
         };
-        // The quick kinds first, so a reminder is not late behind searches.
+        // The quick kinds first, so a reminder is not late behind searches,
+        // and at most one search per pass, [`SEARCH_GAP`] after the last:
+        // the next pass (at once after a long run) checks the quick kinds
+        // again, and the Claude worker's one background slot stays free for
+        // the owner's own work in between.
         jobs.sort_by_key(|job| matches!(job.kind, Kind::Prompt | Kind::DependencyReview));
+        let mut searched = false;
         for job in jobs {
             match job.due(now, &self.tz) {
                 Due::Nothing => {}
                 Due::Run(slot) => {
+                    if job.kind == Kind::Prompt {
+                        if searched || !self.search_gap_passed() {
+                            continue;
+                        }
+                        searched = true;
+                    }
                     self.run(&job, slot, Trigger::Schedule).await;
                 }
                 Due::Missed(slot) => {
@@ -1137,19 +1157,39 @@ impl Runner {
             Ok(run_id) => run_id,
             Err(failed) => return failed == Failed::Refused,
         };
-        let mut finish = tokio::time::timeout(RUN_TIMEOUT, self.work(job))
-            .await
-            .unwrap_or_else(|_| Finish::failed("timed_out"));
+        // Its own task, so a panic fails the run instead of the runner.
+        let mut task = tokio::spawn(work(
+            self.work.clone(),
+            self.db.clone(),
+            self.tz.clone(),
+            job.clone(),
+        ));
+        let mut finish = match tokio::time::timeout(RUN_TIMEOUT, &mut task).await {
+            Ok(Ok(finish)) => finish,
+            Ok(Err(_)) => Finish::failed("internal"),
+            Err(_) => {
+                task.abort();
+                Finish::failed("timed_out")
+            }
+        };
+        if job.kind == Kind::Prompt {
+            if let Ok(mut at) = self.searched_at.lock() {
+                *at = Some(std::time::Instant::now());
+            }
+        }
         if let Err(reason) = finish.check() {
             // A result the store would refuse still ends the run.
             tracing::warn!(reason, "scheduled job result refused");
             finish = Finish::failed("invalid_result");
         }
         // The streak first, so a client that sees the run ended sees it too.
-        if job.kind != Kind::DependencyReview {
-            let failed = finish.status == RunStatus::Failed;
+        if let Some(failed) = finish
+            .streak()
+            .filter(|_| job.kind != Kind::DependencyReview)
+        {
             if call(store::record_outcome(&self.db, &job.id, failed)).await == Ok(true) {
                 tracing::warn!("scheduled job paused after failed runs");
+                self.audit("jobs.paused", &job.id).await;
             }
         }
         if call(store::finish_run(&self.db, &run_id, &finish)).await == Ok(true) {
@@ -1158,14 +1198,17 @@ impl Runner {
         true
     }
 
-    async fn work(&self, job: &Job) -> Finish {
-        let app = self.work.app.as_ref();
-        match (job.kind, app) {
-            (Kind::DependencyReview, _) => dependency_review::run(&self.work, &self.db, job).await,
-            (Kind::Prompt, Some(app)) => chat::prompt(app, job, &self.tz).await,
-            (Kind::Reminder, Some(app)) => chat::reminder(app, job).await,
-            (Kind::DiskCheck, Some(app)) => chat::disk_check(app, job).await,
-            (_, None) => Finish::failed("not_configured"),
+    fn search_gap_passed(&self) -> bool {
+        self.searched_at
+            .lock()
+            .map(|at| at.is_none_or(|at| at.elapsed() >= SEARCH_GAP))
+            .unwrap_or(true)
+    }
+
+    /// A security audit row without a device: Core did it by itself.
+    async fn audit(&self, event: &str, job_id: &str) {
+        if let Some(app) = &self.work.app {
+            crate::audit::record_security_event(app, None, event, "ok", Some(job_id)).await;
         }
     }
 
@@ -1176,6 +1219,16 @@ impl Runner {
             run_id: run_id.to_owned(),
             status: status.as_str().to_owned(),
         });
+    }
+}
+
+async fn work(work: Work, db: Database, tz: TimeZone, job: Job) -> Finish {
+    match (job.kind, work.app.as_ref()) {
+        (Kind::DependencyReview, _) => dependency_review::run(&work, &db, &job).await,
+        (Kind::Prompt, Some(app)) => chat::prompt(app, &job, &tz).await,
+        (Kind::Reminder, Some(app)) => chat::reminder(app, &job).await,
+        (Kind::DiskCheck, Some(app)) => chat::disk_check(app, &job).await,
+        (_, None) => Finish::failed("not_configured"),
     }
 }
 
@@ -2050,6 +2103,7 @@ mod tests {
                 brain: Arc::new(jarvis_llm::ClaudeCliProvider::new("unused", "m", "m", "m")),
                 app: None,
             },
+            searched_at: Mutex::new(None),
         };
         let input = serde_json::json!({"kind": "dependency_review", "cadence": "daily"});
         let job = store::create(&db, serde_json::from_value(input)?, None).await?;

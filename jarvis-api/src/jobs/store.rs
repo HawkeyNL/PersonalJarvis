@@ -503,6 +503,21 @@ impl Finish {
         Ok(())
     }
 
+    /// How the run counts towards the failure streak: `Some(true)` for a
+    /// failure that is the job's own (its text, or a run that took too
+    /// long), `Some(false)` for a success, `None` for a failure of
+    /// something else (Research off or down, the database), which neither
+    /// counts nor ends the streak.
+    pub fn streak(&self) -> Option<bool> {
+        match self.status {
+            RunStatus::Failed => {
+                matches!(self.error_code, Some("private_instruction" | "timed_out")).then_some(true)
+            }
+            RunStatus::Ok | RunStatus::Partial => Some(false),
+            _ => None,
+        }
+    }
+
     pub fn failed(error_code: &'static str) -> Self {
         Self {
             status: RunStatus::Failed,
@@ -690,6 +705,28 @@ mod tests {
             "params": {"title": "News", "instruction": "Summarize the AI news"},
         }))
         .expect("prompt")
+    }
+
+    #[test]
+    fn only_the_jobs_own_failures_count_towards_a_pause() {
+        let ok = Finish {
+            status: RunStatus::Ok,
+            ..Finish::failed("unused")
+        };
+        assert_eq!(ok.streak(), Some(false));
+        for own in ["private_instruction", "timed_out"] {
+            assert_eq!(Finish::failed(own).streak(), Some(true), "{own}");
+        }
+        for other in [
+            "research_unavailable",
+            "not_configured",
+            "holdings_unavailable",
+            "conversation_unavailable",
+            "disk_unavailable",
+            "internal",
+        ] {
+            assert_eq!(Finish::failed(other).streak(), None, "{other}");
+        }
     }
 
     #[test]
