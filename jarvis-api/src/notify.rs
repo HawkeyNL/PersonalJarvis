@@ -179,13 +179,16 @@ fn named(device: &DeviceInfo) -> String {
 
 /// Device text that cannot fake a field or a link: separators and quotes
 /// become `-`; `/` and `:` (which ntfy turns into links) are dropped.
+// ponytail: a denylist of look-alikes; switch to an allowlist of letters,
+// digits and plain punctuation if it keeps growing.
 fn unspoofable(value: &str) -> String {
     value
         .chars()
         .filter(|c| !matches!(c, '/' | ':' | '／' | '：' | '∕'))
         .map(|c| match c {
-            '·' | '•' | '∙' | '⋅' | '・' | '"' | '\'' | '`' | '“' | '”' | '‘' | '’' | '„' | '‟'
-            | '«' | '»' | '‹' | '›' | '「' | '」' | '＂' | '＇' => '-',
+            '·' | '\u{387}' | '•' | '‧' | '∙' | '⋅' | '⸱' | '・' | '･' | '"' | '\'' | '`' | '“'
+            | '”' | '‘' | '’' | '„' | '‟' | '«' | '»' | '‹' | '›' | '「' | '」' | '＂' | '＇'
+            | '❝' | '❞' | '〝' | '〞' | '״' => '-',
             c => c,
         })
         .collect()
@@ -827,6 +830,11 @@ mod tests {
         assert_eq!(
             body,
             "Linux device named “-Phone- - iOS”. Open Jarvis to approve or deny."
+        );
+        let look_alikes = "\u{387}\u{2027}\u{ff65}\u{2e31}❝❞〝〞״";
+        assert_eq!(
+            unspoofable(&format!("a{look_alikes}b")),
+            format!("a{}b", "-".repeat(look_alikes.chars().count()))
         );
     }
 
