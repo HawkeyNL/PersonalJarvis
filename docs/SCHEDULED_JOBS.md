@@ -209,8 +209,8 @@ deleted, with their runs, at the start of each check.
 
 Due jobs run one at a time, each in its own task (a crash fails that run
 with `internal`, the runner goes on). Reminders and disk checks run before
-research and dependency reviews, and a check runs at most one research job,
-30 seconds or more after the last one ended; the next check (at once after a
+research and dependency reviews, and a check runs at most one of those (both
+use the Claude worker), 30 seconds or more after the last one ended; the next check (at once after a
 long run) looks at the quick kinds again first. So a reminder is not held up
 by searches, and the Claude worker's one background slot is free for the
 owner's own Research in between. A research slot that waited still runs
