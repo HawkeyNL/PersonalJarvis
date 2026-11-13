@@ -48,7 +48,8 @@ const TICK: Duration = Duration::from_secs(60);
 pub(crate) const DB_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds the work of one run.
 const RUN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-/// Between the end of one scheduled research run and the start of the next.
+/// Between the end of one run that used the Claude worker (a search or a
+/// dependency review) and the start of the next.
 const SEARCH_GAP: Duration = Duration::from_secs(30);
 /// Monday 07:00, the default of a new job.
 const DEFAULT_WEEKDAY: u8 = 1;
@@ -132,6 +133,13 @@ pub enum Kind {
     Reminder,
     /// A note when a Home Node disk is fuller than a threshold.
     DiskCheck,
+}
+
+impl Kind {
+    /// Whether a run takes the Claude subscription worker's background slot.
+    fn uses_worker(self) -> bool {
+        matches!(self, Self::Prompt | Self::DependencyReview)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1064,7 +1072,7 @@ struct Runner {
     events: Hub,
     tz: TimeZone,
     work: Work,
-    /// When the last research run ended.
+    /// When the last run that used the Claude worker ended.
     searched_at: Mutex<Option<std::time::Instant>>,
 }
 
@@ -1114,17 +1122,18 @@ impl Runner {
             return;
         };
         // The quick kinds first, so a reminder is not late behind searches,
-        // and at most one search per pass, [`SEARCH_GAP`] after the last:
+        // and at most one worker job (a search or a dependency review) per
+        // pass, [`SEARCH_GAP`] after the last:
         // the next pass (at once after a long run) checks the quick kinds
         // again, and the Claude worker's one background slot stays free for
         // the owner's own work in between.
-        jobs.sort_by_key(|job| matches!(job.kind, Kind::Prompt | Kind::DependencyReview));
+        jobs.sort_by_key(|job| job.kind.uses_worker());
         let mut searched = false;
         for job in jobs {
             match job.due(now, &self.tz) {
                 Due::Nothing => {}
                 Due::Run(slot) => {
-                    if job.kind == Kind::Prompt {
+                    if job.kind.uses_worker() {
                         if searched || !self.search_gap_passed() {
                             continue;
                         }
@@ -1172,7 +1181,7 @@ impl Runner {
                 Finish::failed("timed_out")
             }
         };
-        if job.kind == Kind::Prompt {
+        if job.kind.uses_worker() {
             if let Ok(mut at) = self.searched_at.lock() {
                 *at = Some(std::time::Instant::now());
             }
