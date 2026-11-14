@@ -536,36 +536,35 @@ impl IbkrOAuthClient {
         }
         let result = self.tickle().await.map(|_| ());
         if result.is_err() {
-            self.close_brokerage(opened_for).await;
+            self.close_brokerage(opened_for, Brokerage::Closed).await;
         }
         result
     }
 
-    /// Forget the brokerage session opened for `generation`; one opened
-    /// meanwhile for a newer LST stays.
-    async fn close_brokerage(&self, generation: u64) {
+    /// Forget the brokerage session opened for `generation` and report it as
+    /// `state`; one opened meanwhile for a newer LST and its status stay.
+    async fn close_brokerage(&self, generation: u64, state: Brokerage) {
         let mut opened_for = self.brokerage.lock().await;
         if *opened_for == generation {
             *opened_for = 0;
-            self.update_status(|s| s.brokerage = Brokerage::Closed);
+            self.update_status(|s| s.brokerage = state);
         }
     }
 
     /// Keep the brokerage session alive; call about once a minute. When the
-    /// session is gone the next `/iserver` call re-opens it.
+    /// session is gone the next `/iserver` call re-opens it. Only a lost
+    /// session changes the reported brokerage state: it is reported open
+    /// only by [`Self::ensure_brokerage`] for the current LST.
     pub async fn tickle(&self) -> Result<AuthStatus, IbkrError> {
         let opened_for = *self.brokerage.lock().await;
-        let tickle: Tickle = serde_json::from_slice(
-            &self
-                .signed(Method::POST, "/tickle", &[], None, false)
-                .await?,
-        )
-        .map_err(IbkrError::Decode)?;
+        let tickle: Tickle = self
+            .signed(Method::POST, "/tickle", &[], None, false)
+            .await?;
         let status = tickle.iserver.map(|i| i.auth_status).unwrap_or_default();
         if !status.authenticated {
-            self.close_brokerage(opened_for).await;
+            self.close_brokerage(opened_for, Brokerage::from(&status))
+                .await;
         }
-        self.update_status(|s| s.brokerage = Brokerage::from(&status));
         Ok(status)
     }
 
@@ -575,10 +574,7 @@ impl IbkrOAuthClient {
         query: &[(&str, String)],
         accounts: bool,
     ) -> Result<T, IbkrError> {
-        let body = self
-            .signed(Method::GET, path, query, None, accounts)
-            .await?;
-        serde_json::from_slice(&body).map_err(IbkrError::Decode)
+        self.signed(Method::GET, path, query, None, accounts).await
     }
 
     /// Open the brokerage session for the current LST if not yet done:
@@ -589,7 +585,7 @@ impl IbkrOAuthClient {
         if *opened_for == generation {
             return Ok(());
         }
-        let init = self
+        let status: AuthStatus = self
             .signed(
                 Method::POST,
                 "/iserver/auth/ssodh/init",
@@ -598,14 +594,18 @@ impl IbkrOAuthClient {
                 false,
             )
             .await?;
-        let status: AuthStatus = serde_json::from_slice(&init).map_err(IbkrError::Decode)?;
-        self.update_status(|s| s.brokerage = Brokerage::from(&status));
         if !status.authenticated {
+            self.update_status(|s| s.brokerage = Brokerage::from(&status));
             return Err(IbkrError::NotAuthenticated);
         }
-        self.signed(Method::GET, "/iserver/accounts", &[], None, false)
-            .await?;
+        // The body is not used, so it is not decoded.
+        let accounts = self
+            .send_signed(Method::GET, "/iserver/accounts", &[], None, false)
+            .await;
+        self.record(&accounts);
+        accounts?;
         *opened_for = generation;
+        self.update_status(|s| s.brokerage = Brokerage::from(&status));
         Ok(())
     }
 
@@ -637,6 +637,8 @@ impl IbkrOAuthClient {
                     s.expires_at = Some(now + lifetime.as_secs());
                     s.generation = generation;
                     s.rejected = false;
+                    // A brokerage session belongs to one LST generation.
+                    s.brokerage = Brokerage::Closed;
                 });
                 Ok(state
                     .current
@@ -738,24 +740,30 @@ impl IbkrOAuthClient {
         Ok((lst, lifetime))
     }
 
-    /// [`Self::send_signed`], recording the outcome for [`Self::status`].
-    async fn signed(
+    /// [`Self::send_signed`] decoded as JSON. The outcome is recorded for
+    /// [`Self::status`] after decoding: a 2xx with a bad body is an error.
+    async fn signed<T: DeserializeOwned>(
         &self,
         method: Method,
         path: &str,
         query: &[(&str, String)],
         json_body: Option<&'static str>,
         accounts: bool,
-    ) -> Result<Vec<u8>, IbkrError> {
+    ) -> Result<T, IbkrError> {
         let result = self
             .send_signed(method, path, query, json_body, accounts)
-            .await;
+            .await
+            .and_then(|body| serde_json::from_slice(&body).map_err(IbkrError::Decode));
+        self.record(&result);
+        result
+    }
+
+    fn record<T>(&self, result: &Result<T, IbkrError>) {
         let now = unix_now().as_secs();
-        self.update_status(|s| match &result {
+        self.update_status(|s| match result {
             Ok(_) => s.last_ok_at = Some(now),
             Err(error) => s.last_error = Some((now, status_code(error))),
         });
-        result
     }
 
     /// Sign and send a request with the current LST. A 401 expires the LST it
@@ -824,7 +832,14 @@ impl IbkrOAuthClient {
             {
                 session.expires_at = Instant::now();
             }
-            self.update_status(|s| s.rejected |= s.generation == generation);
+            self.update_status(|s| {
+                // A 401 for an LST that was replaced meanwhile says nothing
+                // about the current one.
+                if s.generation == generation {
+                    s.rejected = true;
+                    s.brokerage = Brokerage::Closed;
+                }
+            });
         }
         result
     }

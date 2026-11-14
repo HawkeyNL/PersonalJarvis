@@ -179,6 +179,7 @@ impl Fake {
             }
             ("GET", "/portfolio/DU1234567/positions/1") => "[]",
             ("GET", "/portfolio/DU1234567/ledger") => r#"{"BASE":{"cashbalance":12.5}}"#,
+            ("GET", "/portfolio/DU5555555/ledger") => "not json",
             ("POST", "/iserver/auth/ssodh/init") => {
                 assert_eq!(request.body, SSODH_INIT_BODY);
                 assert_eq!(request.headers["content-type"], "application/json");
@@ -370,6 +371,7 @@ async fn unauthorized_forces_a_fresh_lst_and_brokerage_session() {
     assert!(matches!(error, IbkrError::Unauthorized), "{error:?}");
     let status = client.status();
     assert_eq!(status.lst.state, LstState::Rejected);
+    assert_eq!(status.brokerage, Brokerage::Closed);
     assert_eq!(status.last_error.unwrap().code, "auth_rejected");
     fake.fail.lock().unwrap().clear();
     end_cooldown(&client).await;
@@ -828,4 +830,57 @@ fn every_error_maps_to_a_status_code() {
     ] {
         assert_eq!(status_code(&error), code, "{error:?}");
     }
+}
+
+#[tokio::test]
+async fn a_401_for_a_replaced_lst_does_not_reject_the_current_one() {
+    let (client, fake) = fake_client().await;
+    client.history(265598, "1y", "1d").await.unwrap();
+    // As if a newer LST was minted while the next request was in flight.
+    client.update_status(|s| {
+        s.generation += 1;
+        s.brokerage = Brokerage::Open;
+    });
+    fake.fail.lock().unwrap().insert("/ledger", 401);
+    let error = client.ledger("DU1234567").await.unwrap_err();
+    assert!(matches!(error, IbkrError::Unauthorized), "{error:?}");
+    let status = client.status();
+    assert_eq!(status.lst.state, LstState::Valid);
+    assert_eq!(status.brokerage, Brokerage::Open);
+    assert_eq!(status.last_error.unwrap().code, "auth_rejected");
+}
+
+#[tokio::test]
+async fn a_2xx_with_a_bad_body_is_not_a_success() {
+    let (client, _fake) = fake_client().await;
+    let error = client.ledger("DU5555555").await.unwrap_err();
+    assert!(matches!(error, IbkrError::Decode(_)), "{error:?}");
+    let status = client.status();
+    assert_eq!(status.lst.state, LstState::Valid);
+    assert_eq!(status.last_ok_at, None);
+    assert_eq!(status.last_error.unwrap().code, "upstream");
+}
+
+#[tokio::test]
+async fn brokerage_is_open_only_for_the_current_lst() {
+    let (client, fake) = fake_client().await;
+    // ssodh/init succeeds but /iserver/accounts fails: not open.
+    fake.fail.lock().unwrap().insert("/iserver/accounts", 500);
+    client.history(265598, "1y", "1d").await.unwrap_err();
+    assert_eq!(fake.count("/ssodh/init"), 1);
+    assert_eq!(client.status().brokerage, Brokerage::Closed);
+    fake.fail.lock().unwrap().clear();
+    client.history(265598, "1y", "1d").await.unwrap();
+    assert_eq!(client.status().brokerage, Brokerage::Open);
+    // A new LST generation leaves the old brokerage session behind.
+    {
+        let mut state = client.session.lock().await;
+        state.current.as_mut().unwrap().expires_at = Instant::now();
+        state.last_mint = None;
+    }
+    client.ledger("DU1234567").await.unwrap();
+    assert_eq!(fake.mints.load(Ordering::SeqCst), 2);
+    assert_eq!(client.status().brokerage, Brokerage::Closed);
+    client.history(265598, "1y", "1d").await.unwrap();
+    assert_eq!(client.status().brokerage, Brokerage::Open);
 }
