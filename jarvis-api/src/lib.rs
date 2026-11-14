@@ -193,6 +193,7 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/trading/instruments/{conid}/bars",
             get(routes::trading::bars),
         )
+        .route("/v1/trading/ibkr/status", get(routes::trading::ibkr_status))
         .route("/v1/trading/meme/overview", get(routes::meme::overview))
         .route("/v1/trading/meme/candidates", get(routes::meme::candidates))
         .route("/v1/trading/meme/trades", get(routes::meme::trades))

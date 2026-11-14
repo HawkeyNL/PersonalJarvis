@@ -287,6 +287,16 @@ struct PointRow {
     value: String,
 }
 
+/// The time of the last good sync, or `None` before the first one.
+pub async fn last_sync_at(db: &Database) -> Result<Option<OffsetDateTime>> {
+    let rows: Vec<AsOfRow> = db
+        .query("SELECT as_of FROM ibkr_portfolio:current")
+        .await?
+        .check()?
+        .take(0)?;
+    Ok(rows.into_iter().next().map(|row| row.as_of))
+}
+
 /// The last sync time and the daily points since `since`, oldest first, at
 /// most [`MAX_HISTORY_POINTS`]. `None` before the first sync.
 pub async fn load_history(

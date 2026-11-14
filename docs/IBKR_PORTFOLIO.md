@@ -73,3 +73,93 @@ report the price delay; the app shows it as "delay unknown".
 Errors: `503` when the sync is off, has no data yet or the broker cannot be
 reached; `400` for an invalid range or contract id; `500` for a Core
 failure.
+
+## Status
+
+`GET /v1/trading/ibkr/status` (owner session) says whether the sync works
+and, if not, what to fix. It always answers `200` once authenticated: "off"
+and every failure are statuses. Core collects it at most once per 5 seconds
+for all callers; collecting reads the broker unit through `systemctl show`,
+asks the broker its in-memory status (3 s timeout, never an IBKR call) and
+reads the time of the stored portfolio (10 s timeout). Every text in it is a
+fixed constant; codes the broker sends are mapped onto a fixed list
+(`unknown` otherwise). It never holds a token, credential, account id, path
+or log line.
+
+```json
+{
+  "checked_at": "RFC 3339",
+  "overall": "ok | info | warn | error | off",
+  "sync": {
+    "enabled": true,
+    "state": "off | refused | starting | ok | failing | waiting_for_broker",
+    "last_success_at": "RFC 3339 | null",
+    "last_attempt_at": "RFC 3339 | null",
+    "next_attempt_at": "RFC 3339 | null",
+    "consecutive_failures": 0,
+    "last_error": { "code": "...", "at": "RFC 3339" }
+  },
+  "broker": {
+    "service": "active | activating | inactive | failed | deactivating | not_found | unknown",
+    "enabled_at_boot": "true | false | null",
+    "credentials": "present | missing | unknown",
+    "reachable": "true | false | null (not asked: sync off or configuration refused)",
+    "started_at": "RFC 3339 | null"
+  },
+  "token": {
+    "state": "none | valid | refresh_due | expired | rejected",
+    "usable": true,
+    "refreshed_at": "RFC 3339 | null",
+    "expires_at": "RFC 3339 | null",
+    "last_refresh_attempt_at": "RFC 3339 | null",
+    "last_refresh_error": "code | null"
+  },
+  "ibkr": {
+    "last_ok_at": "RFC 3339 | null",
+    "last_error": { "code": "...", "at": "RFC 3339" },
+    "rate_limited_until": "RFC 3339 | null",
+    "brokerage_session": "open | closed | competing"
+  },
+  "problems": [
+    { "code": "...", "severity": "info | warn | error", "summary": "...", "commands": ["..."] }
+  ]
+}
+```
+
+Every field is always present; `last_error` is `null` when there was none,
+and `token` and `ibkr` are `null` when the broker did not answer the status
+request. `sync.last_success_at` also counts the stored portfolio, so it
+survives a Core restart. `credentials` is the result of the broker unit's
+credential condition at its last start.
+
+Sync error codes: `broker_not_running`, `broker_unavailable`, `broker_busy`,
+`broker_timeout`, `ibkr_auth`, `ibkr_rate_limited`, `ibkr_failed`,
+`broker_protocol`, `account_unsupported`, `data_refused`, `store_failed`; a
+refused configuration reports `socket_path_invalid`,
+`broker_account_missing` or `broker_account_unsafe`. Broker codes:
+`auth_rejected`, `not_authenticated`, `rate_limited`, `upstream`, `busy`,
+`invalid_input`.
+
+`problems` holds at most 8, most severe first. `overall` is `off` while the
+sync is off, otherwise the most severe problem, or `ok`. The commands are
+for the owner to copy; Core and the apps never run them.
+
+| Code | Severity | When |
+|---|---|---|
+| `sync_disabled` | info | The sync is off (the only problem then). |
+| `config_refused` | error | Turned on, but Core refused the configuration; the commands depend on the refusal code. |
+| `broker_not_installed` | error | The broker unit does not exist. |
+| `credentials_missing` | error | The unit's credential condition failed. |
+| `broker_not_enabled` | error | The unit does not start at boot. |
+| `broker_failed` | error | The unit failed. |
+| `broker_unreachable` | error | No usable answer from the broker, unless a unit problem explains it while the unit is not running. A reply this Core cannot read, also from a newer broker, counts as no answer. |
+| `broker_restart_needed` | warn | The running broker predates the status request. |
+| `auth_rejected` | error | IBKR rejected the current token or the last token request. |
+| `token_expired` | info | The token expired; the next request renews it. |
+| `session_competing` | warn | Another IBKR session competes. |
+| `rate_limited` | warn | IBKR rate limiting is active. |
+| `account_unsupported` | error | The last sync failed on the account (not one EUR cash account). |
+| `sync_failing` | warn, error from 3 failures in a row | The last sync failed for another reason. Waiting for a missing broker socket is not counted and resets the count, like the backoff. |
+| `sync_stale` | warn | The last good sync is more than 15 minutes old. |
+| `first_sync_pending` | info | No sync finished yet and nothing is stored. |
+| `core_store_unavailable` | error | Core could not read the stored portfolio. |
