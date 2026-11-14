@@ -662,6 +662,18 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .check()?;
     let from_twenty_version: Option<SchemaVersion> = from_twenty.take(0)?;
     assert_eq!(from_twenty_version.unwrap().version, 21);
+    #[derive(serde::Deserialize)]
+    struct TableInfo {
+        indexes: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
+    }
+    let info: Option<TableInfo> = db
+        .query("INFO FOR TABLE scheduled_jobs")
+        .await?
+        .check()?
+        .take(0)?;
+    let indexes = info.unwrap().indexes;
+    assert!(indexes.contains_key("scheduled_jobs_by_kind"));
+    assert!(!indexes.contains_key("scheduled_jobs_kind"));
     // A job stored before 0021 keeps its shape, stays valid when written and
     // may now have a second of its kind.
     let legacy: Vec<bool> = from_twenty.take(1)?;
