@@ -261,8 +261,9 @@ unset -f docker
 norm="$fixture/norm"
 mkdir "$norm"
 printf '{"roadmaps": 1, "notes": 1}\n' > "$norm/live-before.json"
+# shellcheck disable=SC2016  # literal SurrealQL, $value must not expand
 sub_def='DEFINE FIELD phases[*] ON roadmaps TYPE string ASSERT string::len($value) >= 1'
-# shellcheck disable=SC2317  # invoked through normalize_export
+# shellcheck disable=SC2317,SC2016  # invoked through normalize_export; literal backticks
 live_sql() {
     case $1 in
         *'`roadmaps`'*) jq -n --arg d "$sub_def" '[{fields: {phases: "DEFINE FIELD phases ON roadmaps TYPE array<string, 20>", "phases[*]": $d}}]' ;;
