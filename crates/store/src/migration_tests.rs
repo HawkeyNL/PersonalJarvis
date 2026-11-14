@@ -652,6 +652,8 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     }
     db.use_db("from_twenty").await?;
     apply_through_twenty(&db).await?;
+    // A stored job makes 0021 rebuild the kind index over an existing row,
+    // which once failed to commit on RocksDB.
     db.query(job(r, "")).await?.check()?;
     apply_baseline_schema(&db).await?;
     let mut from_twenty = db
