@@ -226,9 +226,9 @@ async fn write(db: &Database, job: &Job) -> Result<()> {
             "limit": limit,
             "singletons": SINGLETON_KINDS,
         }))
-        .await
-        .and_then(surrealdb::Response::check);
-    let Err(error) = response else {
+        .await?;
+    // A lost guard conflict fails the statements too (not the query).
+    let Err(error) = response.check() else {
         return Ok(());
     };
     // Explain the refusal (or the conflict) from the current state;
@@ -1138,6 +1138,49 @@ mod tests {
     async fn concurrent_creates_conflict_on_the_guard_row(
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let db = database().await?;
+        // The mechanism, made certain to overlap: two transactions on two
+        // connections each write their own row after a pause. Without the
+        // guard both commit; with it exactly one does.
+        let other = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+        other
+            .signin(Root {
+                username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+                password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+            })
+            .await?;
+        let ns: Option<String> = db.query("RETURN session::ns()").await?.take(0)?;
+        other.use_ns(ns.ok_or("namespace")?).use_db("core").await?;
+        let overlap = |guard: bool| {
+            let txn = |conn: &Database, row: &str| {
+                let query = format!(
+                    "BEGIN TRANSACTION; {} SLEEP 500ms; \
+                     CREATE scheduled_job_guards:{row} SET touched_at = time::now() RETURN NONE; \
+                     COMMIT TRANSACTION;",
+                    if guard {
+                        "UPSERT scheduled_job_guards:create SET touched_at = time::now() RETURN NONE;"
+                    } else {
+                        ""
+                    }
+                );
+                let conn = conn.clone();
+                async move {
+                    conn.query(query)
+                        .await
+                        .and_then(surrealdb::Response::check)
+                        .is_ok()
+                }
+            };
+            let (a, b) = (
+                txn(&db, &format!("a{guard}")),
+                txn(&other, &format!("b{guard}")),
+            );
+            async move {
+                let (a, b) = tokio::join!(a, b);
+                u8::from(a) + u8::from(b)
+            }
+        };
+        assert_eq!(overlap(false).await, 2);
+        assert_eq!(overlap(true).await, 1);
         let now = OffsetDateTime::now_utc();
         let fresh = || uuid::Uuid::now_v7().to_string();
         let health = || -> Result<Job> {

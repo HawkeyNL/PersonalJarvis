@@ -371,15 +371,19 @@ impl Notifier {
     }
 
     /// Pushes dropped on a full queue or failed after their retries since
-    /// the last call, for the morning check.
+    /// the last call that took them (`take`), for the morning check.
     // ponytail: in memory, resets on restart; app pushes (APNs) are not
     // counted. Persist or widen it if the check needs more.
-    pub fn take_delivery_failures(&self) -> u64 {
+    pub fn delivery_failures(&self, take: bool) -> u64 {
+        let read = |counter: &AtomicU64| {
+            if take {
+                counter.swap(0, Ordering::Relaxed)
+            } else {
+                counter.load(Ordering::Relaxed)
+            }
+        };
         self.inner.as_ref().map_or(0, |inner| {
-            inner
-                .dropped
-                .swap(0, Ordering::Relaxed)
-                .saturating_add(inner.failed.swap(0, Ordering::Relaxed))
+            read(&inner.dropped).saturating_add(read(&inner.failed))
         })
     }
 
@@ -952,9 +956,10 @@ mod tests {
         notifier.notify(pairing());
         next(&mut requests).await;
         nothing_more(&mut requests).await;
-        // The failure is counted once, and taken once.
-        assert_eq!(notifier.take_delivery_failures(), 1);
-        assert_eq!(notifier.take_delivery_failures(), 0);
+        // The failure is counted once, read, then taken once.
+        assert_eq!(notifier.delivery_failures(false), 1);
+        assert_eq!(notifier.delivery_failures(true), 1);
+        assert_eq!(notifier.delivery_failures(true), 0);
     }
 
     #[tokio::test]
@@ -966,9 +971,9 @@ mod tests {
         let inner = notifier.inner.as_ref().unwrap();
         assert_eq!(inner.dropped.load(Ordering::Relaxed), 1);
         assert_eq!(receiver.try_recv().map(|job| job.event), Ok(pairing()));
-        assert_eq!(notifier.take_delivery_failures(), 1);
-        assert_eq!(notifier.take_delivery_failures(), 0);
-        assert_eq!(Notifier::default().take_delivery_failures(), 0);
+        assert_eq!(notifier.delivery_failures(true), 1);
+        assert_eq!(notifier.delivery_failures(true), 0);
+        assert_eq!(Notifier::default().delivery_failures(true), 0);
     }
 
     #[test]

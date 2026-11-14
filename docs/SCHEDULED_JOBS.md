@@ -441,8 +441,9 @@ job's scheduled run. Each source has its own bound; all are read at once:
 Core also looks at what it holds in memory: whether the Claude worker's
 socket exists, whether Research can run, the agent bundle's health, the
 GitHub poller's state, the memecoin paper trader's state, ntfy pushes that
-failed or were dropped since the last check (counted in memory, so a
-restart starts again at 0) and the month's model spend against the budget.
+failed or were dropped since the last scheduled check (counted in memory,
+so a restart starts again at 0; a run on request reads the count and
+leaves it) and the month's model spend against the budget.
 
 | Finding | Severity | When |
 | --- | --- | --- |

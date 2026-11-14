@@ -95,7 +95,7 @@ pub(super) async fn run(state: &AppState, job: &Job, trigger: Trigger) -> Finish
     } else {
         DAY_HOURS
     };
-    finish(&collect(state, hours).await)
+    finish(&collect(state, hours, trigger == Trigger::Schedule).await)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -200,7 +200,9 @@ async fn bounded<T, E: std::fmt::Display>(
     }
 }
 
-async fn collect(state: &AppState, hours: u32) -> Signals {
+/// Only a scheduled run takes the push failure count; the owner's run reads
+/// it and leaves it for the next scheduled one.
+async fn collect(state: &AppState, hours: u32, scheduled: bool) -> Signals {
     let since = OffsetDateTime::now_utc() - time::Duration::hours(hours.into());
     let db = &state.db;
     let (jobs, runs, disks, units, ibkr, llm_failures, audit, claude_worker) = tokio::join!(
@@ -243,7 +245,7 @@ async fn collect(state: &AppState, hours: u32) -> Signals {
         claude_worker: claude_worker.unwrap_or(false),
         research: state.llm.can_research() && state.model_routing.snapshot().research_allowed(),
         llm_failures: llm_failures.unwrap_or_default(),
-        push_failures: state.notifier.take_delivery_failures(),
+        push_failures: state.notifier.delivery_failures(scheduled),
         audit: audit.unwrap_or_default(),
         github: state.github.status().state,
         memecoin_enabled: state.memecoin.enabled(),
@@ -523,8 +525,7 @@ fn findings(s: &Signals) -> Vec<Finding> {
         s.audit
             .iter()
             .filter(|row| {
-                events.contains(&row.event.as_str())
-                    && (outcomes.is_empty() || outcomes.contains(&row.outcome.as_str()))
+                events.contains(&row.event.as_str()) && outcomes.contains(&row.outcome.as_str())
             })
             .fold(
                 (0, None),
@@ -533,7 +534,7 @@ fn findings(s: &Signals) -> Vec<Finding> {
                 },
             )
     };
-    // id, events, outcomes (none: any), the level a count reaches, title
+    // id, events, outcomes, the level a count reaches, title
     type Rule = (
         &'static str,
         &'static [&'static str],
@@ -598,7 +599,8 @@ fn findings(s: &Signals) -> Vec<Finding> {
         (
             "security_recovery_requested",
             &["account.recovery.request"],
-            &[],
+            // One request writes `prepared`, then `signed`.
+            &["prepared"],
             |n| (n >= 1).then_some((Medium, false)),
             |_| "Account recovery was requested".into(),
         ),

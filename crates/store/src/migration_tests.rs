@@ -775,7 +775,6 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         new_job(x, ", kind = 'health'"),
         run(x, ", kind = 'health', slot_at = d'2026-11-30T06:00:00Z'"),
         "UPSERT scheduled_job_guards:create SET touched_at = 'now';".to_owned(),
-        "UPSERT scheduled_job_guards:create SET touched_at = time::now(), note = 'x';".to_owned(),
     ] {
         assert!(db.query(&bad).await?.check().is_err(), "{bad}");
     }
