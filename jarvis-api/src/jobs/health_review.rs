@@ -74,7 +74,8 @@ const IBKR: [(&str, Severity, bool); 15] = [
     ("broker_unreachable", Severity::High, false),
     ("broker_restart_needed", Severity::Medium, false),
     ("auth_rejected", Severity::High, true),
-    ("token_expired", Severity::High, true),
+    // It renews on the next request.
+    ("token_expired", Severity::Info, false),
     ("session_competing", Severity::Medium, false),
     ("rate_limited", Severity::Low, false),
     ("account_unsupported", Severity::Medium, false),
@@ -101,6 +102,7 @@ pub(super) async fn run(state: &AppState, job: &Job, trigger: Trigger) -> Finish
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Severity {
+    Info,
     Low,
     Medium,
     High,
@@ -339,14 +341,6 @@ fn findings(s: &Signals) -> Vec<Finding> {
             High,
             false,
             "The Core updater has failed".into(),
-        ));
-    }
-    if off("jarvis-updater.timer") {
-        found.push(Finding::new(
-            "updater_timer_off",
-            Medium,
-            false,
-            "The Core update timer does not run".into(),
         ));
     }
     if unit("jarvis-backup.service") == Some("failed") {
@@ -883,10 +877,9 @@ mod tests {
         );
         assert!(unit("jarvis-updater.service", "inactive").is_empty());
         for state in ["inactive", "failed", "not_found"] {
-            assert_eq!(
-                unit("jarvis-updater.timer", state),
-                one("updater_timer_off", Medium, false)
-            );
+            // The owner installs Core by hand: an updater timer that does
+            // not run is no finding.
+            assert!(unit("jarvis-updater.timer", state).is_empty());
             assert_eq!(
                 unit("jarvis-backup.timer", state),
                 one("backup_not_enabled", Low, false)
@@ -1018,7 +1011,7 @@ mod tests {
 
     #[test]
     fn ibkr_problems_map_onto_fixed_findings() {
-        use Severity::{High, Low, Medium};
+        use Severity::{High, Info, Low, Medium};
         for (code, severity, urgent) in [
             ("config_refused", High, false),
             ("broker_not_installed", Medium, false),
@@ -1028,7 +1021,7 @@ mod tests {
             ("broker_unreachable", High, false),
             ("broker_restart_needed", Medium, false),
             ("auth_rejected", High, true),
-            ("token_expired", High, true),
+            ("token_expired", Info, false),
             ("session_competing", Medium, false),
             ("rate_limited", Low, false),
             ("account_unsupported", Medium, false),

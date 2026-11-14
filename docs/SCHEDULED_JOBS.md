@@ -450,7 +450,6 @@ leaves it) and the month's model spend against the budget.
 | `disk_full:{label}` | high; critical and urgent from 97% | A disk at 90% or more |
 | `service_failed:{unit}` | high | Core, SurrealDB, the config or Codex broker, OpenSandbox or the agent updater failed |
 | `updater_failed` | high | `jarvis-updater.service` failed |
-| `updater_timer_off` | medium | `jarvis-updater.timer` inactive, failed or not installed |
 | `backup_failed` | critical, urgent | `jarvis-backup.service` failed |
 | `backup_not_enabled` | low | `jarvis-backup.timer` inactive, failed or not installed |
 | `agent_registry_degraded` | medium | The agent bundle did not load |
@@ -459,7 +458,7 @@ leaves it) and the month's model spend against the budget.
 | `job_paused:{job_id}` | medium | A job paused after failed runs |
 | `job_failing:{kind}:{code}` | medium | Failed or partial runs with `token_needs_dependabot_alerts_read`, `github_token_refused`, `not_configured`, `disk_unavailable`, a `roadmap_*` code, or `research_unavailable` twice |
 | `jobs_missed` | low | A missed run |
-| `ibkr:{code}` | per code | Each IBKR status problem but `sync_disabled` and `first_sync_pending`: `auth_rejected` and `token_expired` high and urgent; `config_refused`, `credentials_missing`, `broker_failed`, `broker_unreachable`, `sync_failing` and `core_store_unavailable` high; `rate_limited` low; the others medium |
+| `ibkr:{code}` | per code | Each IBKR status problem but `sync_disabled` and `first_sync_pending`: `auth_rejected` high and urgent; `token_expired` info (it renews on the next request); `config_refused`, `credentials_missing`, `broker_failed`, `broker_unreachable`, `sync_failing` and `core_store_unavailable` high; `rate_limited` low; the others medium |
 | `research_without_worker` | medium | An enabled research job while Research cannot run |
 | `claude_worker_off` | medium | An enabled research job or dependency review while the Claude worker is off |
 | `llm_auth:{backend}` | high, urgent | A model call refused for its credentials |
