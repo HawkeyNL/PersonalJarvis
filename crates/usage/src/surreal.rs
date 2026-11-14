@@ -301,6 +301,47 @@ pub async fn month_agent_statistics(
         .collect())
 }
 
+/// Failed model calls of one backend and failure category.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct UsageFailures {
+    pub backend: String,
+    #[serde(rename = "failure_category")]
+    pub category: String,
+    pub requests: u64,
+    /// RFC 3339.
+    pub last_at: String,
+}
+
+/// Most groups [`failures_since`] returns.
+const MAX_FAILURE_GROUPS: usize = 50;
+
+/// Failed calls since `since` (RFC 3339, Core's clock) per backend and
+/// failure category, most first: Core-assigned identifiers and counts only,
+/// for the morning check.
+fn failures_since_query() -> String {
+    format!(
+        "SELECT *, time::format(last_at, '%+') AS last_at FROM \
+         (SELECT backend, failure_category, count() AS requests, time::max(ts) AS last_at \
+          FROM llm_usage WHERE ts > <datetime>$since \
+          AND failure_category != NONE GROUP BY backend, failure_category) \
+         ORDER BY requests DESC LIMIT {MAX_FAILURE_GROUPS}"
+    )
+}
+
+pub async fn failures_since(
+    db: &Database,
+    since: &str,
+) -> Result<Vec<UsageFailures>, jarvis_store::StoreError> {
+    db.query(failures_since_query())
+        .bind(("since", since.to_owned()))
+        .await
+        .map_err(jarvis_store::StoreError::schema)?
+        .check()
+        .map_err(jarvis_store::StoreError::schema)?
+        .take(0)
+        .map_err(jarvis_store::StoreError::schema)
+}
+
 /// Persist a bounded long-task projection.  The Home Node's process-local gate
 /// rejects concurrent oversubscription during execution; this durable record
 /// makes crash recovery and stale-reservation cleanup observable.
@@ -430,6 +471,30 @@ mod tests {
         assert_eq!(query.matches("math::percentile(").count(), 6);
         assert!(query.contains("time::group(time::now(), 'month')"));
         assert!(!query.contains("1mo"));
+    }
+
+    #[test]
+    fn failures_since_selects_identifiers_and_counts_only() {
+        let query = failures_since_query();
+        for forbidden in [
+            "request_id",
+            "routing_mode",
+            "requested_route",
+            "actual_provider",
+            "agent_id",
+            "model",
+            "prompt",
+            "response",
+        ] {
+            assert!(!query.contains(forbidden), "{forbidden}");
+        }
+        assert!(query.contains("GROUP BY backend, failure_category"));
+        assert!(query.contains("LIMIT 50"));
+        let row: UsageFailures = serde_json::from_str(
+            r#"{"backend":"claude-cli","failure_category":"auth","requests":2,"last_at":"2026-11-14T06:00:00+00:00"}"#,
+        )
+        .unwrap();
+        assert_eq!((row.category.as_str(), row.requests), ("auth", 2));
     }
 
     #[test]

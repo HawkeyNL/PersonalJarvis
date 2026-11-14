@@ -338,6 +338,8 @@ struct Inner {
     /// calendar month `jarvis_usage::month_total_eur` sums over.
     budget_month: Mutex<Option<(i32, u8)>>,
     dropped: AtomicU64,
+    /// ntfy pushes that failed after their retries, counted by the worker.
+    failed: Arc<AtomicU64>,
 }
 
 impl Notifier {
@@ -356,15 +358,33 @@ impl Notifier {
         start_with(ntfy, apns, REQUEST_TIMEOUT, FIRST_BACKOFF)
     }
 
-    fn with_queue(queue: mpsc::Sender<Job>) -> Self {
+    fn with_queue(queue: mpsc::Sender<Job>, failed: Arc<AtomicU64>) -> Self {
         Self {
             inner: Some(Arc::new(Inner {
                 queue,
                 last_sent: Mutex::new(HashMap::new()),
                 budget_month: Mutex::new(None),
                 dropped: AtomicU64::new(0),
+                failed,
             })),
         }
+    }
+
+    /// Pushes dropped on a full queue or failed after their retries since
+    /// the last call that took them (`take`), for the morning check.
+    // ponytail: in memory, resets on restart; app pushes (APNs) are not
+    // counted. Persist or widen it if the check needs more.
+    pub fn delivery_failures(&self, take: bool) -> u64 {
+        let read = |counter: &AtomicU64| {
+            if take {
+                counter.swap(0, Ordering::Relaxed)
+            } else {
+                counter.load(Ordering::Relaxed)
+            }
+        };
+        self.inner.as_ref().map_or(0, |inner| {
+            read(&inner.dropped).saturating_add(read(&inner.failed))
+        })
     }
 
     /// Enqueue without waiting. Repeats within `MIN_INTERVAL` are coalesced;
@@ -489,8 +509,9 @@ fn start_with(
         .build()
         .map_err(|_| "notification client unavailable")?;
     let (queue, receiver) = mpsc::channel(QUEUE_CAPACITY);
-    tokio::spawn(run(client, ntfy, apns, receiver, backoff));
-    Ok(Notifier::with_queue(queue))
+    let failed = Arc::new(AtomicU64::new(0));
+    tokio::spawn(run(client, ntfy, apns, receiver, backoff, failed.clone()));
+    Ok(Notifier::with_queue(queue, failed))
 }
 
 async fn run(
@@ -499,6 +520,7 @@ async fn run(
     mut apns: Option<apns::Apns>,
     mut receiver: mpsc::Receiver<Job>,
     backoff: Duration,
+    failed: Arc<AtomicU64>,
 ) {
     while let Some(job) = receiver.recv().await {
         // The app push first: an approval expires within minutes, and a slow
@@ -507,23 +529,26 @@ async fn run(
             apns.send(&job.event, audience, backoff).await;
         }
         if let Some(ntfy) = &ntfy {
-            publish_with_retry(&client, ntfy, &job.event, backoff).await;
+            if !publish_with_retry(&client, ntfy, &job.event, backoff).await {
+                failed.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
 
+/// Whether the push went out.
 async fn publish_with_retry(
     client: &reqwest::Client,
     ntfy: &Ntfy,
     event: &NotifyEvent,
     backoff: Duration,
-) {
+) -> bool {
     let mut delay = backoff;
     for attempt in 1..=MAX_ATTEMPTS {
         match publish(client, &ntfy.url, &ntfy.token, event).await {
             Ok(()) => {
                 tracing::info!(kind = event.kind(), "owner notification sent");
-                break;
+                return true;
             }
             Err(retry) if retry && attempt < MAX_ATTEMPTS => {
                 tokio::time::sleep(delay).await;
@@ -535,6 +560,7 @@ async fn publish_with_retry(
             }
         }
     }
+    false
 }
 
 /// `Err(true)` is worth retrying (transport error, 429, 5xx).
@@ -926,20 +952,28 @@ mod tests {
     #[tokio::test]
     async fn a_client_error_is_not_retried() {
         let (url, mut requests) = mock(Some(403)).await;
-        fast(&url).notify(pairing());
+        let notifier = fast(&url);
+        notifier.notify(pairing());
         next(&mut requests).await;
         nothing_more(&mut requests).await;
+        // The failure is counted once, read, then taken once.
+        assert_eq!(notifier.delivery_failures(false), 1);
+        assert_eq!(notifier.delivery_failures(true), 1);
+        assert_eq!(notifier.delivery_failures(true), 0);
     }
 
     #[tokio::test]
     async fn a_full_queue_drops_and_counts() {
         let (queue, mut receiver) = mpsc::channel(1);
-        let notifier = Notifier::with_queue(queue);
+        let notifier = Notifier::with_queue(queue, Arc::default());
         notifier.notify(pairing());
         notifier.notify(NotifyEvent::BudgetNinetyPercent);
         let inner = notifier.inner.as_ref().unwrap();
         assert_eq!(inner.dropped.load(Ordering::Relaxed), 1);
         assert_eq!(receiver.try_recv().map(|job| job.event), Ok(pairing()));
+        assert_eq!(notifier.delivery_failures(true), 1);
+        assert_eq!(notifier.delivery_failures(true), 0);
+        assert_eq!(Notifier::default().delivery_failures(true), 0);
     }
 
     #[test]
@@ -977,7 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn repeats_within_the_window_are_coalesced() {
         let (queue, mut receiver) = mpsc::channel(8);
-        let notifier = Notifier::with_queue(queue);
+        let notifier = Notifier::with_queue(queue, Arc::default());
         for _ in 0..5 {
             notifier.notify(pairing());
         }
@@ -1017,7 +1051,7 @@ mod tests {
     #[tokio::test]
     async fn only_approvals_carry_an_app_push_audience() {
         let (queue, mut receiver) = mpsc::channel(8);
-        let notifier = Notifier::with_queue(queue);
+        let notifier = Notifier::with_queue(queue, Arc::default());
         let (user, device) = (Uuid::now_v7(), Uuid::now_v7());
         notifier.notify_approval(unlock(), user, Some(device));
         notifier.notify(NotifyEvent::BudgetNinetyPercent);
@@ -1056,7 +1090,7 @@ mod tests {
     #[test]
     fn budget_fires_once_per_calendar_month_at_ninety_percent() {
         let (queue, _receiver) = mpsc::channel(8);
-        let notifier = Notifier::with_queue(queue);
+        let notifier = Notifier::with_queue(queue, Arc::default());
         let october = (2026, 10);
         assert!(!notifier.budget_crossed(899, 1_000, october));
         assert!(notifier.budget_crossed(900, 1_000, october));
@@ -1070,12 +1104,12 @@ mod tests {
     #[test]
     fn seeding_an_already_crossed_month_suppresses_the_push() {
         let (queue, mut receiver) = mpsc::channel(8);
-        let notifier = Notifier::with_queue(queue);
+        let notifier = Notifier::with_queue(queue, Arc::default());
         notifier.seed_budget(950, 1_000);
         notifier.budget_spend(990, 1_000);
         assert!(receiver.try_recv().is_err());
         let (queue, mut receiver) = mpsc::channel(8);
-        let notifier = Notifier::with_queue(queue);
+        let notifier = Notifier::with_queue(queue, Arc::default());
         notifier.seed_budget(100, 1_000);
         notifier.budget_spend(899, 1_000);
         assert!(receiver.try_recv().is_err());

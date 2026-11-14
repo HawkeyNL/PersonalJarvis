@@ -84,7 +84,7 @@ Line numbers come from `76668a7`.
 ### 2.1 Schema files and migration runner
 
 - **Schema files:** `schema/surreal/0001_baseline.surql` …
-  `0021_jobs_via_chat.surql`, 884 lines, 47 tables.
+  `0022_health_review.surql`, 903 lines, 48 tables.
 - **Statement shape:**
   - Every file is one `BEGIN TRANSACTION; … COMMIT TRANSACTION;` block.
   - Tables are all `SCHEMAFULL PERMISSIONS NONE`.
@@ -126,6 +126,13 @@ Line numbers come from `76668a7`.
     `DEFINE FIELD OVERWRITE` of fields whose `ASSERT` reads fields added in
     the same file, and the `??` operator in Core's job queries for fields
     older rows lack. Tested on 2.6.5, the migration tests on RocksDB.
+  - Since `0022_health_review.surql`: a one-row guard table,
+    `scheduled_job_guards`, that every job create `UPSERT`s first in its
+    transaction, so two creates in flight conflict on that key and only
+    one commits (the room rules read in each cannot both pass). It relies
+    on 2.x RocksDB reporting a write-write conflict at commit; CI tests it
+    on a RocksDB server only, the memory engine misses it. Whether 3.x
+    behaves the same is **unverified**; the drill must run that test too.
 - **Index rule (v0.0.87 incident):** 2.x builds an index over existing rows
   in transactions of its own, outside the migration. 0021 first redefined
   the index under its old name; the builder rewrote keys the migration had
@@ -472,7 +479,7 @@ tagged otherwise.
    - Compare names and kinds after normalising the output; the format
      differs between majors [unverified].
    - `schema_version:baseline.version` must equal the current version
-     (21 since `0021_jobs_via_chat.surql`).
+     (22 since `0022_health_review.surql`).
 3. **Content checksums per table:**
    - Run `SELECT * FROM <t> ORDER BY id` on both sides with `--json`.
    - Normalise with jq: sort keys, canonical datetimes in UTC RFC 3339,

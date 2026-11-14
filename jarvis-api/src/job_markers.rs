@@ -587,6 +587,7 @@ mod tests {
             ("not json", "not a job"),
             (r#"{"kind":"disk_check","extra":1}"#, "not a job"),
             (r#"{"kind":"dependency_review"}"#, "kind"),
+            (r#"{"kind":"health_review"}"#, "kind"),
             (
                 r#"{"kind":"prompt","title":"x","instruction":"y","roadmap_id":"z"}"#,
                 "not a job",

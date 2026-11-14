@@ -5,7 +5,8 @@
 //! `systemctl show` argv (no shell, cleared environment, bounded time). Only
 //! fixed labels and states from a fixed vocabulary leave Core: never PIDs,
 //! command lines, environments, paths or arbitrary units. The IBKR status
-//! route reads the broker unit the same way ([`ibkr_broker_unit`]).
+//! route reads the broker unit the same way ([`ibkr_broker_unit`]), and the
+//! morning check its own allowlist ([`review_unit_states`]).
 
 use std::{collections::HashMap, ffi::CString, os::unix::ffi::OsStrExt, path::Path};
 use std::{
@@ -34,6 +35,20 @@ const SERVICE_UNITS: [(&str, &str); 7] = [
     ("OpenSandbox", "jarvis-opensandbox.service"),
     ("Updater timer", "jarvis-updater.timer"),
     ("Agent updater", "jarvis-private-agent-updater.service"),
+];
+/// What the morning check reads: the Health page's units, the backup and
+/// the updater's service.
+pub(crate) const REVIEW_UNITS: [&str; 10] = [
+    "jarvis-core.service",
+    "jarvis-surrealdb.service",
+    "jarvis-config-broker.service",
+    "jarvis-codex-broker.service",
+    "jarvis-opensandbox.service",
+    "jarvis-updater.timer",
+    "jarvis-private-agent-updater.service",
+    "jarvis-updater.service",
+    "jarvis-backup.timer",
+    "jarvis-backup.service",
 ];
 /// systemd's `ActiveState` vocabulary; anything else is reported as unknown.
 const ACTIVE_STATES: [&str; 8] = [
@@ -113,7 +128,54 @@ async fn services_status(program: &str, timeout: Duration) -> Vec<Value> {
     .await
     .ok()
     .flatten();
-    services_value(&output.as_deref().map(parse_show).unwrap_or_default())
+    let units = SERVICE_UNITS.map(|(_, unit)| unit);
+    services_value(
+        &output
+            .as_deref()
+            .map(|output| parse_show(output, &units))
+            .unwrap_or_default(),
+    )
+}
+
+/// States of [`REVIEW_UNITS`] (a unit systemctl did not answer for is
+/// missing); `None` when the call fails, times out or misbehaves.
+pub(crate) async fn review_unit_states(
+    program: &str,
+) -> Option<HashMap<&'static str, &'static str>> {
+    let output = tokio::time::timeout(
+        TIMEOUT,
+        systemctl_show(
+            program,
+            "--property=Id,LoadState,ActiveState",
+            &REVIEW_UNITS,
+        ),
+    )
+    .await
+    .ok()
+    .flatten()?;
+    Some(parse_show(&output, &REVIEW_UNITS))
+}
+
+/// The used percentage of each disk that could be read, off the async
+/// threads within [`TIMEOUT`]; empty when none could.
+// ponytail: on a timeout the blocking thread stays stuck in statvfs until
+// the mount answers, one per call; bounded by the callers' own schedules.
+pub(crate) async fn used_percent() -> Vec<(&'static str, f64)> {
+    let read = tokio::task::spawn_blocking(|| {
+        DISKS.map(|(label, path)| {
+            (
+                label,
+                disk_value(label, Path::new(path))["used_percent"].as_f64(),
+            )
+        })
+    });
+    match tokio::time::timeout(TIMEOUT, read).await {
+        Ok(Ok(disks)) => disks
+            .into_iter()
+            .filter_map(|(label, used)| Some((label, used?)))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Facts of `jarvis-ibkr-broker.service`; all unknown when the call fails,
@@ -188,7 +250,7 @@ async fn systemctl_show(program: &str, properties: &str, units: &[&str]) -> Opti
 
 /// Map allowlisted unit -> state. Keys and values are always `'static`
 /// constants, so no byte of the subprocess output can reach a client.
-fn parse_show(output: &str) -> HashMap<&'static str, &'static str> {
+fn parse_show(output: &str, units: &[&'static str]) -> HashMap<&'static str, &'static str> {
     let mut states = HashMap::new();
     for block in output.split("\n\n") {
         let (mut id, mut load, mut active) = (None, None, None);
@@ -200,11 +262,7 @@ fn parse_show(output: &str) -> HashMap<&'static str, &'static str> {
                 _ => {}
             }
         }
-        let Some(unit) = SERVICE_UNITS
-            .iter()
-            .map(|(_, unit)| *unit)
-            .find(|unit| Some(*unit) == id)
-        else {
+        let Some(unit) = units.iter().copied().find(|unit| Some(*unit) == id) else {
             continue;
         };
         let state = if load == Some("not-found") {
@@ -286,7 +344,8 @@ mod tests {
              Id=jarvis-surrealdb.service\nLoadState=loaded\nActiveState=$(reboot)\nMainPID=4242\n\n\
              Id=jarvis-opensandbox.service\nLoadState=not-found\nActiveState=inactive\n\n\
              Id=jarvis-updater.timer\nLoadState=loaded\nActiveState=failed\n";
-        let states = parse_show(output);
+        let units = SERVICE_UNITS.map(|(_, unit)| unit);
+        let states = parse_show(output, &units);
         assert_eq!(states.len(), 4);
         assert_eq!(states["jarvis-core.service"], "active");
         assert_eq!(states["jarvis-surrealdb.service"], "unknown");
@@ -387,9 +446,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_morning_check_reads_its_fixed_units_only() {
+        assert_eq!(review_unit_states("/nonexistent/systemctl").await, None);
+        assert_eq!(review_unit_states("/bin/false").await, None);
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("systemctl");
+        let output = dir.path().join("output");
+        std::fs::write(
+            &output,
+            "Id=jarvis-backup.service\nLoadState=loaded\nActiveState=failed\n\n\
+             Id=jarvis-backup.timer\nLoadState=not-found\nActiveState=inactive\n\n\
+             Id=evil.service\nLoadState=loaded\nActiveState=failed\n\n\
+             Id=jarvis-updater.service\nLoadState=loaded\nActiveState=inactive\n",
+        )
+        .unwrap();
+        // Answers only for the exact argv.
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$*\" = \"show --no-pager --property=Id,LoadState,ActiveState -- {}\" ] || exit 1\n\
+                 exec /bin/cat '{}'\n",
+                REVIEW_UNITS.join(" "),
+                output.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let states = review_unit_states(fake.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            states,
+            HashMap::from([
+                ("jarvis-backup.service", "failed"),
+                ("jarvis-backup.timer", "not_found"),
+                ("jarvis-updater.service", "inactive"),
+            ])
+        );
+    }
+
     #[test]
     fn missing_systemctl_output_reports_every_unit_unknown() {
-        let services = services_value(&parse_show(""));
+        let services = services_value(&parse_show("", &[]));
         assert!(services.iter().all(|service| service["state"] == "unknown"));
     }
 
