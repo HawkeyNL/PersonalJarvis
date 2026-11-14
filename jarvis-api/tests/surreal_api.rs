@@ -44,6 +44,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         require_https: false,
         dev_enrollment: true,
         ibkr: None,
+        ibkr_status: Default::default(),
         llm: jarvis_llm::stub(),
         fast_intent_router: None,
         llm_max_tokens: 256,
@@ -1554,6 +1555,8 @@ async fn memecoin_paper_routes_are_read_only_except_pause() -> Result<(), Box<dy
     Ok(())
 }
 
+const IBKR_STATUS: &str = "/v1/trading/ibkr/status";
+
 const TRADING_ROUTES: [&str; 3] = [
     "/v1/trading/portfolio",
     "/v1/trading/portfolio/history?range=1M",
@@ -1563,7 +1566,7 @@ const TRADING_ROUTES: [&str; 3] = [
 #[tokio::test]
 async fn trading_routes_refuse_missing_or_invalid_sessions() {
     let app = build_router(state(jarvis_store::Database::init(), None).await);
-    for path in TRADING_ROUTES {
+    for path in TRADING_ROUTES.into_iter().chain([IBKR_STATUS]) {
         for authorization in [None, Some("Bearer not-a-session")] {
             let mut request = Request::builder().uri(path);
             if let Some(value) = authorization {
@@ -1652,8 +1655,20 @@ async fn trading_routes_serve_the_synced_portfolio_read_only(
         );
     }
 
+    // The status route answers 200 with "off": a status, not an error.
+    let response = call(&off, "GET", IBKR_STATUS).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["overall"], "off");
+    assert_eq!(body["sync"]["state"], "off");
+    assert!(body["broker"]["reachable"].is_null() && body["token"].is_null());
+    assert_eq!(body["problems"][0]["code"], "sync_disabled");
+
     let mut on_state = state(db.clone(), None).await;
     on_state.ibkr = Some(Arc::new(client.clone()));
+    on_state.ibkr_status = Arc::new(jarvis_api::ibkr::SyncStatusHandle::new(
+        jarvis_api::ibkr::SyncMode::On,
+    ));
     let on = build_router(on_state);
     // Enabled, before the first sync: no data yet, still "not connected".
     for path in &TRADING_ROUTES[..2] {
@@ -1663,6 +1678,22 @@ async fn trading_routes_serve_the_synced_portfolio_read_only(
 
     let portfolio = jarvis_api::ibkr::fetch(&client).await?;
     jarvis_api::ibkr::store::write_snapshot(&db, &portfolio).await?;
+
+    // The fake broker predates the status request.
+    let response = call(&on, "GET", IBKR_STATUS).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["sync"]["state"], "starting");
+    assert!(body["sync"]["last_success_at"].is_string());
+    assert_eq!(body["broker"]["reachable"], true);
+    let codes: Vec<&str> = body["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["code"].as_str())
+        .collect();
+    assert!(codes.contains(&"broker_restart_needed"), "{codes:?}");
+    assert!(!codes.contains(&"core_store_unavailable"), "{codes:?}");
 
     let body = json_body(call(&on, "GET", "/v1/trading/portfolio").await?).await;
     assert_eq!(body["source"], "IBKR");
@@ -1725,7 +1756,7 @@ async fn trading_routes_serve_the_synced_portfolio_read_only(
     }
     // Read-only: no write method on any trading route, and the legacy
     // gateway routes are gone.
-    for path in TRADING_ROUTES {
+    for path in TRADING_ROUTES.into_iter().chain([IBKR_STATUS]) {
         for method in ["POST", "PUT", "DELETE"] {
             assert_eq!(
                 call(&on, method, path).await?.status(),

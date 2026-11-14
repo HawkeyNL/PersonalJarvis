@@ -161,6 +161,8 @@ pub struct AppState {
     /// portfolio sync is enabled and the broker identity exists; the trading
     /// routes then answer "not configured".
     pub ibkr: Option<Arc<jarvis_ibkr::broker::BrokerClient>>,
+    /// How the IBKR sync was configured and what it last did.
+    pub ibkr_status: Arc<crate::ibkr::SyncStatusHandle>,
     /// The brain (DEC-001) — provider-abstracted, swappable at runtime.
     pub llm: Arc<dyn llm::LlmProvider>,
     /// Optional provider-neutral advisory classifier cascade, never authority.

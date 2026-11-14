@@ -6,7 +6,8 @@
 //! delay, and the app shows an absent delay as unknown.
 //!
 //! A 503 means IBKR is not configured, has no data yet or cannot be reached
-//! (the app shows "not connected"); a 500 is a Core failure.
+//! (the app shows "not connected"); a 500 is a Core failure. The status
+//! route always answers 200: "off" and every failure are statuses.
 
 use std::time::Duration;
 
@@ -301,6 +302,12 @@ pub(crate) async fn bars(
         OffsetDateTime::now_utc(),
         history.bars,
     )))
+}
+
+/// Health of the sync, the broker and the IBKR session, with what to fix
+/// (docs/IBKR_PORTFOLIO.md).
+pub(crate) async fn ibkr_status(_authed: Authed, State(state): State<AppState>) -> Json<Value> {
+    Json(ibkr::status::cached(&state.ibkr_status, || ibkr::status::collect(&state)).await)
 }
 
 #[cfg(test)]

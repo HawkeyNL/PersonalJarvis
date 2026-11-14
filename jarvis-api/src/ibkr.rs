@@ -6,12 +6,14 @@
 //! model of schema 0015. There is no order, mandate or signer path. The sync
 //! is off unless `JARVIS_IBKR_PORTFOLIO_SYNC_ENABLED=true`.
 
+pub mod status;
 pub mod store;
 
 use std::ffi::CStr;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use jarvis_ibkr::broker::{BrokerClient, BrokerError, UPSTREAM_DEADLINE};
 use jarvis_ibkr::oauth::{Account, Ledger, Position};
@@ -19,6 +21,7 @@ use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
 use jarvis_store::Database;
+use serde_json::Value;
 use store::{Holding, Portfolio, Skipped, BASE_CURRENCY, MAX_POSITIONS, MAX_SKIPPED};
 
 /// Between good syncs; below the app's ten-minute staleness mark.
@@ -33,6 +36,11 @@ const DB_TIMEOUT: Duration = Duration::from_secs(10);
 const BROKER_USER: &CStr = c"jarvis-ibkr";
 /// Decimal strings in schema 0015 have at most 20 integer digits.
 const MAX_ABS: Decimal = Decimal::from_parts(0x6310_0000, 0x6BC7_5E2D, 0x5, false, 0);
+/// The account refusals, reported as `account_unsupported`.
+const ONE_ACCOUNT: &str = "expected exactly one IBKR account";
+const EUR_BASE: &str = "account base currency is not EUR";
+/// `consecutive_failures` stops counting here.
+const MAX_FAILURE_COUNT: u32 = 1000;
 
 /// Why a sync did not store anything. Fixed texts: no broker or database
 /// detail (that is logged where it happens).
@@ -61,20 +69,159 @@ impl std::fmt::Display for SyncError {
 
 impl std::error::Error for SyncError {}
 
+impl SyncError {
+    /// Fixed code for the status route.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::BrokerNotRunning => "broker_not_running",
+            Self::Broker(BrokerError::Unavailable) => "broker_unavailable",
+            Self::Broker(BrokerError::Busy) => "broker_busy",
+            Self::Broker(BrokerError::Timeout) | Self::Timeout => "broker_timeout",
+            Self::Broker(BrokerError::UpstreamAuth) => "ibkr_auth",
+            Self::Broker(BrokerError::RetryLater { .. }) => "ibkr_rate_limited",
+            Self::Broker(BrokerError::Upstream | BrokerError::TooLarge) => "ibkr_failed",
+            Self::Broker(BrokerError::InvalidRequest | BrokerError::InvalidInput { .. }) => {
+                "broker_protocol"
+            }
+            Self::Invalid(ONE_ACCOUNT | EUR_BASE) => "account_unsupported",
+            Self::Invalid(_) => "data_refused",
+            Self::Store => "store_failed",
+        }
+    }
+}
+
+/// Why [`client`] refused the configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientRefusal {
+    SocketPathInvalid,
+    AccountMissing,
+    AccountUnsafe,
+}
+
+impl ClientRefusal {
+    /// Fixed code for the status route.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::SocketPathInvalid => "socket_path_invalid",
+            Self::AccountMissing => "broker_account_missing",
+            Self::AccountUnsafe => "broker_account_unsafe",
+        }
+    }
+}
+
+impl std::fmt::Display for ClientRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::SocketPathInvalid => "JARVIS_IBKR_BROKER_SOCKET must be an absolute path",
+            Self::AccountMissing => "IBKR broker account jarvis-ibkr is missing",
+            Self::AccountUnsafe => "IBKR broker account must not be root or Core's own user",
+        })
+    }
+}
+
 /// The broker client for `socket`, bound to the broker's service uid. Fails
 /// when the path is not absolute or the broker account is missing or is
 /// Core's own user (then any Core-owned socket would pass the uid check).
-pub fn client(socket: &str) -> Result<BrokerClient, &'static str> {
+pub fn client(socket: &str) -> Result<BrokerClient, ClientRefusal> {
     if !Path::new(socket).is_absolute() {
-        return Err("JARVIS_IBKR_BROKER_SOCKET must be an absolute path");
+        return Err(ClientRefusal::SocketPathInvalid);
     }
-    let (uid, _) = crate::peer::lookup_user(BROKER_USER)
-        .ok_or("IBKR broker account jarvis-ibkr is missing")?;
+    let (uid, _) = crate::peer::lookup_user(BROKER_USER).ok_or(ClientRefusal::AccountMissing)?;
     // SAFETY: geteuid has no preconditions.
     if uid == 0 || uid == unsafe { libc::geteuid() } {
-        return Err("IBKR broker account must not be root or Core's own user");
+        return Err(ClientRefusal::AccountUnsafe);
     }
     Ok(BrokerClient::new(socket, uid))
+}
+
+/// How the sync was configured at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    Off,
+    /// Turned on, but the configuration was refused (a [`ClientRefusal`] code).
+    Refused(&'static str),
+    On,
+}
+
+/// What the sync task last did, for the status route. Codes and times only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncStatus {
+    pub mode: SyncMode,
+    pub last_attempt_at: Option<OffsetDateTime>,
+    pub last_success_at: Option<OffsetDateTime>,
+    /// Kept after a later success, so the app can show the last error.
+    pub last_error: Option<(&'static str, OffsetDateTime)>,
+    /// Failed attempts in a row, a missing broker included; capped at 1000.
+    pub consecutive_failures: u32,
+    pub next_attempt_at: Option<OffsetDateTime>,
+}
+
+impl SyncStatus {
+    fn new(mode: SyncMode, now: OffsetDateTime) -> Self {
+        Self {
+            mode,
+            last_attempt_at: None,
+            last_success_at: None,
+            last_error: match mode {
+                SyncMode::Refused(code) => Some((code, now)),
+                SyncMode::Off | SyncMode::On => None,
+            },
+            consecutive_failures: 0,
+            next_attempt_at: None,
+        }
+    }
+
+    /// One finished sync at `now`; the next one starts after `next`.
+    fn record(&mut self, outcome: Result<(), &'static str>, now: OffsetDateTime, next: Duration) {
+        self.last_attempt_at = Some(now);
+        match outcome {
+            Ok(()) => {
+                self.last_success_at = Some(now);
+                self.consecutive_failures = 0;
+            }
+            Err(code) => {
+                self.last_error = Some((code, now));
+                self.consecutive_failures = (self.consecutive_failures + 1).min(MAX_FAILURE_COUNT);
+            }
+        }
+        self.next_attempt_at = Some(now + next);
+    }
+}
+
+/// Shared by the sync task and the status route.
+pub struct SyncStatusHandle {
+    status: RwLock<SyncStatus>,
+    /// The status route's last body; see [`status::cached`].
+    cache: tokio::sync::Mutex<Option<(Instant, Value)>>,
+}
+
+impl Default for SyncStatusHandle {
+    fn default() -> Self {
+        Self::new(SyncMode::Off)
+    }
+}
+
+impl SyncStatusHandle {
+    pub fn new(mode: SyncMode) -> Self {
+        Self {
+            status: RwLock::new(SyncStatus::new(mode, OffsetDateTime::now_utc())),
+            cache: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn get(&self) -> SyncStatus {
+        self.status
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn record(&self, outcome: Result<(), &'static str>, next: Duration) {
+        self.status
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(outcome, OffsetDateTime::now_utc(), next);
+    }
 }
 
 /// One broker call with [`BROKER_TIMEOUT`].
@@ -221,10 +368,10 @@ pub fn map_portfolio(
 /// The single cash account, which must have the EUR base currency.
 fn the_account(accounts: &[Account]) -> Result<&str, &'static str> {
     let [account] = accounts else {
-        return Err("expected exactly one IBKR account");
+        return Err(ONE_ACCOUNT);
     };
     if account.currency.as_deref() != Some(BASE_CURRENCY) {
-        return Err("account base currency is not EUR");
+        return Err(EUR_BASE);
     }
     Ok(&account.account_id)
 }
@@ -270,8 +417,9 @@ fn next_delay(failures: u32) -> Duration {
 
 /// Spawn the sync task: one sync right away, then every [`SYNC_INTERVAL`].
 /// A missing broker socket is waited for at the normal interval; other
-/// failures back off. Each outcome is logged only when it changes.
-pub fn start(db: Database, client: BrokerClient, socket: PathBuf) {
+/// failures back off. Each outcome is logged only when it changes and
+/// recorded in `status`.
+pub fn start(db: Database, client: BrokerClient, socket: PathBuf, status: Arc<SyncStatusHandle>) {
     tokio::spawn(async move {
         let mut failures: u32 = 0;
         let mut last: Option<Result<(), SyncError>> = None;
@@ -306,11 +454,13 @@ pub fn start(db: Database, client: BrokerClient, socket: PathBuf) {
                     last_skipped = (portfolio.skipped_count, portfolio.skipped.clone());
                 }
             }
-            failures = match outcome {
+            failures = match &outcome {
                 Ok(_) | Err(SyncError::BrokerNotRunning) => 0,
                 Err(_) => failures.saturating_add(1),
             };
-            tokio::time::sleep(next_delay(failures)).await;
+            let delay = next_delay(failures);
+            status.record(outcome.as_ref().map(|_| ()).map_err(SyncError::code), delay);
+            tokio::time::sleep(delay).await;
         }
     });
     tracing::info!("IBKR portfolio sync running (read-only)");
@@ -549,7 +699,7 @@ mod tests {
         assert_eq!(next_delay(u32::MAX), MAX_BACKOFF);
     }
 
-    fn own_uid() -> u32 {
+    pub(super) fn own_uid() -> u32 {
         // SAFETY: geteuid has no preconditions.
         unsafe { libc::geteuid() }
     }
@@ -557,7 +707,7 @@ mod tests {
     /// A fake broker on a temporary socket: answers each request line with
     /// the reply for its `kind`. Returns the socket path; the directory lives
     /// as long as the returned guard.
-    async fn fake_broker(replies: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+    pub(super) async fn fake_broker(replies: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
         let replies: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(
             replies
                 .iter()
@@ -664,16 +814,86 @@ mod tests {
 
     #[test]
     fn client_requires_an_absolute_socket_and_a_foreign_broker_account() {
+        let refusal = client("run/broker.sock").unwrap_err();
+        assert_eq!(refusal, ClientRefusal::SocketPathInvalid);
+        assert_eq!(refusal.code(), "socket_path_invalid");
         assert_eq!(
-            client("run/broker.sock").unwrap_err(),
+            refusal.to_string(),
             "JARVIS_IBKR_BROKER_SOCKET must be an absolute path"
         );
         // The jarvis-ibkr account does not exist on CI or dev machines.
         if crate::peer::lookup_user(BROKER_USER).is_none() {
+            let refusal = client("/run/jarvis-ibkr-broker/broker.sock").unwrap_err();
+            assert_eq!(refusal.code(), "broker_account_missing");
             assert_eq!(
-                client("/run/jarvis-ibkr-broker/broker.sock").unwrap_err(),
+                refusal.to_string(),
                 "IBKR broker account jarvis-ibkr is missing"
             );
         }
+        assert_eq!(ClientRefusal::AccountUnsafe.code(), "broker_account_unsafe");
+    }
+
+    #[test]
+    fn sync_errors_map_to_fixed_codes() {
+        let broker = |error| SyncError::Broker(error).code();
+        assert_eq!(SyncError::BrokerNotRunning.code(), "broker_not_running");
+        assert_eq!(broker(BrokerError::Unavailable), "broker_unavailable");
+        assert_eq!(broker(BrokerError::Busy), "broker_busy");
+        assert_eq!(broker(BrokerError::Timeout), "broker_timeout");
+        assert_eq!(SyncError::Timeout.code(), "broker_timeout");
+        assert_eq!(broker(BrokerError::UpstreamAuth), "ibkr_auth");
+        assert_eq!(
+            broker(BrokerError::RetryLater {
+                retry_after_secs: 5
+            }),
+            "ibkr_rate_limited"
+        );
+        assert_eq!(broker(BrokerError::Upstream), "ibkr_failed");
+        assert_eq!(broker(BrokerError::TooLarge), "ibkr_failed");
+        assert_eq!(broker(BrokerError::InvalidRequest), "broker_protocol");
+        assert_eq!(
+            broker(BrokerError::InvalidInput { field: "x".into() }),
+            "broker_protocol"
+        );
+        assert_eq!(
+            SyncError::Invalid(ONE_ACCOUNT).code(),
+            "account_unsupported"
+        );
+        assert_eq!(SyncError::Invalid(EUR_BASE).code(), "account_unsupported");
+        assert_eq!(
+            SyncError::Invalid("duplicate position").code(),
+            "data_refused"
+        );
+        assert_eq!(SyncError::Store.code(), "store_failed");
+    }
+
+    #[test]
+    fn sync_status_records_each_outcome() {
+        let at = |secs| OffsetDateTime::from_unix_timestamp(secs).unwrap();
+        let next = Duration::from_secs(60);
+        let mut status = SyncStatus::new(SyncMode::On, at(0));
+        assert_eq!(status.last_error, None);
+        assert_eq!(status.last_attempt_at, None);
+
+        status.record(Err("broker_timeout"), at(10), next);
+        status.record(Err("ibkr_failed"), at(20), next);
+        assert_eq!(status.consecutive_failures, 2);
+        assert_eq!(status.last_error, Some(("ibkr_failed", at(20))));
+        assert_eq!(status.last_attempt_at, Some(at(20)));
+        assert_eq!(status.last_success_at, None);
+        assert_eq!(status.next_attempt_at, Some(at(80)));
+
+        status.record(Ok(()), at(30), next);
+        assert_eq!(status.consecutive_failures, 0);
+        assert_eq!(status.last_success_at, Some(at(30)));
+        // The last error stays for the app to show.
+        assert_eq!(status.last_error, Some(("ibkr_failed", at(20))));
+
+        status.consecutive_failures = MAX_FAILURE_COUNT;
+        status.record(Err("ibkr_failed"), at(40), next);
+        assert_eq!(status.consecutive_failures, MAX_FAILURE_COUNT);
+
+        let refused = SyncStatus::new(SyncMode::Refused("broker_account_missing"), at(5));
+        assert_eq!(refused.last_error, Some(("broker_account_missing", at(5))));
     }
 }

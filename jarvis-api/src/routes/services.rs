@@ -4,7 +4,8 @@
 //! Only a compile-time allowlist of Jarvis units is queried, through a fixed
 //! `systemctl show` argv (no shell, cleared environment, bounded time). Only
 //! fixed labels and states from a fixed vocabulary leave Core: never PIDs,
-//! command lines, environments, paths or arbitrary units.
+//! command lines, environments, paths or arbitrary units. The IBKR status
+//! route reads the broker unit the same way ([`ibkr_broker_unit`]).
 
 use std::{collections::HashMap, ffi::CString, os::unix::ffi::OsStrExt, path::Path};
 use std::{
@@ -16,9 +17,10 @@ use std::{
 use axum::{extract::State, Json};
 use serde_json::{json, Value};
 
+use crate::ibkr::status::BrokerUnit;
 use crate::{AppState, Authed};
 
-const SYSTEMCTL: &str = "/usr/bin/systemctl";
+pub(crate) const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// Polling clients share one `systemctl` call per window.
@@ -44,6 +46,11 @@ const ACTIVE_STATES: [&str; 8] = [
     "maintenance",
     "refreshing",
 ];
+/// Separate from [`SERVICE_UNITS`]: only the IBKR status reports it.
+const IBKR_BROKER_UNIT: &str = "jarvis-ibkr-broker.service";
+/// `ActiveState`s the IBKR status reports; anything else is unknown.
+const BROKER_ACTIVE_STATES: [&str; 5] =
+    ["active", "activating", "inactive", "failed", "deactivating"];
 pub(crate) const DISKS: [(&str, &str); 2] = [("system", "/"), ("data", "/var/lib/jarvis")];
 
 static CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
@@ -95,22 +102,77 @@ async fn cached_status() -> Value {
 
 /// Every unit is `unknown` when the call fails, times out or misbehaves.
 async fn services_status(program: &str, timeout: Duration) -> Vec<Value> {
-    let output = tokio::time::timeout(timeout, systemctl_show(program))
-        .await
-        .ok()
-        .flatten();
+    let output = tokio::time::timeout(
+        timeout,
+        systemctl_show(
+            program,
+            "--property=Id,LoadState,ActiveState",
+            &SERVICE_UNITS.map(|(_, unit)| unit),
+        ),
+    )
+    .await
+    .ok()
+    .flatten();
     services_value(&output.as_deref().map(parse_show).unwrap_or_default())
 }
 
-async fn systemctl_show(program: &str) -> Option<String> {
+/// Facts of `jarvis-ibkr-broker.service`; all unknown when the call fails,
+/// times out or misbehaves.
+pub(crate) async fn ibkr_broker_unit(program: &str) -> BrokerUnit {
+    tokio::time::timeout(
+        TIMEOUT,
+        systemctl_show(
+            program,
+            "--property=LoadState,ActiveState,UnitFileState,ConditionResult,ConditionTimestampMonotonic",
+            &[IBKR_BROKER_UNIT],
+        ),
+    )
+    .await
+    .ok()
+    .flatten()
+    .map_or(BrokerUnit::UNKNOWN, |output| parse_broker_unit(&output))
+}
+
+/// Like [`parse_show`], every value is a `'static` constant. The unit has a
+/// single condition, its credential file: a start that failed it means the
+/// credentials are missing.
+fn parse_broker_unit(output: &str) -> BrokerUnit {
+    let value = |key: &str| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+    };
+    let service = if value("LoadState") == Some("not-found") {
+        "not_found"
+    } else {
+        BROKER_ACTIVE_STATES
+            .into_iter()
+            .find(|state| Some(*state) == value("ActiveState"))
+            .unwrap_or("unknown")
+    };
+    let enabled_at_boot = match value("UnitFileState") {
+        Some("enabled" | "enabled-runtime") => Some(true),
+        Some("disabled" | "masked" | "masked-runtime") => Some(false),
+        _ => None,
+    };
+    let checked =
+        value("ConditionTimestampMonotonic").is_some_and(|at| !at.is_empty() && at != "0");
+    let credentials = match value("ConditionResult") {
+        Some("no") if checked => "missing",
+        Some("yes") if checked => "present",
+        _ => "unknown",
+    };
+    BrokerUnit {
+        service,
+        enabled_at_boot,
+        credentials,
+    }
+}
+
+async fn systemctl_show(program: &str, properties: &str, units: &[&str]) -> Option<String> {
     let output = tokio::process::Command::new(program)
-        .args([
-            "show",
-            "--no-pager",
-            "--property=Id,LoadState,ActiveState",
-            "--",
-        ])
-        .args(SERVICE_UNITS.map(|(_, unit)| unit))
+        .args(["show", "--no-pager", properties, "--"])
+        .args(units)
         .env_clear()
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -244,6 +306,85 @@ mod tests {
         }
         // Units systemctl did not answer for stay unknown.
         assert_eq!(services[3]["state"], "unknown");
+    }
+
+    #[test]
+    fn ibkr_broker_unit_reports_fixed_values_only() {
+        let unit = |output: &str| parse_broker_unit(output);
+        let running = "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n\
+             ConditionResult=yes\nConditionTimestampMonotonic=123456\n";
+        assert_eq!(
+            unit(running),
+            BrokerUnit {
+                service: "active",
+                enabled_at_boot: Some(true),
+                credentials: "present",
+            }
+        );
+        // The credential condition failed at the last start.
+        let missing = "LoadState=loaded\nActiveState=inactive\nUnitFileState=disabled\n\
+             ConditionResult=no\nConditionTimestampMonotonic=99\n";
+        assert_eq!(
+            unit(missing),
+            BrokerUnit {
+                service: "inactive",
+                enabled_at_boot: Some(false),
+                credentials: "missing",
+            }
+        );
+        // Never started: the condition was never checked.
+        let never = "LoadState=loaded\nActiveState=inactive\nUnitFileState=disabled\n\
+             ConditionResult=no\nConditionTimestampMonotonic=0\n";
+        assert_eq!(unit(never).credentials, "unknown");
+        let absent = "LoadState=not-found\nActiveState=inactive\nUnitFileState=\n\
+             ConditionResult=no\nConditionTimestampMonotonic=0\n";
+        assert_eq!(
+            unit(absent),
+            BrokerUnit {
+                service: "not_found",
+                enabled_at_boot: None,
+                credentials: "unknown",
+            }
+        );
+        let odd = "LoadState=loaded\nActiveState=$(reboot)\nUnitFileState=static\nMainPID=42\n";
+        assert_eq!(
+            unit(odd),
+            BrokerUnit {
+                service: "unknown",
+                enabled_at_boot: None,
+                credentials: "unknown",
+            }
+        );
+        assert_eq!(unit(""), BrokerUnit::UNKNOWN);
+    }
+
+    #[tokio::test]
+    async fn ibkr_broker_unit_asks_systemctl_for_the_fixed_unit_only() {
+        assert_eq!(
+            ibkr_broker_unit("/nonexistent/systemctl").await,
+            BrokerUnit::UNKNOWN
+        );
+        assert_eq!(ibkr_broker_unit("/bin/false").await, BrokerUnit::UNKNOWN);
+        // A fake systemctl that answers only for the exact argv.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("systemctl");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             [ \"$*\" = \"show --no-pager --property=LoadState,ActiveState,UnitFileState,ConditionResult,ConditionTimestampMonotonic -- jarvis-ibkr-broker.service\" ] || exit 1\n\
+             printf 'LoadState=loaded\\nActiveState=failed\\nUnitFileState=enabled\\nConditionResult=yes\\nConditionTimestampMonotonic=7\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        assert_eq!(
+            ibkr_broker_unit(fake.to_str().unwrap()).await,
+            BrokerUnit {
+                service: "failed",
+                enabled_at_boot: Some(true),
+                credentials: "present",
+            }
+        );
     }
 
     #[test]

@@ -555,13 +555,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Off by default. A configuration problem leaves the trading routes
     // answering "not configured"; Core keeps running.
-    let ibkr_broker = if config.ibkr_portfolio_sync_enabled {
-        jarvis_api::ibkr::client(&config.ibkr_broker_socket)
-            .map_err(|reason| tracing::error!(reason, "IBKR portfolio sync disabled"))
-            .ok()
-            .map(Arc::new)
+    let (ibkr_broker, ibkr_mode) = if config.ibkr_portfolio_sync_enabled {
+        match jarvis_api::ibkr::client(&config.ibkr_broker_socket) {
+            Ok(client) => (Some(Arc::new(client)), jarvis_api::ibkr::SyncMode::On),
+            Err(refusal) => {
+                tracing::error!(reason = %refusal, "IBKR portfolio sync disabled");
+                (None, jarvis_api::ibkr::SyncMode::Refused(refusal.code()))
+            }
+        }
     } else {
-        None
+        (None, jarvis_api::ibkr::SyncMode::Off)
     };
     // The GitHub poller for roadmap links is off unless both the repo
     // allowlist and the systemd credential are there (docs/ROADMAPS.md); a
@@ -579,6 +582,7 @@ async fn main() -> anyhow::Result<()> {
         require_https: config.environment.eq_ignore_ascii_case("production"),
         dev_enrollment: config.dev_enrollment,
         ibkr: ibkr_broker.clone(),
+        ibkr_status: Arc::new(jarvis_api::ibkr::SyncStatusHandle::new(ibkr_mode)),
         llm,
         fast_intent_router: {
             use jarvis_api::intent::{
@@ -698,6 +702,7 @@ async fn main() -> anyhow::Result<()> {
             state.db.clone(),
             client.as_ref().clone(),
             config.ibkr_broker_socket.clone().into(),
+            state.ibkr_status.clone(),
         );
     }
     // Scheduled jobs (docs/SCHEDULED_JOBS.md); off when the time zone
