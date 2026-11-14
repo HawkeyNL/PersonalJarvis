@@ -240,7 +240,7 @@ The statements were extracted from all Rust string literals.
   - It imports the export into a disposable container (`--network none`,
     `start --unauthenticated memory`, 1 GiB) started from **the live image
     digest** (`:243-254`), then compares counts.
-  - It encrypts to the owner's keys and keeps 7 daily plus 4 weekly archives.
+  - It encrypts to the owner's keys and keeps the newest 7 archives.
   - The manifest records the image digest.
 - **`schema-backup`** (`deploy/systemd/schema-backup.sh`):
   - It makes a cold `cp -a` copy of `/var/lib/jarvis/surrealdb` with Core

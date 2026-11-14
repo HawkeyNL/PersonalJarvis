@@ -8,8 +8,8 @@
 # its own backups (`init-local` generates that key here once and prints the
 # private half for the owner to store elsewhere). Before encryption the export
 # is imported into a disposable, networkless SurrealDB container and its table
-# counts are compared with the live database. Nothing is uploaded. Archives
-# are kept 7 daily plus 4 weekly.
+# counts are compared with the live database. Nothing is uploaded. The newest
+# 7 archives are kept.
 #
 # The only plaintext file of `create` is the export, on tmpfs below /run,
 # removed on exit. `verify --decrypt` and `restore` read the owner private key
@@ -23,7 +23,7 @@ umask 077
 
 readonly archive_pattern='jarvis-backup-[0-9]{4}-[0-9]{2}-[0-9]{2}\.tar'
 readonly members=(etc-jarvis.tar.zst.gpg manifest.json.gpg surrealdb.surql.zst.gpg)
-readonly keep_daily=7 keep_weekly=4
+readonly keep_archives=7
 # The disposable restore container has 1 GiB; a larger export cannot be tested.
 readonly max_export_kib=$((1024 * 1024))
 readonly max_manifest_kib=1024
@@ -186,29 +186,25 @@ publish() {
     printf '%s\n' "$dest/$name"
 }
 
-# Keep the just-published archive $2, the newest $keep_daily archives and the
-# newest archive of each of the newest $keep_weekly ISO weeks (names carry one
-# date, so one archive per day). The current archive is never a deletion
-# candidate, and nothing is pruned while a future-dated name (clock skew,
-# manual copy) exists, so a wrong clock cannot evict history. Only regular
-# files with the exact archive name and a valid date are considered; symlinks
-# and other files are never touched.
+# Keep the newest $keep_archives archives in total, including the
+# just-published archive $2 (names carry one date, so one archive per day).
+# The current archive is never a deletion candidate, and nothing is pruned
+# while a future-dated name (clock skew, manual copy) exists, so a wrong clock
+# cannot evict history. Only regular files with the exact archive name and a
+# valid date are considered; symlinks and other files are never touched.
 prune() {
-    local dest=$1 current=$2 name week last_week='' days=0 weeks=0 new_week
+    local dest=$1 current=$2 name kept=0
     [[ $current =~ ^$archive_pattern$ ]] || fail 'prune needs the current archive name'
     find "$dest" -mindepth 1 -maxdepth 1 -type d -name '.jarvis-backup.*' -exec rm -rf -- {} +
     while IFS= read -r name; do
-        week=$(date -u -d "${name:14:10}" +%G-%V 2>/dev/null) || continue
+        date -u -d "${name:14:10}" >/dev/null 2>&1 || continue
         # Names sort newest first, so this returns before anything is deleted.
         if [[ $name > $current ]]; then
             log 'an archive is dated after the current one; not pruning (check the clock)'
             return 0
         fi
-        new_week=false
-        if [[ $week != "$last_week" ]]; then weeks=$((weeks + 1)) last_week=$week new_week=true; fi
-        days=$((days + 1))
-        [[ $name == "$current" ]] || (( days <= keep_daily )) || { $new_week && (( weeks <= keep_weekly )); } \
-            || rm -f -- "$dest/$name" "$dest/$name.sha256"
+        kept=$((kept + 1))
+        [[ $name == "$current" ]] || (( kept <= keep_archives )) || rm -f -- "$dest/$name" "$dest/$name.sha256"
     done < <(find "$dest" -mindepth 1 -maxdepth 1 -type f -regextype posix-extended \
         -regex ".*/$archive_pattern" -printf '%f\n' | LC_ALL=C sort -r)
 }

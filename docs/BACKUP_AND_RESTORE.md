@@ -6,9 +6,9 @@ uploaded. For a backup that stays on the Home Node, see
 [Local-only backup](#local-only-backup).
 
 > **Archives stay on the same disk as the live data.** Each run keeps the
-> newest 7 archives and the newest archive of each of the last 4 ISO weeks
-> (3 to 4 weeks of history). A disk failure or a compromised host still
-> leaves you with nothing. Copy archives off the machine when you can (see
+> newest 7 archives (about one week of history with the daily timer). A disk
+> failure or a compromised host still leaves you with nothing. Copy archives
+> off the machine when you can (see
 > [Copying off the machine](#copying-off-the-machine)).
 
 ## What is in an archive
@@ -34,9 +34,9 @@ Not included, by design:
 
 **Chat photos are not backed up.** The archive holds the photo rows (ids,
 sizes, dates, kept flag) but not the files. That is deliberate: archives are
-kept for weeks, so a photo the owner deleted would otherwise live on in them,
-and the photo store may grow to 2 GiB per owner. The cost: a disk failure loses
-the photos. After a restore onto a new disk, each photo whose file is gone
+kept for about a week, so a photo the owner deleted would otherwise live on in
+them, and the photo store may grow to 2 GiB per owner. The cost: a disk failure
+loses the photos. After a restore onto a new disk, each photo whose file is gone
 answers 404 and messages show a placeholder; its row stays until it expires
 or is deleted. Core does not encrypt photo files itself: only full-disk
 encryption, if the Home Node has it, protects them at rest. Deleting a photo
@@ -52,10 +52,10 @@ unlinks its file, which on an SSD does not overwrite the blocks.
    and each restored count must lie between the two live counts. The live
    database is never written.
 4. It encrypts, writes the archive atomically, verifies the checksum and
-   member layout, and only then prunes older archives (7 daily, 4 weekly).
-   The archive it just published is never removed. While any archive carries
-   a later date (clock skew or a manual copy), nothing is pruned and the run
-   logs a warning.
+   member layout, and only then prunes older archives: the newest 7 are kept,
+   counting the one it just published. That archive is never removed. While
+   any archive carries a later date (clock skew or a manual copy), nothing is
+   pruned and the run logs a warning.
 
 When the import fails, the journal shows the cause: a class (for example
 `parse error`, `unique index conflict`, `duplicate record or definition`, or
@@ -109,7 +109,8 @@ that is generated on the host once and then kept only by the owner.
 
 **Protects against:** a bad migration or Core bug that damages data, database
 corruption, and operator error (deleted records, a broken `/etc/jarvis`), up
-to 3 to 4 weeks back.
+to the oldest of the newest 7 archives (about one week back with the daily
+timer).
 
 **Does not protect against:** loss or failure of the SSD, theft of the
 machine, fire, or a compromised host (root can delete the archives, and an
