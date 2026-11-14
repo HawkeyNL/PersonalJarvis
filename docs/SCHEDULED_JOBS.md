@@ -24,7 +24,7 @@ expires 30 days after it was made: it no longer runs or counts towards the
 seeded. Every create first writes one guard row (`scheduled_job_guards`,
 0022) in its transaction, so two creates at the same time cannot both pass
 the room rules: the database lets one commit, and the other is answered
-from the state after it.
+from the state after it, or tried once more when that still leaves room.
 
 Each create, change and delete through the API writes a security audit row
 (`jobs.created`, `jobs.updated`, `jobs.deleted`, `jobs.run_requested`) with
@@ -434,7 +434,7 @@ job's scheduled run. Each source has its own bound; all are read at once:
 | `runs` | The window's runs: job, kind, status, `error_code`, start time (never facts or summary) |
 | `disks` | The Health page's `system` and `data` disks (used percent, within 2 seconds) |
 | `services` | The Health page's units plus `jarvis-updater.service`, `jarvis-backup.timer` and `jarvis-backup.service`, through the same fixed `systemctl show` call (state only, within 2 seconds) |
-| `ibkr` | The problem codes of the IBKR status (`GET /v1/trading/ibkr/status`, within 12 seconds) |
+| `ibkr` | The problem codes of the IBKR status, collected in Core (what `GET /v1/trading/ibkr/status` shows, within 12 seconds) |
 | `llm_usage` | Failed model calls per backend and failure category |
 | `security_audit` | Counts per event and outcome of a fixed list of events (never `detail` or `device_id`) |
 
@@ -458,9 +458,9 @@ leaves it) and the month's model spend against the budget.
 | `job_paused:{job_id}` | medium | A job paused after failed runs |
 | `job_failing:{kind}:{code}` | medium | Failed or partial runs with `token_needs_dependabot_alerts_read`, `github_token_refused`, `not_configured`, `disk_unavailable`, a `roadmap_*` code, or `research_unavailable` twice |
 | `jobs_missed` | low | A missed run |
-| `ibkr:{code}` | per code | Each IBKR status problem but `sync_disabled` and `first_sync_pending`: `auth_rejected` high and urgent; `token_expired` info (it renews on the next request); `config_refused`, `credentials_missing`, `broker_failed`, `broker_unreachable`, `sync_failing` and `core_store_unavailable` high; `rate_limited` low; the others medium |
+| `ibkr:{code}` | per code | Each IBKR status problem but `sync_disabled`, `first_sync_pending` and `token_expired` (it renews on the next request): `auth_rejected` high and urgent; `config_refused`, `credentials_missing`, `broker_failed`, `broker_unreachable`, `sync_failing` and `core_store_unavailable` high; `rate_limited` low; the others medium. A problem the IBKR status rates a warning (such as `sync_failing` before its third failure) is at most medium |
 | `research_without_worker` | medium | An enabled research job while Research cannot run |
-| `claude_worker_off` | medium | An enabled research job or dependency review while the Claude worker is off |
+| `claude_worker_off` | medium | An enabled dependency review while the Claude worker is off |
 | `llm_auth:{backend}` | high, urgent | A model call refused for its credentials |
 | `llm_unavailable:{backend}` | medium | 5 or more calls unavailable or timed out |
 | `push_failing` | medium | 3 or more pushes failed or dropped |

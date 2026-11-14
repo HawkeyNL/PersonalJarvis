@@ -315,13 +315,14 @@ pub struct UsageFailures {
 /// Most groups [`failures_since`] returns.
 const MAX_FAILURE_GROUPS: usize = 50;
 
-/// Failed calls of the last `hours` per backend and failure category, most
-/// first: Core-assigned identifiers and counts only, for the morning check.
+/// Failed calls since `since` (RFC 3339, Core's clock) per backend and
+/// failure category, most first: Core-assigned identifiers and counts only,
+/// for the morning check.
 fn failures_since_query() -> String {
     format!(
         "SELECT *, time::format(last_at, '%+') AS last_at FROM \
          (SELECT backend, failure_category, count() AS requests, time::max(ts) AS last_at \
-          FROM llm_usage WHERE ts > time::now() - duration::from::hours($hours) \
+          FROM llm_usage WHERE ts > <datetime>$since \
           AND failure_category != NONE GROUP BY backend, failure_category) \
          ORDER BY requests DESC LIMIT {MAX_FAILURE_GROUPS}"
     )
@@ -329,10 +330,10 @@ fn failures_since_query() -> String {
 
 pub async fn failures_since(
     db: &Database,
-    hours: u32,
+    since: &str,
 ) -> Result<Vec<UsageFailures>, jarvis_store::StoreError> {
     db.query(failures_since_query())
-        .bind(("hours", hours))
+        .bind(("since", since.to_owned()))
         .await
         .map_err(jarvis_store::StoreError::schema)?
         .check()

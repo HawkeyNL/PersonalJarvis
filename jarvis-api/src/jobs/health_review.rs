@@ -63,9 +63,11 @@ const AUDIT_EVENTS: [&str; 11] = [
     "local.account.recovery.confirm",
     "local.account.recovery.deny",
 ];
-/// IBKR status codes that are findings, and how severe; `sync_disabled` and
-/// `first_sync_pending` are not.
-const IBKR: [(&str, Severity, bool); 15] = [
+/// IBKR status codes that are findings, and how severe at most (a problem
+/// the IBKR status rates a warning is at most medium); `sync_disabled`,
+/// `first_sync_pending` and `token_expired` (it renews on the next request)
+/// are not.
+const IBKR: [(&str, Severity, bool); 14] = [
     ("config_refused", Severity::High, false),
     ("broker_not_installed", Severity::Medium, false),
     ("credentials_missing", Severity::High, false),
@@ -74,8 +76,6 @@ const IBKR: [(&str, Severity, bool); 15] = [
     ("broker_unreachable", Severity::High, false),
     ("broker_restart_needed", Severity::Medium, false),
     ("auth_rejected", Severity::High, true),
-    // It renews on the next request.
-    ("token_expired", Severity::Info, false),
     ("session_competing", Severity::Medium, false),
     ("rate_limited", Severity::Low, false),
     ("account_unsupported", Severity::Medium, false),
@@ -102,7 +102,6 @@ pub(super) async fn run(state: &AppState, job: &Job, trigger: Trigger) -> Finish
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Severity {
-    Info,
     Low,
     Medium,
     High,
@@ -169,8 +168,8 @@ struct Signals {
     /// Unit and state, from a fixed vocabulary.
     units: HashMap<&'static str, &'static str>,
     agent_registry_degraded: bool,
-    /// Code and fixed summary of each IBKR problem.
-    ibkr: Vec<(&'static str, &'static str)>,
+    /// Code, fixed summary and whether the IBKR status rates it an error.
+    ibkr: Vec<(&'static str, &'static str, bool)>,
     claude_worker: bool,
     research: bool,
     llm_failures: Vec<UsageFailures>,
@@ -206,6 +205,7 @@ async fn bounded<T, E: std::fmt::Display>(
 /// it and leaves it for the next scheduled one.
 async fn collect(state: &AppState, hours: u32, scheduled: bool) -> Signals {
     let since = OffsetDateTime::now_utc() - time::Duration::hours(hours.into());
+    let since_text = since.format(&Rfc3339).unwrap_or_default();
     let db = &state.db;
     let (jobs, runs, disks, units, ibkr, llm_failures, audit, claude_worker) = tokio::join!(
         bounded("jobs", store::list(db)),
@@ -213,14 +213,20 @@ async fn collect(state: &AppState, hours: u32, scheduled: bool) -> Signals {
         crate::routes::services::used_percent(),
         crate::routes::services::review_unit_states(crate::routes::services::SYSTEMCTL),
         tokio::time::timeout(IBKR_TIMEOUT, crate::ibkr::status::collect(state)),
-        bounded("llm_usage", jarvis_usage::failures_since(db, hours)),
+        bounded("llm_usage", jarvis_usage::failures_since(db, &since_text)),
         bounded("security_audit", audit_counts(db, since)),
         tokio::fs::try_exists(claude_worker_protocol::SOCKET),
     );
     let ibkr = ibkr.ok().map(|collected| {
         crate::ibkr::status::problems(&collected)
             .into_iter()
-            .map(|problem| (problem.code, problem.summary))
+            .map(|problem| {
+                (
+                    problem.code,
+                    problem.summary,
+                    problem.severity == crate::ibkr::status::Severity::Error,
+                )
+            })
             .collect::<Vec<_>>()
     });
     let sources = BTreeMap::from([
@@ -437,11 +443,15 @@ fn findings(s: &Signals) -> Vec<Finding> {
         );
     }
 
-    for (code, summary) in &s.ibkr {
+    for (code, summary, error) in &s.ibkr {
         if let Some((_, severity, urgent)) = IBKR.iter().find(|entry| entry.0 == *code) {
             found.push(Finding::new(
                 format!("ibkr:{code}"),
-                *severity,
+                if *error {
+                    *severity
+                } else {
+                    (*severity).min(Medium)
+                },
                 *urgent,
                 (*summary).to_owned(),
             ));
@@ -461,12 +471,14 @@ fn findings(s: &Signals) -> Vec<Finding> {
             "Research jobs cannot run: Research is off".into(),
         ));
     }
-    if !s.claude_worker && enabled(&[Kind::Prompt, Kind::DependencyReview]) {
+    // Research may run on another worker; `research_without_worker` covers
+    // the research jobs.
+    if !s.claude_worker && enabled(&[Kind::DependencyReview]) {
         found.push(Finding::new(
             "claude_worker_off",
             Medium,
             false,
-            "The Claude worker is off while jobs need it".into(),
+            "The Claude worker is off while the dependency review needs it".into(),
         ));
     }
 
@@ -765,7 +777,7 @@ mod tests {
                 .map(|unit| (unit, "active"))
                 .collect(),
             agent_registry_degraded: false,
-            ibkr: vec![("sync_disabled", "off")],
+            ibkr: vec![("sync_disabled", "off", false)],
             claude_worker: true,
             research: true,
             llm_failures: Vec::new(),
@@ -1011,7 +1023,7 @@ mod tests {
 
     #[test]
     fn ibkr_problems_map_onto_fixed_findings() {
-        use Severity::{High, Info, Low, Medium};
+        use Severity::{High, Low, Medium};
         for (code, severity, urgent) in [
             ("config_refused", High, false),
             ("broker_not_installed", Medium, false),
@@ -1021,7 +1033,6 @@ mod tests {
             ("broker_unreachable", High, false),
             ("broker_restart_needed", Medium, false),
             ("auth_rejected", High, true),
-            ("token_expired", Info, false),
             ("session_competing", Medium, false),
             ("rate_limited", Low, false),
             ("account_unsupported", Medium, false),
@@ -1030,7 +1041,7 @@ mod tests {
             ("core_store_unavailable", High, false),
         ] {
             let found = findings(&Signals {
-                ibkr: vec![(code, "A fixed summary.")],
+                ibkr: vec![(code, "A fixed summary.", true)],
                 ..healthy()
             });
             assert_eq!(found.len(), 1, "{code}");
@@ -1040,8 +1051,25 @@ mod tests {
             );
             assert_eq!(found[0].title, "A fixed summary.");
         }
-        for code in ["sync_disabled", "first_sync_pending", "unknown"] {
-            assert!(with(|s| s.ibkr = vec![(code, "x")]).is_empty(), "{code}");
+        // A warning is at most medium: a sync failing for the first times.
+        assert_eq!(
+            with(|s| s.ibkr = vec![("sync_failing", "x", false)]),
+            one("ibkr:sync_failing", Medium, false)
+        );
+        assert_eq!(
+            with(|s| s.ibkr = vec![("rate_limited", "x", false)]),
+            one("ibkr:rate_limited", Low, false)
+        );
+        for code in [
+            "sync_disabled",
+            "first_sync_pending",
+            "token_expired",
+            "unknown",
+        ] {
+            assert!(
+                with(|s| s.ibkr = vec![(code, "x", true)]).is_empty(),
+                "{code}"
+            );
         }
     }
 
@@ -1056,6 +1084,12 @@ mod tests {
             with(|s| s.claude_worker = false),
             one("claude_worker_off", Medium, false)
         );
+        // Research jobs alone do not need the Claude worker.
+        assert!(with(|s| {
+            s.claude_worker = false;
+            s.jobs = vec![prompt()];
+        })
+        .is_empty());
         // Only enabled jobs that need them count.
         assert!(with(|s| {
             s.research = false;
@@ -1321,7 +1355,7 @@ mod tests {
             ]
         );
         assert!(audit.iter().all(|row| row.last_at > since));
-        let mut llm = jarvis_usage::failures_since(&db, 24).await?;
+        let mut llm = jarvis_usage::failures_since(&db, &since.format(&Rfc3339)?).await?;
         llm.sort_by(|a, b| a.backend.cmp(&b.backend));
         assert_eq!(
             llm.iter()

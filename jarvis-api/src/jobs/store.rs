@@ -177,15 +177,15 @@ async fn insert(db: &Database, job: Job) -> Result<Job> {
 /// when a caller's timeout released the lock while an earlier write was
 /// still in flight. Every create first writes the one guard row (0022), so
 /// two creates in flight at once conflict on that key and only one commits;
-/// the other is explained from the state after it.
+/// the other is explained from the state after it, and tried once more when
+/// that state still leaves room.
 async fn write(db: &Database, job: &Job) -> Result<()> {
     let limit = match job.origin {
         Origin::Owner => MAX_OWNER_JOBS,
         Origin::Jarvis => MAX_JARVIS_JOBS,
     };
-    let response = db
-        .query(format!(
-            "BEGIN TRANSACTION; \
+    let query = format!(
+        "BEGIN TRANSACTION; \
              UPSERT scheduled_job_guards:create SET touched_at = time::now() RETURN NONE; \
              IF $kind IN $singletons AND array::len((SELECT VALUE id \
                FROM scheduled_jobs WHERE kind = $kind)) > 0 \
@@ -205,8 +205,8 @@ async fn write(db: &Database, job: &Job) -> Result<()> {
                failure_count = 0, created_at = time::now(), updated_at = time::now() \
                RETURN NONE; \
              COMMIT TRANSACTION;"
-        ))
-        .bind(json!({
+    );
+    let bindings = json!({
             "id": job.id,
             "kind": job.kind,
             "cadence": job.cadence,
@@ -225,16 +225,20 @@ async fn write(db: &Database, job: &Job) -> Result<()> {
             "expires_at": slot(job.expires_at)?,
             "limit": limit,
             "singletons": SINGLETON_KINDS,
-        }))
-        .await?;
-    // A lost guard conflict fails the statements too (not the query).
-    let Err(error) = response.check() else {
-        return Ok(());
-    };
-    // Explain the refusal (or the conflict) from the current state;
-    // anything else is a database error.
-    room(&all(db).await?, job)?;
-    Err(error.into())
+    });
+    let mut last = None;
+    for _ in 0..2 {
+        let response = db.query(query.as_str()).bind(bindings.clone()).await?;
+        // A lost guard conflict fails the statements too (not the query).
+        let Err(error) = response.check() else {
+            return Ok(());
+        };
+        // Explain the refusal from the current state; with room left it was
+        // a lost conflict (or another error), worth one more try.
+        room(&all(db).await?, job)?;
+        last = Some(error);
+    }
+    Err(last.map_or(JobError::InvalidData, JobError::from))
 }
 
 /// Change a job at revision `expected`; a change that changes nothing writes
@@ -1163,12 +1167,9 @@ mod tests {
                     }
                 );
                 let conn = conn.clone();
-                async move {
-                    conn.query(query)
-                        .await
-                        .and_then(surrealdb::Response::check)
-                        .is_ok()
-                }
+                // `None` when the query itself failed; else whether it
+                // committed.
+                async move { conn.query(query).await.ok().map(|r| r.check().is_ok()) }
             };
             let (a, b) = (
                 txn(&db, &format!("a{guard}")),
@@ -1176,11 +1177,14 @@ mod tests {
             );
             async move {
                 let (a, b) = tokio::join!(a, b);
-                u8::from(a) + u8::from(b)
+                let mut both = [a, b];
+                both.sort();
+                both
             }
         };
-        assert_eq!(overlap(false).await, 2);
-        assert_eq!(overlap(true).await, 1);
+        assert_eq!(overlap(false).await, [Some(true), Some(true)]);
+        // The loser's statements fail, the query itself does not.
+        assert_eq!(overlap(true).await, [Some(false), Some(true)]);
         let now = OffsetDateTime::now_utc();
         let fresh = || uuid::Uuid::now_v7().to_string();
         let health = || -> Result<Job> {
