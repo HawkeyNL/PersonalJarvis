@@ -2,7 +2,7 @@
 # Run provisioning against the digest-pinned official image. The image is
 # intentionally shell-less, so this is a regression test for direct /surreal
 # execution as well as secret-safe Docker invocation.
-set -euo pipefail
+set -Eeuo pipefail
 
 [[ ${EUID} -eq 0 ]] || {
     echo "shell-less provisioning test must run as root" >&2
@@ -32,6 +32,19 @@ cleanup() {
     rm -rf -- "$tmp"
 }
 trap cleanup EXIT
+# Fail loudly: name the failing line and show the captured provisioning output.
+# It holds only status lines; the passwords above are public fixture values.
+on_error() {
+    local status=$? line=$1
+    echo "shell-less provisioning test failed at line $line (exit $status)" >&2
+    echo "DIAG fixture mount: $(findmnt -no OPTIONS -T "$tmp" 2>&1)" >&2
+    echo "DIAG resolved: $(PATH="$bin_dir:$PATH" type -P docker openssl | tr '\n' ' ')" >&2
+    if [[ -s $output_file ]]; then
+        echo "--- captured provisioning output ---" >&2
+        cat -- "$output_file" >&2
+    fi
+}
+trap 'on_error $LINENO' ERR
 mkdir -p "$bin_dir" "$tmp/data"
 
 install -o root -g root -m 0600 /dev/null "$env_file"
