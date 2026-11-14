@@ -103,6 +103,16 @@ async fn schema_version(db: &Database) -> Result<Option<SchemaVersion>, StoreErr
 /// aborts startup; continuing with a partly-defined security schema would be
 /// unsafe. This is an idempotent baseline for the empty, pre-production Home
 /// Node only. Later schema changes must be explicit, versioned migrations.
+///
+/// SurrealDB 2.x builds an index over existing rows in transactions of its
+/// own, outside the migration's transaction, and production runs RocksDB,
+/// which fails the migration's commit when those writes overlap its own
+/// (schema 0021, v0.0.87). In a migration, therefore:
+/// - never remove or overwrite an index and define it again under the same
+///   name: give the new index a new name;
+/// - never write rows of a populated table in the same migration that
+///   defines an index on it;
+/// - avoid `DEFINE INDEX OVERWRITE` on a populated table.
 pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
     let current = schema_version(db).await?;
     if current.is_some_and(|v| v.version == 21) {
