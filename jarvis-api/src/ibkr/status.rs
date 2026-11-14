@@ -120,6 +120,9 @@ const EN: &str = "sudo systemctl enable --now jarvis-ibkr-broker.service";
 const RB: &str = "sudo systemctl reset-failed jarvis-ibkr-broker.service && sudo systemctl restart jarvis-ibkr-broker.service";
 const LOG: &str = "sudo journalctl -u jarvis-ibkr-broker.service -n 50 --no-pager";
 const CLOG: &str = "sudo jarvis logs core --lines 100";
+const FIX_SOCKET: &str = "Fix JARVIS_IBKR_BROKER_SOCKET in /etc/jarvis/core.env: an absolute path, by default /run/jarvis-ibkr-broker/broker.sock";
+const OWN_ACCOUNT: &str =
+    "The jarvis-ibkr account must be its own user, neither root nor Core's user";
 
 /// Every problem code with its summary and commands.
 const CATALOG: [(&str, &str, &[&str]); 17] = [
@@ -295,14 +298,17 @@ where
 }
 
 fn sync_state(sync: &SyncStatus) -> &'static str {
+    // The last attempt found no broker socket.
+    let waiting = matches!(
+        sync.last_error,
+        Some(("broker_not_running", at)) if Some(at) == sync.last_attempt_at
+    );
     match sync.mode {
         SyncMode::Off => "off",
         SyncMode::Refused(_) => "refused",
         SyncMode::On if sync.last_attempt_at.is_none() => "starting",
+        SyncMode::On if waiting => "waiting_for_broker",
         SyncMode::On if sync.consecutive_failures == 0 => "ok",
-        SyncMode::On if matches!(sync.last_error, Some(("broker_not_running", _))) => {
-            "waiting_for_broker"
-        }
         SyncMode::On => "failing",
     }
 }
@@ -337,7 +343,9 @@ pub fn problems(collected: &Collected) -> Vec<Problem> {
             found.push(("broker_failed", Error));
         }
     }
-    let unit_explains = found.iter().any(|(code, _)| *code != "config_refused");
+    // Only a unit that is not running explains an unreachable broker.
+    let unit_explains = matches!(unit.service, "not_found" | "inactive" | "failed")
+        && found.iter().any(|(code, _)| *code != "config_refused");
 
     match &collected.broker {
         BrokerReply::NotAsked => {}
@@ -382,7 +390,22 @@ pub fn problems(collected: &Collected) -> Vec<Problem> {
             found.push(("core_store_unavailable", Error));
         }
     }
-    finish(found)
+    let mut problems = finish(found);
+    if let SyncMode::Refused(reason) = sync.mode {
+        for problem in problems.iter_mut().filter(|p| p.code == "config_refused") {
+            problem.commands = refused_commands(reason);
+        }
+    }
+    problems
+}
+
+/// What to do about a [`super::ClientRefusal`] code.
+fn refused_commands(reason: &str) -> &'static [&'static str] {
+    match reason {
+        "socket_path_invalid" => &[FIX_SOCKET, RC],
+        "broker_account_unsafe" => &[OWN_ACCOUNT, CS, RC],
+        _ => &[SET, RC],
+    }
 }
 
 fn finish(mut found: Vec<(&'static str, Severity)>) -> Vec<Problem> {
@@ -635,8 +658,7 @@ mod tests {
                     credentials: "unknown",
                 };
                 c.broker = BrokerReply::Unreachable;
-                c.sync.last_error = Some(("broker_not_running", at(NOW - 10)));
-                c.sync.consecutive_failures = 1;
+                c.sync.last_error = Some(("broker_not_running", at(NOW - 60)));
             }),
             [("broker_not_installed", Error)]
         );
@@ -651,6 +673,22 @@ mod tests {
         );
         assert_eq!(
             with(|c| c.unit.enabled_at_boot = Some(false)),
+            [("broker_not_enabled", Error)]
+        );
+        // A running unit does not explain an unreachable broker.
+        assert_eq!(
+            with(|c| {
+                c.unit.enabled_at_boot = Some(false);
+                c.broker = BrokerReply::Unreachable;
+            }),
+            [("broker_not_enabled", Error), ("broker_unreachable", Error)]
+        );
+        assert_eq!(
+            with(|c| {
+                c.unit.service = "inactive";
+                c.unit.enabled_at_boot = Some(false);
+                c.broker = BrokerReply::Unreachable;
+            }),
             [("broker_not_enabled", Error)]
         );
         assert_eq!(
@@ -702,7 +740,10 @@ mod tests {
         assert_eq!(with(failing("ibkr_failed", 2)), [("sync_failing", Warn)]);
         assert_eq!(with(failing("ibkr_failed", 3)), [("sync_failing", Error)]);
         // Waiting for a broker that is not there is the broker's problem.
-        assert!(with(failing("broker_not_running", 9)).is_empty());
+        assert!(with(|c| {
+            c.sync.last_error = Some(("broker_not_running", at(NOW - 60)));
+        })
+        .is_empty());
         assert_eq!(
             with(|c| {
                 c.sync.last_success_at = Some(at(NOW - 16 * 60));
@@ -727,6 +768,47 @@ mod tests {
             with(|c| c.stored_as_of = Err(())),
             [("core_store_unavailable", Error)]
         );
+    }
+
+    #[test]
+    fn a_refused_configuration_says_what_to_fix() {
+        let commands = |reason| {
+            let mut collected = healthy();
+            collected.sync = SyncStatus::new(SyncMode::Refused(reason), at(NOW));
+            collected.broker = BrokerReply::NotAsked;
+            let found = problems(&collected);
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].code, "config_refused");
+            found[0].commands
+        };
+        assert_eq!(commands("broker_account_missing"), [SET, RC]);
+        assert_eq!(commands("socket_path_invalid"), [FIX_SOCKET, RC]);
+        assert_eq!(commands("broker_account_unsafe"), [OWN_ACCOUNT, CS, RC]);
+    }
+
+    #[test]
+    fn waiting_for_the_broker_is_not_a_failing_sync() {
+        let mut collected = healthy();
+        let next = Duration::from_secs(300);
+        for i in 0..2 {
+            collected
+                .sync
+                .record(Err("ibkr_failed"), at(NOW - 100 + i), next);
+        }
+        for i in 0..5 {
+            collected
+                .sync
+                .record(Err("broker_not_running"), at(NOW - 50 + i), next);
+        }
+        assert_eq!(body(&collected)["sync"]["state"], "waiting_for_broker");
+        assert_eq!(collected.sync.consecutive_failures, 0);
+        assert!(codes(&collected).is_empty());
+        // One more failure after the waits is a first failure, not a third.
+        collected
+            .sync
+            .record(Err("ibkr_failed"), at(NOW - 10), next);
+        assert_eq!(codes(&collected), [("sync_failing", Severity::Warn)]);
+        assert_eq!(body(&collected)["sync"]["state"], "failing");
     }
 
     #[test]

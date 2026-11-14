@@ -103,7 +103,7 @@ or log line.
     "service": "active | activating | inactive | failed | deactivating | not_found | unknown",
     "enabled_at_boot": "true | false | null",
     "credentials": "present | missing | unknown",
-    "reachable": "true | false | null (not asked while the sync is off)",
+    "reachable": "true | false | null (not asked: sync off or configuration refused)",
     "started_at": "RFC 3339 | null"
   },
   "token": {
@@ -147,19 +147,19 @@ for the owner to copy; Core and the apps never run them.
 | Code | Severity | When |
 |---|---|---|
 | `sync_disabled` | info | The sync is off (the only problem then). |
-| `config_refused` | error | Turned on, but Core refused the configuration. |
+| `config_refused` | error | Turned on, but Core refused the configuration; the commands depend on the refusal code. |
 | `broker_not_installed` | error | The broker unit does not exist. |
 | `credentials_missing` | error | The unit's credential condition failed. |
 | `broker_not_enabled` | error | The unit does not start at boot. |
 | `broker_failed` | error | The unit failed. |
-| `broker_unreachable` | error | No usable answer from the broker, and the unit explains nothing. A reply this Core cannot read, also from a newer broker, counts as no answer. |
+| `broker_unreachable` | error | No usable answer from the broker, unless a unit problem explains it while the unit is not running. A reply this Core cannot read, also from a newer broker, counts as no answer. |
 | `broker_restart_needed` | warn | The running broker predates the status request. |
 | `auth_rejected` | error | IBKR rejected the current token or the last token request. |
 | `token_expired` | info | The token expired; the next request renews it. |
 | `session_competing` | warn | Another IBKR session competes. |
 | `rate_limited` | warn | IBKR rate limiting is active. |
 | `account_unsupported` | error | The last sync failed on the account (not one EUR cash account). |
-| `sync_failing` | warn, error from 3 failures in a row | The last sync failed for another reason. |
+| `sync_failing` | warn, error from 3 failures in a row | The last sync failed for another reason. Waiting for a missing broker socket is not counted and resets the count, like the backoff. |
 | `sync_stale` | warn | The last good sync is more than 15 minutes old. |
 | `first_sync_pending` | info | No sync finished yet and nothing is stored. |
 | `core_store_unavailable` | error | Core could not read the stored portfolio. |

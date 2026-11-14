@@ -151,7 +151,8 @@ pub struct SyncStatus {
     pub last_success_at: Option<OffsetDateTime>,
     /// Kept after a later success, so the app can show the last error.
     pub last_error: Option<(&'static str, OffsetDateTime)>,
-    /// Failed attempts in a row, a missing broker included; capped at 1000.
+    /// Failed attempts in a row, capped at 1000. Waiting for a missing
+    /// broker socket resets it, like the backoff.
     pub consecutive_failures: u32,
     pub next_attempt_at: Option<OffsetDateTime>,
 }
@@ -181,7 +182,11 @@ impl SyncStatus {
             }
             Err(code) => {
                 self.last_error = Some((code, now));
-                self.consecutive_failures = (self.consecutive_failures + 1).min(MAX_FAILURE_COUNT);
+                self.consecutive_failures = if code == SyncError::BrokerNotRunning.code() {
+                    0
+                } else {
+                    (self.consecutive_failures + 1).min(MAX_FAILURE_COUNT)
+                };
             }
         }
         self.next_attempt_at = Some(now + next);
@@ -892,6 +897,10 @@ mod tests {
         status.consecutive_failures = MAX_FAILURE_COUNT;
         status.record(Err("ibkr_failed"), at(40), next);
         assert_eq!(status.consecutive_failures, MAX_FAILURE_COUNT);
+        // A missing broker socket is waited for, not counted.
+        status.record(Err("broker_not_running"), at(50), next);
+        assert_eq!(status.consecutive_failures, 0);
+        assert_eq!(status.last_error, Some(("broker_not_running", at(50))));
 
         let refused = SyncStatus::new(SyncMode::Refused("broker_account_missing"), at(5));
         assert_eq!(refused.last_error, Some(("broker_account_missing", at(5))));
