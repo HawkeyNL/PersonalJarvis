@@ -19,6 +19,7 @@
 //! encryption key and does no RSA decryption at runtime.
 
 mod crypto;
+mod status;
 mod types;
 
 use std::{
@@ -36,12 +37,14 @@ use serde::{de::DeserializeOwned, Deserialize};
 use tokio::{sync::Mutex, time::Instant};
 use zeroize::Zeroizing;
 
+pub use status::{status_code, BrokerStatus, Brokerage, ErrorAt, LstState, LstStatus, MintStatus};
 pub use types::{
     Account, Bar, History, Ledger, LedgerEntry, MarketDataAvailability, Position, SecdefMatch,
     SecdefSection, Snapshot,
 };
 
 use crate::{AuthStatus, IbkrError};
+use status::ClientStatus;
 
 const BASE_URL: &str = "https://api.ibkr.com/v1/api";
 const USER_AGENT: &str = concat!("jarvis-ibkr/", env!("CARGO_PKG_VERSION"));
@@ -374,6 +377,9 @@ pub struct IbkrOAuthClient {
     /// LST generation the brokerage session was opened for (0 = none).
     brokerage: Mutex<u64>,
     pacer: Pacer,
+    /// Read by [`Self::status`]; only ever locked briefly, never across an
+    /// await and never while waiting for IBKR.
+    status: StdMutex<ClientStatus>,
 }
 
 impl IbkrOAuthClient {
@@ -394,7 +400,24 @@ impl IbkrOAuthClient {
             session: Mutex::new(SessionState::default()),
             brokerage: Mutex::new(0),
             pacer: Pacer::new(),
+            status: StdMutex::new(ClientStatus {
+                started_at: unix_now().as_secs(),
+                ..ClientStatus::default()
+            }),
         }
+    }
+
+    /// Health of this client from memory only: no IBKR request, no mint and
+    /// no wait on the session lock or the pacer.
+    pub fn status(&self) -> BrokerStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .report(unix_now().as_secs())
+    }
+
+    fn update_status(&self, update: impl FnOnce(&mut ClientStatus)) {
+        update(&mut self.status.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
     /// Accounts visible to these credentials. IBKR wants this called before
@@ -524,6 +547,7 @@ impl IbkrOAuthClient {
         let mut opened_for = self.brokerage.lock().await;
         if *opened_for == generation {
             *opened_for = 0;
+            self.update_status(|s| s.brokerage = Brokerage::Closed);
         }
     }
 
@@ -541,6 +565,7 @@ impl IbkrOAuthClient {
         if !status.authenticated {
             self.close_brokerage(opened_for).await;
         }
+        self.update_status(|s| s.brokerage = Brokerage::from(&status));
         Ok(status)
     }
 
@@ -574,6 +599,7 @@ impl IbkrOAuthClient {
             )
             .await?;
         let status: AuthStatus = serde_json::from_slice(&init).map_err(IbkrError::Decode)?;
+        self.update_status(|s| s.brokerage = Brokerage::from(&status));
         if !status.authenticated {
             return Err(IbkrError::NotAuthenticated);
         }
@@ -598,24 +624,40 @@ impl IbkrOAuthClient {
             return Ok(found);
         }
         state.last_mint = Some(Instant::now());
-        match self.mint().await {
-            Ok((lst, expires_at)) => {
+        let result = self.mint().await;
+        let now = unix_now().as_secs();
+        match result {
+            Ok((lst, lifetime)) => {
                 state.generation += 1;
                 let generation = state.generation;
+                self.update_status(|s| {
+                    s.last_mint_at = Some(now);
+                    s.last_mint_error = None;
+                    s.minted_at = Some(now);
+                    s.expires_at = Some(now + lifetime.as_secs());
+                    s.generation = generation;
+                    s.rejected = false;
+                });
                 Ok(state
                     .current
                     .insert(Session {
                         lst,
-                        expires_at,
+                        expires_at: Instant::now() + lifetime,
                         generation,
                     })
                     .handle())
             }
-            // A failed refresh inside the margin keeps the still-valid LST.
-            Err(error) => match state.current.as_ref() {
-                Some(old) if Instant::now() < old.expires_at => Ok(old.handle()),
-                _ => Err(error),
-            },
+            Err(error) => {
+                self.update_status(|s| {
+                    s.last_mint_at = Some(now);
+                    s.last_mint_error = Some(status_code(&error));
+                });
+                // A failed refresh inside the margin keeps the still-valid LST.
+                match state.current.as_ref() {
+                    Some(old) if Instant::now() < old.expires_at => Ok(old.handle()),
+                    _ => Err(error),
+                }
+            }
         }
     }
 
@@ -638,7 +680,8 @@ impl IbkrOAuthClient {
         }
     }
 
-    async fn mint(&self) -> Result<(Zeroizing<Vec<u8>>, Instant), IbkrError> {
+    /// A validated LST and its lifetime (capped at [`MAX_LST_LIFETIME`]).
+    async fn mint(&self) -> Result<(Zeroizing<Vec<u8>>, Duration), IbkrError> {
         let creds = &self.credentials;
         let a = crypto::dh_private();
         let challenge = BigUint::from(2u8)
@@ -692,12 +735,32 @@ impl IbkrOAuthClient {
             .map(|left| left.min(MAX_LST_LIFETIME))
             .filter(|left| *left > LST_REFRESH_MARGIN)
             .ok_or(IbkrError::Handshake("live session token expires too soon"))?;
-        Ok((lst, Instant::now() + lifetime))
+        Ok((lst, lifetime))
+    }
+
+    /// [`Self::send_signed`], recording the outcome for [`Self::status`].
+    async fn signed(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        json_body: Option<&'static str>,
+        accounts: bool,
+    ) -> Result<Vec<u8>, IbkrError> {
+        let result = self
+            .send_signed(method, path, query, json_body, accounts)
+            .await;
+        let now = unix_now().as_secs();
+        self.update_status(|s| match &result {
+            Ok(_) => s.last_ok_at = Some(now),
+            Err(error) => s.last_error = Some((now, status_code(error))),
+        });
+        result
     }
 
     /// Sign and send a request with the current LST. A 401 expires the LST it
     /// was signed with, so the next call mints a fresh one.
-    async fn signed(
+    async fn send_signed(
         &self,
         method: Method,
         path: &str,
@@ -761,6 +824,7 @@ impl IbkrOAuthClient {
             {
                 session.expires_at = Instant::now();
             }
+            self.update_status(|s| s.rejected |= s.generation == generation);
         }
         result
     }
@@ -776,6 +840,8 @@ impl IbkrOAuthClient {
         match response.status() {
             StatusCode::TOO_MANY_REQUESTS => {
                 self.pacer.block();
+                let until = unix_now() + RATE_LIMIT_BACKOFF;
+                self.update_status(|s| s.rate_limited_until = Some(until.as_secs()));
                 Err(IbkrError::RateLimited {
                     retry_after_secs: RATE_LIMIT_BACKOFF.as_secs(),
                 })

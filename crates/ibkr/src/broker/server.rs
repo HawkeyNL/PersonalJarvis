@@ -175,8 +175,8 @@ async fn read_request(read: impl AsyncRead + Unpin) -> Result<BrokerRequest, Bro
     serde_json::from_slice(&line).map_err(|_| BrokerError::InvalidRequest)
 }
 
-/// The only upstream calls the broker can make. Parameters are validated by
-/// [`IbkrOAuthClient`] before anything is sent.
+/// The only upstream calls the broker can make, plus the in-memory status.
+/// Parameters are validated by [`IbkrOAuthClient`] before anything is sent.
 async fn execute(
     client: &IbkrOAuthClient,
     request: &BrokerRequest,
@@ -190,6 +190,7 @@ async fn execute(
         BrokerRequest::History { conid, period, bar } => {
             encode(client.history(*conid, period, bar).await)
         }
+        BrokerRequest::Status {} => encode(Ok(client.status())),
     }
 }
 
