@@ -226,6 +226,96 @@ docker() { [[ $1 != ps ]] || return 1; }
 expect_fail remove_stale_runs
 unset -f docker
 
+# --- Import failure reasons ----------------------------------------------------------
+# SurrealDB 2.x CLI error shapes get a class and a redacted excerpt; exported
+# data (values, record ids, the failing statement) never reaches the message.
+verify_container=jarvis-backup-verify-test
+container_state='false running 0'
+# shellcheck disable=SC2317  # invoked through import_failure_reason
+docker() { [[ $1 == inspect && -n $container_state ]] && printf '%s\n' "$container_state"; }
+import_reason() { printf '%s' "$1" > "$fixture/import.err"; import_failure_reason "$fixture/import.err"; }
+reason=$(import_reason $'\e[2m2026-11-14T03:00:01.123456Z\e[0m \e[31mERROR\e[0m surreal::cli: There was a problem with the database: Database index `account_passwords_owner` already contains [\'secret-owner\'], with record `account_passwords:⟨secret-id⟩`\n')
+[[ $reason == 'unique index conflict: There was a problem with the database: Database index … already contains … with record …' ]]
+reason=$(import_reason $'2026-11-14T03:00:01Z ERROR surreal::cli: There was a problem with the database: There was an error processing a remote HTTP request: \n{\n  "code": 400,\n  "information": "There was a problem with the database: Parse error: Unexpected token `,`, expected an identifier\\n --> [3:41]\\n  |\\n3 | CREATE device:secret SET name = \'secret\',,;\\n  |  ^\\n"\n}\n')
+[[ $reason == 'parse error: There was a problem with the database: Parse error: Unexpected token …, expected an identifier --> [3:41]' ]]
+reason=$(import_reason $'ERROR surreal::cli: There was a problem with the database: Found 4242 for field `amount`, with record `trade:secret`, but expected a string\n')
+[[ $reason == 'schema check: There was a problem with the database: Found … with record …, but expected a string' ]]
+reason=$(import_reason $'ERROR surreal::cli: There was a problem with the database: There was an error processing a remote HTTP request: error sending request for url (http://127.0.0.1:8000/import)\n')
+[[ $reason == 'lost connection: '*'error sending request'* ]]
+# Unterminated quotes and brackets (a cut JSON body) hide the rest.
+reason=$(import_reason $'Parse error: odd {"information": "secret [1, {\'x]\': 2}] secret\n')
+[[ $reason == 'parse error: Parse error: odd …' ]]
+# Adversarial shapes: doubled quotes, apostrophes, unquoted record ids and
+# numbers, a backtick inside a ⟨⟩ id, THROW text, unknown messages.
+# shellcheck disable=SC2016  # literal backticks are the input
+probes=(
+    $'There was a problem with the database: Database index `i` already contains \'\'SECRETSTR\'\' and more, with record `x`\n'
+    $'There was a problem with the database: The field can\'t be analyzed: \'SECRET2\' does not exist\n'
+    $'There was a problem with the database: Database record users:secretid already exists; Found 98765 for the Record ID\n'
+    $'There was a problem with the database: An error occurred: hunter2\n'
+    $'There was a problem with the database: Database record `users:⟨SECRET3`x⟩` already exists\n'
+    $'Something new: hunter2 SECRET3\n'
+)
+reasons=''
+for probe in "${probes[@]}"; do reasons+=$(import_reason "$probe")$'\n'; done
+for leaked in SECRETSTR SECRET2 secretid 98765 hunter2 SECRET3; do
+    if [[ $reasons == *"$leaked"* ]]; then printf 'import reason leaked %s:\n%s' "$leaked" "$reasons" >&2; exit 1; fi
+done
+[[ $reasons == 'unique index conflict: '*$'\nmissing definition: '*$'\nduplicate record or definition: '*$'\nthrown error\nduplicate record or definition: '*$'\nunclassified error\n' ]]
+reason=$(import_reason "Parse error: $(printf 'word %.0s' {1..200})")
+(( ${#reason} <= 320 ))
+container_state='true exited 137'
+[[ $(import_reason x) == 'restore container ran out of memory (1 GiB limit)' ]]
+container_state='false exited 139'
+[[ $(import_reason x) == 'restore container stopped: exited, exit code 139' ]]
+container_state=''
+[[ $(import_reason x) == 'restore container is gone' ]]
+unset -f docker
+
+# --- Export normalization ------------------------------------------------------------
+# Only the wildcard field definitions the live schema reports, in a table's
+# structure section, gain OVERWRITE; the same text inside data is untouched.
+norm="$fixture/norm"
+mkdir "$norm"
+printf '{"roadmaps": 1, "notes": 1}\n' > "$norm/live-before.json"
+# shellcheck disable=SC2016  # literal SurrealQL, $value must not expand
+sub_def='DEFINE FIELD phases[*] ON roadmaps TYPE string ASSERT string::len($value) >= 1'
+# shellcheck disable=SC2317,SC2016  # invoked through normalize_export; literal backticks
+live_sql() {
+    case $1 in
+        *'`roadmaps`'*) jq -n --arg d "$sub_def" '[{fields: {phases: "DEFINE FIELD phases ON roadmaps TYPE array<string, 20>", "phases[*]": $d}}]' ;;
+        *) printf '[{"fields": {}}]\n' ;;
+    esac
+}
+write_export() {
+    printf '%s\n' 'OPTION IMPORT;' '' '-- TABLE: roadmaps' '' 'DEFINE TABLE roadmaps TYPE NORMAL SCHEMAFULL;' '' \
+        'DEFINE FIELD phases ON roadmaps TYPE array<string, 20>;' "$@" '' '-- TABLE DATA: roadmaps' '' \
+        'BEGIN;' "INSERT [ { id: roadmaps:a, phases: ['x'] } ];" "$sub_def;" 'COMMIT;' > "$norm/export.surql"
+}
+write_export "$sub_def;"
+normalize_export "$norm" 2>/dev/null
+[[ $normalized_fields == 1 ]]
+[[ $(grep -c "^DEFINE FIELD OVERWRITE phases\[\*\] ON roadmaps " "$norm/export.surql") == 1 ]]
+[[ $(grep -cxF "$sub_def;" "$norm/export.surql") == 1 ]]
+[[ $(sed -n '/^-- TABLE DATA: /,$p' "$norm/export.surql" | grep -c OVERWRITE || true) == 0 ]]
+# Missing or duplicated definitions fail closed and leave the export alone.
+for copies in 0 2; do
+    lines=()
+    for (( n = 0; n < copies; n++ )); do lines+=("$sub_def;"); done
+    write_export "${lines[@]}"
+    before_norm=$(sha256sum < "$norm/export.surql")
+    expect_fail normalize_export "$norm"
+    [[ $(sha256sum < "$norm/export.surql") == "$before_norm" ]]
+done
+# An export without a final newline would change size: fail closed.
+write_export "$sub_def;"
+printf '%s' "$(cat "$norm/export.surql")" > "$norm/export.trimmed"
+mv "$norm/export.trimmed" "$norm/export.surql"
+before_norm=$(sha256sum < "$norm/export.surql")
+expect_fail normalize_export "$norm"
+[[ $(sha256sum < "$norm/export.surql") == "$before_norm" ]]
+unset -f live_sql
+
 # --- Local-only setup, decrypting verify and restore round trip -------------------
 # Rootless: production directories are root-owned, fixture ones are not.
 # shellcheck disable=SC2317  # invoked through init_local and restore_to

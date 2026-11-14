@@ -42,6 +42,23 @@ CREATE conversation:c SET text = '!';
 DEFINE TABLE empty_table;
 DEFINE USER core ON DATABASE PASSWORD 'fixture-core-password' ROLES EDITOR;
 SQL
+# The real Jarvis schema (SCHEMAFULL tables, UNIQUE indexes, ASSERT fields)
+# with rows written the way Core writes them.
+owner=0190f0aa-0000-7000-8000-00000000a001
+migrations=("$repo"/schema/surreal/[0-9]*.surql)
+cat "${migrations[@]}" | "$real_docker" exec -i "$name" /surreal sql --hide-welcome --endpoint ws://127.0.0.1:8000 \
+    --auth-level root --namespace jarvis --database core >/dev/null
+"$real_docker" exec -i "$name" /surreal sql --hide-welcome --endpoint ws://127.0.0.1:8000 \
+    --auth-level root --namespace jarvis --database core >/dev/null <<SQL
+CREATE users SET id = '$owner', display_name = 'Jarvis owner', status = 'active', created_at = time::now(), updated_at = time::now();
+CREATE account_passwords SET user_id = '$owner', verifier = 'fixture-verifier-secret', revision = 'r1', updated_at = time::now();
+CREATE devices SET id = '0190f0aa-0000-7000-8000-00000000a002', user_id = '$owner', name = 'Owner phone', platform = 'ios', status = 'active', created_at = time::now(), updated_at = time::now();
+CREATE device_keys SET id = '0190f0aa-0000-7000-8000-00000000a003', device_id = '0190f0aa-0000-7000-8000-00000000a002', algorithm = 'ed25519', public_key = <bytes>'0123456789abcdef0123456789abcdef', created_at = time::now(), revoked_at = NONE;
+SQL
+schema=$(printf 'SELECT version FROM schema_version:baseline;\n' | "$real_docker" exec -i "$name" /surreal sql \
+    --hide-welcome --json --endpoint ws://127.0.0.1:8000 --auth-level root --namespace jarvis --database core)
+jq -e --argjson v "${#migrations[@]}" '.[0][0].version == $v' <<< "$schema" >/dev/null \
+    || { echo 'fixture schema migrations did not apply' >&2; exit 1; }
 
 # Production-shaped fixture tree.
 install -d -m 0700 "$fixture/etc/jarvis-backup" "$fixture/run" "$fixture/dest" "$fixture/bin"
@@ -74,6 +91,11 @@ if [[ $1 == compose ]]; then
         "$FIXTURE_DOCKER" exec -i "$FIXTURE_CONTAINER" "$@" | head -c 200
         exit 0
     fi
+    if [[ $2 == export && -n ${FIXTURE_EXPORT_APPEND:-} ]]; then
+        "$FIXTURE_DOCKER" exec -i "$FIXTURE_CONTAINER" "$@"
+        printf '%s\n' "$FIXTURE_EXPORT_APPEND"
+        exit 0
+    fi
     exec "$FIXTURE_DOCKER" exec -i "$FIXTURE_CONTAINER" "$@"
 fi
 exec "$FIXTURE_DOCKER" "$@"
@@ -98,10 +120,19 @@ if grep -aqF "$canary" "$archive"; then echo 'plaintext secret inside the archiv
 mkdir "$fixture/open"
 tar -C "$fixture/open" -xf "$archive"
 manifest=$(gpg --batch --quiet --homedir "$fixture/keys" -d "$fixture/open/manifest.json.gpg" 2>/dev/null)
-jq -e '[.tables[] | {(.table): .restored}] | add == {"conversation": 3, "device": 2, "empty_table": 0}' <<< "$manifest" >/dev/null
+jq -e '[.tables[] | {(.table): .restored}] | add
+    | .conversation == 3 and .device == 2 and .empty_table == 0 and .schema_version == 1
+      and .users == 1 and .account_passwords == 1 and .devices == 1 and .device_keys == 1' <<< "$manifest" >/dev/null
+jq -e '[.tables[] | select(.restored != .live_before)] == []' <<< "$manifest" >/dev/null
+# Array fields (roadmaps.phases and others) need their `x[*]` definitions
+# rewritten to OVERWRITE; the archived export is the normalized one.
+jq -e '.normalized_field_definitions >= 3' <<< "$manifest" >/dev/null
 export_hash=$(gpg --batch --quiet --homedir "$fixture/keys" -d "$fixture/open/surrealdb.surql.zst.gpg" 2>/dev/null \
     | zstd -dq | sha256sum | cut -d' ' -f1)
 [[ $export_hash == "$(jq -r .export_sha256 <<< "$manifest")" ]]
+overwrites=$(gpg --batch --quiet --homedir "$fixture/keys" -d "$fixture/open/surrealdb.surql.zst.gpg" 2>/dev/null \
+    | zstd -dq | grep -c '^DEFINE FIELD OVERWRITE ')
+[[ $overwrites == "$(jq -r .normalized_field_definitions <<< "$manifest")" ]]
 
 # A concurrent run is refused without touching the archive.
 before=$(sha256sum "$archive")
@@ -119,6 +150,21 @@ fi
 # Failure messages never quote exported data (records or password hashes).
 for leaked in argon2 PASSHASH phone laptop hello "$canary"; do
     if [[ $truncated == *"$leaked"* ]]; then echo "failure output quoted exported data: $leaked" >&2; exit 1; fi
+done
+[[ $(sha256sum "$archive") == "$before" ]]
+[[ -z $(find "$fixture/run" "$fixture/dest" -mindepth 1 -maxdepth 1 -name '*jarvis-backup.*' -type d) ]]
+[[ -z $("$real_docker" ps -aq --filter 'name=jarvis-backup-verify-') ]]
+
+# An import error is classified and quoted without exported data: a second
+# password row for the owner breaks the UNIQUE index on user_id.
+if failed=$(FIXTURE_EXPORT_APPEND="CREATE account_passwords SET user_id = '$owner', verifier = 'forced-import-secret', revision = 'r2', updated_at = time::now();" \
+    bash "$helper" create 2>&1); then
+    echo 'export with a broken import was published' >&2; exit 1
+fi
+[[ $failed == *'disposable database (unique index conflict: '*'already contains … with record …'* ]] \
+    || { printf 'unexpected import failure message:\n%s\n' "$failed" >&2; exit 1; }
+for leaked in "$owner" forced-import-secret fixture-verifier-secret account_passwords: "$canary"; do
+    if [[ $failed == *"$leaked"* ]]; then echo "import failure quoted exported data: $leaked" >&2; exit 1; fi
 done
 [[ $(sha256sum "$archive") == "$before" ]]
 [[ -z $(find "$fixture/run" "$fixture/dest" -mindepth 1 -maxdepth 1 -name '*jarvis-backup.*' -type d) ]]
