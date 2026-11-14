@@ -48,6 +48,11 @@ const MIN_DIGIT_RUN: usize = 6;
 const MIN_SEPARATED_DIGITS: usize = 8;
 const KEY_PREFIXES: [&str; 3] = ["sk-", "ghp_", "AKIA"];
 const MIN_KEY_RUN: usize = 24;
+/// A run of base58 characters this long is a key or an on-chain address,
+/// digits or not (a Solana address may have none). It needs an upper-case
+/// letter or digit after its first character, so a long lower-case or
+/// capitalised word ("arbeidsongeschiktheidsverzekering") is not one.
+const MIN_BASE58_RUN: usize = 32;
 
 /// Whether the question may carry personal or financial details and must
 /// stay an offer: an email address, a long number, a currency amount, a
@@ -279,6 +284,16 @@ fn has_key(text: &str) -> bool {
                 && run.contains(|c: char| c.is_ascii_digit())
                 && run.contains(|c: char| c.is_ascii_alphabetic())
         })
+        || runs(text, is_base58).any(|run| {
+            run.len() >= MIN_BASE58_RUN
+                && run[1..].contains(|c: char| c.is_ascii_uppercase() || c.is_ascii_digit())
+        })
+}
+
+/// The Bitcoin/Solana base58 alphabet: ASCII letters and digits without
+/// `0`, `O`, `I` and `l`.
+fn is_base58(c: char) -> bool {
+    c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l')
 }
 
 fn has_possessive(lower: &str) -> bool {
@@ -390,6 +405,21 @@ mod tests {
             ("4111–1111–1111–1111", true),
             ("4111_1111_1111_1111", true),
             ("06\t1234\t5678", true),
+            (
+                "wallet CEyDYzCCrgfDDiiQTxrgGdLSEBrKeSCyuVrSUbyTjWxh balance?",
+                true,
+            ),
+            (
+                "solscan.io/account/CEyDYzCCrgfDDiiQTxrgGdLSEBrKeSCyuVrSUbyTjWxh",
+                true,
+            ),
+            ("Wat dekt een arbeidsongeschiktheidsverzekering?", false),
+            ("Arbeidsongeschiktheidsverzekering voor zzp'ers", false),
+            (
+                "What are the main differences between proof of stake and proof of work \
+                 consensus mechanisms, and why did Ethereum move away from mining?",
+                false,
+            ),
         ] {
             assert_eq!(is_private(question, &held), private, "{question}");
         }
@@ -509,6 +539,21 @@ mod tests {
             ("10-11-2026 10-11-2026", true),
             ("10-11-2026  0612", true),
             ("10-11-2026, 0612", false),
+            // A digitless Solana address; long ordinary words are not keys.
+            ("CEyDYzCCrgfDDiiQTxrgGdLSEBrKeSCyuVrSUbyTjWxh", true),
+            (
+                "solana CEyDYzCCrgfDDiiQTxrgGdLSEBrKeSCyuVrSUbyTjWxh transacties",
+                true,
+            ),
+            ("CEyDYzCCrgfDDiiQTxrgGdLSEBrKeSC", false),
+            ("arbeidsongeschiktheidsverzekering premie 2026", false),
+            ("Arbeidsongeschiktheidsverzekeringen vergelijken", false),
+            ("Thequickbrownfoxjumpsoverthelazydogagainandagain", false),
+            (
+                "How do the Netherlands and Germany compare on housing prices, \
+                 rent control and mortgage interest deductions in 2026?",
+                false,
+            ),
         ] {
             assert_eq!(leaks_identifier(text), leaks, "{text}");
         }
