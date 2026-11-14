@@ -394,10 +394,99 @@ table_counts() {
     printf '%s\n' "$counts" > "$out"
 }
 
+# SurrealDB 2.x import failure messages (surrealdb-core 2.6.5 err/mod.rs and
+# the SDK's HTTP import), most specific first, as "class|ERE".
+readonly import_error_classes=(
+    'parse error|Parse error|not parsed fully|-->[[:space:]]*\[[0-9]+:[0-9]+\]'
+    'unique index conflict|already contains'
+    'duplicate record or definition|already exists'
+    'memory or size limit|memory threshold|too large'
+    'timeout|exceeded the timeout'
+    'failed transaction|due to a (failed|cancelled) transaction|read or write conflict'
+    'schema check|but expected a|must conform to'
+    'missing definition|does not exist'
+    'permission denied|permission|not allowed'
+    'thrown error|An error occurred:'
+    'lost connection|error sending request|connection (closed|refused|reset)|broken pipe'
+    'HTTP error|remote (HTTP|WS) request'
+)
+
+# Replace quoted strings, ⟨escaped⟩ identifiers, objects and arrays (but not
+# [line:col] positions) with \001. Unterminated ones run to the end, so a
+# misparse hides more, never less.
+# shellcheck disable=SC2016  # awk program, not shell
+readonly redact_awk='
+function closer(i,    c) {
+    if (substr(s, i, 3) == "⟨") return "⟩"
+    c = substr(s, i, 1)
+    if (c == "\047" || c == "\"" || c == "`") return c
+    if (c == "{") return "}"
+    if (c == "[") return "]"
+    return ""
+}
+function skip(i, e,    q, inner) {
+    q = (e != "}" && e != "]")
+    i += (e == "⟩") ? 3 : 1
+    while (i <= n) {
+        if (substr(s, i, length(e)) == e) return i + length(e)
+        if (substr(s, i, 1) == "\\") { i += 2; continue }
+        if (!q && (inner = closer(i)) != "") { i = skip(i, inner); continue }
+        i++
+    }
+    return n + 1
+}
+{ s = s $0 "\n" }
+END {
+    n = length(s); i = 1
+    while (i <= n) {
+        e = closer(i)
+        if (e == "") { printf "%s", substr(s, i, 1); i++ }
+        else if (e == "]" && match(substr(s, i, 32), /^\[[0-9]+:[0-9]+\]/)) { printf "%s", substr(s, i, RLENGTH); i += RLENGTH }
+        else { printf "\001"; i = skip(i, e) }
+    }
+}'
+
+# Why the disposable import failed, without quoting exported data: SurrealDB
+# messages embed record ids, values and the failing statement. Prints a class
+# and a redacted excerpt from the first line naming it; $1 is the CLI stderr.
+import_failure_reason() {
+    local state text info entry class='unclassified error' pattern='[Ee]rror' start excerpt
+    # A killed server is the cause; the client only reports a lost connection.
+    state=$(docker inspect --format '{{.State.OOMKilled}} {{.State.Status}} {{.State.ExitCode}}' \
+        "$verify_container" 2>/dev/null) || state=''
+    if [[ $state =~ ^true\  ]]; then
+        echo 'restore container ran out of memory (1 GiB limit)'; return
+    elif [[ $state =~ ^false\ ([a-z]+)\ (-?[0-9]+)$ && ${BASH_REMATCH[1]} != running ]]; then
+        echo "restore container stopped: ${BASH_REMATCH[1]}, exit code ${BASH_REMATCH[2]}"; return
+    elif [[ ! $state =~ ^false\ running\  ]]; then
+        echo 'restore container is gone'; return
+    fi
+    # Bounded and without terminal colours; an HTTP error's JSON body is
+    # replaced by its message.
+    text=$(head -c 65536 -- "$1" | LC_ALL=C sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
+    info=$(sed -n '/^{$/,/^}$/p' <<< "$text" | jq -r '.information // empty' 2>/dev/null) || info=''
+    [[ -z $info ]] || text="$(sed '/^{$/,/^}$/d' <<< "$text")"$'\n'"$info"
+    for entry in "${import_error_classes[@]}"; do
+        if grep -qE -- "${entry#*|}" <<< "$text"; then class=${entry%%|*} pattern=${entry#*|}; break; fi
+    done
+    start=$(grep -m 1 -nE -- "$pattern" <<< "$text" | cut -d: -f1) || start=''
+    # Parse errors print the failing source lines ("12 | INSERT ..."); values
+    # are quoted, bracketed or follow "Found" / "contains" / "but found".
+    excerpt=$(tail -n +"${start:-1}" <<< "$text" \
+        | LC_ALL=C sed -E '/^[[:space:]]*[0-9]*[[:space:]]*\|/d
+            s/^([0-9T:.+-]+Z?[[:space:]]+)?ERROR[[:space:]]+[A-Za-z0-9_:]+:[[:space:]]*//
+            s/(Found|already contains) .* (for (field|param)|with record)/\1 \x01 \2/
+            s/(but found) .*/\1 \x01/' \
+        | LC_ALL=C awk "$redact_awk" | LC_ALL=C tr -cd '\1\11\12\40-\176' | tr '\n\t' '  ' | tr -s ' ' \
+        | cut -c 1-300 | LC_ALL=C sed 's/\x01/…/g; s/^ //; s/ $//') || excerpt=''
+    printf '%s\n' "$class${excerpt:+: $excerpt}"
+}
+
 restore_test() {
     local run=$1 name attempt table before after restored
     name="jarvis-backup-verify-${run##*.}"
-    docker run -d --rm --name "$name" --network none --user 0:0 \
+    # No --rm: a crashed container must stay inspectable; cleanup removes it.
+    docker run -d --name "$name" --network none --user 0:0 \
         --cap-drop ALL --security-opt no-new-privileges:true --memory 1g --cpus 1 --pids-limit 256 \
         -v "$run/export.surql:/restore/export.surql:ro" "$image" start --unauthenticated memory >/dev/null \
         || fail 'cannot start disposable restore container'
@@ -411,14 +500,9 @@ restore_test() {
     printf 'DEFINE NAMESPACE IF NOT EXISTS restoretest; USE NS restoretest; DEFINE DATABASE IF NOT EXISTS restoretest;\n' \
         | docker exec -i "$verify_container" /surreal sql --hide-welcome --endpoint ws://127.0.0.1:8000 >/dev/null \
         || fail 'cannot define the disposable restore database'
-    # Import errors quote exported statements (password hashes, user data).
-    # Report only the error class and position, never the quoted text.
     if ! docker exec "$verify_container" /surreal import --log error --endpoint http://127.0.0.1:8000 \
         --namespace restoretest --database restoretest /restore/export.surql >/dev/null 2>"$run/import.err"; then
-        local reason
-        reason=$(grep -oE '(Parse|Thrown|Database|IO|Api) error|-->[[:space:]]*\[[0-9]+:[0-9]+\]' "$run/import.err" \
-            | head -n 2 | LC_ALL=C tr -cd '[:alnum:] :[]>\n-' | tr '\n' ' ') || true
-        fail "export does not import into a disposable database (${reason:-unclassified error})"
+        fail "export does not import into a disposable database ($(import_failure_reason "$run/import.err"))"
     fi
     table_counts verify_sql "$run/restored.json"
     [[ $(jq -c 'keys' "$run/restored.json") == "$(jq -c 'keys' "$run/live-before.json")" ]] \

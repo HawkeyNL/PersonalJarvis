@@ -226,6 +226,35 @@ docker() { [[ $1 != ps ]] || return 1; }
 expect_fail remove_stale_runs
 unset -f docker
 
+# --- Import failure reasons ----------------------------------------------------------
+# SurrealDB 2.x CLI error shapes get a class and a redacted excerpt; exported
+# data (values, record ids, the failing statement) never reaches the message.
+verify_container=jarvis-backup-verify-test
+container_state='false running 0'
+# shellcheck disable=SC2317  # invoked through import_failure_reason
+docker() { [[ $1 == inspect && -n $container_state ]] && printf '%s\n' "$container_state"; }
+import_reason() { printf '%s' "$1" > "$fixture/import.err"; import_failure_reason "$fixture/import.err"; }
+reason=$(import_reason $'\e[2m2026-11-14T03:00:01.123456Z\e[0m \e[31mERROR\e[0m surreal::cli: There was a problem with the database: Database index `account_passwords_owner` already contains [\'secret-owner\'], with record `account_passwords:⟨secret-id⟩`\n')
+[[ $reason == 'unique index conflict: There was a problem with the database: Database index … already contains … with record …' ]]
+reason=$(import_reason $'2026-11-14T03:00:01Z ERROR surreal::cli: There was a problem with the database: There was an error processing a remote HTTP request: \n{\n  "code": 400,\n  "information": "There was a problem with the database: Parse error: Unexpected token `,`, expected an identifier\\n --> [3:41]\\n  |\\n3 | CREATE device:secret SET name = \'secret\',,;\\n  |  ^\\n"\n}\n')
+[[ $reason == 'parse error: There was a problem with the database: Parse error: Unexpected token …, expected an identifier --> [3:41]' ]]
+reason=$(import_reason $'ERROR surreal::cli: There was a problem with the database: Found 4242 for field `amount`, with record `trade:secret`, but expected a string\n')
+[[ $reason == 'schema check: There was a problem with the database: Found … with record …, but expected a string' ]]
+reason=$(import_reason $'ERROR surreal::cli: There was a problem with the database: There was an error processing a remote HTTP request: error sending request for url (http://127.0.0.1:8000/import)\n')
+[[ $reason == 'lost connection: '*'error sending request'* ]]
+# Unterminated quotes and brackets (a cut JSON body) hide the rest.
+reason=$(import_reason $'odd {"information": "secret [1, {\'x]\': 2}] secret\n')
+[[ $reason == 'unclassified error: odd …' ]]
+reason=$(import_reason "Parse error: $(printf 'word %.0s' {1..200})")
+(( ${#reason} <= 320 ))
+container_state='true exited 137'
+[[ $(import_reason x) == 'restore container ran out of memory (1 GiB limit)' ]]
+container_state='false exited 139'
+[[ $(import_reason x) == 'restore container stopped: exited, exit code 139' ]]
+container_state=''
+[[ $(import_reason x) == 'restore container is gone' ]]
+unset -f docker
+
 # --- Local-only setup, decrypting verify and restore round trip -------------------
 # Rootless: production directories are root-owned, fixture ones are not.
 # shellcheck disable=SC2317  # invoked through init_local and restore_to
