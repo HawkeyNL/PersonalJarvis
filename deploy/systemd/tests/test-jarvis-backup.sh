@@ -166,29 +166,29 @@ expect_fail prune "$fixture/dest" ''
 expect_fail prune "$fixture/dest" notes.txt
 prune "$fixture/dest" jarvis-backup-2026-10-03.tar
 kept() { find "$fixture/dest" -maxdepth 1 -name 'jarvis-backup-*.tar' -type f -printf '%f\n' | sed 's/^jarvis-backup-//; s/\.tar$//' | sort | tr '\n' ' '; }
-# 7 daily, then the newest archive of ISO weeks 38 and 37 (weeks 40 and 39
-# already have a daily). An unparsable date is never touched.
-[[ $(kept) == '2026-09-13 2026-09-20 2026-09-27 2026-09-28 2026-09-29 2026-09-30 2026-10-01 2026-10-02 2026-10-03 2026-13-45 ' ]]
-[[ ! -e $fixture/dest/jarvis-backup-2026-09-26.tar.sha256 && -e $fixture/dest/jarvis-backup-2026-09-13.tar.sha256 ]]
+# The newest 7 archives in total, the current one included. An unparsable
+# date is never touched.
+[[ $(kept) == '2026-09-27 2026-09-28 2026-09-29 2026-09-30 2026-10-01 2026-10-02 2026-10-03 2026-13-45 ' ]]
+[[ ! -e $fixture/dest/jarvis-backup-2026-09-26.tar.sha256 && -e $fixture/dest/jarvis-backup-2026-09-27.tar.sha256 ]]
 [[ -e $fixture/dest/jarvis-backup-2026-10-03.tar.sha256 ]]
 verify "$archive" 2>/dev/null
 [[ -e $fixture/dest/notes.txt ]]
 [[ -L $fixture/dest/jarvis-backup-2026-01-01.tar && $(cat "$fixture/outside") == target ]]
 [[ ! -e $fixture/dest/.jarvis-backup.stale ]]
-# Mid-week: the 7th daily is not the newest of its week.
-mkdir -m 0700 "$fixture/midweek"
-for offset in $(seq 0 30); do
-    printf 'a' > "$fixture/midweek/jarvis-backup-$(date -u -d "2026-10-07 -$offset days" +%F).tar"
+# Ten archives leave seven, the current one included.
+mkdir -m 0700 "$fixture/ten"
+for offset in $(seq 0 9); do
+    printf 'a' > "$fixture/ten/jarvis-backup-$(date -u -d "2026-10-07 -$offset days" +%F).tar"
 done
-prune "$fixture/midweek" jarvis-backup-2026-10-07.tar
-[[ $(find "$fixture/midweek" -type f -printf '%f\n' | sed 's/^jarvis-backup-//; s/\.tar$//' | sort | tr '\n' ' ') \
-    == '2026-09-20 2026-09-27 2026-10-01 2026-10-02 2026-10-03 2026-10-04 2026-10-05 2026-10-06 2026-10-07 ' ]]
+prune "$fixture/ten" jarvis-backup-2026-10-07.tar
+[[ $(find "$fixture/ten" -type f -printf '%f\n' | sed 's/^jarvis-backup-//; s/\.tar$//' | sort | tr '\n' ' ') \
+    == '2026-10-01 2026-10-02 2026-10-03 2026-10-04 2026-10-05 2026-10-06 2026-10-07 ' ]]
 # A future-dated archive (clock skew, manual copy) stops pruning altogether,
 # so a wrong clock can neither evict the current archive nor the history.
 printf 'old' > "$fixture/dest/jarvis-backup-2026-09-01.tar"
 printf 'future' > "$fixture/dest/jarvis-backup-2099-01-01.tar"
 prune "$fixture/dest" jarvis-backup-2026-10-03.tar 2>/dev/null
-[[ $(kept) == '2026-09-01 2026-09-13 2026-09-20 2026-09-27 2026-09-28 2026-09-29 2026-09-30 2026-10-01 2026-10-02 2026-10-03 2026-13-45 2099-01-01 ' ]]
+[[ $(kept) == '2026-09-01 2026-09-27 2026-09-28 2026-09-29 2026-09-30 2026-10-01 2026-10-02 2026-10-03 2026-13-45 2099-01-01 ' ]]
 rm "$fixture/dest/jarvis-backup-2099-01-01.tar" "$fixture/dest/jarvis-backup-2026-13-45.tar" \
     "$fixture/dest/jarvis-backup-2026-09-01.tar"
 
