@@ -448,14 +448,18 @@ readonly import_error_classes=(
 )
 
 # Replace quoted strings, ⟨escaped⟩ identifiers, objects and arrays (but not
-# [line:col] positions) with \001. Unterminated ones run to the end, so a
-# misparse hides more, never less.
+# [line:col] positions) with \001. A quote opens only after, and closes only
+# before, a non-alphanumeric character, so apostrophes ("can't") and doubled
+# quotes stay inside. Unterminated ones run to the end, so a misparse hides
+# more, never less.
 # shellcheck disable=SC2016  # awk program, not shell
 readonly redact_awk='
+function alnum(c) { return c ~ /[A-Za-z0-9]/ }
+function quote(c) { return c == "\047" || c == "\"" || c == "`" }
 function closer(i,    c) {
     if (substr(s, i, 3) == "⟨") return "⟩"
     c = substr(s, i, 1)
-    if (c == "\047" || c == "\"" || c == "`") return c
+    if (quote(c)) return (i > 1 && alnum(substr(s, i - 1, 1))) ? "" : c
     if (c == "{") return "}"
     if (c == "[") return "]"
     return ""
@@ -464,7 +468,7 @@ function skip(i, e,    q, inner) {
     q = (e != "}" && e != "]")
     i += (e == "⟩") ? 3 : 1
     while (i <= n) {
-        if (substr(s, i, length(e)) == e) return i + length(e)
+        if (substr(s, i, length(e)) == e && !(quote(e) && alnum(substr(s, i + 1, 1)))) return i + length(e)
         if (substr(s, i, 1) == "\\") { i += 2; continue }
         if (!q && (inner = closer(i)) != "") { i = skip(i, inner); continue }
         i++
@@ -505,15 +509,21 @@ import_failure_reason() {
     for entry in "${import_error_classes[@]}"; do
         if grep -qE -- "${entry#*|}" <<< "$text"; then class=${entry%%|*} pattern=${entry#*|}; break; fi
     done
+    # Thrown messages are free text from the schema or data; without a class
+    # the shape is unknown. Neither gets an excerpt.
+    case $class in 'thrown error'|'unclassified error') printf '%s\n' "$class"; return ;; esac
     start=$(grep -m 1 -nE -- "$pattern" <<< "$text" | cut -d: -f1) || start=''
     # Parse errors print the failing source lines ("12 | INSERT ..."); values
     # are quoted, bracketed or follow "Found" / "contains" / "but found".
+    # Whatever is left with a digit or an inner colon (unquoted numbers,
+    # record ids, URLs) goes as well, except [line:col] positions.
     excerpt=$(tail -n +"${start:-1}" <<< "$text" \
         | LC_ALL=C sed -E '/^[[:space:]]*[0-9]*[[:space:]]*\|/d
             s/^([0-9T:.+-]+Z?[[:space:]]+)?ERROR[[:space:]]+[A-Za-z0-9_:]+:[[:space:]]*//
             s/(Found|already contains) .* (for (field|param)|with record)/\1 \x01 \2/
             s/(but found) .*/\1 \x01/' \
         | LC_ALL=C awk "$redact_awk" | LC_ALL=C tr -cd '\1\11\12\40-\176' | tr '\n\t' '  ' | tr -s ' ' \
+        | LC_ALL=C awk '{ for (i = 1; i <= NF; i++) if ($i !~ /^\[[0-9]+:[0-9]+\]$/ && ($i ~ /[0-9]/ || $i ~ /:./)) $i = "\001"; print }' \
         | cut -c 1-300 | LC_ALL=C sed 's/\x01/…/g; s/^ //; s/ $//') || excerpt=''
     printf '%s\n' "$class${excerpt:+: $excerpt}"
 }
@@ -521,12 +531,13 @@ import_failure_reason() {
 restore_test() {
     local run=$1 name attempt table before after restored
     name="jarvis-backup-verify-${run##*.}"
-    # No --rm: a crashed container must stay inspectable; cleanup removes it.
+    # No --rm: a crashed container must stay inspectable. Set before the run,
+    # so cleanup also removes one that was created but failed to start.
+    verify_container=$name
     docker run -d --name "$name" --network none --user 0:0 \
         --cap-drop ALL --security-opt no-new-privileges:true --memory 1g --cpus 1 --pids-limit 256 \
         -v "$run/export.surql:/restore/export.surql:ro" "$image" start --unauthenticated memory >/dev/null \
         || fail 'cannot start disposable restore container'
-    verify_container=$name
     for attempt in $(seq 1 30); do
         docker exec "$verify_container" /surreal isready --endpoint http://127.0.0.1:8000 >/dev/null 2>&1 && break
         (( attempt < 30 )) || fail 'disposable restore container did not become ready'

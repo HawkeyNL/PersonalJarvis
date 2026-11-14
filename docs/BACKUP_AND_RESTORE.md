@@ -60,9 +60,10 @@ unlinks its file, which on an SSD does not overwrite the blocks.
 When the import fails, the journal shows the cause: a class (for example
 `parse error`, `unique index conflict`, `duplicate record or definition`, or
 that the restore container ran out of memory) and a short excerpt of the
-SurrealDB message. Quoted strings, identifiers, record ids, objects, arrays
-and the failing statement are replaced with `…`, so no exported data reaches
-the journal.
+SurrealDB message. Quoted strings, identifiers, record ids, numbers, objects,
+arrays and the failing statement are replaced with `…`, and a thrown or
+unrecognized error shows its class only, so no exported data reaches the
+journal.
 
 Before it starts, the run refuses to continue unless the destination has
 room for twice the newest archive plus 1 GiB, and `/run` has 2 GiB for the

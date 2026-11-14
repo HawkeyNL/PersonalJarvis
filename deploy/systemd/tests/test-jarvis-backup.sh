@@ -243,8 +243,25 @@ reason=$(import_reason $'ERROR surreal::cli: There was a problem with the databa
 reason=$(import_reason $'ERROR surreal::cli: There was a problem with the database: There was an error processing a remote HTTP request: error sending request for url (http://127.0.0.1:8000/import)\n')
 [[ $reason == 'lost connection: '*'error sending request'* ]]
 # Unterminated quotes and brackets (a cut JSON body) hide the rest.
-reason=$(import_reason $'odd {"information": "secret [1, {\'x]\': 2}] secret\n')
-[[ $reason == 'unclassified error: odd …' ]]
+reason=$(import_reason $'Parse error: odd {"information": "secret [1, {\'x]\': 2}] secret\n')
+[[ $reason == 'parse error: Parse error: odd …' ]]
+# Adversarial shapes: doubled quotes, apostrophes, unquoted record ids and
+# numbers, a backtick inside a ⟨⟩ id, THROW text, unknown messages.
+# shellcheck disable=SC2016  # literal backticks are the input
+probes=(
+    $'There was a problem with the database: Database index `i` already contains \'\'SECRETSTR\'\' and more, with record `x`\n'
+    $'There was a problem with the database: The field can\'t be analyzed: \'SECRET2\' does not exist\n'
+    $'There was a problem with the database: Database record users:secretid already exists; Found 98765 for the Record ID\n'
+    $'There was a problem with the database: An error occurred: hunter2\n'
+    $'There was a problem with the database: Database record `users:⟨SECRET3`x⟩` already exists\n'
+    $'Something new: hunter2 SECRET3\n'
+)
+reasons=''
+for probe in "${probes[@]}"; do reasons+=$(import_reason "$probe")$'\n'; done
+for leaked in SECRETSTR SECRET2 secretid 98765 hunter2 SECRET3; do
+    if [[ $reasons == *"$leaked"* ]]; then printf 'import reason leaked %s:\n%s' "$leaked" "$reasons" >&2; exit 1; fi
+done
+[[ $reasons == 'unique index conflict: '*$'\nmissing definition: '*$'\nduplicate record or definition: '*$'\nthrown error\nduplicate record or definition: '*$'\nunclassified error\n' ]]
 reason=$(import_reason "Parse error: $(printf 'word %.0s' {1..200})")
 (( ${#reason} <= 320 ))
 container_state='true exited 137'
@@ -290,6 +307,13 @@ for copies in 0 2; do
     expect_fail normalize_export "$norm"
     [[ $(sha256sum < "$norm/export.surql") == "$before_norm" ]]
 done
+# An export without a final newline would change size: fail closed.
+write_export "$sub_def;"
+printf '%s' "$(cat "$norm/export.surql")" > "$norm/export.trimmed"
+mv "$norm/export.trimmed" "$norm/export.surql"
+before_norm=$(sha256sum < "$norm/export.surql")
+expect_fail normalize_export "$norm"
+[[ $(sha256sum < "$norm/export.surql") == "$before_norm" ]]
 unset -f live_sql
 
 # --- Local-only setup, decrypting verify and restore round trip -------------------
