@@ -85,6 +85,9 @@ pub enum JobResult {
         title: String,
         schedule: String,
     },
+    /// The morning check newly proposed this many urgent things to fix; a
+    /// count only, so the lock screen shows nothing else.
+    HealthUrgent(u8),
 }
 
 /// The device behind an approval push, as Core stored it. Untrusted: a new
@@ -109,6 +112,7 @@ impl NotifyEvent {
             Self::JobResult(JobResult::Reminder { .. }) => "reminder",
             Self::JobResult(JobResult::Disk(_)) => "disk",
             Self::JobResult(JobResult::Created { .. }) => "job_created",
+            Self::JobResult(JobResult::HealthUrgent(_)) => "health",
         }
     }
 
@@ -203,6 +207,13 @@ impl NotifyEvent {
                     clean(schedule, MAX_REMINDER_CHARS, "")
                 ),
             ),
+            Self::JobResult(JobResult::HealthUrgent(count)) => (
+                "Jarvis",
+                format!(
+                    "Morning check: {count} urgent {} to fix",
+                    if *count == 1 { "thing" } else { "things" }
+                ),
+            ),
         }
     }
 
@@ -221,6 +232,7 @@ impl NotifyEvent {
             Self::JobResult(JobResult::Prompt | JobResult::Created { .. }) => "mag",
             Self::JobResult(JobResult::Reminder { .. }) => "bell",
             Self::JobResult(JobResult::Disk(_)) => "floppy_disk",
+            Self::JobResult(JobResult::HealthUrgent(_)) => "warning",
         }
     }
 
@@ -705,10 +717,25 @@ mod tests {
         );
         assert_eq!(created.collapse_id(), format!("job-created-{job}"));
         assert_eq!(created.click(), "jarvis://jobs");
+        let health = NotifyEvent::JobResult(JobResult::HealthUrgent(2));
+        assert_eq!(
+            health.alert(),
+            (
+                "Jarvis",
+                "Morning check: 2 urgent things to fix".to_string()
+            )
+        );
+        assert_eq!(
+            NotifyEvent::JobResult(JobResult::HealthUrgent(1)).alert().1,
+            "Morning check: 1 urgent thing to fix"
+        );
+        assert_eq!(health.collapse_id(), "health");
+        assert_eq!(health.click(), "jarvis://jobs");
         for event in [
             reminder,
             disk,
             created,
+            health,
             NotifyEvent::JobResult(JobResult::Prompt),
         ] {
             assert!(event.alert().0.is_ascii());

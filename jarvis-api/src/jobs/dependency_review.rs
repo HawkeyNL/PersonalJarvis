@@ -48,7 +48,7 @@ pub(super) async fn run(work: &Work, db: &Database, job: &Job) -> Finish {
     finish
 }
 
-async fn bounded<T>(
+pub(super) async fn bounded<T>(
     future: impl std::future::Future<Output = Result<T, RoadmapError>>,
 ) -> Result<T, RoadmapError> {
     tokio::time::timeout(DB_TIMEOUT, future)
@@ -71,30 +71,33 @@ async fn propose(
     let pending = bounded(crate::roadmaps::store::list_proposals(db, roadmap_id))
         .await
         .map_err(proposal_error)?;
-    submit(db, &snapshot, &pending, facts).await
+    let ops = proposal_ops(&snapshot, &pending, facts);
+    submit(db, &snapshot, &ops, RATIONALE).await
 }
 
-fn proposal_error(error: RoadmapError) -> &'static str {
+const RATIONALE: &str = "Upgrades with a fixed version, from the scheduled dependency review.";
+
+pub(super) fn proposal_error(error: RoadmapError) -> &'static str {
     match error {
         RoadmapError::Stale | RoadmapError::Conflict => "roadmap_changed",
         RoadmapError::Limit(_) => "roadmap_limit",
         RoadmapError::NotFound | RoadmapError::Archived => "roadmap_unavailable",
         error => {
-            tracing::warn!(%error, "dependency review: roadmap proposal failed");
+            tracing::warn!(%error, "scheduled job: roadmap proposal failed");
             "roadmap_proposal_failed"
         }
     }
 }
 
-/// Record the proposal on `snapshot`'s revision; a roadmap that changed
-/// since is refused (the next run proposes again).
-async fn submit(
+/// Record `ops` as one proposal on `snapshot`'s revision; `Ok(None)` when
+/// there are none. A roadmap that changed since is refused (the next run
+/// proposes again).
+pub(super) async fn submit(
     db: &Database,
     snapshot: &Snapshot,
-    pending: &[Proposal],
-    facts: &DependencyFacts,
+    ops: &[ProposalOp],
+    rationale: &str,
 ) -> Result<Option<String>, &'static str> {
-    let ops = proposal_ops(snapshot, pending, facts);
     if ops.is_empty() {
         return Ok(None);
     }
@@ -102,8 +105,8 @@ async fn submit(
         db,
         &snapshot.roadmap.id,
         snapshot.roadmap.revision,
-        &ops,
-        Some("Upgrades with a fixed version, from the scheduled dependency review."),
+        ops,
+        Some(rationale),
     );
     bounded(created).await.map(Some).map_err(proposal_error)
 }
@@ -851,7 +854,7 @@ mod tests {
         )
         .await?;
         assert_eq!(
-            submit(&db, &stale, &[], &facts()).await,
+            submit(&db, &stale, &proposal_ops(&stale, &[], &facts()), RATIONALE).await,
             Err("roadmap_changed")
         );
         assert!(store::list_proposals(&db, &id).await?.is_empty());

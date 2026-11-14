@@ -28,6 +28,8 @@ use crate::realtime::Hub;
 /// Rows deleted per statement and statements per table per sweep.
 const PRUNE_BATCH: usize = 5_000;
 const PRUNE_MAX_BATCHES: usize = 20;
+/// Rejected proposals [`rejected_since`] returns at most.
+const MAX_REJECTED: usize = 50;
 
 const ROADMAP_FIELDS: &str =
     "record::id(id) AS id, title, description, phases, revision, created_at, updated_at, archived_at";
@@ -465,6 +467,29 @@ pub async fn list_proposals(db: &Database, id: &str) -> Result<Vec<Proposal>> {
              ORDER BY created_at LIMIT {MAX_PENDING_PROPOSALS}"
         ),
         json!({"id": id}),
+    )
+    .await?;
+    found.into_iter().map(Proposal::try_from).collect()
+}
+
+/// Proposals the owner rejected after `since`, newest first, at most
+/// [`MAX_REJECTED`].
+pub async fn rejected_since(
+    db: &Database,
+    id: &str,
+    since: OffsetDateTime,
+) -> Result<Vec<Proposal>> {
+    let since = since
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|_| RoadmapError::InvalidData)?;
+    let found: Vec<ProposalRow> = rows(
+        db,
+        &format!(
+            "SELECT {PROPOSAL_FIELDS}, decided_at FROM roadmap_proposals WHERE roadmap_id = $id \
+             AND status = 'rejected' AND decided_at > <datetime>$since \
+             ORDER BY decided_at DESC LIMIT {MAX_REJECTED}"
+        ),
+        json!({"id": id, "since": since}),
     )
     .await?;
     found.into_iter().map(Proposal::try_from).collect()
