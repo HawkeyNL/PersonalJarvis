@@ -32,6 +32,7 @@ pub mod rpc;
 pub mod rugcheck;
 pub mod snapshot;
 pub mod token2022;
+pub mod wallet;
 
 /// The only hosts any client in this crate may talk to. A client refuses to
 /// build for any other host.

@@ -7,12 +7,15 @@ publish = false
 
 [dependencies]
 base64 = "0.22"
+bs58 = "0.5"
 jarvis-onchain.workspace = true
 reqwest.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tiny-keccak = { version = "2", features = ["keccak"] }
 tokio.workspace = true
 zeroize = "1"
