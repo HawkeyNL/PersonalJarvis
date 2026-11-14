@@ -4,7 +4,6 @@
 //! the portfolio or anything else. A `prompt` run is a web search through
 //! the fixed Research path only.
 
-use std::path::Path;
 use std::time::Duration;
 
 use jiff::tz::TimeZone;
@@ -19,8 +18,6 @@ use super::{Job, Origin, RunStatus, SummarySource, MAX_SUMMARY};
 use crate::notify::{JobResult, NotifyEvent};
 use crate::AppState;
 
-/// Bounds reading the disks.
-const DISK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bounds one research run.
 const RESEARCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Most source links kept in a run's facts, and the longest one.
@@ -235,22 +232,7 @@ pub(super) async fn disk_check(state: &AppState, job: &Job) -> Finish {
         return Finish::failed("not_configured");
     };
     let threshold = job.params.threshold_percent.unwrap_or(80);
-    // statvfs blocks; a hung mount must not hold a runtime thread.
-    // ponytail: on a timeout the blocking thread stays stuck in statvfs until
-    // the mount answers, one per run; bounded by the jobs' own schedules.
-    let read = tokio::task::spawn_blocking(|| {
-        crate::routes::services::DISKS.map(|(label, path)| {
-            let disk = crate::routes::services::disk_value(label, Path::new(path));
-            (label, disk["used_percent"].as_f64())
-        })
-    });
-    let disks: Vec<(&'static str, f64)> = match tokio::time::timeout(DISK_TIMEOUT, read).await {
-        Ok(Ok(disks)) => disks
-            .into_iter()
-            .filter_map(|(label, used)| Some((label, used?)))
-            .collect(),
-        _ => Vec::new(),
-    };
+    let disks = crate::routes::services::used_percent().await;
     if disks.is_empty() {
         return Finish::failed("disk_unavailable");
     }

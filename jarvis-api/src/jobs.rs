@@ -1,4 +1,4 @@
-//! Scheduled jobs (schemas 0019 and 0021): work Core runs by itself on a
+//! Scheduled jobs (schemas 0019, 0021 and 0022): work Core runs by itself on a
 //! schedule, and a record of every run (see `docs/SCHEDULED_JOBS.md`).
 //!
 //! A job's kind is a closed list with typed parameters. This module holds
@@ -10,6 +10,7 @@
 
 pub(crate) mod chat;
 mod dependency_review;
+mod health_review;
 pub mod store;
 
 use std::sync::{Arc, Mutex};
@@ -133,6 +134,8 @@ pub enum Kind {
     Reminder,
     /// A note when a Home Node disk is fuller than a threshold.
     DiskCheck,
+    /// The morning check: Core's own signals against a fixed rule table.
+    HealthReview,
 }
 
 impl Kind {
@@ -140,7 +143,16 @@ impl Kind {
     fn uses_worker(self) -> bool {
         matches!(self, Self::Prompt | Self::DependencyReview)
     }
+
+    /// At most one job of this kind per node; it runs daily or weekly, never
+    /// pauses itself and is not in the owner's [`MAX_OWNER_JOBS`].
+    pub fn singleton(self) -> bool {
+        SINGLETON_KINDS.contains(&self)
+    }
 }
+
+/// The kinds with at most one job per node.
+pub const SINGLETON_KINDS: [Kind; 2] = [Kind::DependencyReview, Kind::HealthReview];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -217,7 +229,8 @@ pub enum SummarySource {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Params {
-    /// `dependency_review`: the roadmap a run proposes its items to.
+    /// `dependency_review`, `health_review`: the roadmap a run proposes its
+    /// items to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roadmap_id: Option<String>,
     /// `prompt`, `reminder`: one line, 1 to 60 characters.
@@ -289,7 +302,8 @@ pub struct Job {
     pub updated_at: OffsetDateTime,
 }
 
-/// A new job; absent fields default to weekly on Monday at 07:00, enabled.
+/// A new job; absent fields default to weekly on Monday at 07:00 (a
+/// `health_review` daily at 07:00), enabled.
 /// Who made it and where it reports are set by Core, never by the client.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -437,16 +451,17 @@ struct Schedule {
 
 impl Schedule {
     /// Check the fields together. A repeating job with `every` above 1 and
-    /// no `start_date` counts from `today`. A `dependency_review` keeps the
-    /// schedules it had before 0021: daily or weekly, nothing more.
+    /// no `start_date` counts from `today`. A singleton kind keeps the
+    /// schedules `dependency_review` had before 0021: daily or weekly,
+    /// nothing more.
     fn checked(mut self, kind: Kind, today: civil::Date) -> Result<Self> {
         check(
-            kind != Kind::DependencyReview
+            !kind.singleton()
                 || (matches!(self.cadence, Cadence::Daily | Cadence::Weekly)
                     && self.every == 1
                     && self.start_date.is_none()
                     && self.max_runs.is_none()),
-            "a dependency review runs daily or weekly",
+            "a dependency or health review runs daily or weekly",
         )?;
         let most = match self.cadence {
             Cadence::Once => 1,
@@ -525,7 +540,7 @@ fn params_for(kind: Kind, mut params: Params) -> Result<Params> {
         threshold_percent,
     } = &params;
     let only = match kind {
-        Kind::DependencyReview => {
+        Kind::DependencyReview | Kind::HealthReview => {
             title.is_none()
                 && instruction.is_none()
                 && text.is_none()
@@ -574,7 +589,7 @@ fn params_for(kind: Kind, mut params: Params) -> Result<Params> {
         "params.threshold_percent must be 50 to 99",
     )?;
     match kind {
-        Kind::DependencyReview => {}
+        Kind::DependencyReview | Kind::HealthReview => {}
         Kind::Prompt => {
             check(
                 title.is_some() && instruction.is_some(),
@@ -621,7 +636,11 @@ impl NewJob {
         tz: Option<&TimeZone>,
         origin: Origin,
     ) -> Result<Job> {
-        let cadence = self.cadence.unwrap_or(Cadence::Weekly);
+        let default_cadence = match self.kind {
+            Kind::HealthReview => Cadence::Daily,
+            _ => Cadence::Weekly,
+        };
+        let cadence = self.cadence.unwrap_or(default_cadence);
         let schedule = Schedule {
             cadence,
             weekday: weekday_for(cadence, self.weekday, DEFAULT_WEEKDAY)?,
@@ -1172,6 +1191,7 @@ impl Runner {
             self.db.clone(),
             self.tz.clone(),
             job.clone(),
+            trigger,
         ));
         let mut finish = match tokio::time::timeout(RUN_TIMEOUT, &mut task).await {
             Ok(Ok(finish)) => finish,
@@ -1192,10 +1212,7 @@ impl Runner {
             finish = Finish::failed("invalid_result");
         }
         // The streak first, so a client that sees the run ended sees it too.
-        if let Some(failed) = finish
-            .streak()
-            .filter(|_| job.kind != Kind::DependencyReview)
-        {
+        if let Some(failed) = finish.streak().filter(|_| !job.kind.singleton()) {
             if call(store::record_outcome(&self.db, &job.id, failed)).await == Ok(true) {
                 tracing::warn!("scheduled job paused after failed runs");
                 self.audit("jobs.paused", &job.id).await;
@@ -1231,12 +1248,13 @@ impl Runner {
     }
 }
 
-async fn work(work: Work, db: Database, tz: TimeZone, job: Job) -> Finish {
+async fn work(work: Work, db: Database, tz: TimeZone, job: Job, trigger: Trigger) -> Finish {
     match (job.kind, work.app.as_ref()) {
         (Kind::DependencyReview, _) => dependency_review::run(&work, &db, &job).await,
         (Kind::Prompt, Some(app)) => chat::prompt(app, &job, &tz).await,
         (Kind::Reminder, Some(app)) => chat::reminder(app, &job).await,
         (Kind::DiskCheck, Some(app)) => chat::disk_check(app, &job).await,
+        (Kind::HealthReview, Some(app)) => health_review::run(app, &job, trigger).await,
         (_, None) => Finish::failed("not_configured"),
     }
 }
@@ -1354,6 +1372,41 @@ mod tests {
             serde_json::json!({"kind": "dependency_review", "params": {"roadmap_id": "plan"}}),
             serde_json::json!({"kind": "dependency_review", "params": {"roadmap_id": id.to_uppercase()}}),
             serde_json::json!({"kind": "dependency_review", "params": {"repo": "a/b"}}),
+        ] {
+            assert!(new_job(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_health_review_is_a_daily_or_weekly_singleton_with_a_roadmap_only() {
+        let job = new_job(serde_json::json!({"kind": "health_review"})).unwrap();
+        assert_eq!(
+            (job.kind, job.cadence, job.weekday, job.at_minute),
+            (Kind::HealthReview, Cadence::Daily, None, 420)
+        );
+        assert!(Kind::HealthReview.singleton() && Kind::DependencyReview.singleton());
+        assert!(!Kind::HealthReview.uses_worker());
+        for kind in [Kind::Prompt, Kind::Reminder, Kind::DiskCheck] {
+            assert!(!kind.singleton(), "{kind:?}");
+        }
+        let id = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let weekly = new_job(serde_json::json!({
+            "kind": "health_review", "cadence": "weekly", "params": {"roadmap_id": id}
+        }))
+        .unwrap();
+        assert_eq!(
+            (weekly.weekday, weekly.params.roadmap_id.as_deref()),
+            (Some(1), Some(id))
+        );
+        for bad in [
+            serde_json::json!({"kind": "health_review", "cadence": "monthly"}),
+            serde_json::json!({"kind": "health_review", "cadence": "once", "start_date": "2026-12-01"}),
+            serde_json::json!({"kind": "health_review", "every": 2}),
+            serde_json::json!({"kind": "health_review", "max_runs": 2}),
+            serde_json::json!({"kind": "health_review", "start_date": "2026-12-01"}),
+            serde_json::json!({"kind": "health_review", "params": {"title": "Check"}}),
+            serde_json::json!({"kind": "health_review", "params": {"threshold_percent": 80}}),
+            serde_json::json!({"kind": "health_review", "params": {"notify": true}}),
         ] {
             assert!(new_job(bad.clone()).is_err(), "{bad}");
         }

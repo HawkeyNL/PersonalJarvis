@@ -2,7 +2,7 @@
 
 Core runs some work by itself on a schedule the owner sets in the app: a
 job runs once, daily, weekly or monthly at a wall-clock minute in
-Europe/Amsterdam. Jobs and their runs live in schemas 0019 and 0021
+Europe/Amsterdam. Jobs and their runs live in schemas 0019, 0021 and 0022
 (`scheduled_jobs`, `scheduled_job_runs`) and are served through `/v1/jobs`.
 
 A job's kind is a closed list, each with typed parameters:
@@ -13,14 +13,18 @@ A job's kind is a closed list, each with typed parameters:
 | `prompt` | A scheduled research run: a web search for the instruction | `title`, `instruction`, `notify?` (default true) |
 | `reminder` | Posts the owner's fixed text and pushes the title | `title`, `text?` |
 | `disk_check` | Notes when a Home Node disk is fuller than the threshold | `threshold_percent?` (50 to 99, default 80) |
+| `health_review` | The morning check: Core's own signals against fixed rules (below) | `roadmap_id?` (not used yet) |
 
-There is at most one `dependency_review` and at most 10 jobs of the other
-kinds made by the owner. Jarvis may keep up to 3 `prompt` jobs of its own
+There is at most one `dependency_review`, at most one `health_review` and
+at most 10 jobs of the other kinds made by the owner. Jarvis may keep up to 3 `prompt` jobs of its own
 apart from those; Core makes them itself from a chat answer (never through
 the API, see [From chat](#from-chat)), and each
 expires 30 days after it was made: it no longer runs or counts towards the
 3, and the runner deletes it with its runs on its next check. Nothing is
-seeded.
+seeded. Every create first writes one guard row (`scheduled_job_guards`,
+0022) in its transaction, so two creates at the same time cannot both pass
+the room rules: the database lets one commit, and the other is answered
+from the state after it.
 
 Each create, change and delete through the API writes a security audit row
 (`jobs.created`, `jobs.updated`, `jobs.deleted`, `jobs.run_requested`) with
@@ -53,7 +57,9 @@ A job has `id`, `kind`, `cadence`, `weekday`, `month_day`, `every`,
 and `next_run_at` (its next slot; null while it is disabled, expired or of a
 kind that does not run yet, or the runner is off).
 
-- `cadence`: `weekly` (default), `daily`, `monthly` or `once`.
+- `cadence`: `weekly` (default; `daily` for a `health_review`), `daily`,
+  `monthly` or `once`. A `dependency_review` or `health_review` runs daily
+  or weekly only, without `every`, `start_date` or `max_runs`.
 - `weekday`: 1 (Monday, default) to 7 (Sunday) for a weekly job; other jobs
   have none. A job that becomes weekly keeps its weekday or gets Monday.
 - `month_day`: 1 (default) to 31 for a monthly job; a shorter month runs on
@@ -105,7 +111,7 @@ Examples:
 
 Errors are `{"error": "…"}`: 400 for invalid input (the message says which
 rule), 404 for an unknown job or run, 409 for a revision conflict, a second
-`dependency_review`, no room for another job, a run request while the runner
+`dependency_review` or `health_review`, no room for another job, a run request while the runner
 is off, 413 for a body over 4 KiB, 422
 for a body that does not parse (an unknown field), 429 for a run request
 within an hour of the last one or while one is queued or running, 503 when
@@ -224,7 +230,7 @@ research and dependency reviews, and a check runs at most one of those (both
 use the Claude worker), 30 seconds or more after the last one ended; the next check (at once after a
 long run) looks at the quick kinds again first. So a reminder is not held up
 by searches, and the Claude worker's one background slot is free for the
-owner's own Research in between. A research slot that waited still runs
+owner's own Research in between. A health review is a quick kind too. A research slot that waited still runs
 once, for its newest slot only.
 
 A run posts and pushes nothing when the owner deleted its job while it
@@ -238,7 +244,8 @@ unavailable) still record a failed run and a notice but leave the streak as
 it is. The
 third failed run in a row disables the job with `paused_reason:
 "paused_after_failures"` at the next revision; the owner enables it again
-(which clears both). A `dependency_review` has no streak. Each check
+(which clears both). A `dependency_review` or `health_review` has no
+streak. Each check
 first marks runs still `running` as `interrupted` (no run is between two
 checks, so such a run was left by an earlier Core or its end could not be
 recorded), and runs nothing until that succeeded.
@@ -412,3 +419,70 @@ it already had one):
 | `roadmap_limit` | The roadmap holds its maximum of items or pending proposals |
 | `roadmap_proposal_failed` | Anything else |
 
+## Health review
+
+The `health_review` job, the morning check, reads Core's own signals and
+turns them into findings with a fixed rule table: no model call, no log
+text, no change on the host. It reads only fixed codes, allowlisted names,
+counts and times, never message text, audit detail, device ids, addresses
+or model output. The window is the last 24 hours, or 7 days for a weekly
+job's scheduled run. Each source has its own bound; all are read at once:
+
+| Source | What is read |
+| --- | --- |
+| `jobs` | Jobs paused after failures (`paused_reason`), and which kinds are enabled |
+| `runs` | The window's runs: job, kind, status, `error_code`, start time (never facts or summary) |
+| `disks` | The Health page's `system` and `data` disks (used percent, within 2 seconds) |
+| `services` | The Health page's units plus `jarvis-updater.service`, `jarvis-backup.timer` and `jarvis-backup.service`, through the same fixed `systemctl show` call (state only, within 2 seconds) |
+| `ibkr` | The problem codes of the IBKR status (`GET /v1/trading/ibkr/status`, within 12 seconds) |
+| `llm_usage` | Failed model calls per backend and failure category |
+| `security_audit` | Counts per event and outcome of a fixed list of events (never `detail` or `device_id`) |
+
+Core also looks at what it holds in memory: whether the Claude worker's
+socket exists, whether Research can run, the agent bundle's health, the
+GitHub poller's state, the memecoin paper trader's state, ntfy pushes that
+failed or were dropped since the last check (counted in memory, so a
+restart starts again at 0) and the month's model spend against the budget.
+
+| Finding | Severity | When |
+| --- | --- | --- |
+| `disk_full:{label}` | high; critical and urgent from 97% | A disk at 90% or more |
+| `service_failed:{unit}` | high | Core, SurrealDB, the config or Codex broker, OpenSandbox or the agent updater failed |
+| `updater_failed` | high | `jarvis-updater.service` failed |
+| `updater_timer_off` | medium | `jarvis-updater.timer` inactive, failed or not installed |
+| `backup_failed` | critical, urgent | `jarvis-backup.service` failed |
+| `backup_not_enabled` | low | `jarvis-backup.timer` inactive, failed or not installed |
+| `agent_registry_degraded` | medium | The agent bundle did not load |
+| `github_auth_failed` | high | GitHub refused the roadmap token |
+| `github_poll_error` | low | The GitHub poller fails or is rate limited |
+| `job_paused:{job_id}` | medium | A job paused after failed runs |
+| `job_failing:{kind}:{code}` | medium | Failed or partial runs with `token_needs_dependabot_alerts_read`, `github_token_refused`, `not_configured`, `disk_unavailable`, a `roadmap_*` code, or `research_unavailable` twice |
+| `jobs_missed` | low | A missed run |
+| `ibkr:{code}` | per code | Each IBKR status problem but `sync_disabled` and `first_sync_pending`: `auth_rejected` and `token_expired` high and urgent; `config_refused`, `credentials_missing`, `broker_failed`, `broker_unreachable`, `sync_failing` and `core_store_unavailable` high; `rate_limited` low; the others medium |
+| `research_without_worker` | medium | An enabled research job while Research cannot run |
+| `claude_worker_off` | medium | An enabled research job or dependency review while the Claude worker is off |
+| `llm_auth:{backend}` | high, urgent | A model call refused for its credentials |
+| `llm_unavailable:{backend}` | medium | 5 or more calls unavailable or timed out |
+| `push_failing` | medium | 3 or more pushes failed or dropped |
+| `security_login_failures` | medium; high and urgent from 10 | 3 or more failed logins |
+| `security_pairing_password_failed` | high, urgent | 3 or more pairing requests with a wrong password |
+| `security_bootstrap_attempts` | high, urgent | A refused first-owner setup |
+| `security_audit_flood` | high, urgent | Anonymous audit rows were dropped |
+| `security_unlock_denied` | medium | An unlock request denied |
+| `security_unlock_failed` | medium | 3 or more failed unlock approvals |
+| `security_password_failed` | high | 3 or more failed password changes |
+| `security_recovery_requested` | medium | An account recovery request |
+| `local_device_denied` | medium | 3 or more refused local device changes |
+| `memecoin_not_running` | medium | The paper trader is on but its task does not run |
+| `memecoin_tick_failing` | medium | The paper trader is on and its last tick failed |
+| `budget_over` | medium | The month's spend reached the budget |
+
+A run keeps at most 50 findings, urgent and most severe first. Its `facts`
+are `{window_hours, sources: {name: "ok" | "unavailable"}, findings: [{id,
+severity, urgent, count?, last_at?}]}` and its summary is Core's template
+(`summary_source: "deterministic"`), such as `2 things to fix (1 urgent):
+Disk data is 98% full; 4 failed logins.`, with the sources it could not
+read. A run is `ok` when every source was read, `partial` with
+`source_unavailable` when some were and `failed` with
+`signals_unavailable` when none were; it fails with `not_configured`
+without Core's application state. It posts and pushes nothing.

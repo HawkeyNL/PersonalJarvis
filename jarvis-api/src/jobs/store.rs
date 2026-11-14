@@ -1,4 +1,5 @@
-//! Typed repository for scheduled jobs and their runs (schemas 0019, 0021).
+//! Typed repository for scheduled jobs and their runs (schemas 0019, 0021,
+//! 0022).
 //!
 //! Owner writes name the revision they build on and bump it. The runner
 //! bumps it only when it disables a job that ran its last slot: it writes a
@@ -18,13 +19,15 @@ use jarvis_store::Database;
 use super::{
     Job, JobError, JobPatch, Kind, NewJob, Origin, Priority, Result, Run, RunStatus, SummarySource,
     Trigger, MAX_FACTS_BYTES, MAX_JARVIS_JOBS, MAX_OWNER_JOBS, MAX_PRIORITIES, MAX_REASON,
-    MAX_RUNS, MAX_SUMMARY, RUN_RETENTION_DAYS,
+    MAX_RUNS, MAX_SUMMARY, RUN_RETENTION_DAYS, SINGLETON_KINDS,
 };
 
 /// An owner may start a job at most once per this many hours.
 pub const OWNER_RUN_HOURS: u32 = 1;
 /// Failed runs in a row that pause a chat-made job.
 pub const MAX_FAILURES: u16 = 3;
+/// Most runs [`runs_since`] reads: a week of 13 daily jobs and spare.
+const MAX_RUNS_SINCE: usize = 500;
 /// Rows deleted per statement and statements per sweep.
 const PRUNE_BATCH: usize = 5_000;
 const PRUNE_MAX_BATCHES: usize = 20;
@@ -83,8 +86,9 @@ pub async fn get(db: &Database, id: &str) -> Result<Option<Job>> {
 }
 
 /// Create the owner's job ([`NewJob::owner_id`] set by the caller). There
-/// is at most one `dependency_review` and [`MAX_OWNER_JOBS`] of the other
-/// kinds. With the zone, the newest slot at creation counts as handled.
+/// is at most one job of each [`Kind::singleton`] kind and
+/// [`MAX_OWNER_JOBS`] of the other kinds. With the zone, the newest slot at
+/// creation counts as handled.
 pub async fn create(db: &Database, input: NewJob, tz: Option<&TimeZone>) -> Result<Job> {
     let job = input.into_job(
         uuid::Uuid::now_v7().to_string(),
@@ -120,12 +124,12 @@ pub async fn used(db: &Database) -> Result<(usize, usize)> {
     ))
 }
 
-/// Jobs of `origin` in its room at `at`: not a `dependency_review`, not
+/// Jobs of `origin` in its room at `at`: not of a singleton kind, not
 /// expired.
 fn in_room(existing: &[Job], origin: Origin, at: OffsetDateTime) -> usize {
     existing
         .iter()
-        .filter(|known| known.kind != Kind::DependencyReview && known.origin == origin)
+        .filter(|known| !known.kind.singleton() && known.origin == origin)
         .filter(|known| known.expires_at.is_none_or(|expires| expires > at))
         .count()
 }
@@ -134,11 +138,8 @@ fn in_room(existing: &[Job], origin: Origin, at: OffsetDateTime) -> usize {
 fn room(existing: &[Job], job: &Job) -> Result<()> {
     let count = |origin: Origin| in_room(existing, origin, job.created_at);
     match (job.kind, job.origin) {
-        (Kind::DependencyReview, _) => {
-            if existing
-                .iter()
-                .any(|known| known.kind == Kind::DependencyReview)
-            {
+        (kind, _) if kind.singleton() => {
+            if existing.iter().any(|known| known.kind == kind) {
                 return Err(JobError::Exists);
             }
         }
@@ -174,7 +175,9 @@ async fn insert(db: &Database, job: Job) -> Result<Job> {
 
 /// Create the row in one transaction with the room rules, so they also hold
 /// when a caller's timeout released the lock while an earlier write was
-/// still in flight.
+/// still in flight. Every create first writes the one guard row (0022), so
+/// two creates in flight at once conflict on that key and only one commits;
+/// the other is explained from the state after it.
 async fn write(db: &Database, job: &Job) -> Result<()> {
     let limit = match job.origin {
         Origin::Owner => MAX_OWNER_JOBS,
@@ -183,11 +186,12 @@ async fn write(db: &Database, job: &Job) -> Result<()> {
     let response = db
         .query(format!(
             "BEGIN TRANSACTION; \
-             IF $kind = 'dependency_review' AND array::len((SELECT VALUE id \
-               FROM scheduled_jobs WHERE kind = 'dependency_review')) > 0 \
+             UPSERT scheduled_job_guards:create SET touched_at = time::now() RETURN NONE; \
+             IF $kind IN $singletons AND array::len((SELECT VALUE id \
+               FROM scheduled_jobs WHERE kind = $kind)) > 0 \
                {{ THROW 'job exists'; }}; \
-             IF $kind != 'dependency_review' AND array::len((SELECT VALUE id \
-               FROM scheduled_jobs WHERE kind != 'dependency_review' \
+             IF $kind NOT IN $singletons AND array::len((SELECT VALUE id \
+               FROM scheduled_jobs WHERE kind NOT IN $singletons \
                AND (origin ?? 'owner') = $origin \
                AND (expires_at = NONE OR expires_at > time::now()))) >= $limit \
                {{ THROW 'no room'; }}; \
@@ -220,13 +224,15 @@ async fn write(db: &Database, job: &Job) -> Result<()> {
             "conversation_id": job.conversation_id,
             "expires_at": slot(job.expires_at)?,
             "limit": limit,
+            "singletons": SINGLETON_KINDS,
         }))
-        .await?;
-    let Err(error) = response.check() else {
+        .await
+        .and_then(surrealdb::Response::check);
+    let Err(error) = response else {
         return Ok(());
     };
-    // Explain the refusal from the current state; anything else is a
-    // database error.
+    // Explain the refusal (or the conflict) from the current state;
+    // anything else is a database error.
     room(&all(db).await?, job)?;
     Err(error.into())
 }
@@ -608,6 +614,31 @@ pub async fn last_owner_run(db: &Database, job_id: &str) -> Result<Option<Offset
     Ok(found.into_iter().next().map(|row| row.started_at))
 }
 
+/// A run as the morning check counts it: never its facts or summary.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct RunOutcome {
+    pub job_id: String,
+    pub kind: Kind,
+    pub status: RunStatus,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+}
+
+/// Runs started after `since`, at most [`MAX_RUNS_SINCE`], newest first.
+pub async fn runs_since(db: &Database, since: OffsetDateTime) -> Result<Vec<RunOutcome>> {
+    rows(
+        db,
+        &format!(
+            "SELECT job_id, kind, status, error_code, started_at FROM scheduled_job_runs \
+             WHERE started_at > <datetime>$since ORDER BY started_at DESC LIMIT {MAX_RUNS_SINCE}"
+        ),
+        json!({"since": slot(Some(since))?}),
+    )
+    .await
+}
+
 /// The job's newest `limit` runs (1 to [`MAX_RUNS`]), newest first, without
 /// their facts.
 pub async fn list_runs(db: &Database, job_id: &str, limit: usize) -> Result<Vec<Run>> {
@@ -774,6 +805,15 @@ mod tests {
         assert!(matches!(room(&others, new_jarvis), Err(JobError::Full(_))));
         assert!(matches!(room(&others, &review), Err(JobError::Exists)));
         assert!(room(&owner(10), &review).is_ok());
+        // So does the health review, one of its own next to the other.
+        let health = serde_json::from_value::<NewJob>(json!({"kind": "health_review"}))
+            .expect("health review")
+            .into_job("h".into(), now, None)
+            .expect("health review");
+        assert!(room(&others, &health).is_ok());
+        others.push(health.clone());
+        assert!(room(&others, new_owner).is_ok());
+        assert!(matches!(room(&others, &health), Err(JobError::Exists)));
         // An expired job of Jarvis's no longer counts.
         let mut expired = jarvis(3);
         expired[0].expires_at = Some(now);
@@ -1087,6 +1127,126 @@ mod tests {
             Err(JobError::Full(_))
         ));
         assert_eq!(all(&db).await?.len(), 1 + MAX_OWNER_JOBS + MAX_JARVIS_JOBS);
+        Ok(())
+    }
+
+    /// Two creates in flight at once, past the lock: on RocksDB both write
+    /// the guard row and only one commits. Runs on the RocksDB server in CI
+    /// (the memory engine misses such conflicts).
+    #[tokio::test]
+    #[ignore = "requires a disposable JARVIS_SURREAL_TEST_* RocksDB database"]
+    async fn concurrent_creates_conflict_on_the_guard_row(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = database().await?;
+        let now = OffsetDateTime::now_utc();
+        let fresh = || uuid::Uuid::now_v7().to_string();
+        let health = || -> Result<Job> {
+            serde_json::from_value::<NewJob>(json!({"kind": "health_review"}))
+                .map_err(|_| JobError::InvalidData)?
+                .into_job(fresh(), now, None)
+        };
+        let count = |kind: &'static str| {
+            let db = db.clone();
+            async move {
+                rows::<String>(
+                    &db,
+                    "SELECT VALUE record::id(id) FROM scheduled_jobs WHERE kind = $kind",
+                    json!({"kind": kind}),
+                )
+                .await
+                .map(|ids| ids.len())
+            }
+        };
+        let (review, other) = (
+            new_job().into_job(fresh(), now, None)?,
+            new_job().into_job(fresh(), now, None)?,
+        );
+        let (first, second) = tokio::join!(write(&db, &review), write(&db, &other));
+        assert_eq!(u8::from(first.is_ok()) + u8::from(second.is_ok()), 1);
+        assert!(matches!(first.and(second), Err(JobError::Exists)));
+        assert_eq!(count("dependency_review").await?, 1);
+        let (first, second) = (health()?, health()?);
+        let (first, second) = tokio::join!(write(&db, &first), write(&db, &second));
+        assert_eq!(u8::from(first.is_ok()) + u8::from(second.is_ok()), 1);
+        assert_eq!(count("health_review").await?, 1);
+        // One place left in the owner's room: one of two creates gets it.
+        for _ in 1..MAX_OWNER_JOBS {
+            write(&db, &prompt().into_job(fresh(), now, None)?).await?;
+        }
+        let (first, second) = (
+            prompt().into_job(fresh(), now, None)?,
+            prompt().into_job(fresh(), now, None)?,
+        );
+        let (first, second) = tokio::join!(write(&db, &first), write(&db, &second));
+        assert_eq!(u8::from(first.is_ok()) + u8::from(second.is_ok()), 1);
+        assert!(matches!(first.and(second), Err(JobError::Full(_))));
+        assert_eq!(count("prompt").await?, MAX_OWNER_JOBS);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn the_morning_check_reads_runs_without_their_text(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = database().await?;
+        let job = create(&db, new_job(), None).await?;
+        let old = start_run(
+            &db,
+            &job,
+            slot("2026-11-02T06:00:00Z"),
+            Trigger::Schedule,
+            RunStatus::Missed,
+        )
+        .await?;
+        let job = get(&db, &job.id).await?.ok_or("job")?;
+        let recent = start_run(
+            &db,
+            &job,
+            slot("2026-11-09T06:00:00Z"),
+            Trigger::Schedule,
+            RunStatus::Running,
+        )
+        .await?;
+        finish_run(
+            &db,
+            &recent,
+            &Finish {
+                summary: Some(("Secret summary".into(), SummarySource::Deterministic)),
+                facts: Some(r#"{"secret":true}"#.into()),
+                ..Finish::failed("github_token_refused")
+            },
+        )
+        .await?;
+        run(
+            &db,
+            "UPDATE scheduled_job_runs SET started_at = time::now() - 3d WHERE record::id(id) = $id",
+            json!({"id": old}),
+        )
+        .await?;
+        let since = OffsetDateTime::now_utc() - time::Duration::days(1);
+        let runs = runs_since(&db, since).await?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            (
+                runs[0].job_id.as_str(),
+                runs[0].kind,
+                runs[0].status,
+                runs[0].error_code.as_deref()
+            ),
+            (
+                job.id.as_str(),
+                Kind::DependencyReview,
+                RunStatus::Failed,
+                Some("github_token_refused")
+            )
+        );
+        assert!(runs[0].started_at > since);
+        assert_eq!(
+            runs_since(&db, since - time::Duration::days(7))
+                .await?
+                .len(),
+            2
+        );
         Ok(())
     }
 

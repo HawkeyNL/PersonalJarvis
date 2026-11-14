@@ -534,8 +534,9 @@ pub fn estimate_task_cost_with_registry(
 /// SurrealDB persistence functions. Failures remain best-effort at the caller,
 /// so metering cannot break an assistant reply.
 pub use surreal::{
-    active_tasks, expire_tasks, month_agent_statistics, month_breakdown, month_statistics,
-    month_total_eur, record, release_task, reserve_task, ActiveReservation,
+    active_tasks, expire_tasks, failures_since, month_agent_statistics, month_breakdown,
+    month_statistics, month_total_eur, record, release_task, reserve_task, ActiveReservation,
+    UsageFailures,
 };
 
 /// Which optional `llm_usage` dimensions Core's writers populate today. The
