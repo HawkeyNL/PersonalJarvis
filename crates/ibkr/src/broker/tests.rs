@@ -15,7 +15,10 @@ use tokio::{
 };
 
 use super::*;
-use crate::oauth::tests::{fake_client, Fake, ACCESS_TOKEN, CONSUMER_KEY, SECRET};
+use crate::oauth::{
+    tests::{fake_client, Fake, ACCESS_TOKEN, CONSUMER_KEY, SECRET},
+    Brokerage, ErrorAt, LstState, LstStatus, MintStatus,
+};
 
 struct Broker {
     _dir: tempfile::TempDir,
@@ -102,6 +105,21 @@ async fn typed_round_trip_for_every_read() {
     assert_eq!(broker.fake.count("/iserver/account"), 0);
 }
 
+#[tokio::test]
+async fn status_round_trip_never_reaches_ibkr() {
+    let broker = start(&[own_uid()]).await;
+    let client = BrokerClient::new(&broker.socket, own_uid());
+    let status = client.status().await.unwrap();
+    assert_eq!(status.lst.state, LstState::None);
+    assert!(broker.fake.requests.lock().unwrap().is_empty());
+    client.accounts().await.unwrap();
+    let sent = broker.fake.requests.lock().unwrap().len();
+    let status = client.status().await.unwrap();
+    assert_eq!(status.lst.state, LstState::Valid);
+    assert!(status.last_ok_at.is_some());
+    assert_eq!(broker.fake.requests.lock().unwrap().len(), sent);
+}
+
 #[test]
 fn wire_format_is_stable() {
     let request = BrokerRequest::History {
@@ -118,6 +136,38 @@ fn wire_format_is_stable() {
         r#"{"kind":"accounts"}"#
     );
     assert_eq!(
+        serde_json::to_string(&BrokerRequest::Status {}).unwrap(),
+        r#"{"kind":"status"}"#
+    );
+    let status = BrokerStatus {
+        started_at: 1,
+        lst: LstStatus {
+            state: LstState::RefreshDue,
+            minted_at: Some(2),
+            expires_at: None,
+        },
+        last_mint: MintStatus {
+            at: Some(3),
+            error: Some("auth_rejected".into()),
+        },
+        last_ok_at: None,
+        last_error: Some(ErrorAt {
+            at: 4,
+            code: "rate_limited".into(),
+        }),
+        rate_limited_until: None,
+        brokerage: Brokerage::Competing,
+    };
+    assert_eq!(
+        serde_json::to_string(&Reply::Ok(status)).unwrap(),
+        concat!(
+            r#"{"ok":{"started_at":1,"lst":{"state":"refresh_due","minted_at":2,"expires_at":null},"#,
+            r#""last_mint":{"at":3,"error":"auth_rejected"},"last_ok_at":null,"#,
+            r#""last_error":{"at":4,"code":"rate_limited"},"rate_limited_until":null,"#,
+            r#""brokerage":"competing"}}"#
+        )
+    );
+    assert_eq!(
         String::from_utf8(server::error_line(BrokerError::RetryLater {
             retry_after_secs: 5
         }))
@@ -129,8 +179,13 @@ fn wire_format_is_stable() {
 #[tokio::test]
 async fn refuses_a_peer_uid_that_is_not_allowlisted() {
     let broker = start(&[own_uid().wrapping_add(1)]).await;
-    let reply = raw(&broker.socket, b"{\"kind\":\"accounts\"}\n").await;
-    assert!(reply.is_empty(), "no reply to an unknown peer");
+    for request in [
+        &b"{\"kind\":\"accounts\"}\n"[..],
+        b"{\"kind\":\"status\"}\n",
+    ] {
+        let reply = raw(&broker.socket, request).await;
+        assert!(reply.is_empty(), "no reply to an unknown peer");
+    }
     assert_eq!(
         BrokerClient::new(&broker.socket, own_uid())
             .accounts()
@@ -154,6 +209,8 @@ async fn refuses_unknown_malformed_and_oversize_requests() {
         b"{\"kind\":\"switch_account\",\"account_id\":\"DU1\"}\n",
         b"{\"kind\":\"get\",\"path\":\"/iserver/account/orders\"}\n",
         b"{\"kind\":\"accounts\",\"path\":\"/x\"}\n",
+        b"{\"kind\":\"status\",\"x\":1}\n",
+        b"{\"kind\":\"status\",\"account_id\":\"DU1234567\"}\n",
         b"{\"kind\":\"ledger\",\"account_id\":\"DU1234567\",\"extra\":1}\n",
         b"{\"kind\":\"ledger\"}\n",
         b"{\"kind\":\"positions\",\"account_id\":\"DU1234567\",\"page\":2}\n",
@@ -291,13 +348,17 @@ async fn audit_lines_and_errors_carry_no_secrets_urls_or_account_ids() {
         b"{\"kind\":\"ledger\",\"account_id\":\"DU1234567\"}\n",
     )
     .await;
+    let status = raw(&broker.socket, b"{\"kind\":\"status\"}\n").await;
+    assert!(status.starts_with(b"{\"ok\":"));
 
     let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("***567"), "{logs}");
     assert!(logs.contains("\"kind\":\"ledger\""), "{logs}");
+    assert!(logs.contains("\"kind\":\"status\""), "{logs}");
     let replies = format!(
-        "{ledger} {ledger:?} {history} {history:?} {}",
-        String::from_utf8_lossy(&reply)
+        "{ledger} {ledger:?} {history} {history:?} {} {}",
+        String::from_utf8_lossy(&reply),
+        String::from_utf8_lossy(&status)
     );
     for text in [&logs, &replies] {
         for leaked in [

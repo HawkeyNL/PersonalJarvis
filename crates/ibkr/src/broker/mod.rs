@@ -8,6 +8,13 @@
 //! [`MAX_REQUEST_BYTES`], answered by one JSON reply line of at most
 //! [`MAX_REPLY_BYTES`], then the broker closes the connection.
 //!
+//! [`BrokerRequest::Status`] is answered from the broker's memory only: it
+//! never reaches IBKR, never mints a session token and never waits for the
+//! session lock or the pacer, so it stays fast while IBKR is slow or down.
+//! The reply holds states, fixed codes and Unix times, never a token,
+//! credential, account id, URL or peer uid. A broker that predates it answers
+//! `invalid_request`.
+//!
 //! [`BrokerClient`] is the typed client Core uses; [`server`] is the broker.
 
 use std::{ffi::CString, path::PathBuf, time::Duration};
@@ -19,7 +26,7 @@ use tokio::{
 };
 
 use crate::{
-    oauth::{Account, History, Ledger, Position, SecdefMatch, Snapshot},
+    oauth::{Account, BrokerStatus, History, Ledger, Position, SecdefMatch, Snapshot},
     IbkrError,
 };
 
@@ -60,6 +67,7 @@ pub enum BrokerRequest {
         period: String,
         bar: String,
     },
+    Status {},
 }
 
 impl BrokerRequest {
@@ -72,6 +80,7 @@ impl BrokerRequest {
             Self::SecdefSearch { .. } => "secdef_search",
             Self::Snapshot { .. } => "snapshot",
             Self::History { .. } => "history",
+            Self::Status {} => "status",
         }
     }
 
@@ -206,6 +215,11 @@ impl BrokerClient {
             bar: bar.to_string(),
         })
         .await
+    }
+
+    /// Broker and IBKR session health, from the broker's memory.
+    pub async fn status(&self) -> Result<BrokerStatus, BrokerError> {
+        self.call(&BrokerRequest::Status {}).await
     }
 
     async fn call<T: DeserializeOwned>(&self, request: &BrokerRequest) -> Result<T, BrokerError> {

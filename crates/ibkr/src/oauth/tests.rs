@@ -179,6 +179,7 @@ impl Fake {
             }
             ("GET", "/portfolio/DU1234567/positions/1") => "[]",
             ("GET", "/portfolio/DU1234567/ledger") => r#"{"BASE":{"cashbalance":12.5}}"#,
+            ("GET", "/portfolio/DU5555555/ledger") => "not json",
             ("POST", "/iserver/auth/ssodh/init") => {
                 assert_eq!(request.body, SSODH_INIT_BODY);
                 assert_eq!(request.headers["content-type"], "application/json");
@@ -199,7 +200,7 @@ impl Fake {
             ("POST", "/tickle")
                 if request.headers.get("content-length").map(String::as_str) == Some("0") =>
             {
-                r#"{"session":"s","iserver":{"authStatus":{"authenticated":false}}}"#
+                r#"{"session":"s","iserver":{"authStatus":{"authenticated":false,"competing":true}}}"#
             }
             _ => return (404, String::new()),
         };
@@ -340,6 +341,11 @@ async fn refuses_an_lst_with_a_bad_signature() {
         0,
         "no request with an unvalidated LST"
     );
+    let status = client.status();
+    assert_eq!(status.lst.state, LstState::None);
+    assert!(status.last_mint.at.is_some());
+    assert_eq!(status.last_mint.error.as_deref(), Some("auth_rejected"));
+    assert_eq!(status.last_ok_at, None);
     *fake.bad_lst_signature.lock().unwrap() = false;
     // A failed mint is not retried at once: the cooldown answers locally.
     let error = client.ledger("DU1234567").await.unwrap_err();
@@ -363,9 +369,14 @@ async fn unauthorized_forces_a_fresh_lst_and_brokerage_session() {
     fake.fail.lock().unwrap().insert("/history", 401);
     let error = client.history(265598, "1y", "1d").await.unwrap_err();
     assert!(matches!(error, IbkrError::Unauthorized), "{error:?}");
+    let status = client.status();
+    assert_eq!(status.lst.state, LstState::Rejected);
+    assert_eq!(status.brokerage, Brokerage::Closed);
+    assert_eq!(status.last_error.unwrap().code, "auth_rejected");
     fake.fail.lock().unwrap().clear();
     end_cooldown(&client).await;
     let history = client.history(265598, "1y", "1d").await.unwrap();
+    assert_eq!(client.status().lst.state, LstState::Valid);
     assert_eq!(history.bars[0].low, Some("0.5".parse().unwrap()));
     assert_eq!(fake.mints.load(Ordering::SeqCst), 2);
     assert_eq!(fake.count("/ssodh/init"), 2);
@@ -390,6 +401,10 @@ async fn rate_limit_backs_off_without_sending() {
     let error = client.ledger("DU1234567").await.unwrap_err();
     assert!(matches!(error, IbkrError::RateLimited { retry_after_secs } if retry_after_secs > 590));
     assert_eq!(fake.requests.lock().unwrap().len(), sent);
+    let status = client.status();
+    let until = status.rate_limited_until.unwrap();
+    assert!(until > unix_now().as_secs() + 590, "{until}");
+    assert_eq!(status.last_error.unwrap().code, "rate_limited");
 }
 
 #[tokio::test]
@@ -418,9 +433,12 @@ async fn snapshot_opens_brokerage_once_and_repeats_the_preflight() {
 #[tokio::test]
 async fn tickle_reports_a_lost_brokerage_session() {
     let (client, fake) = fake_client().await;
+    assert_eq!(client.status().brokerage, Brokerage::Closed);
     client.search("AAPL").await.unwrap_err(); // fake has no search route: 404
     assert_eq!(fake.count("/ssodh/init"), 1);
+    assert_eq!(client.status().brokerage, Brokerage::Open);
     assert!(!client.tickle().await.unwrap().authenticated);
+    assert_eq!(client.status().brokerage, Brokerage::Competing);
     client.history(265598, "30d", "1h").await.unwrap();
     assert_eq!(fake.count("/ssodh/init"), 2);
 }
@@ -685,4 +703,184 @@ async fn failed_refresh_keeps_the_still_valid_lst() {
         .expires_at = Instant::now();
     let error = client.ledger("DU1234567").await.unwrap_err();
     assert!(matches!(error, IbkrError::MintCooldown { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn status_is_served_from_memory_only() {
+    let (client, fake) = fake_client().await;
+    // A mint can hold these for up to a minute; status must not wait.
+    let _session = client.session.lock().await;
+    let _brokerage = client.brokerage.lock().await;
+    client.pacer.block();
+    let status = client.status();
+    assert!(fake.requests.lock().unwrap().is_empty());
+    let now = unix_now().as_secs();
+    assert!(status.started_at <= now && status.started_at + 5 > now);
+    assert_eq!(
+        status,
+        BrokerStatus {
+            started_at: status.started_at,
+            lst: LstStatus {
+                state: LstState::None,
+                minted_at: None,
+                expires_at: None,
+            },
+            last_mint: MintStatus {
+                at: None,
+                error: None,
+            },
+            last_ok_at: None,
+            last_error: None,
+            rate_limited_until: None,
+            brokerage: Brokerage::Closed,
+        }
+    );
+}
+
+#[tokio::test]
+async fn status_reports_a_minted_lst_in_wall_clock_time() {
+    let (client, fake) = fake_client().await;
+    client.ledger("DU1234567").await.unwrap();
+    let status = client.status();
+    let now = unix_now().as_secs();
+    assert_eq!(status.lst.state, LstState::Valid);
+    let minted = status.lst.minted_at.unwrap();
+    assert!(minted <= now && minted + 5 > now, "{minted}");
+    // The fake issues a 24 h token.
+    let expires = status.lst.expires_at.unwrap();
+    assert!(expires.abs_diff(minted + 86_400) <= 5, "{expires}");
+    assert_eq!(status.last_mint.at, Some(minted));
+    assert_eq!(status.last_mint.error, None);
+    assert!(status.last_ok_at.unwrap() >= minted);
+    assert_eq!(status.last_error, None);
+
+    fake.fail.lock().unwrap().insert("/ledger", 500);
+    client.ledger("DU1234567").await.unwrap_err();
+    assert_eq!(client.status().last_error.unwrap().code, "upstream");
+
+    let json = serde_json::to_string(&client.status()).unwrap();
+    let lst = hex::encode(fake.lst.lock().unwrap().clone().unwrap());
+    for leaked in [
+        CONSUMER_KEY,
+        ACCESS_TOKEN,
+        &hex::encode(SECRET),
+        &lst,
+        "limited_poa",
+        "DU1234567",
+        "127.0.0.1",
+        "generation",
+    ] {
+        assert!(!json.contains(leaked), "{leaked} in {json}");
+    }
+}
+
+#[test]
+fn status_states_follow_the_refresh_margin() {
+    let now = 1_000_000;
+    let mut status = ClientStatus {
+        minted_at: Some(now - 100),
+        expires_at: Some(now + LST_REFRESH_MARGIN.as_secs() + 1),
+        generation: 1,
+        ..ClientStatus::default()
+    };
+    assert_eq!(status.report(now).lst.state, LstState::Valid);
+    status.expires_at = Some(now + 60);
+    assert_eq!(status.report(now).lst.state, LstState::RefreshDue);
+    status.expires_at = Some(now);
+    assert_eq!(status.report(now).lst.state, LstState::Expired);
+    status.rejected = true;
+    status.expires_at = Some(now + 3600);
+    assert_eq!(status.report(now).lst.state, LstState::Rejected);
+    // A back-off that has run out is not reported.
+    status.rate_limited_until = Some(now);
+    assert_eq!(status.report(now).rate_limited_until, None);
+    status.rate_limited_until = Some(now + 1);
+    assert_eq!(status.report(now).rate_limited_until, Some(now + 1));
+}
+
+#[test]
+fn every_error_maps_to_a_status_code() {
+    let http = reqwest::Client::new()
+        .get("http://[::1")
+        .build()
+        .unwrap_err();
+    let decode = serde_json::from_str::<u8>("x").unwrap_err();
+    for (error, code) in [
+        (IbkrError::Http(http), "upstream"),
+        (IbkrError::TooLarge, "upstream"),
+        (IbkrError::Decode(decode), "upstream"),
+        (IbkrError::NotAuthenticated, "not_authenticated"),
+        (IbkrError::Credential("x"), "auth_rejected"),
+        (IbkrError::Handshake("x"), "auth_rejected"),
+        (IbkrError::Unauthorized, "auth_rejected"),
+        (
+            IbkrError::RateLimited {
+                retry_after_secs: 1,
+            },
+            "rate_limited",
+        ),
+        (IbkrError::Busy, "busy"),
+        (
+            IbkrError::MintCooldown {
+                retry_after_secs: 1,
+            },
+            "rate_limited",
+        ),
+        (IbkrError::InvalidInput("x"), "invalid_input"),
+    ] {
+        assert_eq!(status_code(&error), code, "{error:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_401_for_a_replaced_lst_does_not_reject_the_current_one() {
+    let (client, fake) = fake_client().await;
+    client.history(265598, "1y", "1d").await.unwrap();
+    // As if a newer LST was minted while the next request was in flight.
+    client.update_status(|s| {
+        s.generation += 1;
+        s.brokerage = Brokerage::Open;
+    });
+    fake.fail.lock().unwrap().insert("/ledger", 401);
+    let error = client.ledger("DU1234567").await.unwrap_err();
+    assert!(matches!(error, IbkrError::Unauthorized), "{error:?}");
+    let status = client.status();
+    assert_eq!(status.lst.state, LstState::Valid);
+    assert_eq!(status.brokerage, Brokerage::Open);
+    assert_eq!(status.last_error.unwrap().code, "auth_rejected");
+}
+
+#[tokio::test]
+async fn a_2xx_with_a_bad_body_is_not_a_success() {
+    let (client, _fake) = fake_client().await;
+    let error = client.ledger("DU5555555").await.unwrap_err();
+    assert!(matches!(error, IbkrError::Decode(_)), "{error:?}");
+    let status = client.status();
+    assert_eq!(status.lst.state, LstState::Valid);
+    assert_eq!(status.last_ok_at, None);
+    assert_eq!(status.last_error.unwrap().code, "upstream");
+}
+
+#[tokio::test]
+async fn brokerage_is_open_only_for_the_current_lst() {
+    let (client, fake) = fake_client().await;
+    // ssodh/init succeeds but /iserver/accounts fails: not open.
+    fake.fail.lock().unwrap().insert("/iserver/accounts", 500);
+    client.history(265598, "1y", "1d").await.unwrap_err();
+    assert_eq!(fake.count("/ssodh/init"), 1);
+    assert_eq!(client.status().brokerage, Brokerage::Closed);
+    fake.fail.lock().unwrap().clear();
+    client.history(265598, "1y", "1d").await.unwrap();
+    assert_eq!(client.status().brokerage, Brokerage::Open);
+    // A new LST generation leaves the old brokerage session behind.
+    {
+        let mut state = client.session.lock().await;
+        state.current.as_mut().unwrap().expires_at = Instant::now();
+        state.last_mint = None;
+    }
+    client.ledger("DU1234567").await.unwrap();
+    assert_eq!(fake.mints.load(Ordering::SeqCst), 2);
+    assert_eq!(client.status().brokerage, Brokerage::Closed);
+    client.history(265598, "1y", "1d").await.unwrap();
+    assert_eq!(client.status().brokerage, Brokerage::Open);
 }
