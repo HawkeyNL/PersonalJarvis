@@ -34,7 +34,7 @@ jobs:
             surrealdb/surrealdb:v2.6.5 start --bind 0.0.0.0:8000 --user root --pass test-root-password memory
           # Migrations run on RocksDB, the production engine: the memory engine
           # misses transaction conflicts that RocksDB reports (schema 0021).
-          docker run --detach --rm --name jarvis-surreal-rocksdb-test -p 127.0.0.1:8001:8000 --tmpfs /data \
+          docker run --detach --rm --name jarvis-surreal-rocksdb-test -p 127.0.0.1:8001:8000 --tmpfs /data:mode=1777 \
             surrealdb/surrealdb:v2.6.5 start --bind 0.0.0.0:8000 --user root --pass test-root-password rocksdb:/data/jarvis.db
           for port in 8000 8001; do
             for attempt in $(seq 1 20); do
