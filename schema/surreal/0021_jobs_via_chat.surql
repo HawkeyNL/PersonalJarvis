@@ -39,8 +39,12 @@ DEFINE FIELD IF NOT EXISTS params.text ON scheduled_jobs TYPE option<string> ASS
 DEFINE FIELD IF NOT EXISTS params.notify ON scheduled_jobs TYPE option<bool>;
 DEFINE FIELD IF NOT EXISTS params.threshold_percent ON scheduled_jobs TYPE option<int> ASSERT $value = NONE OR ($value >= 50 AND $value <= 99);
 
+-- The new index has a new name. SurrealDB 2.x builds an index over existing
+-- rows in transactions of its own, outside this one; rebuilding the removed
+-- index's name would rewrite the very keys REMOVE INDEX deletes here, and on
+-- RocksDB this transaction then fails to commit with a read/write conflict.
 REMOVE INDEX IF EXISTS scheduled_jobs_kind ON scheduled_jobs;
-DEFINE INDEX IF NOT EXISTS scheduled_jobs_kind ON scheduled_jobs FIELDS kind;
+DEFINE INDEX IF NOT EXISTS scheduled_jobs_by_kind ON scheduled_jobs FIELDS kind;
 
 DEFINE FIELD OVERWRITE kind ON scheduled_job_runs TYPE string ASSERT $value IN ['dependency_review', 'prompt', 'reminder', 'disk_check'];
 -- `web`: a research answer from a web search.
