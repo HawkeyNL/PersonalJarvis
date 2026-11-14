@@ -18,9 +18,9 @@ The tar contains three gpg-encrypted members:
 
 | Member | Content |
 |---|---|
-| `surrealdb.surql.zst.gpg` | Logical `surreal export` of the Core namespace/database (one consistent read transaction) |
+| `surrealdb.surql.zst.gpg` | Logical `surreal export` of the Core namespace/database (one consistent read transaction), normalized for import (see below) |
 | `etc-jarvis.tar.zst.gpg` | `/etc/jarvis` including `secrets/`, with owner/group names and modes |
-| `manifest.json.gpg` | Format version, time, SurrealDB image digest, per-table counts (live before, live after, restored), export and member hashes |
+| `manifest.json.gpg` | Format version, time, SurrealDB image digest, per-table counts (live before, live after, restored), export and member hashes, number of normalized field definitions |
 
 Members are encrypted to the owner's **public** keys. The Home Node holds no
 private key, so it cannot decrypt its own backups.
@@ -45,15 +45,24 @@ unlinks its file, which on an SSD does not overwrite the blocks.
 ## What a run checks
 
 1. It counts rows per table in the live database, exports, and counts again.
-2. It imports the export into a disposable, networkless SurrealDB container
+2. It normalizes the export so that a plain `surreal import` accepts it (see
+   [Export normalization](#export-normalization)).
+3. It imports the export into a disposable, networkless SurrealDB container
    (same pinned image, in-memory, 1 GiB limit). It requires the same tables,
    and each restored count must lie between the two live counts. The live
    database is never written.
-3. It encrypts, writes the archive atomically, verifies the checksum and
+4. It encrypts, writes the archive atomically, verifies the checksum and
    member layout, and only then prunes older archives (7 daily, 4 weekly).
    The archive it just published is never removed. While any archive carries
    a later date (clock skew or a manual copy), nothing is pruned and the run
    logs a warning.
+
+When the import fails, the journal shows the cause: a class (for example
+`parse error`, `unique index conflict`, `duplicate record or definition`, or
+that the restore container ran out of memory) and a short excerpt of the
+SurrealDB message. Quoted strings, identifiers, record ids, objects, arrays
+and the failing statement are replaced with `…`, so no exported data reaches
+the journal.
 
 Before it starts, the run refuses to continue unless the destination has
 room for twice the newest archive plus 1 GiB, and `/run` has 2 GiB for the
@@ -67,6 +76,30 @@ the run. tmpfs can be swapped to disk.
 
 The run holds the Core updater lock and waits up to 10 minutes for a running
 update.
+
+### Export normalization
+
+SurrealDB 2.x defines the sub-field `x[*]` by itself whenever it defines an
+array field `x` (Jarvis has several, for example `roadmaps.phases`), but its
+export also lists `x[*]` as a plain `DEFINE FIELD`. Importing that export
+then fails with "The field … already exists". Before the restore test, the
+run therefore rewrites exactly the wildcard field definitions that
+`INFO FOR TABLE` reports for the live database to `DEFINE FIELD OVERWRITE`,
+and only in each table's structure section. Each must appear there exactly
+once and nothing else in the export may change; otherwise the run fails and
+publishes nothing. The archived export is the normalized one:
+`export_sha256` is its hash, and `normalized_field_definitions` in the
+manifest is the number of rewritten lines. The restore test therefore checks
+exactly what is archived, and a plain `surreal import` of the archive works,
+also during disaster recovery.
+
+Archives made by earlier releases, if any, hold the unmodified export (with
+an array field in the schema, such a run failed its restore test and
+published nothing). Before importing one, add
+` OVERWRITE` after `DEFINE FIELD` on each line of the form
+`DEFINE FIELD <name>[*]... ON ...;` (or `.*`) that comes before that table's
+`-- TABLE DATA:` header. Their manifests have no
+`normalized_field_definitions`; `verify` and `restore` accept both.
 
 ## Local-only backup
 

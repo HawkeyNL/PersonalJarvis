@@ -255,6 +255,42 @@ container_state=''
 [[ $(import_reason x) == 'restore container is gone' ]]
 unset -f docker
 
+# --- Export normalization ------------------------------------------------------------
+# Only the wildcard field definitions the live schema reports, in a table's
+# structure section, gain OVERWRITE; the same text inside data is untouched.
+norm="$fixture/norm"
+mkdir "$norm"
+printf '{"roadmaps": 1, "notes": 1}\n' > "$norm/live-before.json"
+sub_def='DEFINE FIELD phases[*] ON roadmaps TYPE string ASSERT string::len($value) >= 1'
+# shellcheck disable=SC2317  # invoked through normalize_export
+live_sql() {
+    case $1 in
+        *'`roadmaps`'*) jq -n --arg d "$sub_def" '[{fields: {phases: "DEFINE FIELD phases ON roadmaps TYPE array<string, 20>", "phases[*]": $d}}]' ;;
+        *) printf '[{"fields": {}}]\n' ;;
+    esac
+}
+write_export() {
+    printf '%s\n' 'OPTION IMPORT;' '' '-- TABLE: roadmaps' '' 'DEFINE TABLE roadmaps TYPE NORMAL SCHEMAFULL;' '' \
+        'DEFINE FIELD phases ON roadmaps TYPE array<string, 20>;' "$@" '' '-- TABLE DATA: roadmaps' '' \
+        'BEGIN;' "INSERT [ { id: roadmaps:a, phases: ['x'] } ];" "$sub_def;" 'COMMIT;' > "$norm/export.surql"
+}
+write_export "$sub_def;"
+normalize_export "$norm" 2>/dev/null
+[[ $normalized_fields == 1 ]]
+[[ $(grep -c "^DEFINE FIELD OVERWRITE phases\[\*\] ON roadmaps " "$norm/export.surql") == 1 ]]
+[[ $(grep -cxF "$sub_def;" "$norm/export.surql") == 1 ]]
+[[ $(sed -n '/^-- TABLE DATA: /,$p' "$norm/export.surql" | grep -c OVERWRITE || true) == 0 ]]
+# Missing or duplicated definitions fail closed and leave the export alone.
+for copies in 0 2; do
+    lines=()
+    for (( n = 0; n < copies; n++ )); do lines+=("$sub_def;"); done
+    write_export "${lines[@]}"
+    before_norm=$(sha256sum < "$norm/export.surql")
+    expect_fail normalize_export "$norm"
+    [[ $(sha256sum < "$norm/export.surql") == "$before_norm" ]]
+done
+unset -f live_sql
+
 # --- Local-only setup, decrypting verify and restore round trip -------------------
 # Rootless: production directories are root-owned, fixture ones are not.
 # shellcheck disable=SC2317  # invoked through init_local and restore_to

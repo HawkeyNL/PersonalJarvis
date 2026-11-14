@@ -124,9 +124,15 @@ jq -e '[.tables[] | {(.table): .restored}] | add
     | .conversation == 3 and .device == 2 and .empty_table == 0 and .schema_version == 1
       and .users == 1 and .account_passwords == 1 and .devices == 1 and .device_keys == 1' <<< "$manifest" >/dev/null
 jq -e '[.tables[] | select(.restored != .live_before)] == []' <<< "$manifest" >/dev/null
+# Array fields (roadmaps.phases and others) need their `x[*]` definitions
+# rewritten to OVERWRITE; the archived export is the normalized one.
+jq -e '.normalized_field_definitions >= 3' <<< "$manifest" >/dev/null
 export_hash=$(gpg --batch --quiet --homedir "$fixture/keys" -d "$fixture/open/surrealdb.surql.zst.gpg" 2>/dev/null \
     | zstd -dq | sha256sum | cut -d' ' -f1)
 [[ $export_hash == "$(jq -r .export_sha256 <<< "$manifest")" ]]
+overwrites=$(gpg --batch --quiet --homedir "$fixture/keys" -d "$fixture/open/surrealdb.surql.zst.gpg" 2>/dev/null \
+    | zstd -dq | grep -c '^DEFINE FIELD OVERWRITE ')
+[[ $overwrites == "$(jq -r .normalized_field_definitions <<< "$manifest")" ]]
 
 # A concurrent run is refused without touching the archive.
 before=$(sha256sum "$archive")

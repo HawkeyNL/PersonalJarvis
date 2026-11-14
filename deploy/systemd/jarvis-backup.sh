@@ -139,11 +139,12 @@ build_members() {
     done
     jq -n --arg created "$(date -u +%FT%TZ)" --arg ns "$namespace" --arg db "$database" \
         --arg image "${image:-}" --arg export_sha "$export_sha" --argjson tables "$tables" \
-        --argjson members "$member_info" --arg gpg "$(gpg --version | head -1)" \
+        --argjson members "$member_info" --argjson normalized "${normalized_fields:-0}" --arg gpg "$(gpg --version | head -1)" \
         --arg zstd "$(zstd --version)" --arg tar "$(tar --version | head -1)" \
         --argjson recipients "$(printf '%s\n' "${recipients[@]}" | jq -R . | jq -s .)" \
         '{format_version: 1, created_at: $created, namespace: $ns, database: $db,
           surrealdb_image: $image, export_sha256: $export_sha, tables: $tables,
+          normalized_field_definitions: $normalized,
           members: $members, recipients: $recipients,
           tools: {gpg: $gpg, zstd: $zstd, tar: $tar}}' \
         | encrypt_to > "$staging/manifest.json.gpg"
@@ -394,6 +395,41 @@ table_counts() {
     printf '%s\n' "$counts" > "$out"
 }
 
+# SurrealDB 2.x defines `x[*]` itself when it defines an array field `x`, but
+# exports that sub-field as a plain DEFINE FIELD too, so importing its own
+# export fails with "The field ... already exists". Rewrite exactly the
+# wildcard field definitions the live database reports (INFO FOR TABLE prints
+# the same text as the export) to DEFINE FIELD OVERWRITE, only in the table
+# structure sections (before each "-- TABLE DATA:"). Each must occur there
+# exactly once and nothing else may change; otherwise fail closed. Sets
+# $normalized_fields.
+normalize_export() {
+    local run=$1 table size
+    : > "$run/wildcard-fields"
+    while IFS= read -r table; do
+        live_sql "INFO FOR TABLE \`$table\`;" | jq -r '.[0].fields // {} | to_entries[]
+            | select((.key | contains("*")) and (.value | startswith("DEFINE FIELD "))
+                and (.value | test("^DEFINE FIELD (OVERWRITE|IF NOT EXISTS) ") | not)) | .value' \
+            >> "$run/wildcard-fields" || fail 'cannot read the live field definitions'
+    done < <(jq -r 'keys[]' "$run/live-before.json")
+    normalized_fields=$(wc -l < "$run/wildcard-fields")
+    (( normalized_fields > 0 )) || return 0
+    size=$(stat -c %s "$run/export.surql")
+    LC_ALL=C awk -v defs="$run/wildcard-fields" '
+        BEGIN { while ((getline line < defs) > 0) { want[line ";"] = 1; total++ } }
+        /^-- TABLE DATA: / { data = 1 }
+        /^-- TABLE: / { data = 0 }
+        !data && ($0 in want) { seen[$0]++; sub(/^DEFINE FIELD /, "DEFINE FIELD OVERWRITE "); done++ }
+        { print }
+        END { for (d in want) if (seen[d] != 1) exit 1; exit (done != total) }
+    ' "$run/export.surql" > "$run/export.normalized" \
+        || fail 'export field definitions do not match the live schema; not normalizing'
+    (( $(stat -c %s "$run/export.normalized") == size + 10 * normalized_fields )) \
+        || fail 'export normalization changed more than the field definitions'
+    mv -f -- "$run/export.normalized" "$run/export.surql"
+    log "normalized $normalized_fields wildcard field definitions for import"
+}
+
 # SurrealDB 2.x import failure messages (surrealdb-core 2.6.5 err/mod.rs and
 # the SDK's HTTP import), most specific first, as "class|ERE".
 readonly import_error_classes=(
@@ -619,6 +655,7 @@ create() {
     # Terminal escapes mean log output leaked into the stream.
     if grep -q $'\x1b' "$run_dir/export.surql"; then fail 'SurrealDB export contains log output'; fi
     table_counts live_sql "$run_dir/live-after.json"
+    normalize_export "$run_dir"
     restore_test "$run_dir"
     build_members "$staging_dir" "$run_dir" "$etc_parent"
     local archive
