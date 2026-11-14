@@ -23,7 +23,6 @@ marker="$tmp/provisioned"
 password_file="$tmp/core-password"
 output_file="$tmp/provision-output"
 argv_file="$tmp/docker-argv"
-bin_dir="$tmp/bin"
 test_core_password='Q2xlYW5Sb290QWNjZXNzQ29yZVBhc3N3b3JkVGhhdElzTm90UmVhbDEyMzQ1Njc4OTA='
 test_root_password='root-password-only-for-shellless-regression'
 
@@ -37,15 +36,13 @@ trap cleanup EXIT
 on_error() {
     local status=$? line=$1
     echo "shell-less provisioning test failed at line $line (exit $status)" >&2
-    echo "DIAG fixture mount: $(findmnt -no OPTIONS -T "$tmp" 2>&1)" >&2
-    echo "DIAG resolved: $(PATH="$bin_dir:$PATH" type -P docker openssl | tr '\n' ' ')" >&2
     if [[ -s $output_file ]]; then
         echo "--- captured provisioning output ---" >&2
         cat -- "$output_file" >&2
     fi
 }
 trap 'on_error $LINENO' ERR
-mkdir -p "$bin_dir" "$tmp/data"
+mkdir -p "$tmp/data"
 
 install -o root -g root -m 0600 /dev/null "$env_file"
 cat > "$env_file" <<EOF
@@ -69,28 +66,25 @@ sed \
     "$subject_source" > "$tmp/provision-core-user.sh"
 chmod 0700 "$tmp/provision-core-user.sh"
 
-cat > "$bin_dir/openssl" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$JARVIS_TEST_CORE_PASSWORD"
-EOF
-chmod 0700 "$bin_dir/openssl"
-
-cat > "$bin_dir/docker" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\0' "$@" > "$JARVIS_TEST_DOCKER_ARGV"
-for argument in "$@"; do
-    case "$argument" in
-        *"$JARVIS_TEST_ROOT_PASSWORD"*|*"$JARVIS_TEST_CORE_PASSWORD"*)
-            echo "secret appeared in Docker argv" >&2
-            exit 98
-            ;;
-    esac
-done
-exec "$JARVIS_REAL_DOCKER" "$@"
-EOF
-chmod 0700 "$bin_dir/docker"
+# Fakes are exported functions, not scripts in $tmp: some CI runners mount /run
+# noexec, so PATH lookup would silently skip them and run the real binaries.
+openssl() {
+    printf '%s\n' "$JARVIS_TEST_CORE_PASSWORD"
+}
+docker() {
+    printf '%s\0' "$@" > "$JARVIS_TEST_DOCKER_ARGV"
+    local argument
+    for argument in "$@"; do
+        case "$argument" in
+            *"$JARVIS_TEST_ROOT_PASSWORD"*|*"$JARVIS_TEST_CORE_PASSWORD"*)
+                echo "secret appeared in Docker argv" >&2
+                exit 98
+                ;;
+        esac
+    done
+    "$JARVIS_REAL_DOCKER" "$@"
+}
+export -f openssl docker
 
 assert_absent() {
     local needle=$1
@@ -118,7 +112,6 @@ if "$real_docker" compose --env-file "$env_file" -f "$compose_file" exec -T surr
     exit 1
 fi
 
-PATH="$bin_dir:$PATH" \
 JARVIS_REAL_DOCKER="$real_docker" \
 JARVIS_TEST_CORE_PASSWORD="$test_core_password" \
 JARVIS_TEST_ROOT_PASSWORD="$test_root_password" \
@@ -145,7 +138,6 @@ printf 'INFO FOR DB;\n' \
 
 # The marker prevents a second account creation or password rotation.
 second_password_file="$tmp/core-password-second"
-PATH="$bin_dir:$PATH" \
 JARVIS_REAL_DOCKER="$real_docker" \
 JARVIS_TEST_CORE_PASSWORD="$test_core_password" \
 JARVIS_TEST_ROOT_PASSWORD="$test_root_password" \
