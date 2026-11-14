@@ -139,11 +139,12 @@ build_members() {
     done
     jq -n --arg created "$(date -u +%FT%TZ)" --arg ns "$namespace" --arg db "$database" \
         --arg image "${image:-}" --arg export_sha "$export_sha" --argjson tables "$tables" \
-        --argjson members "$member_info" --arg gpg "$(gpg --version | head -1)" \
+        --argjson members "$member_info" --argjson normalized "${normalized_fields:-0}" --arg gpg "$(gpg --version | head -1)" \
         --arg zstd "$(zstd --version)" --arg tar "$(tar --version | head -1)" \
         --argjson recipients "$(printf '%s\n' "${recipients[@]}" | jq -R . | jq -s .)" \
         '{format_version: 1, created_at: $created, namespace: $ns, database: $db,
           surrealdb_image: $image, export_sha256: $export_sha, tables: $tables,
+          normalized_field_definitions: $normalized,
           members: $members, recipients: $recipients,
           tools: {gpg: $gpg, zstd: $zstd, tar: $tar}}' \
         | encrypt_to > "$staging/manifest.json.gpg"
@@ -394,14 +395,149 @@ table_counts() {
     printf '%s\n' "$counts" > "$out"
 }
 
+# SurrealDB 2.x defines `x[*]` itself when it defines an array field `x`, but
+# exports that sub-field as a plain DEFINE FIELD too, so importing its own
+# export fails with "The field ... already exists". Rewrite exactly the
+# wildcard field definitions the live database reports (INFO FOR TABLE prints
+# the same text as the export) to DEFINE FIELD OVERWRITE, only in the table
+# structure sections (before each "-- TABLE DATA:"). Each must occur there
+# exactly once and nothing else may change; otherwise fail closed. Sets
+# $normalized_fields.
+normalize_export() {
+    local run=$1 table size
+    : > "$run/wildcard-fields"
+    while IFS= read -r table; do
+        live_sql "INFO FOR TABLE \`$table\`;" | jq -r '.[0].fields // {} | to_entries[]
+            | select((.key | contains("*")) and (.value | startswith("DEFINE FIELD "))
+                and (.value | test("^DEFINE FIELD (OVERWRITE|IF NOT EXISTS) ") | not)) | .value' \
+            >> "$run/wildcard-fields" || fail 'cannot read the live field definitions'
+    done < <(jq -r 'keys[]' "$run/live-before.json")
+    normalized_fields=$(wc -l < "$run/wildcard-fields")
+    (( normalized_fields > 0 )) || return 0
+    size=$(stat -c %s "$run/export.surql")
+    LC_ALL=C awk -v defs="$run/wildcard-fields" '
+        BEGIN { while ((getline line < defs) > 0) { want[line ";"] = 1; total++ } }
+        /^-- TABLE DATA: / { data = 1 }
+        /^-- TABLE: / { data = 0 }
+        !data && ($0 in want) { seen[$0]++; sub(/^DEFINE FIELD /, "DEFINE FIELD OVERWRITE "); done++ }
+        { print }
+        END { for (d in want) if (seen[d] != 1) exit 1; exit (done != total) }
+    ' "$run/export.surql" > "$run/export.normalized" \
+        || fail 'export field definitions do not match the live schema; not normalizing'
+    (( $(stat -c %s "$run/export.normalized") == size + 10 * normalized_fields )) \
+        || fail 'export normalization changed more than the field definitions'
+    mv -f -- "$run/export.normalized" "$run/export.surql"
+    log "normalized $normalized_fields wildcard field definitions for import"
+}
+
+# SurrealDB 2.x import failure messages (surrealdb-core 2.6.5 err/mod.rs and
+# the SDK's HTTP import), most specific first, as "class|ERE".
+readonly import_error_classes=(
+    'parse error|Parse error|not parsed fully|-->[[:space:]]*\[[0-9]+:[0-9]+\]'
+    'unique index conflict|already contains'
+    'duplicate record or definition|already exists'
+    'memory or size limit|memory threshold|too large'
+    'timeout|exceeded the timeout'
+    'failed transaction|due to a (failed|cancelled) transaction|read or write conflict'
+    'schema check|but expected a|must conform to'
+    'missing definition|does not exist'
+    'permission denied|permission|not allowed'
+    'thrown error|An error occurred:'
+    'lost connection|error sending request|connection (closed|refused|reset)|broken pipe'
+    'HTTP error|remote (HTTP|WS) request'
+)
+
+# Replace quoted strings, ⟨escaped⟩ identifiers, objects and arrays (but not
+# [line:col] positions) with \001. A quote opens only after, and closes only
+# before, a non-alphanumeric character, so apostrophes ("can't") and doubled
+# quotes stay inside. Unterminated ones run to the end, so a misparse hides
+# more, never less.
+# shellcheck disable=SC2016  # awk program, not shell
+readonly redact_awk='
+function alnum(c) { return c ~ /[A-Za-z0-9]/ }
+function quote(c) { return c == "\047" || c == "\"" || c == "`" }
+function closer(i,    c) {
+    if (substr(s, i, 3) == "⟨") return "⟩"
+    c = substr(s, i, 1)
+    if (quote(c)) return (i > 1 && alnum(substr(s, i - 1, 1))) ? "" : c
+    if (c == "{") return "}"
+    if (c == "[") return "]"
+    return ""
+}
+function skip(i, e,    q, inner) {
+    q = (e != "}" && e != "]")
+    i += (e == "⟩") ? 3 : 1
+    while (i <= n) {
+        if (substr(s, i, length(e)) == e && !(quote(e) && alnum(substr(s, i + 1, 1)))) return i + length(e)
+        if (substr(s, i, 1) == "\\") { i += 2; continue }
+        if (!q && (inner = closer(i)) != "") { i = skip(i, inner); continue }
+        i++
+    }
+    return n + 1
+}
+{ s = s $0 "\n" }
+END {
+    n = length(s); i = 1
+    while (i <= n) {
+        e = closer(i)
+        if (e == "") { printf "%s", substr(s, i, 1); i++ }
+        else if (e == "]" && match(substr(s, i, 32), /^\[[0-9]+:[0-9]+\]/)) { printf "%s", substr(s, i, RLENGTH); i += RLENGTH }
+        else { printf "\001"; i = skip(i, e) }
+    }
+}'
+
+# Why the disposable import failed, without quoting exported data: SurrealDB
+# messages embed record ids, values and the failing statement. Prints a class
+# and a redacted excerpt from the first line naming it; $1 is the CLI stderr.
+import_failure_reason() {
+    local state text info entry class='unclassified error' pattern='[Ee]rror' start excerpt
+    # A killed server is the cause; the client only reports a lost connection.
+    state=$(docker inspect --format '{{.State.OOMKilled}} {{.State.Status}} {{.State.ExitCode}}' \
+        "$verify_container" 2>/dev/null) || state=''
+    if [[ $state =~ ^true\  ]]; then
+        echo 'restore container ran out of memory (1 GiB limit)'; return
+    elif [[ $state =~ ^false\ ([a-z]+)\ (-?[0-9]+)$ && ${BASH_REMATCH[1]} != running ]]; then
+        echo "restore container stopped: ${BASH_REMATCH[1]}, exit code ${BASH_REMATCH[2]}"; return
+    elif [[ ! $state =~ ^false\ running\  ]]; then
+        echo 'restore container is gone'; return
+    fi
+    # Bounded and without terminal colours; an HTTP error's JSON body is
+    # replaced by its message.
+    text=$(head -c 65536 -- "$1" | LC_ALL=C sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
+    info=$(sed -n '/^{$/,/^}$/p' <<< "$text" | jq -r '.information // empty' 2>/dev/null) || info=''
+    [[ -z $info ]] || text="$(sed '/^{$/,/^}$/d' <<< "$text")"$'\n'"$info"
+    for entry in "${import_error_classes[@]}"; do
+        if grep -qE -- "${entry#*|}" <<< "$text"; then class=${entry%%|*} pattern=${entry#*|}; break; fi
+    done
+    # Thrown messages are free text from the schema or data; without a class
+    # the shape is unknown. Neither gets an excerpt.
+    case $class in 'thrown error'|'unclassified error') printf '%s\n' "$class"; return ;; esac
+    start=$(grep -m 1 -nE -- "$pattern" <<< "$text" | cut -d: -f1) || start=''
+    # Parse errors print the failing source lines ("12 | INSERT ..."); values
+    # are quoted, bracketed or follow "Found" / "contains" / "but found".
+    # Whatever is left with a digit or an inner colon (unquoted numbers,
+    # record ids, URLs) goes as well, except [line:col] positions.
+    excerpt=$(tail -n +"${start:-1}" <<< "$text" \
+        | LC_ALL=C sed -E '/^[[:space:]]*[0-9]*[[:space:]]*\|/d
+            s/^([0-9T:.+-]+Z?[[:space:]]+)?ERROR[[:space:]]+[A-Za-z0-9_:]+:[[:space:]]*//
+            s/(Found|already contains) .* (for (field|param)|with record)/\1 \x01 \2/
+            s/(but found) .*/\1 \x01/' \
+        | LC_ALL=C awk "$redact_awk" | LC_ALL=C tr -cd '\1\11\12\40-\176' | tr '\n\t' '  ' | tr -s ' ' \
+        | LC_ALL=C awk '{ for (i = 1; i <= NF; i++) if ($i !~ /^\[[0-9]+:[0-9]+\]$/ && ($i ~ /[0-9]/ || $i ~ /:./)) $i = "\001"; print }' \
+        | cut -c 1-300 | LC_ALL=C sed 's/\x01/…/g; s/^ //; s/ $//') || excerpt=''
+    printf '%s\n' "$class${excerpt:+: $excerpt}"
+}
+
 restore_test() {
     local run=$1 name attempt table before after restored
     name="jarvis-backup-verify-${run##*.}"
-    docker run -d --rm --name "$name" --network none --user 0:0 \
+    # No --rm: a crashed container must stay inspectable. Set before the run,
+    # so cleanup also removes one that was created but failed to start.
+    verify_container=$name
+    docker run -d --name "$name" --network none --user 0:0 \
         --cap-drop ALL --security-opt no-new-privileges:true --memory 1g --cpus 1 --pids-limit 256 \
         -v "$run/export.surql:/restore/export.surql:ro" "$image" start --unauthenticated memory >/dev/null \
         || fail 'cannot start disposable restore container'
-    verify_container=$name
     for attempt in $(seq 1 30); do
         docker exec "$verify_container" /surreal isready --endpoint http://127.0.0.1:8000 >/dev/null 2>&1 && break
         (( attempt < 30 )) || fail 'disposable restore container did not become ready'
@@ -411,14 +547,9 @@ restore_test() {
     printf 'DEFINE NAMESPACE IF NOT EXISTS restoretest; USE NS restoretest; DEFINE DATABASE IF NOT EXISTS restoretest;\n' \
         | docker exec -i "$verify_container" /surreal sql --hide-welcome --endpoint ws://127.0.0.1:8000 >/dev/null \
         || fail 'cannot define the disposable restore database'
-    # Import errors quote exported statements (password hashes, user data).
-    # Report only the error class and position, never the quoted text.
     if ! docker exec "$verify_container" /surreal import --log error --endpoint http://127.0.0.1:8000 \
         --namespace restoretest --database restoretest /restore/export.surql >/dev/null 2>"$run/import.err"; then
-        local reason
-        reason=$(grep -oE '(Parse|Thrown|Database|IO|Api) error|-->[[:space:]]*\[[0-9]+:[0-9]+\]' "$run/import.err" \
-            | head -n 2 | LC_ALL=C tr -cd '[:alnum:] :[]>\n-' | tr '\n' ' ') || true
-        fail "export does not import into a disposable database (${reason:-unclassified error})"
+        fail "export does not import into a disposable database ($(import_failure_reason "$run/import.err"))"
     fi
     table_counts verify_sql "$run/restored.json"
     [[ $(jq -c 'keys' "$run/restored.json") == "$(jq -c 'keys' "$run/live-before.json")" ]] \
@@ -535,6 +666,7 @@ create() {
     # Terminal escapes mean log output leaked into the stream.
     if grep -q $'\x1b' "$run_dir/export.surql"; then fail 'SurrealDB export contains log output'; fi
     table_counts live_sql "$run_dir/live-after.json"
+    normalize_export "$run_dir"
     restore_test "$run_dir"
     build_members "$staging_dir" "$run_dir" "$etc_parent"
     local archive
