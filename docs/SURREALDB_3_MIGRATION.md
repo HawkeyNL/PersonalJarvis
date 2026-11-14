@@ -84,7 +84,7 @@ Line numbers come from `76668a7`.
 ### 2.1 Schema files and migration runner
 
 - **Schema files:** `schema/surreal/0001_baseline.surql` …
-  `0021_jobs_via_chat.surql`, 879 lines, 47 tables.
+  `0021_jobs_via_chat.surql`, 884 lines, 47 tables.
 - **Statement shape:**
   - Every file is one `BEGIN TRANSACTION; … COMMIT TRANSACTION;` block.
   - Tables are all `SCHEMAFULL PERMISSIONS NONE`.
@@ -122,10 +122,22 @@ Line numbers come from `76668a7`.
     table (`chat_messages.attachments`), with `array::distinct` and a regex
     on its elements through `OVERWRITE attachments.*`. Tested on 2.6.5 only.
   - Since `0021_jobs_via_chat.surql`: `REMOVE INDEX IF EXISTS` (a unique
-    index redefined as a plain one), `DEFINE FIELD OVERWRITE` of fields
-    whose `ASSERT` reads fields added in the same file, and the `??`
-    operator in Core's job queries for fields older rows lack. Tested on
-    2.6.5 only.
+    index replaced by a plain one under a new name, `scheduled_jobs_by_kind`),
+    `DEFINE FIELD OVERWRITE` of fields whose `ASSERT` reads fields added in
+    the same file, and the `??` operator in Core's job queries for fields
+    older rows lack. Tested on 2.6.5, the migration tests on RocksDB.
+- **Index rule (v0.0.87 incident):** 2.x builds an index over existing rows
+  in transactions of its own, outside the migration. 0021 first redefined
+  the index under its old name; the builder rewrote keys the migration had
+  deleted, and on RocksDB the migration failed to commit with a read/write
+  conflict, so Core could not start. The memory engine in CI did not report
+  it. Since then CI and the release gate run the migration tests on a
+  RocksDB server, and a migration never removes or overwrites an index and
+  defines it again under the same name, never writes rows of a populated
+  table in the same migration that defines an index on it, and avoids
+  `DEFINE INDEX OVERWRITE` on a populated table (`crates/store/src/lib.rs`).
+  Whether 3.x builds indexes the same way is **unverified**; the drill must
+  run the migration tests on RocksDB.
 - **`id` fields:** 44 tables declare `DEFINE FIELD id ON <t> TYPE string`.
   - Records are created as `CREATE <t> SET id = $id, …` with a string UUID.
   - Lookups use `WHERE record::id(id) = $id`.

@@ -32,13 +32,21 @@ jobs:
         run: |
           docker run --detach --rm --name jarvis-surreal-test -p 127.0.0.1:8000:8000 \
             surrealdb/surrealdb:v2.6.5 start --bind 0.0.0.0:8000 --user root --pass test-root-password memory
-          for attempt in $(seq 1 20); do
-            curl --fail --silent http://127.0.0.1:8000/health && break
-            sleep 1
+          # Migrations run on RocksDB, the production engine: the memory engine
+          # misses transaction conflicts that RocksDB reports (schema 0021).
+          docker run --detach --rm --name jarvis-surreal-rocksdb-test -p 127.0.0.1:8001:8000 --tmpfs /data:mode=1777 \
+            surrealdb/surrealdb:v2.6.5 start --bind 0.0.0.0:8000 --user root --pass test-root-password rocksdb:/data/jarvis.db
+          for server in jarvis-surreal-test:8000 jarvis-surreal-rocksdb-test:8001; do
+            ready=false
+            for attempt in $(seq 1 20); do
+              curl --fail --silent "http://127.0.0.1:${server#*:}/health" && { ready=true; break; }
+              sleep 1
+            done
+            [ "$ready" = true ] || { docker logs "${server%:*}"; exit 1; }
           done
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-identity surreal::tests::challenge_login_cannot_be_replayed -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-identity surreal::account::tests -- --ignored --test-threads=1
-          JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-store migration_tests -- --ignored
+          JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8001 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-store migration_tests -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-portfolio surreal::tests::preserves_decimal_holdings_and_owner_scope -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-api --test surreal_api -- --ignored
           JARVIS_SURREAL_TEST_ENDPOINT=127.0.0.1:8000 JARVIS_SURREAL_TEST_USER=root JARVIS_SURREAL_TEST_PASS=test-root-password cargo test -p jarvis-api --lib notify::apns -- --ignored
