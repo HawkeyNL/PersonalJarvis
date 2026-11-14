@@ -430,14 +430,15 @@ same_migrations=$(printf 'a%.0s' {1..64})
 changed_migrations=$(printf 'b%.0s' {1..64})
 unrelated_migrations=$(printf 'c%.0s' {1..64})
 
-# Publish a schema-changing candidate that authorizes migration from $2.
+# Publish a schema-changing candidate that authorizes migration from $2 to
+# target $3 (default: the newest supported target).
 prepare_migration_candidate() {
-    local tag=$1 from=$2 asset="$fixture_dir/asset/jarvis-core-$1"
+    local tag=$1 from=$2 target=${3:-23} asset="$fixture_dir/asset/jarvis-core-$1"
     prepare_candidate "$tag" "$changed_migrations"
     install -m 0755 "$repo_dir/deploy/systemd/schema-backup.sh" "$asset/schema-backup"
     install -m 0644 "$repo_dir/jarvis-core-admin/packaging/com.hawkeynl.jarvis.devices.policy" \
         "$asset/com.hawkeynl.jarvis.devices.policy"
-    jq --arg previous "$from" '.tooling.local_devices = 1 | .schema_migration = {version:1,target:21,from_sha256:[$previous]}' \
+    jq --arg previous "$from" --argjson target "$target" '.tooling.local_devices = 1 | .schema_migration = {version:1,target:$target,from_sha256:[$previous]}' \
         "$asset/release.json" > "$fixture_dir/migration-manifest"
     install -m 0644 "$fixture_dir/migration-manifest" "$asset/release.json"
     (cd "$asset" && sha256sum schema-backup com.hawkeynl.jarvis.devices.policy >> artifact-binaries.sha256)
@@ -993,6 +994,12 @@ if run_updater --stage v10.1.2 2>"$fixture_dir/stage-same.err"; then
 fi
 grep -Fq 'use --version v10.1.2' "$fixture_dir/stage-same.err"
 [[ ! -e /opt/jarvis/releases/v10.1.2 ]]
+
+# Every newly supported target stages; the default (newest) target also runs
+# the full stage-then-migrate flow below.
+prepare_migration_candidate v10.1.1 "$same_migrations" 22
+run_updater --stage v10.1.1
+rm -rf -- /opt/jarvis/releases/v10.1.1
 
 prepare_migration_candidate v10.1.1 "$same_migrations"
 : > "$fixture_dir/systemctl.log"
