@@ -73,6 +73,11 @@ fi
 grep -Eq '^TimeoutStartSec=' "$backup_service"
 grep -Fxq 'Restart=on-failure' "$backup_service"
 grep -Fxq 'StartLimitBurst=3' "$backup_service"
+# tar under RestrictSUIDSGID= fails with ENOSYS (openat2 is blocked), as for the updater.
+if grep -Eq '^RestrictSUIDSGID=' "$backup_service"; then
+    echo "jarvis-backup.service must not set RestrictSUIDSGID= (tar needs openat2)" >&2
+    exit 1
+fi
 # Housekeeping follows the same opt-in shape, runs at idle priority and is
 # inert (not failed) after a rollback to a release without its helper.
 housekeeping_service="$repo_dir/deploy/systemd/jarvis-housekeeping.service"
