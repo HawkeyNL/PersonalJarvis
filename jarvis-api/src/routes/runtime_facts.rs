@@ -11,18 +11,22 @@ use jarvis_llm::{
     claude_worker_protocol::{self, MAX_SYSTEM_BYTES},
     codex_chat_protocol, RoutingSnapshot, Tier,
 };
+use jarvis_market_data::wallet::Chain;
 use jiff::{tz::TimeZone, Timestamp};
 use rust_decimal::Decimal;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
+use super::crypto::{self as wallet_routes, Part, CHAINS, CRYPTO, IBKR};
 use crate::auto_research::WEB_SEARCH_MARKER;
+use crate::crypto::store::Wallet;
 use crate::ibkr::store;
 use crate::jobs::{Origin, MAX_JARVIS_JOBS, MAX_OWNER_JOBS, TIME_ZONE};
 use crate::AppState;
 
 /// Hard cap for the whole block (preface included): 2304 bytes, plus 1024
-/// for the job lines, so they take no room from the others.
-const MAX_BYTES: usize = 3 * 1024 + 256;
+/// for the job lines and 768 for the crypto lines, so they take no room from
+/// the others.
+const MAX_BYTES: usize = 4 * 1024;
 /// One owner-configured value (a model id, an agent name) cannot crowd out
 /// the other lines.
 const MAX_LINE_BYTES: usize = 400;
@@ -56,6 +60,49 @@ pub(super) enum Ibkr {
     Synced(Portfolio),
 }
 
+/// The crypto wallets, without addresses, labels, per-wallet values, error
+/// codes or uncounted tokens: only what the owner could say about the whole.
+pub(super) struct CryptoWallets {
+    pub count: usize,
+    /// Every chain of every wallet, in display order.
+    pub chains: Vec<Chain>,
+    /// The oldest good refresh; `None` while every wallet is pending.
+    pub as_of: Option<OffsetDateTime>,
+    pub total_eur: Decimal,
+    /// Allowlist symbol and EUR value of each valued asset, largest first.
+    pub assets: Vec<(&'static str, Decimal)>,
+}
+
+pub(super) enum Crypto {
+    NotEnabled,
+    /// Enabled, but the wallets could not be read right now.
+    Unreadable,
+    Wallets(CryptoWallets),
+}
+
+impl CryptoWallets {
+    fn new(wallets: &[Wallet], valuation: &wallet_routes::Valuation) -> Self {
+        Self {
+            count: wallets.len(),
+            chains: CHAINS
+                .into_iter()
+                .filter(|chain| wallets.iter().any(|wallet| wallet.chains.contains(chain)))
+                .collect(),
+            as_of: valuation.as_of,
+            total_eur: valuation.total,
+            assets: valuation
+                .assets
+                .iter()
+                .filter_map(|&(asset, _, value)| {
+                    value
+                        .filter(|value| *value > Decimal::ZERO)
+                        .map(|value| (asset.symbol, value))
+                })
+                .collect(),
+        }
+    }
+}
+
 pub(super) struct Facts<'a> {
     pub version: &'a str,
     pub now: OffsetDateTime,
@@ -80,6 +127,7 @@ pub(super) struct Facts<'a> {
     /// `None` when no agent bundle is loaded.
     pub agents: Option<Vec<String>>,
     pub ibkr: Ibkr,
+    pub crypto: Crypto,
 }
 
 /// The persona followed by the runtime facts of this moment. `runs_api` is
@@ -88,7 +136,7 @@ pub(super) struct Facts<'a> {
 pub(super) async fn system_prompt(state: &AppState, runs_api: bool) -> String {
     let claude_worker = socket_exists(claude_worker_protocol::SOCKET).await;
     let codex_worker = socket_exists(codex_chat_protocol::SOCKET).await;
-    let ibkr = ibkr(state).await;
+    let (ibkr, crypto) = tokio::join!(ibkr(state), crypto(state));
     let routing = state.model_routing.snapshot();
     let allows = |provider: &str, model: &str| state.model_policy.allows(provider, model);
     let research = state.llm.can_research();
@@ -120,6 +168,7 @@ pub(super) async fn system_prompt(state: &AppState, runs_api: bool) -> String {
                 .collect()
         }),
         ibkr,
+        crypto,
     };
     compose(&state.jarvis_system, &facts)
 }
@@ -154,6 +203,16 @@ async fn ibkr(state: &AppState) -> Ibkr {
         }),
         Ok(Ok(None)) => Ibkr::NoSyncYet,
         _ => Ibkr::Linked,
+    }
+}
+
+async fn crypto(state: &AppState) -> Crypto {
+    if !state.crypto.enabled() {
+        return Crypto::NotEnabled;
+    }
+    match wallet_routes::valued(&state.db, DB_TIMEOUT, OffsetDateTime::now_utc()).await {
+        Some(Ok((wallets, valuation))) => Crypto::Wallets(CryptoWallets::new(&wallets, &valuation)),
+        _ => Crypto::Unreadable,
     }
 }
 
@@ -195,50 +254,66 @@ fn render(facts: &Facts, max: usize) -> String {
     if kept == 0 {
         return String::new();
     }
-    let Ibkr::Synced(portfolio) = &facts.ibkr else {
+    if kept < lines.len() {
         return out;
-    };
-    if kept == lines.len() {
+    }
+    let mut lists = Vec::new();
+    if let Ibkr::Synced(portfolio) = &facts.ibkr {
         let holdings: Vec<String> = portfolio
             .holdings
             .iter()
-            .map(|(symbol, value)| {
-                // Checked: broker values are unbounded and Decimal `/` and `*` panic on overflow.
-                let weight = (portfolio.total_eur > Decimal::ZERO)
-                    .then(|| value.checked_div(portfolio.total_eur))
-                    .flatten()
-                    .and_then(|share| share.checked_mul(Decimal::ONE_HUNDRED))
-                    .map_or_else(String::new, |pct| format!(" ({}%)", pct.round_dp(1)));
-                format!("{} EUR {}{weight}", symbol_text(symbol), value.round_dp(2))
-            })
+            .map(|(symbol, value)| weighted(symbol, *value, portfolio.total_eur))
             .collect();
         let skipped: Vec<String> = portfolio.skipped.iter().map(|s| symbol_text(s)).collect();
-        let lists = [
-            (
-                format!("Positions by value ({}): ", holdings.len()),
-                holdings,
-                portfolio.holdings.len(),
-                POSITIONS_BYTES,
+        lists.push((
+            format!("Positions by value ({}): ", holdings.len()),
+            holdings,
+            portfolio.holdings.len(),
+            POSITIONS_BYTES,
+        ));
+        lists.push((
+            format!(
+                "Non-EUR positions, not tracked ({}): ",
+                portfolio.skipped_count
             ),
-            (
-                format!(
-                    "Non-EUR positions, not tracked ({}): ",
-                    portfolio.skipped_count
-                ),
-                skipped,
-                portfolio.skipped_count,
-                MAX_LINE_BYTES,
-            ),
-        ];
-        for (head, items, total, cap) in lists {
-            let room = max.saturating_sub(out.len() + 1).min(cap);
-            if let Some(line) = list_line(head, &items, total, room) {
-                out.push('\n');
-                out.push_str(&line);
-            }
+            skipped,
+            portfolio.skipped_count,
+            MAX_LINE_BYTES,
+        ));
+    }
+    if let Crypto::Wallets(wallets) = &facts.crypto {
+        let assets: Vec<String> = wallets
+            .assets
+            .iter()
+            .map(|(symbol, value)| weighted(symbol, *value, wallets.total_eur))
+            .collect();
+        lists.push((
+            format!("Crypto by value ({}): ", assets.len()),
+            assets,
+            wallets.assets.len(),
+            MAX_LINE_BYTES,
+        ));
+    }
+    for (head, items, total, cap) in lists {
+        let room = max.saturating_sub(out.len() + 1).min(cap);
+        if let Some(line) = list_line(head, &items, total, room) {
+            out.push('\n');
+            out.push_str(&line);
         }
     }
     out
+}
+
+/// `SYMBOL EUR value (weight%)`; the weight is left out when it cannot be
+/// computed (checked: values are unbounded and Decimal `/` and `*` panic on
+/// overflow).
+fn weighted(symbol: &str, value: Decimal, total: Decimal) -> String {
+    let weight = (total > Decimal::ZERO)
+        .then(|| value.checked_div(total))
+        .flatten()
+        .and_then(|share| share.checked_mul(Decimal::ONE_HUNDRED))
+        .map_or_else(String::new, |pct| format!(" ({}%)", pct.round_dp(1)));
+    format!("{} EUR {}{weight}", symbol_text(symbol), value.round_dp(2))
 }
 
 /// `head` plus as many `items` as fit in `budget` bytes, then "and K more"
@@ -371,20 +446,15 @@ fn lines(facts: &Facts) -> Vec<String> {
         Ibkr::Linked => lines.push("IBKR: linked.".into()),
         Ibkr::NoSyncYet => lines.push("IBKR: linked; portfolio not synced yet.".into()),
         Ibkr::Synced(portfolio) => {
-            let as_of = portfolio
-                .as_of
-                .to_offset(UtcOffset::UTC)
-                .replace_nanosecond(0)
-                .ok()
-                .and_then(|at| at.format(&Rfc3339).ok())
-                .unwrap_or_else(|| "unknown".into());
             lines.push(format!(
-                "IBKR: linked; portfolio last synced {as_of}, {} EUR positions, total value EUR {}.",
+                "IBKR: linked; portfolio last synced {}, {} EUR positions, total value EUR {}.",
+                seconds(portfolio.as_of),
                 portfolio.holdings.len(),
                 portfolio.total_eur.round_dp(2)
             ));
         }
     }
+    lines.extend(crypto_lines(facts));
     lines.push(match &facts.agents {
         None => "Loaded agents: none (no agent bundle loaded).".into(),
         Some(names) if names.is_empty() => "Loaded agents: none.".into(),
@@ -399,6 +469,105 @@ fn lines(facts: &Facts) -> Vec<String> {
         ),
     });
     lines
+}
+
+/// RFC 3339 in UTC, to the second.
+fn seconds(at: OffsetDateTime) -> String {
+    at.to_offset(UtcOffset::UTC)
+        .replace_nanosecond(0)
+        .ok()
+        .and_then(|at| at.format(&Rfc3339).ok())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// The wallets as a whole and, once there are any, the portfolio total.
+fn crypto_lines(facts: &Facts) -> Vec<String> {
+    let (line, part) = match &facts.crypto {
+        Crypto::NotEnabled => return vec!["Crypto wallets: not enabled.".into()],
+        Crypto::Wallets(wallets) if wallets.count == 0 => {
+            return vec!["Crypto wallets: enabled, none added.".into()]
+        }
+        Crypto::Unreadable => ("Crypto wallets: enabled.".into(), Part::Unavailable),
+        Crypto::Wallets(wallets) => {
+            let chains: Vec<&str> = wallets
+                .chains
+                .iter()
+                .map(|chain| chain_name(*chain))
+                .collect();
+            let head = format!(
+                "Crypto wallets: {} {} on {}",
+                wallets.count,
+                if wallets.count == 1 {
+                    "wallet"
+                } else {
+                    "wallets"
+                },
+                chains.join(", ")
+            );
+            match wallets.as_of {
+                None => (format!("{head}, not refreshed yet."), Part::Unavailable),
+                Some(as_of) => (
+                    format!(
+                        "{head}, last refreshed {}, total value EUR {}.",
+                        seconds(as_of),
+                        wallets.total_eur.round_dp(2)
+                    ),
+                    Part::Valued {
+                        value: wallets.total_eur,
+                        as_of,
+                    },
+                ),
+            }
+        }
+    };
+    let ibkr = match &facts.ibkr {
+        Ibkr::NotLinked => Part::Off,
+        Ibkr::Linked | Ibkr::NoSyncYet => Part::Unavailable,
+        Ibkr::Synced(portfolio) => Part::Valued {
+            value: portfolio.total_eur,
+            as_of: portfolio.as_of,
+        },
+    };
+    let mut lines = vec![line];
+    // Out of range: no total rather than a wrong one.
+    if let Ok(total) = wallet_routes::total([(IBKR, ibkr), (CRYPTO, part)]) {
+        let head = "Portfolio total (IBKR + crypto wallets):";
+        let missing: Vec<&str> = total
+            .missing
+            .iter()
+            .map(|source| {
+                if *source == CRYPTO {
+                    "crypto wallets"
+                } else {
+                    source
+                }
+            })
+            .collect();
+        lines.push(if total.parts.is_empty() {
+            format!("{head} not available.")
+        } else if missing.is_empty() {
+            format!("{head} EUR {}.", total.value.round_dp(2))
+        } else {
+            format!(
+                "{head} EUR {}, partial: {} not available.",
+                total.value.round_dp(2),
+                missing.join(" and ")
+            )
+        });
+    }
+    lines
+}
+
+fn chain_name(chain: Chain) -> &'static str {
+    match chain {
+        Chain::Bitcoin => "Bitcoin",
+        Chain::Ethereum => "Ethereum",
+        Chain::Base => "Base",
+        Chain::Arbitrum => "Arbitrum",
+        Chain::Optimism => "Optimism",
+        Chain::Polygon => "Polygon",
+        Chain::Solana => "Solana",
+    }
 }
 
 /// An owner-configured or broker value (model id, agent name, symbol) as
@@ -494,6 +663,7 @@ mod tests {
             own_jobs: false,
             agents: Some(vec!["Research".into(), "Trading".into()]),
             ibkr,
+            crypto: Crypto::NotEnabled,
         }
     }
 
@@ -659,7 +829,10 @@ mod tests {
         })
         .map(|line| line.len() + 1)
         .sum();
-        assert!(job_lines <= MAX_BYTES - (2 * 1024 + 256), "{job_lines}");
+        assert!(
+            job_lines <= MAX_BYTES - (2 * 1024 + 256) - 768,
+            "{job_lines}"
+        );
         assert!(block.len() <= MAX_BYTES);
         assert!(block.ends_with("\nNon-EUR positions, not tracked (1): FIXUSD."));
         for line in block.lines() {
@@ -681,6 +854,190 @@ mod tests {
             MAX_BYTES,
         );
         assert!(!none.contains("[[job"));
+    }
+
+    const ADDRESS: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const LABEL: &str = "Grandma Zebra Vault";
+
+    /// Two wallets with a distinctive address and label, an error code and
+    /// uncounted tokens, none of which may reach the facts.
+    fn crypto(now: OffsetDateTime) -> Crypto {
+        use crate::crypto::store::{StoredBalance, StoredPrice};
+        use jarvis_market_data::wallet::WalletKind;
+        let wallet = |id: &str, kind, address: &str, chain, label: &str, hours| Wallet {
+            id: id.into(),
+            kind,
+            address: address.into(),
+            chains: vec![chain],
+            label: Some(label.into()),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            last_ok_at: Some(now - time::Duration::hours(hours)),
+            error: Some("rate_limited".into()),
+            other_tokens: Some(17),
+        };
+        let wallets = [
+            wallet(
+                "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+                WalletKind::Bitcoin,
+                ADDRESS,
+                Chain::Bitcoin,
+                LABEL,
+                1,
+            ),
+            wallet(
+                "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c",
+                WalletKind::Solana,
+                "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                Chain::Solana,
+                "Phantom",
+                2,
+            ),
+        ];
+        let balance = |wallet: &Wallet, asset: &str, amount: &str| StoredBalance {
+            wallet_id: wallet.id.clone(),
+            chain: wallet.chains[0],
+            asset: asset.into(),
+            amount: amount.parse().unwrap(),
+        };
+        let balances = [
+            balance(&wallets[0], "btc", "0.5"),
+            balance(&wallets[1], "sol", "10"),
+            balance(&wallets[1], "usdc", "1"),
+            balance(&wallets[1], "eurc", "5"),
+        ];
+        let prices = ["btc:50000", "sol:100", "usdc:0.9"].map(|price| {
+            let (asset, eur) = price.split_once(':').unwrap();
+            StoredPrice {
+                asset: asset.into(),
+                eur: eur.parse().unwrap(),
+                as_of: now,
+            }
+        });
+        let valuation = wallet_routes::valuation(&wallets, &balances, &prices, now).unwrap();
+        Crypto::Wallets(CryptoWallets::new(&wallets, &valuation))
+    }
+
+    #[test]
+    fn crypto_lines_describe_the_whole_never_a_wallet() {
+        let routing = routing(PaidApi::Allowed);
+        let now = facts(&routing, Ibkr::NotLinked).now;
+        let block = render(
+            &Facts {
+                crypto: crypto(now),
+                ..facts(&routing, synced())
+            },
+            MAX_BYTES,
+        );
+        for expected in [
+            "total value EUR 123456.79.\nCrypto wallets: 2 wallets on Bitcoin, Solana, last \
+             refreshed 2026-10-26T05:33:20Z, total value EUR 26000.9.\n\
+             Portfolio total (IBKR + crypto wallets): EUR 149457.69.\nLoaded agents",
+            "\nNon-EUR positions, not tracked (1): FIXUSD.\n\
+             Crypto by value (3): BTC EUR 25000.0 (96.2%), SOL EUR 1000 (3.8%), USDC EUR 0.9 (0.0%).",
+        ] {
+            assert!(block.contains(expected), "missing {expected:?} in {block}");
+        }
+        for forbidden in [
+            ADDRESS,
+            "bc1q",
+            LABEL,
+            "Zebra",
+            "Phantom",
+            "9xQe",
+            "0190a1b2",
+            "rate_limited",
+            "17 ",
+            "other",
+            "EURC",
+        ] {
+            assert!(!block.contains(forbidden), "{forbidden:?} in {block}");
+        }
+
+        // Without IBKR, the total is the wallets alone.
+        let alone = render(
+            &Facts {
+                crypto: crypto(now),
+                ..facts(&routing, Ibkr::NotLinked)
+            },
+            MAX_BYTES,
+        );
+        assert!(alone.contains("\nPortfolio total (IBKR + crypto wallets): EUR 26000.9.\n"));
+        assert!(alone.ends_with("\nCrypto by value (3): BTC EUR 25000.0 (96.2%), SOL EUR 1000 (3.8%), USDC EUR 0.9 (0.0%)."));
+
+        let line = |ibkr, crypto| {
+            let block = render(
+                &Facts {
+                    crypto,
+                    ..facts(&routing, ibkr)
+                },
+                MAX_BYTES,
+            );
+            let at = block.find("\nCrypto wallets:").unwrap() + 1;
+            let end = block.find("\nLoaded agents").unwrap();
+            block[at..end].to_owned()
+        };
+        assert_eq!(
+            line(synced(), Crypto::NotEnabled),
+            "Crypto wallets: not enabled."
+        );
+        let none = CryptoWallets {
+            count: 0,
+            chains: Vec::new(),
+            as_of: None,
+            total_eur: Decimal::ZERO,
+            assets: Vec::new(),
+        };
+        assert_eq!(
+            line(synced(), Crypto::Wallets(none)),
+            "Crypto wallets: enabled, none added."
+        );
+        assert_eq!(
+            line(synced(), Crypto::Unreadable),
+            "Crypto wallets: enabled.\n\
+             Portfolio total (IBKR + crypto wallets): EUR 123456.79, partial: crypto wallets not available."
+        );
+        let pending = CryptoWallets {
+            count: 1,
+            chains: vec![Chain::Ethereum, Chain::Base],
+            as_of: None,
+            total_eur: Decimal::ZERO,
+            assets: Vec::new(),
+        };
+        assert_eq!(
+            line(Ibkr::Linked, Crypto::Wallets(pending)),
+            "Crypto wallets: 1 wallet on Ethereum, Base, not refreshed yet.\n\
+             Portfolio total (IBKR + crypto wallets): not available."
+        );
+        assert_eq!(
+            line(Ibkr::NoSyncYet, crypto(now)).lines().nth(1),
+            Some("Portfolio total (IBKR + crypto wallets): EUR 26000.9, partial: IBKR not available.")
+        );
+    }
+
+    #[test]
+    fn crypto_lines_take_no_room_from_the_others() {
+        let routing = routing(PaidApi::Allowed);
+        let full = |crypto| Facts {
+            auto_search: true,
+            jobs: Some((10, 10)),
+            own_jobs: true,
+            crypto,
+            ..facts(&routing, Ibkr::Synced(portfolio(1000, 80)))
+        };
+        let now = full(Crypto::NotEnabled).now;
+        let without = render(&full(Crypto::NotEnabled), MAX_BYTES);
+        let with = render(&full(crypto(now)), MAX_BYTES);
+        assert!(with.len() <= MAX_BYTES, "{}", with.len());
+        let list = |block: &str, head: &str| {
+            block
+                .lines()
+                .find(|line| line.starts_with(head))
+                .map(str::to_owned)
+        };
+        for head in ["Positions by value", "Non-EUR positions"] {
+            assert_eq!(list(&with, head), list(&without, head), "{head}");
+        }
+        assert!(with.ends_with("USDC EUR 0.9 (0.0%)."), "{with}");
     }
 
     #[test]
@@ -763,7 +1120,7 @@ mod tests {
         assert!(block.len() <= MAX_BYTES);
         assert_eq!(block, render(&facts(&routing, ibkr()), MAX_BYTES));
         // Every other line is intact; the lists come last.
-        assert!(block.contains("1000 EUR positions, total value EUR 123456.79.\nLoaded agents (2): Research, Trading.\nPositions by value (1000): FIX0 EUR 40000.00 (32.4%), FIX1 EUR 39999.99 (32.4%)"));
+        assert!(block.contains("1000 EUR positions, total value EUR 123456.79.\nCrypto wallets: not enabled.\nLoaded agents (2): Research, Trading.\nPositions by value (1000): FIX0 EUR 40000.00 (32.4%), FIX1 EUR 39999.99 (32.4%)"));
         let mut lines = block.lines().rev();
         let skipped = lines.next().unwrap();
         let positions = lines.next().unwrap();

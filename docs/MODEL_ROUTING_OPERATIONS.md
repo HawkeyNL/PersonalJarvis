@@ -379,9 +379,10 @@ when it contains:
   aandelen, belegging, hypotheek, pensioen, saldo, spaar, schuld, lening,
   share, stock, invest, mortgage, pension, balance, debt or loan;
 - a symbol the owner holds per the last IBKR sync (the snapshot the runtime
-  facts read), as a whole word in any case. When IBKR is linked but that
-  snapshot cannot be read, or does not list every held symbol, the gate fails
-  closed.
+  facts read), or a crypto wallet's address, coin or token (see
+  `CRYPTO_WALLETS.md`), as a whole word in any case. When IBKR is linked but
+  that snapshot cannot be read, or does not list every held symbol, or the
+  crypto wallets cannot be read, the gate fails closed.
 
 Names, addresses and other free-text personal details are not detectable; a
 question that only carries those still searches automatically. Choose `on`

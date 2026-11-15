@@ -78,9 +78,13 @@ Public events:
 - `jobs.run_finished` with the `job_id`, `run_id` and the run's `status`,
   after a scheduled job's run ends or a slot is recorded as missed; see
   `SCHEDULED_JOBS.md`
+- `trading.crypto.updated` with `as_of` (RFC 3339), after each committed
+  crypto wallet refresh pass (also a partial one) and after a wallet is added
+  or removed; reload `GET /v1/trading/crypto`. See `CRYPTO_WALLETS.md`
 
 The trading, roadmap and job events are hints to reload over REST and carry
-only ids, versions, statuses and flags, never market data or model text.
+only ids, versions, statuses, flags and times, never market data, addresses
+or model text.
 They go to every connected owner. Apps before 0.1.27 close the socket on an
 event type they do not know; 0.1.27 and later ignore it.
 

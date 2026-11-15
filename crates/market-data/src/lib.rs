@@ -1,10 +1,12 @@
 //! Read-only market-data clients for the on-chain memecoin trader.
 //!
 //! Every client here only *reads* public data: DexScreener pairs, RugCheck
-//! token reports, Solana JSON-RPC account and transaction reads and Jupiter
-//! quotes. Nothing in this crate signs, builds or sends a transaction, and no
-//! swap or execution endpoint is called. [`snapshot`] maps the raw reads into
-//! [`jarvis_onchain::types::TokenSnapshot`] for the deterministic core.
+//! token reports, Solana JSON-RPC account and transaction reads, Jupiter
+//! quotes, and for the read-only crypto wallets ([`balances`]) public
+//! balances and EUR prices. Nothing in this crate signs, builds or sends a
+//! transaction, and no swap or execution endpoint is called. [`snapshot`]
+//! maps the raw reads into [`jarvis_onchain::types::TokenSnapshot`] for the
+//! deterministic core.
 //!
 //! All responses are untrusted input:
 //!
@@ -23,6 +25,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer};
 use zeroize::Zeroizing;
 
+pub mod balances;
 pub mod dexscreener;
 pub mod discovery;
 mod http;
@@ -45,6 +48,14 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     "api.mainnet-beta.solana.com",
     "mainnet.helius-rpc.com",
     "solana-mainnet.g.alchemy.com",
+    // Crypto wallets (`balances`): keyless public providers.
+    "mempool.space",
+    "api.coingecko.com",
+    "ethereum-rpc.publicnode.com",
+    "base-rpc.publicnode.com",
+    "arbitrum-one-rpc.publicnode.com",
+    "optimism-rpc.publicnode.com",
+    "polygon-bor-rpc.publicnode.com",
 ];
 
 /// Data provider, named in errors so a rate limit or failure can be traced.
@@ -55,6 +66,10 @@ pub enum Provider {
     Jupiter,
     /// One of the two configured Solana RPC providers (`0` primary, `1` secondary).
     SolanaRpc(u8),
+    Mempool,
+    CoinGecko,
+    /// The configured JSON-RPC provider of one EVM chain.
+    EvmRpc(wallet::Chain),
 }
 
 impl fmt::Display for Provider {
@@ -64,6 +79,9 @@ impl fmt::Display for Provider {
             Self::RugCheck => f.write_str("RugCheck"),
             Self::Jupiter => f.write_str("Jupiter"),
             Self::SolanaRpc(index) => write!(f, "Solana RPC #{index}"),
+            Self::Mempool => f.write_str("mempool.space"),
+            Self::CoinGecko => f.write_str("CoinGecko"),
+            Self::EvmRpc(chain) => write!(f, "EVM RPC ({chain:?})"),
         }
     }
 }

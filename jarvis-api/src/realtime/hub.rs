@@ -106,6 +106,7 @@ impl Inner {
             Event::MemeDecision { .. } => "trading.meme.decision",
             Event::RoadmapChanged { .. } => "roadmap.changed",
             Event::JobRunFinished { .. } => "jobs.run_finished",
+            Event::CryptoUpdated { .. } => "trading.crypto.updated",
         };
         let Some(envelope) = self.envelope(event) else {
             return;

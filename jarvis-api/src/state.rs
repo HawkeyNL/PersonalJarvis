@@ -245,4 +245,7 @@ pub struct AppState {
     /// Chat photo files and the single decode slot; unavailable (503) when
     /// the directory failed its startup checks.
     pub photos: Arc<crate::photos::PhotoStore>,
+    /// Read-only crypto wallets: on/off, the available chains and the
+    /// refresh cooldown. Off by default; the routes then answer 503.
+    pub crypto: Arc<crate::crypto::CryptoHandle>,
 }
