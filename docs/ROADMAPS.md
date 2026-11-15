@@ -141,7 +141,15 @@ proposal was made, the proposal becomes `stale`, nothing is applied and the
 answer is 409. Rejecting only records the decision.
 
 There is no route that creates a proposal: only Core code does, through
-`roadmaps::store::create_proposal`.
+`roadmaps::store::create_proposal`. Two scheduled jobs do (see
+`SCHEDULED_JOBS.md`): the dependency review proposes upgrades, and the
+morning check (`health_review`) proposes things to fix. The morning check's
+items end their notes with a marker line, `Jarvis check: <finding id>`; a
+later run uses it to leave an item it already proposed alone, reopen it when
+the problem comes back or propose it `live` when the problem is gone. It
+also reads the proposals the owner rejected in the last 7 days
+(`roadmaps::store::rejected_since`) and does not propose what they held
+again until then.
 
 ## GitHub
 

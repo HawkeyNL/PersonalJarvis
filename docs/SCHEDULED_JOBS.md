@@ -13,7 +13,7 @@ A job's kind is a closed list, each with typed parameters:
 | `prompt` | A scheduled research run: a web search for the instruction | `title`, `instruction`, `notify?` (default true) |
 | `reminder` | Posts the owner's fixed text and pushes the title | `title`, `text?` |
 | `disk_check` | Notes when a Home Node disk is fuller than the threshold | `threshold_percent?` (50 to 99, default 80) |
-| `health_review` | The morning check: Core's own signals against fixed rules (below) | `roadmap_id?` (not used yet) |
+| `health_review` | The morning check: Core's own signals against fixed rules (below) | `roadmap_id?` |
 
 There is at most one `dependency_review`, at most one `health_review` and
 at most 10 jobs of the other kinds made by the owner. Jarvis may keep up to 3 `prompt` jobs of its own
@@ -407,8 +407,8 @@ the roadmap, in a pending proposal or earlier in this one is left out (so a
 second alert for the same pull request adds nothing), and so is one whose
 title would be over 200 characters; at most 20 items, and no more than the
 roadmap has room for. When nothing is left, no proposal is made. A pending
-proposal that went stale still counts until the owner accepts it (409,
-marked stale), rejects it or it expires; the next run proposes again. A
+proposal made on an older revision of the roadmap can no longer be accepted,
+so the next run marks its own such proposals `stale` and proposes again. A
 proposal that fails makes the run `partial` with one of these codes (unless
 it already had one):
 
@@ -479,10 +479,67 @@ leaves it) and the month's model spend against the budget.
 
 A run keeps at most 50 findings, urgent and most severe first. Its `facts`
 are `{window_hours, sources: {name: "ok" | "unavailable"}, findings: [{id,
-severity, urgent, count?, last_at?}]}` and its summary is Core's template
-(`summary_source: "deterministic"`), such as `2 things to fix (1 urgent):
-Disk data is 98% full; 4 failed logins.`, with the sources it could not
+severity, urgent, count?, last_at?}], proposed, reopened, resolved}` (the
+last three count the roadmap proposal's operations, below) and its summary
+is Core's template (`summary_source: "deterministic"`), such as `2 things to
+fix (1 urgent): Disk data is 98% full; 4 failed logins. Proposed to the
+roadmap: 2 new, 0 reopened, 1 resolved.`, with the sources it could not
 read. A run is `ok` when every source was read, `partial` with
 `source_unavailable` when some were and `failed` with
 `signals_unavailable` when none were; it fails with `not_configured`
-without Core's application state. It posts and pushes nothing.
+without Core's application state. It posts nothing to a conversation.
+
+### Proposals to a roadmap
+
+With `params.roadmap_id`, a run that read at least one source proposes its
+findings to that roadmap as one roadmap proposal (see `ROADMAPS.md`; the
+owner accepts or rejects it, nothing changes on its own), rationale `From
+the morning check.`. Core makes it from fixed text only: the item's title is
+the finding's title, its notes are the finding's fixed fix steps (commands
+for the owner to run; Jarvis never runs them or reads logs), the day it was
+found and its count, and end with the marker line
+
+```text
+Jarvis check: <finding id>
+```
+
+which is how later runs find the item again (exactly the notes' last line;
+an item whose marker the owner edits away no longer counts). In the
+findings' order, at most 20 operations:
+
+- a finding no item carries becomes a new `planned` item (no more than the
+  roadmap has room for);
+- a finding whose item is `ready` or `live` reopens it (`status: planned`),
+  but a counted finding (one with a last time, such as failed logins) only
+  when it happened again after the item last changed: failures from before
+  the owner closed it do not reopen it;
+- a finding whose item is open (`planned`, `in_progress` or `blocked`) adds
+  nothing;
+- then an open item whose finding is gone is set `live`, but only for a
+  finding that resolves by itself (`disk_full`, `service_failed`,
+  `updater_failed`, `backup_failed`, `backup_not_enabled`,
+  `agent_registry_degraded`, `github_auth_failed`, `github_poll_error`,
+  `job_paused`, `ibkr`, `research_without_worker`, `claude_worker_off`,
+  `memecoin_not_running`, `memecoin_tick_failing`, `budget_over`) and only
+  when this run read what shows it (the disk, the unit, the jobs, the IBKR
+  status, a GitHub poller past its start): a source that could not be read
+  never resolves an item. The owner sets the other items live when they are
+  fixed; a run reopens one when its finding comes back.
+
+A finding in a pending proposal's new item, or in one the owner rejected in
+the last 7 days, is left out, and so is an item that a pending or such a
+rejected proposal changes (the run marks its own pending proposals made on
+an older revision `stale`, as they can no longer be accepted, and they hold
+nothing): a rejection snoozes what it held for 7 days.
+When nothing is left, no proposal is made. A proposal that fails makes the
+run `partial` with a `roadmap_*` code as for the dependency review (unless
+it already had `source_unavailable`).
+
+The run's facts always list the findings it proposed, the others up to the
+cap of 50.
+
+When the proposal newly holds an urgent finding (a new item or a reopen),
+the run pushes `Morning check: N urgent things to fix` to the job's owner
+(see `NOTIFICATIONS.md`): a count only, never a finding. Without a roadmap,
+or when the urgent findings are already on it, nothing is pushed; nor when
+the run only proposes again what a proposal it marked stale held.

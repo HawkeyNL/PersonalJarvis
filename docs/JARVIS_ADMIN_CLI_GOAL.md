@@ -189,7 +189,7 @@ Provide safe convenience log access, e.g.:
 sudo jarvis logs core
 sudo jarvis logs surrealdb
 sudo jarvis logs updater
-sudo jarvis logs agents
+sudo jarvis logs agents-updater
 ```
 
 Default to a bounded recent number of lines and support useful options such as `--follow`/`--lines` if implemented safely.

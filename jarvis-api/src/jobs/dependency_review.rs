@@ -48,7 +48,7 @@ pub(super) async fn run(work: &Work, db: &Database, job: &Job) -> Finish {
     finish
 }
 
-async fn bounded<T>(
+pub(super) async fn bounded<T>(
     future: impl std::future::Future<Output = Result<T, RoadmapError>>,
 ) -> Result<T, RoadmapError> {
     tokio::time::timeout(DB_TIMEOUT, future)
@@ -71,30 +71,54 @@ async fn propose(
     let pending = bounded(crate::roadmaps::store::list_proposals(db, roadmap_id))
         .await
         .map_err(proposal_error)?;
-    submit(db, &snapshot, &pending, facts).await
+    retire(db, &snapshot, &pending, RATIONALE).await?;
+    let ops = proposal_ops(&snapshot, &pending, facts);
+    submit(db, &snapshot, &ops, RATIONALE).await
 }
 
-fn proposal_error(error: RoadmapError) -> &'static str {
+/// Mark the job's own pending proposals (by their rationale) that were made
+/// on another revision stale: they can no longer be accepted, and would
+/// hold the roadmap's room for pending proposals for their 14 days.
+pub(super) async fn retire(
+    db: &Database,
+    snapshot: &Snapshot,
+    pending: &[Proposal],
+    rationale: &str,
+) -> Result<(), &'static str> {
+    for proposal in pending.iter().filter(|proposal| {
+        proposal.base_revision != snapshot.roadmap.revision
+            && proposal.rationale.as_deref() == Some(rationale)
+    }) {
+        bounded(crate::roadmaps::store::mark_stale(db, &proposal.id))
+            .await
+            .map_err(proposal_error)?;
+    }
+    Ok(())
+}
+
+const RATIONALE: &str = "Upgrades with a fixed version, from the scheduled dependency review.";
+
+pub(super) fn proposal_error(error: RoadmapError) -> &'static str {
     match error {
         RoadmapError::Stale | RoadmapError::Conflict => "roadmap_changed",
         RoadmapError::Limit(_) => "roadmap_limit",
         RoadmapError::NotFound | RoadmapError::Archived => "roadmap_unavailable",
         error => {
-            tracing::warn!(%error, "dependency review: roadmap proposal failed");
+            tracing::warn!(%error, "scheduled job: roadmap proposal failed");
             "roadmap_proposal_failed"
         }
     }
 }
 
-/// Record the proposal on `snapshot`'s revision; a roadmap that changed
-/// since is refused (the next run proposes again).
-async fn submit(
+/// Record `ops` as one proposal on `snapshot`'s revision; `Ok(None)` when
+/// there are none. A roadmap that changed since is refused (the next run
+/// proposes again).
+pub(super) async fn submit(
     db: &Database,
     snapshot: &Snapshot,
-    pending: &[Proposal],
-    facts: &DependencyFacts,
+    ops: &[ProposalOp],
+    rationale: &str,
 ) -> Result<Option<String>, &'static str> {
-    let ops = proposal_ops(snapshot, pending, facts);
     if ops.is_empty() {
         return Ok(None);
     }
@@ -102,8 +126,8 @@ async fn submit(
         db,
         &snapshot.roadmap.id,
         snapshot.roadmap.revision,
-        &ops,
-        Some("Upgrades with a fixed version, from the scheduled dependency review."),
+        ops,
+        Some(rationale),
     );
     bounded(created).await.map(Some).map_err(proposal_error)
 }
@@ -116,7 +140,8 @@ fn link_key(link: &Link) -> Option<(String, u64)> {
 /// {version} ({repo})", linked to its Dependabot pull request when there is
 /// one. An upgrade whose title or pull request is already on the roadmap or
 /// in a pending proposal (or earlier in this one) is left out; at most 20,
-/// and no more than the roadmap has room for.
+/// and no more than the roadmap has room for. A pending proposal made on
+/// another revision can no longer be accepted and holds nothing.
 fn proposal_ops(
     snapshot: &Snapshot,
     pending: &[Proposal],
@@ -124,6 +149,7 @@ fn proposal_ops(
 ) -> Vec<ProposalOp> {
     let proposed = pending
         .iter()
+        .filter(|proposal| proposal.base_revision == snapshot.roadmap.revision)
         .flat_map(|proposal| &proposal.ops)
         .filter_map(|op| match op {
             ProposalOp::CreateItem { item } => Some((&item.title, &item.links)),
@@ -776,7 +802,13 @@ mod tests {
             created_at: time::OffsetDateTime::now_utc(),
             expires_at: time::OffsetDateTime::now_utc(),
         };
-        assert!(proposal_ops(&on_roadmap, &[pending], &facts).is_empty());
+        assert!(proposal_ops(&on_roadmap, std::slice::from_ref(&pending), &facts).is_empty());
+        // One made on another revision no longer holds its upgrade.
+        let stale = Proposal {
+            base_revision: 2,
+            ..pending
+        };
+        assert_eq!(proposal_ops(&on_roadmap, &[stale], &facts).len(), 1);
         // Twenty at most, and the same upgrade twice only once.
         let mut many = facts.clone();
         many.alerts = (1..=30)
@@ -851,7 +883,7 @@ mod tests {
         )
         .await?;
         assert_eq!(
-            submit(&db, &stale, &[], &facts()).await,
+            submit(&db, &stale, &proposal_ops(&stale, &[], &facts()), RATIONALE).await,
             Err("roadmap_changed")
         );
         assert!(store::list_proposals(&db, &id).await?.is_empty());
@@ -863,6 +895,24 @@ mod tests {
         assert_eq!(pending[0].id, proposal);
         assert_eq!(pending[0].ops.len(), 3);
         assert_eq!(propose(&db, &id, &facts()).await, Ok(None));
+        // The roadmap changed: that proposal can no longer be accepted, so
+        // the next run marks it stale and proposes again.
+        store::update(
+            &db,
+            &id,
+            2,
+            &RoadmapPatch {
+                title: Some("Plan C".into()),
+                ..RoadmapPatch::default()
+            },
+            &device,
+            &hub,
+        )
+        .await?;
+        let proposal = propose(&db, &id, &facts()).await?.ok_or("proposal")?;
+        let pending = store::list_proposals(&db, &id).await?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, proposal);
         // Accepted, the items dedupe the next run as well.
         store::accept_proposal(&db, &id, &proposal, &device, &Default::default(), &hub).await?;
         assert_eq!(propose(&db, &id, &facts()).await, Ok(None));

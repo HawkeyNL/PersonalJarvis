@@ -16,15 +16,17 @@ until `JARVIS_NOTIFY_NTFY_URL` is set.
 | A scheduled reminder is due | Jarvis reminder | The reminder's title, cleaned like a device name and capped at 60 characters | default | `jarvis://jobs` |
 | A scheduled disk check finds disks at or above its threshold | Jarvis | `Disk data at 91%` (every full disk, comma-separated) | default | `jarvis://jobs` |
 | Jarvis made a research job for itself from a chat answer | Jarvis added a research job | `Rust releases — weekly on Monday at 08:00`: the job's title, cleaned like a reminder's, and its schedule | default | `jarvis://jobs` |
+| The morning check newly proposes urgent findings to its roadmap | Jarvis | `Morning check: 2 urgent things to fix` (a count only) | default | `jarvis://jobs` |
 
 Scheduled job pushes (docs/SCHEDULED_JOBS.md) go to ntfy and to every app
 push target of the job's owner. A research result carries no content; a
 reminder carries the title the owner gave it (the owner's choice), with
 hidden characters dropped, separators and quotes replaced, `/` and `:`
 dropped and at most 60 characters; a disk push names the disk by label
-(`system` or `data`), never a path. Their APNs pushes expire after an hour.
-Research results and disk pushes are sent at most once per 60 s like any
-other kind. Reminders skip that window and each job's reminder has its own
+(`system` or `data`), never a path; a morning check push carries only how
+many urgent findings it newly proposed, never what they are. Their APNs
+pushes expire after an hour. Research results, disk and morning check
+pushes are sent at most once per 60 s like any other kind. Reminders skip that window and each job's reminder has its own
 collapse id, so two reminders in the same minute both arrive and neither
 replaces the other. The same holds for the push about a job Jarvis made for
 itself, so the owner hears of every one; its title is model text, cleaned
