@@ -2,10 +2,12 @@
 //! values, add, remove and refresh. Owner session like every `/v1` route;
 //! write bodies are capped by the router at [`BODY_LIMIT`]. Every error text
 //! is fixed and never carries the request: a refused body may hold a private
-//! key or recovery phrase. All routes answer 503 while the feature is off.
-//! Until a wallet's first good refresh it is `pending` and counts for
+//! key or recovery phrase. The wallet routes answer 503 while the feature is
+//! off. Until a wallet's first good refresh it is `pending` and counts for
 //! nothing. A balance counts only with a price younger than an hour; stale
 //! balances still count. Optional fields are absent, never null.
+//! `GET /v1/trading/total` adds the wallets to the IBKR net liquidation and
+//! also answers while either is off.
 
 use std::time::Duration;
 
@@ -29,6 +31,7 @@ use jarvis_market_data::balances::PRICE_MAX_AGE;
 use jarvis_market_data::wallet::{
     evm_checksum, is_key_material, AddressError, Asset, Chain, WalletKind, ASSETS,
 };
+use jarvis_store::Database;
 
 use crate::crypto::store::{self, CryptoStoreError, NewWallet, StoredBalance, StoredPrice, Wallet};
 use crate::{AppState, Authed};
@@ -41,7 +44,7 @@ const STALE_AFTER: time::Duration = time::Duration::hours(1);
 /// EUR values have at most 20 integer digits, like the stored amounts.
 const MAX_EUR: Decimal = Decimal::from_parts(0x6310_0000, 0x6BC7_5E2D, 0x5, false, 0);
 /// Display order of chains.
-const CHAINS: [Chain; 7] = [
+pub(crate) const CHAINS: [Chain; 7] = [
     Chain::Bitcoin,
     Chain::Ethereum,
     Chain::Base,
@@ -134,7 +137,7 @@ pub(crate) struct OutOfRange;
 
 fn add(a: Decimal, b: Decimal) -> Result<Decimal, OutOfRange> {
     a.checked_add(b)
-        .filter(|sum| *sum < MAX_EUR)
+        .filter(|sum| sum.abs() < MAX_EUR)
         .ok_or(OutOfRange)
 }
 
@@ -248,23 +251,27 @@ fn wallet_body(wallet: &Wallet, lines: &[Line], now: OffsetDateTime) -> Result<V
     Ok(Value::Object(body))
 }
 
-/// `GET /v1/trading/crypto`. `as_of` is the oldest good refresh, or now
-/// while no wallet has one.
-pub(crate) fn overview_body(
+/// Every stored balance valued in EUR.
+pub(crate) struct Valuation {
+    /// The lines of each wallet, in the order of the wallets.
+    lines: Vec<Vec<Line>>,
+    pub total: Decimal,
+    /// Per asset over every wallet: amount and value; largest value first,
+    /// unpriced last, then allowlist order.
+    pub assets: Vec<(&'static Asset, Decimal, Option<Decimal>)>,
+    /// The oldest good refresh; `None` while every wallet is pending.
+    pub as_of: Option<OffsetDateTime>,
+}
+
+/// Value the balances of `wallets` with the prices younger than an hour.
+pub(crate) fn valuation(
     wallets: &[Wallet],
     balances: &[StoredBalance],
     prices: &[StoredPrice],
-    chains_available: &[Chain],
     now: OffsetDateTime,
-) -> Result<Value, OutOfRange> {
-    let as_of = wallets
-        .iter()
-        .filter_map(|wallet| wallet.last_ok_at)
-        .min()
-        .unwrap_or(now);
+) -> Result<Valuation, OutOfRange> {
     let mut total = Decimal::ZERO;
-    let mut bodies = Vec::new();
-    // Per asset: amount and value over every wallet.
+    let mut per_wallet = Vec::new();
     let mut assets: Vec<(&'static Asset, Decimal, Option<Decimal>)> = Vec::new();
     for wallet in wallets {
         let lines = lines(&wallet.id, balances, prices, now)?;
@@ -284,18 +291,42 @@ pub(crate) fn overview_body(
                 None => assets.push((line.asset, line.amount, line.value)),
             }
         }
-        bodies.push(wallet_body(wallet, &lines, now)?);
+        per_wallet.push(lines);
     }
-    // Largest value first, unpriced last, then allowlist order.
     assets.sort_by_key(|(asset, _, value)| {
         (
             std::cmp::Reverse(*value),
             ASSETS.iter().position(|a| a.key == asset.key),
         )
     });
-    let assets: Vec<Value> = assets
-        .into_iter()
-        .map(|(asset, amount, value)| {
+    Ok(Valuation {
+        lines: per_wallet,
+        total,
+        assets,
+        as_of: wallets.iter().filter_map(|wallet| wallet.last_ok_at).min(),
+    })
+}
+
+/// `GET /v1/trading/crypto`. `as_of` is the oldest good refresh, or now
+/// while no wallet has one.
+pub(crate) fn overview_body(
+    wallets: &[Wallet],
+    balances: &[StoredBalance],
+    prices: &[StoredPrice],
+    chains_available: &[Chain],
+    now: OffsetDateTime,
+) -> Result<Value, OutOfRange> {
+    let valuation = valuation(wallets, balances, prices, now)?;
+    let total = valuation.total;
+    let bodies = wallets
+        .iter()
+        .zip(&valuation.lines)
+        .map(|(wallet, lines)| wallet_body(wallet, lines, now))
+        .collect::<Result<Vec<_>, _>>()?;
+    let assets: Vec<Value> = valuation
+        .assets
+        .iter()
+        .map(|&(asset, amount, value)| {
             let mut row = Map::new();
             row.insert("asset".into(), asset.key.into());
             row.insert("symbol".into(), asset.symbol.into());
@@ -316,13 +347,130 @@ pub(crate) fn overview_body(
         .collect();
     Ok(json!({
         "source": "crypto",
-        "as_of": ts(as_of),
+        "as_of": ts(valuation.as_of.unwrap_or(now)),
         "base_currency": "EUR",
         "total_eur": eur(total),
         "chains_available": chains_available,
         "wallets": bodies,
         "assets": assets,
     }))
+}
+
+/// The stored wallets and their valuation at `now`. `None` when a read
+/// fails or takes longer than `timeout`.
+pub(crate) async fn valued(
+    db: &Database,
+    timeout: Duration,
+    now: OffsetDateTime,
+) -> Option<Result<(Vec<Wallet>, Valuation), OutOfRange>> {
+    let read = async {
+        Ok::<_, CryptoStoreError>((
+            store::list(db).await?,
+            store::balances(db).await?,
+            store::prices(db).await?,
+        ))
+    };
+    match tokio::time::timeout(timeout, read).await {
+        Ok(Ok((wallets, balances, prices))) => {
+            Some(valuation(&wallets, &balances, &prices, now).map(|valuation| (wallets, valuation)))
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "crypto wallet read failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("crypto wallet read timed out");
+            None
+        }
+    }
+}
+
+/// One part of the portfolio total.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Part {
+    /// Not set up, or nothing held: the total is whole without it.
+    Off,
+    /// Set up, but without a value now: the total is partial.
+    Unavailable,
+    Valued {
+        value: Decimal,
+        as_of: OffsetDateTime,
+    },
+}
+
+impl Part {
+    /// The crypto part of enabled wallets: off without wallets, unavailable
+    /// while every wallet is pending. A pending wallet next to refreshed ones
+    /// counts for nothing, as in `GET /v1/trading/crypto`.
+    pub(crate) fn crypto(wallets: &[Wallet], valuation: &Valuation) -> Self {
+        match valuation.as_of {
+            _ if wallets.is_empty() => Self::Off,
+            None => Self::Unavailable,
+            Some(as_of) => Self::Valued {
+                value: valuation.total,
+                as_of,
+            },
+        }
+    }
+}
+
+/// IBKR plus crypto wallets.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Total {
+    pub value: Decimal,
+    /// The valued parts: source, value and as_of.
+    pub parts: Vec<(&'static str, Decimal, OffsetDateTime)>,
+    /// The sources without a value now.
+    pub missing: Vec<&'static str>,
+}
+
+pub(crate) const IBKR: &str = "IBKR";
+pub(crate) const CRYPTO: &str = "crypto";
+
+/// Sum the parts, each named by its source, with checked arithmetic.
+pub(crate) fn total(parts: [(&'static str, Part); 2]) -> Result<Total, OutOfRange> {
+    let mut total = Total {
+        value: Decimal::ZERO,
+        parts: Vec::new(),
+        missing: Vec::new(),
+    };
+    for (source, part) in parts {
+        match part {
+            Part::Off => {}
+            Part::Unavailable => total.missing.push(source),
+            Part::Valued { value, as_of } => {
+                total.value = add(total.value, value)?;
+                total.parts.push((source, value, as_of));
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// `GET /v1/trading/total`. `as_of` is the oldest part's, or now without
+/// one; `partial` when a part that is set up has no value now.
+pub(crate) fn total_body(total: &Total, now: OffsetDateTime) -> Value {
+    let as_of = total
+        .parts
+        .iter()
+        .map(|&(_, _, as_of)| as_of)
+        .min()
+        .unwrap_or(now);
+    let parts: Vec<Value> = total
+        .parts
+        .iter()
+        .map(|&(source, value, as_of)| {
+            json!({ "source": source, "value": eur(value), "as_of": ts(as_of) })
+        })
+        .collect();
+    json!({
+        "source": "Jarvis",
+        "as_of": ts(as_of),
+        "base_currency": "EUR",
+        "total": eur(total.value),
+        "parts": parts,
+        "partial": !total.missing.is_empty(),
+    })
 }
 
 fn out_of_range(_: OutOfRange) -> Failure {
@@ -391,6 +539,50 @@ pub(crate) async fn overview(_authed: Authed, State(state): State<AppState>) -> 
     )
     .map(Json)
     .map_err(out_of_range)
+}
+
+/// `GET /v1/trading/total`: the IBKR net liquidation plus the crypto
+/// wallets, in EUR. Answers while either is off; a part that cannot be read
+/// is left out and marks the total partial.
+pub(crate) async fn portfolio_total(_authed: Authed, State(state): State<AppState>) -> ApiResult {
+    let now = OffsetDateTime::now_utc();
+    let ibkr = async {
+        if state.ibkr.is_none() {
+            return Part::Off;
+        }
+        match tokio::time::timeout(DB_TIMEOUT, crate::ibkr::store::load_portfolio(&state.db)).await
+        {
+            Ok(Ok(Some(portfolio))) => Part::Valued {
+                value: portfolio.net_liquidation,
+                as_of: portfolio.as_of,
+            },
+            Ok(Ok(None)) => Part::Unavailable,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "IBKR portfolio read failed");
+                Part::Unavailable
+            }
+            Err(_) => {
+                tracing::warn!("IBKR portfolio read timed out");
+                Part::Unavailable
+            }
+        }
+    };
+    let crypto = async {
+        if !state.crypto.enabled() {
+            return Ok(Part::Off);
+        }
+        match valued(&state.db, DB_TIMEOUT, now).await {
+            Some(valued) => valued.map(|(wallets, valuation)| Part::crypto(&wallets, &valuation)),
+            None => Ok(Part::Unavailable),
+        }
+    };
+    let (ibkr, crypto) = tokio::join!(ibkr, crypto);
+    let crypto = crypto.map_err(out_of_range)?;
+    let total = total([(IBKR, ibkr), (CRYPTO, crypto)]).map_err(|_| {
+        tracing::warn!("portfolio total out of range");
+        error(StatusCode::INTERNAL_SERVER_ERROR, "value out of range")
+    })?;
+    Ok(Json(total_body(&total, now)))
 }
 
 /// `POST /v1/trading/crypto/refresh`: 202, or 429 within the cooldown.
@@ -619,6 +811,124 @@ mod tests {
         );
         let text = body.to_string();
         assert!(!text.contains("scam") && !text.contains("other-wallet"));
+    }
+
+    #[test]
+    fn totals_add_the_valued_parts_and_flag_missing_ones() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        let synced = now - time::Duration::hours(5);
+        let ibkr = Part::Valued {
+            value: "1000.506".parse().unwrap(),
+            as_of: synced,
+        };
+        // Stale balances count with their time; unpriced and pending ones
+        // count for nothing.
+        let mut btc = wallet(
+            WalletKind::Bitcoin,
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+        );
+        btc.chains = vec![Chain::Bitcoin];
+        btc.last_ok_at = Some(now - time::Duration::hours(3));
+        let mut evm = wallet(
+            WalletKind::Evm,
+            "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+        );
+        evm.id = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c".into();
+        evm.last_ok_at = Some(now - time::Duration::minutes(10));
+        let mut pending = wallet(
+            WalletKind::Solana,
+            "So11111111111111111111111111111111111111112",
+        );
+        pending.id = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d".into();
+        let balances = [
+            balance(&btc.id, Chain::Bitcoin, "btc", "0.5"),
+            balance(&evm.id, Chain::Base, "dai", "7"),
+            balance(&pending.id, Chain::Solana, "sol", "3"),
+        ];
+        let prices = [
+            price("btc", "50000", now - time::Duration::minutes(5)),
+            price("sol", "100", now - time::Duration::minutes(5)),
+            price("dai", "0.9", now - time::Duration::hours(2)),
+        ];
+        let wallets = [btc, evm, pending.clone()];
+        let valued = valuation(&wallets, &balances[..2], &prices, now).unwrap();
+        let crypto = Part::crypto(&wallets, &valued);
+        assert_eq!(
+            crypto,
+            Part::Valued {
+                value: "25000".parse().unwrap(),
+                as_of: now - time::Duration::hours(3),
+            }
+        );
+
+        let both = total([(IBKR, ibkr), (CRYPTO, crypto)]).unwrap();
+        assert_eq!(
+            total_body(&both, now),
+            json!({
+                "source": "Jarvis",
+                "as_of": "1970-01-01T19:00:00Z",
+                "base_currency": "EUR",
+                "total": "26000.51",
+                "parts": [
+                    {"source": "IBKR", "value": "1000.51", "as_of": "1970-01-01T19:00:00Z"},
+                    {"source": "crypto", "value": "25000", "as_of": "1970-01-01T21:00:00Z"},
+                ],
+                "partial": false,
+            })
+        );
+        let ibkr_only = total_body(&total([(IBKR, ibkr), (CRYPTO, Part::Off)]).unwrap(), now);
+        assert_eq!(
+            (&ibkr_only["total"], &ibkr_only["partial"]),
+            (&json!("1000.51"), &json!(false))
+        );
+        let crypto_only = total_body(&total([(IBKR, Part::Off), (CRYPTO, crypto)]).unwrap(), now);
+        assert_eq!(
+            (&crypto_only["total"], &crypto_only["parts"][0]["source"]),
+            (&json!("25000"), &json!("crypto"))
+        );
+        // A part that is set up but unreadable is left out: partial.
+        let partial = total([(IBKR, Part::Unavailable), (CRYPTO, crypto)]).unwrap();
+        assert_eq!(partial.missing, [IBKR]);
+        let body = total_body(&partial, now);
+        assert_eq!(
+            (&body["total"], &body["partial"], &body["as_of"]),
+            (
+                &json!("25000"),
+                &json!(true),
+                &json!("1970-01-01T21:00:00Z")
+            )
+        );
+        let nothing = total_body(
+            &total([(IBKR, Part::Off), (CRYPTO, Part::Off)]).unwrap(),
+            now,
+        );
+        assert_eq!(
+            nothing,
+            json!({"source": "Jarvis", "as_of": "1970-01-02T00:00:00Z", "base_currency": "EUR", "total": "0", "parts": [], "partial": false})
+        );
+
+        // Only pending wallets: set up, no value yet. No wallets: off.
+        let waiting = std::slice::from_ref(&pending);
+        let none_yet = valuation(waiting, &balances, &prices, now).unwrap();
+        assert_eq!(Part::crypto(waiting, &none_yet), Part::Unavailable);
+        let empty = valuation(&[], &[], &prices, now).unwrap();
+        assert_eq!(Part::crypto(&[], &empty), Part::Off);
+
+        // More than 20 integer digits, either sign, fails the sum.
+        let huge = |value: &str| Part::Valued {
+            value: value.parse().unwrap(),
+            as_of: now,
+        };
+        for (a, b) in [
+            ("60000000000000000000", "60000000000000000000"),
+            ("-60000000000000000000", "-60000000000000000000"),
+            ("100000000000000000000", "0"),
+        ] {
+            assert!(
+                total([(IBKR, huge(a)), (CRYPTO, huge(b))]).is_err(),
+                "{a} {b}"
+            );
+        }
     }
 
     #[test]

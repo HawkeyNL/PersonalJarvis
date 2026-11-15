@@ -2792,7 +2792,8 @@ async fn job_runs_write_to_their_own_conversation() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-const CRYPTO_ROUTES: [(&str, &str); 4] = [
+const CRYPTO_ROUTES: [(&str, &str); 5] = [
+    ("GET", "/v1/trading/total"),
     ("GET", "/v1/trading/crypto"),
     ("POST", "/v1/trading/crypto/wallets"),
     ("POST", "/v1/trading/crypto/refresh"),
@@ -3152,5 +3153,160 @@ async fn crypto_refresh_values_cooldown_and_off_switch() -> Result<(), Box<dyn s
             "crypto wallets are not enabled"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires JARVIS_SURREAL_TEST_* and a disposable SurrealDB server"]
+async fn portfolio_total_and_privacy_gate_cover_crypto_wallets(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use jarvis_api::crypto::store;
+    use jarvis_market_data::balances::{Balance, Price};
+
+    let endpoint = env::var("JARVIS_SURREAL_TEST_ENDPOINT")?;
+    let user = env::var("JARVIS_SURREAL_TEST_USER")?;
+    let pass = env::var("JARVIS_SURREAL_TEST_PASS")?;
+    let db = Surreal::new::<Ws>(&endpoint).await?;
+    db.signin(Root {
+        username: &user,
+        password: &pass,
+    })
+    .await?;
+    db.use_ns(format!("jarvis_api_{}", uuid::Uuid::now_v7().simple()))
+        .use_db("core")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let on = state(db.clone(), None).await;
+    let mut off = on.clone();
+    off.crypto = Default::default();
+    let app = build_router(on);
+    let (token, _) = enroll_login(&app, &SigningKey::from_bytes(&rand::random())).await;
+    let call = |app: &axum::Router, method: &str, path: &str, body: Option<String>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if body.is_some() {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        app.clone().oneshot(
+            request
+                .body(body.map_or_else(Body::empty, Body::from))
+                .unwrap(),
+        )
+    };
+    let prompt = |instruction: &str| {
+        json!({"kind": "prompt", "params": {"title": "Coins", "instruction": instruction}})
+            .to_string()
+    };
+
+    // Neither IBKR nor wallets: a whole, empty total.
+    let empty = json_body(call(&app, "GET", "/v1/trading/total", None).await?).await;
+    assert_eq!(
+        (
+            &empty["source"],
+            &empty["total"],
+            &empty["parts"],
+            &empty["partial"]
+        ),
+        (&json!("Jarvis"), &json!("0"), &json!([]), &json!(false))
+    );
+
+    // A pending wallet has no value yet: partial. Its chain's coin is held
+    // already.
+    let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    let created = call(
+        &app,
+        "POST",
+        "/v1/trading/crypto/wallets",
+        Some(json!({"kind": "bitcoin", "address": address}).to_string()),
+    )
+    .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let id = json_body(created).await["id"]
+        .as_str()
+        .ok_or("id")?
+        .to_owned();
+    let pending = json_body(call(&app, "GET", "/v1/trading/total", None).await?).await;
+    assert_eq!(
+        (&pending["total"], &pending["partial"]),
+        (&json!("0"), &json!(true))
+    );
+    let refused = call(
+        &app,
+        "POST",
+        "/v1/jobs",
+        Some(prompt("Will Bitcoin rise this year?")),
+    )
+    .await?;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+    // Refreshed: the wallet's value is the crypto part.
+    store::write_prices(
+        &db,
+        &[Price {
+            asset: "btc",
+            eur: "50000".parse()?,
+            as_of: time::OffsetDateTime::now_utc(),
+        }],
+    )
+    .await?;
+    let half = Balance {
+        chain: Chain::Bitcoin,
+        asset: "btc",
+        amount: "0.5".parse()?,
+    };
+    store::write_refresh(
+        &db,
+        &id,
+        &store::Refresh {
+            chains: &[Chain::Bitcoin],
+            balances: std::slice::from_ref(&half),
+            other_tokens: None,
+            error: None,
+        },
+    )
+    .await?;
+    let total = json_body(call(&app, "GET", "/v1/trading/total", None).await?).await;
+    assert_eq!(
+        (
+            &total["total"],
+            &total["partial"],
+            &total["parts"][0]["source"],
+            &total["parts"][0]["value"]
+        ),
+        (
+            &json!("25000"),
+            &json!(false),
+            &json!("crypto"),
+            &json!("25000")
+        )
+    );
+
+    // Off: no crypto part, but the stored wallet's coin still counts as
+    // held (its address is key-like anyway), while other coins pass.
+    let off = build_router(off);
+    let total = json_body(call(&off, "GET", "/v1/trading/total", None).await?).await;
+    assert_eq!(
+        (&total["total"], &total["partial"]),
+        (&json!("0"), &json!(false))
+    );
+    for held in [
+        "Will bitcoin rise this year?",
+        &format!("Who sent to {address}"),
+    ] {
+        let status = call(&off, "POST", "/v1/jobs", Some(prompt(held)))
+            .await?
+            .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{held}");
+    }
+    let fine = call(
+        &off,
+        "POST",
+        "/v1/jobs",
+        Some(prompt("Will Cardano rise this year?")),
+    )
+    .await?;
+    assert_eq!(fine.status(), StatusCode::OK);
     Ok(())
 }

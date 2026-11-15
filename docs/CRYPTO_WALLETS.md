@@ -156,10 +156,39 @@ in the Home Node's egress rules:
   deposit addresses, and do not also enter these coins as manual holdings.
   WBTC and BTC, and IBKR crypto positions, are counted separately.
 
+## Portfolio total, runtime facts and privacy
+
+- **`GET /v1/trading/total`** adds the IBKR net liquidation and the crypto
+  wallets' value, in EUR, and answers while either is off:
+  `{source: "Jarvis", as_of, base_currency: "EUR", total, parts[], partial}`
+  with `parts[]` `{source: "IBKR" | "crypto", value, as_of}` and `as_of` the
+  oldest part's (now without parts). A part that is off (IBKR not linked,
+  crypto wallets off or none added) is left out and the total is whole. A
+  part that is set up but has no value now (IBKR not synced yet or
+  unreadable; wallets unreadable or all `pending`) is left out and
+  `partial` is `true`. A `pending` wallet next to refreshed ones counts for
+  nothing and does not make the total partial. The crypto value is the `total_eur` of
+  `GET /v1/trading/crypto`; a sum beyond 20 integer digits answers `500`.
+- **Runtime facts** (the chat model's live facts) say how many wallets there
+  are, on which chains, the oldest refresh and the total value; the
+  portfolio total (IBKR + crypto wallets), with what is missing when
+  partial; and "Crypto by value", the allowlist symbols with their EUR value
+  and weight. Never an address, label, per-wallet value, error code or the
+  count of uncounted tokens.
+- **Privacy gate** (automatic web search, scheduled `prompt` jobs, Jarvis's
+  own jobs; see `MODEL_ROUTING_OPERATIONS.md`): a question is kept on the
+  owner's click when it names something held. For crypto wallets that is
+  every stored address (an EVM address also in EIP-55 form), the native coin
+  of every chain of every wallet, pending ones too, and every allowlisted
+  asset with a balance above zero, each by symbol and aliases (`ETH`,
+  `ether`, `ethereum`). So naming a held coin turns an automatic search into
+  an offer. Stored wallets count even while the feature is off, and the gate
+  fails closed when the wallets cannot be read.
+
 ## API
 
-Owner session on all; `503` while off. Optional fields are absent, never
-null.
+Owner session on all; `503` while off (except `GET /v1/trading/total`,
+above). Optional fields are absent, never null.
 
 - `GET /v1/trading/crypto`: `source`, `as_of` (oldest good refresh),
   `base_currency` `EUR`, `total_eur`, `chains_available`, `wallets[]`
