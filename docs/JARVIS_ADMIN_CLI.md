@@ -675,7 +675,7 @@ signature. The existing CLI `sudo` authentication policy is unchanged.
 sudo jarvis services status
 sudo jarvis logs core --lines 100
 sudo jarvis logs updater
-sudo jarvis logs agents --follow
+sudo jarvis logs agents-updater --follow
 ```
 
 Log targets are allowlisted; the command is not a generic `journalctl` or

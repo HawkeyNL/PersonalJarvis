@@ -22,7 +22,7 @@ use jarvis_llm::claude_worker_protocol;
 use jarvis_store::Database;
 use jarvis_usage::UsageFailures;
 
-use super::dependency_review::{proposal_error, submit};
+use super::dependency_review::{proposal_error, retire, submit};
 use super::store::{self, Finish, RunOutcome};
 use super::{Cadence, Job, Kind, RunStatus, SummarySource, Trigger, DB_TIMEOUT, MAX_SUMMARY};
 use crate::ibkr::status::Problem;
@@ -124,7 +124,7 @@ const RULES: [(&str, bool, &[&str]); 30] = [
     // A oneshot run by its timer: nothing to restart.
     ("service_failed:jarvis-private-agent-updater.service", true, &[
         "The private agent updater failed on its last run. To see why:",
-        "sudo jarvis logs agents",
+        "sudo jarvis logs agents-updater",
         "sudo jarvis agents check",
         "Fix the cause, then clear the failed state: sudo systemctl reset-failed jarvis-private-agent-updater.service",
         LOGS,
@@ -1062,12 +1062,31 @@ fn proposal_ops(
     found: &[Finding],
     today: Date,
 ) -> (Vec<ProposalOp>, Proposed) {
+    let marked: Vec<(&str, &Item)> = snapshot
+        .items
+        .iter()
+        .filter_map(|item| Some((marker(item.notes.as_deref()?)?, item)))
+        .collect();
+    // A pending proposal made on another revision can no longer be accepted
+    // (the run marks it stale): it holds nothing, but the findings its new
+    // and changed items carry are not new, so they do not push again.
+    let (current, superseded): (Vec<&Proposal>, Vec<&Proposal>) = pending
+        .iter()
+        .partition(|proposal| proposal.base_revision == snapshot.roadmap.revision);
+    let mut earlier = HashSet::new();
+    for op in superseded.into_iter().flat_map(|proposal| &proposal.ops) {
+        earlier.extend(match op {
+            ProposalOp::CreateItem { item } => item.notes.as_deref().and_then(marker),
+            ProposalOp::UpdateItem { item_id, .. } => marked
+                .iter()
+                .find(|(_, item)| item.id == *item_id)
+                .map(|(id, _)| *id),
+        });
+    }
     let mut busy_ids = HashSet::new();
     let mut busy_items = HashSet::new();
-    // A pending proposal made on another revision can no longer be accepted.
-    for op in pending
-        .iter()
-        .filter(|proposal| proposal.base_revision == snapshot.roadmap.revision)
+    for op in current
+        .into_iter()
         .chain(rejected)
         .flat_map(|proposal| &proposal.ops)
     {
@@ -1081,11 +1100,6 @@ fn proposal_ops(
         }
     }
     let open = |item: &Item| !matches!(item.status, Status::Ready | Status::Live);
-    let marked: Vec<(&str, &Item)> = snapshot
-        .items
-        .iter()
-        .filter_map(|item| Some((marker(item.notes.as_deref()?)?, item)))
-        .collect();
     let mut room = MAX_ITEMS.saturating_sub(snapshot.items.len());
     let mut ops = Vec::new();
     let mut done = Proposed::default();
@@ -1118,7 +1132,7 @@ fn proposal_ops(
             ops.push(ProposalOp::CreateItem { item });
             done.created += 1;
         }
-        done.urgent += usize::from(finding.urgent);
+        done.urgent += usize::from(finding.urgent && !earlier.contains(id));
         done.findings.push(finding.id.clone());
     }
     let present: HashSet<&str> = found.iter().map(|finding| finding.id.as_str()).collect();
@@ -1161,6 +1175,7 @@ async fn propose(
     let rejected = bounded(roadmaps::rejected_since(db, roadmap_id, now - SNOOZE))
         .await
         .map_err(proposal_error)?;
+    retire(db, &snapshot, &pending, RATIONALE).await?;
     let (ops, proposed) = proposal_ops(&snapshot, &pending, &rejected, s, found, now.date());
     submit(db, &snapshot, &ops, RATIONALE).await?;
     Ok(proposed)
@@ -2510,7 +2525,7 @@ mod tests {
     fn a_pending_proposal_on_another_revision_holds_nothing() {
         let mut stale = proposal(vec![create("disk_full:data"), update("github_auth_failed")]);
         stale.base_revision = 1;
-        let (ops_, _) = ops(
+        let (ops_, done) = ops(
             vec![marked("github_auth_failed", Status::Live)],
             &[stale.clone()],
             &[],
@@ -2524,6 +2539,21 @@ mod tests {
                 "create push_failing"
             ]
         );
+        // What it held is proposed again, but its urgent disk is not new.
+        assert_eq!((done.created, done.urgent), (2, 0));
+        let (_, done) = ops(Vec::new(), &[], &[], &three());
+        assert_eq!(done.urgent, 1);
+        // Nor is the urgent disk an earlier proposal reopened.
+        let mut reopen = proposal(vec![update("disk_full:data")]);
+        reopen.base_revision = 1;
+        let (ops_, done) = ops(
+            vec![marked("disk_full:data", Status::Live)],
+            &[reopen],
+            &[],
+            &three(),
+        );
+        assert_eq!(ops_[0], "item-disk_full:data Planned");
+        assert_eq!((done.reopened, done.urgent), (1, 0));
         // A rejection snoozes whatever revision it was made on.
         let (ops_, _) = ops(
             vec![marked("github_auth_failed", Status::Live)],
@@ -2549,7 +2579,7 @@ mod tests {
         assert!(
             agents.contains("sudo systemctl reset-failed jarvis-private-agent-updater.service\n")
         );
-        assert!(agents.contains("\nsudo jarvis logs agents\nsudo jarvis agents check\n"));
+        assert!(agents.contains("\nsudo jarvis logs agents-updater\nsudo jarvis agents check\n"));
         // IBKR: no dangling lead-in without commands; prose or commands after
         // a neutral one.
         let none = item("ibkr:sync_stale", &[]);
@@ -2658,6 +2688,33 @@ mod tests {
         assert_eq!(pending[0].rationale.as_deref(), Some(RATIONALE));
         assert_eq!(describe(&pending[0].ops), ["create disk_full:data"]);
         assert_eq!(check(&full, now).await, Ok(Proposed::default()));
+
+        // The roadmap changed: that proposal can no longer be accepted. The
+        // next run marks it stale and proposes the disk again, without a
+        // second push.
+        let revision = roadmaps::get(&db, &id)
+            .await?
+            .ok_or("roadmap")?
+            .roadmap
+            .revision;
+        let rename = crate::roadmaps::RoadmapPatch {
+            title: Some("Fixes".into()),
+            ..crate::roadmaps::RoadmapPatch::default()
+        };
+        roadmaps::update(&db, &id, revision, &rename, &device, &hub).await?;
+        assert_eq!(
+            check(&full, now).await,
+            Ok(Proposed {
+                created: 1,
+                findings: vec!["disk_full:data".into()],
+                ..Proposed::default()
+            })
+        );
+        let renewed = roadmaps::list_proposals(&db, &id).await?;
+        assert_eq!(renewed.len(), 1);
+        assert_ne!(renewed[0].id, pending[0].id);
+        assert_eq!(renewed[0].base_revision, revision + 1);
+        let pending = renewed;
 
         // Accepted, the item holds it; once the disk is clear, run 3
         // proposes it live.

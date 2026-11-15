@@ -563,7 +563,9 @@ pub async fn create_proposal(
     Ok(proposal_id)
 }
 
-async fn mark_stale(db: &Database, proposal_id: &str) -> Result<()> {
+/// Mark a pending proposal stale: it was made on a revision the roadmap no
+/// longer has, so it can never be accepted.
+pub async fn mark_stale(db: &Database, proposal_id: &str) -> Result<()> {
     run(
         db,
         "UPDATE roadmap_proposals SET status = 'stale', decided_at = time::now() \

@@ -71,8 +71,29 @@ async fn propose(
     let pending = bounded(crate::roadmaps::store::list_proposals(db, roadmap_id))
         .await
         .map_err(proposal_error)?;
+    retire(db, &snapshot, &pending, RATIONALE).await?;
     let ops = proposal_ops(&snapshot, &pending, facts);
     submit(db, &snapshot, &ops, RATIONALE).await
+}
+
+/// Mark the job's own pending proposals (by their rationale) that were made
+/// on another revision stale: they can no longer be accepted, and would
+/// hold the roadmap's room for pending proposals for their 14 days.
+pub(super) async fn retire(
+    db: &Database,
+    snapshot: &Snapshot,
+    pending: &[Proposal],
+    rationale: &str,
+) -> Result<(), &'static str> {
+    for proposal in pending.iter().filter(|proposal| {
+        proposal.base_revision != snapshot.roadmap.revision
+            && proposal.rationale.as_deref() == Some(rationale)
+    }) {
+        bounded(crate::roadmaps::store::mark_stale(db, &proposal.id))
+            .await
+            .map_err(proposal_error)?;
+    }
+    Ok(())
 }
 
 const RATIONALE: &str = "Upgrades with a fixed version, from the scheduled dependency review.";
@@ -874,6 +895,24 @@ mod tests {
         assert_eq!(pending[0].id, proposal);
         assert_eq!(pending[0].ops.len(), 3);
         assert_eq!(propose(&db, &id, &facts()).await, Ok(None));
+        // The roadmap changed: that proposal can no longer be accepted, so
+        // the next run marks it stale and proposes again.
+        store::update(
+            &db,
+            &id,
+            2,
+            &RoadmapPatch {
+                title: Some("Plan C".into()),
+                ..RoadmapPatch::default()
+            },
+            &device,
+            &hub,
+        )
+        .await?;
+        let proposal = propose(&db, &id, &facts()).await?.ok_or("proposal")?;
+        let pending = store::list_proposals(&db, &id).await?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, proposal);
         // Accepted, the items dedupe the next run as well.
         store::accept_proposal(&db, &id, &proposal, &device, &Default::default(), &hub).await?;
         assert_eq!(propose(&db, &id, &facts()).await, Ok(None));
