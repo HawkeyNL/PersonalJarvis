@@ -3283,8 +3283,8 @@ async fn portfolio_total_and_privacy_gate_cover_crypto_wallets(
         )
     );
 
-    // Off: no crypto part, but the stored wallet still counts as held, its
-    // address too, while other coins pass.
+    // Off: no crypto part, but the stored wallet's coin still counts as
+    // held (its address is key-like anyway), while other coins pass.
     let off = build_router(off);
     let total = json_body(call(&off, "GET", "/v1/trading/total", None).await?).await;
     assert_eq!(

@@ -166,7 +166,8 @@ in the Home Node's egress rules:
   crypto wallets off or none added) is left out and the total is whole. A
   part that is set up but has no value now (IBKR not synced yet or
   unreadable; wallets unreadable or all `pending`) is left out and
-  `partial` is `true`. The crypto value is the `total_eur` of
+  `partial` is `true`. A `pending` wallet next to refreshed ones counts for
+  nothing and does not make the total partial. The crypto value is the `total_eur` of
   `GET /v1/trading/crypto`; a sum beyond 20 integer digits answers `500`.
 - **Runtime facts** (the chat model's live facts) say how many wallets there
   are, on which chains, the oldest refresh and the total value; the

@@ -400,7 +400,8 @@ pub(crate) enum Part {
 
 impl Part {
     /// The crypto part of enabled wallets: off without wallets, unavailable
-    /// while every wallet is pending.
+    /// while every wallet is pending. A pending wallet next to refreshed ones
+    /// counts for nothing, as in `GET /v1/trading/crypto`.
     pub(crate) fn crypto(wallets: &[Wallet], valuation: &Valuation) -> Self {
         match valuation.as_of {
             _ if wallets.is_empty() => Self::Off,
@@ -545,9 +546,10 @@ pub(crate) async fn overview(_authed: Authed, State(state): State<AppState>) -> 
 /// is left out and marks the total partial.
 pub(crate) async fn portfolio_total(_authed: Authed, State(state): State<AppState>) -> ApiResult {
     let now = OffsetDateTime::now_utc();
-    let ibkr = if state.ibkr.is_none() {
-        Part::Off
-    } else {
+    let ibkr = async {
+        if state.ibkr.is_none() {
+            return Part::Off;
+        }
         match tokio::time::timeout(DB_TIMEOUT, crate::ibkr::store::load_portfolio(&state.db)).await
         {
             Ok(Ok(Some(portfolio))) => Part::Valued {
@@ -565,17 +567,17 @@ pub(crate) async fn portfolio_total(_authed: Authed, State(state): State<AppStat
             }
         }
     };
-    let crypto = if state.crypto.enabled() {
-        match valued(&state.db, DB_TIMEOUT, now).await {
-            Some(valued) => {
-                let (wallets, valuation) = valued.map_err(out_of_range)?;
-                Part::crypto(&wallets, &valuation)
-            }
-            None => Part::Unavailable,
+    let crypto = async {
+        if !state.crypto.enabled() {
+            return Ok(Part::Off);
         }
-    } else {
-        Part::Off
+        match valued(&state.db, DB_TIMEOUT, now).await {
+            Some(valued) => valued.map(|(wallets, valuation)| Part::crypto(&wallets, &valuation)),
+            None => Ok(Part::Unavailable),
+        }
     };
+    let (ibkr, crypto) = tokio::join!(ibkr, crypto);
+    let crypto = crypto.map_err(out_of_range)?;
     let total = total([(IBKR, ibkr), (CRYPTO, crypto)]).map_err(|_| {
         tracing::warn!("portfolio total out of range");
         error(StatusCode::INTERNAL_SERVER_ERROR, "value out of range")

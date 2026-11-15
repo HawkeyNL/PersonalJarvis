@@ -189,7 +189,7 @@ fn merge(
 }
 
 /// What the crypto wallets give away: every stored address (an EVM one also
-/// in its EIP-55 form); the native coin of every chain of every wallet,
+/// in its EIP-55 form; key-like already, so a second line of defence); the native coin of every chain of every wallet,
 /// pending ones too; and every allowlisted asset with a balance above zero.
 /// Coins with their symbol and aliases (`ETH`, `ether`, `ethereum`).
 fn wallet_words(wallets: &[Wallet], balances: &[StoredBalance]) -> Vec<String> {
@@ -354,6 +354,9 @@ mod tests {
             assert!(is_private(private, &held), "{private}");
         }
         assert!(!is_private("Will cardano rise?", &held));
+        // Addresses are key-like on their own already; the words are a
+        // second line of defence.
+        assert!(is_private(&format!("Who sent to {solana}?"), &[]));
         // A failed or late read on either side fails closed.
         assert_eq!(merge(None, Some((wallets.to_vec(), Vec::new()))), None);
         assert_eq!(merge(ibkr, None), None);
