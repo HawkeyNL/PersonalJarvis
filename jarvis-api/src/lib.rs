@@ -204,6 +204,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/trading/crypto/wallets/{id}",
             delete(routes::crypto::delete).layer(DefaultBodyLimit::max(routes::crypto::BODY_LIMIT)),
         )
+        .route(
+            "/v1/trading/crypto/refresh",
+            post(routes::crypto::refresh).layer(DefaultBodyLimit::max(routes::crypto::BODY_LIMIT)),
+        )
         .route("/v1/trading/meme/overview", get(routes::meme::overview))
         .route("/v1/trading/meme/candidates", get(routes::meme::candidates))
         .route("/v1/trading/meme/trades", get(routes::meme::trades))

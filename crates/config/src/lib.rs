@@ -415,6 +415,23 @@ pub struct AppConfig {
     /// The broker's Unix socket (absolute path).
     #[serde(default = "default_ibkr_broker_socket")]
     pub ibkr_broker_socket: String,
+    /// Read-only crypto wallets (docs/CRYPTO_WALLETS.md): public balances
+    /// and EUR prices, never a key or transaction. Default **false**.
+    #[serde(default)]
+    pub crypto_wallets_enabled: bool,
+    /// JSON-RPC endpoint per EVM chain. Defaults to the keyless PublicNode
+    /// endpoint; empty turns the chain off. A provider URL may embed a key,
+    /// so these are redacted in `Debug`.
+    #[serde(default = "default_crypto_evm_rpc_ethereum_url")]
+    pub crypto_evm_rpc_ethereum_url: String,
+    #[serde(default = "default_crypto_evm_rpc_base_url")]
+    pub crypto_evm_rpc_base_url: String,
+    #[serde(default = "default_crypto_evm_rpc_arbitrum_url")]
+    pub crypto_evm_rpc_arbitrum_url: String,
+    #[serde(default = "default_crypto_evm_rpc_optimism_url")]
+    pub crypto_evm_rpc_optimism_url: String,
+    #[serde(default = "default_crypto_evm_rpc_polygon_url")]
+    pub crypto_evm_rpc_polygon_url: String,
 }
 
 /// The directory that holds Core's API socket, created by the Core unit.
@@ -611,6 +628,26 @@ fn default_huggingface_catalog_path() -> String {
 
 fn default_ibkr_broker_socket() -> String {
     "/run/jarvis-ibkr-broker/broker.sock".to_string()
+}
+
+fn default_crypto_evm_rpc_ethereum_url() -> String {
+    "https://ethereum-rpc.publicnode.com".to_string()
+}
+
+fn default_crypto_evm_rpc_base_url() -> String {
+    "https://base-rpc.publicnode.com".to_string()
+}
+
+fn default_crypto_evm_rpc_arbitrum_url() -> String {
+    "https://arbitrum-one-rpc.publicnode.com".to_string()
+}
+
+fn default_crypto_evm_rpc_optimism_url() -> String {
+    "https://optimism-rpc.publicnode.com".to_string()
+}
+
+fn default_crypto_evm_rpc_polygon_url() -> String {
+    "https://polygon-bor-rpc.publicnode.com".to_string()
 }
 
 fn default_memecoin_paper_profile_path() -> String {
@@ -932,6 +969,27 @@ impl fmt::Debug for AppConfig {
                 &self.ibkr_portfolio_sync_enabled,
             )
             .field("ibkr_broker_socket", &self.ibkr_broker_socket)
+            .field("crypto_wallets_enabled", &self.crypto_wallets_enabled)
+            .field(
+                "crypto_evm_rpc_ethereum_url",
+                &redact(&self.crypto_evm_rpc_ethereum_url),
+            )
+            .field(
+                "crypto_evm_rpc_base_url",
+                &redact(&self.crypto_evm_rpc_base_url),
+            )
+            .field(
+                "crypto_evm_rpc_arbitrum_url",
+                &redact(&self.crypto_evm_rpc_arbitrum_url),
+            )
+            .field(
+                "crypto_evm_rpc_optimism_url",
+                &redact(&self.crypto_evm_rpc_optimism_url),
+            )
+            .field(
+                "crypto_evm_rpc_polygon_url",
+                &redact(&self.crypto_evm_rpc_polygon_url),
+            )
             .finish()
     }
 }
@@ -1061,6 +1119,17 @@ mod tests {
             market_jupiter_api_key: "jupiter-supersecret".to_string(),
             ibkr_portfolio_sync_enabled: false,
             ibkr_broker_socket: default_ibkr_broker_socket(),
+            crypto_wallets_enabled: false,
+            crypto_evm_rpc_ethereum_url: "https://ethereum-rpc.publicnode.com/?key=rpc-supersecret"
+                .to_string(),
+            crypto_evm_rpc_base_url: "https://base-rpc.publicnode.com/?key=rpc-supersecret"
+                .to_string(),
+            crypto_evm_rpc_arbitrum_url:
+                "https://arbitrum-one-rpc.publicnode.com/?key=rpc-supersecret".to_string(),
+            crypto_evm_rpc_optimism_url: "https://optimism-rpc.publicnode.com/?key=rpc-supersecret"
+                .to_string(),
+            crypto_evm_rpc_polygon_url:
+                "https://polygon-bor-rpc.publicnode.com/?key=rpc-supersecret".to_string(),
         };
 
         let rendered = format!("{cfg:?}");
@@ -1103,6 +1172,11 @@ mod tests {
             assert_eq!(cfg.environment, "development"); // default
             assert!(!cfg.memecoin_paper_enabled); // off unless deliberately enabled
             assert!(!cfg.ibkr_portfolio_sync_enabled);
+            assert!(!cfg.crypto_wallets_enabled);
+            assert_eq!(
+                cfg.crypto_evm_rpc_polygon_url,
+                "https://polygon-bor-rpc.publicnode.com"
+            );
             assert_eq!(
                 cfg.ibkr_broker_socket,
                 "/run/jarvis-ibkr-broker/broker.sock"
@@ -1213,6 +1287,17 @@ mod tests {
             market_jupiter_api_key: "jupiter-supersecret".to_string(),
             ibkr_portfolio_sync_enabled: false,
             ibkr_broker_socket: default_ibkr_broker_socket(),
+            crypto_wallets_enabled: false,
+            crypto_evm_rpc_ethereum_url: "https://ethereum-rpc.publicnode.com/?key=rpc-supersecret"
+                .to_string(),
+            crypto_evm_rpc_base_url: "https://base-rpc.publicnode.com/?key=rpc-supersecret"
+                .to_string(),
+            crypto_evm_rpc_arbitrum_url:
+                "https://arbitrum-one-rpc.publicnode.com/?key=rpc-supersecret".to_string(),
+            crypto_evm_rpc_optimism_url: "https://optimism-rpc.publicnode.com/?key=rpc-supersecret"
+                .to_string(),
+            crypto_evm_rpc_polygon_url:
+                "https://polygon-bor-rpc.publicnode.com/?key=rpc-supersecret".to_string(),
         };
         assert!(cfg.bootstrap_enrollment().is_err());
         cfg.bootstrap_allowed_cidrs = "192.168.10.0/24".to_string();

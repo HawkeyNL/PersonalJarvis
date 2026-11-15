@@ -1,10 +1,11 @@
-//! Read-only crypto wallets of the owner (schema 0023): the list, add and
-//! remove. Owner session like every `/v1` route; write bodies are capped by
-//! the router at [`BODY_LIMIT`]. Every error text is fixed and never carries
-//! the request: a refused body may hold a private key or recovery phrase.
-//! Balances come with the refresh (a later change); until a wallet's first
-//! good refresh it is `pending` and counts for nothing. Optional fields are
-//! absent, never null.
+//! Read-only crypto wallets of the owner (schema 0023): the list with EUR
+//! values, add, remove and refresh. Owner session like every `/v1` route;
+//! write bodies are capped by the router at [`BODY_LIMIT`]. Every error text
+//! is fixed and never carries the request: a refused body may hold a private
+//! key or recovery phrase. All routes answer 503 while the feature is off.
+//! Until a wallet's first good refresh it is `pending` and counts for
+//! nothing. A balance counts only with a price younger than an hour; stale
+//! balances still count. Optional fields are absent, never null.
 
 use std::time::Duration;
 
@@ -16,15 +17,20 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use jarvis_client_core::realtime::Event;
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use jarvis_market_data::wallet::{evm_checksum, is_key_material, AddressError, Chain, WalletKind};
+use jarvis_market_data::balances::PRICE_MAX_AGE;
+use jarvis_market_data::wallet::{
+    evm_checksum, is_key_material, AddressError, Asset, Chain, WalletKind, ASSETS,
+};
 
-use crate::crypto::store::{self, CryptoStoreError, NewWallet, Wallet};
+use crate::crypto::store::{self, CryptoStoreError, NewWallet, StoredBalance, StoredPrice, Wallet};
 use crate::{AppState, Authed};
 
 /// Request bodies of the wallet routes.
@@ -32,6 +38,9 @@ pub(crate) const BODY_LIMIT: usize = 4 * 1024;
 const DB_TIMEOUT: Duration = Duration::from_secs(10);
 /// A wallet whose last good refresh is older than this is `stale`.
 const STALE_AFTER: time::Duration = time::Duration::hours(1);
+/// EUR values have at most 20 integer digits, like the stored amounts.
+const MAX_EUR: Decimal = Decimal::from_parts(0x6310_0000, 0x6BC7_5E2D, 0x5, false, 0);
+/// Display order of chains.
 const CHAINS: [Chain; 7] = [
     Chain::Bitcoin,
     Chain::Ethereum,
@@ -63,6 +72,18 @@ fn failure(refused: CryptoStoreError) -> Failure {
             tracing::warn!(error = %refused, "crypto wallet operation failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
+    }
+}
+
+/// Every route answers this while the feature is off.
+fn require_enabled(state: &AppState) -> Result<(), Failure> {
+    if state.crypto.enabled() {
+        Ok(())
+    } else {
+        Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "crypto wallets are not enabled",
+        ))
     }
 }
 
@@ -107,8 +128,87 @@ fn status(wallet: &Wallet, now: OffsetDateTime) -> &'static str {
     }
 }
 
+/// A sum or product beyond [`MAX_EUR`].
+#[derive(Debug)]
+pub(crate) struct OutOfRange;
+
+fn add(a: Decimal, b: Decimal) -> Result<Decimal, OutOfRange> {
+    a.checked_add(b)
+        .filter(|sum| *sum < MAX_EUR)
+        .ok_or(OutOfRange)
+}
+
+fn eur(value: Decimal) -> String {
+    value.round_dp(2).normalize().to_string()
+}
+
+/// One stored balance with its EUR price and value, when priced.
+struct Line {
+    chain: Chain,
+    asset: &'static Asset,
+    amount: Decimal,
+    price: Option<Decimal>,
+    value: Option<Decimal>,
+}
+
+/// The price of `asset` if it is younger than [`PRICE_MAX_AGE`].
+fn price_of(prices: &[StoredPrice], asset: &str, now: OffsetDateTime) -> Option<Decimal> {
+    prices
+        .iter()
+        .find(|price| price.asset == asset && now - price.as_of <= PRICE_MAX_AGE)
+        .map(|price| price.eur)
+}
+
+/// The balances of `wallet_id` on the allowlist, in display order.
+fn lines(
+    wallet_id: &str,
+    balances: &[StoredBalance],
+    prices: &[StoredPrice],
+    now: OffsetDateTime,
+) -> Result<Vec<Line>, OutOfRange> {
+    let mut lines = Vec::new();
+    for balance in balances.iter().filter(|b| b.wallet_id == wallet_id) {
+        let Some(asset) = ASSETS.iter().find(|a| a.key == balance.asset) else {
+            continue;
+        };
+        let price = price_of(prices, asset.key, now);
+        let value = price
+            .map(|price| {
+                balance
+                    .amount
+                    .checked_mul(price)
+                    .filter(|value| *value < MAX_EUR)
+                    .ok_or(OutOfRange)
+            })
+            .transpose()?;
+        lines.push(Line {
+            chain: balance.chain,
+            asset,
+            amount: balance.amount,
+            price,
+            value,
+        });
+    }
+    lines.sort_by_key(|line| {
+        (
+            CHAINS.iter().position(|chain| *chain == line.chain),
+            ASSETS.iter().position(|a| a.key == line.asset.key),
+        )
+    });
+    Ok(lines)
+}
+
+fn priced(body: &mut Map<String, Value>, price: Option<Decimal>, value: Option<Decimal>) {
+    if let Some(price) = price {
+        body.insert("price_eur".into(), price.normalize().to_string().into());
+    }
+    if let Some(value) = value {
+        body.insert("value_eur".into(), eur(value).into());
+    }
+}
+
 /// A wallet of the app contract; EVM addresses in their EIP-55 form.
-pub(crate) fn wallet_body(wallet: &Wallet, now: OffsetDateTime) -> Value {
+fn wallet_body(wallet: &Wallet, lines: &[Line], now: OffsetDateTime) -> Result<Value, OutOfRange> {
     let address = match wallet.kind {
         WalletKind::Evm => evm_checksum(&wallet.address),
         WalletKind::Bitcoin | WalletKind::Solana => wallet.address.clone(),
@@ -131,28 +231,113 @@ pub(crate) fn wallet_body(wallet: &Wallet, now: OffsetDateTime) -> Value {
     if let Some(count) = wallet.other_tokens {
         body.insert("other_tokens".into(), count.into());
     }
-    body.insert("value_eur".into(), "0".into());
-    body.insert("balances".into(), json!([]));
-    Value::Object(body)
+    let mut value = Decimal::ZERO;
+    let mut balances = Vec::new();
+    for line in lines {
+        value = add(value, line.value.unwrap_or_default())?;
+        let mut row = Map::new();
+        row.insert("chain".into(), json!(line.chain));
+        row.insert("asset".into(), line.asset.key.into());
+        row.insert("symbol".into(), line.asset.symbol.into());
+        row.insert("amount".into(), line.amount.normalize().to_string().into());
+        priced(&mut row, line.price, line.value);
+        balances.push(Value::Object(row));
+    }
+    body.insert("value_eur".into(), eur(value).into());
+    body.insert("balances".into(), balances.into());
+    Ok(Value::Object(body))
 }
 
 /// `GET /v1/trading/crypto`. `as_of` is the oldest good refresh, or now
 /// while no wallet has one.
-pub(crate) fn overview_body(wallets: &[Wallet], now: OffsetDateTime) -> Value {
+pub(crate) fn overview_body(
+    wallets: &[Wallet],
+    balances: &[StoredBalance],
+    prices: &[StoredPrice],
+    chains_available: &[Chain],
+    now: OffsetDateTime,
+) -> Result<Value, OutOfRange> {
     let as_of = wallets
         .iter()
         .filter_map(|wallet| wallet.last_ok_at)
         .min()
         .unwrap_or(now);
-    json!({
+    let mut total = Decimal::ZERO;
+    let mut bodies = Vec::new();
+    // Per asset: amount and value over every wallet.
+    let mut assets: Vec<(&'static Asset, Decimal, Option<Decimal>)> = Vec::new();
+    for wallet in wallets {
+        let lines = lines(&wallet.id, balances, prices, now)?;
+        for line in &lines {
+            total = add(total, line.value.unwrap_or_default())?;
+            match assets
+                .iter_mut()
+                .find(|(asset, ..)| asset.key == line.asset.key)
+            {
+                Some((_, amount, value)) => {
+                    *amount = add(*amount, line.amount)?;
+                    *value = match (*value, line.value) {
+                        (Some(a), Some(b)) => Some(add(a, b)?),
+                        (a, b) => a.or(b),
+                    };
+                }
+                None => assets.push((line.asset, line.amount, line.value)),
+            }
+        }
+        bodies.push(wallet_body(wallet, &lines, now)?);
+    }
+    // Largest value first, unpriced last, then allowlist order.
+    assets.sort_by_key(|(asset, _, value)| {
+        (
+            std::cmp::Reverse(*value),
+            ASSETS.iter().position(|a| a.key == asset.key),
+        )
+    });
+    let assets: Vec<Value> = assets
+        .into_iter()
+        .map(|(asset, amount, value)| {
+            let mut row = Map::new();
+            row.insert("asset".into(), asset.key.into());
+            row.insert("symbol".into(), asset.symbol.into());
+            row.insert("amount".into(), amount.normalize().to_string().into());
+            priced(&mut row, price_of(prices, asset.key, now), value);
+            if let Some(weight) = value
+                .and_then(|value| value.checked_mul(Decimal::ONE_HUNDRED))
+                .and_then(|value| value.checked_div(total))
+            {
+                row.insert("weight_pct".into(), eur(weight).into());
+            }
+            Value::Object(row)
+        })
+        .collect();
+    let chains_available: Vec<Chain> = CHAINS
+        .into_iter()
+        .filter(|chain| chains_available.contains(chain))
+        .collect();
+    Ok(json!({
         "source": "crypto",
         "as_of": ts(as_of),
         "base_currency": "EUR",
-        "total_eur": "0",
-        "chains_available": CHAINS,
-        "wallets": wallets.iter().map(|wallet| wallet_body(wallet, now)).collect::<Vec<_>>(),
-        "assets": [],
-    })
+        "total_eur": eur(total),
+        "chains_available": chains_available,
+        "wallets": bodies,
+        "assets": assets,
+    }))
+}
+
+fn out_of_range(_: OutOfRange) -> Failure {
+    tracing::warn!("crypto wallet value out of range");
+    error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "crypto value out of range",
+    )
+}
+
+/// Tell the apps the wallets changed.
+fn changed(state: &AppState) {
+    state.realtime.publish_all(Event::CryptoUpdated {
+        as_of: OffsetDateTime::now_utc(),
+    });
 }
 
 #[derive(Deserialize)]
@@ -193,8 +378,37 @@ fn holds_key_material(value: &Value) -> bool {
 }
 
 pub(crate) async fn overview(_authed: Authed, State(state): State<AppState>) -> ApiResult {
+    require_enabled(&state)?;
     let wallets = bounded(store::list(&state.db)).await?;
-    Ok(Json(overview_body(&wallets, OffsetDateTime::now_utc())))
+    let balances = bounded(store::balances(&state.db)).await?;
+    let prices = bounded(store::prices(&state.db)).await?;
+    overview_body(
+        &wallets,
+        &balances,
+        &prices,
+        state.crypto.chains(),
+        OffsetDateTime::now_utc(),
+    )
+    .map(Json)
+    .map_err(out_of_range)
+}
+
+/// `POST /v1/trading/crypto/refresh`: 202, or 429 within the cooldown.
+pub(crate) async fn refresh(
+    _authed: Authed,
+    State(state): State<AppState>,
+) -> Result<(StatusCode, Json<Value>), Failure> {
+    require_enabled(&state)?;
+    match state.crypto.request_refresh() {
+        Ok(()) => Ok((StatusCode::ACCEPTED, Json(json!({ "queued": true })))),
+        Err(retry_after_secs) => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "a refresh was asked for less than a minute ago",
+                "retry_after_secs": retry_after_secs,
+            })),
+        )),
+    }
 }
 
 pub(crate) async fn create(
@@ -202,6 +416,7 @@ pub(crate) async fn create(
     State(state): State<AppState>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), Failure> {
+    require_enabled(&state)?;
     let Json(body) = body.map_err(unreadable)?;
     // Key material first, wherever it is in the body, before any other check.
     if holds_key_material(&body) {
@@ -216,12 +431,23 @@ pub(crate) async fn create(
         input.label.as_deref(),
     )
     .map_err(failure)?;
+    if !wallet
+        .chains
+        .iter()
+        .all(|chain| state.crypto.chains().contains(chain))
+    {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "a chosen chain is not available on this Core",
+        ));
+    }
     let created = bounded(store::create(&state.db, &wallet)).await?;
     audit(&state, &authed, "crypto.wallet_added", &created).await;
-    Ok((
-        StatusCode::CREATED,
-        Json(wallet_body(&created, OffsetDateTime::now_utc())),
-    ))
+    // Read it right away, or as soon as the cooldown allows.
+    state.crypto.refresh_soon();
+    changed(&state);
+    let body = wallet_body(&created, &[], OffsetDateTime::now_utc()).map_err(out_of_range)?;
+    Ok((StatusCode::CREATED, Json(body)))
 }
 
 /// Remove the wallet and its balances.
@@ -230,9 +456,11 @@ pub(crate) async fn delete(
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> ApiResult {
+    require_enabled(&state)?;
     let Path(id) = id.map_err(|_| error(StatusCode::BAD_REQUEST, "invalid wallet id"))?;
     let gone = bounded(store::delete(&state.db, &id.to_string())).await?;
     audit(&state, &authed, "crypto.wallet_removed", &gone).await;
+    changed(&state);
     Ok(Json(json!({ "deleted": true })))
 }
 
@@ -268,6 +496,23 @@ mod tests {
         assert!(!holds_key_material(&fine));
     }
 
+    fn balance(wallet_id: &str, chain: Chain, asset: &str, amount: &str) -> StoredBalance {
+        StoredBalance {
+            wallet_id: wallet_id.into(),
+            chain,
+            asset: asset.into(),
+            amount: amount.parse().unwrap(),
+        }
+    }
+
+    fn price(asset: &str, eur: &str, as_of: OffsetDateTime) -> StoredPrice {
+        StoredPrice {
+            asset: asset.into(),
+            eur: eur.parse().unwrap(),
+            as_of,
+        }
+    }
+
     #[test]
     fn bodies_match_the_app_contract() {
         let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
@@ -275,7 +520,7 @@ mod tests {
             WalletKind::Evm,
             "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
         );
-        let body = wallet_body(&evm, now);
+        let body = wallet_body(&evm, &[], now).unwrap();
         assert_eq!(
             body,
             json!({
@@ -292,31 +537,103 @@ mod tests {
             WalletKind::Solana,
             "So11111111111111111111111111111111111111112",
         );
+        refreshed.id = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c".into();
         refreshed.label = Some("Phantom".into());
         refreshed.last_ok_at = Some(now - time::Duration::minutes(5));
         refreshed.other_tokens = Some(2);
-        let body = wallet_body(&refreshed, now);
+        let body = wallet_body(&refreshed, &[], now).unwrap();
         assert_eq!(
             (&body["status"], &body["label"], &body["other_tokens"]),
             (&json!("ok"), &json!("Phantom"), &json!(2))
         );
         assert_eq!(body["last_refresh_at"], "1970-01-01T23:55:00Z");
         refreshed.last_ok_at = Some(now - time::Duration::hours(2));
-        assert_eq!(wallet_body(&refreshed, now)["status"], "stale");
+        assert_eq!(
+            wallet_body(&refreshed, &[], now).unwrap()["status"],
+            "stale"
+        );
         refreshed.error = Some("rate_limited".into());
-        let failed = wallet_body(&refreshed, now);
+        let failed = wallet_body(&refreshed, &[], now).unwrap();
         assert_eq!(
             (&failed["status"], &failed["error"]),
             (&json!("error"), &json!("rate_limited"))
         );
 
-        let overview = overview_body(&[evm, refreshed], now);
+        let all = CHAINS.to_vec();
+        let overview = overview_body(&[evm, refreshed], &[], &[], &all, now).unwrap();
         assert_eq!(overview["as_of"], "1970-01-01T22:00:00Z");
         assert_eq!(overview["source"], "crypto");
         assert_eq!(
             overview["chains_available"].as_array().map(Vec::len),
             Some(7)
         );
-        assert_eq!(overview_body(&[], now)["as_of"], "1970-01-02T00:00:00Z");
+        let empty = overview_body(&[], &[], &[], &[Chain::Solana, Chain::Bitcoin], now).unwrap();
+        assert_eq!(empty["as_of"], "1970-01-02T00:00:00Z");
+        assert_eq!(empty["chains_available"], json!(["bitcoin", "solana"]));
+    }
+
+    #[test]
+    fn values_count_only_fresh_prices_and_stale_balances() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        let mut evm = wallet(
+            WalletKind::Evm,
+            "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+        );
+        // Stale balances still count.
+        evm.last_ok_at = Some(now - time::Duration::hours(3));
+        let id = evm.id.clone();
+        let balances = [
+            balance(&id, Chain::Base, "usdc", "100"),
+            balance(&id, Chain::Ethereum, "eth", "0.5"),
+            balance(&id, Chain::Base, "eth", "1.5"),
+            balance(&id, Chain::Base, "dai", "7"),
+            balance(&id, Chain::Base, "scam", "1000"),
+            balance("other-wallet", Chain::Base, "eth", "9"),
+        ];
+        let prices = [
+            price("eth", "2000", now - time::Duration::minutes(10)),
+            price("usdc", "0.9", now - time::Duration::minutes(59)),
+            // Too old: shown without a price, not counted.
+            price("dai", "0.9", now - time::Duration::minutes(61)),
+        ];
+        let body = overview_body(&[evm], &balances, &prices, &CHAINS, now).unwrap();
+        assert_eq!(body["total_eur"], "4090");
+        let wallet = &body["wallets"][0];
+        assert_eq!(wallet["value_eur"], "4090");
+        assert_eq!(
+            wallet["balances"],
+            json!([
+                {"chain": "ethereum", "asset": "eth", "symbol": "ETH", "amount": "0.5", "price_eur": "2000", "value_eur": "1000"},
+                {"chain": "base", "asset": "eth", "symbol": "ETH", "amount": "1.5", "price_eur": "2000", "value_eur": "3000"},
+                {"chain": "base", "asset": "usdc", "symbol": "USDC", "amount": "100", "price_eur": "0.9", "value_eur": "90"},
+                {"chain": "base", "asset": "dai", "symbol": "DAI", "amount": "7"},
+            ])
+        );
+        assert_eq!(
+            body["assets"],
+            json!([
+                {"asset": "eth", "symbol": "ETH", "amount": "2", "price_eur": "2000", "value_eur": "4000", "weight_pct": "97.8"},
+                {"asset": "usdc", "symbol": "USDC", "amount": "100", "price_eur": "0.9", "value_eur": "90", "weight_pct": "2.2"},
+                {"asset": "dai", "symbol": "DAI", "amount": "7"},
+            ])
+        );
+        let text = body.to_string();
+        assert!(!text.contains("scam") && !text.contains("other-wallet"));
+    }
+
+    #[test]
+    fn values_beyond_twenty_digits_are_refused() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        let evm = wallet(
+            WalletKind::Evm,
+            "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+        );
+        let huge = "99999999999999999999";
+        let balances = [
+            balance(&evm.id, Chain::Base, "eth", huge),
+            balance(&evm.id, Chain::Ethereum, "eth", huge),
+        ];
+        let prices = [price("eth", "1", now)];
+        assert!(overview_body(&[evm], &balances, &prices, &CHAINS, now).is_err());
     }
 }

@@ -162,6 +162,13 @@ pub enum Event {
         run_id: String,
         status: String,
     },
+    /// A crypto wallet refresh pass committed (also a partial one), or a
+    /// wallet was added or removed; reload `GET /v1/trading/crypto`.
+    #[serde(rename = "trading.crypto.updated")]
+    CryptoUpdated {
+        #[serde(with = "time::serde::rfc3339")]
+        as_of: OffsetDateTime,
+    },
 }
 
 /// Fixed safe failure codes, not raw provider errors.
@@ -376,6 +383,20 @@ mod tests {
             })
         );
         assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), finished);
+    }
+
+    #[test]
+    fn crypto_updated_carries_only_a_time() {
+        let updated = Event::CryptoUpdated {
+            as_of: OffsetDateTime::UNIX_EPOCH,
+        };
+        let wire = serde_json::to_value(&updated).unwrap();
+        assert_eq!(wire["type"], "trading.crypto.updated");
+        assert_eq!(
+            wire["payload"],
+            serde_json::json!({"as_of": "1970-01-01T00:00:00Z"})
+        );
+        assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), updated);
     }
 
     #[test]
