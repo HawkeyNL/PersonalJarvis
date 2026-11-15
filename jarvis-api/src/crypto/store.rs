@@ -5,10 +5,13 @@
 //! returned: a refused write may quote the address it was given. All values
 //! are bound parameters.
 
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::json;
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use jarvis_market_data::balances::{Balance, Price};
 use jarvis_market_data::wallet::{is_key_material, parse_address, AddressError, Chain, WalletKind};
 use jarvis_store::Database;
 
@@ -249,6 +252,148 @@ pub async fn create(db: &Database, wallet: &NewWallet) -> Result<Wallet> {
         });
     }
     get(db, &id).await?.ok_or(CryptoStoreError::InvalidData)
+}
+
+/// Most balance rows: 20 wallets on at most five chains of seven assets.
+const MAX_BALANCE_ROWS: usize = 1000;
+
+/// One stored balance of an allowlisted asset.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StoredBalance {
+    pub wallet_id: String,
+    pub chain: Chain,
+    pub asset: String,
+    pub amount: Decimal,
+}
+
+/// The last good EUR price of an asset.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StoredPrice {
+    pub asset: String,
+    pub eur: Decimal,
+    #[serde(with = "time::serde::rfc3339")]
+    pub as_of: OffsetDateTime,
+}
+
+/// The outcome of one wallet's refresh.
+#[derive(Debug)]
+pub struct Refresh<'a> {
+    /// The chains read in full; only their rows are replaced, so a failed
+    /// chain keeps its last good balances.
+    pub chains: &'a [Chain],
+    pub balances: &'a [Balance],
+    /// Solana only: mints off the allowlist, counted.
+    pub other_tokens: Option<u32>,
+    /// The first failure code; `None` when every chain was read.
+    pub error: Option<&'static str>,
+}
+
+pub async fn balances(db: &Database) -> Result<Vec<StoredBalance>> {
+    Ok(db
+        .query(format!(
+            "SELECT wallet_id, chain, asset, amount FROM crypto_balances \
+             ORDER BY wallet_id, chain, asset LIMIT {MAX_BALANCE_ROWS}"
+        ))
+        .await?
+        .check()?
+        .take(0)?)
+}
+
+pub async fn prices(db: &Database) -> Result<Vec<StoredPrice>> {
+    Ok(db
+        .query("SELECT record::id(id) AS asset, eur, as_of FROM crypto_prices LIMIT 100")
+        .await?
+        .check()?
+        .take(0)?)
+}
+
+fn rfc3339(at: OffsetDateTime) -> Result<String> {
+    at.format(&Rfc3339)
+        .map_err(|_| CryptoStoreError::InvalidData)
+}
+
+/// Replace the prices of the assets in `prices`; others keep their last
+/// price, which ages out by its own time.
+pub async fn write_prices(db: &Database, prices: &[Price]) -> Result<()> {
+    let rows = prices
+        .iter()
+        .map(|price| {
+            Ok(json!({
+                "asset": price.asset,
+                "eur": price.eur.to_string(),
+                "as_of": rfc3339(price.as_of)?,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let keys: Vec<&str> = prices.iter().map(|price| price.asset).collect();
+    db.query(
+        "BEGIN TRANSACTION; \
+         DELETE crypto_prices WHERE record::id(id) IN $keys RETURN NONE; \
+         FOR $p IN $rows { CREATE crypto_prices SET id = $p.asset, eur = $p.eur, \
+           as_of = <datetime>$p.as_of RETURN NONE; }; \
+         COMMIT TRANSACTION;",
+    )
+    .bind(json!({ "keys": keys, "rows": rows }))
+    .await?
+    .check()?;
+    Ok(())
+}
+
+/// Store one wallet's refresh in one transaction: the rows of the chains
+/// read are replaced, then the wallet's status. [`CryptoStoreError::NotFound`]
+/// when the wallet was removed meanwhile.
+pub async fn write_refresh(db: &Database, wallet_id: &str, refresh: &Refresh<'_>) -> Result<()> {
+    let rows: Vec<_> = refresh
+        .balances
+        .iter()
+        .filter(|balance| refresh.chains.contains(&balance.chain))
+        .map(|balance| {
+            json!({
+                "chain": balance.chain,
+                "asset": balance.asset,
+                "amount": balance.amount.to_string(),
+            })
+        })
+        .collect();
+    // Fixed fragments only; every value is bound.
+    let status = if refresh.error.is_some() {
+        "error = $error"
+    } else {
+        "error = NONE, last_ok_at = time::now()"
+    };
+    let other = if refresh.other_tokens.is_some() {
+        ", other_tokens = $other_tokens"
+    } else {
+        ""
+    };
+    let response = db
+        .query(format!(
+            "BEGIN TRANSACTION; \
+             IF array::len((SELECT VALUE id FROM crypto_wallets WHERE record::id(id) = $id)) != 1 \
+               {{ THROW 'wallet unavailable'; }}; \
+             DELETE crypto_balances WHERE wallet_id = $id AND chain IN $chains RETURN NONE; \
+             FOR $b IN $rows {{ CREATE crypto_balances SET \
+               id = string::concat($id, ':', $b.chain, ':', $b.asset), wallet_id = $id, \
+               chain = $b.chain, asset = $b.asset, amount = $b.amount, as_of = time::now() \
+               RETURN NONE; }}; \
+             UPDATE crypto_wallets SET {status}{other} WHERE record::id(id) = $id RETURN NONE; \
+             COMMIT TRANSACTION;"
+        ))
+        .bind(json!({
+            "id": wallet_id,
+            "chains": refresh.chains,
+            "rows": rows,
+            "error": refresh.error,
+            "other_tokens": refresh.other_tokens,
+        }))
+        .await?;
+    if response.check().is_err() {
+        return Err(match get(db, wallet_id).await? {
+            None => CryptoStoreError::NotFound,
+            Some(_) => CryptoStoreError::Database,
+        });
+    }
+    Ok(())
 }
 
 /// Remove a wallet and its balances in one transaction.

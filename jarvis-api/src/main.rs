@@ -575,6 +575,22 @@ async fn main() -> anyhow::Result<()> {
             .as_deref()
             .map(Path::new),
     );
+    // Off by default (docs/CRYPTO_WALLETS.md); a refused RPC URL turns only
+    // that chain off.
+    let (crypto, crypto_sources) = {
+        use jarvis_market_data::wallet::Chain;
+        jarvis_api::crypto::configure(
+            config.crypto_wallets_enabled,
+            &config.market_solana_rpc_a_url,
+            [
+                (Chain::Ethereum, config.crypto_evm_rpc_ethereum_url.as_str()),
+                (Chain::Base, config.crypto_evm_rpc_base_url.as_str()),
+                (Chain::Arbitrum, config.crypto_evm_rpc_arbitrum_url.as_str()),
+                (Chain::Optimism, config.crypto_evm_rpc_optimism_url.as_str()),
+                (Chain::Polygon, config.crypto_evm_rpc_polygon_url.as_str()),
+            ],
+        )
+    };
     let state = AppState {
         realtime: Default::default(),
         db,
@@ -664,6 +680,7 @@ async fn main() -> anyhow::Result<()> {
         github,
         jobs: Arc::new(jarvis_api::jobs::JobsHandle::new()),
         photos,
+        crypto: Arc::new(crypto),
     };
 
     jarvis_api::refresh_usage_snapshot(&state).await;
@@ -703,6 +720,14 @@ async fn main() -> anyhow::Result<()> {
             client.as_ref().clone(),
             config.ibkr_broker_socket.clone().into(),
             state.ibkr_status.clone(),
+        );
+    }
+    if let Some(sources) = crypto_sources {
+        jarvis_api::crypto::start(
+            state.db.clone(),
+            state.crypto.clone(),
+            sources,
+            state.realtime.clone(),
         );
     }
     // Scheduled jobs (docs/SCHEDULED_JOBS.md); off when the time zone

@@ -1,7 +1,8 @@
 //! Read-only Solana JSON-RPC reads against two independent providers.
 //!
-//! Only `getAccountInfo`, `getTokenLargestAccounts`, and for
-//! [`crate::discovery`] `getSignaturesForAddress` and `getTransaction`, are
+//! Only `getAccountInfo`, `getTokenLargestAccounts`, for
+//! [`crate::discovery`] `getSignaturesForAddress` and `getTransaction`, and
+//! for [`crate::balances`] `getBalance` and `getTokenAccountsByOwner`, are
 //! called, at `confirmed` commitment. [`CrossCheckedRpc`] asks both providers
 //! and fails with [`MarketDataError::ProviderDisagreement`] unless they agree
 //! exactly; only values built from its reads (here and in
@@ -47,6 +48,20 @@ impl RpcEndpoint {
             .to_owned();
         Ok(Self { url, host })
     }
+
+    /// The URL for one request. reqwest keeps its own (not zeroized) copy.
+    pub(crate) fn url(&self) -> Result<Url, MarketDataError> {
+        Url::parse(&self.url).map_err(|_| MarketDataError::InvalidUrl)
+    }
+
+    /// A plain-HTTP endpoint for the local test server.
+    #[cfg(test)]
+    pub(crate) fn local(base: &str) -> Self {
+        Self {
+            url: Zeroizing::new(base.to_owned()),
+            host: "localhost".to_owned(),
+        }
+    }
 }
 
 impl fmt::Debug for RpcEndpoint {
@@ -60,7 +75,7 @@ impl fmt::Debug for RpcEndpoint {
 /// JSON-RPC error codes inside an HTTP 200 that block the provider like a
 /// 429: `-32005` is "node unhealthy / behind" (not a rate limit, but backing
 /// off from a lagging node also fails closed), `-32429` is a rate limit.
-const BACKOFF_CODES: &[i64] = &[-32005, -32429];
+pub(crate) const BACKOFF_CODES: &[i64] = &[-32005, -32429];
 
 /// One RPC provider. Crate-private: callers read through [`CrossCheckedRpc`].
 pub(crate) struct RpcClient {
@@ -99,8 +114,8 @@ fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
 }
 
 #[derive(Deserialize)]
-struct ReplyError {
-    code: i64,
+pub(crate) struct ReplyError {
+    pub code: i64,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +143,51 @@ pub struct TokenAccountBalance {
     pub address: String,
     #[serde(deserialize_with = "u64_string")]
     pub amount: u64,
+}
+
+#[derive(Deserialize)]
+struct KeyedTokenAccount {
+    account: ParsedTokenAccount,
+}
+
+#[derive(Deserialize)]
+struct ParsedTokenAccount {
+    data: TokenData,
+}
+
+/// `jsonParsed` falls back to raw data for an account the provider cannot
+/// parse.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TokenData {
+    Parsed(ParsedTokenData),
+    Raw(serde::de::IgnoredAny),
+}
+
+#[derive(Deserialize)]
+struct ParsedTokenData {
+    parsed: ParsedTokenInfo,
+}
+
+#[derive(Deserialize)]
+struct ParsedTokenInfo {
+    info: TokenAccountInfo,
+}
+
+/// One token account of `getTokenAccountsByOwner` (`jsonParsed`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TokenAccountInfo {
+    pub mint: String,
+    pub owner: String,
+    pub token_amount: TokenAmount,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TokenAmount {
+    #[serde(deserialize_with = "u64_string")]
+    pub amount: u64,
+    pub decimals: u8,
 }
 
 /// Most signatures one `getSignaturesForAddress` call may ask for (RPC spec).
@@ -210,10 +270,7 @@ impl RpcClient {
     pub(crate) fn plain(index: u8, base: &str) -> Self {
         Self {
             http: Http::plain(Provider::SolanaRpc(index), Duration::ZERO),
-            endpoint: RpcEndpoint {
-                url: Zeroizing::new(base.to_owned()),
-                host: "localhost".to_owned(),
-            },
+            endpoint: RpcEndpoint::local(base),
         }
     }
 
@@ -229,8 +286,7 @@ impl RpcClient {
         method: &'static str,
         params: Value,
     ) -> Result<T, MarketDataError> {
-        // reqwest keeps its own (not zeroized) copy of the URL for the request.
-        let url = Url::parse(&self.endpoint.url).map_err(|_| MarketDataError::InvalidUrl)?;
+        let url = self.endpoint.url()?;
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
         let reply: Reply<T> = self.http.json(self.http.post(url).json(&body)).await?;
         if reply.jsonrpc != "2.0" || reply.id != json!(1) {
@@ -247,6 +303,48 @@ impl RpcClient {
             (Some(result), None) => Ok(result),
             (None, None) => Err(self.invalid("reply has neither result nor error")),
         }
+    }
+
+    /// The SOL balance of `address`, in lamports.
+    pub(crate) async fn balance(&self, address: &str) -> Result<u64, MarketDataError> {
+        validate_address(address)?;
+        let reply: WithContext<u64> = self
+            .call(
+                "getBalance",
+                json!([address, { "commitment": "confirmed" }]),
+            )
+            .await?;
+        Ok(reply.value)
+    }
+
+    /// Every token account `owner` holds under one token program
+    /// (`jsonParsed`), `None` for one the provider could not parse. Only the
+    /// mint, owner and raw amount with its decimals are read; token names
+    /// and symbols are never deserialized.
+    pub(crate) async fn token_accounts_by_owner(
+        &self,
+        owner: &str,
+        program: &'static str,
+    ) -> Result<Vec<Option<TokenAccountInfo>>, MarketDataError> {
+        validate_address(owner)?;
+        let reply: WithContext<Vec<KeyedTokenAccount>> = self
+            .call(
+                "getTokenAccountsByOwner",
+                json!([
+                    owner,
+                    { "programId": program },
+                    { "encoding": "jsonParsed", "commitment": "confirmed" }
+                ]),
+            )
+            .await?;
+        Ok(reply
+            .value
+            .into_iter()
+            .map(|keyed| match keyed.account.data {
+                TokenData::Parsed(data) => Some(data.parsed.info),
+                TokenData::Raw(_) => None,
+            })
+            .collect())
     }
 
     /// Read any account; `what` names it in the not-found error.
