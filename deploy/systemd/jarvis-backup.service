@@ -24,7 +24,9 @@ NoNewPrivileges=true
 # The database is reached through the Docker socket, which dockerd serves.
 CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 LockPersonality=true
-RestrictSUIDSGID=true
+# No RestrictSUIDSGID=: systemd blocks openat2() with ENOSYS under it, and tar
+# 1.35+dfsg-4ubuntu0.2 and later fails to stat its input ("Cannot stat:
+# Function not implemented"). The helper archives only etc/jarvis as root.
 PrivateTmp=true
 PrivateDevices=true
 # Not strict: the destination is owner configuration. The helper writes below
