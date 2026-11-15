@@ -407,8 +407,8 @@ the roadmap, in a pending proposal or earlier in this one is left out (so a
 second alert for the same pull request adds nothing), and so is one whose
 title would be over 200 characters; at most 20 items, and no more than the
 roadmap has room for. When nothing is left, no proposal is made. A pending
-proposal that went stale still counts until the owner accepts it (409,
-marked stale), rejects it or it expires; the next run proposes again. A
+proposal made on an older revision of the roadmap can no longer be accepted
+(409, marked stale), so it holds nothing: the next run proposes again. A
 proposal that fails makes the run `partial` with one of these codes (unless
 it already had one):
 
@@ -509,7 +509,10 @@ findings' order, at most 20 operations:
 
 - a finding no item carries becomes a new `planned` item (no more than the
   roadmap has room for);
-- a finding whose item is `ready` or `live` reopens it (`status: planned`);
+- a finding whose item is `ready` or `live` reopens it (`status: planned`),
+  but a counted finding (one with a last time, such as failed logins) only
+  when it happened again after the item last changed: failures from before
+  the owner closed it do not reopen it;
 - a finding whose item is open (`planned`, `in_progress` or `blocked`) adds
   nothing;
 - then an open item whose finding is gone is set `live`, but only for a
@@ -525,10 +528,14 @@ findings' order, at most 20 operations:
 
 A finding in a pending proposal's new item, or in one the owner rejected in
 the last 7 days, is left out, and so is an item that a pending or such a
-rejected proposal changes: a rejection snoozes what it held for 7 days.
+rejected proposal changes (a pending proposal made on an older revision
+counts for nothing, as it can no longer be accepted): a rejection snoozes what it held for 7 days.
 When nothing is left, no proposal is made. A proposal that fails makes the
 run `partial` with a `roadmap_*` code as for the dependency review (unless
 it already had `source_unavailable`).
+
+The run's facts always list the findings it proposed, the others up to the
+cap of 50.
 
 When the proposal newly holds an urgent finding (a new item or a reopen),
 the run pushes `Morning check: N urgent things to fix` to the job's owner

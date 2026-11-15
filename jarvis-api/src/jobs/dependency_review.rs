@@ -119,7 +119,8 @@ fn link_key(link: &Link) -> Option<(String, u64)> {
 /// {version} ({repo})", linked to its Dependabot pull request when there is
 /// one. An upgrade whose title or pull request is already on the roadmap or
 /// in a pending proposal (or earlier in this one) is left out; at most 20,
-/// and no more than the roadmap has room for.
+/// and no more than the roadmap has room for. A pending proposal made on
+/// another revision can no longer be accepted and holds nothing.
 fn proposal_ops(
     snapshot: &Snapshot,
     pending: &[Proposal],
@@ -127,6 +128,7 @@ fn proposal_ops(
 ) -> Vec<ProposalOp> {
     let proposed = pending
         .iter()
+        .filter(|proposal| proposal.base_revision == snapshot.roadmap.revision)
         .flat_map(|proposal| &proposal.ops)
         .filter_map(|op| match op {
             ProposalOp::CreateItem { item } => Some((&item.title, &item.links)),
@@ -779,7 +781,13 @@ mod tests {
             created_at: time::OffsetDateTime::now_utc(),
             expires_at: time::OffsetDateTime::now_utc(),
         };
-        assert!(proposal_ops(&on_roadmap, &[pending], &facts).is_empty());
+        assert!(proposal_ops(&on_roadmap, std::slice::from_ref(&pending), &facts).is_empty());
+        // One made on another revision no longer holds its upgrade.
+        let stale = Proposal {
+            base_revision: 2,
+            ..pending
+        };
+        assert_eq!(proposal_ops(&on_roadmap, &[stale], &facts).len(), 1);
         // Twenty at most, and the same upgrade twice only once.
         let mut many = facts.clone();
         many.alerts = (1..=30)

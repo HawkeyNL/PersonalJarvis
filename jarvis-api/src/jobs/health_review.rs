@@ -109,15 +109,25 @@ const REOPENS: &str =
     "Set this item to live when it is fixed; the morning check reopens it if the problem comes back.";
 const LOGS: &str = "Jarvis never reads logs; these commands are for you to run on the Home Node.";
 
-/// Per finding code (an id up to its first `:`): whether the check sets the
-/// item live once the finding is gone, and the owner's fixed fix steps;
-/// `{subject}` is the id after the code (an allowlisted name). The `ibkr`
-/// steps are followed by the IBKR status's own commands.
-const RULES: [(&str, bool, &[&str]); 29] = [
+/// Per finding id, or else per finding code (an id up to its first `:`):
+/// whether the check sets the item live once the finding is gone, and the
+/// owner's fixed fix steps; `{subject}` is the id after the code (an
+/// allowlisted name). The `ibkr` steps are followed by the IBKR status's own
+/// commands.
+const RULES: [(&str, bool, &[&str]); 30] = [
     ("disk_full", true, &[
         "Disk {subject} is nearly full; Core and SurrealDB stop writing when it is full.",
         "See both disks on the Health page in Jarvis, or on the Home Node: df -h / /var/lib/jarvis",
-        "Old backup archives are the usual candidates: see docs/BACKUP_AND_RESTORE.md and docs/HOUSEKEEPING.md.",
+        "See what Core's housekeeping can delete: sudo jarvis housekeeping status",
+        "Then delete what it lists: sudo jarvis housekeeping run --apply (docs/HOUSEKEEPING.md)",
+    ]),
+    // A oneshot run by its timer: nothing to restart.
+    ("service_failed:jarvis-private-agent-updater.service", true, &[
+        "The private agent updater failed on its last run. To see why:",
+        "sudo jarvis logs agents",
+        "sudo jarvis agents check",
+        "Fix the cause, then clear the failed state: sudo systemctl reset-failed jarvis-private-agent-updater.service",
+        LOGS,
     ]),
     ("service_failed", true, &[
         "{subject} has failed. To see why:",
@@ -170,7 +180,7 @@ const RULES: [(&str, bool, &[&str]); 29] = [
         LOGS,
     ]),
     ("ibkr", true, &[
-        "The IBKR status in Jarvis shows this problem. See docs/IBKR_PORTFOLIO.md; on the Home Node:",
+        "The IBKR status in Jarvis shows this problem; see docs/IBKR_PORTFOLIO.md.",
     ]),
     ("research_without_worker", true, &[
         "Research jobs are on, but Research cannot run: it is off or no subscription worker is set up.",
@@ -178,7 +188,7 @@ const RULES: [(&str, bool, &[&str]); 29] = [
     ]),
     ("claude_worker_off", true, &[
         "The dependency review needs the Claude worker, but its socket is missing.",
-        "Set it up as docs/SUBSCRIPTION_WORKERS.md describes, or start it: sudo systemctl enable --now jarvis-claude.socket",
+        "Turn it on as docs/SUBSCRIPTION_WORKERS.md describes: sudo jarvis accounts worker enable claude",
     ]),
     ("llm_auth", false, &[
         "Model backend {subject} refused its credentials: a key or a sign-in expired or was revoked.",
@@ -270,13 +280,15 @@ pub(super) async fn run(state: &AppState, job: &Job, trigger: Trigger) -> Finish
 }
 
 /// What a run proposed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Proposed {
     created: usize,
     reopened: usize,
     resolved: usize,
     /// Urgent findings among the created and reopened.
     urgent: usize,
+    /// The ids of the created and reopened findings.
+    findings: Vec<String>,
 }
 
 /// The owner's push when the run newly proposed something urgent.
@@ -848,13 +860,25 @@ fn findings(s: &Signals) -> Vec<Finding> {
 }
 
 /// The run's record: its facts and a templated summary.
-fn finish(s: &Signals, found: &[Finding], proposed: &Result<Proposed, &'static str>) -> Finish {
+fn finish(s: &Signals, all: &[Finding], proposed: &Result<Proposed, &'static str>) -> Finish {
     let read = s.sources.values().filter(|ok| **ok).count();
     if read == 0 {
         return Finish::failed("signals_unavailable");
     }
-    let found = &found[..found.len().min(MAX_FINDINGS)];
-    let done = proposed.unwrap_or_default();
+    let none = Proposed::default();
+    let done = proposed.as_ref().unwrap_or(&none);
+    // The proposed findings always, the others up to the cap.
+    let room = MAX_FINDINGS.saturating_sub(done.findings.len());
+    let mut others = 0;
+    let mut found: Vec<&Finding> = Vec::new();
+    for finding in all {
+        if done.findings.contains(&finding.id) {
+            found.push(finding);
+        } else if others < room {
+            others += 1;
+            found.push(finding);
+        }
+    }
     let unread: Vec<&str> = s
         .sources
         .iter()
@@ -902,7 +926,7 @@ fn finish(s: &Signals, found: &[Finding], proposed: &Result<Proposed, &'static s
         .collect();
     summary.push_str(&tail);
     let error_code = if unread.is_empty() {
-        proposed.err()
+        proposed.as_ref().err().copied()
     } else {
         Some("source_unavailable")
     };
@@ -935,12 +959,14 @@ fn marker(notes: &str) -> Option<&str> {
     finding_id(id).then_some(id)
 }
 
-/// A finding code's rule: whether it resolves and its fix steps.
+/// A finding's rule, by its id or else its code: whether it resolves and
+/// its fix steps.
 fn rule(id: &str) -> Option<(bool, &'static [&'static str])> {
     let code = id.split_once(':').map_or(id, |(code, _)| code);
     RULES
         .iter()
-        .find(|entry| entry.0 == code)
+        .find(|entry| entry.0 == id)
+        .or_else(|| RULES.iter().find(|entry| entry.0 == code))
         .map(|entry| (entry.1, entry.2))
 }
 
@@ -977,7 +1003,12 @@ fn new_item(finding: &Finding, today: Date) -> Option<NewItem> {
         .split_once(':')
         .map_or("", |(_, subject)| subject);
     let mut notes = String::new();
-    for line in steps.iter().chain(finding.commands) {
+    let intro: &[&str] = if finding.commands.is_empty() {
+        &[]
+    } else {
+        &["What to do, from the IBKR status:"]
+    };
+    for line in steps.iter().chain(intro).chain(finding.commands) {
         notes.push_str(&line.replace("{subject}", subject));
         notes.push('\n');
     }
@@ -994,6 +1025,16 @@ fn new_item(finding: &Finding, today: Date) -> Option<NewItem> {
             ..NewItem::default()
         },
     )
+}
+
+/// Whether `finding` happened again after `item` last changed (the owner
+/// closed it): a counted finding's last time must be later; a state finding
+/// (no time) is there now.
+fn back_since(finding: &Finding, item: &Item) -> bool {
+    finding
+        .last_at
+        .as_deref()
+        .is_none_or(|at| OffsetDateTime::parse(at, &Rfc3339).is_ok_and(|at| at > item.updated_at))
 }
 
 fn set_status(item: &Item, status: Status) -> ProposalOp {
@@ -1023,8 +1064,10 @@ fn proposal_ops(
 ) -> (Vec<ProposalOp>, Proposed) {
     let mut busy_ids = HashSet::new();
     let mut busy_items = HashSet::new();
+    // A pending proposal made on another revision can no longer be accepted.
     for op in pending
         .iter()
+        .filter(|proposal| proposal.base_revision == snapshot.roadmap.revision)
         .chain(rejected)
         .flat_map(|proposal| &proposal.ops)
     {
@@ -1062,7 +1105,7 @@ fn proposal_ops(
             continue;
         }
         if let Some(closed) = items.next() {
-            if busy_items.contains(closed.id.as_str()) {
+            if busy_items.contains(closed.id.as_str()) || !back_since(finding, closed) {
                 continue;
             }
             ops.push(set_status(closed, Status::Planned));
@@ -1076,6 +1119,7 @@ fn proposal_ops(
             done.created += 1;
         }
         done.urgent += usize::from(finding.urgent);
+        done.findings.push(finding.id.clone());
     }
     let present: HashSet<&str> = found.iter().map(|finding| finding.id.as_str()).collect();
     for (id, item) in marked {
@@ -1956,6 +2000,7 @@ mod tests {
             HashSet::from([
                 "disk_full",
                 "service_failed",
+                "service_failed:jarvis-private-agent-updater.service",
                 "updater_failed",
                 "backup_failed",
                 "backup_not_enabled",
@@ -2051,8 +2096,9 @@ mod tests {
             .iter()
             .map(|f| f.id.split_once(':').map_or(f.id.as_str(), |(code, _)| code))
             .collect();
-        // All but `github_poll_error`: the poller is in one state.
-        assert_eq!(found_codes.len(), RULES.len() - 1);
+        // All but `github_poll_error` (the poller is in one state); the
+        // agent updater's own rule is a `service_failed` too.
+        assert_eq!(found_codes.len(), RULES.len() - 2);
         for finding in &found {
             let item = new_item(finding, today()).unwrap();
             assert_eq!(item.title, finding.title);
@@ -2117,6 +2163,11 @@ mod tests {
             Proposed {
                 created: 3,
                 urgent: 1,
+                findings: vec![
+                    "disk_full:data".into(),
+                    "github_auth_failed".into(),
+                    "push_failing".into()
+                ],
                 ..Proposed::default()
             }
         );
@@ -2377,6 +2428,7 @@ mod tests {
             reopened: 1,
             resolved: 4,
             urgent: 1,
+            findings: Vec::new(),
         });
         let recorded = finish(&s, &found, &proposed);
         assert_eq!(
@@ -2416,6 +2468,141 @@ mod tests {
             .0;
         assert_eq!(summary.chars().count(), MAX_SUMMARY);
         assert!(summary.ends_with("4 resolved. Could not read: ibkr."));
+    }
+
+    #[test]
+    fn a_counted_finding_reopens_only_when_it_happened_after_the_fix() {
+        // Ten failed logins, the last at 05:00.
+        let logins = Signals {
+            audit: vec![audit("auth.login", "fail", 10)],
+            ..healthy()
+        };
+        let mut fixed = marked("security_login_failures", Status::Live);
+        // The owner closed it at 09:00: the run counts earlier failures.
+        fixed.updated_at = at("2026-11-14T09:00:00Z");
+        let (ops_, done) = ops(vec![fixed.clone()], &[], &[], &logins);
+        assert!(ops_.is_empty());
+        assert_eq!(done, Proposed::default());
+        let mut owned = job("health_review", json!({}));
+        owned.owner_id = Some(Uuid::now_v7().to_string());
+        assert_eq!(urgent_push(&owned, &Ok(done)), None);
+        // Closed before the last failure: it is back.
+        fixed.updated_at = at("2026-11-14T04:00:00Z");
+        let (ops_, done) = ops(vec![fixed], &[], &[], &logins);
+        assert_eq!(ops_, ["item-security_login_failures Planned"]);
+        assert_eq!(done.urgent, 1);
+        // A state finding has no time: it is there now and reopens.
+        let mut disk = marked("disk_full:data", Status::Live);
+        disk.updated_at = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let (ops_, _) = ops(
+            vec![disk],
+            &[],
+            &[],
+            &Signals {
+                disks: vec![("data", 99.0)],
+                ..healthy()
+            },
+        );
+        assert_eq!(ops_, ["item-disk_full:data Planned"]);
+    }
+
+    #[test]
+    fn a_pending_proposal_on_another_revision_holds_nothing() {
+        let mut stale = proposal(vec![create("disk_full:data"), update("github_auth_failed")]);
+        stale.base_revision = 1;
+        let (ops_, _) = ops(
+            vec![marked("github_auth_failed", Status::Live)],
+            &[stale.clone()],
+            &[],
+            &three(),
+        );
+        assert_eq!(
+            ops_,
+            [
+                "create disk_full:data",
+                "item-github_auth_failed Planned",
+                "create push_failing"
+            ]
+        );
+        // A rejection snoozes whatever revision it was made on.
+        let (ops_, _) = ops(
+            vec![marked("github_auth_failed", Status::Live)],
+            &[],
+            &[stale],
+            &three(),
+        );
+        assert_eq!(ops_, ["create push_failing"]);
+    }
+
+    #[test]
+    fn steps_fit_the_unit_and_the_ibkr_commands() {
+        let item = |id: &str, commands: &'static [&'static str]| {
+            let mut finding = Finding::new(id, Severity::High, false, "Title".into());
+            finding.commands = commands;
+            new_item(&finding, today()).unwrap().notes.unwrap()
+        };
+        // A long-running service restarts; the timer's oneshot is cleared.
+        let core = item("service_failed:jarvis-core.service", &[]);
+        assert!(core.contains("sudo systemctl restart jarvis-core.service\n"));
+        let agents = item("service_failed:jarvis-private-agent-updater.service", &[]);
+        assert!(!agents.contains("restart"), "{agents}");
+        assert!(
+            agents.contains("sudo systemctl reset-failed jarvis-private-agent-updater.service\n")
+        );
+        assert!(agents.contains("\nsudo jarvis logs agents\nsudo jarvis agents check\n"));
+        // IBKR: no dangling lead-in without commands; prose or commands after
+        // a neutral one.
+        let none = item("ibkr:sync_stale", &[]);
+        assert!(!none.contains("What to do"), "{none}");
+        assert!(none.starts_with(
+            "The IBKR status in Jarvis shows this problem; see docs/IBKR_PORTFOLIO.md.\nThe morning"
+        ));
+        let prose = item("ibkr:credentials_missing", &["Fix it in core.env"]);
+        assert!(prose.contains(
+            "docs/IBKR_PORTFOLIO.md.\nWhat to do, from the IBKR status:\nFix it in core.env\n"
+        ));
+        // Disk and Claude worker steps name the admin commands.
+        let disk = item("disk_full:data", &[]);
+        assert!(disk.contains("sudo jarvis housekeeping status\n"));
+        assert!(disk.contains("sudo jarvis housekeeping run --apply"));
+        assert!(!disk.contains("backup archives"));
+        let worker = item("claude_worker_off", &[]);
+        assert!(worker.contains("sudo jarvis accounts worker enable claude\n"));
+        assert!(!worker.contains("systemctl"));
+    }
+
+    #[test]
+    fn proposed_findings_are_always_in_the_facts() {
+        let many = Signals {
+            jobs: (0..60)
+                .map(|_| {
+                    let mut job = prompt();
+                    job.enabled = false;
+                    job.paused_reason = Some(PausedReason::PausedAfterFailures);
+                    job
+                })
+                .collect(),
+            ..three()
+        };
+        let found = findings(&many);
+        let last = found.last().unwrap().id.clone();
+        let proposed = Ok(Proposed {
+            created: 1,
+            findings: vec![last.clone()],
+            ..Proposed::default()
+        });
+        let recorded = finish(&many, &found, &proposed);
+        let facts: serde_json::Value =
+            serde_json::from_str(recorded.facts.as_deref().unwrap()).unwrap();
+        let kept: Vec<&str> = facts["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(kept.len(), MAX_FINDINGS);
+        assert_eq!(kept[0], "disk_full:data");
+        assert_eq!(kept.last(), Some(&last.as_str()));
     }
 
     #[tokio::test]
@@ -2462,6 +2649,7 @@ mod tests {
             Ok(Proposed {
                 created: 1,
                 urgent: 1,
+                findings: vec!["disk_full:data".into()],
                 ..Proposed::default()
             })
         );
@@ -2512,9 +2700,29 @@ mod tests {
             Ok(Proposed {
                 reopened: 1,
                 urgent: 1,
+                findings: vec!["disk_full:data".into()],
                 ..Proposed::default()
             })
         );
+
+        // Rejections come newest first, at most 50 (ids are UUIDv7, so in
+        // the order they were made and rejected here).
+        let op = [create("budget_over")];
+        let revision = roadmaps::get(&db, &id)
+            .await?
+            .ok_or("roadmap")?
+            .roadmap
+            .revision;
+        let mut made = Vec::new();
+        for _ in 0..51 {
+            let pid = roadmaps::create_proposal(&db, &id, revision, &op, None).await?;
+            roadmaps::reject_proposal(&db, &id, &pid, &device).await?;
+            made.push(pid);
+        }
+        let rejected = roadmaps::rejected_since(&db, &id, now - SNOOZE).await?;
+        assert_eq!(rejected.len(), 50);
+        assert_eq!(Some(&rejected[0].id), made.last());
+        assert!(rejected.windows(2).all(|pair| pair[0].id > pair[1].id));
         Ok(())
     }
 }
