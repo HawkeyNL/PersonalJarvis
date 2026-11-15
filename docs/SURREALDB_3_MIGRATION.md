@@ -84,7 +84,7 @@ Line numbers come from `76668a7`.
 ### 2.1 Schema files and migration runner
 
 - **Schema files:** `schema/surreal/0001_baseline.surql` …
-  `0022_health_review.surql`, 903 lines, 48 tables.
+  `0023_crypto_wallets.surql`, 961 lines, 52 tables.
 - **Statement shape:**
   - Every file is one `BEGIN TRANSACTION; … COMMIT TRANSACTION;` block.
   - Tables are all `SCHEMAFULL PERMISSIONS NONE`.
@@ -133,6 +133,14 @@ Line numbers come from `76668a7`.
     on 2.x RocksDB reporting a write-write conflict at commit; CI tests it
     on a RocksDB server only, the memory engine misses it. Whether 3.x
     behaves the same is **unverified**; the drill must run that test too.
+  - Since `0023_crypto_wallets.surql`: three new, empty tables (read-only
+    crypto wallets, their balances and EUR prices) and a guard table like
+    0022's (`crypto_wallet_guards`, for the 20-wallet cap), with a composite
+    `UNIQUE` index on two strings (`kind, address`), a field `ASSERT` that
+    picks its regex by another field (`address` by `kind`), `ALLINSIDE` on
+    an `array<string, 5>`, and `record::id($value)` on string ids. No
+    existing table or index changes. Tested on 2.6.5, the migration tests
+    on RocksDB.
 - **Index rule (v0.0.87 incident):** 2.x builds an index over existing rows
   in transactions of its own, outside the migration. 0021 first redefined
   the index under its old name; the builder rewrote keys the migration had
@@ -145,7 +153,7 @@ Line numbers come from `76668a7`.
   `DEFINE INDEX OVERWRITE` on a populated table (`crates/store/src/lib.rs`).
   Whether 3.x builds indexes the same way is **unverified**; the drill must
   run the migration tests on RocksDB.
-- **`id` fields:** 44 tables declare `DEFINE FIELD id ON <t> TYPE string`.
+- **`id` fields:** 47 tables declare `DEFINE FIELD id ON <t> TYPE string`.
   - Records are created as `CREATE <t> SET id = $id, …` with a string UUID.
   - Lookups use `WHERE record::id(id) = $id`.
 - **Runner:** `crates/store/src/lib.rs:82-337`.
@@ -479,7 +487,7 @@ tagged otherwise.
    - Compare names and kinds after normalising the output; the format
      differs between majors [unverified].
    - `schema_version:baseline.version` must equal the current version
-     (22 since `0022_health_review.surql`).
+     (23 since `0023_crypto_wallets.surql`).
 3. **Content checksums per table:**
    - Run `SELECT * FROM <t> ORDER BY id` on both sides with `--json`.
    - Normalise with jq: sort keys, canonical datetimes in UTC RFC 3339,

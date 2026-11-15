@@ -11,7 +11,8 @@ use tiny_keccak::{Hasher, Keccak};
 use zeroize::Zeroizing;
 
 /// What kind of address a wallet holds. One EVM address covers every EVM chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum WalletKind {
     Bitcoin,
     Evm,
@@ -19,7 +20,8 @@ pub enum WalletKind {
 }
 
 /// The closed set of supported chains.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Chain {
     Bitcoin,
     Ethereum,

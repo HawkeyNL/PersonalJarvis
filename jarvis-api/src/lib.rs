@@ -29,6 +29,7 @@ pub mod auto_research;
 #[cfg(unix)]
 pub mod broker_replay;
 pub mod budget_gate;
+pub mod crypto;
 mod error;
 mod extract;
 pub mod ibkr;
@@ -194,6 +195,15 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::trading::bars),
         )
         .route("/v1/trading/ibkr/status", get(routes::trading::ibkr_status))
+        .route("/v1/trading/crypto", get(routes::crypto::overview))
+        .route(
+            "/v1/trading/crypto/wallets",
+            post(routes::crypto::create).layer(DefaultBodyLimit::max(routes::crypto::BODY_LIMIT)),
+        )
+        .route(
+            "/v1/trading/crypto/wallets/{id}",
+            delete(routes::crypto::delete).layer(DefaultBodyLimit::max(routes::crypto::BODY_LIMIT)),
+        )
         .route("/v1/trading/meme/overview", get(routes::meme::overview))
         .route("/v1/trading/meme/candidates", get(routes::meme::candidates))
         .route("/v1/trading/meme/trades", get(routes::meme::trades))

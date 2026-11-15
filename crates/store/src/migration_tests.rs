@@ -26,7 +26,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     let mut result = db.query("SELECT version FROM schema_version:baseline; SELECT VALUE display_name FROM users:fixture;").await?.check()?;
     let version: Option<SchemaVersion> = result.take(0)?;
     let names: Vec<String> = result.take(1)?;
-    assert_eq!(version.unwrap().version, 22);
+    assert_eq!(version.unwrap().version, 23);
     assert_eq!(names, ["Migration fixture"]);
     // Cold on-disk rollback is tested against RocksDB by the deployment
     // fixture; WebSocket connections intentionally do not implement exports.
@@ -47,7 +47,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_eleven.unwrap().version, 22);
+    assert_eq!(from_eleven.unwrap().version, 23);
     db.use_db("from_twelve").await?;
     apply_through_twelve(&db).await?;
     // A v12 pairing row has none of the new optional fields and stays valid.
@@ -59,7 +59,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_twelve_version: Option<SchemaVersion> = from_twelve.take(0)?;
-    assert_eq!(from_twelve_version.unwrap().version, 22);
+    assert_eq!(from_twelve_version.unwrap().version, 23);
     let legacy_has_no_ip: Vec<bool> = from_twelve.take(1)?;
     assert_eq!(legacy_has_no_ip, [true]);
     // The database bounds the new fields even if Core validation regressed.
@@ -88,7 +88,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let migrated_version: Option<SchemaVersion> = migrated.take(0)?;
-    assert_eq!(migrated_version.unwrap().version, 22);
+    assert_eq!(migrated_version.unwrap().version, 23);
     let legacy: Vec<String> = migrated.take(1)?;
     assert_eq!(legacy, ["password-set"]);
     db.query("CREATE account_actions SET id = 'reset', user_id = 'fixture', device_id = 'e', action = 'password-reset', target = 'fixture', nonce = <bytes>'n', verifier = NONE, created_at = time::now(), expires_at = time::now() + 5m, consumed_at = NONE;")
@@ -134,7 +134,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_thirteen.unwrap().version, 22);
+    assert_eq!(from_thirteen.unwrap().version, 23);
     // The paper tables enforce their shape even if Core validation regressed.
     let (mint, other) = (
         "So11111111111111111111111111111111111111112",
@@ -187,7 +187,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(from_fourteen.unwrap().version, 22);
+    assert_eq!(from_fourteen.unwrap().version, 23);
     // The IBKR read model enforces its shape even if Core validation regressed.
     let position = |id: &str, extra: &str| {
         format!("CREATE ibkr_positions SET id = '{id}', conid = {id}, symbol = 'VWCE', asset_class = 'STK', currency = 'EUR', quantity = '12.5', avg_cost = '101.25', last_price = '120', market_value = '1500', unrealized_pnl = '-3.5'{extra};")
@@ -232,7 +232,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_fifteen_version: Option<SchemaVersion> = from_fifteen.take(0)?;
-    assert_eq!(from_fifteen_version.unwrap().version, 22);
+    assert_eq!(from_fifteen_version.unwrap().version, 23);
     let legacy_has_no_anchor: Vec<bool> = from_fifteen.take(1)?;
     assert_eq!(legacy_has_no_anchor, [true]);
     db.query(session(
@@ -269,7 +269,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_sixteen_version: Option<SchemaVersion> = from_sixteen.take(0)?;
-    assert_eq!(from_sixteen_version.unwrap().version, 22);
+    assert_eq!(from_sixteen_version.unwrap().version, 23);
     let legacy_has_no_lineage: Vec<bool> = from_sixteen.take(1)?;
     assert_eq!(legacy_has_no_lineage, [true]);
     // Legacy rows still pass every rule when they are written again.
@@ -371,7 +371,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_seventeen_version: Option<SchemaVersion> = from_seventeen.take(0)?;
-    assert_eq!(from_seventeen_version.unwrap().version, 22);
+    assert_eq!(from_seventeen_version.unwrap().version, 23);
     let kept: Vec<String> = from_seventeen.take(1)?;
     assert_eq!(kept, ["momentum-a"]);
     // The roadmap tables enforce their shape even if Core validation regressed.
@@ -507,7 +507,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_eighteen_version: Option<SchemaVersion> = from_eighteen.take(0)?;
-    assert_eq!(from_eighteen_version.unwrap().version, 22);
+    assert_eq!(from_eighteen_version.unwrap().version, 23);
     let kept: Vec<String> = from_eighteen.take(1)?;
     assert_eq!(kept, [r]);
     // The job tables enforce their shape even if Core validation regressed.
@@ -610,7 +610,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_nineteen_version: Option<SchemaVersion> = from_nineteen.take(0)?;
-    assert_eq!(from_nineteen_version.unwrap().version, 22);
+    assert_eq!(from_nineteen_version.unwrap().version, 23);
     let legacy_has_no_attachments: Vec<bool> = from_nineteen.take(1)?;
     assert_eq!(legacy_has_no_attachments, [true]);
     db.query(message(i, &format!(", attachments = ['{r}', '{d}']")))
@@ -661,7 +661,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_twenty_version: Option<SchemaVersion> = from_twenty.take(0)?;
-    assert_eq!(from_twenty_version.unwrap().version, 22);
+    assert_eq!(from_twenty_version.unwrap().version, 23);
     #[derive(serde::Deserialize)]
     struct TableInfo {
         indexes: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
@@ -749,7 +749,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?;
     let from_twentyone_version: Option<SchemaVersion> = from_twentyone.take(0)?;
-    assert_eq!(from_twentyone_version.unwrap().version, 22);
+    assert_eq!(from_twentyone_version.unwrap().version, 23);
     let kinds: Vec<String> = from_twentyone.take(1)?;
     assert_eq!(kinds, ["dependency_review", "prompt"]);
     db.query("UPDATE scheduled_jobs SET at_minute = 0; UPDATE scheduled_job_runs SET summary = 'Kept.', summary_source = 'deterministic';")
@@ -778,6 +778,74 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
     ] {
         assert!(db.query(&bad).await?.check().is_err(), "{bad}");
     }
+    db.use_db("from_twentytwo").await?;
+    apply_through_twentytwo(&db).await?;
+    db.query(job(r, "")).await?.check()?;
+    apply_baseline_schema(&db).await?;
+    let from_twentytwo: Option<SchemaVersion> = db
+        .query("SELECT version FROM schema_version:baseline")
+        .await?
+        .check()?
+        .take(0)?;
+    assert_eq!(from_twentytwo.unwrap().version, 23);
+    // The wallet tables enforce their shape even if Core validation regressed.
+    let evm = format!("0x{}", "ab".repeat(20));
+    let wallet = |id: &str, extra: &str| {
+        format!("CREATE crypto_wallets SET id = '{id}', kind = 'evm', address = '{evm}', chains = ['ethereum', 'base'], created_at = time::now(){extra};")
+    };
+    let solana = "So11111111111111111111111111111111111111112";
+    for good in [
+        wallet(r, ", label = 'Cold storage'"),
+        wallet(i, ", kind = 'bitcoin', address = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4', chains = ['bitcoin']"),
+        wallet(d, ", kind = 'bitcoin', address = '1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2', chains = ['bitcoin'], last_ok_at = time::now()"),
+        wallet(&fresh_id(), &format!(", kind = 'solana', address = '{solana}', chains = ['solana'], other_tokens = 3, error = 'rate_limited'")),
+        format!("CREATE crypto_balances SET id = '{r}:ethereum:eth', wallet_id = '{r}', chain = 'ethereum', asset = 'eth', amount = '1.5', as_of = time::now();"),
+        format!("CREATE crypto_balances SET id = '{r}:base:usdc', wallet_id = '{r}', chain = 'base', asset = 'usdc', amount = '0', as_of = time::now();"),
+        "CREATE crypto_prices SET id = 'eth', eur = '3012.5', as_of = time::now();".to_owned(),
+        "UPSERT crypto_wallet_guards:create SET touched_at = time::now() RETURN NONE;".to_owned(),
+    ] {
+        db.query(&good).await?.check()?;
+    }
+    let other = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    // Each case breaks a rule on an address not stored yet.
+    let spare = format!("0x{}", "cd".repeat(20));
+    let broken = |extra: &str| wallet(x, &format!(", address = '{spare}'{extra}"));
+    let balance = |extra: &str| {
+        format!("CREATE crypto_balances SET id = '{x}:ethereum:eth', wallet_id = '{x}', chain = 'ethereum', asset = 'eth', amount = '2', as_of = time::now(){extra};")
+    };
+    let price = |extra: &str| {
+        format!("CREATE crypto_prices SET id = 'sol', eur = '150', as_of = time::now(){extra};")
+    };
+    for bad in [
+        wallet("wallet", &format!(", address = '0x{}'", "cd".repeat(20))),
+        broken(", kind = 'cardano'"),
+        broken(&format!(", address = '0x{}'", "AB".repeat(20))),
+        broken(", kind = 'bitcoin', chains = ['bitcoin']"),
+        broken(", address = 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx', kind = 'bitcoin', chains = ['bitcoin']"),
+        broken(&format!(", kind = 'solana', address = '{other}'")),
+        broken(", chains = []"),
+        broken(", chains = ['ethereum', 'ethereum']"),
+        broken(", chains = ['ethereum', 'solana']"),
+        broken(", label = ''"),
+        broken(&format!(", label = '{}'", "l".repeat(41))),
+        broken(", error = 'boom'"),
+        broken(", other_tokens = 1"),
+        broken(&format!(", kind = 'solana', address = '{other}', chains = ['solana'], other_tokens = -1")),
+        // The same address twice (the UNIQUE index on kind and address).
+        wallet(x, ""),
+        balance(", wallet_id = 'wallet'"),
+        balance(", chain = 'tron'"),
+        balance(", asset = 'ETH'"),
+        balance(", amount = '-1'"),
+        balance(", amount = '1e5'"),
+        "CREATE crypto_prices SET id = 'SOL', eur = '150', as_of = time::now();".to_owned(),
+        "UPSERT crypto_wallet_guards:create SET touched_at = 'now';".to_owned(),
+        price(", eur = '0'"),
+        price(", eur = '0.000'"),
+        price(", eur = '-150'"),
+    ] {
+        assert!(db.query(&bad).await?.check().is_err(), "{bad}");
+    }
     // A fresh database goes straight to the current schema.
     db.use_db("fresh").await?;
     apply_baseline_schema(&db).await?;
@@ -786,7 +854,7 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .await?
         .check()?
         .take(0)?;
-    assert_eq!(fresh.unwrap().version, 22);
+    assert_eq!(fresh.unwrap().version, 23);
     db.query(photo(r, "")).await?.check()?;
     db.query("UPDATE schema_version:baseline SET version = 99;")
         .await?
