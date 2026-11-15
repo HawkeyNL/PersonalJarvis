@@ -14,7 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use jarvis_llm::privacy::is_private;
+use jarvis_market_data::wallet::{evm_checksum, WalletKind, ASSETS, TOKENS};
+use rust_decimal::Decimal;
 
+use crate::crypto::store::{StoredBalance, Wallet};
 use crate::AppState;
 
 const PER_HOUR: usize = 10;
@@ -150,19 +153,74 @@ pub(crate) async fn start(
     state.auto_research.try_start()
 }
 
-/// The symbols the owner holds per the last IBKR sync (the snapshot runtime
-/// facts read). `None`, so the gate fails closed, when IBKR is linked but the
-/// snapshot cannot be read or does not list every held symbol.
+/// Every word that names something the owner holds: the symbols of the last
+/// IBKR sync (the snapshot runtime facts read) and [`wallet_words`]. Stored
+/// wallets count even while crypto wallets are off: their rows stay. `None`,
+/// so the gate fails closed, when a read fails or takes longer than
+/// [`HOLDINGS_TIMEOUT`], or the IBKR snapshot does not list every held
+/// symbol.
 pub(crate) async fn held_symbols(state: &AppState) -> Option<Vec<String>> {
-    if state.ibkr.is_none() {
-        return Some(Vec::new());
+    let ibkr = async {
+        if state.ibkr.is_none() {
+            return Some(Vec::new());
+        }
+        every_held_symbol(crate::ibkr::store::load_portfolio(&state.db).await.ok())
+    };
+    let read = async {
+        tokio::join!(
+            ibkr,
+            crate::crypto::store::list(&state.db),
+            crate::crypto::store::balances(&state.db),
+        )
+    };
+    let (ibkr, wallets, balances) = tokio::time::timeout(HOLDINGS_TIMEOUT, read).await.ok()?;
+    merge(ibkr, wallets.ok().zip(balances.ok()))
+}
+
+/// The IBKR symbols plus the wallet words; `None` when either is unknown.
+fn merge(
+    ibkr: Option<Vec<String>>,
+    wallets: Option<(Vec<Wallet>, Vec<StoredBalance>)>,
+) -> Option<Vec<String>> {
+    let (wallets, balances) = wallets?;
+    let mut held = ibkr?;
+    held.extend(wallet_words(&wallets, &balances));
+    Some(held)
+}
+
+/// What the crypto wallets give away: every stored address (an EVM one also
+/// in its EIP-55 form); the native coin of every chain of every wallet,
+/// pending ones too; and every allowlisted asset with a balance above zero.
+/// Coins with their symbol and aliases (`ETH`, `ether`, `ethereum`).
+fn wallet_words(wallets: &[Wallet], balances: &[StoredBalance]) -> Vec<String> {
+    let natives = wallets
+        .iter()
+        .flat_map(|wallet| &wallet.chains)
+        .filter_map(|chain| {
+            TOKENS
+                .iter()
+                .find(|token| token.chain == *chain && token.contract.is_none())
+                .map(|token| token.asset)
+        });
+    let held = balances
+        .iter()
+        .filter(|balance| balance.amount > Decimal::ZERO)
+        .map(|balance| balance.asset.as_str());
+    let mut words: Vec<String> = natives
+        .chain(held)
+        .filter_map(|key| ASSETS.iter().find(|asset| asset.key == key))
+        .flat_map(|asset| std::iter::once(asset.symbol).chain(asset.aliases.iter().copied()))
+        .map(str::to_owned)
+        .collect();
+    for wallet in wallets {
+        words.push(wallet.address.clone());
+        if wallet.kind == WalletKind::Evm {
+            words.push(evm_checksum(&wallet.address));
+        }
     }
-    let read = tokio::time::timeout(
-        HOLDINGS_TIMEOUT,
-        crate::ibkr::store::load_portfolio(&state.db),
-    )
-    .await;
-    every_held_symbol(read.ok().and_then(Result::ok))
+    words.sort_unstable();
+    words.dedup();
+    words
 }
 
 /// `snapshot` is `None` when the read failed or timed out, `Some(None)`
@@ -223,6 +281,86 @@ mod tests {
         );
         // More skipped positions than the snapshot names.
         assert_eq!(every_held_symbol(Some(Some(portfolio(2)))), None);
+    }
+
+    #[test]
+    fn wallets_add_addresses_natives_and_held_coins_and_fail_closed() {
+        use jarvis_market_data::wallet::Chain;
+        let wallet = |id: &str, kind, address: &str, chains| Wallet {
+            id: id.into(),
+            kind,
+            address: address.into(),
+            chains,
+            label: Some("Zebra vault".into()),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            last_ok_at: None,
+            error: None,
+            other_tokens: None,
+        };
+        let balance = |wallet_id: &str, chain, asset: &str, amount: &str| StoredBalance {
+            wallet_id: wallet_id.into(),
+            chain,
+            asset: asset.into(),
+            amount: amount.parse().unwrap(),
+        };
+        let solana = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+        let wallets = [
+            // Pending: no balances read yet, its chains' natives count.
+            wallet(
+                "a",
+                WalletKind::Evm,
+                "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+                vec![Chain::Base, Chain::Polygon],
+            ),
+            wallet("b", WalletKind::Solana, solana, vec![Chain::Solana]),
+        ];
+        let balances = [
+            balance("b", Chain::Solana, "usdc", "12.5"),
+            balance("b", Chain::Solana, "usdt", "0"),
+            balance("b", Chain::Solana, "scam", "1000"),
+        ];
+        let words = wallet_words(&wallets, &balances);
+        for expected in [
+            "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+            "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            solana,
+            "ETH",
+            "ether",
+            "ethereum",
+            "POL",
+            "matic",
+            "polygon",
+            "SOL",
+            "solana",
+            "USDC",
+            "usd coin",
+        ] {
+            assert!(words.iter().any(|word| word == expected), "{expected}");
+        }
+        // A zero balance, an asset off the allowlist and the label are not held.
+        for absent in ["USDT", "tether", "scam", "Zebra vault", "BTC"] {
+            assert!(!words.iter().any(|word| word == absent), "{absent}");
+        }
+
+        let ibkr = Some(vec!["ASML".to_owned()]);
+        let held = merge(ibkr.clone(), Some((wallets.to_vec(), balances.to_vec()))).unwrap();
+        for private in [
+            "Will ASML rise?",
+            "Is Ether a good buy?",
+            "news about usd coin",
+            "What does 0x5AAEB6053F3E94C9B9A09F33669435E7EF1BEAED hold?",
+            "Polygon upgrade",
+        ] {
+            assert!(is_private(private, &held), "{private}");
+        }
+        assert!(!is_private("Will cardano rise?", &held));
+        // A failed or late read on either side fails closed.
+        assert_eq!(merge(None, Some((wallets.to_vec(), Vec::new()))), None);
+        assert_eq!(merge(ibkr, None), None);
+        assert_eq!(
+            merge(Some(Vec::new()), Some((Vec::new(), Vec::new()))),
+            Some(Vec::new())
+        );
     }
 
     #[test]

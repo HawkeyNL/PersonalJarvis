@@ -195,6 +195,7 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::trading::bars),
         )
         .route("/v1/trading/ibkr/status", get(routes::trading::ibkr_status))
+        .route("/v1/trading/total", get(routes::crypto::portfolio_total))
         .route("/v1/trading/crypto", get(routes::crypto::overview))
         .route(
             "/v1/trading/crypto/wallets",
