@@ -82,6 +82,20 @@ pub struct JobProposal {
     pub body: serde_json::Value,
 }
 
+/// A roadmap the answer proposed (docs/ROADMAPS.md, "From chat"). Advisory
+/// and not stored: only the owner's Add sends `body` (a checked route body),
+/// to `POST /v1/roadmaps` for a new roadmap or, with `roadmap_id`, to
+/// `POST /v1/roadmaps/{roadmap_id}/items/batch`. `title` is the new or the
+/// existing roadmap's title. `id` lets the app show each proposal once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoadmapProposal {
+    pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roadmap_id: Option<String>,
+    pub title: String,
+    pub body: serde_json::Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum Event {
@@ -122,6 +136,10 @@ pub enum Event {
         /// when there are none and from older Cores.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         job_proposals: Vec<JobProposal>,
+        /// At most one roadmap the answer proposed for the owner to add.
+        /// Absent when there is none and from older Cores.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roadmap_proposals: Vec<RoadmapProposal>,
     },
     #[serde(rename = "assistant.failed")]
     AssistantFailed {
@@ -419,11 +437,13 @@ mod tests {
             },
             research_offer: None,
             job_proposals: Vec::new(),
+            roadmap_proposals: Vec::new(),
         };
         // Without an offer the payload keeps the old shape, so old payloads decode.
         let old = serde_json::to_value(&completed).unwrap();
         assert!(old["payload"].get("research_offer").is_none());
         assert!(old["payload"].get("job_proposals").is_none());
+        assert!(old["payload"].get("roadmap_proposals").is_none());
         assert_eq!(serde_json::from_value::<Event>(old).unwrap(), completed);
 
         if let Event::AssistantCompleted { research_offer, .. } = &mut completed {
@@ -452,6 +472,39 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_value::<Event>(proposed).unwrap(),
+            completed
+        );
+
+        if let Event::AssistantCompleted {
+            roadmap_proposals, ..
+        } = &mut completed
+        {
+            roadmap_proposals.push(RoadmapProposal {
+                id: Uuid::from_u128(10),
+                roadmap_id: None,
+                title: "Trip".into(),
+                body: serde_json::json!({"title": "Trip", "items": []}),
+            });
+            roadmap_proposals.push(RoadmapProposal {
+                id: Uuid::from_u128(11),
+                roadmap_id: Some("0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into()),
+                title: "Jarvis".into(),
+                body: serde_json::json!({"items": [{"title": "Ship"}]}),
+            });
+        }
+        let roadmaps = serde_json::to_value(&completed).unwrap();
+        assert_eq!(
+            roadmaps["payload"]["roadmap_proposals"],
+            serde_json::json!([
+                {"id": "00000000-0000-0000-0000-00000000000a", "title": "Trip",
+                    "body": {"title": "Trip", "items": []}},
+                {"id": "00000000-0000-0000-0000-00000000000b",
+                    "roadmap_id": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "title": "Jarvis",
+                    "body": {"items": [{"title": "Ship"}]}}
+            ])
+        );
+        assert_eq!(
+            serde_json::from_value::<Event>(roadmaps).unwrap(),
             completed
         );
     }

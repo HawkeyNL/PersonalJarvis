@@ -39,16 +39,18 @@ pub(crate) fn last_line(text: &str) -> (usize, &str) {
 }
 
 /// Most text [`MarkerHold`] holds back: room for every marker an answer may
-/// carry at its longest (3 jobs, one of Jarvis's own, the web search).
+/// carry at its longest (3 jobs, one of Jarvis's own, the web search, one
+/// roadmap).
 /// `job_markers::take` takes no marker beyond it, so what it takes off was
 /// never streamed.
-pub(crate) const MAX_HOLD_BYTES: usize = 5 * crate::routes::jobs::BODY_LIMIT;
+pub(crate) const MAX_HOLD_BYTES: usize =
+    5 * crate::routes::jobs::BODY_LIMIT + crate::roadmap_markers::MAX_ROADMAP_LINE;
 
-/// Streams reply deltas without trailing markers (this one and the job
-/// markers): trailing whitespace and the trailing lines that start with `[[`,
-/// or could, wait for more text, up to [`MAX_HOLD_BYTES`]. What is held back
-/// when the stream ends is never sent; the completed message carries the
-/// final text.
+/// Streams reply deltas without trailing markers (this one, the job and the
+/// roadmap markers): trailing whitespace and the trailing lines that start
+/// with `[[`, or could, wait for more text, up to [`MAX_HOLD_BYTES`]. What
+/// is held back when the stream ends is never sent; the completed message
+/// carries the final text.
 #[derive(Default)]
 pub(crate) struct MarkerHold {
     text: String,
@@ -470,7 +472,7 @@ mod tests {
             "A\n[[x]]\n[[y]]\nB"
         );
         // Bounded: beyond the cap the oldest held lines are sent.
-        let links = format!("A\n{}", "[[link]]\n".repeat(4000));
+        let links = format!("A\n{}", "[[link]]\n".repeat(6000));
         let sent = stream(&[&links]);
         assert!(sent.len() < links.trim_end().len());
         assert!(sent.len() + MAX_HOLD_BYTES >= links.trim_end().len());

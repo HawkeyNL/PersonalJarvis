@@ -249,6 +249,7 @@ mod tests {
             },
             research_offer: None,
             job_proposals: Vec::new(),
+            roadmap_proposals: Vec::new(),
         }
     }
     fn enabled_gate(run: &RunIdentity) -> VoiceGate {

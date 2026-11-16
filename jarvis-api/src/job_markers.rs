@@ -25,6 +25,7 @@ use crate::AppState;
 pub(crate) const MAX_PROPOSALS: usize = 3;
 const JOB: &str = "[[job ";
 const JOB_SELF: &str = "[[job_self ";
+const ROADMAP: &str = "[[roadmap ";
 /// A marker line longer than a job route's body is refused.
 const MAX_LINE_BYTES: usize = crate::routes::jobs::BODY_LIMIT;
 const WEEKDAYS: [&str; 7] = [
@@ -48,12 +49,17 @@ pub(crate) struct Markers {
     pub job_self: Vec<String>,
     /// Any job marker line was taken, valid or not.
     pub any_job: bool,
+    /// The JSON of each `[[roadmap …]]` line, in reply order.
+    pub roadmaps: Vec<String>,
+    /// Any roadmap marker line was taken, valid or not.
+    pub any_roadmap: bool,
 }
 
 /// Takes the trailing marker lines off `text`: `[[web_search]]`,
-/// `[[job …]]` and `[[job_self …]]` in any order, and any other trailing line
-/// starting with `[[job` (dropped). Trailing `[[photo:N]]` lines among them
-/// stay, after the text, for the photo markers. Nothing beyond
+/// `[[job …]]`, `[[job_self …]]` and `[[roadmap …]]` in any order, and any
+/// other trailing line starting with `[[job` or `[[roadmap` (dropped; a
+/// roadmap one still counts in `any_roadmap`). Trailing `[[photo:N]]` lines
+/// among them stay, after the text, for the photo markers. Nothing beyond
 /// [`MAX_HOLD_BYTES`] from the end is taken (it stays text), so what is taken
 /// was never streamed.
 pub(crate) fn take(text: &mut String) -> Markers {
@@ -79,6 +85,15 @@ pub(crate) fn take(text: &mut String) -> Markers {
             } else {
                 tracing::info!("malformed job marker dropped");
             }
+        } else if line.starts_with("[[roadmap") {
+            markers.any_roadmap = true;
+            match line
+                .strip_prefix(ROADMAP)
+                .and_then(|json| json.strip_suffix("]]"))
+            {
+                Some(json) => markers.roadmaps.push(json.to_owned()),
+                None => tracing::info!("malformed roadmap marker dropped"),
+            }
         } else {
             break;
         }
@@ -92,6 +107,7 @@ pub(crate) fn take(text: &mut String) -> Markers {
     }
     markers.jobs.reverse();
     markers.job_self.reverse();
+    markers.roadmaps.reverse();
     markers
 }
 
@@ -487,8 +503,9 @@ mod tests {
             (text, markers)
         };
         let (text, markers) = taken(
-            "Answer.\n[[job {\"a\":1}]]\n\n[[web_search]]\n[[job {\"b\":2}]]\n\
-             [[job_self {\"c\":3}]]\n[[job broken\n",
+            "Answer.\n[[job {\"a\":1}]]\n[[roadmap {\"title\":\"T\"}]]\n\n[[web_search]]\n\
+             [[job {\"b\":2}]]\n[[job_self {\"c\":3}]]\n[[roadmap {\"d\":4}]]\n[[job broken\n\
+             [[roadmap {\"cut\":\n",
         );
         assert_eq!(text, "Answer.");
         assert_eq!(
@@ -498,14 +515,22 @@ mod tests {
                 jobs: vec!["{\"a\":1}".into(), "{\"b\":2}".into()],
                 job_self: vec!["{\"c\":3}".into()],
                 any_job: true,
+                roadmaps: vec!["{\"title\":\"T\"}".into(), "{\"d\":4}".into()],
+                any_roadmap: true,
             }
         );
+        // A cut-off roadmap line alone is taken and counts, with no JSON.
+        let (text, markers) = taken("Answer.\n[[roadmap {\"title\":\"T\",\"items\":[");
+        assert_eq!(text, "Answer.");
+        assert!(markers.any_roadmap && markers.roadmaps.is_empty());
         // A marker before ordinary text, or inline, is ordinary text.
         for kept in [
             "[[job {}]]\nAnswer.",
             "Answer. [[job {}]]",
             "Use [[job_self {}]] like this.\nDone.",
             "Answer.\n[[JOB {}]]",
+            "Answer.\n[[Roadmap {}]]",
+            "[[roadmap {}]]\nAnswer.",
         ] {
             assert_eq!(taken(kept), (kept.to_owned(), Markers::default()), "{kept}");
         }
@@ -516,7 +541,7 @@ mod tests {
         assert_eq!(text, "Answer.\n[[photo:1]]");
         assert!(markers.web_search && markers.jobs.len() == 1);
         // Nothing beyond what streaming holds back is taken: it stays text.
-        let far = format!("Answer.\n[[job {{}}]]\n{}", "[[job x]]\n".repeat(3000));
+        let far = format!("Answer.\n[[job {{}}]]\n{}", "[[job x]]\n".repeat(5000));
         let (text, markers) = taken(&far);
         assert!(text.starts_with("Answer.\n[[job {}]]\n[[job x]]"));
         assert!(!markers.jobs.iter().any(|json| json == "{}"));

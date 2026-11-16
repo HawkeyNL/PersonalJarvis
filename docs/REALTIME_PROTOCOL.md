@@ -68,6 +68,13 @@ Public events:
   `POST /v1/jobs` body; only the owner's confirmation sends it, and `id`
   only lets the app show each proposal once. Advisory and not stored;
   absent when there are none, so older apps keep working.
+  Such an answer may also carry `roadmap_proposals`: at most one
+  `{"id": "<uuid>", "roadmap_id"?: "<uuid>", "title": "…", "body": {…}}`,
+  a roadmap the answer proposed (see "From chat" in `ROADMAPS.md`). Without
+  `roadmap_id`, `body` is a checked `POST /v1/roadmaps` body; with it, a
+  checked `POST /v1/roadmaps/{roadmap_id}/items/batch` body and `title` is
+  that roadmap's title. Only the owner's Add sends it. Advisory and not
+  stored; absent when there is none.
 - `assistant.failed` with a fixed safe reason code
 - `voice.owner_changed`, `voice.started`, `voice.stopped`, `voice.failed`
 - `trading.meme.strategy_changed` with `strategy_id`, `version` and `enabled`,

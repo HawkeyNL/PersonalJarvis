@@ -24,9 +24,12 @@ use crate::jobs::{Origin, MAX_JARVIS_JOBS, MAX_OWNER_JOBS, TIME_ZONE};
 use crate::AppState;
 
 /// Hard cap for the whole block (preface included): 2304 bytes, plus 1024
-/// for the job lines and 768 for the crypto lines, so they take no room from
-/// the others.
-const MAX_BYTES: usize = 4 * 1024;
+/// for the job lines, 768 for the crypto lines and 512 for the roadmap line,
+/// so they take no room from the others.
+const MAX_BYTES: usize = 4 * 1024 + 512;
+/// Items the model is told to keep a roadmap card to; Core's cap is
+/// [`crate::roadmaps::MAX_BULK_ITEMS`].
+const CARD_ITEMS: usize = 25;
 /// One owner-configured value (a model id, an agent name) cannot crowd out
 /// the other lines.
 const MAX_LINE_BYTES: usize = 400;
@@ -124,6 +127,8 @@ pub(super) struct Facts<'a> {
     /// Whether this answer may make a research job of Jarvis's own: also
     /// Research and automatic web search on, what its runs need.
     pub own_jobs: bool,
+    /// Whether this answer may propose a roadmap (a runs-API answer).
+    pub roadmaps: bool,
     /// `None` when no agent bundle is loaded.
     pub agents: Option<Vec<String>>,
     pub ibkr: Ibkr,
@@ -158,6 +163,7 @@ pub(super) async fn system_prompt(state: &AppState, runs_api: bool) -> String {
         auto_search: runs_api && research && routing.research_auto(),
         jobs,
         own_jobs: runs_api && crate::jobs::chat::research_on(state, Origin::Jarvis),
+        roadmaps: runs_api,
         agents: state.agent_registry.as_deref().map(|loader| {
             let snapshot = loader.snapshot();
             snapshot
@@ -396,6 +402,16 @@ fn lines(facts: &Facts) -> Vec<String> {
                  {MAX_JARVIS_JOBS} own research jobs used."
             ));
         }
+    }
+    if facts.roadmaps {
+        lines.push(format!(
+            "Roadmaps: if asked, end your reply with one line [[roadmap {{\"title\":\"Trip\",\
+             \"phases\":[\"Now\"],\"items\":[{{\"title\":\"Book\",\"status\":\"planned\",\
+             \"phase\":\"Now\"}}]}}]]; to add items, \"roadmap\":\"<its title>\" replaces title. \
+             Statuses planned, in_progress, ready, live, blocked; optional notes. Max {CARD_ITEMS} \
+             items; for more, the owner asks \"add items to roadmap X\". No URLs. The owner taps \
+             Add: never say it is done."
+        ));
     }
     lines.push(format!(
         "Current time, to the hour: {hour} ({}). An age like [3 h ago] on an earlier owner \
@@ -661,6 +677,7 @@ mod tests {
             auto_search: false,
             jobs: None,
             own_jobs: false,
+            roadmaps: false,
             agents: Some(vec!["Research".into(), "Trading".into()]),
             ibkr,
             crypto: Crypto::NotEnabled,
@@ -796,6 +813,7 @@ mod tests {
             auto_search: true,
             jobs: Some((4, 1)),
             own_jobs: true,
+            roadmaps: true,
             ..facts(&routing, synced())
         };
         let block = render(&full(), MAX_BYTES);
@@ -808,7 +826,9 @@ mod tests {
             "max_runs, notify.\nOwn research jobs: only for research you yourself want",
             "it expires in 30 days and Core tells the owner, so never say it is set up. Never \
              for jobs the owner asked for, no links or sites. 1 of 3 own research jobs used.\n\
-             Current time",
+             Roadmaps: if asked, end your reply with one line [[roadmap {\"title\":\"Trip\",",
+            "Max 25 items; for more, the owner asks \"add items to roadmap X\". No URLs. The \
+             owner taps Add: never say it is done.\nCurrent time",
         ] {
             assert!(block.contains(expected), "missing {expected:?} in {block}");
         }
@@ -830,9 +850,32 @@ mod tests {
         .map(|line| line.len() + 1)
         .sum();
         assert!(
-            job_lines <= MAX_BYTES - (2 * 1024 + 256) - 768,
+            job_lines <= MAX_BYTES - (2 * 1024 + 256) - 768 - 512,
             "{job_lines}"
         );
+        // The roadmap line has a budget of its own and is never clipped.
+        let roadmap = block
+            .lines()
+            .find(|line| line.starts_with("Roadmaps:"))
+            .unwrap();
+        assert!(roadmap.len() < MAX_LINE_BYTES - '…'.len_utf8(), "{roadmap}");
+        assert!(roadmap.len() < 512);
+        // Its example is a marker Core accepts.
+        let example = roadmap
+            .split_once("[[roadmap ")
+            .and_then(|(_, rest)| rest.split_once("]]"))
+            .unwrap()
+            .0;
+        let marker: serde_json::Value = serde_json::from_str(example).unwrap();
+        assert_eq!(marker["items"][0]["status"], "planned");
+        let no_roadmaps = render(
+            &Facts {
+                roadmaps: false,
+                ..full()
+            },
+            MAX_BYTES,
+        );
+        assert!(!no_roadmaps.contains("[[roadmap"));
         assert!(block.len() <= MAX_BYTES);
         assert!(block.ends_with("\nNon-EUR positions, not tracked (1): FIXUSD."));
         for line in block.lines() {
@@ -1021,6 +1064,7 @@ mod tests {
             auto_search: true,
             jobs: Some((10, 10)),
             own_jobs: true,
+            roadmaps: true,
             crypto,
             ..facts(&routing, Ibkr::Synced(portfolio(1000, 80)))
         };
