@@ -17,6 +17,8 @@ use time::OffsetDateTime;
 /// Roadmaps that are not archived.
 pub const MAX_ROADMAPS: usize = 20;
 pub const MAX_ITEMS: usize = 300;
+/// Items one write may add: a new roadmap's first items or one batch.
+pub const MAX_BULK_ITEMS: usize = 100;
 /// Pending, unexpired proposals per roadmap.
 pub const MAX_PENDING_PROPOSALS: usize = 10;
 pub const MAX_PROPOSAL_OPS: usize = 20;
@@ -187,6 +189,9 @@ pub struct NewRoadmap {
     pub description: Option<String>,
     #[serde(default)]
     pub phases: Vec<String>,
+    /// The first items, at most [`MAX_BULK_ITEMS`].
+    #[serde(default)]
+    pub items: Vec<NewItem>,
 }
 
 /// Absent fields stay; `description: null` clears it. Items in a removed
@@ -415,6 +420,43 @@ pub fn validate_new_roadmap(input: &NewRoadmap) -> Result<()> {
     validate_roadmap_title(&input.title)?;
     validate_description(input.description.as_deref())?;
     validate_phases(&input.phases)
+}
+
+/// A new roadmap with its first items, as a draft at revision 1: its changes
+/// are `roadmap_created` and one `item_created` per item.
+pub fn new_draft(input: &NewRoadmap) -> Result<Draft> {
+    validate_new_roadmap(input)?;
+    check(
+        input.items.len() <= MAX_BULK_ITEMS,
+        "at most 100 items at once",
+    )?;
+    let now = OffsetDateTime::now_utc();
+    let mut draft = Draft::new(Snapshot {
+        roadmap: Roadmap {
+            id: uuid::Uuid::now_v7().to_string(),
+            title: input.title.clone(),
+            description: input.description.clone(),
+            phases: input.phases.clone(),
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        },
+        items: Vec::new(),
+    });
+    draft.changes.push(Change {
+        action: Action::RoadmapCreated,
+        item_id: None,
+        title: input.title.clone(),
+        fields: Vec::new(),
+        from_status: None,
+        to_status: None,
+    });
+    for item in &input.items {
+        draft.create_item(item)?;
+    }
+    draft.finish()?;
+    Ok(draft)
 }
 
 /// True when following `depends_on` from some item leads back to it.
@@ -1057,6 +1099,7 @@ mod tests {
             title: "Plan".into(),
             description: Some("Line\nline".into()),
             phases: vec!["Now".into(), "Next".into()],
+            items: Vec::new(),
         };
         assert!(validate_new_roadmap(&ok).is_ok());
         for bad in [
@@ -1087,6 +1130,68 @@ mod tests {
         ] {
             assert!(validate_new_roadmap(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_new_roadmap_draft_holds_its_items() {
+        let plan = |items: Vec<NewItem>| NewRoadmap {
+            title: "Plan".into(),
+            description: None,
+            phases: vec!["Now".into()],
+            items,
+        };
+        let draft = new_draft(&plan(vec![
+            NewItem {
+                phase: Some("Now".into()),
+                status: Status::Live,
+                ..new_item("A")
+            },
+            new_item("B"),
+        ]))
+        .unwrap();
+        assert_eq!(draft.roadmap.revision, 1);
+        let positions: Vec<_> = draft
+            .items
+            .iter()
+            .map(|i| (&*i.title, i.position))
+            .collect();
+        assert_eq!(positions, [("A", 0), ("B", 1)]);
+        let changes: Vec<_> = draft
+            .changes
+            .iter()
+            .map(|c| (c.action, c.to_status))
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                (Action::RoadmapCreated, None),
+                (Action::ItemCreated, Some(Status::Live)),
+                (Action::ItemCreated, Some(Status::Planned)),
+            ]
+        );
+        assert_eq!(draft.writes().creates.len(), 2);
+        assert!(new_draft(&plan(Vec::new())).unwrap().items.is_empty());
+        // Every item follows the item rules; at most 100 at once.
+        for bad in [
+            vec![NewItem {
+                phase: Some("Later".into()),
+                ..new_item("x")
+            }],
+            vec![new_item(" ")],
+            vec![new_item("x"); MAX_BULK_ITEMS + 1],
+        ] {
+            assert!(
+                matches!(new_draft(&plan(bad)), Err(RoadmapError::Invalid(_))),
+                "refused"
+            );
+        }
+        assert_eq!(
+            new_draft(&plan(vec![new_item("x"); MAX_BULK_ITEMS]))
+                .unwrap()
+                .items
+                .len(),
+            MAX_BULK_ITEMS
+        );
     }
 
     #[test]

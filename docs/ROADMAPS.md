@@ -24,11 +24,12 @@ refused. Each database call is bounded by 10 seconds (503 when it fails).
 | Method | Path | Does |
 | --- | --- | --- |
 | GET | `/v1/roadmaps[?archived=true]` | The roadmaps that are not archived, oldest first; or the 100 most recently archived |
-| POST | `/v1/roadmaps` | Create: `{title, description?, phases?}` |
+| POST | `/v1/roadmaps` | Create: `{title, description?, phases?, items?}`, with up to 100 items |
 | GET | `/v1/roadmaps/{id}` | The roadmap with its items (also when archived) |
 | PATCH | `/v1/roadmaps/{id}?expected_revision=N` | Change `title`, `description` (`null` clears) or `phases` |
 | DELETE | `/v1/roadmaps/{id}?expected_revision=N` | Archive; nothing is deleted |
 | POST | `/v1/roadmaps/{id}/items?expected_revision=N` | Add an item; the answer also has `item_id` |
+| POST | `/v1/roadmaps/{id}/items/batch?expected_revision=N` | Add 1 to 100 items: `{"items": [{…}, …]}`; the answer also has `item_ids`, in input order |
 | PATCH | `/v1/roadmaps/{id}/items/{item}?expected_revision=N` | Change an item; absent fields stay, `phase: null` and `notes: null` clear |
 | DELETE | `/v1/roadmaps/{id}/items/{item}?expected_revision=N` | Delete an item; items that depended on it no longer do |
 | GET | `/v1/roadmaps/{id}/history?limit=1..100` | The newest changes (default 50), newest first |
@@ -56,6 +57,12 @@ revision it was made on (`expected_revision`, required); if the roadmap has
 moved on, nothing is written and the answer is 409, so the client reloads
 and tries again. A write that changes nothing writes nothing and keeps the
 revision.
+
+A new roadmap with `items`, and a batch, are each one write: every item
+follows the rules below, and if one item is refused nothing is written. A
+new roadmap starts at revision 1 with all its items; a batch raises the
+revision by one. Both stay within the 64 KiB body cap. A Core without the
+batch route answers 405.
 
 After every committed write (the owner's, an accepted proposal or the
 GitHub poller's) Core sends the realtime event
@@ -101,6 +108,7 @@ must not contain control or invisible characters.
 | --- | --- |
 | Roadmaps that are not archived | 20 |
 | Items per roadmap | 300 |
+| Items per write (a new roadmap's items, a batch) | 100 |
 | Pending proposals per roadmap | 10 |
 | Operations per proposal | 20 |
 | Proposal lifetime | 14 days |
@@ -116,7 +124,9 @@ changes, the `action` (`roadmap_created`, `roadmap_updated`,
 `item_id`, the title at the time, the changed `fields` and, for a status
 change, `from_status` and `to_status`. The schema enforces the attribution:
 an owner change has a device, a GitHub change none, and a Jarvis change is
-always an accepted proposal accepted from a device.
+always an accepted proposal accepted from a device. A write with several
+items writes one row per item, all at the same revision; a new roadmap's
+items are at revision 1 with its `roadmap_created` row.
 
 The hourly audit housekeeping deletes changes older than 365 days, marks
 pending proposals past their 14 days as `expired` and deletes proposals

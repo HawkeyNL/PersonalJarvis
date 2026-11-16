@@ -2059,13 +2059,14 @@ async fn memecoin_strategies_disable_at_once_and_enable_only_with_a_fresh_signat
     Ok(())
 }
 
-const ROADMAP_ROUTES: [(&str, &str); 12] = [
+const ROADMAP_ROUTES: [(&str, &str); 13] = [
     ("GET", "/v1/roadmaps"),
     ("POST", "/v1/roadmaps"),
     ("GET", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"),
     ("PATCH", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b?expected_revision=1"),
     ("DELETE", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b?expected_revision=1"),
     ("POST", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/items?expected_revision=1"),
+    ("POST", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/items/batch?expected_revision=1"),
     ("PATCH", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/items/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c?expected_revision=1"),
     ("DELETE", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/items/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c?expected_revision=1"),
     ("GET", "/v1/roadmaps/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/history?limit=5"),
@@ -2386,6 +2387,61 @@ async fn roadmap_sync_and_link_allowlist_routes() -> Result<(), Box<dyn std::err
     let kept = update(3, json!([pr("x/y", 1), pr("a/b", 3)])).await?;
     assert_eq!(kept.status(), StatusCode::OK);
     assert_eq!(json_body(kept).await["roadmap"]["revision"], 4);
+
+    // A batch: the same rules and allowlist, all items in one revision.
+    let batch = |revision: u64, body: Value| {
+        call(
+            &allow,
+            "POST",
+            &format!("{base}/items/batch?expected_revision={revision}"),
+            Some(body),
+        )
+    };
+    for bad in [
+        json!({"items": []}),
+        json!({"items": [{"title": "C"}], "extra": 1}),
+        json!({"items": [{"title": "C"}, {"title": ""}]}),
+        json!({"items": [{"title": "C", "links": [pr("x/y", 5)]}]}),
+    ] {
+        let status = batch(4, bad.clone()).await?.status();
+        assert!(status.is_client_error(), "{bad} {status}");
+    }
+    assert_eq!(
+        batch(3, json!({"items": [{"title": "C"}]})).await?.status(),
+        StatusCode::CONFLICT
+    );
+    let added = batch(
+        4,
+        json!({"items": [{"title": "C", "links": [pr("a/b", 5)]}, {"title": "D"}]}),
+    )
+    .await?;
+    assert_eq!(added.status(), StatusCode::OK);
+    let added = json_body(added).await;
+    assert_eq!(added["roadmap"]["revision"], 5);
+    assert_eq!(added["items"].as_array().map(Vec::len), Some(4));
+    assert_eq!(added["item_ids"][0], added["items"][2]["id"]);
+    assert_eq!(added["item_ids"][1], added["items"][3]["id"]);
+
+    // A new roadmap's items: the same allowlist, all at revision 1.
+    let outside = json!({"title": "Other", "items": [{"title": "A", "links": [pr("x/y", 1)]}]});
+    assert_eq!(
+        call(&allow, "POST", "/v1/roadmaps", Some(outside))
+            .await?
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let made = call(
+        &allow,
+        "POST",
+        "/v1/roadmaps",
+        Some(json!({"title": "Other", "phases": ["Now"],
+            "items": [{"title": "A", "phase": "Now", "links": [pr("a/b", 1)]}]})),
+    )
+    .await?;
+    assert_eq!(made.status(), StatusCode::OK);
+    let made = json_body(made).await;
+    assert_eq!(made["roadmap"]["revision"], 1);
+    assert_eq!(made["items"][0]["phase"], "Now");
     Ok(())
 }
 

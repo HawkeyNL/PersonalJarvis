@@ -864,6 +864,7 @@ mod tests {
             title: "Plan".into(),
             description: None,
             phases: Vec::new(),
+            items: Vec::new(),
         };
         let roadmap = store::create(&db, &plan, &device, &hub).await?;
         let id = roadmap.roadmap.id.clone();
