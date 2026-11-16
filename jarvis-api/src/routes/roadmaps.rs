@@ -75,6 +75,13 @@ pub(crate) struct RevisionQuery {
     expected_revision: u64,
 }
 
+/// The body of `POST /v1/roadmaps/{id}/items/batch`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NewItems {
+    items: Vec<NewItem>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HistoryQuery {
@@ -95,6 +102,10 @@ pub(crate) async fn create(
     State(state): State<AppState>,
     Json(input): Json<NewRoadmap>,
 ) -> ApiResult {
+    state
+        .github
+        .check_links(input.items.iter().flat_map(|item| &item.links))
+        .map_err(bad_request)?;
     let device = authed.device.id.to_string();
     bounded(store::create(&state.db, &input, &device, &state.realtime))
         .await
@@ -174,6 +185,34 @@ pub(crate) async fn create_item(
     .await?;
     let mut body = json!(roadmap);
     body["item_id"] = item_id.into();
+    Ok(Json(body))
+}
+
+/// Add 1 to 100 items in one revision; the answer also has `item_ids`, in
+/// input order.
+pub(crate) async fn create_items(
+    authed: Authed,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(revision): Query<RevisionQuery>,
+    Json(input): Json<NewItems>,
+) -> ApiResult {
+    state
+        .github
+        .check_links(input.items.iter().flat_map(|item| &item.links))
+        .map_err(bad_request)?;
+    let device = authed.device.id.to_string();
+    let (item_ids, roadmap) = bounded(store::create_items(
+        &state.db,
+        &id.to_string(),
+        revision.expected_revision,
+        &input.items,
+        &device,
+        &state.realtime,
+    ))
+    .await?;
+    let mut body = json!(roadmap);
+    body["item_ids"] = json!(item_ids);
     Ok(Json(body))
 }
 

@@ -250,6 +250,11 @@ pub fn build_router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(routes::roadmaps::BODY_LIMIT)),
         )
         .route(
+            "/v1/roadmaps/{id}/items/batch",
+            post(routes::roadmaps::create_items)
+                .layer(DefaultBodyLimit::max(routes::roadmaps::BODY_LIMIT)),
+        )
+        .route(
             "/v1/roadmaps/{id}/items/{item}",
             patch(routes::roadmaps::update_item)
                 .delete(routes::roadmaps::delete_item)

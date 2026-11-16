@@ -2656,6 +2656,7 @@ mod tests {
             title: "Te fixen".into(),
             description: None,
             phases: Vec::new(),
+            items: Vec::new(),
         };
         let id = roadmaps::create(&db, &plan, &device, &hub)
             .await?

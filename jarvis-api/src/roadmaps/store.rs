@@ -18,10 +18,10 @@ use jarvis_store::Database;
 
 use super::github::GithubHandle;
 use super::{
-    added_links, check, text, validate_new_roadmap, Action, Change, Draft, Item, ItemPatch,
-    NewItem, NewRoadmap, ProposalOp, Result, Roadmap, RoadmapError, RoadmapPatch, Snapshot, Status,
-    HISTORY_RETENTION_DAYS, MAX_HISTORY, MAX_ITEMS, MAX_OP_BYTES, MAX_PENDING_PROPOSALS,
-    MAX_PROPOSAL_OPS, MAX_RATIONALE, MAX_ROADMAPS, PROPOSAL_TTL_DAYS,
+    added_links, check, new_draft, text, Action, Change, Draft, Item, ItemPatch, NewItem,
+    NewRoadmap, ProposalOp, Result, Roadmap, RoadmapError, RoadmapPatch, Snapshot, Status,
+    HISTORY_RETENTION_DAYS, MAX_BULK_ITEMS, MAX_HISTORY, MAX_ITEMS, MAX_OP_BYTES,
+    MAX_PENDING_PROPOSALS, MAX_PROPOSAL_OPS, MAX_RATIONALE, MAX_ROADMAPS, PROPOSAL_TTL_DAYS,
 };
 use crate::realtime::Hub;
 
@@ -42,6 +42,11 @@ const WRITE_CHANGES: &str = "FOR $c IN $changes { CREATE roadmap_changes SET id 
      device_id = $device, proposal_id = $proposal, action = $c.action, item_id = $c.item_id, \
      title = $c.title, fields = $c.fields, from_status = $c.from_status, \
      to_status = $c.to_status RETURN NONE; };";
+/// Creates the items `$creates` of roadmap `$id`.
+const CREATE_ITEMS: &str = "FOR $item IN $creates { CREATE roadmap_items SET id = $item.id, \
+     roadmap_id = $id, title = $item.title, status = $item.status, phase = $item.phase, \
+     position = $item.position, notes = $item.notes, depends_on = $item.depends_on, \
+     links = $item.links, created_at = time::now(), updated_at = time::now() RETURN NONE; };";
 
 async fn run(db: &Database, query: &str, bindings: Value) -> Result<surrealdb::Response> {
     Ok(db.query(query).bind(bindings).await?.check()?)
@@ -117,7 +122,8 @@ pub async fn get(db: &Database, id: &str) -> Result<Option<Snapshot>> {
     Ok(Some(Snapshot { roadmap, items }))
 }
 
-/// Create a roadmap. At most [`MAX_ROADMAPS`] are not archived.
+/// Create a roadmap with its first items (see [`new_draft`]) in one
+/// transaction. At most [`MAX_ROADMAPS`] are not archived.
 // ponytail: the count and the insert touch no shared key, so two concurrent
 // creates can end at 21; add a counter row both write if that ever matters.
 pub async fn create(
@@ -126,16 +132,8 @@ pub async fn create(
     device_id: &str,
     events: &Hub,
 ) -> Result<Snapshot> {
-    validate_new_roadmap(input)?;
-    let id = uuid::Uuid::now_v7().to_string();
-    let changes = [Change {
-        action: Action::RoadmapCreated,
-        item_id: None,
-        title: input.title.clone(),
-        fields: Vec::new(),
-        from_status: None,
-        to_status: None,
-    }];
+    let draft = new_draft(input)?;
+    let id = &draft.roadmap.id;
     let response = db
         .query(format!(
             "BEGIN TRANSACTION; \
@@ -144,6 +142,7 @@ pub async fn create(
              CREATE roadmaps SET id = $id, title = $title, description = $description, \
                phases = $phases, revision = $revision, created_at = time::now(), \
                updated_at = time::now() RETURN NONE; \
+             {CREATE_ITEMS} \
              {WRITE_CHANGES} \
              COMMIT TRANSACTION;"
         ))
@@ -153,7 +152,8 @@ pub async fn create(
             "description": input.description,
             "phases": input.phases,
             "revision": 1,
-            "changes": changes_json(&changes)?,
+            "creates": draft.writes().creates,
+            "changes": changes_json(&draft.changes)?,
             "author": "owner",
             "device": device_id,
             "proposal": None::<String>,
@@ -165,8 +165,8 @@ pub async fn create(
         }
         return Err(error.into());
     }
-    announce(events, &id, 1);
-    get(db, &id).await?.ok_or(RoadmapError::InvalidData)
+    announce(events, id, 1);
+    get(db, id).await?.ok_or(RoadmapError::InvalidData)
 }
 
 /// The roadmap as a draft, if it may be changed at `expected` (any revision
@@ -226,11 +226,7 @@ async fn commit(
                position = $item.position, notes = $item.notes, depends_on = $item.depends_on, \
                links = $item.links, updated_at = time::now() \
                WHERE roadmap_id = $id AND record::id(id) = $item.id RETURN NONE; }}; \
-             FOR $item IN $creates {{ CREATE roadmap_items SET id = $item.id, roadmap_id = $id, \
-               title = $item.title, status = $item.status, phase = $item.phase, \
-               position = $item.position, notes = $item.notes, depends_on = $item.depends_on, \
-               links = $item.links, created_at = time::now(), updated_at = time::now() \
-               RETURN NONE; }}; \
+             {CREATE_ITEMS} \
              {WRITE_CHANGES} \
              LET $decided = (UPDATE roadmap_proposals SET status = 'accepted', \
                decided_at = time::now(), decided_by = $device \
@@ -339,6 +335,28 @@ pub async fn create_item(
     let mut draft = load(db, id, Some(expected)).await?;
     let item_id = draft.create_item(input)?;
     Ok((item_id, save(db, draft, device_id, events).await?))
+}
+
+/// Add 1 to [`MAX_BULK_ITEMS`] items in one revision; returns their ids, in
+/// input order, and the roadmap.
+pub async fn create_items(
+    db: &Database,
+    id: &str,
+    expected: u64,
+    input: &[NewItem],
+    device_id: &str,
+    events: &Hub,
+) -> Result<(Vec<String>, Snapshot)> {
+    check(
+        (1..=MAX_BULK_ITEMS).contains(&input.len()),
+        "1 to 100 items at once",
+    )?;
+    let mut draft = load(db, id, Some(expected)).await?;
+    let item_ids = input
+        .iter()
+        .map(|item| draft.create_item(item))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((item_ids, save(db, draft, device_id, events).await?))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -710,6 +728,7 @@ mod tests {
             title: title.into(),
             description: None,
             phases: vec!["Now".into(), "Next".into()],
+            items: Vec::new(),
         }
     }
 
@@ -965,6 +984,89 @@ mod tests {
             create(&db, &plan("One too many"), &device, events).await,
             Err(RoadmapError::Limit(_))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn bulk_items_are_one_revision_or_nothing(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = database().await?;
+        let device = uuid::Uuid::now_v7().to_string();
+        let hub = Hub::default();
+        let events = &hub;
+        let mut listener = listen(&hub);
+        let titles = |snapshot: &Snapshot| -> Vec<String> {
+            snapshot.items.iter().map(|i| i.title.clone()).collect()
+        };
+
+        // A new roadmap with items: one revision, audited per item.
+        let first = NewRoadmap {
+            items: vec![
+                NewItem {
+                    phase: Some("Now".into()),
+                    status: Status::Live,
+                    ..item("A")
+                },
+                item("B"),
+            ],
+            ..plan("Plan")
+        };
+        let created = create(&db, &first, &device, events).await?;
+        let id = created.roadmap.id.clone();
+        assert_eq!(created.roadmap.revision, 1);
+        assert_eq!(titles(&created), ["A", "B"]);
+        assert_eq!(created.items[0].status, Status::Live);
+        assert_eq!(heard(&mut listener), [(id.clone(), 1)]);
+        let mut actions: Vec<(u64, Action)> = history(&db, &id, MAX_HISTORY)
+            .await?
+            .iter()
+            .map(|c| (c.revision, c.action))
+            .collect();
+        actions.sort_by_key(|(_, action)| *action != Action::RoadmapCreated);
+        assert_eq!(
+            actions,
+            [
+                (1, Action::RoadmapCreated),
+                (1, Action::ItemCreated),
+                (1, Action::ItemCreated)
+            ]
+        );
+        // One invalid item creates nothing at all.
+        let refused = NewRoadmap {
+            items: vec![item("C"), item(" ")],
+            ..plan("Refused")
+        };
+        assert!(matches!(
+            create(&db, &refused, &device, events).await,
+            Err(RoadmapError::Invalid(_))
+        ));
+        assert_eq!(list(&db, false).await?.len(), 1);
+
+        // A batch on an existing roadmap: one revision, ids in input order.
+        let (ids, roadmap) =
+            create_items(&db, &id, 1, &[item("C"), item("D")], &device, events).await?;
+        assert_eq!(roadmap.roadmap.revision, 2);
+        assert_eq!(titles(&roadmap), ["A", "B", "C", "D"]);
+        assert_eq!(
+            ids,
+            [roadmap.items[2].id.clone(), roadmap.items[3].id.clone()]
+        );
+        assert_eq!(heard(&mut listener), [(id.clone(), 2)]);
+        // Empty, too many, stale or one invalid item: nothing is written.
+        for (revision, items) in [
+            (2, Vec::new()),
+            (2, vec![item("x"); MAX_BULK_ITEMS + 1]),
+            (1, vec![item("E")]),
+            (2, vec![item("E"), item(" ")]),
+        ] {
+            assert!(create_items(&db, &id, revision, &items, &device, events)
+                .await
+                .is_err());
+        }
+        let roadmap = get(&db, &id).await?.ok_or("roadmap missing")?;
+        assert_eq!((roadmap.roadmap.revision, roadmap.items.len()), (2, 4));
+        assert!(heard(&mut listener).is_empty());
         Ok(())
     }
 
