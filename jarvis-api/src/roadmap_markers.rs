@@ -48,6 +48,15 @@ struct MarkerItem {
     links: Vec<Link>,
 }
 
+/// A marker checked as far as it can be without the database.
+#[derive(Debug, PartialEq)]
+enum Parsed {
+    /// The exact `POST /v1/roadmaps` body.
+    New { title: String, body: Value },
+    /// Items for the live roadmap with the title `name`, in any case.
+    Items { name: String, items: Vec<NewItem> },
+}
+
 /// A marker checked as far as it can be without the roadmap's items.
 #[derive(Debug, PartialEq)]
 enum Checked {
@@ -66,9 +75,9 @@ fn web_link(text: &str) -> bool {
     text.contains("://") || text.contains("www.")
 }
 
-/// The marker's JSON checked against the GitHub allowlist and the live
-/// (not archived) roadmaps. `Err` names the rule it broke, for the log.
-fn check(json: &str, github: &GithubHandle, live: &[Roadmap]) -> Result<Checked, &'static str> {
+/// The marker's JSON checked on its own and against the GitHub allowlist.
+/// `Err` names the rule it broke, for the log.
+fn parse(json: &str, github: &GithubHandle) -> Result<Parsed, &'static str> {
     if json.len() > MAX_ROADMAP_LINE {
         return Err("too long");
     }
@@ -127,9 +136,6 @@ fn check(json: &str, github: &GithubHandle, live: &[Roadmap]) -> Result<Checked,
     }
     match (marker.title, marker.roadmap) {
         (Some(title), None) => {
-            if live.len() >= MAX_ROADMAPS {
-                return Err("roadmap limit");
-            }
             let mut body = json!({
                 "title": title,
                 "description": marker.description,
@@ -141,7 +147,7 @@ fn check(json: &str, github: &GithubHandle, live: &[Roadmap]) -> Result<Checked,
             }
             let input: NewRoadmap = serde_json::from_value(body.clone()).map_err(|_| "body")?;
             new_draft(&input).map_err(|_| "invalid roadmap")?;
-            Ok(Checked::New { title, body })
+            Ok(Parsed::New { title, body })
         }
         (None, Some(name)) => {
             if marker.description.is_some() || marker.phases.is_some() {
@@ -150,9 +156,32 @@ fn check(json: &str, github: &GithubHandle, live: &[Roadmap]) -> Result<Checked,
             if items.is_empty() {
                 return Err("no items");
             }
-            let mut found = live
-                .iter()
-                .filter(|roadmap| roadmap.title.to_lowercase() == name.to_lowercase());
+            Ok(Parsed::Items { name, items })
+        }
+        _ => Err("title or roadmap"),
+    }
+}
+
+/// A parsed marker checked against the live (not archived) roadmaps: a new
+/// one within the limit and with a title of its own, items for exactly one.
+fn check(parsed: Parsed, live: &[Roadmap]) -> Result<Checked, &'static str> {
+    let named = |name: &str| {
+        let name = name.to_lowercase();
+        live.iter()
+            .filter(move |roadmap| roadmap.title.to_lowercase() == name)
+    };
+    match parsed {
+        Parsed::New { title, body } => {
+            if live.len() >= MAX_ROADMAPS {
+                Err("roadmap limit")
+            } else if named(&title).next().is_some() {
+                Err("title taken")
+            } else {
+                Ok(Checked::New { title, body })
+            }
+        }
+        Parsed::Items { name, items } => {
+            let mut found = named(&name);
             match (found.next(), found.next()) {
                 (Some(roadmap), None) => Ok(Checked::Items {
                     roadmap: roadmap.clone(),
@@ -162,7 +191,6 @@ fn check(json: &str, github: &GithubHandle, live: &[Roadmap]) -> Result<Checked,
                 (Some(_), Some(_)) => Err("ambiguous roadmap"),
             }
         }
-        _ => Err("title or roadmap"),
     }
 }
 
@@ -179,7 +207,8 @@ fn check_items(snapshot: Snapshot, items: &[NewItem]) -> Result<(), &'static str
 }
 
 /// Why an answer's roadmap marker gets no card. `split` when the line was
-/// cut off, too long or not JSON: a smaller card may fit.
+/// cut off, too long, not JSON or held too many items: a smaller card may
+/// fit.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Refused {
     pub split: bool,
@@ -188,7 +217,10 @@ pub(crate) struct Refused {
 fn refused(reason: &'static str) -> Refused {
     tracing::info!(reason, "roadmap marker dropped");
     Refused {
-        split: matches!(reason, "malformed" | "too long" | "not json"),
+        split: matches!(
+            reason,
+            "malformed" | "too long" | "not json" | "too many items"
+        ),
     }
 }
 
@@ -206,8 +238,9 @@ async fn read<T>(
 
 /// The card for the first `[[roadmap …]]` line of an answer (`lines` holds
 /// the JSON of the well-formed ones; empty when every one was malformed).
-/// Reads the roadmaps, writes nothing. Anything refused is logged without
-/// its text.
+/// Reads the roadmaps only once the line passed every check that needs no
+/// database, and writes nothing. Anything refused is logged without its
+/// text.
 pub(crate) async fn proposal(
     state: &AppState,
     lines: &[String],
@@ -216,8 +249,9 @@ pub(crate) async fn proposal(
     if lines.len() > 1 {
         tracing::info!(dropped = lines.len() - 1, "extra roadmap markers dropped");
     }
+    let parsed = parse(json, &state.github).map_err(refused)?;
     let live = read(store::list(&state.db, false)).await?;
-    match check(json, &state.github, &live).map_err(refused)? {
+    match check(parsed, &live).map_err(refused)? {
         Checked::New { title, body } => Ok(RoadmapProposal {
             id: Uuid::now_v7(),
             roadmap_id: None,
@@ -264,18 +298,22 @@ mod tests {
         github::configure("HawkeyNL/PersonalJarvis", None).0
     }
 
+    fn run(json: &str, github: &GithubHandle, live: &[Roadmap]) -> Result<Checked, &'static str> {
+        parse(json, github).and_then(|parsed| check(parsed, live))
+    }
+
     fn checked(json: &str) -> Result<Checked, &'static str> {
-        check(json, &allowlist(), &[roadmap("Jarvis"), roadmap("Trip")])
+        run(json, &allowlist(), &[roadmap("Jarvis"), roadmap("Old")])
     }
 
     #[test]
     fn a_new_roadmap_becomes_the_exact_create_body() {
-        let json = r#"{"title":"Jarvis","description":"What ships when.","phases":["Done","Now"],"items":[{"title":"Roadmaps","status":"live","phase":"Done","notes":"Line one\nline two","links":[{"kind":"pr","repo":"HawkeyNL/PersonalJarvis","number":294}]},{"title":"Chat cards","phase":"Now"}]}"#;
+        let json = r#"{"title":"Core","description":"What ships when.","phases":["Done","Now"],"items":[{"title":"Roadmaps","status":"live","phase":"Done","notes":"Line one\nline two","links":[{"kind":"pr","repo":"HawkeyNL/PersonalJarvis","number":294}]},{"title":"Chat cards","phase":"Now"}]}"#;
         assert_eq!(
             checked(json),
             Ok(Checked::New {
-                title: "Jarvis".into(),
-                body: json!({"title": "Jarvis", "description": "What ships when.",
+                title: "Core".into(),
+                body: json!({"title": "Core", "description": "What ships when.",
                     "phases": ["Done", "Now"], "items": [
                         {"title": "Roadmaps", "status": "live", "phase": "Done",
                             "notes": "Line one\nline two", "links": [{"kind": "pr",
@@ -290,7 +328,7 @@ mod tests {
         assert_eq!(body, json!({"title": "Empty", "phases": [], "items": []}));
         assert!(serde_json::from_value::<NewRoadmap>(body).is_ok()); // The runtime facts' example.
         assert!(checked(
-            r#"{"title":"Trip","phases":["Now"],"items":[{"title":"Book","status":"planned","phase":"Now"}]}"#
+            r#"{"title":"Trip","phases":["Now"],"items":[{"title":"Book","phase":"Now"}]}"#
         )
         .is_ok());
     }
@@ -338,13 +376,20 @@ mod tests {
             ..items[0].clone()
         }];
         assert_eq!(check_items(snapshot(0), &later), Err("invalid items"));
+        // An escaped bidi character is refused on the roadmap's rules too.
+        let Ok(Checked::Items { items: hidden, .. }) =
+            checked(r#"{"roadmap":"Jarvis","items":[{"title":"a\u202eb"}]}"#)
+        else {
+            panic!("refused early");
+        };
+        assert_eq!(check_items(snapshot(0), &hidden), Err("invalid items"));
         let mut archived = snapshot(0);
         archived.roadmap.archived_at = Some(OffsetDateTime::now_utc());
         assert_eq!(check_items(archived, &items), Err("archived"));
         // No match, or two roadmaps with that title, is refused.
         let two = [roadmap("Jarvis"), roadmap("JARVIS")];
         assert_eq!(
-            check(json, &allowlist(), &two).map(|_| ()),
+            run(json, &allowlist(), &two).map(|_| ()),
             Err("ambiguous roadmap")
         );
         assert_eq!(
@@ -373,6 +418,12 @@ mod tests {
             ("not json", "not json"),
             (long.as_str(), "too long"),
             ("{\"title\":\"a\u{202e}b\"}", "hidden characters"),
+            // Escaped in the JSON, the text rules still refuse it.
+            (r#"{"title":"a\u202eb"}"#, "invalid roadmap"),
+            (
+                r#"{"title":"T","items":[{"title":"x","notes":"a\u202Eb"}]}"#,
+                "invalid roadmap",
+            ),
             (r#"{"title":"T","extra":1}"#, "not a roadmap"),
             (
                 r#"{"title":"T","items":[{"title":"x","position":1}]}"#,
@@ -436,7 +487,7 @@ mod tests {
         assert!(checked(&pr("hawkeynl/personaljarvis")).is_ok());
         // Without an allowlist no link is offered at all.
         assert_eq!(
-            check(
+            run(
                 &pr("HawkeyNL/PersonalJarvis"),
                 &GithubHandle::default(),
                 &[]
@@ -447,20 +498,28 @@ mod tests {
         // The 20-roadmap limit holds for a new one only.
         let full: Vec<Roadmap> = (0..MAX_ROADMAPS).map(|n| roadmap(&n.to_string())).collect();
         assert_eq!(
-            check(r#"{"title":"T"}"#, &allowlist(), &full).map(|_| ()),
+            run(r#"{"title":"T"}"#, &allowlist(), &full).map(|_| ()),
             Err("roadmap limit")
         );
-        assert!(check(
+        assert!(run(
             r#"{"roadmap":"7","items":[{"title":"x"}]}"#,
             &allowlist(),
             &full
         )
         .is_ok());
-        // Cut off or not JSON: the reply asks for a smaller card.
+        // A new roadmap needs a title no live roadmap has.
+        assert_eq!(
+            checked(r#"{"title":"OLD"}"#).map(|_| ()),
+            Err("title taken")
+        );
+        // The cheap checks need no live roadmaps.
+        assert_eq!(parse("not json", &allowlist()), Err("not json"));
+        // Cut off, not JSON or too big: the reply asks for a smaller card.
         for (reason, split) in [
             ("malformed", true),
             ("too long", true),
             ("not json", true),
+            ("too many items", true),
             ("not a roadmap", false),
             ("web link", false),
         ] {

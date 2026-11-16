@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use jarvis_client_core::realtime::JobProposal;
 
-use crate::auto_research::{last_line, MAX_HOLD_BYTES, WEB_SEARCH_MARKER};
+use crate::auto_research::{beyond_hold, last_line, WEB_SEARCH_MARKER};
 use crate::jobs::store;
 use crate::jobs::{Cadence, Job, Kind, NewJob, Origin, Params, DB_TIMEOUT, MAX_OWNER_JOBS};
 use crate::notify::{JobResult, NotifyEvent};
@@ -60,15 +60,15 @@ pub(crate) struct Markers {
 /// other trailing line starting with `[[job` or `[[roadmap` (dropped; a
 /// roadmap one still counts in `any_roadmap`). Trailing `[[photo:N]]` lines
 /// among them stay, after the text, for the photo markers. Nothing beyond
-/// [`MAX_HOLD_BYTES`] from the end is taken (it stays text), so what is taken
-/// was never streamed.
+/// [`crate::auto_research::MAX_HOLD_BYTES`] from the end is taken (it stays
+/// text) but a `[[roadmap` line, so what is taken was never streamed.
 pub(crate) fn take(text: &mut String) -> Markers {
     let total = text.len();
     let mut markers = Markers::default();
     let mut photos = Vec::new();
     loop {
         let (keep, line) = last_line(text);
-        if line.is_empty() || total - keep > MAX_HOLD_BYTES {
+        if line.is_empty() || beyond_hold(total - keep, line) {
             break;
         }
         if line == WEB_SEARCH_MARKER {
@@ -476,6 +476,7 @@ fn schedule(job: &Job) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auto_research::MAX_HOLD_BYTES;
 
     fn now() -> OffsetDateTime {
         OffsetDateTime::parse(
@@ -546,6 +547,15 @@ mod tests {
         assert!(text.starts_with("Answer.\n[[job {}]]\n[[job x]]"));
         assert!(!markers.jobs.iter().any(|json| json == "{}"));
         assert!(far.len() - text.len() <= MAX_HOLD_BYTES + 1);
+        // A roadmap line is taken at any length, whatever stands before it.
+        let huge = format!(
+            "[[roadmap {{\"title\":\"{}\"}}]]",
+            "a".repeat(MAX_HOLD_BYTES)
+        );
+        let (text, markers) = taken(&format!("Answer.\n{huge}\n[[web_search]]"));
+        assert_eq!(text, "Answer.");
+        assert_eq!(markers.roadmaps.len(), 1);
+        assert!(markers.web_search);
         // The web search marker alone keeps its old meaning.
         let (text, markers) = taken("Answer.\n[[web_search]]");
         assert_eq!(text, "Answer.");

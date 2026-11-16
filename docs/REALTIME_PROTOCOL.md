@@ -174,13 +174,14 @@ schema-migration deployment procedure is required before any future release.
 
 ## Streaming and recovery
 
-Core removes the trailing `[[web_search]]`, `[[job …]]` and
-`[[job_self …]]` lines from every chat answer before it is stored or
+Core removes the trailing `[[web_search]]`, `[[job …]]`, `[[job_self …]]`
+and `[[roadmap …]]` lines from every chat answer before it is stored or
 published. While deltas stream, trailing whitespace and the trailing lines
-that start with `[[` (or could) wait for more text, up to 20 KiB; what is held
+that start with `[[` (or could) wait for more text, up to 36 KiB; what is held
 back when the stream ends is never sent as a delta, and the completed message
-carries the final text. A marker line further than 20 KiB from the end stays
-in the text, so no removed marker was ever streamed.
+carries the final text. A marker line further than 36 KiB from the end stays
+in the text, so no removed marker was ever streamed. A `[[roadmap` line is
+the exception: it always waits and is always removed, whatever its length.
 
 The provider-neutral `chat_stream` interface defaults to a final-only result.
 OpenAI-compatible backends decode bounded SSE and emit only `delta.content`.

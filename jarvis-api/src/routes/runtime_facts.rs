@@ -405,12 +405,11 @@ fn lines(facts: &Facts) -> Vec<String> {
     }
     if facts.roadmaps {
         lines.push(format!(
-            "Roadmaps: if asked, end your reply with one line [[roadmap {{\"title\":\"Trip\",\
-             \"phases\":[\"Now\"],\"items\":[{{\"title\":\"Book\",\"status\":\"planned\",\
-             \"phase\":\"Now\"}}]}}]]; to add items, \"roadmap\":\"<its title>\" replaces title. \
-             Statuses planned, in_progress, ready, live, blocked; optional notes. Max {CARD_ITEMS} \
-             items; for more, the owner asks \"add items to roadmap X\". No URLs. The owner taps \
-             Add: never say it is done."
+            "Roadmaps: if asked, end your reply with [[roadmap {{\"title\":\"Trip\",\
+             \"phases\":[\"Now\"],\"items\":[{{\"title\":\"Book\",\"phase\":\"Now\"}}]}}]] on \
+             one line. Item status: planned, in_progress, ready, live, blocked. To add items: \
+             \"roadmap\":\"<its title>\" replaces title; no phase unless named. Max {CARD_ITEMS} \
+             items, more via \"add items to roadmap X\". No URLs. Owner taps Add: never say done."
         ));
     }
     lines.push(format!(
@@ -826,9 +825,10 @@ mod tests {
             "max_runs, notify.\nOwn research jobs: only for research you yourself want",
             "it expires in 30 days and Core tells the owner, so never say it is set up. Never \
              for jobs the owner asked for, no links or sites. 1 of 3 own research jobs used.\n\
-             Roadmaps: if asked, end your reply with one line [[roadmap {\"title\":\"Trip\",",
-            "Max 25 items; for more, the owner asks \"add items to roadmap X\". No URLs. The \
-             owner taps Add: never say it is done.\nCurrent time",
+             Roadmaps: if asked, end your reply with [[roadmap {\"title\":\"Trip\",",
+            "\"roadmap\":\"<its title>\" replaces title; no phase unless named. Max 25 items, \
+             more via \"add items to roadmap X\". No URLs. Owner taps Add: never say done.\n\
+             Current time",
         ] {
             assert!(block.contains(expected), "missing {expected:?} in {block}");
         }
@@ -858,8 +858,7 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("Roadmaps:"))
             .unwrap();
-        assert!(roadmap.len() < MAX_LINE_BYTES - '…'.len_utf8(), "{roadmap}");
-        assert!(roadmap.len() < 512);
+        assert!(roadmap.len() <= 370, "{}", roadmap.len());
         // Its example is a marker Core accepts.
         let example = roadmap
             .split_once("[[roadmap ")
@@ -867,7 +866,7 @@ mod tests {
             .unwrap()
             .0;
         let marker: serde_json::Value = serde_json::from_str(example).unwrap();
-        assert_eq!(marker["items"][0]["status"], "planned");
+        assert_eq!(marker["items"][0]["phase"], "Now");
         let no_roadmaps = render(
             &Facts {
                 roadmaps: false,

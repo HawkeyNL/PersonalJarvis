@@ -191,7 +191,8 @@ steered, so the rules are stricter than the routes':
 - One line of at most 16 KiB without hidden or bidi characters, parsed
   strictly (unknown fields refused).
 - Exactly one of `title` (a new roadmap, with optional `description` and
-  `phases`) or `roadmap` (an existing one; `description` and `phases` are
+  `phases`; no roadmap that is not archived may have that title, ignoring
+  case) or `roadmap` (an existing one; `description` and `phases` are
   refused).
 - 0 to 100 items for a new roadmap, 1 to 100 for an existing one; the
   20-roadmap and 300-item limits hold as the marker is checked.
@@ -210,12 +211,16 @@ steered, so the rules are stricter than the routes':
 A refused marker is logged without its text. The answer then ends with
 `I could not set up that roadmap.`, followed by `Ask for fewer items at
 once, then add the rest with "add items to roadmap …".` when the line was
-cut off, too long or not JSON. An answer that was only the marker is stored
-as `Tap Add below to create it.` when a card follows.
+cut off, too long, not JSON or held over 100 items. A `[[roadmap` line is
+never streamed and is taken off at any length (unlike the job markers, it
+has no 36 KiB limit; the reply's token cap bounds it), so an oversized one
+is refused, not shown. An answer that was only the marker is stored as
+`Tap Add below to confirm.` when a card follows.
 
 The runtime facts of a runs-API answer explain the marker and ask the model
-to keep a card to 25 items and to let the owner ask "add items to roadmap X"
-for more.
+to keep a card to 25 items, to let the owner ask "add items to roadmap X"
+for more, and to leave out `phase` on added items unless the owner named
+one.
 
 ## GitHub
 

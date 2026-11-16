@@ -852,7 +852,7 @@ const JOB_PROPOSED_REPLY: &str = "Here is a scheduled job for you to confirm.";
 const OWN_JOB_REPLY: &str = "I will follow this up myself.";
 const JOB_REFUSED_REPLY: &str = "I could not set up that job.";
 /// Stored when a reply was nothing but a roadmap marker that became a card.
-const ROADMAP_PROPOSED_REPLY: &str = "Tap Add below to create it.";
+const ROADMAP_PROPOSED_REPLY: &str = "Tap Add below to confirm.";
 /// Added when a roadmap marker became no card.
 const ROADMAP_REFUSED_REPLY: &str = "I could not set up that roadmap.";
 /// Added when the marker was cut off or not JSON.

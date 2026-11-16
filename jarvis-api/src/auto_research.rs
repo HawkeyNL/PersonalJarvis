@@ -40,17 +40,24 @@ pub(crate) fn last_line(text: &str) -> (usize, &str) {
 
 /// Most text [`MarkerHold`] holds back: room for every marker an answer may
 /// carry at its longest (3 jobs, one of Jarvis's own, the web search, one
-/// roadmap).
-/// `job_markers::take` takes no marker beyond it, so what it takes off was
-/// never streamed.
+/// roadmap). `job_markers::take` takes no marker beyond it, so what it takes
+/// off was never streamed. A `[[roadmap` line is the exception: it is held
+/// and taken at any length (the reply's own token cap bounds it), so an
+/// oversized one is refused instead of shown.
 pub(crate) const MAX_HOLD_BYTES: usize =
     5 * crate::routes::jobs::BODY_LIMIT + crate::roadmap_markers::MAX_ROADMAP_LINE;
 
+/// Whether a trailing marker line, `from_end` bytes from the end of the
+/// reply, is too far back to hold or take.
+pub(crate) fn beyond_hold(from_end: usize, line: &str) -> bool {
+    from_end > MAX_HOLD_BYTES && !line.starts_with("[[roadmap")
+}
+
 /// Streams reply deltas without trailing markers (this one, the job and the
 /// roadmap markers): trailing whitespace and the trailing lines that start
-/// with `[[`, or could, wait for more text, up to [`MAX_HOLD_BYTES`]. What
-/// is held back when the stream ends is never sent; the completed message
-/// carries the final text.
+/// with `[[`, or could, wait for more text, up to [`MAX_HOLD_BYTES`] (a
+/// `[[roadmap` line always waits). What is held back when the stream ends is
+/// never sent; the completed message carries the final text.
 #[derive(Default)]
 pub(crate) struct MarkerHold {
     text: String,
@@ -65,7 +72,7 @@ impl MarkerHold {
         loop {
             let (keep, line) = last_line(&self.text[..end]);
             let marker = line.starts_with("[[") || "[[".starts_with(line);
-            if line.is_empty() || !marker || self.text.len() - keep > MAX_HOLD_BYTES {
+            if line.is_empty() || !marker || beyond_hold(self.text.len() - keep, line) {
                 break;
             }
             end = keep;
@@ -476,5 +483,25 @@ mod tests {
         let sent = stream(&[&links]);
         assert!(sent.len() < links.trim_end().len());
         assert!(sent.len() + MAX_HOLD_BYTES >= links.trim_end().len());
+        // A roadmap line is never sent, however long, nor what it holds
+        // back behind it; text before it still is.
+        let roadmap = format!(
+            "Plan.\n[[roadmap {{\"title\":\"T\",\"description\":\"{}\"}}]]\n[[web_search]]",
+            "a".repeat(2 * MAX_HOLD_BYTES)
+        );
+        let chunks: Vec<&str> = roadmap
+            .as_bytes()
+            .chunks(1000)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect();
+        let mut hold = MarkerHold::default();
+        for chunk in &chunks {
+            let ready = hold.push(chunk);
+            assert!(
+                !ready.contains("[[roadmap") && !ready.contains("[[web"),
+                "{ready}"
+            );
+        }
+        assert_eq!(stream(&chunks), "Plan.");
     }
 }
