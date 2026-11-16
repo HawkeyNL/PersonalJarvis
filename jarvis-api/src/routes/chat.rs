@@ -487,8 +487,9 @@ pub(super) async fn execute_chat(
         Ok(mut reply) => {
             let (research_advised, markers) =
                 research_advised(&mut reply.text, requested_mode, intent_kind);
-            // Only an ordinary runs-API answer may propose or make jobs; a
-            // research answer and the legacy endpoint only lose the markers.
+            // Only an ordinary runs-API answer may propose or make jobs or
+            // propose a roadmap; a research answer and the legacy endpoint
+            // only lose the markers.
             // A job of Jarvis's own searches the web without the owner's
             // click, so a turn with photos never makes one.
             let honoured = realtime_run.is_some()
@@ -518,15 +519,44 @@ pub(super) async fn execute_chat(
                 held.as_deref(),
             )
             .await;
-            if markers.any_job && reply.text.trim().is_empty() {
+            let roadmap = if honoured && markers.any_roadmap {
+                Some(crate::roadmap_markers::proposal(&state, &markers.roadmaps).await)
+            } else {
+                None
+            };
+            // The owner asked for a roadmap: say what follows, or that no
+            // card does.
+            let roadmap_note = match &roadmap {
+                None => None,
+                Some(Ok(_)) => reply
+                    .text
+                    .trim()
+                    .is_empty()
+                    .then_some(ROADMAP_PROPOSED_REPLY.to_owned()),
+                Some(Err(crate::roadmap_markers::Refused { split: true })) => {
+                    Some(format!("{ROADMAP_REFUSED_REPLY} {ROADMAP_SPLIT_HINT}"))
+                }
+                Some(Err(_)) => Some(ROADMAP_REFUSED_REPLY.to_owned()),
+            };
+            if let Some(note) = roadmap_note {
+                reply.text = if reply.text.trim().is_empty() {
+                    note
+                } else {
+                    format!("{}\n\n{note}", reply.text.trim_end())
+                };
+            }
+            let roadmap_proposals: Vec<_> = roadmap.and_then(Result::ok).into_iter().collect();
+            if (markers.any_job || markers.any_roadmap) && reply.text.trim().is_empty() {
                 reply.text = if requested_mode == llm::RoutingMode::Research {
                     RESEARCH_EMPTY
                 } else if !job_proposals.is_empty() {
                     JOB_PROPOSED_REPLY
                 } else if own_job.is_some() {
                     OWN_JOB_REPLY
-                } else {
+                } else if markers.any_job {
                     JOB_REFUSED_REPLY
+                } else {
+                    ROADMAP_REFUSED_REPLY
                 }
                 .into();
             } else if honoured && !markers.jobs.is_empty() && job_proposals.is_empty() {
@@ -632,6 +662,7 @@ pub(super) async fn execute_chat(
                         message,
                         research_offer,
                         job_proposals,
+                        roadmap_proposals,
                     },
                 );
                 state.realtime.publish(
@@ -695,6 +726,7 @@ pub(super) async fn execute_chat(
                         message,
                         research_offer: None,
                         job_proposals: Vec::new(),
+                        roadmap_proposals: Vec::new(),
                     },
                 );
             }
@@ -819,6 +851,13 @@ const MARKER_ONLY_REPLY: &str = "I can't answer this reliably without a web sear
 const JOB_PROPOSED_REPLY: &str = "Here is a scheduled job for you to confirm.";
 const OWN_JOB_REPLY: &str = "I will follow this up myself.";
 const JOB_REFUSED_REPLY: &str = "I could not set up that job.";
+/// Stored when a reply was nothing but a roadmap marker that became a card.
+const ROADMAP_PROPOSED_REPLY: &str = "Tap Add below to confirm.";
+/// Added when a roadmap marker became no card.
+const ROADMAP_REFUSED_REPLY: &str = "I could not set up that roadmap.";
+/// Added when the marker was cut off or not JSON.
+const ROADMAP_SPLIT_HINT: &str = "Ask for fewer items at once, then add the rest with \
+\"add items to roadmap …\".";
 /// The model the note on a job of Jarvis's own is stored under, like a
 /// job's fixed messages.
 const JOB_NOTE_MODEL: &str = "job";
@@ -1040,6 +1079,7 @@ async fn auto_research_run(
                     message,
                     research_offer: None,
                     job_proposals: Vec::new(),
+                    roadmap_proposals: Vec::new(),
                 },
             );
             state.realtime.publish(

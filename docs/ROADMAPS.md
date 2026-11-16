@@ -161,6 +161,67 @@ also reads the proposals the owner rejected in the last 7 days
 (`roadmaps::store::rejected_since`) and does not propose what they held
 again until then.
 
+## From chat
+
+The owner can ask Jarvis for a roadmap in chat. An ordinary chat answer
+through the runs API may end with one marker line, which Core takes off the
+answer like the job markers (see "From chat" in `SCHEDULED_JOBS.md`: only
+trailing lines, never stored or streamed, honoured only on such answers and
+never on the legacy endpoint, an explicit Research answer, an automatic web
+search's answer or a job run's output). Only the first such line counts.
+
+```
+[[roadmap {"title":"Jarvis","description":"…","phases":["Done","Now"],"items":[{"title":"Roadmaps","status":"live","phase":"Done","notes":"…","links":[{"kind":"pr","repo":"HawkeyNL/PersonalJarvis","number":294}]}]}]]
+[[roadmap {"roadmap":"Jarvis","items":[{"title":"Chat cards","phase":"Now"}]}]]
+```
+
+Core writes nothing for it: it only reads the roadmaps, each read bounded by
+10 seconds. It checks the marker and sends the answer's
+`assistant.completed` with `roadmap_proposals: [{"id", "roadmap_id"?,
+"title", "body"}]` (see `REALTIME_PROTOCOL.md`). Only the owner's Add in the
+app writes, through the owner routes and as the owner's change: `body` goes
+to `POST /v1/roadmaps` for a new roadmap, or with `roadmap_id` to
+`POST /v1/roadmaps/{roadmap_id}/items/batch` with the roadmap's current
+revision. Add never updates, deletes or archives anything. Tapping Add on two
+devices makes two roadmaps.
+
+The JSON is model output that web text in the conversation may have
+steered, so the rules are stricter than the routes':
+
+- One line of at most 16 KiB without hidden or bidi characters, parsed
+  strictly (unknown fields refused).
+- Exactly one of `title` (a new roadmap, with optional `description` and
+  `phases`; no roadmap that is not archived may have that title, ignoring
+  case) or `roadmap` (an existing one; `description` and `phases` are
+  refused).
+- 0 to 100 items for a new roadmap, 1 to 100 for an existing one; the
+  20-roadmap and 300-item limits hold as the marker is checked.
+- An item has only `title`, `status`, `phase`, `notes` and `links`; no
+  `position` or `depends_on`.
+- `links` are `pr`, `issue` or `release` only (no `url`, no `state`), and
+  every repo must be on `JARVIS_GITHUB_REPOS`; without that allowlist a link
+  is refused.
+- Every text, links included, is refused if it holds `://` or `www.` (any
+  case).
+- `roadmap` must match the title of exactly one roadmap that is not
+  archived, ignoring case; the items are then tried on that roadmap as it is
+  now, like the batch route does. A new roadmap is checked like a
+  `POST /v1/roadmaps` body.
+
+A refused marker is logged without its text. The answer then ends with
+`I could not set up that roadmap.`, followed by `Ask for fewer items at
+once, then add the rest with "add items to roadmap …".` when the line was
+cut off, too long, not JSON or held over 100 items. A `[[roadmap` line is
+never streamed and is taken off at any length (unlike the job markers, it
+has no 36 KiB limit; the reply's token cap bounds it), so an oversized one
+is refused, not shown. An answer that was only the marker is stored as
+`Tap Add below to confirm.` when a card follows.
+
+The runtime facts of a runs-API answer explain the marker and ask the model
+to keep a card to 25 items, to let the owner ask "add items to roadmap X"
+for more, and to leave out `phase` on added items unless the owner named
+one.
+
 ## GitHub
 
 Core can follow the PRs, issues and releases that items link to and move

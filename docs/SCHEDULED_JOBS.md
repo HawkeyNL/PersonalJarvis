@@ -130,7 +130,7 @@ not (an invalid one is dropped and logged without its text, never shown).
 Only trailing lines count, after the last line of ordinary text, in any
 order with `[[web_search]]` (trailing `[[photo:N]]` lines among them stay,
 after the text); a marker anywhere else is ordinary text, and so is a
-marker more than 20 KiB from the end (what streaming holds back), so a
+marker more than 36 KiB from the end (what streaming holds back), so a
 marker Core takes off was never streamed. Any other trailing line starting
 with `[[job` (such as `[[jobs]]`) is dropped too.
 Markers are honoured only on such answers: never on the legacy

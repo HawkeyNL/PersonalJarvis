@@ -68,6 +68,13 @@ Public events:
   `POST /v1/jobs` body; only the owner's confirmation sends it, and `id`
   only lets the app show each proposal once. Advisory and not stored;
   absent when there are none, so older apps keep working.
+  Such an answer may also carry `roadmap_proposals`: at most one
+  `{"id": "<uuid>", "roadmap_id"?: "<uuid>", "title": "…", "body": {…}}`,
+  a roadmap the answer proposed (see "From chat" in `ROADMAPS.md`). Without
+  `roadmap_id`, `body` is a checked `POST /v1/roadmaps` body; with it, a
+  checked `POST /v1/roadmaps/{roadmap_id}/items/batch` body and `title` is
+  that roadmap's title. Only the owner's Add sends it. Advisory and not
+  stored; absent when there is none.
 - `assistant.failed` with a fixed safe reason code
 - `voice.owner_changed`, `voice.started`, `voice.stopped`, `voice.failed`
 - `trading.meme.strategy_changed` with `strategy_id`, `version` and `enabled`,
@@ -167,13 +174,14 @@ schema-migration deployment procedure is required before any future release.
 
 ## Streaming and recovery
 
-Core removes the trailing `[[web_search]]`, `[[job …]]` and
-`[[job_self …]]` lines from every chat answer before it is stored or
+Core removes the trailing `[[web_search]]`, `[[job …]]`, `[[job_self …]]`
+and `[[roadmap …]]` lines from every chat answer before it is stored or
 published. While deltas stream, trailing whitespace and the trailing lines
-that start with `[[` (or could) wait for more text, up to 20 KiB; what is held
+that start with `[[` (or could) wait for more text, up to 36 KiB; what is held
 back when the stream ends is never sent as a delta, and the completed message
-carries the final text. A marker line further than 20 KiB from the end stays
-in the text, so no removed marker was ever streamed.
+carries the final text. A marker line further than 36 KiB from the end stays
+in the text, so no removed marker was ever streamed. A `[[roadmap` line is
+the exception: it always waits and is always removed, whatever its length.
 
 The provider-neutral `chat_stream` interface defaults to a final-only result.
 OpenAI-compatible backends decode bounded SSE and emit only `delta.content`.

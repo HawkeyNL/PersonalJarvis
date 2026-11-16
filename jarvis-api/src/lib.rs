@@ -48,6 +48,7 @@ mod persona;
 pub mod photos;
 mod rate_limit;
 pub mod realtime;
+mod roadmap_markers;
 pub mod roadmaps;
 mod routes;
 mod state;

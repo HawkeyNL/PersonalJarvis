@@ -1279,3 +1279,253 @@ async fn jobs_of_jarvis_own_are_refused_without_auto_search_at_the_limit_and_wit
     }
     Ok(())
 }
+
+/// Answers by what the owner asked: a new roadmap, items for `Jarvis`,
+/// items for a roadmap that does not exist, a cut-off or an oversized
+/// marker, or a new roadmap plus a web search. Streams in small deltas; a
+/// web answer carries a marker too.
+struct RoadmapFake;
+const NEW_ROADMAP: &str = "[[roadmap {\"title\":\"Trip\",\"phases\":[\"Now\"],\
+\"items\":[{\"title\":\"Book\",\"phase\":\"Now\"},{\"title\":\"Pack\",\"status\":\"blocked\"}]}]]";
+const ADD_ITEMS: &str =
+    "[[roadmap {\"roadmap\":\"jarvis\",\"items\":[{\"title\":\"Chat cards\"}]}]]";
+impl RoadmapFake {
+    fn answer(req: &ChatRequest) -> String {
+        let asked = req.messages.last().map_or("", |m| m.content.as_str());
+        let marker = if asked.contains("add items") {
+            ADD_ITEMS.to_owned()
+        } else if asked.contains("nope") {
+            "[[roadmap {\"roadmap\":\"Nope\",\"items\":[{\"title\":\"x\"}]}]]".to_owned()
+        } else if asked.contains("cut") {
+            "[[roadmap {\"title\":\"Cut\",\"items\":[{\"title\":".to_owned()
+        } else if asked.contains("huge") {
+            format!(
+                "[[roadmap {{\"title\":\"Huge\",\"description\":\"{}\"}}]]",
+                "a".repeat(40 * 1024)
+            )
+        } else if asked.contains("search") {
+            format!("{NEW_ROADMAP}\n[[web_search]]")
+        } else {
+            NEW_ROADMAP.to_owned()
+        };
+        format!("Plan below.\n{marker}")
+    }
+}
+#[async_trait::async_trait]
+impl LlmProvider for RoadmapFake {
+    fn label(&self) -> &str {
+        "roadmap-fixture"
+    }
+    fn can_research(&self) -> bool {
+        true
+    }
+    async fn chat(&self, req: &ChatRequest) -> Result<ChatReply, LlmError> {
+        Ok(ChatReply {
+            text: Self::answer(req),
+            model: "fixture-model".into(),
+            backend: Some("ollama".into()),
+            requested_route: None,
+            actual_provider: None,
+            fallback_count: 0,
+            stop_reason: Some("stop".into()),
+            usage: None,
+        })
+    }
+    async fn chat_stream(
+        &self,
+        req: &ChatRequest,
+        sink: jarvis_llm::TextDeltaSink,
+    ) -> Result<ChatReply, LlmError> {
+        // ASCII only, so every chunk is a whole string.
+        for chunk in Self::answer(req).as_bytes().chunks(1000) {
+            sink(std::str::from_utf8(chunk).unwrap());
+        }
+        self.chat(req).await
+    }
+    async fn research(&self, _: &jarvis_llm::ResearchRequest) -> Result<ChatReply, LlmError> {
+        Ok(ChatReply {
+            text: format!("Web answer\n{NEW_ROADMAP}"),
+            model: "claude-opus-5".into(),
+            backend: Some("claude-cli".into()),
+            requested_route: None,
+            actual_provider: None,
+            fallback_count: 0,
+            stop_reason: Some("end_turn".into()),
+            usage: None,
+        })
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable JARVIS_SURREAL_TEST_* server"]
+async fn roadmap_markers_become_cards_and_write_nothing() -> Result<(), Box<dyn std::error::Error>>
+{
+    use jarvis_api::roadmaps::{store as roadmaps, NewRoadmap};
+    let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+    db.signin(Root {
+        username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+        password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+    })
+    .await?;
+    db.use_ns(format!("realtime_{}", Uuid::now_v7().simple()))
+        .use_db("fixture")
+        .await?;
+    jarvis_store::apply_baseline_schema(&db).await?;
+    let owner = jarvis_identity::first_user_or_create(&db, "fixture").await?;
+    let (device, token) = device_token(&db, owner.id).await;
+    let mut fixture = state(db.clone(), None).await;
+    fixture.llm = Arc::new(RoadmapFake);
+    fixture.model_routing = Arc::new(jarvis_llm::LiveRouting::new(jarvis_llm::RoutingSnapshot {
+        routing: Some(jarvis_llm::ModelRouting::parse(
+            br#"{"version":1,"research_web_search":"auto"}"#,
+        )?),
+        unavailable_reason: None,
+    }));
+    let existing = roadmaps::create(
+        &db,
+        &NewRoadmap {
+            title: "Jarvis".into(),
+            description: None,
+            phases: Vec::new(),
+            items: Vec::new(),
+        },
+        &device.to_string(),
+        &fixture.realtime,
+    )
+    .await?
+    .roadmap;
+    let hub = fixture.realtime.clone();
+    let mut display = hub.subscribe(owner.id, device).unwrap();
+    let app = build_router(fixture);
+
+    let mut conversation = None;
+    // Each completed answer: (web search run, text, cards).
+    let mut answers = Vec::new();
+    let mut deltas = String::new();
+    for (mode, content, completions) in [
+        ("auto", "make a trip roadmap", 1),
+        ("auto", "add items to roadmap Jarvis", 1),
+        ("research", "nieuws over Rust", 1),
+        ("auto", "add to roadmap nope", 1),
+        ("auto", "a cut roadmap", 1),
+        ("auto", "a huge roadmap", 1),
+        ("auto", "plan it and search the web", 2),
+    ] {
+        let mut request = json!({"request_id": Uuid::now_v7(), "mode": mode,
+            "messages": [{"role": "user", "content": content}]});
+        if let Some(id) = conversation {
+            request["conversation_id"] = json!(id);
+        }
+        // The previous run may still hold the conversation briefly.
+        let (mut status, mut run) = (StatusCode::CONFLICT, Value::Null);
+        for _ in 0..100 {
+            (status, run) = post(&app, &token, "/v1/assistant/runs", request.clone()).await;
+            if status != StatusCode::CONFLICT {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status, StatusCode::OK, "{content}: {run}");
+        conversation = Some(serde_json::from_value::<Uuid>(
+            run["conversation_id"].clone(),
+        )?);
+        let mut automatic = None;
+        let mut done = 0;
+        while done < completions {
+            let envelope = tokio::time::timeout(Duration::from_secs(5), display.receiver.recv())
+                .await?
+                .unwrap();
+            match &envelope.event {
+                Event::AssistantDelta { text, .. } => deltas.push_str(text),
+                Event::AssistantStarted {
+                    run,
+                    web_search: true,
+                } => automatic = Some(run.run_id),
+                Event::AssistantCompleted {
+                    run,
+                    message,
+                    roadmap_proposals,
+                    ..
+                } => {
+                    answers.push((
+                        automatic == Some(run.run_id),
+                        message.content.clone(),
+                        roadmap_proposals.clone(),
+                    ));
+                    done += 1;
+                }
+                Event::AssistantFailed { .. } => panic!("{envelope:?}"),
+                _ => {}
+            }
+        }
+    }
+    let split = "I could not set up that roadmap. Ask for fewer items at once, then add the \
+                 rest with \"add items to roadmap …\".";
+    let texts: Vec<(bool, &str, usize)> = answers
+        .iter()
+        .map(|(web, text, cards)| (*web, text.as_str(), cards.len()))
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            (false, "Plan below.", 1),
+            (false, "Plan below.", 1),
+            // A Research answer only loses the marker.
+            (false, "Web answer", 0),
+            // Refused: no card, and the answer says so; a cut-off or
+            // oversized marker asks for a smaller card.
+            (false, "Plan below.\n\nI could not set up that roadmap.", 0),
+            (false, &format!("Plan below.\n\n{split}"), 0),
+            (false, &format!("Plan below.\n\n{split}"), 0),
+            // The answer's card goes out; the automatic search's answer
+            // only loses its marker.
+            (false, "Plan below.", 1),
+            (true, "Web answer", 0),
+        ]
+    );
+    // A new roadmap: the exact create body, no roadmap id.
+    let new = &answers[0].2[0];
+    assert_eq!(new.roadmap_id, None);
+    assert_eq!(new.title, "Trip");
+    assert_eq!(
+        new.body,
+        json!({"title": "Trip", "phases": ["Now"], "items": [
+            {"title": "Book", "status": "planned", "phase": "Now"},
+            {"title": "Pack", "status": "blocked"}]})
+    );
+    // Items for the existing roadmap, named in any case.
+    let add = &answers[1].2[0];
+    assert_eq!(add.roadmap_id.as_deref(), Some(existing.id.as_str()));
+    assert_eq!(add.title, "Jarvis");
+    assert_eq!(
+        add.body,
+        json!({"items": [{"title": "Chat cards", "status": "planned"}]})
+    );
+    assert_ne!(new.id, add.id);
+    // No delta and no stored message ever carried a marker.
+    assert!(deltas.contains("Plan below."));
+    assert!(!deltas.contains("[[roadmap") && !deltas.contains("[[web"));
+    let stored: Vec<String> = db
+        .query("SELECT VALUE content FROM chat_messages")
+        .await?
+        .take(0)?;
+    assert!(stored.iter().all(|content| !content.contains("[[")));
+
+    // The legacy endpoint only loses the marker.
+    let (status, legacy) = post(
+        &app,
+        &token,
+        "/v1/assistant/chat",
+        json!({"messages":[{"role":"user","content":"make a trip roadmap"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{legacy}");
+    assert_eq!(legacy["reply"], "Plan below.");
+
+    // Nothing was written: one roadmap, still at revision 1 and empty.
+    let live = roadmaps::list(&db, false).await?;
+    assert_eq!(live.len(), 1);
+    let stored = roadmaps::get(&db, &existing.id).await?.ok_or("roadmap")?;
+    assert_eq!((stored.roadmap.revision, stored.items.len()), (1, 0));
+    Ok(())
+}

@@ -20,7 +20,7 @@ use crate::{AppState, Authed};
 
 /// Request bodies of the roadmap routes.
 pub(crate) const BODY_LIMIT: usize = 64 * 1024;
-const DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const DEFAULT_HISTORY: usize = 50;
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
