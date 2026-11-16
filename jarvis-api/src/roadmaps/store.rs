@@ -1053,6 +1053,16 @@ mod tests {
             [roadmap.items[2].id.clone(), roadmap.items[3].id.clone()]
         );
         assert_eq!(heard(&mut listener), [(id.clone(), 2)]);
+        // Every row is the owner's change from this device: one per item at
+        // revision 2, and the roadmap's own rows at revision 1.
+        let rows = history(&db, &id, MAX_HISTORY).await?;
+        let batch: Vec<_> = rows.iter().filter(|c| c.revision == 2).collect();
+        assert_eq!(batch.len(), 2);
+        assert!(batch.iter().all(|c| c.action == Action::ItemCreated));
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|c| c.author == "owner"
+            && c.device_id.as_deref() == Some(device.as_str())
+            && c.proposal_id.is_none()));
         // Empty, too many, stale or one invalid item: nothing is written.
         for (revision, items) in [
             (2, Vec::new()),
