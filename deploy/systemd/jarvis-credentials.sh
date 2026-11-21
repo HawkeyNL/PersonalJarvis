@@ -175,7 +175,8 @@ probe_market_rpc() (
     config=$(mktemp /run/jarvis-credential-test.XXXXXX) || return 1
     response_file=$(mktemp /run/jarvis-credential-response.XXXXXX) || return 1
     printf 'url = "%s"\nheader = "Content-Type: application/json"\ndata = "{\\"jsonrpc\\":\\"2.0\\",\\"id\\":1,\\"method\\":\\"getSlot\\"}"\n' "$1" > "$config"
-    http_code=$(curl --config "$config" --proto '=https' --max-redirs 0 --output "$response_file" \
+    # -q first: no ~/.curlrc; no proxy from the environment, like Core.
+    http_code=$(curl -q --config "$config" --noproxy '*' --proto '=https' --max-redirs 0 --output "$response_file" \
         --silent --max-time 10 --max-filesize 65536 --write-out '%{http_code}' 2>/dev/null) || return 1
     [[ $http_code == 200 ]] &&
         jq -e '(.result | type == "number") and .result > 0' "$response_file" >/dev/null 2>&1

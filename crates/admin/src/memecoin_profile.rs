@@ -33,6 +33,9 @@ pub fn run(command: MemecoinCommand) -> Result<()> {
         MemecoinCommand::InitProfile { force } => {
             write_profile(Path::new(PROFILE), force, true)?;
             println!("jarvis: wrote {PROFILE} (paper only; validated as Core reads it).");
+            println!(
+                "Core reads this path unless JARVIS_MEMECOIN_PAPER_PROFILE_PATH points elsewhere."
+            );
             println!("Next steps:");
             println!("  1. sudo jarvis-credentials set market-data");
             println!("  2. Set JARVIS_MEMECOIN_PAPER_ENABLED=true in /etc/jarvis/core.env");
