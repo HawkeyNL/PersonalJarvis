@@ -148,7 +148,9 @@ the entry is not made, and Claude's entry is recorded as `skip` with reason
 `risk_limit`. A cut entry of Claude's is recorded as `enter` with the
 `size_bps` it asked for; the trade's cost shows the size it got. The limit
 counts the planned stop: a price gap past the stop between two ticks (60 s)
-can still lose more, as it can in real trading.
+can still lose more, as it can in real trading, and the fees of failed entry
+or exit attempts come on top. Backtests size entries without this limit, so
+their results can differ from the paper book's.
 
 ## Claude decisions
 
