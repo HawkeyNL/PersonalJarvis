@@ -13,7 +13,7 @@ use std::path::Path;
 
 use jarvis_onchain::filter::FilterRules;
 use jarvis_onchain::paper::CostModel;
-use jarvis_onchain::strategy::StrategyParams;
+use jarvis_onchain::strategy::{bounds, StrategyParams};
 use jarvis_onchain::types::ExtensionKind;
 
 use super::agent::AgentSettings;
@@ -40,6 +40,11 @@ struct ProfileFile {
     stake_usd: Decimal,
     max_position_usd: Decimal,
     max_open_positions: usize,
+    /// Most one trade may lose at its stop, fees and slippage included, as a
+    /// share of the paper equity. At most the code cap (10%), which is also
+    /// the default.
+    #[serde(default = "max_risk_per_trade_bps")]
+    max_risk_per_trade_bps: u32,
     filter: FilterFile,
     /// Deprecated: the single strategy of profiles written before typed
     /// strategies. It no longer enters; it only names the exit rules of the
@@ -68,6 +73,10 @@ struct AgentFile {
 
 fn on() -> bool {
     true
+}
+
+fn max_risk_per_trade_bps() -> u32 {
+    bounds::RISK_PER_TRADE_BPS.1
 }
 
 /// Everything that decided the results of a legacy strategy. It is recorded
@@ -166,6 +175,8 @@ pub struct PaperProfile {
     pub stake_usd: Decimal,
     pub max_position_usd: Decimal,
     pub max_open_positions: usize,
+    /// Every entry is cut so it risks at most this share of the equity.
+    pub max_risk_per_trade_bps: u32,
     pub rules: FilterRules,
     /// Deprecated legacy strategy, if the profile still has one. Its version
     /// is below [`STRATEGY_VERSION_FLOOR`].
@@ -254,6 +265,12 @@ impl PaperProfile {
         {
             return Err("stake_usd must cover max_position_usd x max_open_positions".into());
         }
+        let (min_risk, max_risk) = bounds::RISK_PER_TRADE_BPS;
+        if !(min_risk..=max_risk).contains(&v.max_risk_per_trade_bps) {
+            return Err(format!(
+                "max_risk_per_trade_bps must be {min_risk} to {max_risk}"
+            ));
+        }
         if file.goal_multiple <= Decimal::ONE {
             return Err("goal_multiple must be above 1".into());
         }
@@ -311,6 +328,7 @@ impl PaperProfile {
             stake_usd: file.stake_usd,
             max_position_usd: file.max_position_usd,
             max_open_positions: file.max_open_positions,
+            max_risk_per_trade_bps: file.max_risk_per_trade_bps,
             rules,
             strategy,
             costs,
@@ -411,6 +429,10 @@ pub(crate) mod tests {
     fn parses_and_records_canonical_params() {
         let profile = fixture();
         assert_eq!(profile.strategy.as_ref().map(|s| s.version), Some(3));
+        assert_eq!(
+            profile.max_risk_per_trade_bps, 1_000,
+            "the 10% cap by default"
+        );
         assert_eq!(profile.rules.max_snapshot_age, Duration::minutes(1));
         assert!(profile.discovery, "discovery is on by default");
         // Formatting and the candidate sources do not change the recorded
@@ -418,8 +440,11 @@ pub(crate) mod tests {
         let mut other = fixture_json();
         other["watchlist"] = serde_json::json!([MINT_B]);
         other["discovery"] = false.into();
+        // Not recorded with a legacy version: it only cuts new entries.
+        other["max_risk_per_trade_bps"] = 250.into();
         let reparsed = PaperProfile::parse(&serde_json::to_string_pretty(&other).unwrap()).unwrap();
         assert!(!reparsed.discovery);
+        assert_eq!(reparsed.max_risk_per_trade_bps, 250);
         assert_eq!(reparsed.versioned_params, profile.versioned_params);
         let mut changed = fixture_json();
         changed["costs"]["dex_fee_bps"] = 30.into();
@@ -460,7 +485,7 @@ pub(crate) mod tests {
 
     #[test]
     fn refuses_unsafe_or_unknown_input() {
-        let cases: [(&str, serde_json::Value); 9] = [
+        let cases: [(&str, serde_json::Value); 11] = [
             ("/unknown", serde_json::json!(1)),
             ("/watchlist", serde_json::json!([])),
             (
@@ -472,6 +497,9 @@ pub(crate) mod tests {
             // 3 x 100 exceeds the 250 stake.
             ("/max_position_usd", serde_json::json!("100")),
             ("/goal_multiple", serde_json::json!("1")),
+            // Above the code cap of 10%, or nothing.
+            ("/max_risk_per_trade_bps", serde_json::json!(1_001)),
+            ("/max_risk_per_trade_bps", serde_json::json!(0)),
             ("/strategy/stop_loss_bps", serde_json::json!(1)),
             ("/costs/failure_rate", serde_json::json!("1")),
         ];
@@ -479,9 +507,8 @@ pub(crate) mod tests {
             let mut json = fixture_json();
             match json.pointer_mut(pointer) {
                 Some(slot) => *slot = value,
-                None => {
-                    json["unknown"] = value;
-                }
+                // A top-level field the fixture leaves out.
+                None => json[pointer.trim_start_matches('/')] = value,
             }
             assert!(PaperProfile::parse(&json.to_string()).is_err(), "{pointer}");
         }

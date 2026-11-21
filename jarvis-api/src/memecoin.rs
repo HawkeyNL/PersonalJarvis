@@ -1247,6 +1247,12 @@ impl PaperTask {
             per_strategy,
             now,
         );
+        // Every entry is cut to risk at most the profile's share of this.
+        let equity_usd = book
+            .as_ref()
+            .ok()
+            .and_then(|book| book.ledger.pnl(&marks, &p.costs).ok())
+            .and_then(|pnl| p.stake_usd.checked_add(pnl.net_usd));
 
         // A decision Claude finished is carried out first, while the tick
         // has most of its time left.
@@ -1267,6 +1273,7 @@ impl PaperTask {
                 stats: &mut stats,
                 read_failed,
                 book_ok: book.is_ok(),
+                equity_usd,
             };
             agent_apply(agent, &mut env).await?;
         }
@@ -1426,6 +1433,11 @@ impl PaperTask {
                 }
                 // No research step runs yet; it could only veto or shrink.
                 let size = apply_research(size, ResearchAdjustment::Keep);
+                let Some(size) = equity_usd.and_then(|equity| {
+                    config.risk_capped_size(size, &p.costs, equity, p.max_risk_per_trade_bps)
+                }) else {
+                    continue;
+                };
                 if paused() {
                     break 'mints;
                 }
@@ -1488,6 +1500,7 @@ impl PaperTask {
                 stats: &mut stats,
                 read_failed,
                 book_ok: book.is_ok(),
+                equity_usd,
             };
             agent_schedule(agent, &mut env, book.as_ref().ok()).await?;
         }
@@ -1601,6 +1614,8 @@ struct AgentEnv<'t, 'a> {
     read_failed: bool,
     /// The stored ledger replays; without it the limits cannot be counted.
     book_ok: bool,
+    /// Paper equity at the tick's marks; the base of the risk limit.
+    equity_usd: Option<Decimal>,
 }
 
 impl AgentEnv<'_, '_> {
@@ -1932,8 +1947,8 @@ async fn agent_exit(
 /// Enter a candidate Claude chose, if it still passes every check on fresh
 /// data: its strategy enabled at the same version, the global and the
 /// strategy's limits, and the hard filter. The size is `size_bps` of what
-/// the strategy would enter, within the free paper stake. `Ok(Err(reason))`
-/// when refused.
+/// the strategy would enter, within the free paper stake, cut to the risk
+/// limit. `Ok(Err(reason))` when refused.
 async fn agent_enter(
     env: &mut AgentEnv<'_, '_>,
     candidate: &agent::Eligible,
@@ -1999,6 +2014,17 @@ async fn agent_enter(
     let Some(size) = size else {
         return Ok(Err("no_stake"));
     };
+    // Claude picks the size; code caps what it can lose at the stop.
+    let capped = env.equity_usd.and_then(|equity| {
+        config.risk_capped_size(size, &p.costs, equity, p.max_risk_per_trade_bps)
+    });
+    let Some(capped) = capped else {
+        return Ok(Err("risk_limit"));
+    };
+    if capped < size {
+        tracing::info!(%mint, "memecoin paper: Claude's entry cut to the risk limit");
+    }
+    let size = capped;
     if env.paused() || env.handle.disabled(id) {
         return Ok(Err("paused"));
     }
@@ -3123,6 +3149,57 @@ mod tests {
                 rows[0].mint.as_deref()
             ),
             ("skip", Some("book_unavailable"), Some(MINT_A))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn entries_are_cut_to_the_risk_limit() -> Result<(), Box<dyn std::error::Error>> {
+        // 1% of the 250 stake: A's full 25 would risk about 7 at its stop.
+        let mut json = fixture_json();
+        json["watchlist"] = serde_json::json!([MINT_A]);
+        json["max_open_positions"] = 4.into();
+        json["max_risk_per_trade_bps"] = 100.into();
+        let market = FixtureMarket::new(&[(MINT_A, "0.001", Duration::hours(2))]);
+        let mut no_failure = || Decimal::new(999_999, 6);
+        let profile = PaperProfile::parse(&json.to_string())?;
+        let cut = seeds()[0]
+            .risk_capped_size(d("25"), &profile.costs, d("250"), 100)
+            .ok_or("no size")?;
+        assert!(cut < d("25"));
+
+        // A strategy entering on its own signal.
+        let db = connect("memecoin_risk").await?;
+        pool_age_strategies(&db, &profile).await?;
+        let mut task = PaperTask::new(profile, Arc::new(PaperHandle::new(true)));
+        assert_eq!(task.tick(&db, &market, &mut no_failure).await?.entries, 1);
+        let trips = store::load_trips(&db).await?;
+        assert_eq!(trips[0].cost_usd, cut + d("0.011"));
+
+        // Claude asking for the strategy's full size.
+        json["agent"] = serde_json::json!({});
+        let profile = PaperProfile::parse(&json.to_string())?;
+        let db = connect("memecoin_risk_agent").await?;
+        pool_age_strategies(&db, &profile).await?;
+        let brain = ScriptedBrain::new();
+        let mut task = PaperTask::new(profile, Arc::new(PaperHandle::new(true)))
+            .with_agent(Some(brain.clone()), None);
+        task.tick(&db, &market, &mut no_failure).await?;
+        settle(&task).await;
+        brain.reply(Ok(
+            r#"{"actions":[{"action":"enter","id":"c0","size_bps":10000,"reason_code":"momentum"}]}"#
+                .into(),
+        ));
+        task.tick(&db, &market, &mut no_failure).await?;
+        settle(&task).await;
+        assert_eq!(task.tick(&db, &market, &mut no_failure).await?.entries, 1);
+        let trips = store::load_trips(&db).await?;
+        assert_eq!(trips[0].cost_usd, cut + d("0.011"));
+        let rows = agent_rows(&db).await?;
+        assert_eq!(
+            (rows[0].kind.as_str(), rows[0].size_bps),
+            ("enter", Some(10_000))
         );
         Ok(())
     }

@@ -77,6 +77,9 @@ pub mod bounds {
     pub const ENTRY_CONDITIONS: (usize, usize) = (1, 8);
     pub const ENTRIES_PER_DAY: (u32, u32) = (1, 24);
     pub const TOKEN_COOLDOWN: (Duration, Duration) = (Duration::minutes(1), Duration::days(30));
+    /// Most a paper trade may lose at its stop, fees and slippage included,
+    /// as a share of the paper equity: at most 10%.
+    pub const RISK_PER_TRADE_BPS: (u32, u32) = (1, 1_000);
 }
 
 /// A parameter outside its code-fixed bounds.
