@@ -289,6 +289,19 @@ if systemctl is-active --quiet jarvis-ibkr-broker.service; then
 else
     ui_detail "IBKR broker: inactive (optional)"
 fi
+# Optional owner-enabled page reader: when it runs, its identity and socket
+# boundary are mandatory.
+if systemctl is-active --quiet jarvis-page-reader.service; then
+    check "Page reader uses its own identity and group" bash -c \
+        '[[ $(systemctl show -p User --value jarvis-page-reader.service) == jarvis-reader && $(systemctl show -p Group --value jarvis-page-reader.service) == jarvis-reader ]]'
+    check "Page reader identity has no extra group access" bash -c \
+        '[[ $(id -nG jarvis-reader) == jarvis-reader ]]'
+    check "Page reader socket is private to Core's group" bash -c \
+        '[[ -d /run/jarvis-page-reader && ! -L /run/jarvis-page-reader && $(stat -c "%U:%G:%a" /run/jarvis-page-reader) == jarvis-reader:jarvis:2750 && -S /run/jarvis-page-reader/reader.sock && ! -L /run/jarvis-page-reader/reader.sock && $(stat -c "%U:%G:%a" /run/jarvis-page-reader/reader.sock) == jarvis-reader:jarvis:660 ]]'
+    ui_detail "Page reader: active (optional; public pages only)"
+else
+    ui_detail "Page reader: inactive (optional)"
+fi
 # Never removed automatically: the owner deletes the retired chat login.
 if getent passwd jarvis-codex-chat >/dev/null || [[ -e /var/lib/jarvis-codex-chat || -L /var/lib/jarvis-codex-chat ]]; then
     ui_warning "legacy jarvis-codex-chat identity or /var/lib/jarvis-codex-chat is no longer used and can be removed (docs/SUBSCRIPTION_WORKERS.md)"

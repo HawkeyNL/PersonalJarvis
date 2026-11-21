@@ -245,6 +245,11 @@ done
 if ! getent passwd jarvis-ibkr >/dev/null; then
     useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin jarvis-ibkr
 fi
+# The optional page reader identity, the same way; its unit stays disabled
+# until the owner enables it.
+if ! getent passwd jarvis-reader >/dev/null; then
+    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin jarvis-reader
+fi
 
 [[ -f /etc/jarvis/surrealdb.env && ! -L /etc/jarvis/surrealdb.env ]] || {
     echo "missing root-only /etc/jarvis/surrealdb.env" >&2

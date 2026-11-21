@@ -20,6 +20,7 @@ sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-core-socket-dir-syst
 bash deploy/systemd/tests/test-laya-release-artifacts.sh
 bash deploy/systemd/tests/test-subscription-worker-release.sh
 bash deploy/systemd/tests/test-ibkr-broker-release.sh
+bash deploy/systemd/tests/test-page-reader-release.sh
 sudo env GITHUB_ACTIONS=true bash deploy/systemd/tests/test-laya-provision-retry.sh
 sudo env GITHUB_ACTIONS=true python3 deploy/systemd/tests/test-laya-networkless.py
 python3 -m unittest discover -s tools/laya -p 'test_*.py'

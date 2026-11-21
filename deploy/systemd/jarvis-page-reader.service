@@ -1,0 +1,75 @@
+[Unit]
+Description=Jarvis page reader (one public web page per request)
+After=network-online.target
+Wants=network-online.target
+# Optional and never enabled by an install or update. The owner turns reading
+# pages on with `systemctl enable --now jarvis-page-reader.service` plus
+# JARVIS_WEB_FETCH_ENABLED=true for Core.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+# Holds nothing: no credentials and no Jarvis state. Its own group, so it
+# cannot reach Core's group-only sockets; the reader also checks the kernel
+# peer uid of every caller.
+User=jarvis-reader
+Group=jarvis-reader
+Environment=JARVIS_PAGE_READER_ALLOWED_PEERS=jarvis
+# Setgid to Core's group, so the 0660 socket is Core-connectable while the
+# reader itself is not in that group. Not a RuntimeDirectory=: systemd resets
+# those to User:Group before every Exec* command.
+ExecStartPre=+/usr/bin/install -d -o jarvis-reader -g jarvis -m 2750 /run/jarvis-page-reader
+# Optional (-): the namespace is also built for ExecStartPre, before the
+# directory exists.
+ReadWritePaths=-/run/jarvis-page-reader
+ExecStart=/opt/jarvis/current/jarvis-page-reader
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=20s
+TimeoutStopSec=30s
+UMask=0117
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+PrivatePIDs=true
+RemoveIPC=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+MemoryDenyWriteExecute=true
+# Nothing executes except the release binary and the shared libraries it
+# loads (only the multiarch directory: /usr/lib itself holds shells).
+NoExecPaths=/
+ExecPaths=/opt/jarvis/releases /usr/lib/x86_64-linux-gnu -/usr/lib64
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Public internet only, as a second fence behind the reader's own address
+# check: no loopback, LAN, link-local, CGNAT/Tailscale, ULA, documentation,
+# benchmarking, reserved, NAT64 or 6to4 ranges. 127.0.0.53 is the
+# systemd-resolved stub.
+IPAddressDeny=localhost link-local multicast 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 240.0.0.0/4 ::/128 ::ffff:0:0/96 64:ff9b::/96 64:ff9b:1::/48 100::/64 2001::/23 2001:db8::/32 2002::/16 3fff::/20 fc00::/7 fec0::/10
+IPAddressAllow=127.0.0.53
+# It only connects out; it never listens on an IP socket.
+SocketBindDeny=any
+InaccessiblePaths=/etc/jarvis /var/lib/jarvis -/var/lib/jarvis-claude -/var/lib/jarvis-codex -/var/lib/jarvis-codex-chat -/var/lib/jarvis-codex-broker -/var/lib/jarvis-config-broker -/var/lib/jarvis-engineering -/var/lib/jarvis-codex-repositories -/var/lib/jarvis-housekeeping -/var/lib/jarvis-app-updates -/run/jarvis-core -/run/jarvis-codex -/run/jarvis-codex-broker -/run/jarvis-config-broker -/run/jarvis-claude -/run/jarvis-codex-chat -/run/jarvis-ibkr-broker -/run/docker.sock
+LimitCORE=0
+TasksMax=32
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
