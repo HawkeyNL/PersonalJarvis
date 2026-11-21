@@ -219,6 +219,20 @@ fn is_remote(ip: IpAddr) -> bool {
     is_public(ip) && !on_local_network(ip.to_canonical())
 }
 
+/// Whether this host's interfaces can be listed. Every address check needs
+/// that and fails closed without it, so the reader refuses to start then
+/// (under systemd it needs `AF_NETLINK`).
+pub fn interfaces_readable() -> bool {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list freed right after.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return false;
+    }
+    // SAFETY: `head` came from getifaddrs and is freed once.
+    unsafe { libc::freeifaddrs(head) };
+    true
+}
+
 /// Whether `ip` is inside the network of any local interface address.
 /// Fails closed: true when the interfaces cannot be listed.
 fn on_local_network(ip: IpAddr) -> bool {
