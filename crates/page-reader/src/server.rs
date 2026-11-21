@@ -32,6 +32,9 @@ const MAX_CONNECTIONS: usize = 4;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
+/// Pause after an accept error that passes (out of file descriptors, an
+/// aborted connection).
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 /// Resolve a comma-separated list of numeric uids or user names. Fails on an
 /// empty list or an unknown user.
@@ -85,6 +88,11 @@ pub async fn serve<R: Resolve + 'static>(
             () = &mut shutdown => break Ok(()),
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => stream,
+                Err(error) if is_transient(&error) => {
+                    tracing::warn!(target: AUDIT, %error, "accept failed; retrying");
+                    tokio::time::sleep(ACCEPT_RETRY).await;
+                    continue;
+                }
                 Err(error) => break Err(error),
             },
         };
@@ -117,6 +125,15 @@ pub async fn serve<R: Resolve + 'static>(
         tracing::warn!(target: AUDIT, "page reader stopped with requests in flight");
     }
     result
+}
+
+/// An accept error that passes: the loop waits and goes on instead of
+/// ending the reader.
+fn is_transient(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ECONNABORTED | libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
 }
 
 async fn handle<R: Resolve>(stream: UnixStream, fetcher: &Fetcher<R>, peer_uid: u32) {

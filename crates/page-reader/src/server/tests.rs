@@ -124,6 +124,24 @@ async fn malformed_requests_are_refused() {
     assert!(requests.lock().unwrap().is_empty());
 }
 
+#[test]
+fn only_passing_accept_errors_are_retried() {
+    let os = std::io::Error::from_raw_os_error;
+    for code in [
+        libc::ECONNABORTED,
+        libc::EMFILE,
+        libc::ENFILE,
+        libc::ENOBUFS,
+        libc::ENOMEM,
+    ] {
+        assert!(is_transient(&os(code)), "{code}");
+    }
+    for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+        assert!(!is_transient(&os(code)), "{code}");
+    }
+    assert!(!is_transient(&std::io::Error::other("x")));
+}
+
 #[tokio::test]
 async fn bind_never_replaces_another_file() {
     let dir = tempfile::tempdir().unwrap();
