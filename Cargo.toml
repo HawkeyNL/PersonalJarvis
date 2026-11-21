@@ -10,6 +10,7 @@ members = [
     "crates/identity",
     "crates/portfolio",
     "crates/ibkr",
+    "crates/page-reader",
     "crates/llm",
     "crates/speech",
     "crates/registry",
@@ -96,6 +97,7 @@ jarvis-observability = { path = "crates/observability" }
 jarvis-identity = { path = "crates/identity" }
 jarvis-portfolio = { path = "crates/portfolio" }
 jarvis-ibkr = { path = "crates/ibkr" }
+jarvis-page-reader = { path = "crates/page-reader" }
 jarvis-llm = { path = "crates/llm" }
 jarvis-speech = { path = "crates/speech" }
 jarvis-registry = { path = "crates/registry" }
