@@ -341,7 +341,9 @@ impl StrategyConfig {
     /// the exit slippage allowance on its cost (size and entry fees; the
     /// stop already measures the pool fee and price impact), plus the exit
     /// fees. Without a stop distance the whole cost counts. A price gap past
-    /// the stop between two observations can still lose more.
+    /// the stop between two observations can still lose more, and so can
+    /// the fees of failed attempts (at most one per tick, until the
+    /// position is stuck), which are not counted here.
     pub fn risk_capped_size(
         &self,
         size: Decimal,
