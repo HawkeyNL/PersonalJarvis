@@ -345,6 +345,7 @@ async fn a_silent_site_times_out() {
 #[test]
 fn the_hosts_own_networks_are_not_remote() {
     // Loopback is always an interface network; a public resolver is not.
+    assert!(interfaces_readable());
     assert!(on_local_network("127.0.0.1".parse().unwrap()));
     assert!(on_local_network(
         "::ffff:127.0.0.1".parse::<IpAddr>().unwrap().to_canonical()

@@ -9,7 +9,7 @@
 use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
 use jarvis_page_reader::{
-    fetch::{Fetcher, SystemResolver},
+    fetch::{self, Fetcher, SystemResolver},
     server, DEFAULT_SOCKET,
 };
 use tokio::signal::unix::{signal, SignalKind};
@@ -42,6 +42,11 @@ async fn run() -> Result<(), String> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
         return Err("jarvis-page-reader must not run as root".into());
+    }
+    // Without the interface list every address check fails closed: refuse
+    // to start instead of refusing every page.
+    if !fetch::interfaces_readable() {
+        return Err("cannot list the network interfaces; every page would be refused".into());
     }
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
     let allowed = server::resolve_peers(
