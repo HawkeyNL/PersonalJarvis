@@ -495,6 +495,25 @@ pub(super) async fn execute_chat(
             let honoured = realtime_run.is_some()
                 && user_already_published
                 && requested_mode != llm::RoutingMode::Research;
+            if !honoured && (markers.any_job || markers.any_roadmap) {
+                let reason = if requested_mode == llm::RoutingMode::Research {
+                    "research mode"
+                } else {
+                    "legacy endpoint"
+                };
+                tracing::info!(
+                    reason,
+                    jobs = markers.any_job,
+                    roadmap = markers.any_roadmap,
+                    "chat markers not honoured"
+                );
+            }
+            if honoured && image_turn && !markers.job_self.is_empty() {
+                tracing::info!(
+                    dropped = markers.job_self.len(),
+                    "job_self markers not honoured: photo turn"
+                );
+            }
             let own_lines: &[String] = if honoured && !image_turn {
                 &markers.job_self
             } else {

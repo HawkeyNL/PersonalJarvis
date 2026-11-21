@@ -251,26 +251,32 @@ pub(crate) async fn proposal(
     }
     let parsed = parse(json, &state.github).map_err(refused)?;
     let live = read(store::list(&state.db, false)).await?;
-    match check(parsed, &live).map_err(refused)? {
-        Checked::New { title, body } => Ok(RoadmapProposal {
+    let card = match check(parsed, &live).map_err(refused)? {
+        Checked::New { title, body } => RoadmapProposal {
             id: Uuid::now_v7(),
             roadmap_id: None,
             title,
             body,
-        }),
+        },
         Checked::Items { roadmap, items } => {
             let snapshot = read(store::get(&state.db, &roadmap.id))
                 .await?
                 .ok_or_else(|| refused("no such roadmap"))?;
             check_items(snapshot, &items).map_err(refused)?;
-            Ok(RoadmapProposal {
+            RoadmapProposal {
                 id: Uuid::now_v7(),
                 roadmap_id: Some(roadmap.id),
                 title: roadmap.title,
                 body: json!({ "items": items }),
-            })
+            }
         }
-    }
+    };
+    tracing::info!(
+        id = %card.id,
+        items = card.body["items"].as_array().map_or(0, Vec::len),
+        "roadmap card proposed"
+    );
+    Ok(card)
 }
 
 #[cfg(test)]
