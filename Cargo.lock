@@ -2670,6 +2670,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-page-reader"
+version = "0.1.0"
+dependencies = [
+ "encoding_rs",
+ "html5ever",
+ "jarvis-observability",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "jarvis-policy"
 version = "0.1.0"
 dependencies = [

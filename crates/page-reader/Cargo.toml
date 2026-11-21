@@ -1,0 +1,24 @@
+[package]
+name = "jarvis-page-reader"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { workspace = true }
+# Already in Cargo.lock (through ammonia and multer): no new download.
+html5ever = "0.40"
+encoding_rs = "0.8"
+# Peer uid lookup and the startup guards of the binary.
+libc = "0.2"
+tracing.workspace = true
+jarvis-observability.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
