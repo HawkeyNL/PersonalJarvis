@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use time::Duration;
 
 use crate::filter::{FilterRules, Loosening};
+use crate::paper::CostModel;
 use crate::signals::{self, Series, SignalId};
 use crate::strategy::{bounds, within, ExitRules, OutOfBounds};
 
@@ -330,6 +331,42 @@ impl StrategyConfig {
             .round_dp_with_strategy(2, RoundingStrategy::ToZero);
         (size > Decimal::ZERO).then_some(size)
     }
+
+    /// `size` cut so the trade risks at most `max_risk_bps` (never above
+    /// [`bounds::RISK_PER_TRADE_BPS`]) of `equity_usd`, rounded down to
+    /// cents. `None` when nothing is left, the equity is gone or the numbers
+    /// overflow.
+    ///
+    /// Risk is what the trade loses when its stop is hit: the stop loss plus
+    /// the exit slippage allowance on its cost (size and entry fees; the
+    /// stop already measures the pool fee and price impact), plus the exit
+    /// fees. Without a stop distance the whole cost counts. A price gap past
+    /// the stop between two observations can still lose more.
+    pub fn risk_capped_size(
+        &self,
+        size: Decimal,
+        costs: &CostModel,
+        equity_usd: Decimal,
+        max_risk_bps: u32,
+    ) -> Option<Decimal> {
+        let bps = Decimal::from(10_000);
+        let loss_bps = match self.stop_loss_bps {
+            0 => 10_000,
+            stop => stop.saturating_add(self.exit_slippage_bps).min(10_000),
+        };
+        let loss = Decimal::from(loss_bps) / bps;
+        let fees = costs.network_fee_usd.checked_add(costs.priority_fee_usd)?;
+        let max_risk_bps = max_risk_bps.min(bounds::RISK_PER_TRADE_BPS.1);
+        let cap = equity_usd.checked_mul(Decimal::from(max_risk_bps))? / bps;
+        // (size + fees) x loss + fees <= cap
+        let max_size = cap
+            .checked_sub(fees.checked_mul(Decimal::ONE + loss)?)?
+            .checked_div(loss)?;
+        let size = size
+            .min(max_size)
+            .round_dp_with_strategy(2, RoundingStrategy::ToZero);
+        (size > Decimal::ZERO).then_some(size)
+    }
 }
 
 /// Seconds as a duration; values beyond `i64` saturate (and fail any bound).
@@ -440,7 +477,7 @@ pub fn seeds() -> [StrategyConfig; 3] {
 mod tests {
     use super::*;
     use crate::filter::tests::rules;
-    use crate::testutil::{d, Rng};
+    use crate::testutil::{costs, d, Rng};
 
     fn config() -> StrategyConfig {
         seeds()[0].clone()
@@ -609,5 +646,52 @@ mod tests {
         let tight = c.validate(&base).unwrap();
         assert_eq!(tight.max_sell_impact_bps, 1);
         assert_eq!(tight.min_pool_age, Duration::MAX);
+    }
+
+    #[test]
+    fn entries_risk_at_most_the_share_of_equity_at_their_stop() {
+        let costs = costs(); // 0.011 USD per attempt
+        let mut a = seeds()[0].clone(); // stop 20% + exit slippage 8%
+        let capped = |c: &StrategyConfig, size, equity, bps| {
+            c.risk_capped_size(d(size), &costs, d(equity), bps)
+        };
+        // 10% of 100 is 10; 20 x 28% plus fees is about 5.6: unchanged.
+        assert_eq!(capped(&a, "20", "100", 1_000), Some(d("20")));
+        // 10% of 50 is 5: (5 - 0.011 x 1.28) / 0.28 = 17.807.
+        assert_eq!(capped(&a, "20", "50", 1_000), Some(d("17.80")));
+        // The share can only go down from the code cap of 10%.
+        assert_eq!(capped(&a, "20", "50", 5_000), Some(d("17.80")));
+        assert_eq!(capped(&a, "20", "50", 500), Some(d("8.87")));
+        // No equity left, or not enough for the fees: no entry.
+        assert_eq!(capped(&a, "20", "0", 1_000), None);
+        assert_eq!(capped(&a, "20", "-5", 1_000), None);
+        assert_eq!(capped(&a, "20", "0.1", 1_000), None);
+        // Stop plus slippage at or beyond 100%, or no stop: the whole cost
+        // is at risk.
+        a.stop_loss_bps = 9_000;
+        a.exit_slippage_bps = 5_000;
+        assert_eq!(capped(&a, "20", "100", 1_000), Some(d("9.97")));
+        a.stop_loss_bps = 0;
+        a.exit_slippage_bps = 1;
+        assert_eq!(capped(&a, "20", "100", 1_000), Some(d("9.97")));
+        // Whatever the numbers, the risk stays within the cap.
+        let mut rng = Rng::new(11);
+        for _ in 0..500 {
+            let mut c = seeds()[rng.below(3) as usize].clone();
+            c.stop_loss_bps = 100 + rng.below(8_901) as u32;
+            c.exit_slippage_bps = 1 + rng.below(5_000) as u32;
+            let size = Decimal::new(rng.below(1_000_000) as i64 + 1, 2);
+            let equity = Decimal::new(rng.below(10_000_000) as i64, 2);
+            let Some(cut) = c.risk_capped_size(size, &costs, equity, 1_000) else {
+                continue;
+            };
+            let loss = Decimal::from((c.stop_loss_bps + c.exit_slippage_bps).min(10_000))
+                / Decimal::from(10_000);
+            let risk = (cut + d("0.011")) * loss + d("0.011");
+            assert!(
+                cut <= size && risk <= equity / Decimal::TEN,
+                "{c:?} {size} {equity}"
+            );
+        }
     }
 }

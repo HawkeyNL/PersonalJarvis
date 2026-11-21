@@ -50,6 +50,9 @@ no values on purpose.
 - `stake_usd`, `max_position_usd`, `max_open_positions` (1–10): simulation
   inputs only, never limits for live trading. The stake must cover
   `max_position_usd × max_open_positions`.
+- `max_risk_per_trade_bps` (optional, 1–1000, default 1000): the most one
+  trade may lose at its stop, as a share of the paper equity (below). The
+  code caps it at 10%; a higher value is refused.
 - `filter`: `min_liquidity_usd`, `min_pool_age_secs`, `max_top_holders_share`
   (fraction), `max_sell_impact_bps`, `allowed_extensions` (snake_case
   Token-2022 extension names), `max_snapshot_age_secs`,
@@ -98,7 +101,7 @@ order:
   daily ones before, at most 2000 points, ending with the snapshot an entry
   would fill at.
 - The entry size is the version's share of `max_position_usd`, capped by its
-  share of pool liquidity.
+  share of pool liquidity, then cut to the risk limit (below).
 - Limits: the profile's `max_open_positions` and one position per mint
   across all strategies; per strategy an equal share of `max_open_positions`
   among the enabled strategies (at least one), its `max_entries_per_day` per
@@ -126,6 +129,26 @@ parent and family as their row. Trades, net result
 (after failed-attempt fees and AI cost), expectancy, win rate and maximum
 drawdown per strategy, over all its versions, are shown per strategy (API
 below).
+
+## Risk per trade
+
+Every paper entry, by a strategy's own signal or by Claude, is cut in code so
+that the trade risks at most `max_risk_per_trade_bps` (at most 10%) of the
+paper equity: the stake plus the net result, with open positions valued at
+the tick's prices (a position without a price counts as lost). The risk of
+an entry is what it loses when its version's stop is hit:
+
+    (size + entry fees) × min(stop_loss_bps + exit_slippage_bps, 100%) + exit fees
+
+The stop already measures the pool fee and price impact against the cost;
+the exit slippage is the allowance on top. Without a stop distance the whole
+cost counts. An entry is cut to the largest size, in cents, within the
+limit; when nothing is left (the equity is gone or too small for the fees)
+the entry is not made, and Claude's entry is recorded as `skip` with reason
+`risk_limit`. A cut entry of Claude's is recorded as `enter` with the
+`size_bps` it asked for; the trade's cost shows the size it got. The limit
+counts the planned stop: a price gap past the stop between two ticks (60 s)
+can still lose more, as it can in real trading.
 
 ## Claude decisions
 
@@ -156,8 +179,10 @@ whatever Claude does or whether it answers at all.
   the strategy's open, daily and cooldown limits, and the hard filter. Its
   size is `size_bps` of what the strategy would enter (its share of
   `max_position_usd`, capped by its liquidity share), within the free paper
-  stake. A refused action is recorded as `skip` with the reason (for example
-  `strategy_limit`, `no_slot`, `liquidity_too_low`). Exits sell at the tick's
+  stake and cut to the risk limit (above). The seed strategies enter their
+  full `max_position_usd`, so Claude chooses any size up to it; a version
+  Claude proposes can lower its `position_share_bps`. A refused action is recorded as `skip` with the reason (for example
+  `strategy_limit`, `no_slot`, `risk_limit`, `liquidity_too_low`). Exits sell at the tick's
   price with exit reason `agent_exit`.
 - **Recorded.** Every call starts with a `skip` row with reason
   `call_started`, written before the call is made; if it cannot be written,
