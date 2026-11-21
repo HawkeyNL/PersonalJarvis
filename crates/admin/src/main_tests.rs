@@ -76,6 +76,19 @@ fn housekeeping_defaults_to_a_dry_run_and_takes_no_paths() {
     assert!(Cli::try_parse_from(["jarvis", "housekeeping", "prune"]).is_err());
 }
 #[test]
+fn memecoin_init_profile_takes_only_force() {
+    let force = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
+        Some(Commands::Memecoin {
+            command: memecoin_profile::MemecoinCommand::InitProfile { force },
+        }) => force,
+        _ => panic!("expected memecoin init-profile"),
+    };
+    assert!(!force(&["jarvis", "memecoin", "init-profile"]));
+    assert!(force(&["jarvis", "memecoin", "init-profile", "--force"]));
+    assert!(Cli::try_parse_from(["jarvis", "memecoin", "init-profile", "/tmp/x"]).is_err());
+    assert!(Cli::try_parse_from(["jarvis", "memecoin", "enable"]).is_err());
+}
+#[test]
 fn log_target_is_allowlisted() {
     assert!(Cli::try_parse_from(["jarvis", "logs", "arbitrary.service"]).is_err());
 }

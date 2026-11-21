@@ -15,6 +15,43 @@ running.
 
 ## Enabling it (owner)
 
+After an update that ships these helpers:
+
+```bash
+sudo jarvis memecoin init-profile          # the default paper profile
+sudo jarvis-credentials set market-data    # RPC A, RPC B, optional Jupiter key
+sudo jarvis-credentials status market-data # set/empty per key
+# set JARVIS_MEMECOIN_PAPER_ENABLED=true in /etc/jarvis/core.env, then:
+sudo systemctl restart jarvis-core.service
+sudo jarvis logs core --lines 200          # "memecoin PAPER trader running"
+```
+
+- `jarvis memecoin init-profile [--force]` writes the default profile to
+  `/etc/jarvis/memecoin-paper.json` as root with the group of `/etc/jarvis`
+  and mode `0640`. It stages the file beside the target and checks the staged
+  file with the same code Core loads it with (`jarvis_onchain::profile`)
+  before it moves the file into place. It never replaces an existing profile
+  without `--force`, and it always refuses a symlink. The default: a $100
+  paper stake, at most 5 positions of $20, pump.fun discovery on, BONK, WIF
+  and POPCAT on the watchlist, strict filters (at least $50 000 liquidity, a
+  pool at least 1 hour old, top holders at most 30%, sell impact at most 2%,
+  only the metadata Token-2022 extensions), at most 10% risk per trade, and
+  `agent` with the code-cap call budget and new strategies enabled. Edit the
+  file afterwards as root if you want other values. Core reads it at its
+  next start.
+- `jarvis-credentials set market-data` reads the two RPC URLs and the
+  optional Jupiter key from the TTY with input hidden. It checks the URLs
+  against the market-data allowlist (below: https, no user, port or
+  fragment) and checks that A and B are on different hosts. It then probes
+  each one with a read-only JSON-RPC `getSlot` (10 s) and prints only
+  `RPC A: ok` or `failed`. Only when both answer does it write
+  `/etc/jarvis/secrets/market-data.env` (`root:jarvis 0640`, staged and
+  moved into place). A new `set` replaces the whole file, so leaving the
+  Jupiter key empty removes it. The command does not restart Core.
+  `status market-data` prints `set` or `empty` per key and never a value.
+
+### By hand
+
 1. Write the paper profile (below) to `/etc/jarvis/memecoin-paper.json`,
    owned by root, with the group of `/etc/jarvis` and mode `0640`. Production
    refuses any other owner, mode or a symlink. No API writes this file.
@@ -33,15 +70,12 @@ running.
    restart Core. The log shows `memecoin PAPER trader running` or the reason
    it stayed off; the overview then reports `running` or a `last_error`.
 
-`jarvis-credentials` does not manage `market-data.env` yet; a provider that
-reads these values from the TTY and probes them read-only is a follow-up.
-Until then the owner writes the file by hand.
-
 ## Paper profile
 
 A JSON object; unknown fields are refused. Amounts are decimal strings, ratios
-in basis points, durations in seconds (at most 30 days). The repository ships
-no values on purpose.
+in basis points, durations in seconds (at most 30 days). Apart from the
+owner's default that `jarvis memecoin init-profile` writes, the repository
+ships no values.
 
 - `watchlist`: 1–20 distinct base58 mints to observe.
 - `discovery` (optional, default `true`): also observe mints from pump.fun

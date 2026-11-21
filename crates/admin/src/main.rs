@@ -41,6 +41,7 @@ mod ai_accounts;
 mod credential_setup;
 mod laya;
 mod local_devices;
+mod memecoin_profile;
 mod persona;
 mod sandbox_preflight;
 mod terminal_ui;
@@ -136,6 +137,11 @@ enum Commands {
     Laya {
         #[command(subcommand)]
         command: laya::LayaCommand,
+    },
+    /// Memecoin PAPER trader setup; see docs/MEMECOIN_PAPER.md.
+    Memecoin {
+        #[command(subcommand)]
+        command: memecoin_profile::MemecoinCommand,
     },
     /// Deterministic disk housekeeping; see docs/HOUSEKEEPING.md.
     Housekeeping {
@@ -607,6 +613,12 @@ fn run() -> Result<()> {
             command: ServicesCommand::Status,
         } => services(&presentation),
         Commands::Laya { command } => laya::run(command, cli.json),
+        Commands::Memecoin { command } => {
+            if cli.json {
+                bail!("--json is not supported for memecoin setup");
+            }
+            memecoin_profile::run(command)
+        }
         Commands::Housekeeping { command } => {
             let mut helper = trusted_admin_helper_command(AdminHelper::Housekeeping)?;
             helper.args(housekeeping_arguments(&command, cli.json));

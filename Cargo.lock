@@ -2380,6 +2380,7 @@ dependencies = [
  "hex",
  "jarvis-config",
  "jarvis-llm",
+ "jarvis-onchain",
  "jarvis-privileged",
  "jarvis-usage",
  "libc",
@@ -2651,6 +2652,7 @@ dependencies = [
 name = "jarvis-onchain"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rust_decimal",
  "serde",
  "serde_json",

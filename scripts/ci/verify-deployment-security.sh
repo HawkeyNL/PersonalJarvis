@@ -31,6 +31,7 @@ bash deploy/systemd/tests/test-model-discovery-pipeline.sh
 bash deploy/systemd/tests/test-hourly-model-catalog.sh
 bash deploy/systemd/tests/test-credential-candidate.sh
 bash deploy/systemd/tests/test-ibkr-oauth-credentials.sh
+bash deploy/systemd/tests/test-market-data-credentials.sh
 bash deploy/systemd/tests/test-huggingface-credential-probe.sh
 bash deploy/systemd/tests/test-jev-credential-probe.sh
 sudo env GITHUB_ACTIONS=true bash deploy/surrealdb/tests/test-provision-core-user-shellless.sh

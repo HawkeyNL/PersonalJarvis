@@ -335,6 +335,26 @@ only. Set, test and remove remain explicit trusted commands so secret input is
 handled through `/dev/tty`; no credential value is stored in TUI state or
 captured child output.
 
+## Memecoin paper trader
+
+```bash
+sudo jarvis memecoin init-profile [--force]
+sudo jarvis-credentials set market-data
+sudo jarvis-credentials status market-data
+```
+
+`memecoin init-profile` writes the owner's default paper profile to
+`/etc/jarvis/memecoin-paper.json` (root, the group of `/etc/jarvis`, `0640`).
+It validates the staged file with Core's own parser before moving it into
+place, never replaces an existing profile without `--force`, and refuses a
+symlink. `set market-data` reads two Solana RPC URLs and an optional Jupiter
+key with hidden input, checks them against the market-data allowlist, probes
+each RPC with a read-only `getSlot`, and saves
+`/etc/jarvis/secrets/market-data.env` only when both answer. `status` prints
+set/empty per key. Neither command restarts Core or turns the trader on; see
+[MEMECOIN_PAPER.md](MEMECOIN_PAPER.md#enabling-it-owner). The trader is
+paper only: it has no wallet, signer or execution path.
+
 ## Private agents
 
 ```bash
