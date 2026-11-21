@@ -415,6 +415,11 @@ pub struct AppConfig {
     /// The broker's Unix socket (absolute path).
     #[serde(default = "default_ibkr_broker_socket")]
     pub ibkr_broker_socket: String,
+    /// Read one public web page in chat through the local page reader
+    /// (docs/WEB_PAGES.md). Default **false**; the reader unit is never
+    /// enabled by an install or update either.
+    #[serde(default)]
+    pub web_fetch_enabled: bool,
     /// Read-only crypto wallets (docs/CRYPTO_WALLETS.md): public balances
     /// and EUR prices, never a key or transaction. Default **false**.
     #[serde(default)]
@@ -969,6 +974,7 @@ impl fmt::Debug for AppConfig {
                 &self.ibkr_portfolio_sync_enabled,
             )
             .field("ibkr_broker_socket", &self.ibkr_broker_socket)
+            .field("web_fetch_enabled", &self.web_fetch_enabled)
             .field("crypto_wallets_enabled", &self.crypto_wallets_enabled)
             .field(
                 "crypto_evm_rpc_ethereum_url",
@@ -1119,6 +1125,7 @@ mod tests {
             market_jupiter_api_key: "jupiter-supersecret".to_string(),
             ibkr_portfolio_sync_enabled: false,
             ibkr_broker_socket: default_ibkr_broker_socket(),
+            web_fetch_enabled: false,
             crypto_wallets_enabled: false,
             crypto_evm_rpc_ethereum_url: "https://ethereum-rpc.publicnode.com/?key=rpc-supersecret"
                 .to_string(),
@@ -1172,6 +1179,7 @@ mod tests {
             assert_eq!(cfg.environment, "development"); // default
             assert!(!cfg.memecoin_paper_enabled); // off unless deliberately enabled
             assert!(!cfg.ibkr_portfolio_sync_enabled);
+            assert!(!cfg.web_fetch_enabled);
             assert!(!cfg.crypto_wallets_enabled);
             assert_eq!(
                 cfg.crypto_evm_rpc_polygon_url,
@@ -1287,6 +1295,7 @@ mod tests {
             market_jupiter_api_key: "jupiter-supersecret".to_string(),
             ibkr_portfolio_sync_enabled: false,
             ibkr_broker_socket: default_ibkr_broker_socket(),
+            web_fetch_enabled: false,
             crypto_wallets_enabled: false,
             crypto_evm_rpc_ethereum_url: "https://ethereum-rpc.publicnode.com/?key=rpc-supersecret"
                 .to_string(),

@@ -555,6 +555,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Off by default. A configuration problem leaves the trading routes
     // answering "not configured"; Core keeps running.
+    let page_reader = match jarvis_api::page_read::PageReader::configured(
+        config.web_fetch_enabled,
+        &config.public_hostname,
+    ) {
+        Ok(reader) => reader.map(Arc::new),
+        Err(refused) => {
+            tracing::warn!(%refused, "reading web pages stays off");
+            None
+        }
+    };
     let (ibkr_broker, ibkr_mode) = if config.ibkr_portfolio_sync_enabled {
         match jarvis_api::ibkr::client(&config.ibkr_broker_socket) {
             Ok(client) => (Some(Arc::new(client)), jarvis_api::ibkr::SyncMode::On),
@@ -677,6 +687,7 @@ async fn main() -> anyhow::Result<()> {
             config.memecoin_paper_enabled,
         )),
         auto_research: Default::default(),
+        page_reader,
         github,
         jobs: Arc::new(jarvis_api::jobs::JobsHandle::new()),
         photos,

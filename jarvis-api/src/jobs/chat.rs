@@ -20,9 +20,6 @@ use crate::AppState;
 
 /// Bounds one research run.
 const RESEARCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// Most source links kept in a run's facts, and the longest one.
-const MAX_SOURCES: usize = 20;
-const MAX_SOURCE_CHARS: usize = 500;
 /// The model a fixed message of Core's is stored under.
 const NOTICE_MODEL: &str = "job";
 
@@ -126,25 +123,6 @@ fn run_date(now: OffsetDateTime, tz: &TimeZone) -> String {
         .unwrap_or_default()
 }
 
-/// The https links in an answer, each once.
-fn sources(text: &str) -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
-    for word in text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>')) {
-        let url = word.trim_end_matches(['.', ',', ';', ']']);
-        if url.starts_with("https://")
-            && url.len() > "https://".len()
-            && url.chars().count() <= MAX_SOURCE_CHARS
-            && !found.iter().any(|known| known == url)
-        {
-            found.push(url.to_owned());
-            if found.len() == MAX_SOURCES {
-                break;
-            }
-        }
-    }
-    found
-}
-
 /// The first [`MAX_SUMMARY`] characters, if any are visible.
 fn summary(text: &str) -> Option<String> {
     let text = text.trim();
@@ -176,6 +154,13 @@ pub(super) async fn prompt(state: &AppState, job: &Job, tz: &TimeZone) -> Finish
             crate::routes::chat::job_research(state, Uuid::now_v7(), &question, RESEARCH_TIMEOUT);
         match search.await {
             Ok(Some((answer, model))) => {
+                // Jarvis's own job may have a model-written question: its
+                // answer is stored apart, so "source N" never reads it.
+                let model = if job.origin == Origin::Jarvis {
+                    crate::routes::chat_context::own_research_model(&model)
+                } else {
+                    model
+                };
                 let Some((conversation, message)) = post(state, job, &to, &answer, &model).await
                 else {
                     return Finish::failed("conversation_unavailable");
@@ -189,7 +174,7 @@ pub(super) async fn prompt(state: &AppState, job: &Job, tz: &TimeZone) -> Finish
                     json!({
                         "conversation_id": conversation.to_string(),
                         "message_id": message.to_string(),
-                        "sources": sources(&answer),
+                        "sources": crate::routes::chat_context::sources(&answer),
                     }),
                     summary(&answer).map(|text| (text, SummarySource::Web)),
                 );
@@ -282,23 +267,6 @@ fn finished(facts: serde_json::Value, summary: Option<(String, SummarySource)>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sources_keep_https_links_once_and_bounded() {
-        let text = "See https://a.example/x. and (https://b.example/y) or \
-                    http://plain.example and https://a.example/x again; https://";
-        assert_eq!(
-            sources(text),
-            ["https://a.example/x", "https://b.example/y"]
-        );
-        let many = (0..30)
-            .map(|i| format!("https://e.example/{i}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(sources(&many).len(), MAX_SOURCES);
-        let long = format!("https://e.example/{}", "a".repeat(MAX_SOURCE_CHARS));
-        assert!(sources(&long).is_empty());
-    }
 
     #[test]
     fn summaries_and_dates_are_bounded_and_local() {

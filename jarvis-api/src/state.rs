@@ -237,7 +237,10 @@ pub struct AppState {
     /// Memecoin PAPER trader state shared with its task; off by default.
     pub memecoin: Arc<crate::memecoin::PaperHandle>,
     /// The single slot and caps of automatic web search runs.
-    pub auto_research: Arc<crate::auto_research::AutoResearch>,
+    pub auto_research: Arc<crate::auto_research::RunCaps>,
+    /// Reads the one page a chat turn links to; `None` unless
+    /// `JARVIS_WEB_FETCH_ENABLED=true` and the reader's account exists.
+    pub page_reader: Option<Arc<crate::page_read::PageReader>>,
     /// GitHub poller for roadmap links and its repo allowlist; off by default.
     pub github: Arc<crate::roadmaps::github::GithubHandle>,
     /// The scheduled jobs runner; off when its time zone cannot be loaded.

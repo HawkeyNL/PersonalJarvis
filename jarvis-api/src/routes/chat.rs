@@ -293,11 +293,11 @@ pub(super) async fn execute_chat(
         .map_err(|_| internal_error())?,
     };
     // Only the runs API carries photos: their labels for this run.
-    let (canonical_history, photo_labels) = if user_already_published {
+    let (canonical_history, photo_labels, last_sources) = if user_already_published {
         // A web search never sees photos, so none are read for one.
         let research =
             req.mode.as_deref().map(llm::RoutingMode::parse) == Some(llm::RoutingMode::Research);
-        let (messages, labels) = super::chat_context::load(
+        let (messages, labels, sources) = super::chat_context::load(
             &state.db,
             &state.photos,
             authed.user.id,
@@ -306,9 +306,9 @@ pub(super) async fn execute_chat(
         )
         .await
         .map_err(|_| internal_error())?;
-        (Some(messages), labels)
+        (Some(messages), labels, sources)
     } else {
-        (None, Vec::new())
+        (None, Vec::new(), Vec::new())
     };
     if let Some(run) = &realtime_run {
         if !user_already_published {
@@ -413,6 +413,27 @@ pub(super) async fn execute_chat(
         }
     }
 
+    // One page per turn, only on a runs-API turn outside Research and only
+    // from the owner's own link or a "source N": never a URL of the model's.
+    let page = match &state.page_reader {
+        Some(reader) if user_already_published && requested_mode != llm::RoutingMode::Research => {
+            match crate::page_read::pick(&new_msg, &last_sources) {
+                Some(url) => Some(reader.read(&url, new_msg.chars().count()).await),
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    if let (Some(page), Some(turn)) = (&page, chat.messages.last_mut()) {
+        turn.content = page.add_to(&turn.content);
+    }
+    // Only a page that was read makes a page turn; a refusal is a note.
+    let page_source = match &page {
+        Some(crate::page_read::PageOutcome::Read { url, .. }) => Some(url.as_str()),
+        _ => None,
+    };
+    let page_turn = page_source.is_some();
+
     // Built only on the paths that send it, after the early refusals.
     if requested_mode != llm::RoutingMode::Research {
         let headroom = chat_headroom(!photo_labels.is_empty());
@@ -443,7 +464,8 @@ pub(super) async fn execute_chat(
             &new_msg,
         )
         .await)
-    } else if let Some(run) = &realtime_run {
+    } else if let (Some(run), false) = (&realtime_run, page_turn) {
+        // A page turn is not streamed: only its cleaned answer is shown.
         let hub = state.realtime.clone();
         let run = run.clone();
         let user = authed.user.id;
@@ -489,17 +511,23 @@ pub(super) async fn execute_chat(
         Ok(mut reply) => {
             let (research_advised, markers) =
                 research_advised(&mut reply.text, requested_mode, intent_kind);
+            // A page turn's answer was written with web text in its input:
+            // it loses every marker and never leads to a web search.
+            let research_advised = research_advised && !page_turn;
             // Only an ordinary runs-API answer may propose or make jobs or
-            // propose a roadmap; a research answer and the legacy endpoint
-            // only lose the markers.
+            // propose a roadmap; a research answer, a page turn and the
+            // legacy endpoint only lose the markers.
             // A job of Jarvis's own searches the web without the owner's
             // click, so a turn with photos never makes one.
             let honoured = realtime_run.is_some()
                 && user_already_published
-                && requested_mode != llm::RoutingMode::Research;
+                && requested_mode != llm::RoutingMode::Research
+                && !page_turn;
             if !honoured && (markers.any_job || markers.any_roadmap) {
                 let reason = if requested_mode == llm::RoutingMode::Research {
                     "research mode"
+                } else if page_turn {
+                    "page turn"
                 } else {
                     "not a runs-API turn"
                 };
@@ -567,7 +595,11 @@ pub(super) async fn execute_chat(
                 };
             }
             let roadmap_proposals: Vec<_> = roadmap.and_then(Result::ok).into_iter().collect();
-            if (markers.any_job || markers.any_roadmap) && reply.text.trim().is_empty() {
+            // A page turn says nothing about markers it never honours.
+            if !page_turn
+                && (markers.any_job || markers.any_roadmap)
+                && reply.text.trim().is_empty()
+            {
                 reply.text = if requested_mode == llm::RoutingMode::Research {
                     RESEARCH_EMPTY
                 } else if !job_proposals.is_empty() {
@@ -584,9 +616,10 @@ pub(super) async fn execute_chat(
                 // The owner asked for a job and no card follows: say so.
                 reply.text = format!("{}\n\n{JOB_REFUSED_REPLY}", reply.text.trim_end());
             }
-            // A web answer never shows a photo; a chat answer only one of
-            // this run's photos.
-            let labels: &[(u8, Uuid)] = if requested_mode == llm::RoutingMode::Research {
+            // A web or page answer never shows a photo; a chat answer only
+            // one of this run's photos.
+            let labels: &[(u8, Uuid)] = if requested_mode == llm::RoutingMode::Research || page_turn
+            {
                 &[]
             } else {
                 &photo_labels
@@ -595,6 +628,9 @@ pub(super) async fn execute_chat(
             let shown = take_photo_markers(&mut reply.text, labels);
             if had_markers && reply.text.trim().is_empty() && shown.is_empty() {
                 reply.text = PHOTO_NOT_FOUND_REPLY.into();
+            }
+            if let Some(source) = page_source {
+                reply.text = page_answer(&reply.text, source);
             }
             let input_bytes = chat
                 .messages
@@ -624,7 +660,7 @@ pub(super) async fn execute_chat(
                 authed.user.id,
                 "assistant",
                 &reply.text,
-                Some(stored_model(requested_mode, &reply).as_str()),
+                Some(stored_model(requested_mode, page_turn, &reply).as_str()),
                 &shown,
             )
             .await;
@@ -662,12 +698,12 @@ pub(super) async fn execute_chat(
                 // Only a runs-API run (its user message was persisted first)
                 // may search by itself; the legacy endpoint never does. A
                 // turn with photos never leads to a web search.
-                let auto = if user_already_published && !image_turn {
+                let auto = if user_already_published && !image_turn && !page_turn {
                     crate::auto_research::start(&state, research_advised, &new_msg).await
                 } else {
                     None
                 };
-                let research_offer = if auto.is_some() || image_turn {
+                let research_offer = if auto.is_some() || image_turn || page_turn {
                     None
                 } else {
                     crate::intent::research_offer(
@@ -929,14 +965,93 @@ Ask again or rephrase the question.";
 const MAX_RESEARCH_ANSWER_CHARS: usize = 12_000;
 
 /// The model a reply is stored under. A completed Research run (a notice has
-/// no backend) is `web:<model>`, so later context carries it as untrusted
-/// data; metering keeps the plain model.
-fn stored_model(requested_mode: llm::RoutingMode, reply: &llm::ChatReply) -> String {
-    if requested_mode == llm::RoutingMode::Research && reply.backend.is_some() {
+/// no backend) is `web:<model>` and a page turn's answer `read:<model>`, so
+/// later context carries them as untrusted data; metering keeps the plain
+/// model.
+fn stored_model(
+    requested_mode: llm::RoutingMode,
+    page_turn: bool,
+    reply: &llm::ChatReply,
+) -> String {
+    if reply.backend.is_none() {
+        reply.model.clone()
+    } else if requested_mode == llm::RoutingMode::Research {
         super::chat_context::web_model(&reply.model)
+    } else if page_turn {
+        super::chat_context::read_model(&reply.model)
     } else {
         reply.model.clone()
     }
+}
+
+/// Stored when a page turn's answer was empty.
+const PAGE_EMPTY: &str = "I could not write an answer from that page.";
+
+/// A page turn's answer as stored. Its model had private context next to
+/// text a site controls, so nothing in it may hide a URL: cleaned like a
+/// web answer (no remote images, capped), the model's own Sources list
+/// dropped, every markdown link and link definition reduced to its text,
+/// and no `<` left for HTML or an autolink. A plain URL stays visible as
+/// written. The page is its only Sources line.
+fn page_answer(text: &str, source: &str) -> String {
+    let text = clean_research_text(text);
+    let lines: Vec<&str> = text.lines().collect();
+    let body = match lines
+        .iter()
+        .rposition(|line| super::chat_context::is_sources_header(line))
+    {
+        Some(header) => lines[..header].join("\n"),
+        None => text.clone(),
+    };
+    let body = links_as_text(&body)
+        .lines()
+        .filter(|line| !is_link_definition(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace('<', "\u{ff1c}");
+    let body = if body.trim().is_empty() {
+        PAGE_EMPTY
+    } else {
+        body.trim_end()
+    };
+    format!("{body}\n\nSources:\n- {source}")
+}
+
+/// `[text](target)` becomes `text`.
+fn links_as_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('[') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let link = after.find("](").and_then(|label_end| {
+            let label = &after[..label_end];
+            let target = &after[label_end + 2..];
+            let close = target.find(')')?;
+            (!label.contains(['[', ']', '\n']) && !target[..close].contains('\n'))
+                .then_some((label, label_end + 2 + close + 1))
+        });
+        match link {
+            Some((label, len)) => {
+                out.push_str(label);
+                rest = &after[len..];
+            }
+            None => {
+                out.push('[');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A reference link definition line: `[name]: target`.
+fn is_link_definition(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("]:"))
+        .is_some_and(|(name, _)| !name.is_empty() && !name.contains(['[', ']']))
 }
 
 /// Web-derived text before it is stored: markdown images become their alt
@@ -981,10 +1096,10 @@ fn images_as_text(text: &str) -> String {
 
 fn https_sources_only(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
-    let Some(header) = lines.iter().rposition(|line| {
-        let label = line.trim().trim_matches(['#', '*', '_', ':', ' ']);
-        label.eq_ignore_ascii_case("sources") || label.eq_ignore_ascii_case("bronnen")
-    }) else {
+    let Some(header) = lines
+        .iter()
+        .rposition(|line| super::chat_context::is_sources_header(line))
+    else {
         return text.to_string();
     };
     let mut kept = lines[..=header].to_vec();
@@ -1155,7 +1270,7 @@ async fn auto_research_answer(
         reply.text = RESEARCH_EMPTY.into();
     }
     reply.backend.is_some().then(|| {
-        let model = stored_model(llm::RoutingMode::Research, &reply);
+        let model = stored_model(llm::RoutingMode::Research, false, &reply);
         (reply, model)
     })
 }
@@ -1954,13 +2069,46 @@ mod tests {
             answer.model, "claude-opus-5",
             "metering keeps the plain model"
         );
-        assert_eq!(stored_model(research, &answer), "web:claude-opus-5");
+        assert_eq!(stored_model(research, false, &answer), "web:claude-opus-5");
         assert_eq!(
-            stored_model(llm::RoutingMode::Auto, &answer),
+            stored_model(llm::RoutingMode::Auto, false, &answer),
             "claude-opus-5"
         );
         let off = research_reply(&llm::RoutingSnapshot::default(), &Recorder::default(), "x").await;
-        assert_eq!(stored_model(research, &off), "research");
+        assert_eq!(stored_model(research, false, &off), "research");
+        // A page turn's answer is `read:`, never `web:`; a notice stays plain.
+        assert_eq!(
+            stored_model(llm::RoutingMode::Auto, true, &answer),
+            "read:claude-opus-5"
+        );
+        assert_eq!(stored_model(llm::RoutingMode::Auto, true, &off), "research");
+    }
+
+    #[test]
+    fn page_answers_are_cleaned_and_end_with_their_source() {
+        assert_eq!(
+            page_answer(
+                "Samenvatting ![x](https://evil.example/?d=1) klaar.\n",
+                "https://nos.nl/a"
+            ),
+            "Samenvatting x klaar.\n\nSources:\n- https://nos.nl/a"
+        );
+        // No link can hide a URL; the model's own Sources list is dropped.
+        assert_eq!(
+            page_answer(
+                "Zie [meer](https://evil.example/?h=AAPL) en [ref][1], <img src=x> <https://a.example/>.\n\
+                 [1]: https://evil.example/r\n\
+                 Plain https://visible.example/x stays.\n\n\
+                 ## Sources\n- https://evil.example/s",
+                "https://nos.nl/a"
+            ),
+            "Zie meer en [ref][1], \u{ff1c}img src=x> \u{ff1c}https://a.example/>.\n\
+             Plain https://visible.example/x stays.\n\nSources:\n- https://nos.nl/a"
+        );
+        assert_eq!(
+            page_answer("  ", "https://nos.nl/a"),
+            format!("{PAGE_EMPTY}\n\nSources:\n- https://nos.nl/a")
+        );
     }
 
     #[tokio::test]

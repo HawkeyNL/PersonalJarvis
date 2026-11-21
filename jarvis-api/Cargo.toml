@@ -51,6 +51,7 @@ jarvis-observability.workspace = true
 jarvis-identity.workspace = true
 jarvis-portfolio.workspace = true
 jarvis-ibkr.workspace = true
+jarvis-page-reader.workspace = true
 jarvis-llm.workspace = true
 jarvis-speech.workspace = true
 jarvis-registry.workspace = true

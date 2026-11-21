@@ -63,7 +63,8 @@ BROWSER_USES = {"crates/sandbox/src/lib.rs": 5}
 # Core reads a page only through the gate in page_read.rs (URL pick, the URL
 # and identifier checks, caps); the reader crate defines and tests both.
 PAGE_READER_CLIENT = re.compile(r"\bPageReaderClient\s*::\s*new\b")
-PAGE_READER_CLIENT_FILES = {"jarvis-api/src/page_read.rs"}
+# The realtime test points Core at a fake reader on a temporary socket.
+PAGE_READER_CLIENT_FILES = {"jarvis-api/src/page_read.rs", "jarvis-api/tests/realtime/mod.rs"}
 PAGE_FETCHER = re.compile(r"\bjarvis_page_reader\s*::\s*(?:fetch\b|\{[^}]*\bfetch\b)|\bFetcher\s*::\s*(?:new|for_test)\b")
 PAGE_READER_CRATE = "crates/page-reader/"
 
