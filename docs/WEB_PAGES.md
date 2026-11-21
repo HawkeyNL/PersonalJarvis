@@ -13,15 +13,28 @@ pages.
 
 ## Enabling it (owner)
 
-1. Start the reader: `sudo systemctl enable --now jarvis-page-reader.service`.
-2. Set `JARVIS_WEB_FETCH_ENABLED=true` in `/etc/jarvis/core.env` and restart
+1. Create the reader account. The full installer does this; a Home Node
+   that only ran `jarvis update` does not have it yet, and the unit then fails
+   with `Failed to determine credentials for user 'jarvis-reader'`:
+
+   ```
+   getent passwd jarvis-reader || sudo useradd --system --user-group \
+     --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin jarvis-reader
+   ```
+
+   If the unit already failed, clear it first with
+   `sudo systemctl reset-failed jarvis-page-reader.service`.
+2. Start the reader: `sudo systemctl enable --now jarvis-page-reader.service`.
+   `journalctl -u jarvis-page-reader.service` then shows `page reader ready`.
+3. Set `JARVIS_WEB_FETCH_ENABLED=true` in `/etc/jarvis/core.env` and restart
    Core. `reading web pages stays off` in the Core log at startup means the
    reader account is missing or unsafe; Core keeps running either way.
-3. If the Home Node's firewall lists allowed outgoing hosts, the reader needs
+4. If the Home Node's firewall lists allowed outgoing hosts, the reader needs
    TCP 443 out for uid `jarvis-reader` only.
 
 To turn it off, set the flag back to `false`, restart Core and
-`sudo systemctl disable --now jarvis-page-reader.service`.
+`sudo systemctl disable --now jarvis-page-reader.service`. The account can stay;
+remove it with `sudo userdel jarvis-reader` once the unit is disabled.
 
 ## Which page is read
 
