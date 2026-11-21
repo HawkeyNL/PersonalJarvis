@@ -501,7 +501,7 @@ pub(super) async fn execute_chat(
                 let reason = if requested_mode == llm::RoutingMode::Research {
                     "research mode"
                 } else {
-                    "legacy endpoint"
+                    "not a runs-API turn"
                 };
                 tracing::info!(
                     reason,

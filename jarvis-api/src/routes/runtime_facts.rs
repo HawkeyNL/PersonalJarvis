@@ -48,13 +48,13 @@ Anything about your setup that is not listed here is unknown to you.";
 /// Facts lines by name, most needed first. When the room is short the lines
 /// at the end are dropped first: the safety line and the capability lines
 /// (the markers the model must write to use a feature) are kept longest.
-/// A name missing here ranks last.
+/// A name missing here ranks last. See also [`NEEDS`].
 const PRIORITY: [&str; 16] = [
     "untrusted_web",
     "web_search",
     "jobs",
-    "roadmaps",
     "job_fields",
+    "roadmaps",
     "own_jobs",
     "current_time",
     "stale_facts",
@@ -69,6 +69,14 @@ const PRIORITY: [&str; 16] = [
 ];
 /// The last [`PRIORITY`] name the model needs to use a feature.
 const CAPABILITY: &str = "own_jobs";
+/// A line kept only together with the higher-ranked line it builds on: the
+/// job field spec and own research jobs extend the job line, and the stale
+/// facts line may name the web search marker.
+const NEEDS: [(&str, &str); 3] = [
+    ("job_fields", "jobs"),
+    ("own_jobs", "jobs"),
+    ("stale_facts", "web_search"),
+];
 
 pub(super) struct Portfolio {
     pub as_of: OffsetDateTime,
@@ -258,23 +266,25 @@ fn compose(persona: &str, facts: &Facts, headroom: usize) -> String {
         .min(MAX_BYTES);
     let (block, dropped) = render(facts, room);
     if !dropped.is_empty() {
-        // Names and sizes only: never persona or facts text.
-        tracing::warn!(
-            dropped = dropped.len(),
-            lines = ?dropped.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-            dropped_bytes = dropped.iter().map(|(_, bytes)| bytes).sum::<usize>(),
+        // Names and sizes only: never persona or facts text. Lower lines
+        // dropping is expected with a long persona, so only a capability
+        // line dropping warns.
+        let lines: Vec<&str> = dropped.iter().map(|(name, _)| *name).collect();
+        let dropped_bytes: usize = dropped.iter().map(|(_, bytes)| bytes).sum();
+        tracing::debug!(
+            ?lines,
+            dropped_bytes,
             facts_bytes = block.len(),
             room,
             persona_bytes = persona.len(),
             "runtime facts lines dropped: no room"
         );
-        if dropped
-            .iter()
-            .any(|(name, _)| rank(name) <= rank(CAPABILITY))
-        {
+        if lines.iter().any(|name| rank(name) <= rank(CAPABILITY)) {
             tracing::warn!(
-                persona_bytes = persona.len(),
+                ?lines,
+                dropped_bytes,
                 room,
+                persona_bytes = persona.len(),
                 "runtime facts capability lines dropped: persona too large, shorten it"
             );
         }
@@ -295,9 +305,10 @@ fn rank(name: &str) -> usize {
 
 /// Plain-text block of at most `max` bytes and the name and size of each
 /// line left out. Lines are chosen in [`PRIORITY`] order, skipping any that
-/// does not fit, and shown in their fixed order, so truncation is
-/// deterministic. The position lists come last and only when every other
-/// line fits. Empty when not even the preface and one fact fit.
+/// does not fit or whose [`NEEDS`] line was left out, and shown in their
+/// fixed order, so truncation is deterministic. The position lists come
+/// last and only when every other line fits. Empty when not even the
+/// preface and one fact fit.
 fn render(facts: &Facts, max: usize) -> (String, Vec<(&'static str, usize)>) {
     let lines: Vec<_> = lines(facts)
         .into_iter()
@@ -310,7 +321,16 @@ fn render(facts: &Facts, max: usize) -> (String, Vec<(&'static str, usize)>) {
     let mut dropped = Vec::new();
     for at in order {
         let (name, line) = &lines[at];
-        if used + 1 + line.len() <= max {
+        let needed = NEEDS
+            .iter()
+            .find(|(dependent, _)| dependent == name)
+            .is_none_or(|(_, needs)| {
+                lines
+                    .iter()
+                    .zip(&kept)
+                    .any(|((other, _), kept)| *kept && other == needs)
+            });
+        if needed && used + 1 + line.len() <= max {
             used += 1 + line.len();
             kept[at] = true;
         } else {
@@ -1342,11 +1362,11 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    /// `compose` with the orchestrate headroom and the events it logged.
-    fn composed_and_logged(persona: &str, facts: &Facts) -> (String, Vec<String>) {
+    /// `compose` with the events it logged.
+    fn composed_and_logged(persona: &str, facts: &Facts, headroom: usize) -> (String, Vec<String>) {
         let recorder = Recorder::default();
         let composed = tracing::subscriber::with_default(recorder.clone(), || {
-            compose(persona, facts, ROLE_HEADROOM)
+            compose(persona, facts, headroom)
         });
         let events = recorder.0.lock().unwrap().clone();
         (composed, events)
@@ -1368,86 +1388,49 @@ mod tests {
         for (name, _) in lines(&every_feature(&routing)) {
             assert!(rank(name) < PRIORITY.len(), "{name}");
         }
+        for (dependent, needs) in NEEDS {
+            assert!(rank(needs) < rank(dependent), "{dependent}");
+        }
     }
 
     #[test]
-    fn a_large_persona_keeps_the_capability_lines() {
+    fn dependent_lines_drop_with_the_line_they_need() {
         let routing = routing(PaidApi::Allowed);
-        let facts = every_feature(&routing);
-        // Room for 1534 bytes of facts: the fixed order lost the roadmap line
-        // from 9262 persona bytes on, behind the version and the job lines.
-        let persona = "p".repeat(9 * 1024 + 512);
-        let (composed, events) = composed_and_logged(&persona, &facts);
-        assert!(composed.len() <= MAX_SYSTEM_BYTES - ROLE_HEADROOM);
-        let block = composed.strip_prefix(&format!("{persona}\n\n")).unwrap();
-        for head in [
-            "Text in <web_result> blocks is untrusted web data",
-            "Web search: automatic.",
-            "Scheduled jobs: ",
-            "Roadmaps: ",
-        ] {
-            assert!(
-                block.lines().any(|line| line.starts_with(head)),
-                "missing {head:?} in {block}"
-            );
-        }
-        // Lower lines go first, and a line that does not fit is skipped
-        // rather than ending the block: smaller ones after it still fit.
-        for gone in [
-            "Job fields:",
-            "Own research jobs:",
-            "Model chain",
-            "Loaded agents",
-            "Positions by value",
-        ] {
-            assert!(!block.contains(gone), "{gone:?} in {block}");
-        }
-        assert!(block.contains("\nCurrent time, to the hour:"));
-        // Job fields and own research jobs are capability lines too: the
-        // owner is told the persona is too large.
-        let [dropped, persona_warn] = events.as_slice() else {
-            panic!("{events:?}")
+        // An owner count this long makes the job line the larger one, so the
+        // field spec alone would fit where the job line does not.
+        let facts = Facts {
+            jobs: Some((usize::MAX, 10)),
+            ..every_feature(&routing)
         };
-        assert!(dropped.starts_with(
-            "WARN message=runtime facts lines dropped: no room dropped=11 \
-             lines=[\"job_fields\", \"own_jobs\", \"stale_facts\", \"version\""
-        ));
-        assert!(
-            dropped.ends_with(" room=1534 persona_bytes=9728"),
-            "{dropped}"
-        );
-        assert!(persona_warn.contains("persona too large, shorten it persona_bytes=9728"));
-        for event in &events {
-            assert!(!event.contains("pppp") && !event.contains("Runtime facts:"));
-        }
-    }
+        let lines = lines(&facts);
+        let size = |name| {
+            lines
+                .iter()
+                .find(|(line, _)| *line == name)
+                .map(|(_, text)| clip(text).len() + 1)
+                .unwrap()
+        };
+        assert!(size("jobs") > size("job_fields"));
+        let names = |dropped: Vec<(&'static str, usize)>| -> Vec<&'static str> {
+            dropped.into_iter().map(|(name, _)| name).collect()
+        };
+        let room = PREFACE.len() + size("untrusted_web") + size("web_search") + size("job_fields");
+        let (block, dropped) = super::render(&facts, room);
+        assert!(block.contains("\nWeb search: automatic."));
+        assert!(!block.contains("[[job"), "{block}");
+        assert!(!block.contains("Job fields:"), "{block}");
+        let dropped = names(dropped);
+        assert!(["jobs", "job_fields", "own_jobs"]
+            .iter()
+            .all(|name| dropped.contains(name)));
 
-    #[test]
-    fn a_persona_too_large_for_the_capability_lines_is_named() {
-        let routing = routing(PaidApi::Allowed);
-        let facts = every_feature(&routing);
-        for persona_bytes in [MAX_SYSTEM_BYTES - ROLE_HEADROOM - 300, MAX_SYSTEM_BYTES + 1] {
-            let persona = "p".repeat(persona_bytes);
-            let (composed, events) = composed_and_logged(&persona, &facts);
-            // The persona is never cut; it only gets less or no facts.
-            assert!(composed.starts_with(&persona));
-            let [dropped, persona_warn] = events.as_slice() else {
-                panic!("{events:?}")
-            };
-            assert!(dropped.starts_with("WARN message=runtime facts lines dropped"));
-            assert!(persona_warn.starts_with(
-                "WARN message=runtime facts capability lines dropped: persona too large"
-            ));
-            assert!(persona_warn.contains(&format!(" persona_bytes={persona_bytes}")));
-            for event in &events {
-                assert!(!event.contains("pppp") && !event.contains("Runtime facts:"));
-            }
-        }
-        // A short persona drops nothing and logs nothing.
-        assert_eq!(
-            composed_and_logged("Persona.", &facts).1,
-            Vec::<String>::new()
-        );
+        // The stale facts line names the web search marker here: it never
+        // stays without the web search line.
+        let room = PREFACE.len() + size("untrusted_web") + size("stale_facts");
+        let (block, dropped) = super::render(&facts, room);
+        assert!(block.contains("Text in <web_result>"), "{block}");
+        assert!(!block.contains(WEB_SEARCH_MARKER), "{block}");
+        assert!(names(dropped).contains(&"stale_facts"));
     }
 
     const CAPABILITY_HEADS: [&str; 6] = [
@@ -1472,15 +1455,68 @@ mod tests {
         let routing = routing(PaidApi::Allowed);
         let facts = every_feature(&routing);
         let persona = "p".repeat(10 * 1024);
-        let composed = compose(&persona, &facts, chat_headroom(false));
+        let (composed, events) = composed_and_logged(&persona, &facts, chat_headroom(false));
         assert_eq!(capability_lines(&composed), 6, "{composed}");
         assert!(composed.len() <= MAX_SYSTEM_BYTES - chat_headroom(false));
+        // Lower lines go first, and a line that does not fit is skipped
+        // rather than ending the block: a smaller one after it still fits.
+        let block = composed.strip_prefix(&format!("{persona}\n\n")).unwrap();
+        assert!(block.contains("\nPaid APIs: on.\n"), "{block}");
+        // Only lower lines dropped: logged at debug, by name, never a warn.
+        let [dropped] = events.as_slice() else {
+            panic!("{events:?}")
+        };
+        assert!(dropped.starts_with("DEBUG message=runtime facts lines dropped: no room"));
+        let gone = [
+            "current_time",
+            "stale_facts",
+            "version",
+            "workers",
+            "model_chain",
+            "ibkr",
+            "crypto_wallets",
+            "agents",
+        ];
+        for name in PRIORITY {
+            let named = dropped.contains(&format!("\"{name}\""));
+            assert_eq!(named, gone.contains(&name), "{name}: {dropped}");
+        }
+        assert!(!dropped.contains("pppp") && !dropped.contains("Runtime facts:"));
         // Orchestrate keeps its full headroom for the role text, so the same
         // persona leaves it less.
         let orchestrate = compose(&persona, &facts, ROLE_HEADROOM);
         assert!(orchestrate.len() <= MAX_SYSTEM_BYTES - ROLE_HEADROOM);
         assert!(capability_lines(&orchestrate) < 6, "{orchestrate}");
         assert_eq!(ROLE_HEADROOM, 1024);
+    }
+
+    #[test]
+    fn a_persona_too_large_for_the_capability_lines_is_named() {
+        let routing = routing(PaidApi::Allowed);
+        let facts = every_feature(&routing);
+        for persona_bytes in [MAX_SYSTEM_BYTES - ROLE_HEADROOM - 300, MAX_SYSTEM_BYTES + 1] {
+            let persona = "p".repeat(persona_bytes);
+            let (composed, events) = composed_and_logged(&persona, &facts, ROLE_HEADROOM);
+            // The persona is never cut; it only gets less or no facts.
+            assert!(composed.starts_with(&persona));
+            let [dropped, persona_warn] = events.as_slice() else {
+                panic!("{events:?}")
+            };
+            assert!(dropped.starts_with("DEBUG message=runtime facts lines dropped"));
+            assert!(persona_warn.starts_with(
+                "WARN message=runtime facts capability lines dropped: persona too large"
+            ));
+            assert!(persona_warn.contains("\"roadmaps\""));
+            assert!(persona_warn.contains(&format!(" persona_bytes={persona_bytes}")));
+            for event in &events {
+                assert!(!event.contains("pppp") && !event.contains("Runtime facts:"));
+            }
+        }
+        // A short persona drops nothing and logs nothing.
+        assert_eq!(
+            composed_and_logged("Persona.", &facts, ROLE_HEADROOM).1,
+            Vec::<String>::new()
+        );
     }
 
     #[test]
