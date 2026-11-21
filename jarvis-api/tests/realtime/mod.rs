@@ -1713,7 +1713,8 @@ async fn a_linked_page_is_read_once_fenced_and_never_stored_or_acted_on(
     // The page text was never stored; no job came of the markers.
     let rows: Vec<Value> = db
         .query(
-            "SELECT role, content, model FROM chat_messages WHERE conversation_id = $conversation \
+            "SELECT role, content, model, created_at FROM chat_messages \
+             WHERE conversation_id = $conversation \
              ORDER BY created_at",
         )
         .bind(json!({"conversation": conversation.to_string()}))
