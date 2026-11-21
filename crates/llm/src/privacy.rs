@@ -83,6 +83,119 @@ pub fn leaks_identifier(text: &str) -> bool {
         || has_digit_run(text, true)
 }
 
+/// Query parameter names that carry a credential or a one-time value,
+/// matched at the start or end of each word of the lower-cased name
+/// (`access_token`, `apikey`, `X-Amz-Signature`, `oauth_state`).
+const SECRET_QUERY_WORDS: [&str; 20] = [
+    "token",
+    "key",
+    "sig",
+    "auth",
+    "pass",
+    "pwd",
+    "secret",
+    "session",
+    "sid",
+    "code",
+    "otp",
+    "ticket",
+    "state",
+    "jwt",
+    "bearer",
+    "nonce",
+    "hmac",
+    "credential",
+    "assertion",
+    "saml",
+];
+/// Percent-decoding rounds, so `%2540` cannot hide an `@`. Text that is
+/// still encoded after the last round counts as leaking.
+const DECODE_ROUNDS: usize = 3;
+
+/// Whether a URL Core would send to the page reader carries a personal
+/// identifier or a credential: an email address anywhere (user info
+/// included), a key-like host, path, query or fragment part, an identifier
+/// in the host (it leaks through DNS before any fetch), a possessive near a
+/// money or account word in the path, a query name that looks like a
+/// credential, or a query value that fails [`leaks_identifier`].
+/// Percent-encoding is decoded first. Path digits are allowed (article ids);
+/// this is a heuristic like the rest of this module, so it refuses some
+/// harmless URLs (`?keyword=`) rather than miss one.
+pub fn url_leaks_identifier(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let (authority, rest) = after_scheme
+        .find(['/', '?', '#'])
+        .map_or((after_scheme, ""), |at| after_scheme.split_at(at));
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host);
+    let (before_fragment, fragment) = rest.split_once('#').unwrap_or((rest, ""));
+    let (path, query) = before_fragment
+        .split_once('?')
+        .unwrap_or((before_fragment, ""));
+    // Still encoded after the last round: fail closed.
+    let leaks =
+        |text: &str, check: &dyn Fn(&str) -> bool| decode(text).is_none_or(|text| check(&text));
+    authority.contains('@')
+        || leaks(url, &has_email)
+        || leaks(host, &|host| has_key(host) || leaks_identifier(host))
+        || leaks(path, &|path| {
+            has_key(path) || has_possessive(&path.to_lowercase())
+        })
+        || leaks(fragment, &has_key)
+        || query
+            .split(['&', ';'])
+            .filter(|pair| !pair.is_empty())
+            .any(|pair| {
+                let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                leaks(name, &is_secret_query_name)
+                    || leaks(value, &|value| has_key(value) || leaks_identifier(value))
+            })
+}
+
+fn is_secret_query_name(name: &str) -> bool {
+    runs(&name.to_lowercase(), char::is_alphanumeric).any(|word| {
+        SECRET_QUERY_WORDS
+            .iter()
+            .any(|secret| word.starts_with(secret) || word.ends_with(secret))
+    })
+}
+
+/// Percent-decodes up to [`DECODE_ROUNDS`] times and reads `+` as a space;
+/// `None` when the text still changes after the last round. Invalid escapes
+/// and invalid UTF-8 stay as they are (lossy).
+fn decode(text: &str) -> Option<String> {
+    let mut text = text.replace('+', " ");
+    for _ in 0..=DECODE_ROUNDS {
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut at = 0;
+        while at < bytes.len() {
+            let hex = |offset: usize| {
+                bytes
+                    .get(at + offset)
+                    .and_then(|byte| (*byte as char).to_digit(16))
+            };
+            match (bytes[at], hex(1), hex(2)) {
+                (b'%', Some(high), Some(low)) => {
+                    out.push((high * 16 + low) as u8);
+                    at += 3;
+                }
+                (byte, _, _) => {
+                    out.push(byte);
+                    at += 1;
+                }
+            }
+        }
+        let decoded = String::from_utf8_lossy(&out).into_owned();
+        if decoded == text {
+            return Some(text);
+        }
+        text = decoded;
+    }
+    None
+}
+
 fn has_email(text: &str) -> bool {
     text.split_whitespace().any(|token| {
         token.split_once('@').is_some_and(|(local, domain)| {
@@ -566,5 +679,76 @@ mod tests {
         assert!(!is_private("prijs per m² in de stad", &[]));
         assert!(!is_private("prijs in euro per m²", &[]));
         assert!(!is_private("½ liter melk", &[]));
+    }
+
+    #[test]
+    fn url_identifier_gate_table() {
+        for (url, leaks) in [
+            ("https://example.com/", false),
+            ("https://www.nu.nl/economie/6312345/rente-daalt.html", false),
+            ("https://example.com/news/2026/11/21/storm", false),
+            ("https://example.com/search?q=bitcoin+price&page=2", false),
+            ("https://example.com/a?lang=nl&utm_source=feed", false),
+            (
+                "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+                false,
+            ),
+            ("https://example.com/page#section-2", false),
+            ("https://example.com/?q=nieuws+2026-11-10", false),
+            // Emails anywhere, encoded or not, and user info.
+            ("https://example.com/u/jan@example.nl", true),
+            ("https://example.com/?to=jan%40example.nl", true),
+            ("https://example.com/?to=jan%2540example.nl", true),
+            ("https://jan:secret@example.com/", true),
+            ("https://jan@example.com/", true),
+            ("https://example.com/#jan@example.nl", true),
+            // Key-like parts.
+            ("https://example.com/share/a1b2c3d4e5f6g7h8i9j0k1l2m3", true),
+            ("https://example.com/?x=sk-proj-abc", true),
+            ("https://example.com/#a1b2c3d4e5f6g7h8i9j0k1l2m3", true),
+            (
+                "https://solscan.io/account/CEyDYzCCrgfDDiiQTxrgGdLSEBrKeSCyuVrSUbyTjWxh",
+                true,
+            ),
+            // Credential-like query names, whatever the value.
+            ("https://example.com/?token=1", true),
+            ("https://example.com/?access_token=x", true),
+            ("https://example.com/?apiKey=x", true),
+            ("https://example.com/?X-Amz-Signature=x", true),
+            ("https://example.com/?sig=x", true),
+            ("https://example.com/?auth=x", true),
+            ("https://example.com/?password=x", true),
+            ("https://example.com/?client_secret=x", true),
+            ("https://example.com/?sessionid=x", true),
+            ("https://example.com/?code=x", true),
+            ("https://example.com/?otp=1", true),
+            ("https://example.com/?ticket=x", true),
+            ("https://example.com/?state=x", true),
+            ("https://example.com/?a=1&TOKEN=x", true),
+            ("https://example.com/?%74oken=x", true),
+            // Query values with an identifier.
+            ("https://example.com/?phone=0612345678", true),
+            ("https://example.com/?n=06+1234+5678", true),
+            ("https://example.com/?q=mijn+portfolio", true),
+            ("https://example.com/?iban=NL91ABNA0417164300", true),
+            // Identifiers in the host leak through DNS.
+            ("https://0612345678.example.com/", true),
+            ("https://a1b2c3d4e5f6g7h8i9j0k1l2m3.example.com/", true),
+            ("https://www.example.com:443/", false),
+            // Still encoded after the last round.
+            ("https://example.com/?to=jan%25252540example.nl", true),
+            ("https://example.com/?to=jan%252540example.nl", true),
+            // A possessive near a money word in the path.
+            ("https://example.com/zoek/mijn-portfolio-aapl", true),
+            ("https://example.com/news/mijn-fiets", false),
+            // `;` separates query pairs too; more credential names.
+            ("https://example.com/?a=1;token=x", true),
+            ("https://example.com/?jwt=x", true),
+            ("https://example.com/?sid=x", true),
+            ("https://example.com/?pwd=x", true),
+            ("https://example.com/?SAMLResponse=x", true),
+        ] {
+            assert_eq!(url_leaks_identifier(url), leaks, "{url}");
+        }
     }
 }
