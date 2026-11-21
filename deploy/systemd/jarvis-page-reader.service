@@ -57,7 +57,10 @@ MemoryDenyWriteExecute=true
 # loads (only the multiarch directory: /usr/lib itself holds shells).
 NoExecPaths=/
 ExecPaths=/opt/jarvis/releases /usr/lib/x86_64-linux-gnu -/usr/lib64
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_NETLINK only to list the host's interfaces (getifaddrs): the reader
+# refuses addresses on their networks and will not start without them. With
+# no capabilities it can only read routing information, never change it.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # Public internet only, as a second fence behind the reader's own address
 # check: no loopback, LAN, link-local, CGNAT/Tailscale, ULA, documentation,
 # benchmarking, reserved, NAT64 or 6to4 ranges. 127.0.0.53 is the

@@ -20,7 +20,7 @@ for directive in NoNewPrivileges=true CapabilityBoundingSet= LockPersonality=tru
     ProtectKernelLogs=true ProtectClock=true ProtectHostname=true ProtectProc=invisible ProcSubset=pid \
     RestrictRealtime=true RestrictNamespaces=true SystemCallArchitectures=native \
     SystemCallFilter=@system-service MemoryDenyWriteExecute=true \
-    'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' \
+    'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK' \
     UMask=0117 LimitCORE=0 TasksMax=32 MemoryMax=256M Restart=on-failure StartLimitIntervalSec=300 StartLimitBurst=5 \
     PrivatePIDs=true RemoveIPC=true 'SystemCallFilter=~@privileged @resources' NoExecPaths=/ \
     'ExecPaths=/opt/jarvis/releases /usr/lib/x86_64-linux-gnu -/usr/lib64' \
