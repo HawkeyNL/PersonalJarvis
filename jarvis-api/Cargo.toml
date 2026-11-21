@@ -79,7 +79,7 @@ libc = "0.2"
 tempfile = "3"
 surrealdb.workspace = true
 # ES256 provider tokens for APNs (already in the tree through surrealdb).
-jsonwebtoken = "9.3"
+jsonwebtoken = "11.1"
 # Chat photo sanitizer: decode JPEG/PNG/WebP and re-encode as JPEG. Owner
 # approved. No default features: only these three formats, no rayon threads.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
