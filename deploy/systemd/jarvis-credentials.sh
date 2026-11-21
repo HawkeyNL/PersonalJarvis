@@ -15,11 +15,13 @@ fail() { echo "jarvis-credentials: $*" >&2; exit 1; }
 usage() {
     cat >&2 <<'EOF'
 Usage: sudo jarvis-credentials <set|list|test|remove> [provider]
-       sudo jarvis-credentials <set|status> ibkr-oauth
+       sudo jarvis-credentials <set|status> <ibkr-oauth|market-data>
 
 Providers: anthropic, openai, deepseek, xai, zai, ollama-cloud, huggingface, jev.
 Local Ollama has no credential; configure its loopback URL/model in core.env.
 ibkr-oauth: the read-only IBKR broker; never readable by Core.
+market-data: two Solana RPC URLs and an optional Jupiter key for the memecoin
+PAPER trader; each RPC is probed read-only before anything is saved.
 EOF
     exit 64
 }
@@ -130,6 +132,98 @@ ibkr_oauth_status() {
         state=empty
         [[ -f $ibkr_oauth_dir/$item && -s $ibkr_oauth_dir/$item ]] && ibkr_private_ok "$ibkr_oauth_dir/$item" && state=set
         printf '%-24s %s\n' "$item" "$state"
+    done
+}
+
+# Market data for the memecoin PAPER trader. Core loads the file as an
+# optional EnvironmentFile. Tests may point these elsewhere.
+market_data_file=$secret_dir/market-data.env
+market_data_owner=root:jarvis
+readonly -a market_data_keys=(JARVIS_MARKET_SOLANA_RPC_A_URL JARVIS_MARKET_SOLANA_RPC_B_URL JARVIS_MARKET_JUPITER_API_KEY)
+# The Solana RPC hosts of jarvis-market-data's ALLOWED_HOSTS.
+readonly -a market_rpc_hosts=(api.mainnet-beta.solana.com mainnet.helius-rpc.com solana-mainnet.g.alchemy.com)
+
+market_read_hidden() {
+    local value
+    printf 'Enter %s (input hidden): ' "$1" >/dev/tty
+    IFS= read -r -s value </dev/tty || return 1
+    printf '\n' >/dev/tty
+    printf '%s' "$value"
+}
+
+# The allowlisted host of an RPC URL Core accepts: https, no user, port or
+# fragment, and no character that needs quoting in an EnvironmentFile or a
+# curl config.
+market_rpc_host() {
+    local re='^https://([a-z0-9.-]+)([/?][A-Za-z0-9._~:/?&=%+,;-]*)?$' host allowed
+    [[ ${#1} -le 2048 && $1 =~ $re ]] || return 1
+    host=${BASH_REMATCH[1]}
+    for allowed in "${market_rpc_hosts[@]}"; do
+        [[ $host == "$allowed" ]] && { printf '%s' "$host"; return 0; }
+    done
+    return 1
+}
+
+# Read-only JSON-RPC getSlot. The URL usually holds a provider key, so it
+# goes only into a mode-0600 curl config, never argv or output; the answer
+# is checked, never shown.
+probe_market_rpc() (
+    local config='' response_file='' http_code
+    command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 1
+    trap 'rm -f -- "$config" "$response_file"' EXIT
+    umask 077
+    config=$(mktemp /run/jarvis-credential-test.XXXXXX) || return 1
+    response_file=$(mktemp /run/jarvis-credential-response.XXXXXX) || return 1
+    printf 'url = "%s"\nheader = "Content-Type: application/json"\ndata = "{\\"jsonrpc\\":\\"2.0\\",\\"id\\":1,\\"method\\":\\"getSlot\\"}"\n' "$1" > "$config"
+    # -q first: no ~/.curlrc; no proxy from the environment, like Core.
+    http_code=$(curl -q --config "$config" --noproxy '*' --proto '=https' --max-redirs 0 --output "$response_file" \
+        --silent --max-time 10 --max-filesize 65536 --write-out '%{http_code}' 2>/dev/null) || return 1
+    [[ $http_code == 200 ]] &&
+        jq -e '(.result | type == "number") and .result > 0' "$response_file" >/dev/null 2>&1
+)
+
+set_market_data() (
+    local rpc_a rpc_b jupiter host_a host_b tmp='' dir=${market_data_file%/*} failed=0
+    require_tty
+    trap 'rm -f -- "$tmp"; unset rpc_a rpc_b jupiter' EXIT
+    umask 077
+    rpc_a=$(market_read_hidden "Solana RPC A URL") || fail "could not read the RPC A URL"
+    host_a=$(market_rpc_host "$rpc_a") ||
+        fail "RPC A must be an https URL on ${market_rpc_hosts[*]}, without user, port or fragment"
+    rpc_b=$(market_read_hidden "Solana RPC B URL") || fail "could not read the RPC B URL"
+    host_b=$(market_rpc_host "$rpc_b") ||
+        fail "RPC B must be an https URL on ${market_rpc_hosts[*]}, without user, port or fragment"
+    [[ $host_a != "$host_b" ]] || fail "RPC A and RPC B must be on different hosts"
+    jupiter=$(market_read_hidden "Jupiter API key (optional, empty for none)") ||
+        fail "could not read the Jupiter API key"
+    [[ -z $jupiter || $jupiter =~ ^[A-Za-z0-9._~+/=-]{1,512}$ ]] ||
+        fail "the Jupiter API key must be 1-512 letters, digits or ._~+/=-"
+    if probe_market_rpc "$rpc_a"; then echo "RPC A: ok"; else echo "RPC A: failed"; failed=1; fi
+    if probe_market_rpc "$rpc_b"; then echo "RPC B: ok"; else echo "RPC B: failed"; failed=1; fi
+    ((failed == 0)) || fail "an RPC endpoint did not answer a read-only getSlot; nothing was changed"
+    install -d -o root -g jarvis -m 0750 "$dir"
+    [[ ! -e $market_data_file && ! -L $market_data_file ]] || [[ -f $market_data_file && ! -L $market_data_file ]] ||
+        fail "$market_data_file is not a regular file; nothing was changed"
+    tmp=$(mktemp "$dir/.market-data.XXXXXX")
+    {
+        printf 'JARVIS_MARKET_SOLANA_RPC_A_URL=%s\n' "$rpc_a"
+        printf 'JARVIS_MARKET_SOLANA_RPC_B_URL=%s\n' "$rpc_b"
+        [[ -z $jupiter ]] || printf 'JARVIS_MARKET_JUPITER_API_KEY=%s\n' "$jupiter"
+    } > "$tmp"
+    chown "$market_data_owner" "$tmp" && chmod 0640 "$tmp" && mv -Tf -- "$tmp" "$market_data_file" ||
+        fail "could not save the market data; nothing was changed"
+    echo "jarvis-credentials: market data saved. Core reads it at its next start: sudo systemctl restart jarvis-core.service"
+)
+
+# set or empty per key; an unsafe or linked file counts as empty.
+market_data_status() {
+    local key state safe=no
+    [[ -f $market_data_file && ! -L $market_data_file &&
+        $(stat -c '%U:%G:%a' "$market_data_file" 2>/dev/null) == "$market_data_owner:640" ]] && safe=yes
+    for key in "${market_data_keys[@]}"; do
+        state=empty
+        [[ $safe == yes ]] && grep -Eq "^$key=.+" "$market_data_file" && state=set
+        printf '%-32s %s\n' "$key" "$state"
     done
 }
 
@@ -428,9 +522,20 @@ main() {
     case ${1:-} in
         set)
             (($# == 2)) || usage
-            if [[ $2 == ibkr-oauth ]]; then set_ibkr_oauth; else set_credential "$2"; fi
+            case $2 in
+                ibkr-oauth) set_ibkr_oauth ;;
+                market-data) set_market_data ;;
+                *) set_credential "$2" ;;
+            esac
             ;;
-        status) (($# == 2)) && [[ $2 == ibkr-oauth ]] || usage; ibkr_oauth_status ;;
+        status)
+            (($# == 2)) || usage
+            case $2 in
+                ibkr-oauth) ibkr_oauth_status ;;
+                market-data) market_data_status ;;
+                *) usage ;;
+            esac
+            ;;
         list) (($# == 1)) || usage; list_credentials ;;
         test) (($# == 2)) || usage; test_credential "$2" ;;
         remove) (($# == 2)) || usage; remove_credential "$2" ;;

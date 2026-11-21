@@ -34,12 +34,10 @@ use super::store::{self, CallRow, DecisionKind, StrategyAuthor, StrategyPerforma
 use super::{bounded, STRATEGY_VERSION_FLOOR};
 use crate::realtime::Hub;
 
-/// At most one decision call per this interval ...
+/// At most one decision call per this interval, and at most
+/// [`MAX_CALLS_PER_HOUR`] and [`MAX_CALLS_PER_DAY`] per rolling hour and day.
 pub const DECISION_INTERVAL: Duration = Duration::minutes(15);
-/// ... and at most this many per rolling hour and day. The profile can only
-/// lower these.
-pub const MAX_CALLS_PER_HOUR: u32 = 4;
-pub const MAX_CALLS_PER_DAY: u32 = 48;
+pub use jarvis_onchain::profile::{AgentSettings, MAX_CALLS_PER_DAY, MAX_CALLS_PER_HOUR};
 /// Candidates and open positions in one decision input.
 pub const MAX_CANDIDATES: usize = 10;
 pub const MAX_POSITIONS: usize = 10;
@@ -74,39 +72,6 @@ const BPS: i64 = 10_000;
 
 /// Who changed a strategy, as recorded.
 pub const CLAUDE: &str = "claude";
-
-/// What the profile allows Claude.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AgentSettings {
-    pub max_calls_per_hour: u32,
-    pub max_calls_per_day: u32,
-    /// Strategies Claude creates start enabled.
-    pub new_strategies_enabled: bool,
-}
-
-impl AgentSettings {
-    /// Unset caps take the code caps; a higher one is refused.
-    pub fn new(
-        per_hour: Option<u32>,
-        per_day: Option<u32>,
-        new_strategies_enabled: bool,
-    ) -> Result<Self, String> {
-        let per_hour = per_hour.unwrap_or(MAX_CALLS_PER_HOUR);
-        let per_day = per_day.unwrap_or(MAX_CALLS_PER_DAY);
-        if !(1..=MAX_CALLS_PER_HOUR).contains(&per_hour)
-            || !(1..=MAX_CALLS_PER_DAY).contains(&per_day)
-        {
-            return Err(format!(
-                "agent calls must be 1 to {MAX_CALLS_PER_HOUR} per hour and 1 to {MAX_CALLS_PER_DAY} per day"
-            ));
-        }
-        Ok(Self {
-            max_calls_per_hour: per_hour,
-            max_calls_per_day: per_day,
-            new_strategies_enabled,
-        })
-    }
-}
 
 /// The model behind the typed tasks. Live: the Claude subscription worker,
 /// never the router; tests use a fixture.

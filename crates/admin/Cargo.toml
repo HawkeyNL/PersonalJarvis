@@ -26,6 +26,7 @@ thiserror.workspace = true
 jarvis-llm.workspace = true
 jarvis-usage.workspace = true
 jarvis-config.workspace = true
+jarvis-onchain.workspace = true
 jarvis-privileged.workspace = true
 uuid.workspace = true
 rand.workspace = true

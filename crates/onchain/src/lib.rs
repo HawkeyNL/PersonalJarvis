@@ -1,7 +1,8 @@
 //! Deterministic core of the on-chain memecoin trader.
 //!
-//! This crate only *calculates*. It has no I/O, no database, no network, no
-//! async and no clock reads: every timestamp is passed in by the caller. That
+//! This crate only *calculates*. It has no I/O (except [`profile`] reading
+//! the root-owned paper profile file), no database, no network, no async and
+//! no clock reads: every timestamp is passed in by the caller. That
 //! keeps each decision reproducible from recorded data, which is what paper
 //! trading, backtests and the promotion gate need.
 //!
@@ -37,6 +38,7 @@ pub mod filter;
 pub mod gate;
 pub mod goals;
 pub mod paper;
+pub mod profile;
 pub mod research;
 pub mod signals;
 pub mod strategy;

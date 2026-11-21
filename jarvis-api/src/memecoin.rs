@@ -80,8 +80,8 @@ pub const EXIT_FAILURE_CAP: u32 = 10;
 /// would stretch the paper gate's duration.
 const CLOCK_TOLERANCE: Duration = Duration::minutes(5);
 /// Typed strategy versions start above this; legacy profile versions stay
-/// below it. Versions are unique across strategies, so the two never collide.
-pub const STRATEGY_VERSION_FLOOR: u32 = 1_000_000;
+/// below it.
+pub use jarvis_onchain::profile::STRATEGY_VERSION_FLOOR;
 /// Exits of a position whose version has no usable rules: only the time
 /// stop, at the longest hold any typed version may have. The price-based
 /// fields are never read, as such a position is evaluated without a mark.
