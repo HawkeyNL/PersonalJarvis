@@ -18,9 +18,9 @@ use url::Url;
 use crate::{Page, MAX_TEXT_BYTES, MAX_TITLE_CHARS};
 
 /// Elements whose content is never page text.
-const SKIPPED: [&str; 17] = [
+const SKIPPED: [&str; 19] = [
     "script", "style", "noscript", "template", "svg", "math", "nav", "footer", "form", "aside",
-    "iframe", "object", "embed", "button", "select", "textarea", "dialog",
+    "iframe", "object", "embed", "button", "select", "textarea", "dialog", "noembed", "noframes",
 ];
 /// Elements that start a new line.
 const BLOCKS: [&str; 30] = [
@@ -73,7 +73,10 @@ pub fn page(url: &Url, body: &[u8], html: bool, charset: Option<&str>, cut: bool
     } else {
         (String::new(), clean(&decoded))
     };
-    let title: String = collapse(&title).chars().take(MAX_TITLE_CHARS).collect();
+    let title: String = collapse(&clean(&title))
+        .chars()
+        .take(MAX_TITLE_CHARS)
+        .collect();
     let mut truncated = cut;
     if text.len() > MAX_TEXT_BYTES {
         let mut end = MAX_TEXT_BYTES;
@@ -113,11 +116,32 @@ fn meta_charset(body: &[u8]) -> Option<&'static Encoding> {
 
 /// Characters a page could use to hide text from a human reader: controls
 /// other than line breaks and tabs, zero-width and bidi controls.
+// ponytail: a hand-kept list like `privacy::is_invisible`; a new invisible
+// character may slip through. Use a Unicode data crate if it must be complete.
 fn is_hidden(c: char) -> bool {
     (c.is_control() && !matches!(c, '\n' | '\t'))
         || matches!(
             c,
-            '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'
+            '\u{ad}'
+                | '\u{34f}'
+                | '\u{61c}'
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{17b4}'
+                | '\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff0}'..='\u{fffb}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e0fff}'
         )
 }
 
@@ -283,8 +307,13 @@ mod tests {
 
     #[test]
     fn hidden_characters_are_dropped() {
-        let page = read("<p>a\u{200b}b\u{202e}c\u{0}d\u{7}e</p>");
-        assert_eq!(page.text, "abcde");
+        let page = read(
+            "<title>T\u{202e}i\u{e0041}t\u{7}l\u{200b}e</title>\
+             <p>a\u{200b}b\u{202e}c\u{0}d\u{7}e\u{e0049}\u{e0067}f\u{fe0f}g\u{2800}h</p>\
+             <noembed>x</noembed><noframes>y</noframes>",
+        );
+        assert_eq!(page.text, "abcdefgh");
+        assert_eq!(page.title, "Title");
     }
 
     #[test]

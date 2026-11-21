@@ -81,6 +81,13 @@ fn check_url_table() {
             Err(Refusal::ActionPath),
         ),
         ("https://example.com/x?Do=1", Err(Refusal::ActionPath)),
+        ("https://example.com/a&logout", Err(Refusal::ActionPath)),
+        (
+            "https://example.com/logout;jsessionid=x",
+            Err(Refusal::ActionPath),
+        ),
+        ("https://example.com/log+out", Err(Refusal::ActionPath)),
+        ("https://example.com/log%20out", Err(Refusal::ActionPath)),
         // Not a URL, or too long.
         ("example.com", Err(Refusal::UrlRefused)),
         ("", Err(Refusal::UrlRefused)),
@@ -90,6 +97,10 @@ fn check_url_table() {
     }
     let long = format!("https://example.com/{}", "a".repeat(MAX_URL_BYTES));
     assert_eq!(check_url(&long, &[]), Err(Refusal::UrlRefused));
+    // Within the limit as typed, beyond it once percent-encoded.
+    let grows = format!("https://example.com/{}", "é".repeat(MAX_URL_BYTES / 3));
+    assert!(grows.len() <= MAX_URL_BYTES);
+    assert_eq!(check_url(&grows, &[]), Err(Refusal::UrlRefused));
     // An empty deny entry denies nothing.
     assert!(check_url("https://example.com/", &[String::new()]).is_ok());
 }

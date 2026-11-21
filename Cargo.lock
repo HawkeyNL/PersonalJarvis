@@ -2677,6 +2677,7 @@ dependencies = [
  "html5ever",
  "jarvis-observability",
  "libc",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",

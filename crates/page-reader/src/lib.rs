@@ -186,6 +186,10 @@ pub fn check_url(url: &str, deny_hosts: &[String]) -> Result<Url, Refusal> {
         return Err(Refusal::UrlRefused);
     }
     let mut url = Url::parse(url).map_err(|_| Refusal::UrlRefused)?;
+    // Parsing may grow it (percent-encoding, punycode).
+    if url.as_str().len() > MAX_URL_BYTES {
+        return Err(Refusal::UrlRefused);
+    }
     let host = match url.host() {
         Some(Host::Domain(domain)) => domain.trim_end_matches('.').to_ascii_lowercase(),
         _ => return Err(Refusal::UrlRefused),
@@ -233,28 +237,24 @@ fn is_public_domain(host: &str) -> bool {
 fn is_action(url: &Url) -> bool {
     let squash = |text: &str| -> String {
         text.chars()
-            .filter(|c| !matches!(c, '-' | '_'))
+            .filter(|c| !matches!(c, '-' | '_' | '+') && !c.is_whitespace())
             .collect::<String>()
             .to_lowercase()
     };
+    // Each part of a segment counts: `logout.php`, `logout;jsessionid=x`,
+    // `a&logout`.
     let path_action = url.path_segments().is_some_and(|mut segments| {
         segments.any(|segment| {
-            let decoded = percent_decode(segment);
-            let stem = decoded.split('.').next().unwrap_or_default();
-            ACTION_SEGMENTS.contains(&squash(stem).as_str())
+            let decoded = percent_encoding::percent_decode_str(segment).decode_utf8_lossy();
+            decoded
+                .split(['.', ';', '&', ',', '='])
+                .any(|part| ACTION_SEGMENTS.contains(&squash(part).as_str()))
         })
     });
     path_action
         || url
             .query_pairs()
             .any(|(name, _)| ACTION_QUERY_NAMES.contains(&squash(&name).as_str()))
-}
-
-fn percent_decode(segment: &str) -> String {
-    url::form_urlencoded::parse(format!("x={segment}").as_bytes())
-        .next()
-        .map(|(_, value)| value.into_owned())
-        .unwrap_or_default()
 }
 
 /// Whether an address is public: refuses private, loopback, link-local,

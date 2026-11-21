@@ -342,6 +342,18 @@ async fn a_silent_site_times_out() {
     assert!(started.elapsed() < Duration::from_secs(4));
 }
 
+#[test]
+fn the_hosts_own_networks_are_not_remote() {
+    // Loopback is always an interface network; a public resolver is not.
+    assert!(on_local_network("127.0.0.1".parse().unwrap()));
+    assert!(on_local_network(
+        "::ffff:127.0.0.1".parse::<IpAddr>().unwrap().to_canonical()
+    ));
+    assert!(!on_local_network("8.8.8.8".parse().unwrap()));
+    assert!(is_remote("8.8.8.8".parse().unwrap()));
+    assert!(!is_remote("127.0.0.1".parse().unwrap()));
+}
+
 #[tokio::test]
 async fn the_client_resolves_only_the_pinned_name() {
     let pinned = Pinned {

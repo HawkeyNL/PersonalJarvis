@@ -32,6 +32,9 @@ pub trait Resolve: Send + Sync {
 /// The system resolver (systemd-resolved on the Home Node).
 pub struct SystemResolver;
 
+// ponytail: getaddrinfo runs on the blocking pool and the deadline drops the
+// future, not the thread, so slow DNS can hold the 8 blocking threads for a
+// while (four requests at most at a time). Use an async resolver if it bites.
 impl Resolve for SystemResolver {
     async fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>> {
         Ok(tokio::net::lookup_host((host, 443))
@@ -72,7 +75,7 @@ impl<R: Resolve> Fetcher<R> {
     pub fn new(resolver: R) -> Self {
         Self {
             resolver,
-            allow: is_public,
+            allow: is_remote,
             deadline: UPSTREAM_DEADLINE,
             #[cfg(test)]
             plain_http_port: None,
@@ -206,6 +209,65 @@ impl<R> Fetcher<R> {
             return (target, false);
         }
         (url.clone(), true)
+    }
+}
+
+/// Public, and not on a network of this host's own interfaces: the Home
+/// Node's global IPv6 prefix (and its LAN neighbours there) is public
+/// address space but not a public site.
+fn is_remote(ip: IpAddr) -> bool {
+    is_public(ip) && !on_local_network(ip.to_canonical())
+}
+
+/// Whether `ip` is inside the network of any local interface address.
+/// Fails closed: true when the interfaces cannot be listed.
+fn on_local_network(ip: IpAddr) -> bool {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list freed below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return true;
+    }
+    let mut found = false;
+    let mut entry = head;
+    while !entry.is_null() {
+        // SAFETY: a non-null entry of the list getifaddrs returned.
+        let ifa = unsafe { &*entry };
+        if let (Some(addr), Some(mask)) = (sockaddr_ip(ifa.ifa_addr), sockaddr_ip(ifa.ifa_netmask))
+        {
+            found |= match (ip, addr, mask) {
+                (IpAddr::V4(ip), IpAddr::V4(addr), IpAddr::V4(mask)) => {
+                    (u32::from(ip) ^ u32::from(addr)) & u32::from(mask) == 0
+                }
+                (IpAddr::V6(ip), IpAddr::V6(addr), IpAddr::V6(mask)) => {
+                    (u128::from(ip) ^ u128::from(addr)) & u128::from(mask) == 0
+                }
+                _ => false,
+            };
+        }
+        entry = ifa.ifa_next;
+    }
+    // SAFETY: `head` came from getifaddrs and is freed once.
+    unsafe { libc::freeifaddrs(head) };
+    found
+}
+
+fn sockaddr_ip(addr: *const libc::sockaddr) -> Option<IpAddr> {
+    if addr.is_null() {
+        return None;
+    }
+    // SAFETY: getifaddrs gives sockaddrs whose family says their real type.
+    unsafe {
+        match i32::from((*addr).sa_family) {
+            libc::AF_INET => {
+                let v4 = &*(addr as *const libc::sockaddr_in);
+                Some(IpAddr::from(u32::from_be(v4.sin_addr.s_addr).to_be_bytes()))
+            }
+            libc::AF_INET6 => {
+                let v6 = &*(addr as *const libc::sockaddr_in6);
+                Some(IpAddr::from(v6.sin6_addr.s6_addr))
+            }
+            _ => None,
+        }
     }
 }
 
