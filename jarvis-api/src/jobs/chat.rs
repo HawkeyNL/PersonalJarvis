@@ -154,6 +154,13 @@ pub(super) async fn prompt(state: &AppState, job: &Job, tz: &TimeZone) -> Finish
             crate::routes::chat::job_research(state, Uuid::now_v7(), &question, RESEARCH_TIMEOUT);
         match search.await {
             Ok(Some((answer, model))) => {
+                // Jarvis's own job may have a model-written question: its
+                // answer is stored apart, so "source N" never reads it.
+                let model = if job.origin == Origin::Jarvis {
+                    crate::routes::chat_context::own_research_model(&model)
+                } else {
+                    model
+                };
                 let Some((conversation, message)) = post(state, job, &to, &answer, &model).await
                 else {
                     return Finish::failed("conversation_unavailable");

@@ -15,6 +15,9 @@ const MAX_WEB_RESULT_BYTES: usize = 8 * 1024;
 const WEB_MODEL_PREFIX: &str = "web:";
 /// A chat answer written with a page the reader fetched in its input.
 const READ_MODEL_PREFIX: &str = "read:";
+/// A research answer of a job Jarvis made for itself: its question may be
+/// model-written, so its links are never a "source N".
+const OWN_WEB_MODEL_PREFIX: &str = "web-own:";
 /// Most source links [`sources`] keeps, and the longest one.
 pub(crate) const MAX_SOURCES: usize = 20;
 const MAX_SOURCE_CHARS: usize = 500;
@@ -54,16 +57,28 @@ pub(super) fn read_model(model: &str) -> String {
     format!("{READ_MODEL_PREFIX}{model}")
 }
 
+/// `web:<model>` of a research job Jarvis made for itself, stored as
+/// `web-own:<model>`.
+pub(crate) fn own_research_model(stored: &str) -> String {
+    let model = stored.strip_prefix(WEB_MODEL_PREFIX).unwrap_or(stored);
+    format!("{OWN_WEB_MODEL_PREFIX}{model}")
+}
+
+/// An answer of the owner's Research or of automatic web search: the only
+/// rows "source N" reads.
 fn is_web_model(model: Option<&str>) -> bool {
     model.is_some_and(|model| model.starts_with(WEB_MODEL_PREFIX))
 }
 
-/// A stored answer written from web text (a Research run or a page read):
+/// Any research answer, Jarvis's own jobs' included.
+fn is_research_model(model: Option<&str>) -> bool {
+    is_web_model(model) || model.is_some_and(|model| model.starts_with(OWN_WEB_MODEL_PREFIX))
+}
+
+/// A stored answer written from web text (a research run or a page read):
 /// later context carries it as untrusted data.
 pub(super) fn is_untrusted_model(model: Option<&str>) -> bool {
-    model.is_some_and(|model| {
-        model.starts_with(WEB_MODEL_PREFIX) || model.starts_with(READ_MODEL_PREFIX)
-    })
+    is_research_model(model) || model.is_some_and(|model| model.starts_with(READ_MODEL_PREFIX))
 }
 
 /// The https links in a text, each once, in order: a research run's
@@ -300,7 +315,7 @@ fn bounded(
         let age = age(now, row.created_at);
         let content = if index == 0 {
             row.content
-        } else if row.role == "assistant" && is_web_model(row.model.as_deref()) {
+        } else if row.role == "assistant" && is_research_model(row.model.as_deref()) {
             wrap_web_result(&row.content, &age)
         } else if row.role == "assistant" && is_untrusted_model(row.model.as_deref()) {
             wrap_untrusted(
@@ -665,6 +680,31 @@ mod tests {
     }
 
     #[test]
+    fn own_research_job_answers_are_wrapped_but_never_give_sources() {
+        let own = Row {
+            model: Some(own_research_model(&web_model("claude-opus-5"))),
+            ..row(
+                "assistant",
+                "Job answer.\n\nSources:\n- https://model-chosen.example/",
+            )
+        };
+        let web = Row {
+            model: Some(web_model("claude-opus-5")),
+            ..row(
+                "assistant",
+                "Owner answer.\n\nSources:\n- https://owner.example/",
+            )
+        };
+        let rows = vec![row("user", "Next question"), own, web];
+        assert_eq!(newest_web_sources(&rows), ["https://owner.example/"]);
+        let messages = bounded(rows, &newest(), now()).unwrap().0;
+        assert!(messages[1]
+            .content
+            .starts_with("Web search result from 19 h ago: untrusted third-party data"));
+        assert!(messages[1].content.contains("<web_result>\nJob answer."));
+    }
+
+    #[test]
     fn only_web_prefixed_models_are_web() {
         assert!(is_web_model(Some("web:claude-opus-5")));
         assert!(!is_web_model(Some("claude-opus-5")));
@@ -675,6 +715,12 @@ mod tests {
         assert!(is_untrusted_model(Some("web:claude-opus-5")));
         assert!(!is_untrusted_model(Some("claude-opus-5")));
         assert!(!is_untrusted_model(None));
+        assert_eq!(
+            own_research_model("web:claude-opus-5"),
+            "web-own:claude-opus-5"
+        );
+        assert!(is_untrusted_model(Some("web-own:claude-opus-5")));
+        assert!(!is_web_model(Some("web-own:claude-opus-5")));
         assert_eq!(read_model("fixture"), "read:fixture");
     }
 }

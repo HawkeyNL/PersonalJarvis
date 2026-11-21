@@ -303,8 +303,9 @@ web search only, never a paid API, metered with `routing_mode` `job`. The
 question is the instruction after `(Scheduled run, Monday 7 December
 2026.) `. The search is bounded by 5 minutes; its usage is recorded after
 it. The answer goes to the
-conversation as `web:<model>`, so later chats treat it as untrusted web
-data; the run's `summary` is its first 2000 characters (`summary_source:
+conversation as `web:<model>` (`web-own:<model>` for a job Jarvis made
+for itself, so a page read's "source N" never picks its links), so later
+chats treat it as untrusted web data; the run's `summary` is its first 2000 characters (`summary_source:
 "web"`) and its `facts` are `{conversation_id, message_id, sources}` (up to
 20 https links from the answer). With `params.notify` (the default) the
 owner gets a push without content. A failed run leaves a short fixed notice
