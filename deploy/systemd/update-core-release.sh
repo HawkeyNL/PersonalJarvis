@@ -871,6 +871,8 @@ restart_managed_services() {
     systemctl try-restart jarvis-opensandbox.service >/dev/null 2>&1 || true
     # Optional and owner-enabled: only an already running broker is restarted.
     systemctl try-restart jarvis-ibkr-broker.service >/dev/null 2>&1 || true
+    # Optional and owner-enabled: only an already running reader is restarted.
+    systemctl try-restart jarvis-page-reader.service >/dev/null 2>&1 || true
     restore_laya_runtime_state || return 1
     restore_claude_runtime_state || return 1
     restart_codex_chat_worker
@@ -902,6 +904,8 @@ restore_release_transaction() {
     systemctl try-restart jarvis-opensandbox.service >/dev/null 2>&1 || true
     # Optional and owner-enabled: only an already running broker is restarted.
     systemctl try-restart jarvis-ibkr-broker.service >/dev/null 2>&1 || true
+    # Optional and owner-enabled: only an already running reader is restarted.
+    systemctl try-restart jarvis-page-reader.service >/dev/null 2>&1 || true
     restore_laya_runtime_state || return 1
     restore_claude_runtime_state || return 1
     restart_codex_chat_worker
@@ -978,6 +982,15 @@ activate_managed_release() {
         if systemctl is-active --quiet jarvis-ibkr-broker.service || \
             unit_enabled jarvis-ibkr-broker.service; then
             echo 'jarvis updater: run `systemctl disable --now jarvis-ibkr-broker.service` before rolling back to a release without the IBKR broker' >&2
+            return 1
+        fi
+        unit_manager="$previous/manage-systemd-units"
+    fi
+    if jq -e '.tooling.page_reader == 1' "$previous/release.json" >/dev/null && \
+        ! jq -e '.tooling.page_reader == 1' "$release/release.json" >/dev/null; then
+        if systemctl is-active --quiet jarvis-page-reader.service || \
+            unit_enabled jarvis-page-reader.service; then
+            echo 'jarvis updater: run `systemctl disable --now jarvis-page-reader.service` before rolling back to a release without the page reader' >&2
             return 1
         fi
         unit_manager="$previous/manage-systemd-units"

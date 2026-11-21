@@ -83,6 +83,22 @@ class EgressToolTests(unittest.TestCase):
         self.assertEqual(self.rules("crates/sandbox/src/lib.rs", definitions), [])
         self.assertEqual(len(self.rules("crates/sandbox/src/lib.rs", definitions * 2)), 1)
 
+    def test_page_reader_client_only_in_the_gate(self):
+        gate = "jarvis-api/src/page_read.rs"
+        for text in ["PageReaderClient::new(socket, uid)", "jarvis_page_reader::PageReaderClient :: new(s, u)"]:
+            self.assertEqual(self.rules(OTHER, text), ["page reader client outside page_read.rs"], text)
+            self.assertEqual(self.rules(gate, text), [], text)
+            self.assertEqual(self.rules("crates/page-reader/src/server/tests.rs", text), [], text)
+        self.assertEqual(self.rules(OTHER, "use jarvis_page_reader::PageReaderClient;"), [])
+
+    def test_page_fetcher_only_in_its_crate(self):
+        for text in ["use jarvis_page_reader::fetch::Fetcher;", "use jarvis_page_reader::{check_url, fetch};",
+                     "Fetcher::new(SystemResolver)"]:
+            self.assertEqual(self.rules("jarvis-api/src/page_read.rs", text),
+                             ["page fetcher outside the page reader"], text)
+            self.assertEqual(self.rules("crates/page-reader/src/bin/jarvis-page-reader.rs", text), [], text)
+        self.assertEqual(self.rules(OTHER, "use jarvis_page_reader::{check_url, Refusal};"), [])
+
     def test_current_tree_is_clean(self):
         self.assertEqual(egress.audit(Path(__file__).resolve().parents[2]), 0)
 

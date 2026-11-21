@@ -14,7 +14,7 @@ revision=0123456789abcdef0123456789abcdef01234567
 write_candidate() {
     local tag=$1 release="$fixture/candidate/jarvis-core-$1" helper unit
     mkdir -p "$release"
-    for helper in jarvis-models jarvis-credentials jarvis-backup jarvis-housekeeping jarvis-model-policy-storage jarvis-claude-worker jarvis-codex-chat-worker jarvis-codex-runtime jarvis-ibkr-broker; do
+    for helper in jarvis-models jarvis-credentials jarvis-backup jarvis-housekeeping jarvis-model-policy-storage jarvis-claude-worker jarvis-codex-chat-worker jarvis-codex-runtime jarvis-ibkr-broker jarvis-page-reader; do
         printf '#!/usr/bin/env bash\nprintf "%s fixture\\n"\n' "$helper" > "$release/$helper"
         chmod 0755 "$release/$helper"
     done
@@ -38,17 +38,17 @@ write_candidate() {
         jarvis-model-catalog.service jarvis-model-catalog.timer jarvis-laya.service jarvis-laya.socket \
         jarvis-claude.service jarvis-claude.socket jarvis-codex-chat.service jarvis-codex-chat.socket \
         jarvis-backup.service jarvis-backup.timer jarvis-housekeeping.service jarvis-housekeeping.timer \
-        jarvis-ibkr-broker.service; do
+        jarvis-ibkr-broker.service jarvis-page-reader.service; do
         cp "$repo_dir/deploy/systemd/$unit" "$release/systemd-$unit"
         chmod 0644 "$release/systemd-$unit"
     done
     install -m 0644 "$repo_dir/deploy/systemd/pricing-registry.json" "$release/pricing-registry.json"
     jq -n --arg tag "$tag" --arg revision "$revision" \
-        '{tag:$tag,revision:$revision,schema_sha256:("b" * 64),schema_migration:{version:1,target:10,from_sha256:[range(9) | "a" * 64]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1,model_policy_directory:1,model_catalog:1,laya_runtime:1,subscription_workers:1,codex_chat_worker:1,ibkr_broker:1,codex_runtime:1,backup_timer:1,housekeeping_timer:1,persona_validate:1}}' \
+        '{tag:$tag,revision:$revision,schema_sha256:("b" * 64),schema_migration:{version:1,target:10,from_sha256:[range(9) | "a" * 64]},components:{core:"0.1.0",cli:"0.1.1",core_admin:"0.1.1"},tooling:{private_agents:1,admin_helpers:1,systemd_units:1,local_devices:1,model_policy_directory:1,model_catalog:1,laya_runtime:1,subscription_workers:1,codex_chat_worker:1,ibkr_broker:1,page_reader:1,codex_runtime:1,backup_timer:1,housekeeping_timer:1,persona_validate:1}}' \
         > "$release/release.json"
     (
         cd "$release"
-        sha256sum jarvis-models jarvis-credentials jarvis-backup jarvis-housekeeping jarvis-model-policy-storage jarvis-claude-worker jarvis-codex-chat-worker jarvis-codex-runtime jarvis-ibkr-broker pricing-registry.json \
+        sha256sum jarvis-models jarvis-credentials jarvis-backup jarvis-housekeeping jarvis-model-policy-storage jarvis-claude-worker jarvis-codex-chat-worker jarvis-codex-runtime jarvis-ibkr-broker jarvis-page-reader pricing-registry.json \
             com.hawkeynl.jarvis.devices.policy \
             schema-backup laya-offline.py provision-laya \
             manage-systemd-units verify-home-node install-home-node-core ui.sh \
@@ -65,8 +65,8 @@ archive="$fixture/jarvis-core-$tag-linux-x86_64.tar.gz"
 # Consume the complete listing before assertions: grep -q on a pipe can close
 # early and make a healthy tar fail with SIGPIPE/write error under pipefail.
 tar -tzf "$archive" > "$fixture/archive-members.txt"
-for member in jarvis-models jarvis-credentials jarvis-backup jarvis-housekeeping jarvis-model-policy-storage jarvis-claude-worker jarvis-codex-chat-worker jarvis-codex-runtime jarvis-ibkr-broker pricing-registry.json laya-offline.py provision-laya \
-    systemd-jarvis-ibkr-broker.service \
+for member in jarvis-models jarvis-credentials jarvis-backup jarvis-housekeeping jarvis-model-policy-storage jarvis-claude-worker jarvis-codex-chat-worker jarvis-codex-runtime jarvis-ibkr-broker jarvis-page-reader pricing-registry.json laya-offline.py provision-laya \
+    systemd-jarvis-ibkr-broker.service systemd-jarvis-page-reader.service \
     systemd-jarvis-model-catalog.service systemd-jarvis-model-catalog.timer \
     systemd-jarvis-codex-chat.service systemd-jarvis-codex-chat.socket \
     systemd-jarvis-laya.service systemd-jarvis-laya.socket \
@@ -101,6 +101,7 @@ jq -e '.tooling.laya_runtime == 1' "$extracted/jarvis-core-$tag/release.json" >/
 jq -e '.tooling.subscription_workers == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
 jq -e '.tooling.codex_chat_worker == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
 jq -e '.tooling.ibkr_broker == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
+jq -e '.tooling.page_reader == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
 jq -e '.tooling.backup_timer == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
 jq -e '.tooling.housekeeping_timer == 1' "$extracted/jarvis-core-$tag/release.json" >/dev/null
 cmp "$fixture/candidate/jarvis-core-$tag/jarvis-housekeeping" \
@@ -154,7 +155,7 @@ fi
 grep -Fq 'managed unit is missing or unsafe: jarvis-config-broker.service' \
     "$fixture/bad-unit.stderr"
 
-for defect in missing tampered symlink capability missing-backup unsupported-schema oversized-migration-sources missing-migration unsafe-migration unsupported-layout missing-catalog-service missing-catalog-timer unsupported-catalog missing-laya-unit missing-laya-socket missing-laya-wrapper unsupported-laya missing-claude-worker missing-claude-socket unsupported-subscription missing-codex-chat-worker tampered-codex-chat-worker missing-codex-chat-socket unsupported-codex-chat undeclared-codex-chat missing-ibkr-broker tampered-ibkr-broker missing-ibkr-unit unsupported-ibkr-broker undeclared-ibkr-broker missing-codex-runtime tampered-codex-runtime symlink-codex-runtime unsupported-codex-runtime missing-backup-service missing-backup-timer unsupported-backup-timer undeclared-backup-timer unsafe-backup-helper missing-housekeeping-helper missing-housekeeping-service missing-housekeeping-timer unsupported-housekeeping-timer undeclared-housekeeping-timer unsafe-housekeeping-helper tampered-housekeeping-helper; do
+for defect in missing tampered symlink capability missing-backup unsupported-schema oversized-migration-sources missing-migration unsafe-migration unsupported-layout missing-catalog-service missing-catalog-timer unsupported-catalog missing-laya-unit missing-laya-socket missing-laya-wrapper unsupported-laya missing-claude-worker missing-claude-socket unsupported-subscription missing-codex-chat-worker tampered-codex-chat-worker missing-codex-chat-socket unsupported-codex-chat undeclared-codex-chat missing-ibkr-broker tampered-ibkr-broker missing-ibkr-unit unsupported-ibkr-broker undeclared-ibkr-broker missing-page-reader tampered-page-reader missing-page-reader-unit unsupported-page-reader undeclared-page-reader missing-codex-runtime tampered-codex-runtime symlink-codex-runtime unsupported-codex-runtime missing-backup-service missing-backup-timer unsupported-backup-timer undeclared-backup-timer unsafe-backup-helper missing-housekeeping-helper missing-housekeeping-service missing-housekeeping-timer unsupported-housekeeping-timer undeclared-housekeeping-timer unsafe-housekeeping-helper tampered-housekeeping-helper; do
     write_candidate v9.8.10
     policy="$fixture/candidate/jarvis-core-v9.8.10/com.hawkeynl.jarvis.devices.policy"
     case $defect in
@@ -193,6 +194,17 @@ for defect in missing tampered symlink capability missing-backup unsupported-sch
             ;;
         undeclared-ibkr-broker)
             jq 'del(.tooling.ibkr_broker)' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
+            cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
+            ;;
+        missing-page-reader) rm -- "$fixture/candidate/jarvis-core-v9.8.10/jarvis-page-reader" ;;
+        tampered-page-reader) printf 'tamper\n' >> "$fixture/candidate/jarvis-core-v9.8.10/jarvis-page-reader" ;;
+        missing-page-reader-unit) rm -- "$fixture/candidate/jarvis-core-v9.8.10/systemd-jarvis-page-reader.service" ;;
+        unsupported-page-reader)
+            jq '.tooling.page_reader = 2' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
+            cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
+            ;;
+        undeclared-page-reader)
+            jq 'del(.tooling.page_reader)' "$fixture/candidate/jarvis-core-v9.8.10/release.json" > "$fixture/manifest"
             cp "$fixture/manifest" "$fixture/candidate/jarvis-core-v9.8.10/release.json"
             ;;
         missing-codex-runtime) rm -- "$fixture/candidate/jarvis-core-v9.8.10/jarvis-codex-runtime" ;;
@@ -283,6 +295,10 @@ for defect in missing tampered symlink capability missing-backup unsupported-sch
         tampered-ibkr-broker) expected='release artifact checksum verification failed' ;;
         missing-ibkr-unit) expected='managed unit is missing or unsafe: jarvis-ibkr-broker.service' ;;
         unsupported-ibkr-broker|undeclared-ibkr-broker) expected='release candidate does not declare IBKR broker capability 1' ;;
+        missing-page-reader) expected='page reader is missing or unsafe' ;;
+        tampered-page-reader) expected='release artifact checksum verification failed' ;;
+        missing-page-reader-unit) expected='managed unit is missing or unsafe: jarvis-page-reader.service' ;;
+        unsupported-page-reader|undeclared-page-reader) expected='release candidate does not declare page reader capability 1' ;;
     esac
     if [[ -n $expected ]] && ! grep -Fq "$expected" "$fixture/policy.log"; then
         echo "packager rejected $defect for the wrong reason" >&2

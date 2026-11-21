@@ -9,7 +9,9 @@ Fails when tracked Rust source:
 - names WebFetch or Bash inside any string literal ("Bash(git:*)",
   "WebSearch,WebFetch"), or an `mcp__` tool, outside the known deny-lists
   and their tests;
-- uses `SandboxProfile::Browser` beyond its existing profile definitions.
+- uses `SandboxProfile::Browser` beyond its existing profile definitions;
+- builds a page reader client (`PageReaderClient::new`) outside Core's
+  reviewed page-read gate, or uses the reader's fetcher outside its crate.
 
 The allowlists are explicit on purpose: a new use needs a review and an
 update here. String literals are found across lines (plain, byte and raw
@@ -58,6 +60,12 @@ TOOL_FILES = {
 BROWSER = re.compile(r"SandboxProfile::(?:Browser\b|\*|\{[^}]*\bBrowser\b)")
 # The profile's own limits, network policy, config, name and test: no caller.
 BROWSER_USES = {"crates/sandbox/src/lib.rs": 5}
+# Core reads a page only through the gate in page_read.rs (URL pick, the URL
+# and identifier checks, caps); the reader crate defines and tests both.
+PAGE_READER_CLIENT = re.compile(r"\bPageReaderClient\s*::\s*new\b")
+PAGE_READER_CLIENT_FILES = {"jarvis-api/src/page_read.rs"}
+PAGE_FETCHER = re.compile(r"\bjarvis_page_reader\s*::\s*(?:fetch\b|\{[^}]*\bfetch\b)|\bFetcher\s*::\s*(?:new|for_test)\b")
+PAGE_READER_CRATE = "crates/page-reader/"
 
 
 def literals(text):
@@ -90,6 +98,12 @@ def violations(name, text):
     if name not in TOOL_FILES:
         found |= {(line_of(match.start()), "WebFetch, Bash or mcp__ tool outside a reviewed deny-list")
                   for match in MCP.finditer(text)}
+    if not name.startswith(PAGE_READER_CRATE):
+        if name not in PAGE_READER_CLIENT_FILES:
+            found |= {(line_of(match.start()), "page reader client outside page_read.rs")
+                      for match in PAGE_READER_CLIENT.finditer(text)}
+        found |= {(line_of(match.start()), "page fetcher outside the page reader")
+                  for match in PAGE_FETCHER.finditer(text)}
     yield from sorted(found)
     lines = text.splitlines()
     browser = [number for number, line in enumerate(lines, 1) if BROWSER.search(line)]

@@ -118,6 +118,11 @@ jobs:
           cargo build --locked -p jarvis-ibkr --bin jarvis-ibkr-broker
           sudo env GITHUB_ACTIONS=true JARVIS_IBKR_BROKER_BINARY="$GITHUB_WORKSPACE/target/debug/jarvis-ibkr-broker" \
             bash deploy/systemd/tests/test-ibkr-broker-systemd.sh
+      - name: Page reader under real systemd
+        run: |
+          cargo build --locked -p jarvis-page-reader --bin jarvis-page-reader
+          sudo env GITHUB_ACTIONS=true JARVIS_PAGE_READER_BINARY="$GITHUB_WORKSPACE/target/debug/jarvis-page-reader" \
+            bash deploy/systemd/tests/test-page-reader-systemd.sh
       - name: Protected-input Core startup regression
         run: sudo env GITHUB_ACTIONS=true JARVIS_API_BINARY="$GITHUB_WORKSPACE/target/debug/jarvis-api" bash deploy/systemd/tests/test-core-startup-protected-inputs.sh
 
