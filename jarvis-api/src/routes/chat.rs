@@ -987,16 +987,71 @@ fn stored_model(
 /// Stored when a page turn's answer was empty.
 const PAGE_EMPTY: &str = "I could not write an answer from that page.";
 
-/// A page turn's answer as stored: cleaned like a web answer (no remote
-/// images, https-only Sources, capped), then the page as its Sources line.
+/// A page turn's answer as stored. Its model had private context next to
+/// text a site controls, so nothing in it may hide a URL: cleaned like a
+/// web answer (no remote images, capped), the model's own Sources list
+/// dropped, every markdown link and link definition reduced to its text,
+/// and no `<` left for HTML or an autolink. A plain URL stays visible as
+/// written. The page is its only Sources line.
 fn page_answer(text: &str, source: &str) -> String {
     let text = clean_research_text(text);
-    let text = if text.trim().is_empty() {
+    let lines: Vec<&str> = text.lines().collect();
+    let body = match lines
+        .iter()
+        .rposition(|line| super::chat_context::is_sources_header(line))
+    {
+        Some(header) => lines[..header].join("\n"),
+        None => text.clone(),
+    };
+    let body = links_as_text(&body)
+        .lines()
+        .filter(|line| !is_link_definition(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace('<', "\u{ff1c}");
+    let body = if body.trim().is_empty() {
         PAGE_EMPTY
     } else {
-        text.trim_end()
+        body.trim_end()
     };
-    format!("{text}\n\nSources:\n- {source}")
+    format!("{body}\n\nSources:\n- {source}")
+}
+
+/// `[text](target)` becomes `text`.
+fn links_as_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('[') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let link = after.find("](").and_then(|label_end| {
+            let label = &after[..label_end];
+            let target = &after[label_end + 2..];
+            let close = target.find(')')?;
+            (!label.contains(['[', ']', '\n']) && !target[..close].contains('\n'))
+                .then_some((label, label_end + 2 + close + 1))
+        });
+        match link {
+            Some((label, len)) => {
+                out.push_str(label);
+                rest = &after[len..];
+            }
+            None => {
+                out.push('[');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A reference link definition line: `[name]: target`.
+fn is_link_definition(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("]:"))
+        .is_some_and(|(name, _)| !name.is_empty() && !name.contains(['[', ']']))
 }
 
 /// Web-derived text before it is stored: markdown images become their alt
@@ -1041,10 +1096,10 @@ fn images_as_text(text: &str) -> String {
 
 fn https_sources_only(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
-    let Some(header) = lines.iter().rposition(|line| {
-        let label = line.trim().trim_matches(['#', '*', '_', ':', ' ']);
-        label.eq_ignore_ascii_case("sources") || label.eq_ignore_ascii_case("bronnen")
-    }) else {
+    let Some(header) = lines
+        .iter()
+        .rposition(|line| super::chat_context::is_sources_header(line))
+    else {
         return text.to_string();
     };
     let mut kept = lines[..=header].to_vec();
@@ -2037,6 +2092,18 @@ mod tests {
                 "https://nos.nl/a"
             ),
             "Samenvatting x klaar.\n\nSources:\n- https://nos.nl/a"
+        );
+        // No link can hide a URL; the model's own Sources list is dropped.
+        assert_eq!(
+            page_answer(
+                "Zie [meer](https://evil.example/?h=AAPL) en [ref][1], <img src=x> <https://a.example/>.\n\
+                 [1]: https://evil.example/r\n\
+                 Plain https://visible.example/x stays.\n\n\
+                 ## Sources\n- https://evil.example/s",
+                "https://nos.nl/a"
+            ),
+            "Zie meer en [ref][1], \u{ff1c}img src=x> \u{ff1c}https://a.example/>.\n\
+             Plain https://visible.example/x stays.\n\nSources:\n- https://nos.nl/a"
         );
         assert_eq!(
             page_answer("  ", "https://nos.nl/a"),

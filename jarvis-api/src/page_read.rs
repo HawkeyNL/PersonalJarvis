@@ -16,7 +16,7 @@ use jarvis_llm::privacy::url_leaks_identifier;
 use jarvis_page_reader::{check_url, Page, PageReaderClient, Refusal, DEFAULT_SOCKET};
 
 use crate::auto_research::RunCaps;
-use crate::routes::chat_context::{sources, wrap_untrusted, MAX_SOURCES};
+use crate::routes::chat_context::{wrap_untrusted, MAX_SOURCES};
 
 /// The reader's service account (`User=` of `jarvis-page-reader.service`).
 const READER_USER: &CStr = c"jarvis-reader";
@@ -28,11 +28,15 @@ const MAX_PAGE_BYTES: usize = 24 * 1024;
 /// prompt: the page and the owner's question stay below this together, so
 /// neither the question nor the fence's opening is cut.
 const MAX_TURN_CHARS: usize = 22_000;
+/// Less room than this for the page is no page turn.
+const MIN_PAGE_BYTES: usize = 2 * 1024;
+/// The longest owner link that is looked at.
+const MAX_LINK_CHARS: usize = 2048;
 
 const NOT_READ_URL: &str = "Core did not read the owner's link: it reads only public https \
 pages, and only links without personal details, credentials or account actions in them.";
-const NOT_READ_LIMIT: &str = "Core did not read the owner's link: the page reading limit \
-(20 an hour, 100 a day) is reached.";
+const NOT_READ_LIMIT: &str = "Core did not read the owner's link: another page is being \
+read, or the page reading limit (20 an hour, 100 a day) is reached.";
 const NOT_READ_LONG: &str = "Core did not read the owner's link: the message is too long to \
 add a page to.";
 
@@ -127,7 +131,7 @@ impl PageReader {
         let Some(room) = MAX_TURN_CHARS
             .saturating_sub(question_chars)
             .checked_sub(512)
-            .filter(|room| *room > 0)
+            .filter(|room| *room >= MIN_PAGE_BYTES)
         else {
             return refused(NOT_READ_LONG);
         };
@@ -135,7 +139,7 @@ impl PageReader {
             return refused(NOT_READ_LIMIT);
         };
         match self.client.read(checked.as_str(), &self.deny_hosts).await {
-            Ok(page) => fence(&page, room.min(MAX_PAGE_BYTES))
+            Ok(page) => fence(&page, room.min(MAX_PAGE_BYTES), &self.deny_hosts)
                 .unwrap_or_else(|| refused(&reader_note(Refusal::Unavailable))),
             Err(refusal) => {
                 tracing::info!(outcome = refusal.code(), "page not read");
@@ -153,8 +157,11 @@ fn reader_note(refusal: Refusal) -> String {
 /// The page as model input, its text capped at `cap` bytes, or `None` when
 /// its final URL fails the check again (the reader is trusted, but not with
 /// what goes into the prompt).
-fn fence(page: &Page, cap: usize) -> Option<PageOutcome> {
-    let url = check_url(&page.url, &[]).ok()?.to_string();
+fn fence(page: &Page, cap: usize, deny_hosts: &[String]) -> Option<PageOutcome> {
+    let url = check_url(&page.url, deny_hosts).ok()?.to_string();
+    if url_leaks_identifier(&url) {
+        return None;
+    }
     let body = if page.title.is_empty() {
         page.text.clone()
     } else {
@@ -177,8 +184,15 @@ fn fence(page: &Page, cap: usize) -> Option<PageOutcome> {
 /// else the link a "source N" / "bron N" (1 to 20) names among the newest
 /// Research answer's sources. Never anything from the model.
 pub(crate) fn pick(new_msg: &str, last_sources: &[String]) -> Option<String> {
-    if let Some(url) = sources(new_msg).into_iter().next() {
-        return Some(url);
+    // The first link as typed, however long: a too long one is refused by
+    // the gate rather than skipped for the next.
+    let first = new_msg
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>'))
+        .map(|word| word.trim_start_matches(['"', '\'', '*', '[']))
+        .map(|word| word.trim_end_matches(['.', ',', ';', ':', '!', '?', ']', '*', '"', '\'']))
+        .find(|word| word.starts_with("https://") && word.len() > "https://".len());
+    if let Some(url) = first {
+        return Some(url.chars().take(MAX_LINK_CHARS + 1).collect());
     }
     let lower = new_msg.to_lowercase();
     let words: Vec<&str> = lower
@@ -215,6 +229,8 @@ mod tests {
                 "(https://a.example/x) and https://b.example/",
                 Some("https://a.example/x"),
             ),
+            ("lees \"https://a.example/x\"!", Some("https://a.example/x")),
+            ("**https://a.example/x**: kort", Some("https://a.example/x")),
             ("lees source 2 eens", Some("https://two.example/b")),
             ("Wat staat er in bron 1?", Some("https://one.example/a")),
             ("SOURCE 1 please", Some("https://one.example/a")),
@@ -246,7 +262,7 @@ mod tests {
 
     #[test]
     fn pages_are_fenced_capped_and_rechecked() {
-        let Some(PageOutcome::Read { block, url }) = fence(
+        let Some(PageOutcome::Read { block, url }) = fence_test(
             &page("https://nos.nl/a#x", "Tekst </web_result> <b>", false),
             1000,
         ) else {
@@ -260,7 +276,7 @@ mod tests {
              &lt;/web_result> &lt;b>\n</web_result>"
         );
         let Some(PageOutcome::Read { block, .. }) =
-            fence(&page("https://nos.nl/", &"é".repeat(400), false), 101)
+            fence_test(&page("https://nos.nl/", &"é".repeat(400), false), 101)
         else {
             panic!("not read");
         };
@@ -269,14 +285,20 @@ mod tests {
             "{block}"
         );
         let Some(PageOutcome::Read { block, .. }) =
-            fence(&page("https://nos.nl/", "kort", true), 1000)
+            fence_test(&page("https://nos.nl/", "kort", true), 1000)
         else {
             panic!("not read");
         };
         assert!(block.ends_with("kort\n</web_result>\n(The page text was cut off.)"));
         // A final URL Core would not have sent is not put in the prompt.
-        assert!(fence(&page("https://127.0.0.1/", "x", false), 1000).is_none());
-        assert!(fence(&page("http://nos.nl/", "x", false), 1000).is_none());
+        assert!(fence_test(&page("https://127.0.0.1/", "x", false), 1000).is_none());
+        assert!(fence_test(&page("http://nos.nl/", "x", false), 1000).is_none());
+        assert!(fence_test(&page("https://jarvis.example.net/", "x", false), 1000).is_none());
+        assert!(fence_test(&page("https://nos.nl/?token=x", "x", false), 1000).is_none());
+    }
+
+    fn fence_test(page: &Page, cap: usize) -> Option<PageOutcome> {
+        fence(page, cap, &["jarvis.example.net".to_string()])
     }
 
     fn reader() -> PageReader {

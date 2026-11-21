@@ -158,12 +158,27 @@ pub(super) async fn load(
 /// The links of the newest `web:` answer among the rows (newest first, the
 /// new question excluded). A `read:` answer never counts: its links came
 /// from a page, not from the research worker that has no private context.
+/// Numbered as the app shows them: only the links after its last Sources
+/// header, or every link when it has none.
 fn newest_web_sources(rows: &[Row]) -> Vec<String> {
     rows.iter()
         .skip(1)
         .find(|row| row.role == "assistant" && is_web_model(row.model.as_deref()))
-        .map(|row| sources(&row.content))
+        .map(|row| {
+            let lines: Vec<&str> = row.content.lines().collect();
+            match lines.iter().rposition(|line| is_sources_header(line)) {
+                Some(header) => sources(&lines[header + 1..].join("\n")),
+                None => sources(&row.content),
+            }
+        })
         .unwrap_or_default()
+}
+
+/// A line that heads a Sources list: `Sources` or `Bronnen`, with markdown
+/// heading, emphasis or a colon around it.
+pub(super) fn is_sources_header(line: &str) -> bool {
+    let label = line.trim().trim_matches(['#', '*', '_', ':', ' ']);
+    label.eq_ignore_ascii_case("sources") || label.eq_ignore_ascii_case("bronnen")
 }
 
 /// Which of these turns' photos still exist: the owner's, in this
@@ -615,7 +630,7 @@ mod tests {
             model: Some(web_model("claude-opus-5")),
             ..row(
                 "assistant",
-                "Found it.\n\nSources:\n- https://one.example/\n- https://two.example/x",
+                "Found it on https://body.example/.\n\n**Bronnen:**\n- https://one.example/\n- https://two.example/x",
             )
         };
         let rows = vec![row("user", "Next question"), read, web];

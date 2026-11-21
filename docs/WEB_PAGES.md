@@ -32,7 +32,8 @@ To turn it off, set the flag back to `false`, restart Core and
   Research answer in the conversation. The chat model can never choose a
   URL: its context holds memory, facts and portfolio data that a URL could
   carry out. A page answer's own links are never a "source N".
-- One page per turn, at most 20 an hour and 100 a day (one at a time).
+- One page per turn, at most 20 an hour and 100 a day (one at a time). A
+  message too long to add a page to is answered without one.
 
 ## What is refused
 
@@ -69,7 +70,9 @@ and the outcome only.
   typed.
 - On a page turn the answer is not streamed, every marker (web search, jobs,
   roadmaps, photos) is removed and none is honoured, no web search or search
-  offer follows, remote images become their alt text and a `Sources` line
-  with the page's final URL is added.
+  offer follows. Nothing in the answer may hide a URL: remote images and
+  markdown links become their text, `<` is replaced, the model's own
+  Sources list is dropped and a `Sources` line with the page's final URL is
+  added. A plain URL the model writes stays visible as written.
 - The answer is stored with model `read:<model>`. Later turns carry it as
   untrusted data, like a `web:` Research answer.
