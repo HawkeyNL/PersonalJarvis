@@ -86,39 +86,70 @@ pub fn leaks_identifier(text: &str) -> bool {
 /// Query parameter names that carry a credential or a one-time value,
 /// matched at the start or end of each word of the lower-cased name
 /// (`access_token`, `apikey`, `X-Amz-Signature`, `oauth_state`).
-const SECRET_QUERY_WORDS: [&str; 11] = [
-    "token", "key", "sig", "auth", "pass", "secret", "session", "code", "otp", "ticket", "state",
+const SECRET_QUERY_WORDS: [&str; 20] = [
+    "token",
+    "key",
+    "sig",
+    "auth",
+    "pass",
+    "pwd",
+    "secret",
+    "session",
+    "sid",
+    "code",
+    "otp",
+    "ticket",
+    "state",
+    "jwt",
+    "bearer",
+    "nonce",
+    "hmac",
+    "credential",
+    "assertion",
+    "saml",
 ];
-/// Percent-decoding rounds, so `%2540` cannot hide an `@`.
+/// Percent-decoding rounds, so `%2540` cannot hide an `@`. Text that is
+/// still encoded after the last round counts as leaking.
 const DECODE_ROUNDS: usize = 3;
 
 /// Whether a URL Core would send to the page reader carries a personal
 /// identifier or a credential: an email address anywhere (user info
-/// included), a key-like path, query or fragment part, a query name that
-/// looks like a credential, or a query value that fails
-/// [`leaks_identifier`]. Percent-encoding is decoded first. Path digits are
-/// allowed (article ids); this is a heuristic like the rest of this module,
-/// so it refuses some harmless URLs (`?keyword=`) rather than miss one.
+/// included), a key-like host, path, query or fragment part, an identifier
+/// in the host (it leaks through DNS before any fetch), a possessive near a
+/// money or account word in the path, a query name that looks like a
+/// credential, or a query value that fails [`leaks_identifier`].
+/// Percent-encoding is decoded first. Path digits are allowed (article ids);
+/// this is a heuristic like the rest of this module, so it refuses some
+/// harmless URLs (`?keyword=`) rather than miss one.
 pub fn url_leaks_identifier(url: &str) -> bool {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let (authority, rest) = after_scheme
         .find(['/', '?', '#'])
         .map_or((after_scheme, ""), |at| after_scheme.split_at(at));
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host);
     let (before_fragment, fragment) = rest.split_once('#').unwrap_or((rest, ""));
     let (path, query) = before_fragment
         .split_once('?')
         .unwrap_or((before_fragment, ""));
+    // Still encoded after the last round: fail closed.
+    let leaks =
+        |text: &str, check: &dyn Fn(&str) -> bool| decode(text).is_none_or(|text| check(&text));
     authority.contains('@')
-        || has_email(&decode(url))
-        || has_key(&decode(path))
-        || has_key(&decode(fragment))
+        || leaks(url, &has_email)
+        || leaks(host, &|host| has_key(host) || leaks_identifier(host))
+        || leaks(path, &|path| {
+            has_key(path) || has_possessive(&path.to_lowercase())
+        })
+        || leaks(fragment, &has_key)
         || query
-            .split('&')
+            .split(['&', ';'])
             .filter(|pair| !pair.is_empty())
             .any(|pair| {
                 let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-                let (name, value) = (decode(name), decode(value));
-                is_secret_query_name(&name) || has_key(&value) || leaks_identifier(&value)
+                leaks(name, &is_secret_query_name)
+                    || leaks(value, &|value| has_key(value) || leaks_identifier(value))
             })
 }
 
@@ -130,11 +161,12 @@ fn is_secret_query_name(name: &str) -> bool {
     })
 }
 
-/// Percent-decodes up to [`DECODE_ROUNDS`] times and reads `+` as a space.
-/// Invalid escapes and invalid UTF-8 stay as they are (lossy).
-fn decode(text: &str) -> String {
+/// Percent-decodes up to [`DECODE_ROUNDS`] times and reads `+` as a space;
+/// `None` when the text still changes after the last round. Invalid escapes
+/// and invalid UTF-8 stay as they are (lossy).
+fn decode(text: &str) -> Option<String> {
     let mut text = text.replace('+', " ");
-    for _ in 0..DECODE_ROUNDS {
+    for _ in 0..=DECODE_ROUNDS {
         let bytes = text.as_bytes();
         let mut out = Vec::with_capacity(bytes.len());
         let mut at = 0;
@@ -157,11 +189,11 @@ fn decode(text: &str) -> String {
         }
         let decoded = String::from_utf8_lossy(&out).into_owned();
         if decoded == text {
-            break;
+            return Some(text);
         }
         text = decoded;
     }
-    text
+    None
 }
 
 fn has_email(text: &str) -> bool {
@@ -699,6 +731,22 @@ mod tests {
             ("https://example.com/?n=06+1234+5678", true),
             ("https://example.com/?q=mijn+portfolio", true),
             ("https://example.com/?iban=NL91ABNA0417164300", true),
+            // Identifiers in the host leak through DNS.
+            ("https://0612345678.example.com/", true),
+            ("https://a1b2c3d4e5f6g7h8i9j0k1l2m3.example.com/", true),
+            ("https://www.example.com:443/", false),
+            // Still encoded after the last round.
+            ("https://example.com/?to=jan%25252540example.nl", true),
+            ("https://example.com/?to=jan%252540example.nl", true),
+            // A possessive near a money word in the path.
+            ("https://example.com/zoek/mijn-portfolio-aapl", true),
+            ("https://example.com/news/mijn-fiets", false),
+            // `;` separates query pairs too; more credential names.
+            ("https://example.com/?a=1;token=x", true),
+            ("https://example.com/?jwt=x", true),
+            ("https://example.com/?sid=x", true),
+            ("https://example.com/?pwd=x", true),
+            ("https://example.com/?SAMLResponse=x", true),
         ] {
             assert_eq!(url_leaks_identifier(url), leaks, "{url}");
         }
