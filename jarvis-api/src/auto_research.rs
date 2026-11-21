@@ -84,18 +84,26 @@ impl MarkerHold {
     }
 }
 
-/// At most one automatic run at a time, at most [`PER_HOUR`] per hour and
-/// [`PER_DAY`] per day. Explicit Research runs never count.
-#[derive(Default)]
-pub struct AutoResearch {
+/// One run at a time, at most `per_hour` per hour and `per_day` per day.
+/// The default is the automatic web search's: [`PER_HOUR`] and [`PER_DAY`];
+/// explicit Research runs never count.
+pub struct RunCaps {
+    per_hour: usize,
+    per_day: usize,
     in_flight: AtomicBool,
     // ponytail: in memory, so the caps reset on a Core restart; persist the
     // start times if restarts ever become frequent.
     starts: Mutex<VecDeque<Instant>>,
 }
 
-/// The single automatic run slot; dropping it frees the slot.
-pub(crate) struct AutoSlot(Arc<AutoResearch>);
+impl Default for RunCaps {
+    fn default() -> Self {
+        Self::with_caps(PER_HOUR, PER_DAY)
+    }
+}
+
+/// The single run slot; dropping it frees the slot.
+pub(crate) struct AutoSlot(Arc<RunCaps>);
 
 impl Drop for AutoSlot {
     fn drop(&mut self) {
@@ -103,7 +111,16 @@ impl Drop for AutoSlot {
     }
 }
 
-impl AutoResearch {
+impl RunCaps {
+    pub fn with_caps(per_hour: usize, per_day: usize) -> Self {
+        Self {
+            per_hour,
+            per_day,
+            in_flight: AtomicBool::new(false),
+            starts: Mutex::default(),
+        }
+    }
+
     /// Takes the slot and counts a run, or `None` when a run is in flight or
     /// a cap is reached.
     pub(crate) fn try_start(self: &Arc<Self>) -> Option<AutoSlot> {
@@ -131,7 +148,7 @@ impl AutoResearch {
             .iter()
             .filter(|start| now.duration_since(**start) < HOUR)
             .count();
-        if starts.len() >= PER_DAY || last_hour >= PER_HOUR {
+        if starts.len() >= self.per_day || last_hour >= self.per_hour {
             return None;
         }
         starts.push_back(now);
@@ -376,8 +393,19 @@ mod tests {
     }
 
     #[test]
+    fn other_caps_count_the_same_way() {
+        let caps = Arc::new(RunCaps::with_caps(2, 3));
+        let start = Instant::now();
+        assert!(caps.try_start_at(start).is_some());
+        assert!(caps.try_start_at(start + HOUR / 4).is_some());
+        assert!(caps.try_start_at(start + HOUR / 2).is_none());
+        assert!(caps.try_start_at(start + HOUR).is_some());
+        assert!(caps.try_start_at(start + 2 * HOUR).is_none());
+    }
+
+    #[test]
     fn one_run_at_a_time_within_hourly_and_daily_caps() {
-        let auto = Arc::new(AutoResearch::default());
+        let auto = Arc::new(RunCaps::default());
         let start = Instant::now();
         let held = auto.try_start_at(start).unwrap();
         // Busy: refused, and a refusal is not counted.

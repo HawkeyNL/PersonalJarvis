@@ -9,7 +9,7 @@ pub(crate) mod agents;
 pub(crate) mod app_updates;
 pub(crate) mod auth;
 pub(crate) mod chat;
-mod chat_context;
+pub(crate) mod chat_context;
 pub(crate) mod coding;
 pub(crate) mod crypto;
 pub(crate) mod jobs;

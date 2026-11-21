@@ -49,9 +49,10 @@ Anything about your setup that is not listed here is unknown to you.";
 /// at the end are dropped first: the safety line and the capability lines
 /// (the markers the model must write to use a feature) are kept longest.
 /// A name missing here ranks last. See also [`NEEDS`].
-const PRIORITY: [&str; 16] = [
+const PRIORITY: [&str; 17] = [
     "untrusted_web",
     "web_search",
+    "web_pages",
     "jobs",
     "job_fields",
     "roadmaps",
@@ -162,6 +163,9 @@ pub(super) struct Facts<'a> {
     pub own_jobs: bool,
     /// Whether this answer may propose a roadmap (a runs-API answer).
     pub roadmaps: bool,
+    /// Whether Core reads the page the owner links to (a runs-API answer,
+    /// the page reader on).
+    pub web_pages: bool,
     /// `None` when no agent bundle is loaded.
     pub agents: Option<Vec<String>>,
     pub ibkr: Ibkr,
@@ -198,6 +202,7 @@ pub(super) async fn system_prompt(state: &AppState, runs_api: bool, headroom: us
         jobs,
         own_jobs: runs_api && crate::jobs::chat::research_on(state, Origin::Jarvis),
         roadmaps: runs_api,
+        web_pages: runs_api && state.page_reader.is_some(),
         agents: state.agent_registry.as_deref().map(|loader| {
             let snapshot = loader.snapshot();
             snapshot
@@ -476,6 +481,15 @@ fn lines(facts: &Facts) -> Vec<(&'static str, String)> {
             },
         ),
     ];
+    if facts.web_pages {
+        lines.push((
+            "web_pages",
+            "Web pages: when the owner's message has an https link, or asks for \"source N\" \
+             of the last web search answer, Core reads that one page and adds its text as a \
+             <web_result> block. You cannot open any other link."
+                .into(),
+        ));
+    }
     if let Some((owner, own)) = facts.jobs {
         lines.push((
             "jobs",
@@ -789,6 +803,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_web_pages_line_follows_web_search_only_when_pages_are_read() {
+        let routing = RoutingSnapshot::default();
+        let names = |facts: &Facts| -> Vec<&'static str> {
+            lines(facts).into_iter().map(|(name, _)| name).collect()
+        };
+        let mut pages = facts(&routing, Ibkr::NotLinked);
+        assert!(!names(&pages).contains(&"web_pages"));
+        pages.web_pages = true;
+        let shown = names(&pages);
+        let at = shown.iter().position(|name| *name == "web_pages").unwrap();
+        assert_eq!(shown[at - 1], "web_search");
+        let line = &lines(&pages)[at].1;
+        assert!(line.starts_with("Web pages: when the owner's message has an https link"));
+        assert!(line.contains("<web_result>"));
+    }
+
     fn allows(_: &str, model: &str) -> bool {
         model != "disallowed-fixture"
     }
@@ -807,6 +838,7 @@ mod tests {
             jobs: None,
             own_jobs: false,
             roadmaps: false,
+            web_pages: false,
             agents: Some(vec!["Research".into(), "Trading".into()]),
             ibkr,
             crypto: Crypto::NotEnabled,
@@ -943,6 +975,7 @@ mod tests {
             jobs: Some((4, 1)),
             own_jobs: true,
             roadmaps: true,
+            web_pages: false,
             ..facts(&routing, synced())
         };
         let block = render(&full(), MAX_BYTES);
@@ -1000,6 +1033,7 @@ mod tests {
         let no_roadmaps = render(
             &Facts {
                 roadmaps: false,
+                web_pages: false,
                 ..full()
             },
             MAX_BYTES,
@@ -1194,6 +1228,7 @@ mod tests {
             jobs: Some((10, 10)),
             own_jobs: true,
             roadmaps: true,
+            web_pages: false,
             crypto,
             ..facts(&routing, Ibkr::Synced(portfolio(1000, 80)))
         };
@@ -1378,6 +1413,7 @@ mod tests {
             jobs: Some((10, 10)),
             own_jobs: true,
             roadmaps: true,
+            web_pages: false,
             ..facts(routing, synced())
         }
     }

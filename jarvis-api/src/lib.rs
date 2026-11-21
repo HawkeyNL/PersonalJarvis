@@ -43,6 +43,7 @@ pub mod memecoin;
 mod metering;
 pub mod model_control;
 pub mod notify;
+pub mod page_read;
 mod peer;
 mod persona;
 pub mod photos;

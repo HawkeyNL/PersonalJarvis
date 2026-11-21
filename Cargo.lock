@@ -2432,6 +2432,7 @@ dependencies = [
  "jarvis-observability",
  "jarvis-onchain",
  "jarvis-orchestrator",
+ "jarvis-page-reader",
  "jarvis-policy",
  "jarvis-portfolio",
  "jarvis-privileged",
