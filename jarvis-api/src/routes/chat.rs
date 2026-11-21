@@ -415,7 +415,9 @@ pub(super) async fn execute_chat(
 
     // Built only on the paths that send it, after the early refusals.
     if requested_mode != llm::RoutingMode::Research {
-        let mut system = super::runtime_facts::system_prompt(&state, user_already_published).await;
+        let headroom = chat_headroom(!photo_labels.is_empty());
+        let mut system =
+            super::runtime_facts::system_prompt(&state, user_already_published, headroom).await;
         if !photo_labels.is_empty() {
             add_photo_sentence(&mut system);
         }
@@ -495,6 +497,25 @@ pub(super) async fn execute_chat(
             let honoured = realtime_run.is_some()
                 && user_already_published
                 && requested_mode != llm::RoutingMode::Research;
+            if !honoured && (markers.any_job || markers.any_roadmap) {
+                let reason = if requested_mode == llm::RoutingMode::Research {
+                    "research mode"
+                } else {
+                    "not a runs-API turn"
+                };
+                tracing::info!(
+                    reason,
+                    jobs = markers.any_job,
+                    roadmap = markers.any_roadmap,
+                    "chat markers not honoured"
+                );
+            }
+            if honoured && image_turn && !markers.job_self.is_empty() {
+                tracing::info!(
+                    dropped = markers.job_self.len(),
+                    "job_self markers not honoured: photo turn"
+                );
+            }
             let own_lines: &[String] = if honoured && !image_turn {
                 &markers.job_self
             } else {
@@ -762,8 +783,17 @@ your Claude or Codex subscription worker, and neither is available. Your photo i
 with your message.";
 /// Stored when a reply was nothing but photo markers that matched no photo.
 const PHOTO_NOT_FOUND_REPLY: &str = "I can't show that photo.";
-const PHOTO_SENTENCE: &str = "The owner attached photos labelled [photo N]. To show one \
-of them back, put a line that is exactly [[photo:N]].";
+pub(super) const PHOTO_SENTENCE: &str = "The owner attached photos labelled [photo N]. To \
+show one of them back, put a line that is exactly [[photo:N]].";
+/// Spare room below the worker's system cap on the chat path.
+const CHAT_MARGIN: usize = 64;
+
+/// Room the chat path keeps below the worker's system cap for what it adds
+/// after the runtime facts: only the photo sentence, on a turn with photos.
+/// Orchestrate keeps [`super::runtime_facts::ROLE_HEADROOM`] for its role text.
+pub(super) fn chat_headroom(photos: bool) -> usize {
+    CHAT_MARGIN + if photos { PHOTO_SENTENCE.len() + 2 } else { 0 }
+}
 
 /// Tell the model how to show a photo back, if the worker's system cap
 /// leaves room; the labels in the turns stand on their own otherwise.
@@ -1675,7 +1705,9 @@ pub(crate) async fn assistant_orchestrate(
     if task.len() > validation::MAX_TASK_LEN {
         return Err(bad_request("task too long"));
     }
-    let system = super::runtime_facts::system_prompt(&state, false).await;
+    let system =
+        super::runtime_facts::system_prompt(&state, false, super::runtime_facts::ROLE_HEADROOM)
+            .await;
     let result = orchestrator::plan_and_execute(&state.llm, task, &system).await;
     if let Err(error) = &result {
         record_failure(&state, None, error, Default::default()).await;
