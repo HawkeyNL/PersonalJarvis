@@ -143,9 +143,11 @@ readonly -a market_data_keys=(JARVIS_MARKET_SOLANA_RPC_A_URL JARVIS_MARKET_SOLAN
 # The Solana RPC hosts of jarvis-market-data's ALLOWED_HOSTS.
 readonly -a market_rpc_hosts=(api.mainnet-beta.solana.com mainnet.helius-rpc.com solana-mainnet.g.alchemy.com)
 
+# A second argument "keep" says that Enter keeps the saved value.
 market_read_hidden() {
-    local value
-    printf 'Enter %s (input hidden): ' "$1" >/dev/tty
+    local value hint='input hidden'
+    [[ ${2:-} != keep ]] || hint='input hidden, Enter keeps the saved value'
+    printf 'Enter %s (%s): ' "$1" "$hint" >/dev/tty
     IFS= read -r -s value </dev/tty || return 1
     printf '\n' >/dev/tty
     printf '%s' "$value"
@@ -182,20 +184,57 @@ probe_market_rpc() (
         jq -e '(.result | type == "number") and .result > 0' "$response_file" >/dev/null 2>&1
 )
 
+# Regular, not a link, and exactly the owner and mode set writes.
+market_data_safe() {
+    [[ -f $market_data_file && ! -L $market_data_file &&
+        $(stat -c '%U:%G:%a' "$market_data_file" 2>/dev/null) == "$market_data_owner:640" ]]
+}
+
+# Fills the caller's saved_a, saved_b and saved_jupiter from a safe file;
+# an unsafe or linked file counts as nothing saved. The file is opened once
+# and read only when the open file is still the safe one at the path. Plain
+# line reads only: never sourced, and no value reaches argv or output.
+market_data_load_saved() {
+    local line fd want
+    market_data_safe || return 0
+    exec {fd}<"$market_data_file" || return 0
+    want="$(stat -c '%d:%i' "$market_data_file" 2>/dev/null || true):$market_data_owner:640"
+    if [[ -f /dev/fd/$fd && ! -L $market_data_file &&
+        $(stat -L -c '%d:%i:%U:%G:%a' "/dev/fd/$fd" 2>/dev/null) == "$want" ]]; then
+        while IFS= read -r -u "$fd" line || [[ -n $line ]]; do
+            case $line in
+                JARVIS_MARKET_SOLANA_RPC_A_URL=?*) saved_a=${line#*=} ;;
+                JARVIS_MARKET_SOLANA_RPC_B_URL=?*) saved_b=${line#*=} ;;
+                JARVIS_MARKET_JUPITER_API_KEY=?*) saved_jupiter=${line#*=} ;;
+            esac
+        done
+    fi
+    exec {fd}<&-
+}
+
+# Enter on an empty prompt keeps the saved value; a kept value is checked
+# and probed like a typed one. "-" removes a saved Jupiter key.
 set_market_data() (
     local rpc_a rpc_b jupiter host_a host_b tmp='' dir=${market_data_file%/*} failed=0
+    local saved_a='' saved_b='' saved_jupiter='' jupiter_label='Jupiter API key (optional, empty or - for none)'
     require_tty
-    trap 'rm -f -- "$tmp"; unset rpc_a rpc_b jupiter' EXIT
+    trap 'rm -f -- "$tmp"; unset rpc_a rpc_b jupiter saved_a saved_b saved_jupiter' EXIT
     umask 077
-    rpc_a=$(market_read_hidden "Solana RPC A URL") || fail "could not read the RPC A URL"
+    market_data_load_saved
+    rpc_a=$(market_read_hidden "Solana RPC A URL" "${saved_a:+keep}") || fail "could not read the RPC A URL"
+    [[ -n $rpc_a ]] || rpc_a=$saved_a
     host_a=$(market_rpc_host "$rpc_a") ||
         fail "RPC A must be an https URL on ${market_rpc_hosts[*]}, without user, port or fragment"
-    rpc_b=$(market_read_hidden "Solana RPC B URL") || fail "could not read the RPC B URL"
+    rpc_b=$(market_read_hidden "Solana RPC B URL" "${saved_b:+keep}") || fail "could not read the RPC B URL"
+    [[ -n $rpc_b ]] || rpc_b=$saved_b
     host_b=$(market_rpc_host "$rpc_b") ||
         fail "RPC B must be an https URL on ${market_rpc_hosts[*]}, without user, port or fragment"
     [[ $host_a != "$host_b" ]] || fail "RPC A and RPC B must be on different hosts"
-    jupiter=$(market_read_hidden "Jupiter API key (optional, empty for none)") ||
+    [[ -z $saved_jupiter ]] || jupiter_label='Jupiter API key (optional, - removes the saved key)'
+    jupiter=$(market_read_hidden "$jupiter_label" "${saved_jupiter:+keep}") ||
         fail "could not read the Jupiter API key"
+    [[ -n $jupiter ]] || jupiter=$saved_jupiter
+    [[ $jupiter != - ]] || jupiter=''
     [[ -z $jupiter || $jupiter =~ ^[A-Za-z0-9._~+/=-]{1,512}$ ]] ||
         fail "the Jupiter API key must be 1-512 letters, digits or ._~+/=-"
     if probe_market_rpc "$rpc_a"; then echo "RPC A: ok"; else echo "RPC A: failed"; failed=1; fi
@@ -218,8 +257,7 @@ set_market_data() (
 # set or empty per key; an unsafe or linked file counts as empty.
 market_data_status() {
     local key state safe=no
-    [[ -f $market_data_file && ! -L $market_data_file &&
-        $(stat -c '%U:%G:%a' "$market_data_file" 2>/dev/null) == "$market_data_owner:640" ]] && safe=yes
+    market_data_safe && safe=yes
     for key in "${market_data_keys[@]}"; do
         state=empty
         [[ $safe == yes ]] && grep -Eq "^$key=.+" "$market_data_file" && state=set
