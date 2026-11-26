@@ -80,6 +80,9 @@ pub mod bounds {
     /// Most a paper trade may lose at its stop, fees and slippage included,
     /// as a share of the paper equity: at most 10%.
     pub const RISK_PER_TRADE_BPS: (u32, u32) = (1, 1_000);
+    /// Most all open paper positions together may lose at their stops, fees
+    /// and slippage included, as a share of the paper equity: at most 30%.
+    pub const TOTAL_RISK_BPS: (u32, u32) = (1, 3_000);
 }
 
 /// A parameter outside its code-fixed bounds.

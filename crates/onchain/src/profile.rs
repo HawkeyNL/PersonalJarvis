@@ -53,6 +53,11 @@ struct ProfileFile {
     /// the default.
     #[serde(default = "max_risk_per_trade_bps")]
     max_risk_per_trade_bps: u32,
+    /// Most all open positions together may lose at their stops, as a share
+    /// of the paper equity. At most the code cap (30%), which is also the
+    /// default, and at least `max_risk_per_trade_bps`.
+    #[serde(default = "max_total_risk_bps")]
+    max_total_risk_bps: u32,
     filter: FilterFile,
     /// Deprecated: the single strategy of profiles written before typed
     /// strategies. It no longer enters; it only names the exit rules of the
@@ -118,6 +123,10 @@ impl AgentSettings {
 
 fn max_risk_per_trade_bps() -> u32 {
     bounds::RISK_PER_TRADE_BPS.1
+}
+
+fn max_total_risk_bps() -> u32 {
+    bounds::TOTAL_RISK_BPS.1
 }
 
 /// Everything that decided the results of a legacy strategy. It is recorded
@@ -218,6 +227,9 @@ pub struct PaperProfile {
     pub max_open_positions: usize,
     /// Every entry is cut so it risks at most this share of the equity.
     pub max_risk_per_trade_bps: u32,
+    /// Every entry is cut so all open positions together risk at most this
+    /// share of the equity.
+    pub max_total_risk_bps: u32,
     pub rules: FilterRules,
     /// Deprecated legacy strategy, if the profile still has one. Its version
     /// is below [`STRATEGY_VERSION_FLOOR`].
@@ -312,6 +324,14 @@ impl PaperProfile {
                 "max_risk_per_trade_bps must be {min_risk} to {max_risk}"
             ));
         }
+        let (min_total, max_total) = bounds::TOTAL_RISK_BPS;
+        if !(min_total..=max_total).contains(&v.max_total_risk_bps)
+            || v.max_total_risk_bps < v.max_risk_per_trade_bps
+        {
+            return Err(format!(
+                "max_total_risk_bps must be {min_total} to {max_total} and at least max_risk_per_trade_bps"
+            ));
+        }
         if file.goal_multiple <= Decimal::ONE {
             return Err("goal_multiple must be above 1".into());
         }
@@ -370,6 +390,7 @@ impl PaperProfile {
             max_position_usd: file.max_position_usd,
             max_open_positions: file.max_open_positions,
             max_risk_per_trade_bps: file.max_risk_per_trade_bps,
+            max_total_risk_bps: file.max_total_risk_bps,
             rules,
             strategy,
             costs,

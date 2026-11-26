@@ -59,6 +59,7 @@ pub(crate) mod tests {
             profile.max_risk_per_trade_bps, 1_000,
             "the 10% cap by default"
         );
+        assert_eq!(profile.max_total_risk_bps, 3_000, "the 30% cap by default");
         assert_eq!(profile.rules.max_snapshot_age, Duration::minutes(1));
         assert!(profile.discovery, "discovery is on by default");
         // Formatting and the candidate sources do not change the recorded
@@ -68,9 +69,11 @@ pub(crate) mod tests {
         other["discovery"] = false.into();
         // Not recorded with a legacy version: it only cuts new entries.
         other["max_risk_per_trade_bps"] = 250.into();
+        other["max_total_risk_bps"] = 250.into();
         let reparsed = PaperProfile::parse(&serde_json::to_string_pretty(&other).unwrap()).unwrap();
         assert!(!reparsed.discovery);
         assert_eq!(reparsed.max_risk_per_trade_bps, 250);
+        assert_eq!(reparsed.max_total_risk_bps, 250);
         assert_eq!(reparsed.versioned_params, profile.versioned_params);
         let mut changed = fixture_json();
         changed["costs"]["dex_fee_bps"] = 30.into();
@@ -111,7 +114,7 @@ pub(crate) mod tests {
 
     #[test]
     fn refuses_unsafe_or_unknown_input() {
-        let cases: [(&str, serde_json::Value); 11] = [
+        let cases: [(&str, serde_json::Value); 14] = [
             ("/unknown", serde_json::json!(1)),
             ("/watchlist", serde_json::json!([])),
             (
@@ -126,6 +129,10 @@ pub(crate) mod tests {
             // Above the code cap of 10%, or nothing.
             ("/max_risk_per_trade_bps", serde_json::json!(1_001)),
             ("/max_risk_per_trade_bps", serde_json::json!(0)),
+            // Above the code cap of 30%, nothing, or below the 10% per trade.
+            ("/max_total_risk_bps", serde_json::json!(3_001)),
+            ("/max_total_risk_bps", serde_json::json!(0)),
+            ("/max_total_risk_bps", serde_json::json!(999)),
             ("/strategy/stop_loss_bps", serde_json::json!(1)),
             ("/costs/failure_rate", serde_json::json!("1")),
         ];
