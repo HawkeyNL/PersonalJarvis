@@ -19,9 +19,11 @@ mktemp() {
         *) command mktemp "$@" ;;
     esac
 }
-# Answers the hidden prompts in order from the fixture's answer list.
+# Answers the hidden prompts in order from the fixture's answer list and
+# records each prompt label and its keep flag.
 market_read_hidden() {
     local answer
+    printf '%s|%s\n' "$1" "${2:-}" >> "$fixture/prompts"
     answer=$(sed -n '1p' "$fixture/answers")
     sed -i '1d' "$fixture/answers"
     printf '%s' "$answer"
@@ -75,6 +77,9 @@ expect_refused 'a quote' 'https://mainnet.helius-rpc.com/?k="x' "$fx_rpc_b" ''
 expect_refused 'a lookalike host' 'https://mainnet.helius-rpc.com.evil.example/' "$fx_rpc_b" ''
 expect_refused 'one host twice' "$fx_rpc_a" 'https://mainnet.helius-rpc.com/?api-key=other' ''
 expect_refused 'a malformed Jupiter key' "$fx_rpc_a" "$fx_rpc_b" 'bad key'
+# With nothing saved, Enter is an empty URL and a plain prompt.
+expect_refused 'an empty RPC A with nothing saved' '' "$fx_rpc_b" ''
+[[ $(tail -n1 "$fixture/prompts") == 'Solana RPC A URL|' ]]
 grep -Fq 'must be on different hosts' "$fixture/output"
 [[ ! -e $fixture/curl.argv ]]
 
@@ -102,10 +107,59 @@ fi
 market_data_status > "$fixture/status"
 [[ $(grep -c ' set$' "$fixture/status") == 3 ]]
 
-# The Jupiter key is optional; a new set replaces the whole file.
-answers "$fx_rpc_b" "$fx_rpc_a" ''
+# Saved values: every prompt offers to keep its value.
+fx_rpc_c='https://api.mainnet-beta.solana.com/'
+: > "$fixture/prompts"
+: > "$fixture/curl.config"
+answers '' "$fx_rpc_c" ''
+set_market_data >> "$fixture/output" 2>&1
+[[ $(<"$fixture/prompts") == 'Solana RPC A URL|keep
+Solana RPC B URL|keep
+Jupiter API key (optional, - removes the saved key)|keep' ]]
+# Keep A and type B: the kept A is probed again, the key is kept.
+[[ $(<"$market_data_file") == "JARVIS_MARKET_SOLANA_RPC_A_URL=$fx_rpc_a
+JARVIS_MARKET_SOLANA_RPC_B_URL=$fx_rpc_c
+JARVIS_MARKET_JUPITER_API_KEY=$fx_jupiter" ]]
+grep -Fq "url = \"$fx_rpc_a\"" "$fixture/curl.config"
+[[ $(command stat -c '%a' "$market_data_file") == 640 ]]
+# A kept A still needs a B on another host.
+cp "$market_data_file" "$fixture/before"
+answers '' 'https://mainnet.helius-rpc.com/?api-key=other' ''
+if set_market_data >> "$fixture/output" 2>&1; then
+    echo 'a kept RPC A on the same host as B was accepted' >&2; exit 1
+fi
+cmp -s "$market_data_file" "$fixture/before"
+# Keep both, and a kept RPC that no longer answers changes nothing.
+answers "$fx_rpc_b" '' ''
+set_market_data >> "$fixture/output" 2>&1
+[[ $(<"$market_data_file") == "JARVIS_MARKET_SOLANA_RPC_A_URL=$fx_rpc_b
+JARVIS_MARKET_SOLANA_RPC_B_URL=$fx_rpc_c
+JARVIS_MARKET_JUPITER_API_KEY=$fx_jupiter" ]]
+cp "$market_data_file" "$fixture/before"
+: > "$fixture/curl.config"
+answers '' '' ''
+set_market_data >> "$fixture/output" 2>&1
+cmp -s "$market_data_file" "$fixture/before"
+grep -Fq "url = \"$fx_rpc_b\"" "$fixture/curl.config"
+grep -Fq "url = \"$fx_rpc_c\"" "$fixture/curl.config"
+sed -i "s|^JARVIS_MARKET_SOLANA_RPC_B_URL=.*|JARVIS_MARKET_SOLANA_RPC_B_URL=${fx_rpc_c}down|" "$market_data_file"
+cp "$market_data_file" "$fixture/before"
+answers '' '' ''
+if set_market_data >> "$fixture/output" 2>&1; then
+    echo 'a kept RPC that failed its probe was saved' >&2; exit 1
+fi
+cmp -s "$market_data_file" "$fixture/before"
+
+# The Jupiter key is optional; a new set replaces the whole file, and "-"
+# removes a saved key.
+answers "$fx_rpc_b" "$fx_rpc_a" '-'
 set_market_data >> "$fixture/output" 2>&1
 [[ $(wc -l < "$market_data_file") == 2 ]]
+: > "$fixture/prompts"
+answers '' '' ''
+set_market_data >> "$fixture/output" 2>&1
+[[ $(wc -l < "$market_data_file") == 2 ]]
+[[ $(tail -n1 "$fixture/prompts") == 'Jupiter API key (optional, empty for none)|' ]]
 market_data_status > "$fixture/status"
 grep -Eq '^JARVIS_MARKET_JUPITER_API_KEY +empty$' "$fixture/status"
 grep -Eq '^JARVIS_MARKET_SOLANA_RPC_A_URL +set$' "$fixture/status"
@@ -115,15 +169,30 @@ if compgen -G "$fixture/credential-*" >/dev/null; then
     echo 'a probe left a temporary file behind' >&2; exit 1
 fi
 
-# An unsafe or linked file counts as empty, and a link is never replaced.
+# An unsafe or linked file counts as empty, nothing in it is kept, and a
+# link is never replaced.
 chmod 0644 "$market_data_file"
 market_data_status > "$fixture/status"
 [[ $(grep -c ' empty$' "$fixture/status") == 3 ]]
+cp "$market_data_file" "$fixture/before"
+: > "$fixture/prompts"
+answers '' '' ''
+if set_market_data >> "$fixture/output" 2>&1; then
+    echo 'a value from an unsafe market data file was kept' >&2; exit 1
+fi
+[[ $(<"$fixture/prompts") == 'Solana RPC A URL|' ]]
+cmp -s "$market_data_file" "$fixture/before"
 chmod 0640 "$market_data_file"
 mv "$market_data_file" "$fixture/real.env"
 ln -s "$fixture/real.env" "$market_data_file"
 market_data_status > "$fixture/status"
 [[ $(grep -c ' empty$' "$fixture/status") == 3 ]]
+: > "$fixture/prompts"
+answers '' '' ''
+if set_market_data >> "$fixture/output" 2>&1; then
+    echo 'a value from a linked market data file was kept' >&2; exit 1
+fi
+[[ $(<"$fixture/prompts") == 'Solana RPC A URL|' ]]
 answers "$fx_rpc_a" "$fx_rpc_b" ''
 if set_market_data >> "$fixture/output" 2>&1; then
     echo 'a linked market data file was replaced' >&2; exit 1
