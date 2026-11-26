@@ -3272,7 +3272,8 @@ mod tests {
     async fn entries_are_cut_to_the_total_risk_limit() -> Result<(), Box<dyn std::error::Error>> {
         // 4% of the 250 stake per trade and for all open positions together:
         // a full 25 risks 6.5 to 7.5 at its stop, so the first entry fits,
-        // the second gets what is left and the third nothing.
+        // the second gets what is left and the third nothing. Claude can
+        // spend a third of a slot per entry, so it gets 1.5%.
         let mut json = fixture_json();
         json["watchlist"] = serde_json::json!([MINT_A, MINT_B, MINT_C]);
         json["max_open_positions"] = 4.into();
@@ -3289,10 +3290,10 @@ mod tests {
         // MINT_A suits A, MINT_B suits B, MINT_C suits C. The sizes of the
         // first two entries, in the order given.
         let seeds = seeds();
-        let sizes = |order: [usize; 3]| -> Option<(Decimal, Decimal)> {
-            let cap = |i: usize, open| {
-                seeds[i].total_risk_capped_size(d("25"), &costs, d("250"), open, 400)
-            };
+        let sizes = |order: [usize; 3], size: &str, bps| -> Option<(Decimal, Decimal)> {
+            let size = d(size);
+            let cap =
+                |i: usize, open| seeds[i].total_risk_capped_size(size, &costs, d("250"), open, bps);
             let loss =
                 |i: usize, size| config::loss_at_stop(Some(&seeds[i]), size + d("0.011"), &costs);
             let first = cap(order[0], Decimal::ZERO)?;
@@ -3300,9 +3301,9 @@ mod tests {
             let second = cap(order[1], open)?;
             let open = open + loss(order[1], second)?;
             // The per-trade limit alone would not cut the second.
-            let per_trade = seeds[order[1]].risk_capped_size(d("25"), &costs, d("250"), 400);
-            assert_eq!((first, per_trade), (d("25"), Some(d("25"))));
-            assert!(second < d("25"));
+            let per_trade = seeds[order[1]].risk_capped_size(size, &costs, d("250"), bps);
+            assert_eq!((first, per_trade), (size, Some(size)));
+            assert!(second < size);
             assert_eq!(cap(order[2], open), None);
             Some((first, second))
         };
@@ -3314,7 +3315,7 @@ mod tests {
         };
 
         // Strategies entering on their own signals, in watchlist order.
-        let (first, second) = sizes([0, 1, 2]).ok_or("no size")?;
+        let (first, second) = sizes([0, 1, 2], "25", 400).ok_or("no size")?;
         let db = connect("memecoin_total_risk").await?;
         pool_age_strategies(&db, &profile).await?;
         let mut task = PaperTask::new(profile, Arc::new(PaperHandle::new(true)));
@@ -3324,9 +3325,11 @@ mod tests {
         assert_eq!(cost_of(&trips, MINT_B), Some(second));
         assert_eq!(cost_of(&trips, MINT_C), None);
 
-        // Claude asking for each full size, newest candidate first.
-        let (first, second) = sizes([2, 1, 0]).ok_or("no size")?;
+        // Claude asking for a third of each size, newest candidate first.
+        let (first, second) = sizes([2, 1, 0], "8.33", 150).ok_or("no size")?;
         json["agent"] = serde_json::json!({});
+        json["max_risk_per_trade_bps"] = 150.into();
+        json["max_total_risk_bps"] = 150.into();
         let profile = PaperProfile::parse(&json.to_string())?;
         let db = connect("memecoin_total_risk_agent").await?;
         pool_age_strategies(&db, &profile).await?;
@@ -3336,9 +3339,9 @@ mod tests {
         task.tick(&db, &market, &mut no_failure).await?;
         settle(&task).await;
         brain.reply(Ok(r#"{"actions":[
-            {"action":"enter","id":"c0","size_bps":10000,"reason_code":"momentum"},
-            {"action":"enter","id":"c1","size_bps":10000,"reason_code":"momentum"},
-            {"action":"enter","id":"c2","size_bps":10000,"reason_code":"momentum"}]}"#
+            {"action":"enter","id":"c0","size_bps":3333,"reason_code":"momentum"},
+            {"action":"enter","id":"c1","size_bps":3333,"reason_code":"momentum"},
+            {"action":"enter","id":"c2","size_bps":3333,"reason_code":"momentum"}]}"#
             .into()));
         task.tick(&db, &market, &mut no_failure).await?;
         settle(&task).await;
