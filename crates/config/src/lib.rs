@@ -420,6 +420,10 @@ pub struct AppConfig {
     /// enabled by an install or update either.
     #[serde(default)]
     pub web_fetch_enabled: bool,
+    /// Let a chat answer search the owner's earlier chats on this node.
+    /// Default **false**.
+    #[serde(default)]
+    pub chat_search_enabled: bool,
     /// Read-only crypto wallets (docs/CRYPTO_WALLETS.md): public balances
     /// and EUR prices, never a key or transaction. Default **false**.
     #[serde(default)]
@@ -975,6 +979,7 @@ impl fmt::Debug for AppConfig {
             )
             .field("ibkr_broker_socket", &self.ibkr_broker_socket)
             .field("web_fetch_enabled", &self.web_fetch_enabled)
+            .field("chat_search_enabled", &self.chat_search_enabled)
             .field("crypto_wallets_enabled", &self.crypto_wallets_enabled)
             .field(
                 "crypto_evm_rpc_ethereum_url",
@@ -1126,6 +1131,7 @@ mod tests {
             ibkr_portfolio_sync_enabled: false,
             ibkr_broker_socket: default_ibkr_broker_socket(),
             web_fetch_enabled: false,
+            chat_search_enabled: false,
             crypto_wallets_enabled: false,
             crypto_evm_rpc_ethereum_url: "https://ethereum-rpc.publicnode.com/?key=rpc-supersecret"
                 .to_string(),
@@ -1180,6 +1186,7 @@ mod tests {
             assert!(!cfg.memecoin_paper_enabled); // off unless deliberately enabled
             assert!(!cfg.ibkr_portfolio_sync_enabled);
             assert!(!cfg.web_fetch_enabled);
+            assert!(!cfg.chat_search_enabled);
             assert!(!cfg.crypto_wallets_enabled);
             assert_eq!(
                 cfg.crypto_evm_rpc_polygon_url,
@@ -1296,6 +1303,7 @@ mod tests {
             ibkr_portfolio_sync_enabled: false,
             ibkr_broker_socket: default_ibkr_broker_socket(),
             web_fetch_enabled: false,
+            chat_search_enabled: false,
             crypto_wallets_enabled: false,
             crypto_evm_rpc_ethereum_url: "https://ethereum-rpc.publicnode.com/?key=rpc-supersecret"
                 .to_string(),
