@@ -199,22 +199,29 @@ way; when nothing fits it is not made, and Claude's entry is recorded as
 open positions, of what each can still take off the equity, from the value
 the equity counts it at down to its stop:
 
-    max(0, value - cost + (cost × min(stop_loss_bps + exit_slippage_bps, 100%) + exit fees))
+    loss at stop = cost × min(stop_loss_bps + exit_slippage_bps, 100%) + exit fees
+    open risk    = max(0, value - cost + loss at stop)
 
 with the value what selling it would return at the tick's price and the
 stop and exit slippage of the version that opened it. So a gain above the
 cost is at risk as well, and a loss already in the equity is not counted
-twice. A position whose version has no typed config that fits the profile
-(a legacy version, one that no longer fits, or one without usable rules),
-or that is stuck, counts its whole remaining value plus the exit fees. A
-position without a price counts as already lost in the equity, so as
-nothing more at risk. A position already below its stop (its exit failed)
-counts only what is left of its planned loss, down to nothing; like a price
-gap, it can still lose more. Each
-entry made during a tick adds its risk at entry (the per-trade formula
-above) for the rest of that tick; an exit Claude makes frees its risk from
-the next tick. When the equity or the open risk cannot be counted (the
-ledger does not replay, or the numbers overflow) no entry is made.
+twice. Where that is unsure, it fails closed:
+
+- A position without a price counts its loss at stop as if it were still
+  worth its cost. The equity counts it at zero, but the price can come
+  back.
+- A position without a usable stop counts its whole remaining value, at
+  least its cost, plus the exit fees. That is one whose version has no
+  typed config that fits the profile (a legacy version, one that no longer
+  fits, or one without usable rules), or one that is stuck.
+
+A position already below its stop (its exit failed) counts only what is
+left of its planned loss, down to nothing; like a price gap, it can still
+lose more. Each entry made during a tick adds its risk at entry (the
+per-trade formula above) for the rest of that tick; an exit Claude makes
+frees its risk from the next tick. When the equity or the open risk cannot
+be counted (the ledger does not replay, or the numbers overflow) no entry
+is made.
 
 ## Claude decisions
 
@@ -247,10 +254,10 @@ whatever Claude does or whether it answers at all.
   `max_position_usd`, capped by its liquidity share), within the free paper
   stake and cut to the risk limits (above). The seed strategies enter their
   full `max_position_usd`, so Claude chooses any size up to it; a version
-  Claude proposes can lower its `position_share_bps`. A refused action is recorded as `skip` with the reason (for example
-  `strategy_limit`, `no_slot`, `risk_limit`, `total_risk_limit`,
-  `liquidity_too_low`). Exits sell at the tick's
-  price with exit reason `agent_exit`.
+  Claude proposes can lower its `position_share_bps`. A refused action is
+  recorded as `skip` with the reason (for example `strategy_limit`,
+  `no_slot`, `risk_limit`, `total_risk_limit`, `liquidity_too_low`). Exits
+  sell at the tick's price with exit reason `agent_exit`.
 - **Recorded.** Every call starts with a `skip` row with reason
   `call_started`, written before the call is made; if it cannot be written,
   the call is not made. Then every action and failure is a decision row:
@@ -307,8 +314,8 @@ reason it was refused.
 - **Disable** is immediate and needs only the owner's session: entries of
   that strategy stop within the running tick (also when the database cannot
   be reached; a `503` then means the disable holds only until the next
-  restart, so retry), and it holds as the owner's disable. Its positions keep exiting. Audited as
-  `memecoin.strategy.disable`.
+  restart, so retry), and it holds as the owner's disable. Its positions
+  keep exiting. Audited as `memecoin.strategy.disable`.
 - What a signature enables is the **strategy**, not one version: while it
   stays enabled, later versions Claude writes for it become active without a
   new signature, each within `StrategyConfig::validate` against the

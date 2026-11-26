@@ -1629,10 +1629,10 @@ fn risk_capped(
         .ok_or("total_risk_limit")
 }
 
-/// What the open trips in `held` can still take off the paper equity at
+/// What the open trips in `held` count against the total risk limit at
 /// `marks` (see [`config::open_risk`]), valued as the equity values them. A
 /// trip counts its stop only when its version is a typed one and it is not
-/// stuck; otherwise its whole remaining value counts. `None` on overflow.
+/// stuck; otherwise it has no usable stop. `None` on overflow.
 fn open_risk_of(
     held: &[Trip],
     versions: &HashMap<u32, Version>,
@@ -3359,6 +3359,79 @@ mod tests {
         assert_eq!(row(MINT_C), Some(("enter", Some("momentum"))));
         assert_eq!(row(MINT_B), Some(("enter", Some("momentum"))));
         assert_eq!(row(MINT_A), Some(("skip", Some("total_risk_limit"))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn positions_held_at_the_start_count_against_the_total_risk_limit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // 4% of the equity per trade and in total; MINT_A suits A, whose
+        // full 25 risks about 7 at its stop.
+        let mut json = fixture_json();
+        json["watchlist"] = serde_json::json!([MINT_A]);
+        json["max_open_positions"] = 4.into();
+        json["max_risk_per_trade_bps"] = 400.into();
+        json["max_total_risk_bps"] = 400.into();
+        let profile = PaperProfile::parse(&json.to_string())?;
+        let costs = profile.costs.clone();
+        // MINT_D has no price; MINT_B is priced.
+        let market = FixtureMarket::new(&[
+            (MINT_A, "0.001", Duration::hours(2)),
+            (MINT_B, "0.001", Duration::hours(7)),
+        ]);
+        let mut no_failure = || Decimal::new(999_999, 6);
+        let held = |id: &str, mint: &str, version: u32| {
+            let mut t = trip(id, mint, 0, None);
+            t.strategy_version = version;
+            t.cost_usd = d("10");
+            t.opened_at = OffsetDateTime::now_utc() - Duration::minutes(5);
+            t
+        };
+
+        // An unpriced position of B's counts its loss at stop as if it were
+        // still worth its cost, so A's entry is cut where the per-trade
+        // limit alone would not cut it.
+        let db = connect("memecoin_held_risk").await?;
+        let [_, b, _] = pool_age_strategies(&db, &profile).await?;
+        store::open_trip(&db, &held("dark", MINT_D, b)).await?;
+        let equity = d("240"); // the stake less the unpriced cost
+        let open = config::loss_at_stop(Some(&seeds()[1]), d("10"), &costs).ok_or("overflow")?;
+        let cut = seeds()[0]
+            .total_risk_capped_size(d("25"), &costs, equity, open, 400)
+            .ok_or("no size")?;
+        assert!(cut < d("25"));
+        assert_eq!(
+            seeds()[0].risk_capped_size(d("25"), &costs, equity, 400),
+            Some(d("25"))
+        );
+        let mut task = PaperTask::new(profile.clone(), Arc::new(PaperHandle::new(true)));
+        assert_eq!(task.tick(&db, &market, &mut no_failure).await?.entries, 1);
+        let trips = store::load_trips(&db).await?;
+        let entered = trips.iter().find(|t| t.mint == MINT_A).ok_or("no entry")?;
+        assert_eq!(entered.cost_usd, cut + d("0.011"));
+
+        // A priced position without a usable stop, opened by a version that
+        // was never recorded or stuck, counts at least its cost: more than
+        // the 9.6 limit, so nothing enters.
+        for stuck in [false, true] {
+            let db = connect("memecoin_held_risk_stopless").await?;
+            let [_, b, _] = pool_age_strategies(&db, &profile).await?;
+            let trip = held("stopless", MINT_B, if stuck { b } else { 77 });
+            store::open_trip(&db, &trip).await?;
+            if stuck {
+                for _ in 0..EXIT_FAILURE_CAP {
+                    store::record_exit_failure(&db, &trip.id, EXIT_FAILURE_CAP).await?;
+                }
+            }
+            let mut task = PaperTask::new(profile.clone(), Arc::new(PaperHandle::new(true)));
+            assert_eq!(
+                task.tick(&db, &market, &mut no_failure).await?.entries,
+                0,
+                "{stuck}"
+            );
+            assert_eq!(store::load_trips(&db).await?.len(), 1, "{stuck}");
+        }
         Ok(())
     }
 

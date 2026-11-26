@@ -426,11 +426,14 @@ pub fn loss_at_stop(
         .checked_add(attempt_fees(costs)?)
 }
 
-/// What an open position can still take off the paper equity, which counts
-/// it at `value_usd` (what selling it would return): from that value down to
-/// its [`loss_at_stop`], never below zero. Without a usable stop that is its
-/// whole remaining value plus the exit fees. A position without a value
-/// (`None`: no price) already counts as lost, so nothing more is at risk.
+/// What an open position counts against the total risk limit. With a
+/// value (`value_usd`, what selling it would return, as the paper equity
+/// counts it): from that value down to its [`loss_at_stop`], never below
+/// zero, so a gain above the cost counts and a loss already taken does not.
+/// Fails closed where that is unsure: without a price (`None`; the equity
+/// counts it at zero, but the price can come back) it counts its
+/// [`loss_at_stop`] as if it were still worth its cost, and without a usable
+/// stop (`stop` is `None`) at least its whole cost plus the exit fees.
 /// `None` when the numbers overflow.
 pub fn open_risk(
     stop: Option<&StrategyConfig>,
@@ -438,13 +441,19 @@ pub fn open_risk(
     value_usd: Option<Decimal>,
     costs: &CostModel,
 ) -> Option<Decimal> {
+    let at_stop = loss_at_stop(stop, cost_usd, costs)?;
     let Some(value) = value_usd else {
-        return Some(Decimal::ZERO);
+        return Some(at_stop);
     };
     let risk = value
         .checked_sub(cost_usd)?
-        .checked_add(loss_at_stop(stop, cost_usd, costs)?)?;
-    Some(risk.max(Decimal::ZERO))
+        .checked_add(at_stop)?
+        .max(Decimal::ZERO);
+    Some(if stop.is_none() {
+        risk.max(at_stop)
+    } else {
+        risk
+    })
 }
 
 /// Seconds as a duration; values beyond `i64` saturate (and fail any bound).
@@ -737,11 +746,13 @@ mod tests {
         assert_eq!(risk(Some(&a), Some("30")), Some(d("15.611")));
         assert_eq!(risk(Some(&a), Some("16")), Some(d("1.611")));
         assert_eq!(risk(Some(&a), Some("10")), Some(d("0")));
-        // Without a stop the whole remaining value counts.
-        assert_eq!(risk(None, Some("16")), Some(d("16.011")));
-        // Without a price it already counts as lost: nothing more at risk.
-        assert_eq!(risk(Some(&a), None), Some(d("0")));
-        assert_eq!(risk(None, None), Some(d("0")));
+        // Without a stop the whole remaining value counts, at least the cost.
+        assert_eq!(risk(None, Some("30")), Some(d("30.011")));
+        assert_eq!(risk(None, Some("16")), Some(d("20.011")));
+        assert_eq!(risk(None, Some("0")), Some(d("20.011")));
+        // Without a price it counts as if still worth its cost.
+        assert_eq!(risk(Some(&a), None), Some(d("5.611")));
+        assert_eq!(risk(None, None), Some(d("20.011")));
         // The loss of a new entry is the per-trade model.
         assert_eq!(loss_at_stop(Some(&a), d("20"), &costs), Some(d("5.611")));
         assert_eq!(loss_at_stop(None, d("20"), &costs), Some(d("20.011")));
