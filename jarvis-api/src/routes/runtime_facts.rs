@@ -13,7 +13,7 @@ use jarvis_llm::{
 };
 use jarvis_market_data::wallet::Chain;
 use jiff::{tz::TimeZone, Timestamp};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
 use super::crypto::{self as wallet_routes, Part, CHAINS, CRYPTO, IBKR};
@@ -62,11 +62,11 @@ const PRIORITY: [&str; 19] = [
     "roadmaps",
     "own_jobs",
     "current_time",
-    "job_status",
-    "paper_trader",
     "stale_facts",
     "version",
     "paid_api",
+    "job_status",
+    "paper_trader",
     "workers",
     "model_chain",
     "ibkr",
@@ -196,7 +196,7 @@ pub(super) struct Facts<'a> {
     pub ibkr: Ibkr,
     pub crypto: Crypto,
     pub trader: Trader,
-    /// `None` when the jobs could not be read.
+    /// `None` when the jobs could not be read in time.
     pub jobs_status: Option<Vec<JobStatus>>,
 }
 
@@ -313,7 +313,10 @@ async fn jobs_status(state: &AppState) -> Option<Vec<JobStatus>> {
             crate::jobs::store::runs_since(&state.db, since)
         )
     };
-    let (jobs, runs) = tokio::time::timeout(DB_TIMEOUT, read).await.ok()?.ok()?;
+    let Ok(Ok((jobs, runs))) = tokio::time::timeout(DB_TIMEOUT, read).await else {
+        tracing::debug!("runtime facts: background jobs unreadable");
+        return None;
+    };
     Some(job_status(&jobs, &runs, now, state.jobs.time_zone()))
 }
 
@@ -714,12 +717,17 @@ fn lines(facts: &Facts) -> Vec<(&'static str, String)> {
             ),
         },
     ));
-    // Last: these change most often, so the text before them (and its
-    // provider cache) changes less.
-    if let Some(jobs) = &facts.jobs_status {
-        lines.push(("job_status", job_status_line(jobs, &zone)));
-    }
-    lines.push(("paper_trader", trader_line(&facts.trader)));
+    // The system prompt precedes the history, so any change to these lines
+    // misses the provider cache for the whole request; coarse values (job
+    // states, equity to USD 10) limit how often they change.
+    lines.push((
+        "job_status",
+        facts.jobs_status.as_deref().map_or_else(
+            || "Background jobs: unreadable.".into(),
+            |jobs| job_status_line(jobs, &zone),
+        ),
+    ));
+    lines.extend(trader_line(&facts.trader).map(|line| ("paper_trader", line)));
     lines
 }
 
@@ -756,20 +764,32 @@ fn job_status_line(jobs: &[JobStatus], zone: &TimeZone) -> String {
         .unwrap_or_else(|| format!("Background jobs: {}.", jobs.len()))
 }
 
-/// Equity to whole USD, so the line changes less often.
-fn trader_line(trader: &Trader) -> String {
+/// No line while the trader is off. Equity is rounded to the nearest USD 10
+/// (left out when that overflows), so the line changes less often.
+fn trader_line(trader: &Trader) -> Option<String> {
     let state = match trader {
-        Trader::Off => "off".to_string(),
+        Trader::Off => return None,
         Trader::Paused => "paused".to_string(),
         Trader::Stopped => "enabled, not running".to_string(),
         Trader::Running(None) => "running".to_string(),
-        Trader::Running(Some((open, equity))) => format!(
-            "running, {open} open {}, paper equity USD {}",
-            if *open == 1 { "position" } else { "positions" },
-            safe(&equity.round_dp(0).to_string())
-        ),
+        Trader::Running(Some((open, equity))) => {
+            let ten = Decimal::TEN;
+            let equity = equity
+                .checked_div(ten)
+                .map(|tens| tens.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero))
+                .and_then(|tens| tens.checked_mul(ten))
+                .map_or_else(String::new, |usd| {
+                    format!(", paper equity USD {}", safe(&usd.to_string()))
+                });
+            format!(
+                "running, {open} open {}{equity}",
+                if *open == 1 { "position" } else { "positions" }
+            )
+        }
     };
-    format!("Memecoin paper trader (simulated money only): {state}.")
+    Some(format!(
+        "Memecoin paper trader (simulated money only): {state}."
+    ))
 }
 
 /// RFC 3339 in UTC, to the second.
@@ -990,7 +1010,7 @@ mod tests {
             ibkr,
             crypto: Crypto::NotEnabled,
             trader: Trader::Off,
-            jobs_status: None,
+            jobs_status: Some(Vec::new()),
         }
     }
 
@@ -1036,7 +1056,7 @@ mod tests {
             "IBKR: linked; portfolio last synced 2026-10-26T",
             "2 EUR positions, total value EUR 123456.79.",
             "Loaded agents (2): Research, Trading.\n\
-             Memecoin paper trader (simulated money only): off.\n\
+             Background jobs: none.\n\
              Positions by value (2): FIXA EUR 61728.39 (50.0%), FIXB EUR 1234.57 (1.0%).\n\
              Non-EUR positions, not tracked (1): FIXUSD.",
         ] {
@@ -1478,7 +1498,7 @@ mod tests {
         assert!(block.len() <= MAX_BYTES);
         assert_eq!(block, render(&facts(&routing, ibkr()), MAX_BYTES));
         // Every other line is intact; the lists come last.
-        assert!(block.contains("1000 EUR positions, total value EUR 123456.79.\nCrypto wallets: not enabled.\nLoaded agents (2): Research, Trading.\nMemecoin paper trader (simulated money only): off.\nPositions by value (1000): FIX0 EUR 40000.00 (32.4%), FIX1 EUR 39999.99 (32.4%)"));
+        assert!(block.contains("1000 EUR positions, total value EUR 123456.79.\nCrypto wallets: not enabled.\nLoaded agents (2): Research, Trading.\nBackground jobs: none.\nPositions by value (1000): FIX0 EUR 40000.00 (32.4%), FIX1 EUR 39999.99 (32.4%)"));
         let mut lines = block.lines().rev();
         let skipped = lines.next().unwrap();
         let positions = lines.next().unwrap();
@@ -1493,7 +1513,7 @@ mod tests {
             &facts(&routing, ibkr()),
             block.find("\nPositions").unwrap() + 20,
         );
-        assert!(tight.ends_with("Memecoin paper trader (simulated money only): off."));
+        assert!(tight.ends_with("Background jobs: none."));
     }
 
     #[test]
@@ -1516,7 +1536,7 @@ mod tests {
         assert!(small
             .lines()
             .all(|line| full.lines().any(|kept| kept == line)));
-        assert_eq!(small.lines().count(), 2);
+        assert_eq!(small.lines().count(), 3);
         assert!(render(&many, PREFACE.len() + 10).is_empty());
     }
 
@@ -1614,10 +1634,10 @@ mod tests {
                 },
                 "Memecoin paper trader",
             )
-            .unwrap()
         };
+        assert_eq!(line(Trader::Off), None);
+        let line = |trader| line(trader).unwrap();
         let head = "Memecoin paper trader (simulated money only):";
-        assert_eq!(line(Trader::Off), format!("{head} off."));
         assert_eq!(line(Trader::Paused), format!("{head} paused."));
         assert_eq!(
             line(Trader::Stopped),
@@ -1626,16 +1646,27 @@ mod tests {
         assert_eq!(line(Trader::Running(None)), format!("{head} running."));
         assert_eq!(
             line(Trader::Running(Some((3, Decimal::new(123_449, 2))))),
-            format!("{head} running, 3 open positions, paper equity USD 1234.")
+            format!("{head} running, 3 open positions, paper equity USD 1230.")
         );
-        assert_eq!(
-            line(Trader::Running(Some((1, Decimal::new(-506, 1))))),
-            format!("{head} running, 1 open position, paper equity USD -51.")
-        );
-        // Extreme values stay plain ASCII and capped.
+        for (cents, usd) in [
+            (-5_500, "-60"),
+            (-5_499, "-50"),
+            (125_000, "1250"),
+            (0, "0"),
+        ] {
+            assert_eq!(
+                line(Trader::Running(Some((1, Decimal::new(cents, 2))))),
+                format!("{head} running, 1 open position, paper equity USD {usd}.")
+            );
+        }
+        // Extreme values stay plain ASCII and capped; an equity that cannot
+        // be rounded is left out.
         let huge = line(Trader::Running(Some((usize::MAX, Decimal::MAX))));
         assert!(huge.is_ascii() && huge.len() <= MAX_LINE_BYTES, "{huge}");
-        assert!(huge.ends_with(&format!("USD {}.", Decimal::MAX)), "{huge}");
+        assert_eq!(
+            huge,
+            format!("{head} running, {} open positions.", usize::MAX)
+        );
     }
 
     #[test]
@@ -1652,7 +1683,7 @@ mod tests {
                 "Background jobs",
             )
         };
-        assert_eq!(line(None), None);
+        assert_eq!(line(None).unwrap(), "Background jobs: unreadable.");
         assert_eq!(line(Some(Vec::new())).unwrap(), "Background jobs: none.");
         assert_eq!(
             line(Some(statuses())).unwrap(),
@@ -1740,7 +1771,7 @@ mod tests {
             ibkr: Ibkr::Synced(portfolio(1000, 80)),
             jobs_status: background.then(statuses),
             trader: if background {
-                Trader::Running(Some((usize::MAX, Decimal::MAX)))
+                Trader::Running(Some((usize::MAX, Decimal::new(i64::MAX, 2))))
             } else {
                 Trader::Off
             },
@@ -1784,10 +1815,9 @@ mod tests {
         }
         for name in ["job_status", "paper_trader"] {
             assert!(names.contains(&name), "{name}");
-            assert!(
-                rank(name) == rank("current_time") + 1 || rank(name) == rank("current_time") + 2
-            );
-            assert!(rank(name) > rank(CAPABILITY));
+            for above in ["stale_facts", "version", "paid_api", CAPABILITY] {
+                assert!(rank(name) > rank(above), "{name} above {above}");
+            }
         }
         for (dependent, needs) in NEEDS {
             assert!(rank(needs) < rank(dependent), "{dependent}");
