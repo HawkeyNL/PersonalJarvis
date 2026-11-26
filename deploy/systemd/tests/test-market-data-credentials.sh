@@ -200,6 +200,24 @@ done
 market_data_owner="$(id -un):$(id -gn)"
 unset saved_a saved_b saved_jupiter
 printf '%s\n' "JARVIS_MARKET_SOLANA_RPC_A_URL=$fx_rpc_b" "JARVIS_MARKET_SOLANA_RPC_B_URL=$fx_rpc_a" > "$market_data_file"
+# The open file is checked itself, not only the path: with the path check
+# stubbed out, a 0644 file or a link still loads nothing.
+(
+    market_data_safe() { return 0; }
+    market_data_load_saved
+    [[ $saved_a == "$fx_rpc_b" ]]
+    unset saved_a saved_b saved_jupiter
+    chmod 0644 "$market_data_file"
+    market_data_load_saved
+    [[ -z ${saved_a:-}${saved_b:-}${saved_jupiter:-} ]]
+    chmod 0640 "$market_data_file"
+    mv "$market_data_file" "$fixture/linked.env"
+    ln -s "$fixture/linked.env" "$market_data_file"
+    market_data_load_saved
+    [[ -z ${saved_a:-}${saved_b:-}${saved_jupiter:-} ]]
+    mv -fT -- "$fixture/linked.env" "$market_data_file"
+)
+[[ -f $market_data_file && ! -L $market_data_file ]]
 
 # An unsafe or linked file counts as empty, nothing in it is kept, and a
 # link is never replaced.

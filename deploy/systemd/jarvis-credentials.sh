@@ -198,7 +198,7 @@ market_data_load_saved() {
     local line fd want
     market_data_safe || return 0
     exec {fd}<"$market_data_file" || return 0
-    want="$(stat -c '%d:%i' "$market_data_file" 2>/dev/null):$market_data_owner:640"
+    want="$(stat -c '%d:%i' "$market_data_file" 2>/dev/null || true):$market_data_owner:640"
     if [[ -f /dev/fd/$fd && ! -L $market_data_file &&
         $(stat -L -c '%d:%i:%U:%G:%a' "/dev/fd/$fd" 2>/dev/null) == "$want" ]]; then
         while IFS= read -r -u "$fd" line || [[ -n $line ]]; do
