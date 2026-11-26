@@ -1632,8 +1632,7 @@ fn risk_capped(
 /// What the open trips in `held` count against the total risk limit at
 /// `marks` (see [`config::open_risk`]), valued as the equity values them. A
 /// trip counts its stop only when its version is a typed one and it is not
-/// stuck; otherwise it has no usable stop. `None` when any of them cannot
-/// be counted (no price and no peak) or on overflow.
+/// stuck; otherwise it has no usable stop. `None` on overflow.
 fn open_risk_of(
     held: &[Trip],
     versions: &HashMap<u32, Version>,
@@ -3391,31 +3390,37 @@ mod tests {
             t
         };
 
-        // An unpriced position of B's with no peak cannot be counted: no
-        // entry. With a peak of 12 it counts as if worth that, so A's entry
-        // is cut where the per-trade limit alone would not cut it.
-        let db = connect("memecoin_held_risk").await?;
-        let [_, b, _] = pool_age_strategies(&db, &profile).await?;
-        store::open_trip(&db, &held("dark", MINT_D, b)).await?;
-        let mut task = PaperTask::new(profile.clone(), Arc::new(PaperHandle::new(true)));
-        assert_eq!(task.tick(&db, &market, &mut no_failure).await?.entries, 0);
-        assert!(store::set_peak_value(&db, "dark", d("12")).await?);
-        let equity = d("240"); // the stake less the unpriced cost
-        let open = config::open_risk(Some(&seeds()[1]), d("10"), None, Some(d("12")), &costs)
-            .ok_or("overflow")?;
-        let cut = seeds()[0]
-            .total_risk_capped_size(d("25"), &costs, equity, open, 400)
-            .ok_or("no size")?;
-        assert!(cut < d("25"));
-        assert_eq!(
-            seeds()[0].risk_capped_size(d("25"), &costs, equity, 400),
-            Some(d("25"))
-        );
-        let mut task = PaperTask::new(profile.clone(), Arc::new(PaperHandle::new(true)));
-        assert_eq!(task.tick(&db, &market, &mut no_failure).await?.entries, 1);
-        let trips = store::load_trips(&db).await?;
-        let entered = trips.iter().find(|t| t.mint == MINT_A).ok_or("no entry")?;
-        assert_eq!(entered.cost_usd, cut + d("0.011"));
+        // An unpriced position of B's counts as if worth its cost, or its
+        // peak of 12 once one is stored, so A's entry is cut where the
+        // per-trade limit alone would not cut it.
+        for peak in [None, Some("12")] {
+            let db = connect("memecoin_held_risk").await?;
+            let [_, b, _] = pool_age_strategies(&db, &profile).await?;
+            store::open_trip(&db, &held("dark", MINT_D, b)).await?;
+            if let Some(peak) = peak {
+                assert!(store::set_peak_value(&db, "dark", d(peak)).await?);
+            }
+            let equity = d("240"); // the stake less the unpriced cost
+            let open = config::open_risk(Some(&seeds()[1]), d("10"), None, peak.map(d), &costs)
+                .ok_or("overflow")?;
+            let cut = seeds()[0]
+                .total_risk_capped_size(d("25"), &costs, equity, open, 400)
+                .ok_or("no size")?;
+            assert!(cut < d("25"), "{peak:?}");
+            assert_eq!(
+                seeds()[0].risk_capped_size(d("25"), &costs, equity, 400),
+                Some(d("25"))
+            );
+            let mut task = PaperTask::new(profile.clone(), Arc::new(PaperHandle::new(true)));
+            assert_eq!(
+                task.tick(&db, &market, &mut no_failure).await?.entries,
+                1,
+                "{peak:?}"
+            );
+            let trips = store::load_trips(&db).await?;
+            let entered = trips.iter().find(|t| t.mint == MINT_A).ok_or("no entry")?;
+            assert_eq!(entered.cost_usd, cut + d("0.011"), "{peak:?}");
+        }
 
         // A priced position without a usable stop, opened by a version that
         // was never recorded or stuck, counts at least its cost: more than

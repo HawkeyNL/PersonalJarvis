@@ -433,9 +433,9 @@ pub fn loss_at_stop(
 /// Fails closed where that is unsure. Without a price (`None`; the equity
 /// counts it at zero, but the price can come back) it counts as if worth
 /// the higher of its cost and `peak_value_usd`, the highest value seen
-/// since entry, and with no peak either it cannot be counted (`None`).
-/// Without a usable stop (`stop` is `None`) it counts at least its whole
-/// cost plus the exit fees. `None` also when the numbers overflow.
+/// since entry; never priced since entry, as if worth its cost. Without a
+/// usable stop (`stop` is `None`) it counts at least its whole cost plus the
+/// exit fees. `None` when the numbers overflow.
 pub fn open_risk(
     stop: Option<&StrategyConfig>,
     cost_usd: Decimal,
@@ -444,7 +444,8 @@ pub fn open_risk(
     costs: &CostModel,
 ) -> Option<Decimal> {
     let at_stop = loss_at_stop(stop, cost_usd, costs)?;
-    let value = value_usd.or(peak_value_usd.map(|peak| peak.max(cost_usd)))?;
+    let value =
+        value_usd.unwrap_or_else(|| peak_value_usd.map_or(cost_usd, |peak| peak.max(cost_usd)));
     let risk = value
         .checked_sub(cost_usd)?
         .checked_add(at_stop)?
@@ -753,13 +754,13 @@ mod tests {
         assert_eq!(risk(None, Some("16")), Some(d("20.011")));
         assert_eq!(risk(None, Some("0")), Some(d("20.011")));
         // Without a price it counts as if worth its cost or its peak, if
-        // higher; with no peak it cannot be counted.
+        // higher; with no peak, its cost.
         assert_eq!(risk(Some(&a), None), Some(d("5.611")));
         assert_eq!(risk(None, None), Some(d("20.011")));
         let unpriced = |peak: Option<&str>| open_risk(Some(&a), d("20"), None, peak.map(d), &costs);
         assert_eq!(unpriced(Some("16")), Some(d("5.611")));
         assert_eq!(unpriced(Some("30")), Some(d("15.611")));
-        assert_eq!(unpriced(None), None);
+        assert_eq!(unpriced(None), Some(d("5.611")));
         // A price beats the peak.
         assert_eq!(
             open_risk(Some(&a), d("20"), Some(d("16")), Some(d("30")), &costs),
