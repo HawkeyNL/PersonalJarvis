@@ -420,7 +420,11 @@ cost a candidate, never let one through.
   book; with `agent` set, Claude's call budget (`agent`). The top-level `strategy_version` is **deprecated** and kept for
   older clients: it is the active version of the first strategy by id
   (normally `a-survivor-momentum`) and scopes nothing else in the response.
-- `GET /v1/trading/meme/candidates?limit=1..100` (default 50).
+- `GET /v1/trading/meme/candidates?limit=1..100&before=<cursor>` (default
+  50): filter decisions, newest first (`observed_at`, then record id). The
+  response carries `next_before` only when older rows exist; pass it as
+  `before` for the next page. The cursor is opaque, URL-safe and at most 128
+  bytes; a malformed one is a `400`.
 - `GET /v1/trading/meme/trades?limit=1..100`: closed paper trades.
 - `POST /v1/trading/meme/pause`: stops entries at once and persists the pause
   (security audit `memecoin.paper.pause`). Exits continue. A `503` means the

@@ -1531,13 +1531,37 @@ async fn memecoin_paper_routes_are_read_only_except_pause() -> Result<(), Box<dy
     assert_eq!(overview["paused"], false);
     assert!(overview.get("equity_usd").is_none());
     let candidates = json_body(call("GET", "/v1/trading/meme/candidates").await?).await;
-    assert_eq!(candidates["candidates"], json!([]));
+    assert_eq!(candidates, json!({ "candidates": [] }));
+    // Three rows, two with the same time: pages of two, then the rest.
+    audit_db
+        .query(
+            "CREATE memecoin_candidates SET id = 'c1', mint = $mint, observed_at = <datetime>'2026-11-01T00:00:00Z', strategy_version = 1;
+             CREATE memecoin_candidates SET id = 'c2', mint = $mint, observed_at = <datetime>'2026-11-01T00:00:00Z', strategy_version = 1;
+             CREATE memecoin_candidates SET id = 'c3', mint = $mint, observed_at = <datetime>'2026-11-02T00:00:00Z', strategy_version = 1;",
+        )
+        .bind(("mint", "So11111111111111111111111111111111111111112"))
+        .await?
+        .check()?;
+    let first = json_body(call("GET", "/v1/trading/meme/candidates?limit=2").await?).await;
+    assert_eq!(first["candidates"].as_array().map(Vec::len), Some(2));
+    let cursor = first["next_before"].as_str().ok_or("no next_before")?;
+    let next: &'static str = format!("/v1/trading/meme/candidates?limit=2&before={cursor}").leak();
+    let last = json_body(call("GET", next).await?).await;
+    assert_eq!(last["candidates"].as_array().map(Vec::len), Some(1));
+    assert_eq!(last["candidates"][0]["observed_at"], "2026-11-01T00:00:00Z");
+    assert!(last.get("next_before").is_none());
+    let oversized: &'static str =
+        format!("/v1/trading/meme/candidates?before=1.{}", "61".repeat(64)).leak();
     let trades = json_body(call("GET", "/v1/trading/meme/trades?limit=100").await?).await;
     assert_eq!(trades["trades"], json!([]));
     for bad in [
         "/v1/trading/meme/trades?limit=0",
         "/v1/trading/meme/candidates?limit=101",
         "/v1/trading/meme/candidates?limit=x",
+        "/v1/trading/meme/candidates?before=",
+        "/v1/trading/meme/candidates?before=x",
+        "/v1/trading/meme/candidates?before=1.zz",
+        oversized,
     ] {
         assert_eq!(
             call("GET", bad).await?.status(),

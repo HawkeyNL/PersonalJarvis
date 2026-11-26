@@ -93,6 +93,8 @@ pub struct Candidate {
 /// A stored candidate as listed back.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredCandidate {
+    /// The record key, the paging tie-breaker.
+    pub id: String,
     pub mint: String,
     pub observed_at: OffsetDateTime,
     pub strategy_version: u32,
@@ -277,6 +279,7 @@ pub async fn insert_candidate(db: &Database, candidate: &Candidate) -> Result<()
 
 #[derive(Deserialize)]
 struct CandidateRow {
+    id: String,
     mint: String,
     #[serde(with = "time::serde::rfc3339")]
     observed_at: OffsetDateTime,
@@ -286,18 +289,40 @@ struct CandidateRow {
     liquidity_usd: Option<String>,
 }
 
-/// Newest decisions first, at most [`MAX_LIST`].
-pub async fn recent_candidates(db: &Database, limit: usize) -> Result<Vec<StoredCandidate>> {
-    let rows: Vec<CandidateRow> = rows(
+/// Newest decisions first (`observed_at`, then id, descending), at most
+/// [`MAX_LIST`]; with `before`, only those strictly older than that
+/// `(observed_at, id)` position. The flag says whether older rows exist.
+pub async fn recent_candidates(
+    db: &Database,
+    limit: usize,
+    before: Option<(OffsetDateTime, &str)>,
+) -> Result<(Vec<StoredCandidate>, bool)> {
+    let limit = limit.min(MAX_LIST);
+    let (filter, bindings) = match before {
+        None => ("", json!({"limit": limit + 1})),
+        // `observed_at <= $at` alone is a range the observed_at index can serve.
+        Some((at, id)) => (
+            "WHERE observed_at <= <datetime>$at AND (observed_at < <datetime>$at OR record::id(id) < $id) ",
+            json!({"limit": limit + 1, "at": rfc3339(at)?, "id": id}),
+        ),
+    };
+    let mut rows: Vec<CandidateRow> = rows(
         db,
-        "SELECT mint, observed_at, strategy_version, reason, price_usd, liquidity_usd \
-         FROM memecoin_candidates ORDER BY observed_at DESC LIMIT $limit",
-        json!({"limit": limit.min(MAX_LIST)}),
+        &format!(
+            "SELECT record::id(id) AS id, mint, observed_at, strategy_version, reason, price_usd, \
+             liquidity_usd FROM memecoin_candidates {filter}ORDER BY observed_at DESC, id DESC \
+             LIMIT $limit"
+        ),
+        bindings,
     )
     .await?;
-    rows.into_iter()
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    let rows = rows
+        .into_iter()
         .map(|row| {
             Ok(StoredCandidate {
+                id: row.id,
                 mint: row.mint,
                 observed_at: row.observed_at,
                 strategy_version: row.strategy_version,
@@ -306,7 +331,8 @@ pub async fn recent_candidates(db: &Database, limit: usize) -> Result<Vec<Stored
                 liquidity_usd: optional_decimal(row.liquidity_usd.as_deref())?,
             })
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    Ok((rows, more))
 }
 
 /// Record `version` with its canonical parameter JSON, or confirm that it is
@@ -1744,7 +1770,8 @@ mod tests {
             )
             .await?;
         }
-        let listed = recent_candidates(&db, 10).await?;
+        let (listed, more) = recent_candidates(&db, 10, None).await?;
+        assert!(!more);
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].reason, None);
         assert_eq!(listed[1].reason.as_deref(), Some("lp_not_secured"));
@@ -1852,7 +1879,7 @@ mod tests {
         assert!(!control(&db).await?.paused);
 
         assert_eq!(prune(&db).await?, 2);
-        assert_eq!(recent_candidates(&db, 10).await?.len(), 1);
+        assert_eq!(recent_candidates(&db, 10, None).await?.0.len(), 1);
         // The ledger is never pruned.
         assert_eq!(load_trips(&db).await?.len(), 2);
         Ok(())
@@ -2365,6 +2392,64 @@ mod tests {
         let none = strategy_performance(&db, "missing").await?;
         assert_eq!((none.closed.trades, none.net_usd), (0, Decimal::ZERO));
         assert!(strategy_performance(&db, "Not An Id").await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn candidates_page_by_observed_at_then_id(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let db = Surreal::new::<Ws>(env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+        db.signin(Root {
+            username: &env::var("JARVIS_SURREAL_TEST_USER")?,
+            password: &env::var("JARVIS_SURREAL_TEST_PASS")?,
+        })
+        .await?;
+        db.use_ns(format!("memecoin_{}", uuid::Uuid::now_v7().simple()))
+            .use_db("core")
+            .await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+        let now = OffsetDateTime::now_utc();
+        let tie = now - Duration::minutes(1);
+        // "d", "c" and "b" share `observed_at`; a page boundary falls inside them.
+        for (id, at) in [
+            ("e", now),
+            ("b", tie),
+            ("d", tie),
+            ("c", tie),
+            ("a", now - Duration::minutes(2)),
+        ] {
+            insert_candidate(
+                &db,
+                &Candidate {
+                    id: id.into(),
+                    mint: MINT.into(),
+                    observed_at: at,
+                    strategy_version: 1,
+                    reason: None,
+                    price_usd: None,
+                    liquidity_usd: None,
+                },
+            )
+            .await?;
+        }
+        let ids = |rows: &[StoredCandidate]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+
+        let (all, more) = recent_candidates(&db, 5, None).await?;
+        assert_eq!(ids(&all), ["e", "d", "c", "b", "a"]);
+        assert!(!more);
+
+        let (first, more) = recent_candidates(&db, 2, None).await?;
+        assert_eq!(ids(&first), ["e", "d"]);
+        assert!(more);
+        let last = &first[1];
+        let (second, more) = recent_candidates(&db, 2, Some((last.observed_at, &last.id))).await?;
+        assert_eq!(ids(&second), ["c", "b"]);
+        assert!(more);
+        let last = &second[1];
+        let (third, more) = recent_candidates(&db, 2, Some((last.observed_at, &last.id))).await?;
+        assert_eq!(ids(&third), ["a"]);
+        assert!(!more);
         Ok(())
     }
 }
