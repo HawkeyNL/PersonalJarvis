@@ -1632,7 +1632,8 @@ fn risk_capped(
 /// What the open trips in `held` count against the total risk limit at
 /// `marks` (see [`config::open_risk`]), valued as the equity values them. A
 /// trip counts its stop only when its version is a typed one and it is not
-/// stuck; otherwise it has no usable stop. `None` on overflow.
+/// stuck; otherwise it has no usable stop. `None` when any of them cannot
+/// be counted (no price and no peak) or on overflow.
 fn open_risk_of(
     held: &[Trip],
     versions: &HashMap<u32, Version>,
@@ -1652,7 +1653,8 @@ fn open_risk_of(
             let value = marks
                 .get(&t.mint)
                 .and_then(|m| paper::sell_value(t.tokens, m.price_usd, m.liquidity_usd, costs));
-            sum.checked_add(config::open_risk(stop, t.cost_usd, value, costs)?)
+            let risk = config::open_risk(stop, t.cost_usd, value, t.peak_value_usd, costs)?;
+            sum.checked_add(risk)
         })
 }
 
@@ -3389,14 +3391,18 @@ mod tests {
             t
         };
 
-        // An unpriced position of B's counts its loss at stop as if it were
-        // still worth its cost, so A's entry is cut where the per-trade
-        // limit alone would not cut it.
+        // An unpriced position of B's with no peak cannot be counted: no
+        // entry. With a peak of 12 it counts as if worth that, so A's entry
+        // is cut where the per-trade limit alone would not cut it.
         let db = connect("memecoin_held_risk").await?;
         let [_, b, _] = pool_age_strategies(&db, &profile).await?;
         store::open_trip(&db, &held("dark", MINT_D, b)).await?;
+        let mut task = PaperTask::new(profile.clone(), Arc::new(PaperHandle::new(true)));
+        assert_eq!(task.tick(&db, &market, &mut no_failure).await?.entries, 0);
+        assert!(store::set_peak_value(&db, "dark", d("12")).await?);
         let equity = d("240"); // the stake less the unpriced cost
-        let open = config::loss_at_stop(Some(&seeds()[1]), d("10"), &costs).ok_or("overflow")?;
+        let open = config::open_risk(Some(&seeds()[1]), d("10"), None, Some(d("12")), &costs)
+            .ok_or("overflow")?;
         let cut = seeds()[0]
             .total_risk_capped_size(d("25"), &costs, equity, open, 400)
             .ok_or("no size")?;

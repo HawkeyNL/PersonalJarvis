@@ -430,21 +430,21 @@ pub fn loss_at_stop(
 /// value (`value_usd`, what selling it would return, as the paper equity
 /// counts it): from that value down to its [`loss_at_stop`], never below
 /// zero, so a gain above the cost counts and a loss already taken does not.
-/// Fails closed where that is unsure: without a price (`None`; the equity
-/// counts it at zero, but the price can come back) it counts its
-/// [`loss_at_stop`] as if it were still worth its cost, and without a usable
-/// stop (`stop` is `None`) at least its whole cost plus the exit fees.
-/// `None` when the numbers overflow.
+/// Fails closed where that is unsure. Without a price (`None`; the equity
+/// counts it at zero, but the price can come back) it counts as if worth
+/// the higher of its cost and `peak_value_usd`, the highest value seen
+/// since entry, and with no peak either it cannot be counted (`None`).
+/// Without a usable stop (`stop` is `None`) it counts at least its whole
+/// cost plus the exit fees. `None` also when the numbers overflow.
 pub fn open_risk(
     stop: Option<&StrategyConfig>,
     cost_usd: Decimal,
     value_usd: Option<Decimal>,
+    peak_value_usd: Option<Decimal>,
     costs: &CostModel,
 ) -> Option<Decimal> {
     let at_stop = loss_at_stop(stop, cost_usd, costs)?;
-    let Some(value) = value_usd else {
-        return Some(at_stop);
-    };
+    let value = value_usd.or(peak_value_usd.map(|peak| peak.max(cost_usd)))?;
     let risk = value
         .checked_sub(cost_usd)?
         .checked_add(at_stop)?
@@ -739,7 +739,9 @@ mod tests {
     fn open_risk_is_what_the_equity_can_still_lose() {
         let costs = costs(); // 0.011 USD per attempt
         let a = seeds()[0].clone(); // stop 20% + exit slippage 8%
-        let risk = |stop, value: Option<&str>| open_risk(stop, d("20"), value.map(d), &costs);
+        let risk = |stop, value: Option<&str>| {
+            open_risk(stop, d("20"), value.map(d), Some(d("0")), &costs)
+        };
         // Bought for 20, worth 20: 20 x 28% plus the exit fees.
         assert_eq!(risk(Some(&a), Some("20")), Some(d("5.611")));
         // A gain above the cost is at risk as well; a loss already counts.
@@ -750,9 +752,19 @@ mod tests {
         assert_eq!(risk(None, Some("30")), Some(d("30.011")));
         assert_eq!(risk(None, Some("16")), Some(d("20.011")));
         assert_eq!(risk(None, Some("0")), Some(d("20.011")));
-        // Without a price it counts as if still worth its cost.
+        // Without a price it counts as if worth its cost or its peak, if
+        // higher; with no peak it cannot be counted.
         assert_eq!(risk(Some(&a), None), Some(d("5.611")));
         assert_eq!(risk(None, None), Some(d("20.011")));
+        let unpriced = |peak: Option<&str>| open_risk(Some(&a), d("20"), None, peak.map(d), &costs);
+        assert_eq!(unpriced(Some("16")), Some(d("5.611")));
+        assert_eq!(unpriced(Some("30")), Some(d("15.611")));
+        assert_eq!(unpriced(None), None);
+        // A price beats the peak.
+        assert_eq!(
+            open_risk(Some(&a), d("20"), Some(d("16")), Some(d("30")), &costs),
+            Some(d("1.611"))
+        );
         // The loss of a new entry is the per-trade model.
         assert_eq!(loss_at_stop(Some(&a), d("20"), &costs), Some(d("5.611")));
         assert_eq!(loss_at_stop(None, d("20"), &costs), Some(d("20.011")));

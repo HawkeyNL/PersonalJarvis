@@ -207,9 +207,11 @@ stop and exit slippage of the version that opened it. So a gain above the
 cost is at risk as well, and a loss already in the equity is not counted
 twice. Where that is unsure, it fails closed:
 
-- A position without a price counts its loss at stop as if it were still
-  worth its cost. The equity counts it at zero, but the price can come
-  back.
+- A position without a price counts as if it were worth the higher of its
+  cost and its peak value (the highest executable value seen since entry,
+  stored with the trip). The equity counts it at zero, but the price can
+  come back. Without a stored peak it cannot be counted, so no entry is
+  made while it has no price.
 - A position without a usable stop counts its whole remaining value, at
   least its cost, plus the exit fees. That is one whose version has no
   typed config that fits the profile (a legacy version, one that no longer
