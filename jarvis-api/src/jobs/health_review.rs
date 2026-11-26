@@ -478,13 +478,14 @@ async fn audit_counts(
 
 /// The id part and the display name of a kind.
 fn kind_name(kind: Kind) -> (&'static str, &'static str) {
-    match kind {
-        Kind::DependencyReview => ("dependency_review", "Dependency review"),
-        Kind::Prompt => ("prompt", "Research job"),
-        Kind::Reminder => ("reminder", "Reminder"),
-        Kind::DiskCheck => ("disk_check", "Disk check"),
-        Kind::HealthReview => ("health_review", "Morning check"),
-    }
+    let id = match kind {
+        Kind::DependencyReview => "dependency_review",
+        Kind::Prompt => "prompt",
+        Kind::Reminder => "reminder",
+        Kind::DiskCheck => "disk_check",
+        Kind::HealthReview => "health_review",
+    };
+    (id, kind.display_name())
 }
 
 fn rfc3339(at: OffsetDateTime) -> Option<String> {
