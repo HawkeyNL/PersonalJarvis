@@ -88,6 +88,14 @@ expect_refused 'a failed probe' "$fx_rpc_a" 'https://api.mainnet-beta.solana.com
 grep -Fxq 'RPC A: ok' "$fixture/output"
 grep -Fxq 'RPC B: failed' "$fixture/output"
 
+# With nothing saved, "-" also means no Jupiter key.
+: > "$fixture/prompts"
+answers "$fx_rpc_a" "$fx_rpc_b" '-'
+set_market_data >> "$fixture/output" 2>&1
+[[ $(tail -n1 "$fixture/prompts") == 'Jupiter API key (optional, empty or - for none)|' ]]
+[[ $(<"$market_data_file") == "JARVIS_MARKET_SOLANA_RPC_A_URL=$fx_rpc_a
+JARVIS_MARKET_SOLANA_RPC_B_URL=$fx_rpc_b" ]]
+
 # Success: both probed with a read-only getSlot, the file staged and moved
 # into place with mode 0640, and the values never on curl's argv.
 answers "$fx_rpc_a" "$fx_rpc_b" "$fx_jupiter"
@@ -101,9 +109,6 @@ JARVIS_MARKET_JUPITER_API_KEY=$fx_jupiter" ]]
 [[ $(command stat -c '%a' "$market_data_file") == 640 ]]
 grep -Fq "url = \"$fx_rpc_a\"" "$fixture/curl.config"
 grep -Fq '"method\":\"getSlot\"' "$fixture/curl.config"
-if grep -Fq -e "$fx_rpc_a" -e "$fx_rpc_b" -e "$fx_jupiter" "$fixture/curl.argv"; then
-    echo 'market data leaked into curl argv' >&2; exit 1
-fi
 market_data_status > "$fixture/status"
 [[ $(grep -c ' set$' "$fixture/status") == 3 ]]
 
@@ -159,7 +164,7 @@ set_market_data >> "$fixture/output" 2>&1
 answers '' '' ''
 set_market_data >> "$fixture/output" 2>&1
 [[ $(wc -l < "$market_data_file") == 2 ]]
-[[ $(tail -n1 "$fixture/prompts") == 'Jupiter API key (optional, empty for none)|' ]]
+[[ $(tail -n1 "$fixture/prompts") == 'Jupiter API key (optional, empty or - for none)|' ]]
 market_data_status > "$fixture/status"
 grep -Eq '^JARVIS_MARKET_JUPITER_API_KEY +empty$' "$fixture/status"
 grep -Eq '^JARVIS_MARKET_SOLANA_RPC_A_URL +set$' "$fixture/status"
@@ -168,6 +173,33 @@ grep -Eq '^JARVIS_MARKET_SOLANA_RPC_A_URL +set$' "$fixture/status"
 if compgen -G "$fixture/credential-*" >/dev/null; then
     echo 'a probe left a temporary file behind' >&2; exit 1
 fi
+
+# Hand-edited file: the last duplicate wins, a missing final newline still
+# reads, and malformed, empty or leading-space lines are ignored.
+printf '%s\n' "JARVIS_MARKET_SOLANA_RPC_A_URL=$fx_rpc_c" "JARVIS_MARKET_SOLANA_RPC_A_URL=$fx_rpc_a" \
+    "JARVIS_MARKET_SOLANA_RPC_B_URL=" " JARVIS_MARKET_SOLANA_RPC_B_URL=$fx_rpc_c" 'not a line' '#x' > "$market_data_file"
+printf '%s' "JARVIS_MARKET_SOLANA_RPC_B_URL=$fx_rpc_b" >> "$market_data_file"
+chmod 0640 "$market_data_file"
+saved_a='' saved_b='' saved_jupiter=''
+market_data_load_saved
+[[ $saved_a == "$fx_rpc_a" && $saved_b == "$fx_rpc_b" && -z $saved_jupiter ]]
+# A CR line keeps a value that fails its check, so set fails closed.
+printf '%s\r\n%s\n' "JARVIS_MARKET_SOLANA_RPC_A_URL=$fx_rpc_a" "JARVIS_MARKET_SOLANA_RPC_B_URL=$fx_rpc_b" > "$market_data_file"
+cp "$market_data_file" "$fixture/before"
+answers '' '' ''
+if set_market_data >> "$fixture/output" 2>&1; then
+    echo 'a kept value with a CR was accepted' >&2; exit 1
+fi
+cmp -s "$market_data_file" "$fixture/before"
+# A wrong owner or group counts as nothing saved.
+for market_data_owner in "wrong-user:$(id -gn)" "$(id -un):wrong-group"; do
+    saved_a='' saved_b='' saved_jupiter=''
+    market_data_load_saved
+    [[ -z $saved_a$saved_b$saved_jupiter ]]
+done
+market_data_owner="$(id -un):$(id -gn)"
+unset saved_a saved_b saved_jupiter
+printf '%s\n' "JARVIS_MARKET_SOLANA_RPC_A_URL=$fx_rpc_b" "JARVIS_MARKET_SOLANA_RPC_B_URL=$fx_rpc_a" > "$market_data_file"
 
 # An unsafe or linked file counts as empty, nothing in it is kept, and a
 # link is never replaced.
@@ -199,7 +231,11 @@ if set_market_data >> "$fixture/output" 2>&1; then
 fi
 [[ -L $market_data_file ]]
 
-# No URL or key reaches the output or the status.
+# No URL or key, typed or kept, reaches curl's argv, the output or the
+# status.
+if grep -Fq -e "$fx_rpc_a" -e "$fx_rpc_b" -e "$fx_rpc_c" -e "$fx_jupiter" "$fixture/curl.argv"; then
+    echo 'market data leaked into curl argv' >&2; exit 1
+fi
 if grep -Fq -e "$fx_rpc_a" -e "$fx_rpc_b" -e "$fx_jupiter" -e fixture-helius-key -e fixture-alchemy-key \
     "$fixture/output" "$fixture/status"; then
     echo 'market data leaked into output' >&2; exit 1

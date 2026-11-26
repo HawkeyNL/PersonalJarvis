@@ -52,7 +52,7 @@ sudo jarvis logs core --lines 200          # "memecoin PAPER trader running"
   says `Enter keeps the saved value`: Enter on an empty prompt keeps that
   value, so you can change only RPC B. A kept URL is checked and probed
   like a typed one. For a saved Jupiter key, Enter keeps it and `-`
-  removes it; with no saved key, Enter means none. A linked file or one
+  removes it; with no saved key, Enter or `-` means none. A linked file or one
   with other owner or mode counts as nothing saved. The command does not
   restart Core.
   `status market-data` prints `set` or `empty` per key and never a value.

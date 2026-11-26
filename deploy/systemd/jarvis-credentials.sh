@@ -191,25 +191,32 @@ market_data_safe() {
 }
 
 # Fills the caller's saved_a, saved_b and saved_jupiter from a safe file;
-# an unsafe or linked file counts as nothing saved. Plain line reads only:
-# the file is never sourced and no value reaches argv or output.
+# an unsafe or linked file counts as nothing saved. The file is opened once
+# and read only when the open file is still the safe one at the path. Plain
+# line reads only: never sourced, and no value reaches argv or output.
 market_data_load_saved() {
-    local line
+    local line fd want
     market_data_safe || return 0
-    while IFS= read -r line || [[ -n $line ]]; do
-        case $line in
-            JARVIS_MARKET_SOLANA_RPC_A_URL=?*) saved_a=${line#*=} ;;
-            JARVIS_MARKET_SOLANA_RPC_B_URL=?*) saved_b=${line#*=} ;;
-            JARVIS_MARKET_JUPITER_API_KEY=?*) saved_jupiter=${line#*=} ;;
-        esac
-    done < "$market_data_file"
+    exec {fd}<"$market_data_file" || return 0
+    want="$(stat -c '%d:%i' "$market_data_file" 2>/dev/null):$market_data_owner:640"
+    if [[ -f /dev/fd/$fd && ! -L $market_data_file &&
+        $(stat -L -c '%d:%i:%U:%G:%a' "/dev/fd/$fd" 2>/dev/null) == "$want" ]]; then
+        while IFS= read -r -u "$fd" line || [[ -n $line ]]; do
+            case $line in
+                JARVIS_MARKET_SOLANA_RPC_A_URL=?*) saved_a=${line#*=} ;;
+                JARVIS_MARKET_SOLANA_RPC_B_URL=?*) saved_b=${line#*=} ;;
+                JARVIS_MARKET_JUPITER_API_KEY=?*) saved_jupiter=${line#*=} ;;
+            esac
+        done
+    fi
+    exec {fd}<&-
 }
 
 # Enter on an empty prompt keeps the saved value; a kept value is checked
 # and probed like a typed one. "-" removes a saved Jupiter key.
 set_market_data() (
     local rpc_a rpc_b jupiter host_a host_b tmp='' dir=${market_data_file%/*} failed=0
-    local saved_a='' saved_b='' saved_jupiter='' jupiter_label='Jupiter API key (optional, empty for none)'
+    local saved_a='' saved_b='' saved_jupiter='' jupiter_label='Jupiter API key (optional, empty or - for none)'
     require_tty
     trap 'rm -f -- "$tmp"; unset rpc_a rpc_b jupiter saved_a saved_b saved_jupiter' EXIT
     umask 077
