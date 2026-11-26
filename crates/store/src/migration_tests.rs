@@ -867,12 +867,9 @@ async fn account_migration_preserves_legacy_state_and_rejects_unknown_schema(
         .bind(("s", "é".repeat(2000)))
         .await?
         .check()?;
-    assert!(db
-        .query(summary)
-        .bind(("s", "a".repeat(2001)))
-        .await?
-        .check()
-        .is_err());
+    for bad in [String::new(), "a".repeat(2001)] {
+        assert!(db.query(summary).bind(("s", bad)).await?.check().is_err());
+    }
     for bad in [
         "UPDATE conversations:legacy SET summary_through = 'yesterday';",
         "UPDATE conversations:legacy SET summary_untrusted = 'yes';",

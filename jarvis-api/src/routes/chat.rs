@@ -1568,7 +1568,8 @@ pub(crate) async fn history_summary(
 /// Store a newer summary of this user's conversation. Writes only move
 /// forward: a summary through the same or an earlier message, or for a
 /// deleted conversation, changes nothing and returns `false`. Once untrusted,
-/// a conversation's summary stays untrusted.
+/// a conversation's summary stays untrusted. A concurrent write may fail with
+/// `Err`; the caller drops it and does not retry.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the summary worker in the next PR calls it")

@@ -8,7 +8,7 @@ BEGIN TRANSACTION;
 -- 0024 stay valid as they are. No index is defined or removed and no row is
 -- written (see `apply_baseline_schema`).
 
-DEFINE FIELD IF NOT EXISTS history_summary ON conversations TYPE option<string> ASSERT $value = NONE OR string::len($value) <= 2000;
+DEFINE FIELD IF NOT EXISTS history_summary ON conversations TYPE option<string> ASSERT $value = NONE OR (string::len($value) >= 1 AND string::len($value) <= 2000);
 -- The `created_at` of the newest message the summary covers.
 DEFINE FIELD IF NOT EXISTS summary_through ON conversations TYPE option<datetime>;
 -- True once any message the summary was made from was untrusted (web text,
