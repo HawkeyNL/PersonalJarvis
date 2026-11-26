@@ -418,7 +418,14 @@ pub(super) async fn execute_chat(
     let page = match &state.page_reader {
         Some(reader) if user_already_published && requested_mode != llm::RoutingMode::Research => {
             match crate::page_read::pick(&new_msg, &last_sources) {
-                Some(url) => Some(reader.read(&url, new_msg.chars().count()).await),
+                // The turn as sent: the owner's text plus any photo notes.
+                Some(url) => {
+                    let turn = chat
+                        .messages
+                        .last()
+                        .map_or(new_msg.as_str(), |turn| &turn.content);
+                    Some(reader.read(&url, turn).await)
+                }
                 None => None,
             }
         }

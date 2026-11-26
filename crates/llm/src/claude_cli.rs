@@ -9,7 +9,7 @@ use tokio::{io::AsyncReadExt, io::AsyncWriteExt, net::UnixStream};
 use crate::{
     claude_worker_protocol::{
         ClaudeWorkerReply, ClaudeWorkerRequest, ClaudeWorkerState, WorkerImage, WorkerTask,
-        MAX_REPLY_BYTES, SOCKET,
+        MAX_CHAT_PROMPT_BYTES, MAX_REPLY_BYTES, MAX_REQUEST_BYTES, MAX_SYSTEM_BYTES, SOCKET,
     },
     types::{
         ChatMessage, ChatReply, ChatRequest, LlmError, ResearchRequest, Role, Tier, Usage,
@@ -258,7 +258,7 @@ fn chat_worker_request(model: String, req: &ChatRequest) -> ClaudeWorkerRequest 
         protocol: 1,
         model,
         system: req.system.clone(),
-        prompt: build_bounded_prompt(&req.messages),
+        prompt: build_bounded_prompt(&req.messages, system_excess(req.system.as_deref())),
         research: false,
         task: None,
         images: req
@@ -268,6 +268,13 @@ fn chat_worker_request(model: String, req: &ChatRequest) -> ClaudeWorkerRequest 
             .map(|image| WorkerImage::jpeg(image.bytes()))
             .collect(),
     }
+}
+
+/// How far a system text runs past [`MAX_SYSTEM_BYTES`] on the wire.
+fn system_excess(system: Option<&str>) -> usize {
+    system.map_or(0, |system| {
+        wire_len(system).saturating_sub(MAX_SYSTEM_BYTES)
+    })
 }
 
 fn research_worker_request(model: String, req: &ResearchRequest) -> ClaudeWorkerRequest {
@@ -282,38 +289,155 @@ fn research_worker_request(model: String, req: &ResearchRequest) -> ClaudeWorker
     }
 }
 
-/// Include only the most recent eight turns, with an aggregate character cap.
-fn build_bounded_prompt(messages: &[ChatMessage]) -> String {
-    let mut selected = Vec::new();
-    let mut remaining = 24_000;
-    for message in messages.iter().rev().take(8) {
-        let content: String = message
-            .content
-            .chars()
-            .rev()
-            .take(remaining)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        remaining -= content.chars().count();
-        selected.push((message.role, content));
-        if remaining == 0 {
-            break;
+/// Most prompt bytes of a chat run, counted as escaped on the JSON wire: under
+/// the worker's chat prompt limit, and with a [`MAX_SYSTEM_BYTES`] system text
+/// still inside one request line. A system text longer than that on the wire
+/// takes its excess from the earlier turns' share.
+const MAX_PROMPT_BYTES: usize = 44 * 1024;
+/// Earlier turns always keep this much of the prompt: only past it is the
+/// newest turn (a long message or a page turn) cut.
+const MIN_HISTORY_BYTES: usize = 12 * 1024;
+/// Most turns in a prompt, the same as Core's context loader sends: the byte
+/// budget is the real limit.
+const MAX_PROMPT_MESSAGES: usize = 32;
+/// Room for the oldest omitted-turns note and the closing cue.
+const FRAME_BYTES: usize = 64;
+/// Room for one omitted-turns note between kept turns.
+const NOTE_BYTES: usize = 40;
+/// A plain earlier turn is cut to no less than this, or left out.
+const MIN_CUT_BYTES: usize = 512;
+/// The longest newest turn (in [`wire_len`] bytes) that is never cut, however
+/// long the earlier turns are.
+pub const MAX_WHOLE_TURN_BYTES: usize =
+    MAX_PROMPT_BYTES - FRAME_BYTES - MIN_HISTORY_BYTES - "Jarvis: ".len() - 2;
+const _: () = assert!(
+    MAX_PROMPT_BYTES <= MAX_CHAT_PROMPT_BYTES
+        && MAX_PROMPT_BYTES + MAX_SYSTEM_BYTES + 4 * 1024 <= MAX_REQUEST_BYTES
+);
+
+/// A character's length in a JSON string, as serde_json writes it.
+fn wire_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        '\0'..='\u{1f}' => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// The text's length inside a JSON string on the worker wire.
+pub fn wire_len(text: &str) -> usize {
+    text.chars().map(wire_char_len).sum()
+}
+
+/// The longest start of `text` whose [`wire_len`] is at most `max`.
+pub fn wire_prefix(text: &str, max: usize) -> &str {
+    let mut used = 0;
+    for (index, c) in text.char_indices() {
+        used += wire_char_len(c);
+        if used > max {
+            return &text[..index];
         }
     }
-    selected.reverse();
+    text
+}
+
+/// The longest end of `text` whose [`wire_len`] is at most `max`.
+fn wire_suffix(text: &str, max: usize) -> &str {
+    let mut used = 0;
+    for (index, c) in text.char_indices().rev() {
+        used += wire_char_len(c);
+        if used > max {
+            return &text[index + c.len_utf8()..];
+        }
+    }
+    text
+}
+
+/// A turn with web text in a `<web_result>` fence, or one that names the
+/// tag: never cut, so the fence keeps its "untrusted" opening.
+fn fenced(message: &ChatMessage) -> bool {
+    message.content.contains("<web_result>")
+}
+
+/// The newest turns within [`MAX_PROMPT_BYTES`]. The newest turn keeps its
+/// end and leaves [`MIN_HISTORY_BYTES`] (less `system_excess`) to earlier
+/// turns. Walking back from the newest, an earlier turn that fits is kept
+/// whole. One that does not fit is, when fenced, left out and the walk goes
+/// on; when plain, cut to its end in half the room left, so older turns keep
+/// the other half. The walk stops when that half is under [`MIN_CUT_BYTES`].
+/// Each run of left-out turns becomes one note in its place:
+/// `[N earlier message(s) not shown]`.
+fn build_bounded_prompt(messages: &[ChatMessage], system_excess: usize) -> String {
+    let label = |role| match role {
+        Role::User => "User: ",
+        Role::Assistant => "Jarvis: ",
+    };
+    // Label, text and the escaped newline.
+    let cost = |role, text: &str| label(role).len() + wire_len(text) + 2;
+    let Some((newest, earlier)) = messages.split_last() else {
+        return "Jarvis:".into();
+    };
+    let share = MIN_HISTORY_BYTES - system_excess.min(MIN_HISTORY_BYTES);
+    let considered = earlier.len().min(MAX_PROMPT_MESSAGES - 1);
+    let history: usize = earlier[earlier.len() - considered..]
+        .iter()
+        .map(|message| cost(message.role, &message.content))
+        .sum();
+    let mut room = MAX_WHOLE_TURN_BYTES + "Jarvis: ".len() + 2 + share;
+    let newest_text = wire_suffix(
+        &newest.content,
+        room - history.min(share) - label(newest.role).len() - 2,
+    );
+    room -= cost(newest.role, newest_text);
+
+    // The earlier turns' text, newest first; `None` where one is left out.
+    let mut kept: Vec<Option<&str>> = Vec::new();
+    for message in earlier.iter().rev().take(considered) {
+        let text = if cost(message.role, &message.content) <= room {
+            Some(message.content.as_str())
+        } else if fenced(message) {
+            if room < NOTE_BYTES {
+                break;
+            }
+            None
+        } else {
+            let half = (room / 2).saturating_sub(label(message.role).len() + 2);
+            if half < MIN_CUT_BYTES {
+                break;
+            }
+            Some(wire_suffix(&message.content, half))
+        };
+        room -= text.map_or(NOTE_BYTES, |text| cost(message.role, text));
+        kept.push(text);
+    }
+
     let mut prompt = String::new();
-    for (role, content) in selected {
-        prompt.push_str(match role {
-            Role::User => "User: ",
-            Role::Assistant => "Jarvis: ",
-        });
-        prompt.push_str(&content);
+    let mut gap = earlier.len() - kept.len();
+    let shown = earlier[gap..].iter().zip(kept.into_iter().rev());
+    for (message, text) in shown {
+        let Some(text) = text else {
+            gap += 1;
+            continue;
+        };
+        push_note(&mut prompt, &mut gap);
+        prompt.push_str(label(message.role));
+        prompt.push_str(text);
         prompt.push('\n');
     }
-    prompt.push_str("Jarvis:");
+    push_note(&mut prompt, &mut gap);
+    prompt.push_str(label(newest.role));
+    prompt.push_str(newest_text);
+    prompt.push_str("\nJarvis:");
     prompt
+}
+
+/// The note for `gap` left-out turns, if any, and a new count.
+fn push_note(prompt: &mut String, gap: &mut usize) {
+    if *gap > 0 {
+        let plural = if *gap == 1 { "" } else { "s" };
+        prompt.push_str(&format!("[{gap} earlier message{plural} not shown]\n"));
+        *gap = 0;
+    }
 }
 
 #[cfg(test)]
@@ -321,16 +445,226 @@ mod tests {
     use super::*;
     use crate::claude_worker_protocol::MAX_IMAGE_BYTES;
 
+    fn turns(count: usize, text: &str) -> Vec<ChatMessage> {
+        (0..count)
+            .map(|number| {
+                if number % 2 == 0 {
+                    ChatMessage::user(format!("{text} {number}"))
+                } else {
+                    ChatMessage::assistant(format!("{text} {number}"))
+                }
+            })
+            .collect()
+    }
+
     #[test]
-    fn context_compiler_is_bounded_and_recent() {
-        let mut messages = vec![ChatMessage::user("old private history")];
-        messages.extend((0..9).map(|number| ChatMessage::user(format!("recent {number}"))));
-        let prompt = build_bounded_prompt(&messages);
-        assert!(!prompt.contains("old private history"));
-        assert!(!prompt.contains("recent 0"));
-        assert!(prompt.contains("recent 8"));
-        let large = build_bounded_prompt(&[ChatMessage::user("x".repeat(100_000))]);
-        assert!(large.len() < 25_000);
+    fn wire_len_matches_serde_json() {
+        for c in (0..=0x7f_u8).map(char::from).chain(['é', '€', '😀']) {
+            let json = serde_json::to_string(&c.to_string()).unwrap();
+            assert_eq!(wire_len(&c.to_string()), json.len() - 2, "{c:?}");
+        }
+        assert_eq!(wire_prefix("a\"é\n", 3), "a\"");
+        assert_eq!(wire_prefix("a\"é\n", 4), "a\"");
+        assert_eq!(wire_prefix("a\"é\n", 5), "a\"é");
+        assert_eq!(wire_suffix("a\"é\n", 4), "é\n");
+    }
+
+    #[test]
+    fn twenty_short_turns_are_all_kept() {
+        let mut messages = turns(20, "turn");
+        messages.push(ChatMessage::user("newest"));
+        let prompt = build_bounded_prompt(&messages, 0);
+        assert!(
+            prompt.starts_with("User: turn 0\nJarvis: turn 1\n"),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("Jarvis: turn 19\nUser: newest\nJarvis:"));
+        assert!(!prompt.contains("not shown"));
+    }
+
+    #[test]
+    fn dropped_turns_are_noted_and_the_message_cap_holds() {
+        let mut messages = turns(40, "turn");
+        messages.push(ChatMessage::user("newest"));
+        let prompt = build_bounded_prompt(&messages, 0);
+        assert!(prompt.starts_with("[9 earlier messages not shown]\nJarvis: turn 9\n"));
+        assert_eq!(prompt.lines().count(), 1 + MAX_PROMPT_MESSAGES + 1);
+        // Two fenced 30 KB rows: the older one does not fit and is left out.
+        let fenced = ChatMessage::assistant(format!("<web_result>{}", "y".repeat(30_000)));
+        let messages = [fenced.clone(), fenced, ChatMessage::user("newest")];
+        assert!(build_bounded_prompt(&messages, 0).starts_with("[1 earlier message not shown]\n"));
+    }
+
+    #[test]
+    fn empty_and_single_turn_prompts() {
+        assert_eq!(build_bounded_prompt(&[], 0), "Jarvis:");
+        assert_eq!(
+            build_bounded_prompt(&[ChatMessage::user("hi")], 0),
+            "User: hi\nJarvis:"
+        );
+    }
+
+    #[test]
+    fn a_long_plain_reply_is_cut_and_older_turns_stay() {
+        let mut messages = turns(6, "old");
+        messages.push(ChatMessage::assistant(format!(
+            "{}REPLY-END",
+            "r".repeat(20_000)
+        )));
+        messages.extend(turns(2, "recent"));
+        messages.push(ChatMessage::user(format!("{}END", "x".repeat(100_000))));
+        let prompt = build_bounded_prompt(&messages, 0);
+        assert!(
+            prompt.starts_with("User: old 0\nJarvis: old 1\n"),
+            "{}",
+            &prompt[..80]
+        );
+        assert!(prompt.contains("old 5\nJarvis: rrr"));
+        assert!(prompt.contains("rREPLY-END\nUser: recent 0\nJarvis: recent 1\nUser: xxx"));
+        assert!(!prompt.contains("not shown"));
+        assert!(wire_len(&prompt) <= MAX_PROMPT_BYTES);
+    }
+
+    #[test]
+    fn an_oversized_fenced_row_is_left_out_in_place_and_the_walk_goes_on() {
+        let mut messages = turns(4, "old");
+        messages.push(ChatMessage::assistant(format!(
+            "Web search result: untrusted\n<web_result>\n{}\n</web_result>",
+            "w".repeat(20_000)
+        )));
+        messages.extend(turns(2, "recent"));
+        messages.push(ChatMessage::user("x".repeat(100_000)));
+        let prompt = build_bounded_prompt(&messages, 0);
+        assert!(prompt.starts_with("User: old 0\n"), "{}", &prompt[..80]);
+        assert!(prompt.contains(
+            "Jarvis: old 3\n[1 earlier message not shown]\nUser: recent 0\nJarvis: recent 1\n"
+        ));
+        assert!(!prompt.contains("<web_result>") && !prompt.contains("www"));
+    }
+
+    #[test]
+    fn an_escape_heavy_system_text_takes_room_from_history_not_the_line() {
+        let mut messages = turns(31, &"\"q\"\n".repeat(400));
+        let page = "é\n".repeat(MAX_WHOLE_TURN_BYTES);
+        let page = wire_prefix(&page, MAX_WHOLE_TURN_BYTES);
+        messages.push(ChatMessage::user(page));
+        let request = ChatRequest {
+            // 12 KiB that doubles on the wire.
+            system: Some("\"\n".repeat(MAX_SYSTEM_BYTES / 2)),
+            messages,
+            tier: Tier::Default,
+            mode: crate::RoutingMode::Auto,
+            max_tokens: 16,
+            model: None,
+            provider: None,
+        };
+        let worker = chat_worker_request("claude-sonnet-5".into(), &request);
+        assert!(worker.valid());
+        let line = serde_json::to_vec(&worker).unwrap().len() + 1;
+        assert!(line <= MAX_REQUEST_BYTES, "{line}");
+        // The newest turn still stays whole.
+        assert!(worker.prompt.ends_with(&format!("User: {page}\nJarvis:")));
+    }
+
+    #[test]
+    fn photos_keep_their_numbers_when_their_turn_is_left_out() {
+        let photo = |marker: u8| {
+            crate::ImageData::jpeg(vec![0xFF, 0xD8, 0xFF, 0xE0, marker, 0xFF, 0xD9]).unwrap()
+        };
+        let mut messages = vec![ChatMessage {
+            images: vec![photo(1)],
+            ..ChatMessage::user("[photo 1]\nold photo")
+        }];
+        messages.extend(turns(40, "turn"));
+        messages.push(ChatMessage {
+            images: vec![photo(2)],
+            ..ChatMessage::user("[photo 2]\nnew photo")
+        });
+        let request = ChatRequest {
+            system: None,
+            messages,
+            tier: Tier::Default,
+            mode: crate::RoutingMode::Auto,
+            max_tokens: 16,
+            model: None,
+            provider: None,
+        };
+        let worker = chat_worker_request("claude-sonnet-5".into(), &request);
+        assert!(!worker.prompt.contains("[photo 1]"));
+        assert!(worker
+            .prompt
+            .ends_with("User: [photo 2]\nnew photo\nJarvis:"));
+        // The worker labels the Nth image `[photo N]`: Core's numbers, which
+        // `[[photo:N]]` resolves, so every photo goes along in order.
+        let decoded: Vec<_> = worker.images.iter().map(|i| i.decoded().unwrap()).collect();
+        assert_eq!(decoded, [1, 2].map(|marker| photo(marker).bytes().to_vec()));
+    }
+
+    #[test]
+    fn a_huge_newest_turn_leaves_room_for_history() {
+        let mut messages = turns(200, &"h".repeat(500));
+        messages.push(ChatMessage::user(format!("{}END", "x".repeat(100_000))));
+        let prompt = build_bounded_prompt(&messages, 0);
+        assert!(prompt.starts_with('['), "{}", &prompt[..80]);
+        assert!(prompt.contains(" earlier messages not shown]\n"));
+        assert!(prompt.ends_with("xxEND\nJarvis:"));
+        let newest = prompt.rfind("User: x").unwrap();
+        let history = &prompt[prompt.find('\n').unwrap() + 1..newest];
+        assert!(
+            wire_len(history) >= MIN_HISTORY_BYTES - 600,
+            "{}",
+            history.len()
+        );
+        assert!(wire_len(&prompt) <= MAX_PROMPT_BYTES);
+        // Turns that fit are whole; the next is not cut to a scrap.
+        assert!(history
+            .lines()
+            .all(|line| line.starts_with("User: h") || line.starts_with("Jarvis: h")));
+    }
+
+    #[test]
+    fn multibyte_and_escaped_text_never_exceeds_the_byte_budget() {
+        for text in ["é€😀", "\"\\\n", "\u{1}"] {
+            let mut messages = turns(64, &text.repeat(700));
+            messages.push(ChatMessage::user(text.repeat(40_000)));
+            let prompt = build_bounded_prompt(&messages, 0);
+            assert!(wire_len(&prompt) <= MAX_PROMPT_BYTES, "{text:?}");
+            let json = serde_json::to_string(&prompt).unwrap();
+            assert!(json.len() - 2 <= MAX_PROMPT_BYTES);
+        }
+    }
+
+    #[test]
+    fn a_page_turn_is_kept_whole_beside_history() {
+        let mut messages = turns(31, &"\"q\"\n".repeat(400));
+        let page = format!("<web_result>{}?", "é\n".repeat(MAX_WHOLE_TURN_BYTES));
+        let page = wire_prefix(&page, MAX_WHOLE_TURN_BYTES);
+        messages.push(ChatMessage::user(page));
+        let prompt = build_bounded_prompt(&messages, 0);
+        assert!(prompt.contains(&format!("User: {page}\nJarvis:")));
+        let newest = prompt.rfind("User: <web_result>").unwrap();
+        assert!(wire_len(&prompt[..newest]) >= MIN_HISTORY_BYTES - 1700);
+        assert!(prompt.contains(" earlier messages not shown]\n"));
+    }
+
+    #[test]
+    fn the_worst_case_chat_request_is_valid_and_fits_one_line() {
+        let mut messages = turns(31, &"\"\\\n€".repeat(2_000));
+        messages.push(ChatMessage::user("😀\"".repeat(30_000)));
+        let request = ChatRequest {
+            // Persona-like text: a newline and two quotes every 35 bytes.
+            system: Some("A \"line\" of persona text, roughly.\n".repeat(MAX_SYSTEM_BYTES / 35)),
+            messages,
+            tier: Tier::Default,
+            mode: crate::RoutingMode::Auto,
+            max_tokens: 16,
+            model: None,
+            provider: None,
+        };
+        let worker = chat_worker_request("claude-sonnet-5".into(), &request);
+        assert!(worker.valid());
+        let line = serde_json::to_vec(&worker).unwrap().len() + 1;
+        assert!(line <= worker.max_line_bytes(), "{line}");
     }
 
     #[test]
@@ -385,7 +719,7 @@ mod tests {
             decoded,
             [1, 2, 3].map(|marker| photo(marker).bytes().to_vec())
         );
-        assert_eq!(worker.prompt, build_bounded_prompt(&request.messages));
+        assert_eq!(worker.prompt, build_bounded_prompt(&request.messages, 0));
 
         // Without photos the wire shape is exactly the old one.
         let text = ChatRequest {
