@@ -47,8 +47,9 @@ pub fn run(command: MemecoinCommand) -> Result<()> {
 }
 
 /// The owner's default: $100 paper stake, at most 5 positions of $20, pump.fun
-/// discovery, strict filters, at most 10% risk per trade, and Claude deciding
-/// entries and exits and proposing strategy versions within the code bounds.
+/// discovery, strict filters, at most 10% risk per trade and 30% over all
+/// open positions, and Claude deciding entries and exits and proposing
+/// strategy versions within the code bounds.
 /// The watchlist mints were checked on chain (SPL Token mints): BONK, WIF and
 /// POPCAT.
 fn default_profile() -> serde_json::Value {
@@ -64,6 +65,7 @@ fn default_profile() -> serde_json::Value {
         "max_position_usd": "20",
         "max_open_positions": 5,
         "max_risk_per_trade_bps": 1000,
+        "max_total_risk_bps": 3000,
         "filter": {
             "min_liquidity_usd": "50000",
             "min_pool_age_secs": 3600,
@@ -152,6 +154,7 @@ mod tests {
         assert_eq!(profile.max_position_usd, "20".parse().unwrap());
         assert_eq!(profile.max_open_positions, 5);
         assert_eq!(profile.max_risk_per_trade_bps, 1_000);
+        assert_eq!(profile.max_total_risk_bps, 3_000);
         assert_eq!(profile.rules.min_liquidity_usd, "50000".parse().unwrap());
         assert_eq!(profile.rules.min_pool_age.whole_seconds(), 3_600);
         assert_eq!(profile.rules.max_top_holders_share, "0.3".parse().unwrap());

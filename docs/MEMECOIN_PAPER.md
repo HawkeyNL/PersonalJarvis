@@ -35,8 +35,9 @@ sudo jarvis logs core --lines 200          # "memecoin PAPER trader running"
   paper stake, at most 5 positions of $20, pump.fun discovery on, BONK, WIF
   and POPCAT on the watchlist, strict filters (at least $50 000 liquidity, a
   pool at least 1 hour old, top holders at most 30%, sell impact at most 2%,
-  only the metadata Token-2022 extensions), at most 10% risk per trade, and
-  `agent` with the code-cap call budget and new strategies enabled. Edit the
+  only the metadata Token-2022 extensions), at most 10% risk per trade and
+  30% over all open positions, and `agent` with the code-cap call budget
+  and new strategies enabled. Edit the
   file afterwards as root if you want other values. Core reads it at its
   next start.
 - `jarvis-credentials set market-data` reads the two RPC URLs and the
@@ -87,6 +88,10 @@ ships no values.
 - `max_risk_per_trade_bps` (optional, 1–1000, default 1000): the most one
   trade may lose at its stop, as a share of the paper equity (below). The
   code caps it at 10%; a higher value is refused.
+- `max_total_risk_bps` (optional, 1–3000, default 3000): the most all open
+  positions together may lose at their stops, as a share of the paper
+  equity (below). The code caps it at 30%; a higher value, or one below
+  `max_risk_per_trade_bps`, is refused.
 - `filter`: `min_liquidity_usd`, `min_pool_age_secs`, `max_top_holders_share`
   (fraction), `max_sell_impact_bps`, `allowed_extensions` (snake_case
   Token-2022 extension names), `max_snapshot_age_secs`,
@@ -135,7 +140,7 @@ order:
   daily ones before, at most 2000 points, ending with the snapshot an entry
   would fill at.
 - The entry size is the version's share of `max_position_usd`, capped by its
-  share of pool liquidity, then cut to the risk limit (below).
+  share of pool liquidity, then cut to the risk limits (below).
 - Limits: the profile's `max_open_positions` and one position per mint
   across all strategies; per strategy an equal share of `max_open_positions`
   among the enabled strategies (at least one), its `max_entries_per_day` per
@@ -164,7 +169,7 @@ parent and family as their row. Trades, net result
 drawdown per strategy, over all its versions, are shown per strategy (API
 below).
 
-## Risk per trade
+## Risk limits
 
 Every paper entry, by a strategy's own signal or by Claude, is cut in code so
 that the trade risks at most `max_risk_per_trade_bps` (at most 10%) of the
@@ -183,8 +188,33 @@ the entry is not made, and Claude's entry is recorded as `skip` with reason
 `size_bps` it asked for; the trade's cost shows the size it got. The limit
 counts the planned stop: a price gap past the stop between two ticks (60 s)
 can still lose more, as it can in real trading, and the fees of failed entry
-or exit attempts come on top. Backtests size entries without this limit, so
-their results can differ from the paper book's.
+or exit attempts come on top. Backtests size entries without these limits,
+so their results can differ from the paper book's.
+
+On top of that, all open positions together, the new entry included, risk
+at most `max_total_risk_bps` (at most 30%) of the same paper equity. An
+entry is cut to `min(per-trade limit, total limit - open risk)`, in the same
+way; when nothing fits it is not made, and Claude's entry is recorded as
+`skip` with reason `total_risk_limit`. The open risk is the sum, over the
+open positions, of what each can still take off the equity, from the value
+the equity counts it at down to its stop:
+
+    max(0, value - cost + (cost × min(stop_loss_bps + exit_slippage_bps, 100%) + exit fees))
+
+with the value what selling it would return at the tick's price and the
+stop and exit slippage of the version that opened it. So a gain above the
+cost is at risk as well, and a loss already in the equity is not counted
+twice. A position whose version has no typed config that fits the profile
+(a legacy version, one that no longer fits, or one without usable rules),
+or that is stuck, counts its whole remaining value plus the exit fees. A
+position without a price counts as already lost in the equity, so as
+nothing more at risk. A position already below its stop (its exit failed)
+counts only what is left of its planned loss, down to nothing; like a price
+gap, it can still lose more. Each
+entry made during a tick adds its risk at entry (the per-trade formula
+above) for the rest of that tick; an exit Claude makes frees its risk from
+the next tick. When the equity or the open risk cannot be counted (the
+ledger does not replay, or the numbers overflow) no entry is made.
 
 ## Claude decisions
 
@@ -215,10 +245,11 @@ whatever Claude does or whether it answers at all.
   the strategy's open, daily and cooldown limits, and the hard filter. Its
   size is `size_bps` of what the strategy would enter (its share of
   `max_position_usd`, capped by its liquidity share), within the free paper
-  stake and cut to the risk limit (above). The seed strategies enter their
+  stake and cut to the risk limits (above). The seed strategies enter their
   full `max_position_usd`, so Claude chooses any size up to it; a version
   Claude proposes can lower its `position_share_bps`. A refused action is recorded as `skip` with the reason (for example
-  `strategy_limit`, `no_slot`, `risk_limit`, `liquidity_too_low`). Exits sell at the tick's
+  `strategy_limit`, `no_slot`, `risk_limit`, `total_risk_limit`,
+  `liquidity_too_low`). Exits sell at the tick's
   price with exit reason `agent_exit`.
 - **Recorded.** Every call starts with a `skip` row with reason
   `call_started`, written before the call is made; if it cannot be written,

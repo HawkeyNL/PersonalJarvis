@@ -337,13 +337,10 @@ impl StrategyConfig {
     /// cents. `None` when nothing is left, the equity is gone or the numbers
     /// overflow.
     ///
-    /// Risk is what the trade loses when its stop is hit: the stop loss plus
-    /// the exit slippage allowance on its cost (size and entry fees; the
-    /// stop already measures the pool fee and price impact), plus the exit
-    /// fees. Without a stop distance the whole cost counts. A price gap past
-    /// the stop between two observations can still lose more, and so can
-    /// the fees of failed attempts (at most one per tick, until the
-    /// position is stuck), which are not counted here.
+    /// Risk is [`loss_at_stop`] of the trade's cost (size and entry fees).
+    /// A price gap past the stop between two observations can still lose
+    /// more, and so can the fees of failed attempts (at most one per tick,
+    /// until the position is stuck), which are not counted here.
     pub fn risk_capped_size(
         &self,
         size: Decimal,
@@ -351,17 +348,42 @@ impl StrategyConfig {
         equity_usd: Decimal,
         max_risk_bps: u32,
     ) -> Option<Decimal> {
-        let bps = Decimal::from(10_000);
-        let loss_bps = match self.stop_loss_bps {
-            0 => 10_000,
-            stop => stop.saturating_add(self.exit_slippage_bps).min(10_000),
-        };
-        let loss = Decimal::from(loss_bps) / bps;
-        let fees = costs.network_fee_usd.checked_add(costs.priority_fee_usd)?;
         let max_risk_bps = max_risk_bps.min(bounds::RISK_PER_TRADE_BPS.1);
-        let cap = equity_usd.checked_mul(Decimal::from(max_risk_bps))? / bps;
-        // (size + fees) x loss + fees <= cap
-        let max_size = cap
+        let cap = equity_usd.checked_mul(Decimal::from(max_risk_bps))? / BPS;
+        self.size_within(size, costs, cap)
+    }
+
+    /// `size` cut so that the open positions, which already risk
+    /// `open_risk_usd` (the sum of their [`open_risk`]), and this trade
+    /// together risk at most `max_total_risk_bps` (never above
+    /// [`bounds::TOTAL_RISK_BPS`]) of `equity_usd`, rounded down to cents.
+    /// The trade's risk is as in [`Self::risk_capped_size`]. `None` when
+    /// nothing fits or the numbers overflow.
+    pub fn total_risk_capped_size(
+        &self,
+        size: Decimal,
+        costs: &CostModel,
+        equity_usd: Decimal,
+        open_risk_usd: Decimal,
+        max_total_risk_bps: u32,
+    ) -> Option<Decimal> {
+        let max_total_risk_bps = max_total_risk_bps.min(bounds::TOTAL_RISK_BPS.1);
+        let cap = equity_usd.checked_mul(Decimal::from(max_total_risk_bps))? / BPS;
+        self.size_within(size, costs, cap.checked_sub(open_risk_usd)?)
+    }
+
+    /// The largest `size` up to the given one, in cents, whose
+    /// [`loss_at_stop`] stays within `budget_usd`.
+    fn size_within(
+        &self,
+        size: Decimal,
+        costs: &CostModel,
+        budget_usd: Decimal,
+    ) -> Option<Decimal> {
+        let loss = loss_share(Some(self));
+        let fees = attempt_fees(costs)?;
+        // loss_at_stop(size + fees) = (size + fees) x loss + fees <= budget
+        let max_size = budget_usd
             .checked_sub(fees.checked_mul(Decimal::ONE + loss)?)?
             .checked_div(loss)?;
         let size = size
@@ -369,6 +391,60 @@ impl StrategyConfig {
             .round_dp_with_strategy(2, RoundingStrategy::ToZero);
         (size > Decimal::ZERO).then_some(size)
     }
+}
+
+const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
+
+/// The share of its cost a position loses when its stop is hit: the stop
+/// loss plus the exit slippage allowance, at most all of it. `None` (no
+/// usable stop) or a zero stop: all of it.
+fn loss_share(stop: Option<&StrategyConfig>) -> Decimal {
+    let loss_bps = match stop {
+        Some(c) if c.stop_loss_bps > 0 => c.stop_loss_bps.saturating_add(c.exit_slippage_bps),
+        _ => 10_000,
+    };
+    Decimal::from(loss_bps.min(10_000)) / BPS
+}
+
+/// Network and priority fee of one attempt.
+fn attempt_fees(costs: &CostModel) -> Option<Decimal> {
+    costs.network_fee_usd.checked_add(costs.priority_fee_usd)
+}
+
+/// What a position that cost `cost_usd` (size and entry fees) loses when the
+/// stop of `stop` is hit: the stop loss plus the exit slippage allowance on
+/// its cost (the stop already measures the pool fee and price impact), plus
+/// the exit fees. Without a usable stop the whole cost counts. `None` when
+/// the numbers overflow.
+pub fn loss_at_stop(
+    stop: Option<&StrategyConfig>,
+    cost_usd: Decimal,
+    costs: &CostModel,
+) -> Option<Decimal> {
+    cost_usd
+        .checked_mul(loss_share(stop))?
+        .checked_add(attempt_fees(costs)?)
+}
+
+/// What an open position can still take off the paper equity, which counts
+/// it at `value_usd` (what selling it would return): from that value down to
+/// its [`loss_at_stop`], never below zero. Without a usable stop that is its
+/// whole remaining value plus the exit fees. A position without a value
+/// (`None`: no price) already counts as lost, so nothing more is at risk.
+/// `None` when the numbers overflow.
+pub fn open_risk(
+    stop: Option<&StrategyConfig>,
+    cost_usd: Decimal,
+    value_usd: Option<Decimal>,
+    costs: &CostModel,
+) -> Option<Decimal> {
+    let Some(value) = value_usd else {
+        return Some(Decimal::ZERO);
+    };
+    let risk = value
+        .checked_sub(cost_usd)?
+        .checked_add(loss_at_stop(stop, cost_usd, costs)?)?;
+    Some(risk.max(Decimal::ZERO))
 }
 
 /// Seconds as a duration; values beyond `i64` saturate (and fail any bound).
@@ -648,6 +724,53 @@ mod tests {
         let tight = c.validate(&base).unwrap();
         assert_eq!(tight.max_sell_impact_bps, 1);
         assert_eq!(tight.min_pool_age, Duration::MAX);
+    }
+
+    #[test]
+    fn open_risk_is_what_the_equity_can_still_lose() {
+        let costs = costs(); // 0.011 USD per attempt
+        let a = seeds()[0].clone(); // stop 20% + exit slippage 8%
+        let risk = |stop, value: Option<&str>| open_risk(stop, d("20"), value.map(d), &costs);
+        // Bought for 20, worth 20: 20 x 28% plus the exit fees.
+        assert_eq!(risk(Some(&a), Some("20")), Some(d("5.611")));
+        // A gain above the cost is at risk as well; a loss already counts.
+        assert_eq!(risk(Some(&a), Some("30")), Some(d("15.611")));
+        assert_eq!(risk(Some(&a), Some("16")), Some(d("1.611")));
+        assert_eq!(risk(Some(&a), Some("10")), Some(d("0")));
+        // Without a stop the whole remaining value counts.
+        assert_eq!(risk(None, Some("16")), Some(d("16.011")));
+        // Without a price it already counts as lost: nothing more at risk.
+        assert_eq!(risk(Some(&a), None), Some(d("0")));
+        assert_eq!(risk(None, None), Some(d("0")));
+        // The loss of a new entry is the per-trade model.
+        assert_eq!(loss_at_stop(Some(&a), d("20"), &costs), Some(d("5.611")));
+        assert_eq!(loss_at_stop(None, d("20"), &costs), Some(d("20.011")));
+    }
+
+    #[test]
+    fn entries_fit_what_the_open_positions_leave_of_the_total_risk() {
+        let costs = costs(); // 0.011 USD per attempt
+        let a = seeds()[0].clone(); // stop 20% + exit slippage 8%
+        let capped =
+            |size, open, bps| a.total_risk_capped_size(d(size), &costs, d("100"), d(open), bps);
+        // 30% of 100 is 30; nothing open: unchanged.
+        assert_eq!(capped("20", "0", 3_000), Some(d("20")));
+        // 10 at risk leaves 20: (20 - 0.011 x 1.28) / 0.28 = 71.378.
+        assert_eq!(capped("100", "10", 3_000), Some(d("71.37")));
+        let left = loss_at_stop(Some(&a), d("71.37") + d("0.011"), &costs).unwrap();
+        assert!(left <= d("20"), "{left}");
+        // The share can only go down from the code cap of 30%.
+        assert_eq!(capped("100", "10", 5_000), Some(d("71.37")));
+        assert_eq!(capped("100", "10", 2_000), Some(d("35.66")));
+        // Full, over full, or only the fees left: no entry.
+        assert_eq!(capped("20", "30", 3_000), None);
+        assert_eq!(capped("20", "45", 3_000), None);
+        assert_eq!(capped("20", "29.99", 3_000), None);
+        // No equity: no entry.
+        assert_eq!(
+            a.total_risk_capped_size(d("20"), &costs, d("0"), d("0"), 3_000),
+            None
+        );
     }
 
     #[test]
