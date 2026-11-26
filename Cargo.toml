@@ -42,7 +42,7 @@ rust-version = "1.82"
 # async runtime + web
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.7", features = ["trace", "cors"] }
 
 # database
 # SurrealDB 2.6 is deliberately pinned to the server major/minor used by the
