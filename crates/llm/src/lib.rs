@@ -30,7 +30,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 pub use anthropic::AnthropicProvider;
-pub use claude_cli::ClaudeCliProvider;
+pub use claude_cli::{wire_len, wire_prefix, ClaudeCliProvider, MAX_WHOLE_TURN_BYTES};
 pub use codex_cli::CodexCliProvider;
 pub use fallback::FallbackProvider;
 pub use huggingface::{hf_routed_model, HuggingFaceProvider, HuggingFaceRoute};

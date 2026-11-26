@@ -9,6 +9,8 @@ pub const MAX_REPLY_BYTES: usize = 256 * 1024;
 /// Longest system text a worker accepts. Core keeps persona plus runtime
 /// facts within it, so the whole request stays under [`MAX_REQUEST_BYTES`].
 pub const MAX_SYSTEM_BYTES: usize = 12 * 1024;
+/// Longest ordinary chat prompt a worker accepts.
+pub const MAX_CHAT_PROMPT_BYTES: usize = 48 * 1024;
 /// Longest research prompt a worker accepts (the bounded question in UTF-8).
 pub const MAX_RESEARCH_PROMPT_BYTES: usize = 4 * crate::types::MAX_RESEARCH_QUESTION_CHARS;
 /// Longest task input: one JSON object of data.
@@ -163,7 +165,7 @@ impl ClaudeWorkerRequest {
         } else if self.task.is_some() {
             MAX_TASK_PROMPT_BYTES
         } else {
-            48 * 1024
+            MAX_CHAT_PROMPT_BYTES
         };
         self.protocol == 1
             && !self.prompt.trim().is_empty()

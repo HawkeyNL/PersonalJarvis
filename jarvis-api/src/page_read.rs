@@ -13,7 +13,10 @@ use std::ffi::CStr;
 use std::sync::Arc;
 
 use jarvis_llm::privacy::url_leaks_identifier;
-use jarvis_page_reader::{check_url, Page, PageReaderClient, Refusal, DEFAULT_SOCKET};
+use jarvis_llm::{wire_len, wire_prefix};
+use jarvis_page_reader::{
+    check_url, Page, PageReaderClient, Refusal, DEFAULT_SOCKET, MAX_URL_BYTES,
+};
 
 use crate::auto_research::RunCaps;
 use crate::routes::chat_context::{wrap_untrusted, MAX_SOURCES};
@@ -22,12 +25,15 @@ use crate::routes::chat_context::{wrap_untrusted, MAX_SOURCES};
 const READER_USER: &CStr = c"jarvis-reader";
 pub const PER_HOUR: usize = 20;
 pub const PER_DAY: usize = 100;
-/// Most page text the model gets.
+/// Most page text the model gets, in [`wire_len`] bytes.
 const MAX_PAGE_BYTES: usize = 24 * 1024;
-/// The subscription workers keep the last 24 000 characters of a turn's
-/// prompt: the page and the owner's question stay below this together, so
-/// neither the question nor the fence's opening is cut.
-const MAX_TURN_CHARS: usize = 22_000;
+/// The subscription workers keep a newest turn of this many [`wire_len`]
+/// bytes whole beside the earlier turns: the page, its fence and the owner's
+/// question stay below this together, so neither the question nor the
+/// fence's opening is cut.
+const MAX_TURN_BYTES: usize = jarvis_llm::MAX_WHOLE_TURN_BYTES;
+/// The fence's own text around the page and its URL.
+const FENCE_BYTES: usize = 512;
 /// Less room than this for the page is no page turn.
 const MIN_PAGE_BYTES: usize = 2 * 1024;
 /// The longest owner link that is looked at.
@@ -118,9 +124,9 @@ impl PageReader {
         )))
     }
 
-    /// Gate and read `url` for a turn whose owner text has `question_chars`
-    /// characters. Nothing is sent when a check refuses.
-    pub(crate) async fn read(&self, url: &str, question_chars: usize) -> PageOutcome {
+    /// Gate and read `url` for the owner's turn `question`. Nothing is sent
+    /// when a check refuses.
+    pub(crate) async fn read(&self, url: &str, question: &str) -> PageOutcome {
         let refused = |note: &str| PageOutcome::NotRead(note.to_string());
         let Ok(checked) = check_url(url, &self.deny_hosts) else {
             return refused(NOT_READ_URL);
@@ -128,11 +134,7 @@ impl PageReader {
         if url_leaks_identifier(checked.as_str()) {
             return refused(NOT_READ_URL);
         }
-        let Some(room) = MAX_TURN_CHARS
-            .saturating_sub(question_chars)
-            .checked_sub(512)
-            .filter(|room| *room >= MIN_PAGE_BYTES)
-        else {
+        let Some(room) = page_room(question) else {
             return refused(NOT_READ_LONG);
         };
         let Some(_slot) = self.caps.try_start() else {
@@ -149,14 +151,21 @@ impl PageReader {
     }
 }
 
+/// The page text room beside `question`, or `None` when too little is left.
+fn page_room(question: &str) -> Option<usize> {
+    MAX_TURN_BYTES
+        .checked_sub(wire_len(question) + MAX_URL_BYTES + FENCE_BYTES)
+        .filter(|room| *room >= MIN_PAGE_BYTES)
+}
+
 fn reader_note(refusal: Refusal) -> String {
     // Fixed texts: no URL, address or upstream detail.
     format!("Core did not read the owner's link: {refusal}.")
 }
 
-/// The page as model input, its text capped at `cap` bytes, or `None` when
-/// its final URL fails the check again (the reader is trusted, but not with
-/// what goes into the prompt).
+/// The page as model input, its text capped at `cap` [`wire_len`] bytes, or
+/// `None` when its final URL fails the check again (the reader is trusted,
+/// but not with what goes into the prompt).
 fn fence(page: &Page, cap: usize, deny_hosts: &[String]) -> Option<PageOutcome> {
     let url = check_url(&page.url, deny_hosts).ok()?.to_string();
     if url_leaks_identifier(&url) {
@@ -167,12 +176,14 @@ fn fence(page: &Page, cap: usize, deny_hosts: &[String]) -> Option<PageOutcome> 
     } else {
         format!("Title: {}\n\n{}", page.title, page.text)
     };
-    // `wrap_untrusted` caps the escaped text.
-    let cut = page.truncated || body.replace('<', "&lt;").len() > cap;
+    let escaped = body.replace('<', "&lt;");
+    let kept = wire_prefix(&escaped, cap);
+    let cut = page.truncated || kept.len() < escaped.len();
+    // Escaping again changes nothing: `kept` has no `<`.
     let mut block = wrap_untrusted(
         &format!("Web page {url}, read just now at the owner's request"),
-        &body,
-        cap,
+        kept,
+        kept.len(),
     );
     if cut {
         block.push_str("\n(The page text was cut off.)");
@@ -297,6 +308,21 @@ mod tests {
         assert!(fence_test(&page("https://nos.nl/?token=x", "x", false), 1000).is_none());
     }
 
+    #[test]
+    fn a_page_turn_stays_whole_in_the_worker_prompt() {
+        assert!(page_room("kort").unwrap() >= MAX_PAGE_BYTES);
+        let question = "Vat dit samen, \"graag\" 😀\n".repeat(400);
+        let room = page_room(&question).unwrap();
+        assert!(room < MAX_PAGE_BYTES);
+        let url = format!("https://nos.nl/{}", "nieuws/".repeat(290));
+        let text = "\"regel\"\n<b>é\u{1}".repeat(10_000);
+        let Some(outcome @ PageOutcome::Read { .. }) = fence_test(&page(&url, &text, true), room)
+        else {
+            panic!("not read");
+        };
+        assert!(wire_len(&outcome.add_to(&question)) <= MAX_TURN_BYTES);
+    }
+
     fn fence_test(page: &Page, cap: usize) -> Option<PageOutcome> {
         fence(page, cap, &["jarvis.example.net".to_string()])
     }
@@ -329,19 +355,23 @@ mod tests {
             "https://example.com/u/jan@example.nl",
             "https://example.com/?q=0612345678",
         ] {
-            assert_eq!(note(reader.read(url, 10).await), NOT_READ_URL, "{url}");
+            assert_eq!(note(reader.read(url, "kort").await), NOT_READ_URL, "{url}");
         }
         assert_eq!(
-            note(reader.read("https://example.com/", MAX_TURN_CHARS).await),
+            note(
+                reader
+                    .read("https://example.com/", &"x".repeat(MAX_TURN_BYTES))
+                    .await
+            ),
             NOT_READ_LONG
         );
         // Nothing above used up a run.
         for _ in 0..PER_HOUR {
-            let note = note(reader.read("https://example.com/", 10).await);
+            let note = note(reader.read("https://example.com/", "kort").await);
             assert_eq!(note, reader_note(Refusal::Unavailable));
         }
         assert_eq!(
-            note(reader.read("https://example.com/", 10).await),
+            note(reader.read("https://example.com/", "kort").await),
             NOT_READ_LIMIT
         );
         let added = PageOutcome::NotRead(NOT_READ_LIMIT.into()).add_to("Vraag");
