@@ -1574,6 +1574,9 @@ mod tests {
     fn composed_and_logged(persona: &str, facts: &Facts, headroom: usize) -> (String, Vec<String>) {
         let recorder = Recorder::default();
         let composed = tracing::subscriber::with_default(recorder.clone(), || {
+            // A parallel test may first hit these callsites while no recorder
+            // is alive, caching them as never enabled.
+            tracing::callsite::rebuild_interest_cache();
             compose(persona, facts, headroom)
         });
         let events = recorder.0.lock().unwrap().clone();
