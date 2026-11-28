@@ -530,7 +530,7 @@ pub(super) async fn execute_chat(
                 && user_already_published
                 && requested_mode != llm::RoutingMode::Research
                 && !page_turn;
-            let chat_search = markers.chat_search.is_some();
+            let chat_search = markers.any_chat_search;
             if !honoured && (markers.any_job || markers.any_roadmap || chat_search) {
                 let reason = if requested_mode == llm::RoutingMode::Research {
                     "research mode"
@@ -630,19 +630,28 @@ pub(super) async fn execute_chat(
                 // The owner asked for a job and no card follows: say so.
                 reply.text = format!("{}\n\n{JOB_REFUSED_REPLY}", reply.text.trim_end());
             }
-            // Only an ordinary runs-API answer searches earlier chats; its
-            // slot is taken now, so an empty reply says whether one follows.
+            // Only an ordinary runs-API answer without photos searches
+            // earlier chats; its slot is taken now, so the reply can say
+            // whether one follows.
             let recall = match &state.chat_search {
-                Some(caps) if honoured && chat_search => caps.try_start(),
+                Some(caps) if honoured && !image_turn && markers.chat_search.is_some() => {
+                    caps.try_start()
+                }
                 _ => None,
             };
-            if !page_turn && chat_search && reply.text.trim().is_empty() {
-                reply.text = if recall.is_some() {
-                    CHAT_SEARCH_REPLY
-                } else {
-                    CHAT_SEARCH_OFF_REPLY
+            if !page_turn && chat_search {
+                if reply.text.trim().is_empty() {
+                    reply.text = if requested_mode == llm::RoutingMode::Research {
+                        RESEARCH_EMPTY
+                    } else if recall.is_some() {
+                        CHAT_SEARCH_REPLY
+                    } else {
+                        CHAT_SEARCH_OFF_REPLY
+                    }
+                    .into();
+                } else if honoured && recall.is_none() {
+                    reply.text = format!("{}\n\n{CHAT_SEARCH_OFF_REPLY}", reply.text.trim_end());
                 }
-                .into();
             }
             // A web or page answer never shows a photo; a chat answer only
             // one of this run's photos.
@@ -714,11 +723,14 @@ pub(super) async fn execute_chat(
                 // Only a runs-API run (its user message was persisted first)
                 // may search by itself; the legacy endpoint never does. A
                 // turn with photos never leads to a web search.
-                let auto = if user_already_published && !image_turn && !page_turn {
-                    crate::auto_research::start(&state, research_advised, &new_msg).await
-                } else {
-                    None
-                };
+                // At most one follow-up: the chat search the answer asked
+                // for wins; a web search can still be offered.
+                let auto =
+                    if user_already_published && !image_turn && !page_turn && recall.is_none() {
+                        crate::auto_research::start(&state, research_advised, &new_msg).await
+                    } else {
+                        None
+                    };
                 let research_offer = if auto.is_some() || image_turn || page_turn {
                     None
                 } else {
@@ -755,7 +767,6 @@ pub(super) async fn execute_chat(
                         new_msg.clone(),
                     ));
                 } else if let (Some(slot), Some(terms)) = (recall, markers.chat_search) {
-                    // At most one follow-up: an automatic web search wins.
                     tokio::spawn(chat_search_run(
                         state.clone(),
                         slot,
@@ -955,6 +966,9 @@ const CHAT_SEARCH_REPLY: &str = "Let me look through your earlier chats.";
 const CHAT_SEARCH_OFF_REPLY: &str = "I can't search your earlier chats right now.";
 /// Stored when a chat search found nothing.
 const CHAT_SEARCH_NONE: &str = "I found nothing about that in your earlier chats.";
+/// Stored when the owner's turn left no room for the excerpts.
+const CHAT_SEARCH_NO_ROOM: &str = "Your message is too long to add what I found in your \
+earlier chats.";
 /// Stored when the answer from earlier chats was empty.
 const CHAT_SEARCH_EMPTY: &str = "I could not write an answer from your earlier chats.";
 
@@ -1348,8 +1362,8 @@ async fn chat_search_run(
             .publish(user, failed(RunFailure::PersistenceUnavailable));
         return;
     };
+    let note = crate::jobs::chat::NOTICE_MODEL;
     if hits.is_empty() {
-        let note = crate::jobs::chat::NOTICE_MODEL;
         finish_follow_up(&state, user, run, CHAT_SEARCH_NONE, note).await;
         return;
     }
@@ -1363,10 +1377,7 @@ async fn chat_search_run(
         fits
     });
     if !fits {
-        tracing::info!("chat search excerpts not added: no room in the turn");
-        state
-            .realtime
-            .publish(user, failed(RunFailure::ProviderUnavailable));
+        finish_follow_up(&state, user, run, CHAT_SEARCH_NO_ROOM, note).await;
         return;
     }
     chat.system =

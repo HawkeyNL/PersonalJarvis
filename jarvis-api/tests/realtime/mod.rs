@@ -1975,6 +1975,43 @@ async fn a_chat_search_answers_from_fenced_excerpts_and_never_reaches_the_web(
     assert_eq!(rows.len(), 5, "{rows:?}");
     assert!(rows.iter().all(|row| !row.contains("Ignore all rules")));
 
+    // Later answers may repeat it: still no job of its own once the answer
+    // is out of the context window.
+    let filler: String = (0..40)
+        .map(|n| {
+            format!(
+                "CREATE chat_messages SET id = '{}', conversation_id = '{conversation}', \
+                 user_id = '{}', role = 'assistant', content = 'Filler {n}.', \
+                 model = 'fixture-model', created_at = time::now();",
+                Uuid::now_v7(),
+                owner.id
+            )
+        })
+        .collect();
+    db.query(filler).await?.check()?;
+    let (status, run) = post(
+        &app,
+        &token,
+        "/v1/assistant/runs",
+        json!({"request_id": Uuid::now_v7(), "conversation_id": conversation,
+            "messages": [{"role": "user", "content": "Nog iets?"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(
+        completed_runs(&mut display.receiver, 1).await[0].content,
+        "Plain."
+    );
+    assert!(!seen
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .1
+        .iter()
+        .any(|turn| turn.starts_with("Answer from earlier chats")));
+    assert!(jarvis_api::jobs::store::list(&db).await?.is_empty());
+
     // The same answer in a chat without earlier-chat text does make its job.
     let (status, run) = post(
         &app,
@@ -1986,5 +2023,6 @@ async fn a_chat_search_answers_from_fenced_excerpts_and_never_reaches_the_web(
     assert_eq!(status, StatusCode::OK, "{run}");
     completed_runs(&mut display.receiver, 1).await;
     assert_eq!(jarvis_api::jobs::store::list(&db).await?.len(), 1);
+    assert_eq!(research.load(Ordering::SeqCst), 0);
     Ok(())
 }

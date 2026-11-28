@@ -58,6 +58,8 @@ pub(crate) struct Markers {
     pub any_roadmap: bool,
     /// The keywords of a valid `[[chat_search …]]` line.
     pub chat_search: Option<Vec<String>>,
+    /// Any chat search marker line was taken, valid or not.
+    pub any_chat_search: bool,
 }
 
 /// Takes the trailing marker lines off `text`: `[[web_search]]`,
@@ -101,6 +103,7 @@ pub(crate) fn take(text: &mut String) -> Markers {
                 None => tracing::info!("malformed roadmap marker dropped"),
             }
         } else if line.starts_with("[[chat_search") {
+            markers.any_chat_search = true;
             match chat_search_terms(line) {
                 Some(terms) => markers.chat_search = Some(terms),
                 None => tracing::info!("malformed chat_search marker dropped"),
@@ -544,6 +547,7 @@ mod tests {
                 roadmaps: vec!["{\"title\":\"T\"}".into(), "{\"d\":4}".into()],
                 any_roadmap: true,
                 chat_search: None,
+                any_chat_search: false,
             }
         );
         // A cut-off roadmap line alone is taken and counts, with no JSON.
@@ -591,9 +595,11 @@ mod tests {
     #[test]
     fn a_chat_search_line_gives_its_lowercased_keywords_or_nothing() {
         let terms = |text: &str| {
-            let mut text = text.to_owned();
-            let markers = take(&mut text);
-            (text, markers.chat_search)
+            let mut taken = text.to_owned();
+            let markers = take(&mut taken);
+            // Every chat search line taken counts, valid or not.
+            assert_eq!(markers.any_chat_search, taken != text, "{text}");
+            (taken, markers.chat_search)
         };
         let words = |list: &[&str]| Some(list.iter().map(|w| w.to_string()).collect());
         assert_eq!(
