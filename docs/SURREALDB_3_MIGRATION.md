@@ -84,7 +84,7 @@ Line numbers come from `76668a7`.
 ### 2.1 Schema files and migration runner
 
 - **Schema files:** `schema/surreal/0001_baseline.surql` …
-  `0024_chat_summary.surql`, 981 lines, 52 tables.
+  `0025_memories.surql`, 1018 lines, 54 tables.
 - **Statement shape:**
   - Every file is one `BEGIN TRANSACTION; … COMMIT TRANSACTION;` block.
   - Tables are all `SCHEMAFULL PERMISSIONS NONE`.
@@ -149,6 +149,14 @@ Line numbers come from `76668a7`.
     does not apply. Core writes the summary with a monotonic
     `UPDATE … WHERE summary_through = NONE OR summary_through < $t`.
     Tested on 2.6.5, the migration tests on RocksDB.
+  - Since `0025_memories.surql`: two new, empty tables, `memories`
+    (Jarvis's facts about the owner: length `ASSERT`s on `text` 1 to 300
+    and `key` 1 to 400 chars, `sensitivity int` 1 to 10, `created_by` enum,
+    `option<string>` source chat id with a UUID pattern and no cascade,
+    `revision int >= 1`) and the guard table `memory_guards`, with three
+    indexes on the new table (`memories_id` and `memories_user_key (user_id,
+    key)` UNIQUE, `memories_user_updated`). No existing table or index
+    changes. Tested on 2.6.5, the migration tests on RocksDB.
 - **Index rule (v0.0.87 incident):** 2.x builds an index over existing rows
   in transactions of its own, outside the migration. 0021 first redefined
   the index under its old name; the builder rewrote keys the migration had
@@ -495,7 +503,7 @@ tagged otherwise.
    - Compare names and kinds after normalising the output; the format
      differs between majors [unverified].
    - `schema_version:baseline.version` must equal the current version
-     (24 since `0024_chat_summary.surql`).
+     (25 since `0025_memories.surql`).
 3. **Content checksums per table:**
    - Run `SELECT * FROM <t> ORDER BY id` on both sides with `--json`.
    - Normalise with jq: sort keys, canonical datetimes in UTC RFC 3339,
