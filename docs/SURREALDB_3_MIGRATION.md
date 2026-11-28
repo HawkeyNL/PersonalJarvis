@@ -84,7 +84,7 @@ Line numbers come from `76668a7`.
 ### 2.1 Schema files and migration runner
 
 - **Schema files:** `schema/surreal/0001_baseline.surql` …
-  `0023_crypto_wallets.surql`, 961 lines, 52 tables.
+  `0024_chat_summary.surql`, 981 lines, 52 tables.
 - **Statement shape:**
   - Every file is one `BEGIN TRANSACTION; … COMMIT TRANSACTION;` block.
   - Tables are all `SCHEMAFULL PERMISSIONS NONE`.
@@ -141,6 +141,14 @@ Line numbers come from `76668a7`.
     an `array<string, 5>`, and `record::id($value)` on string ids. No
     existing table or index changes. Tested on 2.6.5, the migration tests
     on RocksDB.
+  - Since `0024_chat_summary.surql`: three new optional fields on the
+    populated `conversations` table (`history_summary option<string>` with
+    a length `ASSERT` of 1 to 2000 chars, `summary_through
+    option<datetime>`, `summary_untrusted option<bool>`), defined with
+    `IF NOT EXISTS`. No index and no row writes, so the index rule below
+    does not apply. Core writes the summary with a monotonic
+    `UPDATE … WHERE summary_through = NONE OR summary_through < $t`.
+    Tested on 2.6.5, the migration tests on RocksDB.
 - **Index rule (v0.0.87 incident):** 2.x builds an index over existing rows
   in transactions of its own, outside the migration. 0021 first redefined
   the index under its old name; the builder rewrote keys the migration had
@@ -487,7 +495,7 @@ tagged otherwise.
    - Compare names and kinds after normalising the output; the format
      differs between majors [unverified].
    - `schema_version:baseline.version` must equal the current version
-     (23 since `0023_crypto_wallets.surql`).
+     (24 since `0024_chat_summary.surql`).
 3. **Content checksums per table:**
    - Run `SELECT * FROM <t> ORDER BY id` on both sides with `--json`.
    - Normalise with jq: sort keys, canonical datetimes in UTC RFC 3339,

@@ -115,6 +115,22 @@ async fn schema_version(db: &Database) -> Result<Option<SchemaVersion>, StoreErr
 /// - avoid `DEFINE INDEX OVERWRITE` on a populated table.
 pub async fn apply_baseline_schema(db: &Database) -> Result<(), StoreError> {
     let current = schema_version(db).await?;
+    if current.is_some_and(|v| v.version == 24) {
+        return Ok(());
+    }
+    apply_through_twentythree(db).await?;
+    db.query(include_str!(
+        "../../../schema/surreal/0024_chat_summary.surql"
+    ))
+    .await
+    .map_err(StoreError::schema)?
+    .check()
+    .map_err(StoreError::schema)?;
+    Ok(())
+}
+
+async fn apply_through_twentythree(db: &Database) -> Result<(), StoreError> {
+    let current = schema_version(db).await?;
     if current.is_some_and(|v| v.version == 23) {
         return Ok(());
     }

@@ -1519,6 +1519,92 @@ pub(super) async fn conversation_title(
         .map(|row| row.title)
 }
 
+/// The stored summary of a conversation's older turns (schema 0024).
+#[derive(Debug, PartialEq)]
+pub(crate) struct HistorySummary {
+    pub(crate) text: String,
+    /// The `created_at` of the newest message the summary covers.
+    pub(crate) through: OffsetDateTime,
+    /// Some message it was made from was untrusted; it never goes back.
+    pub(crate) untrusted: bool,
+}
+
+/// The summary of this user's conversation, if it has one.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the summary worker in the next PR calls it")
+)]
+pub(crate) async fn history_summary(
+    db: &jarvis_store::Database,
+    id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<HistorySummary>, ()> {
+    #[derive(Deserialize)]
+    struct Row {
+        history_summary: String,
+        #[serde(with = "time::serde::rfc3339")]
+        summary_through: OffsetDateTime,
+        summary_untrusted: Option<bool>,
+    }
+    let row: Option<Row> = db
+        .query(
+            "SELECT history_summary, summary_through, summary_untrusted FROM conversations \
+             WHERE record::id(id) = $id AND user_id = $user_id \
+             AND history_summary != NONE AND summary_through != NONE LIMIT 1",
+        )
+        .bind(json!({"id": id.to_string(), "user_id": user_id.to_string()}))
+        .await
+        .map_err(|_| ())?
+        .take(0)
+        .map_err(|_| ())?;
+    Ok(row.map(|row| HistorySummary {
+        text: row.history_summary,
+        through: row.summary_through,
+        // A summary without the flag is treated as untrusted (fail closed).
+        untrusted: row.summary_untrusted.unwrap_or(true),
+    }))
+}
+
+/// Store a newer summary of this user's conversation. Writes only move
+/// forward: a summary through the same or an earlier message, or for a
+/// deleted conversation, changes nothing and returns `false`. Once untrusted,
+/// a conversation's summary stays untrusted. A concurrent write may fail with
+/// `Err`; the caller drops it and does not retry.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the summary worker in the next PR calls it")
+)]
+pub(crate) async fn store_history_summary(
+    db: &jarvis_store::Database,
+    id: Uuid,
+    user_id: Uuid,
+    summary: &str,
+    through: OffsetDateTime,
+    untrusted: bool,
+) -> Result<bool, ()> {
+    let through = through
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|_| ())?;
+    let updated: Vec<String> = db
+        .query(
+            "UPDATE conversations SET history_summary = $summary, \
+             summary_through = <datetime>$through, \
+             summary_untrusted = ($untrusted OR summary_untrusted = true) \
+             WHERE record::id(id) = $id AND user_id = $user_id \
+             AND (summary_through = NONE OR summary_through < <datetime>$through) \
+             RETURN VALUE record::id(id)",
+        )
+        .bind(json!({"id": id.to_string(), "user_id": user_id.to_string(),
+            "summary": summary, "through": through, "untrusted": untrusted}))
+        .await
+        .map_err(|_| ())?
+        .check()
+        .map_err(|_| ())?
+        .take(0)
+        .map_err(|_| ())?;
+    Ok(!updated.is_empty())
+}
+
 /// Create a new conversation and return its id (ADR-030).
 async fn create_conversation(
     db: &jarvis_store::Database,
@@ -2370,5 +2456,73 @@ mod tests {
             "attachments": ["../../etc/passwd"],
         }))
         .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable JARVIS_SURREAL_TEST_* database"]
+    async fn history_summary_writes_only_forward_for_the_owner(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
+        let db = Surreal::new::<Ws>(std::env::var("JARVIS_SURREAL_TEST_ENDPOINT")?).await?;
+        db.signin(Root {
+            username: &std::env::var("JARVIS_SURREAL_TEST_USER")?,
+            password: &std::env::var("JARVIS_SURREAL_TEST_PASS")?,
+        })
+        .await?;
+        db.use_ns(format!("chat_summary_{}", Uuid::now_v7().simple()))
+            .use_db("core")
+            .await?;
+        jarvis_store::apply_baseline_schema(&db).await?;
+        let (owner, other) = (Uuid::now_v7(), Uuid::now_v7());
+        let id = create_conversation(&db, owner, "Long chat")
+            .await
+            .map_err(|()| "create")?;
+        let at = |s: i64| OffsetDateTime::from_unix_timestamp(1_800_000_000 + s);
+        let read = || history_summary(&db, id, owner);
+        let store = |text: &'static str, through: OffsetDateTime, untrusted: bool| {
+            store_history_summary(&db, id, owner, text, through, untrusted)
+        };
+        assert_eq!(read().await, Ok(None));
+        assert_eq!(store("first", at(10)?, false).await, Ok(true));
+        let first = HistorySummary {
+            text: "first".into(),
+            through: at(10)?,
+            untrusted: false,
+        };
+        assert_eq!(read().await, Ok(Some(first)));
+        // The same or an older boundary, or another user, changes nothing.
+        assert_eq!(store("same", at(10)?, true).await, Ok(false));
+        assert_eq!(store("older", at(5)?, true).await, Ok(false));
+        assert_eq!(
+            store_history_summary(&db, id, other, "theirs", at(99)?, false).await,
+            Ok(false)
+        );
+        assert_eq!(history_summary(&db, id, other).await, Ok(None));
+        assert_eq!(
+            read().await.map(|s| s.map(|s| s.text)),
+            Ok(Some("first".into()))
+        );
+        // Once untrusted, a later trusted summary stays untrusted.
+        assert_eq!(store("web", at(20)?, true).await, Ok(true));
+        assert_eq!(store("later", at(30)?, false).await, Ok(true));
+        let later = HistorySummary {
+            text: "later".into(),
+            through: at(30)?,
+            untrusted: true,
+        };
+        assert_eq!(read().await, Ok(Some(later)));
+        // The schema refuses a summary over 2000 characters.
+        let long = "a".repeat(2001);
+        assert!(store_history_summary(&db, id, owner, &long, at(40)?, false)
+            .await
+            .is_err());
+        // A deleted conversation gets no summary back.
+        db.query("DELETE conversations WHERE record::id(id) = $id")
+            .bind(("id", id.to_string()))
+            .await?
+            .check()?;
+        assert_eq!(store("gone", at(50)?, false).await, Ok(false));
+        assert_eq!(read().await, Ok(None));
+        Ok(())
     }
 }
