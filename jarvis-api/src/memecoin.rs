@@ -2808,7 +2808,7 @@ mod tests {
         assert_eq!(version_of(&trips, MINT_D), None);
         assert_eq!(trips[0].cost_usd, d("25.011"));
         // A filter verdict per mint and strategy version.
-        let candidates = store::recent_candidates(&db, 100).await?;
+        let candidates = store::recent_candidates(&db, 100, None).await?.0;
         assert_eq!(candidates.len(), 12);
         assert!(candidates.iter().all(|c| c.reason.is_none()));
         // What was seen is recorded for the signals.

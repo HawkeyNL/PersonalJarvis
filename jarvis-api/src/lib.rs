@@ -29,6 +29,9 @@ pub mod auto_research;
 #[cfg(unix)]
 pub mod broker_replay;
 pub mod budget_gate;
+// Wired into chat by the cross-chat search second pass (next change).
+#[allow(dead_code)]
+mod chat_search;
 pub mod crypto;
 mod error;
 mod extract;

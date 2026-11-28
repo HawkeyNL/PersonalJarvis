@@ -149,6 +149,17 @@ impl Kind {
     pub fn singleton(self) -> bool {
         SINGLETON_KINDS.contains(&self)
     }
+
+    /// The name the owner sees for this kind.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::DependencyReview => "Dependency review",
+            Self::Prompt => "Research job",
+            Self::Reminder => "Reminder",
+            Self::DiskCheck => "Disk check",
+            Self::HealthReview => "Morning check",
+        }
+    }
 }
 
 /// The kinds with at most one job per node.

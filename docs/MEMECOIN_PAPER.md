@@ -47,8 +47,14 @@ sudo jarvis logs core --lines 200          # "memecoin PAPER trader running"
   each one with a read-only JSON-RPC `getSlot` (10 s) and prints only
   `RPC A: ok` or `failed`. Only when both answer does it write
   `/etc/jarvis/secrets/market-data.env` (`root:jarvis 0640`, staged and
-  moved into place). A new `set` replaces the whole file, so leaving the
-  Jupiter key empty removes it. The command does not restart Core.
+  moved into place). A new `set` replaces the whole file. When that file
+  is safe (a regular file, `root:jarvis 0640`), a prompt with a saved value
+  says `Enter keeps the saved value`: Enter on an empty prompt keeps that
+  value, so you can change only RPC B. A kept URL is checked and probed
+  like a typed one. For a saved Jupiter key, Enter keeps it and `-`
+  removes it; with no saved key, Enter or `-` means none. A linked file or one
+  with other owner or mode counts as nothing saved. The command does not
+  restart Core.
   `status market-data` prints `set` or `empty` per key and never a value.
 
 ### By hand
@@ -420,7 +426,11 @@ cost a candidate, never let one through.
   book; with `agent` set, Claude's call budget (`agent`). The top-level `strategy_version` is **deprecated** and kept for
   older clients: it is the active version of the first strategy by id
   (normally `a-survivor-momentum`) and scopes nothing else in the response.
-- `GET /v1/trading/meme/candidates?limit=1..100` (default 50).
+- `GET /v1/trading/meme/candidates?limit=1..100&before=<cursor>` (default
+  50): filter decisions, newest first (`observed_at`, then record id). The
+  response carries `next_before` only when older rows exist; pass it as
+  `before` for the next page. The cursor is opaque, URL-safe and at most 128
+  bytes; a malformed one is a `400`.
 - `GET /v1/trading/meme/trades?limit=1..100`: closed paper trades.
 - `POST /v1/trading/meme/pause`: stops entries at once and persists the pause
   (security audit `memecoin.paper.pause`). Exits continue. A `503` means the

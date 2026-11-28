@@ -152,13 +152,53 @@ pub(crate) async fn overview(_authed: Authed, State(state): State<AppState>) -> 
     Ok(Json(body))
 }
 
+#[derive(Deserialize)]
+pub(crate) struct CandidatesQuery {
+    limit: Option<usize>,
+    before: Option<String>,
+}
+
+/// The longest paging cursor accepted.
+const MAX_CURSOR: usize = 128;
+
+/// An opaque, URL-safe position: `<observed_at unix nanos>.<hex record id>`.
+/// Core's ids are 36-character UUIDs, so a cursor is about 92 bytes.
+fn encode_cursor(observed_at: OffsetDateTime, id: &str) -> String {
+    format!("{}.{}", observed_at.unix_timestamp_nanos(), hex::encode(id))
+}
+
+fn decode_cursor(cursor: &str) -> Option<(OffsetDateTime, String)> {
+    if cursor.len() > MAX_CURSOR {
+        return None;
+    }
+    let (nanos, id) = cursor.split_once('.')?;
+    if nanos.is_empty() || !nanos.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let at = OffsetDateTime::from_unix_timestamp_nanos(nanos.parse().ok()?).ok()?;
+    let id = String::from_utf8(hex::decode(id).ok()?).ok()?;
+    (!id.is_empty()).then_some((at, id))
+}
+
+/// Newest first; `before` (a previous `next_before`) continues with older
+/// rows. `next_before` is present only when older rows exist.
 pub(crate) async fn candidates(
     _authed: Authed,
     State(state): State<AppState>,
-    Query(query): Query<LimitQuery>,
+    Query(query): Query<CandidatesQuery>,
 ) -> ApiResult {
-    let rows = bounded(store::recent_candidates(&state.db, limit(&query)?)).await?;
-    Ok(Json(json!({
+    let limit = limit(&LimitQuery { limit: query.limit })?;
+    let before = match query.before.as_deref() {
+        None => None,
+        Some(cursor) => Some(decode_cursor(cursor).ok_or_else(|| bad_request("invalid cursor"))?),
+    };
+    let before = before.as_ref().map(|(at, id)| (*at, id.as_str()));
+    let (rows, more) = bounded(store::recent_candidates(&state.db, limit, before)).await?;
+    let next_before = rows
+        .last()
+        .filter(|_| more)
+        .map(|c| encode_cursor(c.observed_at, &c.id));
+    let mut body = json!({
         "candidates": rows.into_iter().map(|c| json!({
             "mint": c.mint,
             "observed_at": ts(c.observed_at),
@@ -168,7 +208,11 @@ pub(crate) async fn candidates(
             "price_usd": c.price_usd.map(money),
             "liquidity_usd": c.liquidity_usd.map(money),
         })).collect::<Vec<_>>(),
-    })))
+    });
+    if let Some(cursor) = next_before {
+        body["next_before"] = cursor.into();
+    }
+    Ok(Json(body))
 }
 
 pub(crate) async fn trades(
@@ -648,4 +692,42 @@ pub(crate) async fn decisions(
             "output_tokens": d.output_tokens,
         })).collect::<Vec<_>>(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meme_candidate_cursor_round_trips() {
+        let at = OffsetDateTime::from_unix_timestamp_nanos(1_764_000_000_123_456_789).unwrap();
+        let id = "019abcde-0123-7def-8000-0123456789ab";
+        let cursor = encode_cursor(at, id);
+        assert!(cursor.len() <= MAX_CURSOR);
+        assert!(cursor
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.'));
+        assert_eq!(decode_cursor(&cursor), Some((at, id.to_string())));
+    }
+
+    #[test]
+    fn meme_candidate_cursor_rejects_bad_input() {
+        let long = format!("1.{}", "61".repeat(64));
+        for bad in [
+            "",
+            "abc",
+            "1",
+            "1.",
+            ".61",
+            "-1.61",
+            "+1.61",
+            "1.6",
+            "1.zz",
+            "1.ff",
+            "99999999999999999999999999.61",
+            long.as_str(),
+        ] {
+            assert_eq!(decode_cursor(bad), None, "{bad:?}");
+        }
+    }
 }
