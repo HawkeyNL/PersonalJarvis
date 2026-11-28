@@ -43,6 +43,10 @@ pub mod jobs;
 pub mod local_devices;
 mod mcp;
 pub mod memecoin;
+// Wired into chat and the app API by the memory routes and markers (next
+// changes).
+#[allow(dead_code)]
+mod memory;
 mod metering;
 pub mod model_control;
 pub mod notify;
