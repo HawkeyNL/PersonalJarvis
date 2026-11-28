@@ -293,11 +293,11 @@ pub(super) async fn execute_chat(
         .map_err(|_| internal_error())?,
     };
     // Only the runs API carries photos: their labels for this run.
-    let (canonical_history, photo_labels, last_sources) = if user_already_published {
+    let (canonical_history, photo_labels, last_sources, recalled) = if user_already_published {
         // A web search never sees photos, so none are read for one.
         let research =
             req.mode.as_deref().map(llm::RoutingMode::parse) == Some(llm::RoutingMode::Research);
-        let (messages, labels, sources) = super::chat_context::load(
+        let (messages, labels, sources, recalled) = super::chat_context::load(
             &state.db,
             &state.photos,
             authed.user.id,
@@ -306,9 +306,9 @@ pub(super) async fn execute_chat(
         )
         .await
         .map_err(|_| internal_error())?;
-        (Some(messages), labels, sources)
+        (Some(messages), labels, sources, recalled)
     } else {
-        (None, Vec::new(), Vec::new())
+        (None, Vec::new(), Vec::new(), false)
     };
     if let Some(run) = &realtime_run {
         if !user_already_published {
@@ -530,7 +530,8 @@ pub(super) async fn execute_chat(
                 && user_already_published
                 && requested_mode != llm::RoutingMode::Research
                 && !page_turn;
-            if !honoured && (markers.any_job || markers.any_roadmap) {
+            let chat_search = markers.chat_search.is_some();
+            if !honoured && (markers.any_job || markers.any_roadmap || chat_search) {
                 let reason = if requested_mode == llm::RoutingMode::Research {
                     "research mode"
                 } else if page_turn {
@@ -542,16 +543,22 @@ pub(super) async fn execute_chat(
                     reason,
                     jobs = markers.any_job,
                     roadmap = markers.any_roadmap,
+                    chat_search,
                     "chat markers not honoured"
                 );
             }
-            if honoured && image_turn && !markers.job_self.is_empty() {
+            // A job of Jarvis's own searches the web with model-written text,
+            // so none comes of a turn whose context holds an answer written
+            // from the owner's earlier chats.
+            if honoured && (image_turn || recalled) && !markers.job_self.is_empty() {
                 tracing::info!(
                     dropped = markers.job_self.len(),
-                    "job_self markers not honoured: photo turn"
+                    photo = image_turn,
+                    recalled,
+                    "job_self markers not honoured"
                 );
             }
-            let own_lines: &[String] = if honoured && !image_turn {
+            let own_lines: &[String] = if honoured && !image_turn && !recalled {
                 &markers.job_self
             } else {
                 &[]
@@ -623,6 +630,20 @@ pub(super) async fn execute_chat(
                 // The owner asked for a job and no card follows: say so.
                 reply.text = format!("{}\n\n{JOB_REFUSED_REPLY}", reply.text.trim_end());
             }
+            // Only an ordinary runs-API answer searches earlier chats; its
+            // slot is taken now, so an empty reply says whether one follows.
+            let recall = match &state.chat_search {
+                Some(caps) if honoured && chat_search => caps.try_start(),
+                _ => None,
+            };
+            if !page_turn && chat_search && reply.text.trim().is_empty() {
+                reply.text = if recall.is_some() {
+                    CHAT_SEARCH_REPLY
+                } else {
+                    CHAT_SEARCH_OFF_REPLY
+                }
+                .into();
+            }
             // A web or page answer never shows a photo; a chat answer only
             // one of this run's photos.
             let labels: &[(u8, Uuid)] = if requested_mode == llm::RoutingMode::Research || page_turn
@@ -639,19 +660,7 @@ pub(super) async fn execute_chat(
             if let Some(source) = page_source {
                 reply.text = page_answer(&reply.text, source);
             }
-            let input_bytes = chat
-                .messages
-                .iter()
-                .map(|m| {
-                    let images = m.images.iter().map(|image| image.bytes().len() / 4);
-                    m.content
-                        .len()
-                        .saturating_add(32)
-                        .saturating_add(images.sum())
-                })
-                .sum::<usize>()
-                .saturating_add(chat.system.as_ref().map_or(0, String::len));
-            let status = estimate_missing_usage(&mut reply, input_bytes, chat.max_tokens);
+            let status = estimate_missing_usage(&mut reply, input_bytes(&chat), chat.max_tokens);
             record_usage_with_metadata(
                 &state,
                 &reply,
@@ -683,7 +692,7 @@ pub(super) async fn execute_chat(
                         conv_id,
                         authed.user.id,
                         &note,
-                        JOB_NOTE_MODEL,
+                        crate::jobs::chat::NOTICE_MODEL,
                     ),
                 )
                 .await;
@@ -744,6 +753,16 @@ pub(super) async fn execute_chat(
                         authed.user.id,
                         run.clone(),
                         new_msg.clone(),
+                    ));
+                } else if let (Some(slot), Some(terms)) = (recall, markers.chat_search) {
+                    // At most one follow-up: an automatic web search wins.
+                    tokio::spawn(chat_search_run(
+                        state.clone(),
+                        slot,
+                        authed.user.id,
+                        run.clone(),
+                        chat.clone(),
+                        terms,
                     ));
                 }
             }
@@ -931,9 +950,13 @@ const ROADMAP_REFUSED_REPLY: &str = "I could not set up that roadmap.";
 /// Added when the marker was cut off or not JSON.
 const ROADMAP_SPLIT_HINT: &str = "Ask for fewer items at once, then add the rest with \
 \"add items to roadmap …\".";
-/// The model the note on a job of Jarvis's own is stored under, like a
-/// job's fixed messages.
-const JOB_NOTE_MODEL: &str = "job";
+/// Stored when a reply was nothing but a chat search marker.
+const CHAT_SEARCH_REPLY: &str = "Let me look through your earlier chats.";
+const CHAT_SEARCH_OFF_REPLY: &str = "I can't search your earlier chats right now.";
+/// Stored when a chat search found nothing.
+const CHAT_SEARCH_NONE: &str = "I found nothing about that in your earlier chats.";
+/// Stored when the answer from earlier chats was empty.
+const CHAT_SEARCH_EMPTY: &str = "I could not write an answer from your earlier chats.";
 
 /// Whether a web search is advised after this reply: the classifier said
 /// research, or an ordinary answer ended with the web search marker; and the
@@ -994,13 +1017,25 @@ fn stored_model(
 /// Stored when a page turn's answer was empty.
 const PAGE_EMPTY: &str = "I could not write an answer from that page.";
 
-/// A page turn's answer as stored. Its model had private context next to
-/// text a site controls, so nothing in it may hide a URL: cleaned like a
-/// web answer (no remote images, capped), the model's own Sources list
-/// dropped, every markdown link and link definition reduced to its text,
-/// and no `<` left for HTML or an autolink. A plain URL stays visible as
-/// written. The page is its only Sources line.
+/// A page turn's answer as stored: [`untrusted_answer`], with the page as
+/// its only Sources line.
 fn page_answer(text: &str, source: &str) -> String {
+    let body = untrusted_answer(text);
+    let body = if body.trim().is_empty() {
+        PAGE_EMPTY
+    } else {
+        body.trim_end()
+    };
+    format!("{body}\n\nSources:\n- {source}")
+}
+
+/// An answer written from private context next to untrusted text (a page,
+/// excerpts of earlier chats), as stored. Nothing in it may hide a URL:
+/// cleaned like a web answer (no remote images, capped), the model's own
+/// Sources list dropped, every markdown link and link definition reduced to
+/// its text, and no `<` left for HTML or an autolink. A plain URL stays
+/// visible as written.
+fn untrusted_answer(text: &str) -> String {
     let text = clean_research_text(text);
     let lines: Vec<&str> = text.lines().collect();
     let body = match lines
@@ -1010,18 +1045,12 @@ fn page_answer(text: &str, source: &str) -> String {
         Some(header) => lines[..header].join("\n"),
         None => text.clone(),
     };
-    let body = links_as_text(&body)
+    links_as_text(&body)
         .lines()
         .filter(|line| !is_link_definition(line))
         .collect::<Vec<_>>()
         .join("\n")
-        .replace('<', "\u{ff1c}");
-    let body = if body.trim().is_empty() {
-        PAGE_EMPTY
-    } else {
-        body.trim_end()
-    };
-    format!("{body}\n\nSources:\n- {source}")
+        .replace('<', "\u{ff1c}")
 }
 
 /// `[text](target)` becomes `text`.
@@ -1219,10 +1248,14 @@ async fn auto_research_run(
         },
     )
     .await;
-    // The owner may have deleted the conversation while the search ran.
-    match append_to_live_conversation(&state.db, run.conversation_id, user, &reply.text, &model)
-        .await
-    {
+    finish_follow_up(&state, user, run, &reply.text, &model).await;
+}
+
+/// Stores a follow-up run's answer and tells the owner's devices; the owner
+/// may have deleted the conversation while it ran, and then nothing is
+/// stored.
+async fn finish_follow_up(state: &AppState, user: Uuid, run: RunIdentity, text: &str, model: &str) {
+    match append_to_live_conversation(&state.db, run.conversation_id, user, text, model).await {
         Ok(Some((message, title))) => {
             state.realtime.publish(
                 user,
@@ -1258,6 +1291,125 @@ async fn auto_research_run(
             },
         ),
     }
+}
+
+/// What a chat request sends, in bytes, for a usage estimate: a
+/// conservative ceiling with framing and images.
+fn input_bytes(chat: &llm::ChatRequest) -> usize {
+    chat.messages
+        .iter()
+        .map(|m| {
+            let images = m.images.iter().map(|image| image.bytes().len() / 4);
+            m.content
+                .len()
+                .saturating_add(32)
+                .saturating_add(images.sum())
+        })
+        .sum::<usize>()
+        .saturating_add(chat.system.as_ref().map_or(0, String::len))
+}
+
+/// A search of the owner's earlier chats after an answer that asked for one
+/// with `[[chat_search …]]`: a second run on the same turn, its matching
+/// excerpts fenced before the owner's message, answered by the same pin
+/// under a system prompt that offers no marker. Only this chat brain sees
+/// the excerpts: every marker in the answer is taken off and none is
+/// honoured, so no web search, page read, job or other search comes of it.
+/// The answer is stored as `recall:<model>`, untrusted in later context;
+/// nothing found is a fixed note without a model call.
+async fn chat_search_run(
+    state: AppState,
+    slot: crate::auto_research::AutoSlot,
+    user: Uuid,
+    answered: RunIdentity,
+    mut chat: llm::ChatRequest,
+    terms: Vec<String>,
+) {
+    let _slot = slot;
+    let run = RunIdentity {
+        run_id: Uuid::now_v7(),
+        ..answered
+    };
+    state.realtime.publish(
+        user,
+        Event::AssistantStarted {
+            run: run.clone(),
+            web_search: false,
+        },
+    );
+    let failed = |reason| Event::AssistantFailed {
+        run: run.clone(),
+        reason,
+    };
+    let Ok(hits) = crate::chat_search::search(&state.db, user, run.conversation_id, &terms).await
+    else {
+        state
+            .realtime
+            .publish(user, failed(RunFailure::PersistenceUnavailable));
+        return;
+    };
+    if hits.is_empty() {
+        let note = crate::jobs::chat::NOTICE_MODEL;
+        finish_follow_up(&state, user, run, CHAT_SEARCH_NONE, note).await;
+        return;
+    }
+    let block = crate::chat_search::fence(&terms, &hits, OffsetDateTime::now_utc());
+    let fits = chat.messages.last_mut().is_some_and(|turn| {
+        let with = format!("{block}\n\n{}", turn.content);
+        let fits = llm::wire_len(&with) <= llm::MAX_WHOLE_TURN_BYTES;
+        if fits {
+            turn.content = with;
+        }
+        fits
+    });
+    if !fits {
+        tracing::info!("chat search excerpts not added: no room in the turn");
+        state
+            .realtime
+            .publish(user, failed(RunFailure::ProviderUnavailable));
+        return;
+    }
+    chat.system =
+        Some(super::runtime_facts::system_prompt(&state, false, chat_headroom(false)).await);
+    let started = Instant::now();
+    let metadata = jarvis_usage::UsageMetadata {
+        request_id: run.run_id.to_string(),
+        routing_mode: "chat_search".into(),
+        quality_tier: format!("{:?}", chat.tier).to_ascii_lowercase(),
+        ..Default::default()
+    };
+    let mut reply = match state.llm.chat(&chat).await {
+        Ok(reply) => reply,
+        Err(error) => {
+            let pinned = chat.provider.as_deref().zip(chat.model.as_deref());
+            record_failure(&state, pinned, &error, metadata).await;
+            state
+                .realtime
+                .publish(user, failed(RunFailure::ProviderUnavailable));
+            return;
+        }
+    };
+    // Excerpts may carry earlier web text: markers in the answer are
+    // dropped unread.
+    crate::job_markers::take(&mut reply.text);
+    take_photo_markers(&mut reply.text, &[]);
+    reply.text = untrusted_answer(&reply.text);
+    if reply.text.trim().is_empty() {
+        reply.text = CHAT_SEARCH_EMPTY.into();
+    }
+    let status = estimate_missing_usage(&mut reply, input_bytes(&chat), chat.max_tokens);
+    record_usage_with_metadata(
+        &state,
+        &reply,
+        jarvis_usage::UsageMetadata {
+            latency_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+            status: status.into(),
+            ..metadata
+        },
+    )
+    .await;
+    let model = super::chat_context::recall_model(&reply.model);
+    finish_follow_up(&state, user, run, &reply.text, &model).await;
 }
 
 /// The automatic search's answer and the model it is stored under

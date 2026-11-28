@@ -67,6 +67,12 @@ pub(super) fn read_model(model: &str) -> String {
     format!("{READ_MODEL_PREFIX}{model}")
 }
 
+/// The stored model of an answer written from earlier chats:
+/// `recall:<model>`.
+pub(super) fn recall_model(model: &str) -> String {
+    format!("{RECALL_MODEL_PREFIX}{model}")
+}
+
 /// `web:<model>` of a research job Jarvis made for itself, stored as
 /// `web-own:<model>`.
 pub(crate) fn own_research_model(stored: &str) -> String {
@@ -161,14 +167,15 @@ pub(crate) fn wrap_untrusted(label: &str, content: &str, cap: usize) -> String {
 /// The stored conversation as model input, with the photos of the newest
 /// turns attached (only `with_photos`; a web search never gets them) and
 /// every photo labelled in the text, plus the links of the newest Research
-/// answer in the window (what "source N" may pick).
+/// answer in the window (what "source N" may pick) and whether the window
+/// holds an answer written from earlier chats.
 pub(super) async fn load(
     db: &jarvis_store::Database,
     photos: &crate::photos::PhotoStore,
     user: Uuid,
     newest: &CanonicalMessage,
     with_photos: bool,
-) -> Result<(Vec<ChatMessage>, PhotoLabels, Vec<String>), ()> {
+) -> Result<(Vec<ChatMessage>, PhotoLabels, Vec<String>, bool), ()> {
     let mut response = db.query(
         "SELECT record::id(id) AS id, role, content, model, attachments, created_at FROM chat_messages \
          WHERE conversation_id = $conversation AND user_id = $user \
@@ -177,6 +184,7 @@ pub(super) async fn load(
         .await.map_err(|_| ())?;
     let rows: Vec<Row> = response.take(0).map_err(|_| ())?;
     let last_sources = newest_web_sources(&rows);
+    let recalled = rows.iter().any(|row| is_recall_model(row.model.as_deref()));
     let (mut messages, attachments) = bounded(rows, newest, OffsetDateTime::now_utc())?;
     let live = live_photos(db, user, newest.conversation_id, &attachments).await?;
     let shown = if with_photos {
@@ -186,7 +194,7 @@ pub(super) async fn load(
     };
     let images = crate::photos::read_for_model(photos, shown.clone()).await;
     let labels = label_photos(&mut messages, &attachments, &live, &shown, &images);
-    Ok((messages, labels, last_sources))
+    Ok((messages, labels, last_sources, recalled))
 }
 
 /// The links of the newest `web:` answer among the rows (newest first, the

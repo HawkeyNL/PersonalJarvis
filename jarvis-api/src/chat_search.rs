@@ -1,7 +1,7 @@
 //! Search the owner's earlier chats for a few keywords and fence what was
 //! found as untrusted model input. Every row is untrusted, the owner's own
-//! included; answers already written from web text, a page, earlier chats
-//! or a job are never returned, so such text is not passed on again.
+//! included; answers stored under a web, page, recall or job model are never
+//! returned, so such text is not passed on again (only one step deep).
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -10,14 +10,16 @@ use serde_json::json;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::jobs::chat::NOTICE_MODEL;
 use crate::routes::chat_context::{age, wrap_untrusted, UNTRUSTED_MODEL_PREFIXES};
 
 /// Most keywords one search takes.
 pub(crate) const MAX_TERMS: usize = 3;
 const MIN_TERM_CHARS: usize = 3;
 const MAX_TERM_CHARS: usize = 32;
-/// Most rows the database returns, newest first.
-const MAX_ROWS: usize = 20;
+/// Most rows the database returns, newest first: enough that one busy recent
+/// chat does not crowd out older ones after the per-chat cap.
+const MAX_ROWS: usize = 100;
 /// Most hits the model sees, and per conversation.
 const MAX_HITS: usize = 5;
 const MAX_HITS_PER_CHAT: usize = 2;
@@ -29,8 +31,6 @@ const MAX_TITLE_CHARS: usize = 80;
 const MAX_BLOCK_BYTES: usize = 3 * 1024;
 /// The whole search, both queries; the scan itself stops at `TIMEOUT 2s`.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
-/// The stored model of a job's note.
-const JOB_MODEL: &str = "job";
 
 /// One excerpt of an earlier chat.
 pub(crate) struct Hit {
@@ -87,7 +87,7 @@ fn query(terms: usize) -> String {
     format!(
         "SELECT conversation_id, role, content, created_at FROM chat_messages \
          WHERE user_id = $user AND conversation_id != $current \
-         AND (model = NONE OR !({} OR model = '{JOB_MODEL}')){matches} \
+         AND (model = NONE OR !({} OR model = '{NOTICE_MODEL}')){matches} \
          ORDER BY created_at DESC LIMIT {MAX_ROWS} TIMEOUT 2s",
         untrusted.join(" OR ")
     )
@@ -291,7 +291,7 @@ mod tests {
             assert!(query.contains(&format!("string::lowercase(content), $t{n})")));
         }
         assert!(!query.contains("$t3"));
-        assert!(query.ends_with("ORDER BY created_at DESC LIMIT 20 TIMEOUT 2s"));
+        assert!(query.ends_with("ORDER BY created_at DESC LIMIT 100 TIMEOUT 2s"));
     }
 
     #[test]
