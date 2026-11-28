@@ -439,7 +439,7 @@ mod tests {
     fn only_a_trailing_marker_line_is_taken() {
         let take = |text: &str| {
             let mut text = text.to_owned();
-            let marked = crate::job_markers::take(&mut text).web_search;
+            let marked = crate::job_markers::take(&mut text, false).web_search;
             (marked, text)
         };
         assert_eq!(

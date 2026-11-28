@@ -1838,7 +1838,7 @@ mod tests {
         assert!(line.contains("<web_result>") && line.len() < 384, "{line}");
         // Its example is a marker Core takes.
         let mut example = "Answer.\n[[chat_search word word]]".to_owned();
-        let markers = crate::job_markers::take(&mut example);
+        let markers = crate::job_markers::take(&mut example, true);
         assert_eq!(
             markers.chat_search,
             Some(vec!["word".into(), "word".into()])

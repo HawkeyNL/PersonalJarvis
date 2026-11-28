@@ -63,14 +63,15 @@ pub(crate) struct Markers {
 }
 
 /// Takes the trailing marker lines off `text`: `[[web_search]]`,
-/// `[[job …]]`, `[[job_self …]]`, `[[roadmap …]]` and `[[chat_search …]]`
-/// in any order, and any other trailing line starting with `[[job`,
-/// `[[roadmap` or `[[chat_search` (dropped; a
+/// `[[job …]]`, `[[job_self …]]`, `[[roadmap …]]` and, only with
+/// `chat_search` (the search is on), `[[chat_search …]]` in any order, and
+/// any other trailing line starting with `[[job`, `[[roadmap` or (likewise)
+/// `[[chat_search` (dropped; a
 /// roadmap one still counts in `any_roadmap`). Trailing `[[photo:N]]` lines
 /// among them stay, after the text, for the photo markers. Nothing beyond
 /// [`crate::auto_research::MAX_HOLD_BYTES`] from the end is taken (it stays
 /// text) but a `[[roadmap` line, so what is taken was never streamed.
-pub(crate) fn take(text: &mut String) -> Markers {
+pub(crate) fn take(text: &mut String, chat_search: bool) -> Markers {
     let total = text.len();
     let mut markers = Markers::default();
     let mut photos = Vec::new();
@@ -102,7 +103,7 @@ pub(crate) fn take(text: &mut String) -> Markers {
                 Some(json) => markers.roadmaps.push(json.to_owned()),
                 None => tracing::info!("malformed roadmap marker dropped"),
             }
-        } else if line.starts_with("[[chat_search") {
+        } else if chat_search && line.starts_with("[[chat_search") {
             markers.any_chat_search = true;
             match chat_search_terms(line) {
                 Some(terms) => markers.chat_search = Some(terms),
@@ -528,7 +529,7 @@ mod tests {
     fn only_trailing_marker_lines_are_taken_in_reply_order() {
         let taken = |text: &str| {
             let mut text = text.to_owned();
-            let markers = take(&mut text);
+            let markers = take(&mut text, true);
             (text, markers)
         };
         let (text, markers) = taken(
@@ -596,7 +597,7 @@ mod tests {
     fn a_chat_search_line_gives_its_lowercased_keywords_or_nothing() {
         let terms = |text: &str| {
             let mut taken = text.to_owned();
-            let markers = take(&mut taken);
+            let markers = take(&mut taken, true);
             // Every chat search line taken counts, valid or not.
             assert_eq!(markers.any_chat_search, taken != text, "{text}");
             (taken, markers.chat_search)

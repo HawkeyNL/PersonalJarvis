@@ -1801,7 +1801,8 @@ impl LlmProvider for RecallFake {
                  [[chat_search ferry]]\n{OWN_JOB}"
             )
         } else if newest.ends_with("Wanneer ging de ferry?") {
-            "[[chat_search Zeeland ferry]]".into()
+            // Both follow-ups asked for: only the chat search runs.
+            "[[chat_search Zeeland ferry]]\n[[web_search]]".into()
         } else {
             format!("Plain.\n{OWN_JOB}")
         };

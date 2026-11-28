@@ -516,8 +516,12 @@ pub(super) async fn execute_chat(
     }
     match reply {
         Ok(mut reply) => {
-            let (research_advised, markers) =
-                research_advised(&mut reply.text, requested_mode, intent_kind);
+            let (research_advised, markers) = research_advised(
+                &mut reply.text,
+                requested_mode,
+                intent_kind,
+                state.chat_search.is_some(),
+            );
             // A page turn's answer was written with web text in its input:
             // it loses every marker and never leads to a web search.
             let research_advised = research_advised && !page_turn;
@@ -976,14 +980,17 @@ const CHAT_SEARCH_EMPTY: &str = "I could not write an answer from your earlier c
 /// research, or an ordinary answer ended with the web search marker; and the
 /// reply's trailing job markers. Every trailing marker is taken off `reply`
 /// in every case, whatever the routing, so none is ever stored, published
-/// or shown.
+/// or shown; a chat search one only while `chat_search` is on. A reply that
+/// was only a web search marker gets a fixed text, unless a chat search
+/// marker came with it (its caller says what follows).
 fn research_advised(
     reply: &mut String,
     requested_mode: llm::RoutingMode,
     intent_kind: Option<crate::intent::WorkKind>,
+    chat_search: bool,
 ) -> (bool, crate::job_markers::Markers) {
-    let markers = crate::job_markers::take(reply);
-    if markers.web_search && reply.is_empty() {
+    let markers = crate::job_markers::take(reply, chat_search);
+    if markers.web_search && !markers.any_chat_search && reply.is_empty() {
         *reply = MARKER_ONLY_REPLY.into();
     }
     let marked = markers.web_search && requested_mode != llm::RoutingMode::Research;
@@ -1402,7 +1409,7 @@ async fn chat_search_run(
     };
     // Excerpts may carry earlier web text: markers in the answer are
     // dropped unread.
-    crate::job_markers::take(&mut reply.text);
+    crate::job_markers::take(&mut reply.text, true);
     take_photo_markers(&mut reply.text, &[]);
     reply.text = untrusted_answer(&reply.text);
     if reply.text.trim().is_empty() {
@@ -1434,7 +1441,7 @@ async fn auto_research_answer(
     let mut reply = research_reply(routing, brain, question).await;
     // A web page may inject trailing markers; strip them like any answer's.
     // A job's answer comes here too and is never read for markers.
-    research_advised(&mut reply.text, llm::RoutingMode::Research, None);
+    research_advised(&mut reply.text, llm::RoutingMode::Research, None, false);
     take_photo_markers(&mut reply.text, &[]);
     if reply.text.trim().is_empty() {
         reply.text = RESEARCH_EMPTY.into();
@@ -2346,20 +2353,41 @@ mod tests {
             "Answer.\n[[job {}]]\n\n[[web_search]]\n[[job_self {}]]\n",
         ] {
             let mut text = text.to_owned();
-            let (advised, markers) = research_advised(&mut text, Auto, None);
+            let (advised, markers) = research_advised(&mut text, Auto, None, false);
             assert!(advised && markers.web_search, "{text}");
             assert_eq!(text, "Answer.");
             assert_eq!(markers.jobs, ["{}"]);
         }
         // Only job markers: the caller stores a fixed text instead.
         let mut text = "[[job {}]]".to_owned();
-        let (advised, markers) = research_advised(&mut text, Auto, None);
+        let (advised, markers) = research_advised(&mut text, Auto, None, false);
         assert!(!advised && markers.any_job && text.is_empty());
         // A research answer loses them too and never asks for a search.
         let mut text = "Web.\n[[job_self {}]]\n[[web_search]]".to_owned();
-        let (advised, markers) = research_advised(&mut text, Research, None);
+        let (advised, markers) = research_advised(&mut text, Research, None, false);
         assert!(!advised);
         assert_eq!((text.as_str(), markers.job_self.len()), ("Web.", 1));
+    }
+
+    #[test]
+    fn a_chat_search_marker_is_inert_while_the_search_is_off() {
+        use llm::RoutingMode::Auto;
+        // Off: the line stays text, and so does every marker above it.
+        for text in [
+            "Answer.\n[[chat_search zeeland]]",
+            "Answer.\n[[job {}]]\n[[chat_search zeeland]]",
+        ] {
+            let mut kept = text.to_owned();
+            let (advised, markers) = research_advised(&mut kept, Auto, None, false);
+            assert_eq!(kept, text);
+            assert!(!advised && !markers.any_chat_search && !markers.any_job);
+        }
+        // On: taken, and a reply of only it and the web search marker is
+        // left empty for the caller's chat search text.
+        let mut text = "[[chat_search zeeland]]\n[[web_search]]".to_owned();
+        let (advised, markers) = research_advised(&mut text, Auto, None, true);
+        assert!(advised && markers.any_chat_search && text.is_empty());
+        assert_eq!(markers.chat_search, Some(vec!["zeeland".into()]));
     }
 
     #[test]
@@ -2368,7 +2396,7 @@ mod tests {
         use llm::RoutingMode::{Auto, Deep, Research};
         let advised = |text: &str, mode, kind| {
             let mut text = text.to_owned();
-            (research_advised(&mut text, mode, kind).0, text)
+            (research_advised(&mut text, mode, kind, false).0, text)
         };
         let marked = "Short answer.\n[[web_search]]";
         assert_eq!(advised(marked, Auto, None), (true, "Short answer.".into()));
