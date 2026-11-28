@@ -20,8 +20,9 @@ use crate::AppState;
 
 /// Bounds one research run.
 const RESEARCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// The model a fixed message of Core's is stored under.
-const NOTICE_MODEL: &str = "job";
+/// The model a fixed message of Core's is stored under: a job's messages,
+/// the note on a job of Jarvis's own, a chat search that found nothing.
+pub(crate) const NOTICE_MODEL: &str = "job";
 
 /// The fixed notice a failed `prompt` run leaves in its conversation.
 fn failure_notice(code: &str) -> &'static str {

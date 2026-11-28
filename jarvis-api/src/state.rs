@@ -241,6 +241,9 @@ pub struct AppState {
     /// Reads the one page a chat turn links to; `None` unless
     /// `JARVIS_WEB_FETCH_ENABLED=true` and the reader's account exists.
     pub page_reader: Option<Arc<crate::page_read::PageReader>>,
+    /// The single slot and caps of cross-chat searches; `None` unless
+    /// `JARVIS_CHAT_SEARCH_ENABLED=true`.
+    pub chat_search: Option<Arc<crate::auto_research::RunCaps>>,
     /// GitHub poller for roadmap links and its repo allowlist; off by default.
     pub github: Arc<crate::roadmaps::github::GithubHandle>,
     /// The scheduled jobs runner; off when its time zone cannot be loaded.

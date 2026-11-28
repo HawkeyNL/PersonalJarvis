@@ -103,6 +103,7 @@ async fn state(db: jarvis_store::Database, sandbox: Option<Sandbox>) -> AppState
         memecoin: Default::default(),
         auto_research: Default::default(),
         page_reader: None,
+        chat_search: None,
         github: Default::default(),
         jobs: Default::default(),
         photos: Default::default(),

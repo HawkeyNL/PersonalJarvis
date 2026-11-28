@@ -688,6 +688,10 @@ async fn main() -> anyhow::Result<()> {
         )),
         auto_research: Default::default(),
         page_reader,
+        // One cross-chat search at a time, 20 an hour, 100 a day.
+        chat_search: config
+            .chat_search_enabled
+            .then(|| Arc::new(jarvis_api::auto_research::RunCaps::with_caps(20, 100))),
         github,
         jobs: Arc::new(jarvis_api::jobs::JobsHandle::new()),
         photos,

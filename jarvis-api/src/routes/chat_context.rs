@@ -67,6 +67,12 @@ pub(super) fn read_model(model: &str) -> String {
     format!("{READ_MODEL_PREFIX}{model}")
 }
 
+/// The stored model of an answer written from earlier chats:
+/// `recall:<model>`.
+pub(super) fn recall_model(model: &str) -> String {
+    format!("{RECALL_MODEL_PREFIX}{model}")
+}
+
 /// `web:<model>` of a research job Jarvis made for itself, stored as
 /// `web-own:<model>`.
 pub(crate) fn own_research_model(stored: &str) -> String {
@@ -161,21 +167,29 @@ pub(crate) fn wrap_untrusted(label: &str, content: &str, cap: usize) -> String {
 /// The stored conversation as model input, with the photos of the newest
 /// turns attached (only `with_photos`; a web search never gets them) and
 /// every photo labelled in the text, plus the links of the newest Research
-/// answer in the window (what "source N" may pick).
+/// answer in the window (what "source N" may pick) and whether the
+/// conversation holds an answer written from earlier chats, in the window
+/// or before it (later answers may repeat it).
 pub(super) async fn load(
     db: &jarvis_store::Database,
     photos: &crate::photos::PhotoStore,
     user: Uuid,
     newest: &CanonicalMessage,
     with_photos: bool,
-) -> Result<(Vec<ChatMessage>, PhotoLabels, Vec<String>), ()> {
+) -> Result<(Vec<ChatMessage>, PhotoLabels, Vec<String>, bool), ()> {
     let mut response = db.query(
         "SELECT record::id(id) AS id, role, content, model, attachments, created_at FROM chat_messages \
          WHERE conversation_id = $conversation AND user_id = $user \
-         ORDER BY created_at DESC, id DESC LIMIT $limit"
-    ).bind(json!({"conversation": newest.conversation_id.to_string(), "user": user.to_string(), "limit": MAX_CONTEXT_ROWS}))
+         ORDER BY created_at DESC, id DESC LIMIT $limit; \
+         SELECT VALUE record::id(id) FROM chat_messages \
+         WHERE conversation_id = $conversation AND user_id = $user \
+         AND model != NONE AND string::starts_with(model, $recall) LIMIT 1;"
+    ).bind(json!({"conversation": newest.conversation_id.to_string(), "user": user.to_string(),
+        "limit": MAX_CONTEXT_ROWS, "recall": RECALL_MODEL_PREFIX}))
         .await.map_err(|_| ())?;
     let rows: Vec<Row> = response.take(0).map_err(|_| ())?;
+    let recall_rows: Vec<String> = response.take(1).map_err(|_| ())?;
+    let recalled = !recall_rows.is_empty();
     let last_sources = newest_web_sources(&rows);
     let (mut messages, attachments) = bounded(rows, newest, OffsetDateTime::now_utc())?;
     let live = live_photos(db, user, newest.conversation_id, &attachments).await?;
@@ -186,7 +200,7 @@ pub(super) async fn load(
     };
     let images = crate::photos::read_for_model(photos, shown.clone()).await;
     let labels = label_photos(&mut messages, &attachments, &live, &shown, &images);
-    Ok((messages, labels, last_sources))
+    Ok((messages, labels, last_sources, recalled))
 }
 
 /// The links of the newest `web:` answer among the rows (newest first, the

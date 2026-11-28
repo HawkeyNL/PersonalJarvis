@@ -26,6 +26,9 @@ pub(crate) const MAX_PROPOSALS: usize = 3;
 const JOB: &str = "[[job ";
 const JOB_SELF: &str = "[[job_self ";
 const ROADMAP: &str = "[[roadmap ";
+const CHAT_SEARCH: &str = "[[chat_search ";
+/// The longest `[[chat_search …]]` line taken as one.
+pub(crate) const MAX_CHAT_SEARCH_LINE: usize = 128;
 /// A marker line longer than a job route's body is refused.
 const MAX_LINE_BYTES: usize = crate::routes::jobs::BODY_LIMIT;
 const WEEKDAYS: [&str; 7] = [
@@ -53,16 +56,22 @@ pub(crate) struct Markers {
     pub roadmaps: Vec<String>,
     /// Any roadmap marker line was taken, valid or not.
     pub any_roadmap: bool,
+    /// The keywords of a valid `[[chat_search …]]` line.
+    pub chat_search: Option<Vec<String>>,
+    /// Any chat search marker line was taken, valid or not.
+    pub any_chat_search: bool,
 }
 
 /// Takes the trailing marker lines off `text`: `[[web_search]]`,
-/// `[[job …]]`, `[[job_self …]]` and `[[roadmap …]]` in any order, and any
-/// other trailing line starting with `[[job` or `[[roadmap` (dropped; a
+/// `[[job …]]`, `[[job_self …]]`, `[[roadmap …]]` and, only with
+/// `chat_search` (the search is on), `[[chat_search …]]` in any order, and
+/// any other trailing line starting with `[[job`, `[[roadmap` or (likewise)
+/// `[[chat_search` (dropped; a
 /// roadmap one still counts in `any_roadmap`). Trailing `[[photo:N]]` lines
 /// among them stay, after the text, for the photo markers. Nothing beyond
 /// [`crate::auto_research::MAX_HOLD_BYTES`] from the end is taken (it stays
 /// text) but a `[[roadmap` line, so what is taken was never streamed.
-pub(crate) fn take(text: &mut String) -> Markers {
+pub(crate) fn take(text: &mut String, chat_search: bool) -> Markers {
     let total = text.len();
     let mut markers = Markers::default();
     let mut photos = Vec::new();
@@ -94,6 +103,12 @@ pub(crate) fn take(text: &mut String) -> Markers {
                 Some(json) => markers.roadmaps.push(json.to_owned()),
                 None => tracing::info!("malformed roadmap marker dropped"),
             }
+        } else if chat_search && line.starts_with("[[chat_search") {
+            markers.any_chat_search = true;
+            match chat_search_terms(line) {
+                Some(terms) => markers.chat_search = Some(terms),
+                None => tracing::info!("malformed chat_search marker dropped"),
+            }
         } else {
             break;
         }
@@ -109,6 +124,20 @@ pub(crate) fn take(text: &mut String) -> Markers {
     markers.job_self.reverse();
     markers.roadmaps.reverse();
     markers
+}
+
+/// The keywords of a `[[chat_search word …]]` line: 1 to
+/// [`crate::chat_search::MAX_TERMS`] words, lowercased, each a term the
+/// search takes, the line at most [`MAX_CHAT_SEARCH_LINE`] bytes.
+fn chat_search_terms(line: &str) -> Option<Vec<String>> {
+    let words = line.strip_prefix(CHAT_SEARCH)?.strip_suffix("]]")?;
+    let terms: Vec<String> = words.split_whitespace().map(str::to_lowercase).collect();
+    (line.len() <= MAX_CHAT_SEARCH_LINE
+        && (1..=crate::chat_search::MAX_TERMS).contains(&terms.len())
+        && terms
+            .iter()
+            .all(|term| crate::chat_search::valid_term(term)))
+    .then_some(terms)
 }
 
 /// A job as the model writes it: weekday by name, time as `HH:MM`, params
@@ -500,7 +529,7 @@ mod tests {
     fn only_trailing_marker_lines_are_taken_in_reply_order() {
         let taken = |text: &str| {
             let mut text = text.to_owned();
-            let markers = take(&mut text);
+            let markers = take(&mut text, true);
             (text, markers)
         };
         let (text, markers) = taken(
@@ -518,6 +547,8 @@ mod tests {
                 any_job: true,
                 roadmaps: vec!["{\"title\":\"T\"}".into(), "{\"d\":4}".into()],
                 any_roadmap: true,
+                chat_search: None,
+                any_chat_search: false,
             }
         );
         // A cut-off roadmap line alone is taken and counts, with no JSON.
@@ -560,6 +591,56 @@ mod tests {
         let (text, markers) = taken("Answer.\n[[web_search]]");
         assert_eq!(text, "Answer.");
         assert!(markers.web_search && !markers.any_job);
+    }
+
+    #[test]
+    fn a_chat_search_line_gives_its_lowercased_keywords_or_nothing() {
+        let terms = |text: &str| {
+            let mut taken = text.to_owned();
+            let markers = take(&mut taken, true);
+            // Every chat search line taken counts, valid or not.
+            assert_eq!(markers.any_chat_search, taken != text, "{text}");
+            (taken, markers.chat_search)
+        };
+        let words = |list: &[&str]| Some(list.iter().map(|w| w.to_string()).collect());
+        assert_eq!(
+            terms("Answer.\n[[chat_search Zeeland ferry]]\n[[web_search]]"),
+            ("Answer.".into(), words(&["zeeland", "ferry"]))
+        );
+        assert_eq!(
+            terms("[[chat_search café 2026 zee-land]]"),
+            (String::new(), words(&["café", "2026", "zee-land"]))
+        );
+        // Taken off but refused: too many, too short or long, bad characters,
+        // no words, an overlong line, a glued prefix.
+        for bad in [
+            "[[chat_search a1b b2c c3d d4e]]",
+            "[[chat_search ab]]",
+            &format!("[[chat_search {}]]", "a".repeat(33)),
+            "[[chat_search zee'land]]",
+            "[[chat_search </web_result>]]",
+            "[[chat_search ]]",
+            "[[chat_search]]",
+            "[[chat_searchzeeland]]",
+            "[[chat_search zeeland",
+            &format!("[[chat_search {}]]", vec!["a".repeat(32); 4].join(" ")),
+        ] {
+            assert_eq!(
+                terms(&format!("Answer.\n{bad}")),
+                ("Answer.".into(), None),
+                "{bad}"
+            );
+        }
+        let long = format!("[[chat_search {}]]", vec!["a".repeat(32); 3].join(" "));
+        assert!(long.len() <= MAX_CHAT_SEARCH_LINE);
+        assert_eq!(terms(&long).1.map(|t| t.len()), Some(3));
+        // Not the last line, or inline: ordinary text.
+        for kept in [
+            "[[chat_search zeeland]]\nAnswer.",
+            "Answer. [[chat_search zeeland]]",
+        ] {
+            assert_eq!(terms(kept), (kept.to_owned(), None), "{kept}");
+        }
     }
 
     #[test]

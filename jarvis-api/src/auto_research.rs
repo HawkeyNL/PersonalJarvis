@@ -40,12 +40,13 @@ pub(crate) fn last_line(text: &str) -> (usize, &str) {
 
 /// Most text [`MarkerHold`] holds back: room for every marker an answer may
 /// carry at its longest (3 jobs, one of Jarvis's own, the web search, one
-/// roadmap). `job_markers::take` takes no marker beyond it, so what it takes
+/// chat search, one roadmap). `job_markers::take` takes no marker beyond it, so what it takes
 /// off was never streamed. A `[[roadmap` line is the exception: it is held
 /// and taken at any length (the reply's own token cap bounds it), so an
 /// oversized one is refused instead of shown.
-pub(crate) const MAX_HOLD_BYTES: usize =
-    5 * crate::routes::jobs::BODY_LIMIT + crate::roadmap_markers::MAX_ROADMAP_LINE;
+pub(crate) const MAX_HOLD_BYTES: usize = 5 * crate::routes::jobs::BODY_LIMIT
+    + crate::roadmap_markers::MAX_ROADMAP_LINE
+    + crate::job_markers::MAX_CHAT_SEARCH_LINE;
 
 /// Whether a trailing marker line, `from_end` bytes from the end of the
 /// reply, is too far back to hold or take.
@@ -438,7 +439,7 @@ mod tests {
     fn only_a_trailing_marker_line_is_taken() {
         let take = |text: &str| {
             let mut text = text.to_owned();
-            let marked = crate::job_markers::take(&mut text).web_search;
+            let marked = crate::job_markers::take(&mut text, false).web_search;
             (marked, text)
         };
         assert_eq!(
