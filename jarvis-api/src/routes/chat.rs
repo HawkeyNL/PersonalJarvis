@@ -646,13 +646,15 @@ pub(super) async fn execute_chat(
             if !page_turn && chat_search {
                 if reply.text.trim().is_empty() {
                     reply.text = if requested_mode == llm::RoutingMode::Research {
-                        RESEARCH_EMPTY
+                        RESEARCH_EMPTY.into()
                     } else if recall.is_some() {
-                        CHAT_SEARCH_REPLY
+                        CHAT_SEARCH_REPLY.into()
+                    } else if research_advised {
+                        // The web search still follows: say so first.
+                        format!("{MARKER_ONLY_REPLY}\n\n{CHAT_SEARCH_OFF_REPLY}")
                     } else {
-                        CHAT_SEARCH_OFF_REPLY
-                    }
-                    .into();
+                        CHAT_SEARCH_OFF_REPLY.into()
+                    };
                 } else if honoured && recall.is_none() {
                     reply.text = format!("{}\n\n{CHAT_SEARCH_OFF_REPLY}", reply.text.trim_end());
                 }
@@ -1441,7 +1443,7 @@ async fn auto_research_answer(
     let mut reply = research_reply(routing, brain, question).await;
     // A web page may inject trailing markers; strip them like any answer's.
     // A job's answer comes here too and is never read for markers.
-    research_advised(&mut reply.text, llm::RoutingMode::Research, None, false);
+    research_advised(&mut reply.text, llm::RoutingMode::Research, None, true);
     take_photo_markers(&mut reply.text, &[]);
     if reply.text.trim().is_empty() {
         reply.text = RESEARCH_EMPTY.into();
